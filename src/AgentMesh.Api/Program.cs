@@ -1,3 +1,4 @@
+using AgentMesh.Api.Auth;
 using AgentMesh.Api.Tools;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -12,6 +13,19 @@ builder.AddNpgsqlDbContext<AgentMeshDbContext>("agentdb", configureDbContextOpti
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
 builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespace: "default");
 
+// Configure Authentication & Authorization
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddAuthentication(ApiKeyAuthenticationOptions.DefaultScheme)
+    .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationOptions.DefaultScheme, null);
+builder.Services.AddAuthorization();
+
+// Configure Controllers
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles;
+    });
+
 // Register MCP Server
 builder.Services.AddMcpServer()
     .WithHttpTransport()
@@ -19,8 +33,12 @@ builder.Services.AddMcpServer()
 
 var app = builder.Build();
 
+app.UseAuthentication();
+app.UseAuthorization();
+
 app.MapDefaultEndpoints();
-app.MapMcp("/mcp");
+app.MapControllers();
+app.MapMcp("/mcp").RequireAuthorization();
 
 app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online" }));
 

@@ -1,0 +1,47 @@
+# Default values for agent-mesh.
+replicaCount: 1
+
+ingress:
+  enabled: true
+  className: "nginx"
+  host: "agents.yourdomain.local"
+  clusterIssuer: "letsencrypt-prod"
+  tlsSecretName: "agent-mesh-tls"
+
+api:
+  image:
+    repository: "agent-mesh-api"
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  port: 5000
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+worker:
+  image:
+    repository: "agent-mesh-worker"
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+config:
+  staticApiKey: "mesh-default-secret-key"
+  temporalHost: "temporal:7233"
+  temporalNamespace: "default"
+  postgresHost: "postgres"
+  postgresPort: 5432
+  postgresDatabase: "agentdb"
+  postgresUser: "postgres"
+  postgresPassword: "postgrespassword"
+  redisHost: "redis:6379"

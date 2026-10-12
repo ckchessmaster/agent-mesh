@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  Auth__StaticApiKey: {{ .Values.config.staticApiKey | quote }}
+  Temporal__Host: {{ .Values.config.temporalHost | quote }}
+  ConnectionStrings__agentdb: "Host={{ .Values.config.postgresHost }};Port={{ .Values.config.postgresPort }};Database={{ .Values.config.postgresDatabase }};Username={{ .Values.config.postgresUser }};Password={{ .Values.config.postgresPassword }}"
+  ConnectionStrings__redis: {{ .Values.config.redisHost | quote }}

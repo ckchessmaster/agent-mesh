@@ -6,7 +6,10 @@ using AgentMesh.Core.Workflows;
 namespace AgentMesh.Api.Tools;
 
 [McpServerToolType]
-public class StagingTools(ITemporalClient temporalClient, ILogger<StagingTools> logger)
+public class StagingTools(
+    ITemporalClient temporalClient,
+    ILogger<StagingTools> logger,
+    IHttpContextAccessor? httpContextAccessor = null)
 {
     [McpServerTool(Name = "stage_agent_intent")]
     [Description("Stages an operational journal entry or intent payload into the central task ledger for execution.")]
@@ -20,17 +23,21 @@ public class StagingTools(ITemporalClient temporalClient, ILogger<StagingTools> 
         var jobId = Guid.NewGuid();
         var workflowId = $"job-{jobId}";
 
+        var agentId = httpContextAccessor?.HttpContext?.User.FindFirst("AgentId")?.Value
+            ?? (httpContextAccessor?.HttpContext?.Request.Headers.TryGetValue("X-Agent-Id", out var h) == true ? h.ToString() : null)
+            ?? "gemini-spark";
+
         var input = new AgentTaskWorkflowInput(
             JobId: jobId,
             SessionId: Guid.Parse(sessionId),
             TargetService: targetService,
             ActionVerb: actionVerb,
             PayloadJson: payloadJson,
-            RequestedByAgentId: "gemini-spark"
+            RequestedByAgentId: agentId
         );
 
-        logger.LogInformation("Starting Temporal workflow {WorkflowId} for service {Service}:{Verb}", 
-            workflowId, targetService, actionVerb);
+        logger.LogInformation("Starting Temporal workflow {WorkflowId} for service {Service}:{Verb} requested by {AgentId}", 
+            workflowId, targetService, actionVerb, agentId);
 
         await temporalClient.StartWorkflowAsync(
             (AgentTaskWorkflow wf) => wf.RunAsync(input),
