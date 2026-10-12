@@ -8,11 +8,15 @@ public class AgentTaskWorkflow
 {
     private bool _approvalReceived = false;
     private bool _isApproved = false;
+    private string? _reviewer;
+    private string? _rejectionReason;
 
     [WorkflowSignal]
-    public Task SubmitApproval(bool approved)
+    public Task SubmitApproval(bool approved, string reviewer, string? reason = null)
     {
         _isApproved = approved;
+        _reviewer = reviewer;
+        _rejectionReason = reason;
         _approvalReceived = true;
         return Task.CompletedTask;
     }
@@ -20,40 +24,52 @@ public class AgentTaskWorkflow
     [WorkflowRun]
     public async Task<string> RunAsync(AgentTaskWorkflowInput input)
     {
-        // 1. Persist initial staged job record
+        // 1. Stage initial record
         await Workflow.ExecuteActivityAsync(
             (IDatabaseActivities act) => act.CreateStagedJobRecord(input),
             new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
-        // 2. Routing logic: platform_ops auto-approves; others await approval (Phase 4 integration)
-        bool requiresApproval = input.TargetService != "platform_ops";
-        if (requiresApproval)
+        // 2. High risk boundary evaluation
+        bool requiresHumanReview = input.TargetService != "platform_ops";
+
+        if (requiresHumanReview)
         {
             await Workflow.ExecuteActivityAsync(
-                (IDatabaseActivities act) => act.UpdateApprovalStatus(input.JobId, "pending_human"),
+                (IDatabaseActivities act) => act.UpdateApprovalStatus(input.JobId, "PendingHuman"),
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
-            // Durable wait for approval signal (up to 7 days)
+            // Send interactive Discord notification
+            await Workflow.ExecuteActivityAsync(
+                (INotificationActivities act) => act.SendDiscordApprovalRequest(input),
+                new ActivityOptions { StartToCloseTimeout = TimeSpan.FromMinutes(2) });
+
+            // Durable pause up to 7 days
             await Workflow.WaitConditionAsync(() => _approvalReceived, TimeSpan.FromDays(7));
 
             if (!_isApproved)
             {
+                var reason = _rejectionReason ?? "Rejected by operator";
                 await Workflow.ExecuteActivityAsync(
-                    (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "rejected", null, "Rejected by operator"),
+                    (IDatabaseActivities act) => act.UpdateApprovalStatus(input.JobId, "Rejected"),
                     new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
-                return "Task rejected by operator.";
+
+                await Workflow.ExecuteActivityAsync(
+                    (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Failed", null, reason),
+                    new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
+
+                return $"Task rejected by {_reviewer}: {reason}";
             }
 
             await Workflow.ExecuteActivityAsync(
-                (IDatabaseActivities act) => act.UpdateApprovalStatus(input.JobId, "approved"),
+                (IDatabaseActivities act) => act.UpdateApprovalStatus(input.JobId, "Approved"),
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
         }
 
-        // 3. Subsystem execution
+        // 3. Execution Phase
         try
         {
             await Workflow.ExecuteActivityAsync(
-                (IDatabaseActivities act) => act.UpdateExecutionStatus(input.JobId, "running"),
+                (IDatabaseActivities act) => act.UpdateExecutionStatus(input.JobId, "Running"),
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
             var result = await Workflow.ExecuteActivityAsync(
@@ -65,7 +81,7 @@ public class AgentTaskWorkflow
                 });
 
             await Workflow.ExecuteActivityAsync(
-                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "completed", result, null),
+                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Completed", result, null),
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
             return result;
@@ -73,7 +89,7 @@ public class AgentTaskWorkflow
         catch (Exception ex)
         {
             await Workflow.ExecuteActivityAsync(
-                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "failed", null, ex.Message),
+                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Failed", null, ex.Message),
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
             throw;
         }

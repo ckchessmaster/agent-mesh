@@ -11,13 +11,16 @@ builder.AddNpgsqlDbContext<AgentMeshDbContext>("agentdb", configureDbContextOpti
 
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
 
+builder.Services.AddHttpClient<NotificationActivities>();
+
 builder.Services.AddHostedTemporalWorker(
     clientTargetHost: temporalHost,
     clientNamespace: "default",
     taskQueue: "agent-task-queue")
     .AddWorkflow<AgentTaskWorkflow>()
     .AddScopedActivities<DatabaseActivities>()
-    .AddScopedActivities<ExecutionActivities>();
+    .AddScopedActivities<ExecutionActivities>()
+    .AddScopedActivities<NotificationActivities>();
 
 var host = builder.Build();
 host.Run();

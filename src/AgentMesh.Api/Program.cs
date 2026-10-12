@@ -1,4 +1,5 @@
 using AgentMesh.Api.Auth;
+using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Tools;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -19,12 +20,13 @@ builder.Services.AddAuthentication(ApiKeyAuthenticationOptions.DefaultScheme)
     .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationOptions.DefaultScheme, null);
 builder.Services.AddAuthorization();
 
-// Configure Controllers
+// Configure Controllers & SignalR
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
     {
         options.JsonSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles;
     });
+builder.Services.AddSignalR();
 
 // Register MCP Server
 builder.Services.AddMcpServer()
@@ -38,6 +40,7 @@ app.UseAuthorization();
 
 app.MapDefaultEndpoints();
 app.MapControllers();
+app.MapHub<AgentMeshHub>("/hubs/agent-mesh");
 app.MapMcp("/mcp").RequireAuthorization();
 
 app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online" }));
