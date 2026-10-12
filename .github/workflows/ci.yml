@@ -1,0 +1,105 @@
+name: AgentMesh CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend:
+    name: .NET 10 Solution Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore NuGet Packages
+        run: dotnet restore AgentMesh.sln
+
+      - name: Build Solution
+        run: dotnet build AgentMesh.sln --configuration Release --no-restore
+
+      - name: Run Unit & Integration Tests
+        run: dotnet test AgentMesh.sln --configuration Release --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx"
+
+      - name: Publish Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dotnet-test-results
+          path: '**/test-results.trx'
+
+  frontend:
+    name: React 19 Cockpit Build & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/AgentMesh.Dashboard
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: src/AgentMesh.Dashboard/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Frontend Tests (Vitest)
+        run: npm test
+
+      - name: Build React Dashboard
+        run: npm run build
+
+  helm-and-docker:
+    name: Helm & Docker Manifest Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint Helm Chart
+        run: helm lint deploy/helm/agent-mesh
+
+      - name: Render Helm Templates
+        run: helm template deploy/helm/agent-mesh > /dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.api
+          push: false
+          tags: agent-mesh-api:ci-test
+
+      - name: Build Worker Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.worker
+          push: false
+          tags: agent-mesh-worker:ci-test
+
+      - name: Build Dashboard Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.dashboard
+          push: false
+          tags: agent-mesh-dashboard:ci-test

@@ -7,4 +7,7 @@
     <Project Path="src/AgentMesh.ServiceDefaults/AgentMesh.ServiceDefaults.csproj" />
     <Project Path="src/AgentMesh.Worker/AgentMesh.Worker.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AgentMesh.Tests/AgentMesh.Tests.csproj" />
+  </Folder>
 </Solution>
