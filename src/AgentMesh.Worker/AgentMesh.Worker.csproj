@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-AgentMesh.Worker-3474af9b-b93f-4516-9c08-584f23947e35</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Npgsql.EntityFrameworkCore.PostgreSQL" Version="13.6.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AgentMesh.ServiceDefaults\AgentMesh.ServiceDefaults.csproj" />
+    <ProjectReference Include="..\AgentMesh.Infrastructure\AgentMesh.Infrastructure.csproj" />
+    <ProjectReference Include="..\AgentMesh.Core\AgentMesh.Core.csproj" />
+  </ItemGroup>
+</Project>

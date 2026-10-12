@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AgentMesh.Api/AgentMesh.Api.csproj" />
+    <Project Path="src/AgentMesh.AppHost/AgentMesh.AppHost.csproj" />
+    <Project Path="src/AgentMesh.Core/AgentMesh.Core.csproj" />
+    <Project Path="src/AgentMesh.Infrastructure/AgentMesh.Infrastructure.csproj" />
+    <Project Path="src/AgentMesh.ServiceDefaults/AgentMesh.ServiceDefaults.csproj" />
+    <Project Path="src/AgentMesh.Worker/AgentMesh.Worker.csproj" />
+  </Folder>
+</Solution>
