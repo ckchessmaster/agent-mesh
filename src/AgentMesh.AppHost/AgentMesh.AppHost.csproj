@@ -10,6 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.NodeJs" Version="9.5.2" />
     <PackageReference Include="Aspire.Hosting.PostgreSQL" Version="13.6.1" />
     <PackageReference Include="Aspire.Hosting.Redis" Version="13.6.1" />
   </ItemGroup>

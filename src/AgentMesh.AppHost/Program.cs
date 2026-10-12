@@ -30,4 +30,9 @@ var worker = builder.AddProject<Projects.AgentMesh_Worker>("worker")
     .WithEnvironment("Temporal__Host", "localhost:7233")
     .WaitFor(temporal);
 
+// 6. React Vite Frontend
+builder.AddNpmApp("dashboard", "../AgentMesh.Dashboard")
+    .WithReference(api)
+    .WithHttpEndpoint(targetPort: 3000, env: "PORT");
+
 builder.Build().Run();

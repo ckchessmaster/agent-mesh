@@ -20,6 +20,18 @@ builder.Services.AddAuthentication(ApiKeyAuthenticationOptions.DefaultScheme)
     .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationOptions.DefaultScheme, null);
 builder.Services.AddAuthorization();
 
+// Configure CORS
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.SetIsOriginAllowed(_ => true)
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
+
 // Configure Controllers & SignalR
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
@@ -35,6 +47,7 @@ builder.Services.AddMcpServer()
 
 var app = builder.Build();
 
+app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
 

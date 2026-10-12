@@ -45,3 +45,17 @@ config:
   postgresUser: "postgres"
   postgresPassword: "postgrespassword"
   redisHost: "redis:6379"
+
+dashboard:
+  replicas: 1
+  image:
+    repository: "agent-mesh-dashboard"
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi

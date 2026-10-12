@@ -1,7 +1,9 @@
 using System.ComponentModel;
+using AgentMesh.Api.Hubs;
+using AgentMesh.Core.Workflows;
+using Microsoft.AspNetCore.SignalR;
 using ModelContextProtocol.Server;
 using Temporalio.Client;
-using AgentMesh.Core.Workflows;
 
 namespace AgentMesh.Api.Tools;
 
@@ -9,7 +11,8 @@ namespace AgentMesh.Api.Tools;
 public class StagingTools(
     ITemporalClient temporalClient,
     ILogger<StagingTools> logger,
-    IHttpContextAccessor? httpContextAccessor = null)
+    IHttpContextAccessor? httpContextAccessor = null,
+    IHubContext<AgentMeshHub>? hubContext = null)
 {
     [McpServerTool(Name = "stage_agent_intent")]
     [Description("Stages an operational journal entry or intent payload into the central task ledger for execution.")]
@@ -42,6 +45,25 @@ public class StagingTools(
         await temporalClient.StartWorkflowAsync(
             (AgentTaskWorkflow wf) => wf.RunAsync(input),
             new WorkflowOptions(id: workflowId, taskQueue: "agent-task-queue"));
+
+        if (hubContext != null)
+        {
+            try
+            {
+                await hubContext.Clients.All.SendAsync("JobStaged", new
+                {
+                    jobId,
+                    targetService,
+                    actionVerb,
+                    sessionId,
+                    requestedByAgentId = agentId
+                }, cancellationToken: ct);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to broadcast JobStaged over SignalR");
+            }
+        }
 
         return System.Text.Json.JsonSerializer.Serialize(new
         {
