@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Temporalio.Workflows;
 using AgentMesh.Core.Activities;
 
@@ -54,7 +55,7 @@ public class AgentTaskWorkflow
                     new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
                 await Workflow.ExecuteActivityAsync(
-                    (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Failed", null, reason),
+                    (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Failed", null, reason, null, null),
                     new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
                 return $"Task rejected by {_reviewer}: {reason}";
@@ -73,15 +74,26 @@ public class AgentTaskWorkflow
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
             var result = await Workflow.ExecuteActivityAsync(
-                (IExecutionActivities act) => act.ExecuteSubsystemAction(input.TargetService, input.ActionVerb, input.PayloadJson),
+                (IExecutionActivities act) => act.ExecuteSubsystemAction(input.TargetService, input.ActionVerb, input.PayloadJson, input.JobId),
                 new ActivityOptions
                 {
                     StartToCloseTimeout = TimeSpan.FromMinutes(5),
                     RetryPolicy = new() { InitialInterval = TimeSpan.FromSeconds(2), MaximumAttempts = 3 }
                 });
 
+            string? resultS3Uri = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(result);
+                if (doc.RootElement.TryGetProperty("s3_uri", out var uriElem))
+                {
+                    resultS3Uri = uriElem.GetString();
+                }
+            }
+            catch { }
+
             await Workflow.ExecuteActivityAsync(
-                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Completed", result, null),
+                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Completed", result, null, resultS3Uri, null),
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
 
             return result;
@@ -89,7 +101,7 @@ public class AgentTaskWorkflow
         catch (Exception ex)
         {
             await Workflow.ExecuteActivityAsync(
-                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Failed", null, ex.Message),
+                (IDatabaseActivities act) => act.UpdateJobStatus(input.JobId, "Failed", null, ex.Message, null, null),
                 new ActivityOptions { StartToCloseTimeout = TimeSpan.FromSeconds(30) });
             throw;
         }

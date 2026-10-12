@@ -28,6 +28,10 @@ public class AgentJobConfiguration : IEntityTypeConfiguration<AgentJob>
             .HasColumnType("jsonb")
             .IsRequired();
 
+        builder.Property(j => j.PayloadS3Uri)
+            .HasColumnName("payload_s3_uri")
+            .HasMaxLength(512);
+
         builder.Property(j => j.ApprovalStatus)
             .HasConversion<string>()
             .HasMaxLength(32)
@@ -44,6 +48,16 @@ public class AgentJobConfiguration : IEntityTypeConfiguration<AgentJob>
         builder.Property(j => j.ResultJson)
             .HasColumnName("result")
             .HasColumnType("jsonb");
+
+        builder.Property(j => j.ResultS3Uri)
+            .HasColumnName("result_s3_uri")
+            .HasMaxLength(512);
+
+        builder.Property(j => j.ArtifactsManifestJson)
+            .HasColumnName("artifacts")
+            .HasColumnType("jsonb")
+            .HasDefaultValue("{}")
+            .IsRequired();
 
         builder.Property(j => j.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")

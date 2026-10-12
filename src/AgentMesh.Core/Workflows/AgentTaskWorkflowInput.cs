@@ -6,5 +6,6 @@ public record AgentTaskWorkflowInput(
     string TargetService,
     string ActionVerb,
     string PayloadJson,
-    string RequestedByAgentId
+    string RequestedByAgentId,
+    string? PayloadS3Uri = null
 );

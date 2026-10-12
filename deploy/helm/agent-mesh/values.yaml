@@ -45,6 +45,12 @@ config:
   postgresUser: "postgres"
   postgresPassword: "postgrespassword"
   redisHost: "redis:6379"
+  storage:
+    serviceUrl: "http://seaweedfs:8333"
+    bucketName: "agent-mesh-artifacts"
+    accessKey: "agentmesh-storage-key"
+    secretKey: "AgentMesh#SecureS3Pass2026!"
+    thresholdBytes: 65536
 
 dashboard:
   replicas: 1

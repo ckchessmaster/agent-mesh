@@ -184,7 +184,19 @@ export const JobHistoryTable: React.FC<JobHistoryTableProps> = ({ connection, re
               </div>
 
               <div>
-                <span className="text-slate-400 uppercase text-[10px] block mb-1">Payload JSON</span>
+                <div className="flex justify-between items-center mb-1">
+                  <span className="text-slate-400 uppercase text-[10px]">Payload JSON</span>
+                  {selectedJob.payloadS3Uri && (
+                    <a
+                      href={`/api/jobs/${selectedJob.id}/artifacts/payload`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[10px] text-cyan-400 hover:text-cyan-300 underline"
+                    >
+                      Download from SeaweedFS ({selectedJob.payloadS3Uri})
+                    </a>
+                  )}
+                </div>
                 <pre className="bg-slate-950 p-3 rounded text-slate-200 overflow-x-auto border border-slate-800">
                   {JSON.stringify(JSON.parse(selectedJob.payloadJson || '{}'), null, 2)}
                 </pre>
@@ -192,7 +204,19 @@ export const JobHistoryTable: React.FC<JobHistoryTableProps> = ({ connection, re
 
               {selectedJob.resultJson && (
                 <div>
-                  <span className="text-slate-400 uppercase text-[10px] block mb-1">Execution Result</span>
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="text-slate-400 uppercase text-[10px]">Execution Result</span>
+                    {selectedJob.resultS3Uri && (
+                      <a
+                        href={`/api/jobs/${selectedJob.id}/artifacts/result`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[10px] text-cyan-400 hover:text-cyan-300 underline"
+                      >
+                        Download from SeaweedFS ({selectedJob.resultS3Uri})
+                      </a>
+                    )}
+                  </div>
                   <pre className="bg-slate-950 p-3 rounded text-emerald-300 overflow-x-auto border border-slate-800">
                     {JSON.stringify(JSON.parse(selectedJob.resultJson), null, 2)}
                   </pre>

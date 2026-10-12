@@ -15,5 +15,5 @@ public interface IDatabaseActivities
     Task UpdateExecutionStatus(Guid jobId, string executionStatus);
 
     [Activity]
-    Task UpdateJobStatus(Guid jobId, string executionStatus, string? resultJson, string? errorMessage);
+    Task UpdateJobStatus(Guid jobId, string executionStatus, string? resultJson, string? errorMessage, string? resultS3Uri = null, string? artifactsManifestJson = null);
 }

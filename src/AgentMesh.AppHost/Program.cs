@@ -15,22 +15,38 @@ var temporal = builder.AddContainer("temporal", "temporalio/temporal", "latest")
     .WithHttpEndpoint(targetPort: 7233, name: "grpc")
     .WithHttpEndpoint(targetPort: 8233, name: "ui");
 
-// 4. API Service
+// 4. Local SeaweedFS S3 Container
+var seaweedfs = builder.AddContainer("seaweedfs", "chrislusf/seaweedfs", "latest")
+    .WithArgs("server", "-s3", "-dir=/data")
+    .WithHttpEndpoint(targetPort: 8333, name: "s3")
+    .WithHttpEndpoint(targetPort: 9333, name: "master");
+
+// 5. API Service
 var api = builder.AddProject<Projects.AgentMesh_Api>("api")
     .WithReference(agentdb)
     .WithReference(redis)
     .WithEnvironment("Temporal__Host", "localhost:7233")
+    .WithEnvironment("Storage__S3__ServiceUrl", "http://localhost:8333")
+    .WithEnvironment("Storage__S3__BucketName", "agent-mesh-artifacts")
+    .WithEnvironment("Storage__S3__AccessKey", "agentmesh-storage-key")
+    .WithEnvironment("Storage__S3__SecretKey", "AgentMesh#SecureS3Pass2026!")
     .WithHttpEndpoint(targetPort: 5000, name: "http")
-    .WaitFor(temporal);
+    .WaitFor(temporal)
+    .WaitFor(seaweedfs);
 
-// 5. Worker Service
+// 6. Worker Service
 var worker = builder.AddProject<Projects.AgentMesh_Worker>("worker")
     .WithReference(agentdb)
     .WithReference(redis)
     .WithEnvironment("Temporal__Host", "localhost:7233")
-    .WaitFor(temporal);
+    .WithEnvironment("Storage__S3__ServiceUrl", "http://localhost:8333")
+    .WithEnvironment("Storage__S3__BucketName", "agent-mesh-artifacts")
+    .WithEnvironment("Storage__S3__AccessKey", "agentmesh-storage-key")
+    .WithEnvironment("Storage__S3__SecretKey", "AgentMesh#SecureS3Pass2026!")
+    .WaitFor(temporal)
+    .WaitFor(seaweedfs);
 
-// 6. React Vite Frontend
+// 7. React Vite Frontend
 builder.AddNpmApp("dashboard", "../AgentMesh.Dashboard")
     .WithReference(api)
     .WithHttpEndpoint(targetPort: 3000, env: "PORT");

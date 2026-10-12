@@ -7,3 +7,8 @@ data:
   Temporal__Host: {{ .Values.config.temporalHost | quote }}
   ConnectionStrings__agentdb: "Host={{ .Values.config.postgresHost }};Port={{ .Values.config.postgresPort }};Database={{ .Values.config.postgresDatabase }};Username={{ .Values.config.postgresUser }};Password={{ .Values.config.postgresPassword }}"
   ConnectionStrings__redis: {{ .Values.config.redisHost | quote }}
+  Storage__S3__ServiceUrl: {{ .Values.config.storage.serviceUrl | quote }}
+  Storage__S3__BucketName: {{ .Values.config.storage.bucketName | quote }}
+  Storage__S3__AccessKey: {{ .Values.config.storage.accessKey | quote }}
+  Storage__S3__SecretKey: {{ .Values.config.storage.secretKey | quote }}
+  Storage__S3__ThresholdBytes: {{ .Values.config.storage.thresholdBytes | quote }}

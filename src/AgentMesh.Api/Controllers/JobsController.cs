@@ -1,5 +1,6 @@
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -49,5 +50,70 @@ public class JobsController(AgentMeshDbContext db) : ControllerBase
             .FirstOrDefaultAsync(j => j.Id == id);
 
         return job == null ? NotFound() : Ok(job);
+    }
+
+    [HttpGet("{id:guid}/artifacts/{artifactName}")]
+    public async Task<IActionResult> GetArtifact(
+        Guid id,
+        string artifactName,
+        [FromServices] IStorageService storageService)
+    {
+        var job = await db.AgentJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null) return NotFound("Job not found.");
+
+        string? s3Uri = null;
+        if (artifactName.Equals("payload", StringComparison.OrdinalIgnoreCase) || artifactName.Equals("payload.json", StringComparison.OrdinalIgnoreCase))
+        {
+            s3Uri = job.PayloadS3Uri;
+            if (string.IsNullOrEmpty(s3Uri))
+            {
+                return Content(job.PayloadJson, "application/json");
+            }
+        }
+        else if (artifactName.Equals("result", StringComparison.OrdinalIgnoreCase) || artifactName.Equals("result.json", StringComparison.OrdinalIgnoreCase))
+        {
+            s3Uri = job.ResultS3Uri;
+            if (string.IsNullOrEmpty(s3Uri) && job.ResultJson != null)
+            {
+                return Content(job.ResultJson, "application/json");
+            }
+        }
+
+        if (string.IsNullOrEmpty(s3Uri))
+        {
+            return NotFound($"Artifact '{artifactName}' not recorded for job {id}.");
+        }
+
+        try
+        {
+            var stream = await storageService.DownloadStreamAsync(s3Uri);
+            return File(stream, "application/octet-stream", artifactName);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = "Failed to download artifact from SeaweedFS S3", details = ex.Message });
+        }
+    }
+
+    [HttpGet("{id:guid}/artifacts/presigned")]
+    public async Task<IActionResult> GetPresignedUrl(
+        Guid id,
+        [FromQuery] string artifactName,
+        [FromServices] IStorageService storageService)
+    {
+        var job = await db.AgentJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null) return NotFound("Job not found.");
+
+        string? s3Uri = artifactName.StartsWith("payload", StringComparison.OrdinalIgnoreCase)
+            ? job.PayloadS3Uri
+            : job.ResultS3Uri;
+
+        if (string.IsNullOrEmpty(s3Uri))
+        {
+            return NotFound($"No S3 artifact location registered for '{artifactName}'.");
+        }
+
+        var url = await storageService.GetPresignedUrlAsync(s3Uri, TimeSpan.FromMinutes(15));
+        return Ok(new { url, s3_uri = s3Uri, expires_in_minutes = 15 });
     }
 }

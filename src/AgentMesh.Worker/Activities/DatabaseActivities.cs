@@ -21,6 +21,7 @@ public class DatabaseActivities(AgentMeshDbContext dbContext, ILogger<DatabaseAc
             TargetService = input.TargetService,
             ActionVerb = input.ActionVerb,
             PayloadJson = input.PayloadJson,
+            PayloadS3Uri = input.PayloadS3Uri,
             ApprovalStatus = input.TargetService == "platform_ops" ? ApprovalStatus.AutoApproved : ApprovalStatus.PendingHuman,
             ExecutionStatus = ExecutionStatus.Staged,
             TemporalWorkflowId = $"job-{input.JobId}"
@@ -28,7 +29,7 @@ public class DatabaseActivities(AgentMeshDbContext dbContext, ILogger<DatabaseAc
 
         dbContext.AgentJobs.Add(job);
         await dbContext.SaveChangesAsync();
-        logger.LogInformation("Persisted staged job {JobId}", input.JobId);
+        logger.LogInformation("Persisted staged job {JobId} (S3: {S3Uri})", input.JobId, input.PayloadS3Uri ?? "inline");
     }
 
     [Activity]
@@ -56,13 +57,27 @@ public class DatabaseActivities(AgentMeshDbContext dbContext, ILogger<DatabaseAc
     }
 
     [Activity]
-    public async Task UpdateJobStatus(Guid jobId, string executionStatus, string? resultJson, string? errorMessage)
+    public async Task UpdateJobStatus(
+        Guid jobId,
+        string executionStatus,
+        string? resultJson,
+        string? errorMessage,
+        string? resultS3Uri = null,
+        string? artifactsManifestJson = null)
     {
         var job = await dbContext.AgentJobs.FindAsync(jobId);
         if (job != null)
         {
             job.ExecutionStatus = Enum.Parse<ExecutionStatus>(executionStatus, ignoreCase: true);
             job.ResultJson = resultJson;
+            if (!string.IsNullOrEmpty(resultS3Uri))
+            {
+                job.ResultS3Uri = resultS3Uri;
+            }
+            if (!string.IsNullOrEmpty(artifactsManifestJson))
+            {
+                job.ArtifactsManifestJson = artifactsManifestJson;
+            }
             job.ErrorMessage = errorMessage;
             job.UpdatedAt = DateTimeOffset.UtcNow;
             await dbContext.SaveChangesAsync();

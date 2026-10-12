@@ -17,10 +17,13 @@ export interface StagedJob {
   targetService: string;
   actionVerb: string;
   payloadJson: string;
+  payloadS3Uri?: string | null;
   approvalStatus: number | string;
   executionStatus: number | string;
   temporalWorkflowId?: string | null;
   resultJson?: string | null;
+  resultS3Uri?: string | null;
+  artifactsManifestJson?: string;
   errorMessage?: string | null;
   createdAt: string;
   updatedAt: string;

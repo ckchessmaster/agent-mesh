@@ -2,6 +2,7 @@ using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Tools;
 using AgentMesh.Infrastructure.Data;
+using AgentMesh.Infrastructure.Storage;
 using Microsoft.EntityFrameworkCore;
 using Temporalio.Extensions.Hosting;
 
@@ -19,6 +20,9 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddAuthentication(ApiKeyAuthenticationOptions.DefaultScheme)
     .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationOptions.DefaultScheme, null);
 builder.Services.AddAuthorization();
+
+// Configure SeaweedFS S3 Storage
+builder.Services.AddSeaweedS3Storage(builder.Configuration);
 
 // Configure CORS
 builder.Services.AddCors(options =>

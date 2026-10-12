@@ -12,10 +12,13 @@ public class AgentJob
     public string TargetService { get; set; } = string.Empty;
     public string ActionVerb { get; set; } = string.Empty;
     public string PayloadJson { get; set; } = "{}";
+    public string? PayloadS3Uri { get; set; }
     public ApprovalStatus ApprovalStatus { get; set; } = ApprovalStatus.AutoApproved;
     public ExecutionStatus ExecutionStatus { get; set; } = ExecutionStatus.Staged;
     public string? TemporalWorkflowId { get; set; }
     public string? ResultJson { get; set; }
+    public string? ResultS3Uri { get; set; }
+    public string ArtifactsManifestJson { get; set; } = "{}";
     public string? ErrorMessage { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;

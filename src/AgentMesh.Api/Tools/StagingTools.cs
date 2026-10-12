@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
 using Microsoft.AspNetCore.SignalR;
 using ModelContextProtocol.Server;
@@ -12,7 +13,9 @@ public class StagingTools(
     ITemporalClient temporalClient,
     ILogger<StagingTools> logger,
     IHttpContextAccessor? httpContextAccessor = null,
-    IHubContext<AgentMeshHub>? hubContext = null)
+    IHubContext<AgentMeshHub>? hubContext = null,
+    IStorageService? storageService = null,
+    IConfiguration? configuration = null)
 {
     [McpServerTool(Name = "stage_agent_intent")]
     [Description("Stages an operational journal entry or intent payload into the central task ledger for execution.")]
@@ -30,17 +33,37 @@ public class StagingTools(
             ?? (httpContextAccessor?.HttpContext?.Request.Headers.TryGetValue("X-Agent-Id", out var h) == true ? h.ToString() : null)
             ?? "gemini-spark";
 
+        string? payloadS3Uri = null;
+        var threshold = configuration?.GetValue<int>("Storage:S3:ThresholdBytes", 65536) ?? 65536;
+
+        if (payloadJson.Length > threshold && storageService != null)
+        {
+            var s3Key = $"jobs/{jobId}/payload.json";
+            payloadS3Uri = await storageService.UploadTextAsync(s3Key, payloadJson, "application/json", ct);
+            logger.LogInformation("Offloaded large payload for job {JobId} ({Bytes} chars) to {S3Uri}",
+                jobId, payloadJson.Length, payloadS3Uri);
+
+            payloadJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                _offloaded = true,
+                s3_uri = payloadS3Uri,
+                byte_size = payloadJson.Length,
+                preview = payloadJson[..Math.Min(payloadJson.Length, 512)]
+            });
+        }
+
         var input = new AgentTaskWorkflowInput(
             JobId: jobId,
             SessionId: Guid.Parse(sessionId),
             TargetService: targetService,
             ActionVerb: actionVerb,
             PayloadJson: payloadJson,
-            RequestedByAgentId: agentId
+            RequestedByAgentId: agentId,
+            PayloadS3Uri: payloadS3Uri
         );
 
-        logger.LogInformation("Starting Temporal workflow {WorkflowId} for service {Service}:{Verb} requested by {AgentId}", 
-            workflowId, targetService, actionVerb, agentId);
+        logger.LogInformation("Starting Temporal workflow {WorkflowId} for service {Service}:{Verb} requested by {AgentId} (S3: {S3Uri})", 
+            workflowId, targetService, actionVerb, agentId, payloadS3Uri ?? "inline");
 
         await temporalClient.StartWorkflowAsync(
             (AgentTaskWorkflow wf) => wf.RunAsync(input),
@@ -56,7 +79,8 @@ public class StagingTools(
                     targetService,
                     actionVerb,
                     sessionId,
-                    requestedByAgentId = agentId
+                    requestedByAgentId = agentId,
+                    payloadS3Uri
                 }, cancellationToken: ct);
             }
             catch (Exception ex)
@@ -70,7 +94,10 @@ public class StagingTools(
             status = "staged",
             job_id = jobId,
             workflow_id = workflowId,
-            message = "Task successfully queued for background evaluation."
+            payload_s3_uri = payloadS3Uri,
+            message = payloadS3Uri != null 
+                ? "Task successfully offloaded to SeaweedFS and queued for background evaluation."
+                : "Task successfully queued for background evaluation."
         });
     }
 

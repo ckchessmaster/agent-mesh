@@ -101,6 +101,13 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(32)")
                         .HasColumnName("approval_status");
 
+                    b.Property<string>("ArtifactsManifestJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("{}")
+                        .HasColumnName("artifacts");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
@@ -122,6 +129,11 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("jsonb")
                         .HasColumnName("payload");
 
+                    b.Property<string>("PayloadS3Uri")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("payload_s3_uri");
+
                     b.Property<string>("RequestedByAgentId")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -131,6 +143,11 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Property<string>("ResultJson")
                         .HasColumnType("jsonb")
                         .HasColumnName("result");
+
+                    b.Property<string>("ResultS3Uri")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("result_s3_uri");
 
                     b.Property<Guid>("SessionId")
                         .HasColumnType("uuid")

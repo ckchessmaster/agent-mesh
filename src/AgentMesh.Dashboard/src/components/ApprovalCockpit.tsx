@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { CheckCircle2, XCircle, AlertTriangle, RefreshCw, Clock } from 'lucide-react';
+import { CheckCircle2, XCircle, AlertTriangle, RefreshCw, Clock, HardDrive } from 'lucide-react';
 import type { StagedJob } from '../types';
 import { api } from '../services/api';
 import * as signalR from '@microsoft/signalr';
@@ -130,8 +130,21 @@ export const ApprovalCockpit: React.FC<ApprovalCockpitProps> = ({ connection, on
                 </div>
 
                 <div className="mb-3">
-                  <div className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold mb-1">
-                    Intent Payload Arguments
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold">
+                      Intent Payload Arguments
+                    </div>
+                    {job.payloadS3Uri && (
+                      <a
+                        href={`/api/jobs/${job.id}/artifacts/payload`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[11px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1 font-mono bg-cyan-950/40 px-2 py-0.5 rounded border border-cyan-800/40"
+                        title={job.payloadS3Uri}
+                      >
+                        <HardDrive className="w-3 h-3" /> SeaweedFS S3
+                      </a>
+                    )}
                   </div>
                   <pre className="bg-slate-950 p-3 rounded text-xs font-mono text-slate-300 overflow-x-auto border border-slate-850 max-h-48">
                     {formatPayload(job.payloadJson)}

@@ -1,5 +1,6 @@
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
+using AgentMesh.Infrastructure.Storage;
 using AgentMesh.Worker.Activities;
 using Microsoft.EntityFrameworkCore;
 using Temporalio.Extensions.Hosting;
@@ -8,6 +9,9 @@ var builder = Host.CreateApplicationBuilder(args);
 
 builder.AddServiceDefaults();
 builder.AddNpgsqlDbContext<AgentMeshDbContext>("agentdb", configureDbContextOptions: options => options.UseSnakeCaseNamingConvention());
+
+// Configure SeaweedFS S3 Storage
+builder.Services.AddSeaweedS3Storage(builder.Configuration);
 
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
 
