@@ -13,7 +13,10 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         base.OnConfiguring(optionsBuilder);
-        optionsBuilder.UseSnakeCaseNamingConvention();
+        if (!optionsBuilder.IsConfigured)
+        {
+            optionsBuilder.UseSnakeCaseNamingConvention();
+        }
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)

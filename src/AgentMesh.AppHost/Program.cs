@@ -10,8 +10,8 @@ var redis = builder.AddRedis("redis")
     .WithDataVolume();
 
 // 3. Local Temporal Dev Server Container (with Web UI on 8233)
-var temporal = builder.AddContainer("temporal", "temporalio/admin-tools", "latest")
-    .WithArgs("temporal", "server", "start-dev", "--ip", "0.0.0.0")
+var temporal = builder.AddContainer("temporal", "temporalio/temporal", "latest")
+    .WithArgs("server", "start-dev", "--ip", "0.0.0.0")
     .WithHttpEndpoint(targetPort: 7233, name: "grpc")
     .WithHttpEndpoint(targetPort: 8233, name: "ui");
 
