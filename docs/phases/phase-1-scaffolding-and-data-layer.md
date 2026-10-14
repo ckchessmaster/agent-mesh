@@ -375,7 +375,6 @@ var api = builder.AddProject<Projects.AgentMesh_Api>("api")
     .WithReference(postgres)
     .WithReference(redis)
     .WithEnvironment("Temporal__Host", "localhost:7233")
-    .WithHttpEndpoint(targetPort: 5000, name: "http")
     .WaitFor(temporal);
 
 // 5. Worker Service
