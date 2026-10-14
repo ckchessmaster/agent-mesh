@@ -62,4 +62,10 @@ app.MapMcp("/mcp").RequireAuthorization();
 
 app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online" }));
 
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+    await db.Database.MigrateAsync();
+}
+
 app.Run();
