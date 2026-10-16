@@ -2,7 +2,8 @@ var builder = DistributedApplication.CreateBuilder(args);
 
 // 1. Local Postgres with persistent volume
 var postgres = builder.AddPostgres("postgres")
-    .WithDataVolume();
+    .WithDataVolume()
+    .WithPgAdmin(pg => pg.WithHostPort(5050));
 var agentdb = postgres.AddDatabase("agentdb");
 
 // 2. Local Redis with persistent volume
@@ -48,6 +49,6 @@ var worker = builder.AddProject<Projects.AgentMesh_Worker>("worker")
 // 7. React Vite Frontend
 builder.AddNpmApp("dashboard", "../AgentMesh.Dashboard", scriptName: "dev")
     .WithReference(api)
-    .WithHttpEndpoint(targetPort: 3000, env: "PORT");
+    .WithHttpEndpoint(port: 3000, targetPort: 3000, env: "PORT", isProxied: false);
 
 builder.Build().Run();

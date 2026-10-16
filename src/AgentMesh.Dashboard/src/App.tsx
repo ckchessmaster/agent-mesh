@@ -47,7 +47,8 @@ const SERVICE_CONFIGS: ServiceCardConfig[] = [
     icon: Database,
     accent: 'blue',
     defaultDescription: 'Relational persistence store for agent state, sessions & jobs',
-    portInfo: ':5432 (agentdb)'
+    portInfo: ':5432 (agentdb) / :5050 (pgAdmin)',
+    externalLink: 'http://localhost:5050'
   },
   {
     key: 'redis',
