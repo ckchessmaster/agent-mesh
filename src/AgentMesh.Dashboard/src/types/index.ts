@@ -47,3 +47,26 @@ export interface SessionMessage {
   structuredPayloadJson?: string | null;
   createdAt: string;
 }
+
+export interface ServiceHealth {
+  status: 'Healthy' | 'Degraded' | 'Unhealthy' | string;
+  latencyMs?: number;
+  description: string;
+  error?: string;
+  bucket?: string;
+  version?: string;
+}
+
+export interface SystemStatusResponse {
+  status: 'Healthy' | 'Degraded' | 'Unhealthy' | string;
+  timestamp: string;
+  environment: string;
+  services: {
+    api?: ServiceHealth;
+    postgres?: ServiceHealth;
+    redis?: ServiceHealth;
+    temporal?: ServiceHealth;
+    s3?: ServiceHealth;
+    [key: string]: ServiceHealth | undefined;
+  };
+}

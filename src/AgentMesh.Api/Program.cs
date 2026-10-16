@@ -10,6 +10,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.AddServiceDefaults();
 builder.AddNpgsqlDbContext<AgentMeshDbContext>("agentdb", configureDbContextOptions: options => options.UseSnakeCaseNamingConvention());
+builder.AddRedisClient("redis");
 
 // Configure Temporal Client
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
@@ -60,12 +61,158 @@ app.MapControllers();
 app.MapHub<AgentMeshHub>("/hubs/agent-mesh");
 app.MapMcp("/mcp").RequireAuthorization();
 
-app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online" }));
+app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online", Version = "1.0.0" }));
 
-using (var scope = app.Services.CreateScope())
+app.MapGet("/api/status", async (IServiceProvider sp, IConfiguration config) =>
 {
+    var swTotal = System.Diagnostics.Stopwatch.StartNew();
+    var services = new Dictionary<string, object>();
+
+    // 1. PostgreSQL Check
+    try
+    {
+        using var scope = sp.CreateScope();
+        var db = scope.ServiceProvider.GetService<AgentMeshDbContext>();
+        if (db != null)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var canConnect = await db.Database.CanConnectAsync();
+            sw.Stop();
+            services["postgres"] = new
+            {
+                status = canConnect ? "Healthy" : "Unhealthy",
+                latencyMs = sw.ElapsedMilliseconds,
+                description = "PostgreSQL 18 Database (agentdb)"
+            };
+        }
+        else
+        {
+            services["postgres"] = new { status = "Unhealthy", error = "DbContext not registered", description = "PostgreSQL 18 Database (agentdb)" };
+        }
+    }
+    catch (Exception ex)
+    {
+        services["postgres"] = new { status = "Unhealthy", error = ex.Message, description = "PostgreSQL 18 Database (agentdb)" };
+    }
+
+    // 2. Redis Check
+    try
+    {
+        var redis = sp.GetService<StackExchange.Redis.IConnectionMultiplexer>();
+        if (redis != null && redis.IsConnected)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var ping = await redis.GetDatabase().PingAsync();
+            sw.Stop();
+            services["redis"] = new
+            {
+                status = "Healthy",
+                latencyMs = Math.Max(1, (long)ping.TotalMilliseconds),
+                description = "Redis 8.6 Distributed Cache"
+            };
+        }
+        else
+        {
+            services["redis"] = new { status = "Unhealthy", error = "Redis client not connected", description = "Redis 8.6 Distributed Cache" };
+        }
+    }
+    catch (Exception ex)
+    {
+        services["redis"] = new { status = "Unhealthy", error = ex.Message, description = "Redis 8.6 Distributed Cache" };
+    }
+
+    // 3. Temporal Check
+    try
+    {
+        var temporal = sp.GetService<Temporalio.Client.ITemporalClient>();
+        if (temporal != null)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var sysInfo = await temporal.Connection.WorkflowService.GetSystemInfoAsync(new());
+            sw.Stop();
+            services["temporal"] = new
+            {
+                status = "Healthy",
+                latencyMs = sw.ElapsedMilliseconds,
+                version = sysInfo.ServerVersion,
+                description = $"Temporal Dev Server ({config["Temporal:Host"] ?? "localhost:7233"})"
+            };
+        }
+        else
+        {
+            services["temporal"] = new { status = "Unhealthy", error = "Temporal client not registered", description = "Temporal Dev Server" };
+        }
+    }
+    catch (Exception ex)
+    {
+        services["temporal"] = new { status = "Unhealthy", error = ex.Message, description = "Temporal Dev Server" };
+    }
+
+    // 4. SeaweedFS S3 Check
+    try
+    {
+        var storage = sp.GetService<AgentMesh.Core.Services.IStorageService>();
+        if (storage != null)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await storage.EnsureBucketExistsAsync();
+            sw.Stop();
+            services["s3"] = new
+            {
+                status = "Healthy",
+                latencyMs = sw.ElapsedMilliseconds,
+                bucket = config["Storage:S3:BucketName"] ?? "agent-mesh-artifacts",
+                description = $"SeaweedFS S3 Storage ({config["Storage:S3:ServiceUrl"] ?? "http://localhost:8333"})"
+            };
+        }
+        else
+        {
+            services["s3"] = new { status = "Unhealthy", error = "Storage service not registered", description = "SeaweedFS S3 Storage" };
+        }
+    }
+    catch (Exception ex)
+    {
+        services["s3"] = new { status = "Unhealthy", error = ex.Message, description = "SeaweedFS S3 Storage" };
+    }
+
+    // 5. API Gateway Check
+    swTotal.Stop();
+    services["api"] = new
+    {
+        status = "Healthy",
+        latencyMs = swTotal.ElapsedMilliseconds,
+        description = "ASP.NET Core 10 Web API"
+    };
+
+    var isAllHealthy = services.Values.All(v =>
+    {
+        var prop = v.GetType().GetProperty("status");
+        return prop?.GetValue(v)?.ToString() == "Healthy";
+    });
+
+    return Results.Ok(new
+    {
+        status = isAllHealthy ? "Healthy" : "Degraded",
+        timestamp = DateTime.UtcNow,
+        environment = app.Environment.EnvironmentName,
+        services
+    });
+});
+
+if (!app.Environment.IsEnvironment("Testing"))
+{
+    using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
-    await db.Database.MigrateAsync();
+    if (db.Database.IsRelational())
+    {
+        await db.Database.MigrateAsync();
+    }
 }
 
 app.Run();
+
+namespace AgentMesh.Api
+{
+    public partial class Program { }
+}
+

@@ -9,6 +9,7 @@ var builder = Host.CreateApplicationBuilder(args);
 
 builder.AddServiceDefaults();
 builder.AddNpgsqlDbContext<AgentMeshDbContext>("agentdb", configureDbContextOptions: options => options.UseSnakeCaseNamingConvention());
+builder.AddRedisClient("redis");
 
 // Configure SeaweedFS S3 Storage
 builder.Services.AddSeaweedS3Storage(builder.Configuration);

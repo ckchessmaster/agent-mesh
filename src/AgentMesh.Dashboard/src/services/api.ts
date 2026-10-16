@@ -1,4 +1,4 @@
-import type { Agent, AgentSession, SessionMessage, StagedJob } from '../types';
+import type { Agent, AgentSession, SessionMessage, StagedJob, SystemStatusResponse } from '../types';
 
 const API_KEY = 'mesh-default-secret-key';
 
@@ -9,6 +9,12 @@ const defaultHeaders = {
 };
 
 export const api = {
+  async getStatus(): Promise<SystemStatusResponse> {
+    const res = await fetch('/api/status', { headers: defaultHeaders });
+    if (!res.ok) throw new Error(`Failed to load system status: ${res.statusText}`);
+    return res.json();
+  },
+
   async getAgents(): Promise<Agent[]> {
     const res = await fetch('/api/agents', { headers: defaultHeaders });
     if (!res.ok) throw new Error(`Failed to load agents: ${res.statusText}`);
