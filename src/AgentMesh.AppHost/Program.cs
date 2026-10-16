@@ -24,6 +24,7 @@ var seaweedfs = builder.AddContainer("seaweedfs", "chrislusf/seaweedfs", "latest
 
 // 5. API Service
 var api = builder.AddProject<Projects.AgentMesh_Api>("api")
+    .WithHttpEndpoint(port: 5000, targetPort: 5000, name: "http", isProxied: false)
     .WithReference(agentdb)
     .WithReference(redis)
     .WithEnvironment("Temporal__Host", "localhost:7233")
