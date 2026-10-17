@@ -3,9 +3,16 @@ storage:
   type: memory
 web:
   http: 0.0.0.0:5556
+  allowedOrigins:
+    - 'http://localhost:3000'
+    - 'http://127.0.0.1:3000'
+    - '*'
 telemetry:
   http: 0.0.0.0:5558
 enablePasswordDB: true
+
+oauth2:
+  skipApprovalScreen: true
 
 staticClients:
   - id: agentmesh-dashboard

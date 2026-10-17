@@ -19,9 +19,9 @@ function AuthGate({ children }: AuthGateProps) {
   const isCallback = typeof window !== 'undefined' && window.location.pathname === '/auth/callback';
 
   useEffect(() => {
-    // If not authenticated, not loading, and not handling callback, automatically redirect to OIDC provider
-    if (!auth.isAuthenticated && !auth.isLoading && !auth.activeNavigator && !hasAuthParams() && !isCallback) {
-      auth.signinRedirect().catch((err) => {
+    // If not authenticated, not loading, no error, and not handling callback, automatically redirect to OIDC provider
+    if (!auth.isAuthenticated && !auth.isLoading && !auth.error && !auth.activeNavigator && !hasAuthParams() && !isCallback) {
+      auth.signinRedirect?.()?.catch((err: unknown) => {
         console.error('Failed to initiate OIDC login redirect:', err);
       });
     }
