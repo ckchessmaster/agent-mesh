@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import React from 'react';
-import { useAuth } from '../AuthProvider';
 
 // Mock react-oidc-context
 const mockSigninRedirect = vi.fn();
