@@ -198,6 +198,11 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnName("created_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
 
+                    b.Property<string>("CreatorAgentId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("creator_agent_id");
+
                     b.Property<string>("MetadataJson")
                         .IsRequired()
                         .ValueGeneratedOnAdd()
@@ -227,6 +232,9 @@ namespace AgentMesh.Infrastructure.Migrations
 
                     b.HasKey("Id")
                         .HasName("pk_agent_sessions");
+
+                    b.HasIndex("CreatorAgentId")
+                        .HasDatabaseName("ix_agent_sessions_creator_agent_id");
 
                     b.ToTable("agent_sessions", (string)null);
                 });
@@ -302,6 +310,17 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Navigation("RequestedByAgent");
 
                     b.Navigation("Session");
+                });
+
+            modelBuilder.Entity("AgentMesh.Core.Models.AgentSession", b =>
+                {
+                    b.HasOne("AgentMesh.Core.Models.Agent", "CreatorAgent")
+                        .WithMany()
+                        .HasForeignKey("CreatorAgentId")
+                        .OnDelete(DeleteBehavior.SetNull)
+                        .HasConstraintName("fk_agent_sessions_agents_creator_agent_id");
+
+                    b.Navigation("CreatorAgent");
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.SessionMessage", b =>

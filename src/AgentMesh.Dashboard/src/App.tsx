@@ -14,10 +14,12 @@ import {
   Code2,
   Terminal,
   Activity,
-  Layers
+  Layers,
+  MessageSquare
 } from 'lucide-react';
 import { api } from './services/api';
-import type { SystemStatusResponse, ServiceHealth } from './types';
+import type { SystemStatusResponse, ServiceHealth, Agent } from './types';
+import { SessionLedger } from './components/SessionLedger';
 
 interface ServiceCardConfig {
   key: string;
@@ -81,6 +83,8 @@ const SERVICE_CONFIGS: ServiceCardConfig[] = [
 ];
 
 export default function App() {
+  const [activeTab, setActiveTab] = useState<'health' | 'sessions'>('health');
+  const [agents, setAgents] = useState<Agent[]>([]);
   const [statusData, setStatusData] = useState<SystemStatusResponse | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -88,6 +92,10 @@ export default function App() {
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
   const [showRawJson, setShowRawJson] = useState<boolean>(false);
   const [copySuccess, setCopySuccess] = useState<boolean>(false);
+
+  useEffect(() => {
+    api.getAgents().then(setAgents).catch(() => {});
+  }, []);
 
   const fetchStatus = useCallback(async () => {
     setIsLoading(true);
@@ -134,23 +142,52 @@ export default function App() {
       {/* Top Header */}
       <header className="border-b border-slate-800/80 bg-slate-900/90 backdrop-blur sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="p-2.5 bg-gradient-to-br from-sky-500/20 to-indigo-500/20 border border-sky-500/30 rounded-xl text-sky-400 shadow-sm shadow-sky-950">
-              <Shield className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-black text-lg tracking-tight bg-gradient-to-r from-sky-400 via-indigo-300 to-emerald-400 bg-clip-text text-transparent">
-                  AgentMesh
-                </span>
-                <span className="text-[10px] uppercase font-bold tracking-widest px-2 py-0.5 rounded-full bg-slate-800/80 text-sky-300 border border-slate-700/80">
-                  Aspire Skeleton v1.0
-                </span>
+          <div className="flex items-center gap-6">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 bg-gradient-to-br from-sky-500/20 to-indigo-500/20 border border-sky-500/30 rounded-xl text-sky-400 shadow-sm shadow-sky-950">
+                <Shield className="w-5 h-5" />
               </div>
-              <p className="text-[11px] text-slate-400">
-                Core Infrastructure & Control Plane Verification Cockpit
-              </p>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="font-black text-lg tracking-tight bg-gradient-to-r from-sky-400 via-indigo-300 to-emerald-400 bg-clip-text text-transparent">
+                    AgentMesh
+                  </span>
+                  <span className="text-[10px] uppercase font-bold tracking-widest px-2 py-0.5 rounded-full bg-slate-800/80 text-sky-300 border border-slate-700/80">
+                    Aspire Skeleton v1.0
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  Core Infrastructure & Agent Control Plane
+                </p>
+              </div>
             </div>
+
+            {/* Top Navigation Tabs */}
+            <nav className="flex items-center gap-1 bg-slate-950/80 p-1 rounded-xl border border-slate-800/80">
+              <button
+                onClick={() => setActiveTab('health')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 ${
+                  activeTab === 'health'
+                    ? 'bg-sky-600/30 text-sky-300 border border-sky-500/40 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Activity className="w-3.5 h-3.5" />
+                System Health
+              </button>
+
+              <button
+                onClick={() => setActiveTab('sessions')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 ${
+                  activeTab === 'sessions'
+                    ? 'bg-sky-600/30 text-sky-300 border border-sky-500/40 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                Sessions
+              </button>
+            </nav>
           </div>
 
           <div className="flex items-center gap-3">
@@ -197,8 +234,10 @@ export default function App() {
           </div>
         )}
 
-        {/* High-Level Overview Metrics */}
-        <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        {activeTab === 'health' ? (
+          <>
+            {/* High-Level Overview Metrics */}
+            <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
           {/* Card 1: System Status */}
           <div className="bg-slate-900/80 border border-slate-800/80 rounded-xl p-5 shadow-sm">
             <div className="flex items-center justify-between">
@@ -454,6 +493,12 @@ export default function App() {
             </div>
           )}
         </section>
+      </>
+    ) : (
+      <section>
+        <SessionLedger agents={agents} />
+      </section>
+    )}
       </main>
 
       {/* Footer */}

@@ -89,8 +89,8 @@ public class SessionsControllerTests
         var result = await controller.PostMessage(session.Id, req);
 
         // Assert
-        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
-        var msg = okResult.Value.Should().BeOfType<SessionMessage>().Subject;
+        var createdResult = result.Should().BeOfType<CreatedAtActionResult>().Subject;
+        var msg = createdResult.Value.Should().BeOfType<SessionMessageDto>().Subject;
         msg.Content.Should().Be("Proceed with staging step 3");
         msg.SenderAgentId.Should().Be("gemini-spark");
         msg.TargetAgentId.Should().Be("worker-agent");
@@ -108,6 +108,9 @@ public class SessionsControllerTests
         // Arrange
         using var db = TestDbContextFactory.Create();
         var sessionId = Guid.NewGuid();
+        var session = new AgentSession { Id = sessionId, Title = "Session For Messages" };
+        db.AgentSessions.Add(session);
+
         var m1 = new SessionMessage
         {
             Id = Guid.NewGuid(),
@@ -134,7 +137,7 @@ public class SessionsControllerTests
 
         // Assert
         var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
-        var msgs = okResult.Value.Should().BeAssignableTo<IEnumerable<SessionMessage>>().Subject.ToList();
+        var msgs = okResult.Value.Should().BeAssignableTo<IEnumerable<SessionMessageDto>>().Subject.ToList();
         msgs.Should().HaveCount(2);
         msgs[0].Content.Should().Be("First message");
         msgs[1].Content.Should().Be("Second message");

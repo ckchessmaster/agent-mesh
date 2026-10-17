@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
 import type { SystemStatusResponse } from '../types';
@@ -7,12 +7,18 @@ import type { SystemStatusResponse } from '../types';
 vi.mock('../services/api', () => ({
   api: {
     getStatus: vi.fn(),
+    getAgents: vi.fn().mockResolvedValue([]),
+    getSessions: vi.fn().mockResolvedValue([]),
+    getSessionMessages: vi.fn().mockResolvedValue([])
   },
 }));
 
-describe('App - Health Cockpit', () => {
+describe('App - Health Cockpit & Sessions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.getAgents).mockResolvedValue([]);
+    vi.mocked(api.getSessions).mockResolvedValue([]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
   });
 
   it('renders loading or error state and service card titles', async () => {
@@ -53,6 +59,33 @@ describe('App - Health Cockpit', () => {
     await waitFor(() => {
       expect(screen.getByText('API Gateway Unreachable')).toBeInTheDocument();
       expect(screen.getByText('Network connection refused')).toBeInTheDocument();
+    });
+  });
+
+  it('switches between System Health and Sessions tabs', async () => {
+    vi.mocked(api.getStatus).mockResolvedValueOnce({
+      status: 'Healthy',
+      timestamp: new Date().toISOString(),
+      environment: 'Development',
+      services: {}
+    });
+
+    render(<App />);
+
+    // Switch to Sessions tab
+    const sessionsTabButton = screen.getByRole('button', { name: /sessions/i });
+    fireEvent.click(sessionsTabButton);
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText(/search sessions or agents/i)).toBeInTheDocument();
+    });
+
+    // Switch back to System Health tab
+    const healthTabButton = screen.getByRole('button', { name: /system health/i });
+    fireEvent.click(healthTabButton);
+
+    await waitFor(() => {
+      expect(screen.getByText('Mesh Status')).toBeInTheDocument();
     });
   });
 });

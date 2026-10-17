@@ -3,10 +3,10 @@ export interface Agent {
   name: string;
   runtimeType: number | string;
   trustTier: number;
-  personaPrompt: string;
-  memorySummary: string;
+  personaPrompt?: string;
+  memorySummary?: string;
   createdAt: string;
-  updatedAt: string;
+  updatedAt?: string;
 }
 
 export interface StagedJob {
@@ -34,8 +34,12 @@ export interface AgentSession {
   title: string;
   status: string;
   metadataJson: string;
+  creatorAgentId?: string | null;
+  creatorAgentName?: string | null;
+  messageCount?: number;
   createdAt: string;
   updatedAt: string;
+  messages?: SessionMessage[];
 }
 
 export interface SessionMessage {

@@ -1,6 +1,7 @@
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Tools;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Storage;
 using Microsoft.EntityFrameworkCore;
@@ -17,6 +18,7 @@ var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
 builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespace: "default");
 
 // Configure Authentication & Authorization
+builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddAuthentication(ApiKeyAuthenticationOptions.DefaultScheme)
     .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationOptions.DefaultScheme, null);
@@ -48,7 +50,8 @@ builder.Services.AddSignalR();
 // Register MCP Server
 builder.Services.AddMcpServer()
     .WithHttpTransport()
-    .WithTools<StagingTools>();
+    .WithTools<StagingTools>()
+    .WithTools<SessionTools>();
 
 var app = builder.Build();
 
@@ -59,7 +62,7 @@ app.UseAuthorization();
 app.MapDefaultEndpoints();
 app.MapControllers();
 app.MapHub<AgentMeshHub>("/hubs/agent-mesh");
-app.MapMcp("/mcp").RequireAuthorization();
+app.MapMcp("/mcp");
 
 app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online", Version = "1.0.0" }));
 

@@ -21,6 +21,23 @@ export const api = {
     return res.json();
   },
 
+  async registerAgent(req: {
+    id: string;
+    name: string;
+    runtimeType?: number;
+    trustTier?: number;
+    personaPrompt?: string;
+    memorySummary?: string;
+  }): Promise<{ agent: Agent; token: string; instructions: string }> {
+    const res = await fetch('/api/agents/register', {
+      method: 'POST',
+      headers: defaultHeaders,
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to register agent: ${res.statusText}`);
+    return res.json();
+  },
+
   async getJobs(approvalStatus?: string): Promise<StagedJob[]> {
     const query = approvalStatus ? `?approvalStatus=${encodeURIComponent(approvalStatus)}` : '';
     const res = await fetch(`/api/jobs${query}`, { headers: defaultHeaders });
@@ -37,9 +54,39 @@ export const api = {
     if (!res.ok) throw new Error(`Failed to submit approval: ${res.statusText}`);
   },
 
-  async getSessions(): Promise<AgentSession[]> {
-    const res = await fetch('/api/sessions', { headers: defaultHeaders });
+  async getSessions(status?: string, creatorAgentId?: string): Promise<AgentSession[]> {
+    const params = new URLSearchParams();
+    if (status && status !== 'all') params.append('status', status);
+    if (creatorAgentId) params.append('creatorAgentId', creatorAgentId);
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await fetch(`/api/sessions${query}`, { headers: defaultHeaders });
     if (!res.ok) throw new Error(`Failed to load sessions: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getSession(id: string): Promise<AgentSession> {
+    const res = await fetch(`/api/sessions/${id}`, { headers: defaultHeaders });
+    if (!res.ok) throw new Error(`Failed to load session details: ${res.statusText}`);
+    return res.json();
+  },
+
+  async createSession(title: string, metadataJson?: string, initialMessage?: string): Promise<AgentSession> {
+    const res = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: defaultHeaders,
+      body: JSON.stringify({ title, metadataJson: metadataJson || '{}', initialMessage, creatorAgentId: 'operator' })
+    });
+    if (!res.ok) throw new Error(`Failed to create session: ${res.statusText}`);
+    return res.json();
+  },
+
+  async updateSessionStatus(id: string, status: string): Promise<AgentSession> {
+    const res = await fetch(`/api/sessions/${id}`, {
+      method: 'PATCH',
+      headers: defaultHeaders,
+      body: JSON.stringify({ status })
+    });
+    if (!res.ok) throw new Error(`Failed to update session: ${res.statusText}`);
     return res.json();
   },
 
@@ -49,11 +96,16 @@ export const api = {
     return res.json();
   },
 
-  async postSessionMessage(sessionId: string, content: string, targetAgentId?: string): Promise<SessionMessage> {
+  async postSessionMessage(
+    sessionId: string,
+    content: string,
+    targetAgentId?: string,
+    senderAgentId = 'operator'
+  ): Promise<SessionMessage> {
     const res = await fetch(`/api/sessions/${sessionId}/messages`, {
       method: 'POST',
       headers: defaultHeaders,
-      body: JSON.stringify({ content, targetAgentId, senderAgentId: 'gemini-spark' })
+      body: JSON.stringify({ content, targetAgentId, senderAgentId })
     });
     if (!res.ok) throw new Error(`Failed to post message: ${res.statusText}`);
     return res.json();

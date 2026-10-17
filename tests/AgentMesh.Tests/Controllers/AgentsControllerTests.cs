@@ -1,6 +1,7 @@
 using AgentMesh.Api.Controllers;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Mvc;
@@ -10,6 +11,8 @@ namespace AgentMesh.Tests.Controllers;
 
 public class AgentsControllerTests
 {
+    private readonly IApiKeyService _apiKeyService = new ApiKeyService();
+
     [Fact]
     public async Task GetAgents_ReturnsAllAgents_OrderedByName()
     {
@@ -20,14 +23,14 @@ public class AgentsControllerTests
         db.Agents.AddRange(a1, a2);
         await db.SaveChangesAsync();
 
-        var controller = new AgentsController(db);
+        var controller = new AgentsController(db, _apiKeyService);
 
         // Act
         var result = await controller.GetAgents();
 
         // Assert
         var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
-        var agents = okResult.Value.Should().BeAssignableTo<IEnumerable<Agent>>().Subject.ToList();
+        var agents = okResult.Value.Should().BeAssignableTo<IEnumerable<AgentDto>>().Subject.ToList();
 
         agents.Should().HaveCount(2);
         agents[0].Name.Should().Be("Alpha Agent");
@@ -43,14 +46,14 @@ public class AgentsControllerTests
         db.Agents.Add(agent);
         await db.SaveChangesAsync();
 
-        var controller = new AgentsController(db);
+        var controller = new AgentsController(db, _apiKeyService);
 
         // Act
         var result = await controller.GetAgent("spark-1");
 
         // Assert
         var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
-        var returned = okResult.Value.Should().BeOfType<Agent>().Subject;
+        var returned = okResult.Value.Should().BeOfType<AgentDto>().Subject;
         returned.Id.Should().Be("spark-1");
     }
 
@@ -59,12 +62,51 @@ public class AgentsControllerTests
     {
         // Arrange
         using var db = TestDbContextFactory.Create();
-        var controller = new AgentsController(db);
+        var controller = new AgentsController(db, _apiKeyService);
 
         // Act
         var result = await controller.GetAgent("non-existent-agent");
 
         // Assert
-        result.Should().BeOfType<NotFoundResult>();
+        result.Should().BeOfType<NotFoundObjectResult>();
+    }
+
+    [Fact]
+    public async Task RegisterAgent_ValidRequest_CreatesAgentAndReturnsToken()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var controller = new AgentsController(db, _apiKeyService);
+        var req = new RegisterAgentRequest("agy", "Antigravity CLI", RuntimeType.CliAgy, TrustTier.LeadHuman, "Persona", "Memory");
+
+        // Act
+        var result = await controller.RegisterAgent(req);
+
+        // Assert
+        var createdResult = result.Should().BeOfType<CreatedAtActionResult>().Subject;
+        createdResult.ActionName.Should().Be(nameof(AgentsController.GetAgent));
+
+        var saved = await db.Agents.FindAsync("agy");
+        saved.Should().NotBeNull();
+        saved!.Name.Should().Be("Antigravity CLI");
+        saved.ApiKeyHash.Should().NotBeNullOrWhiteSpace();
+        saved.ApiKeyHash.Should().NotStartWith("mesh_tok_"); // must be hashed!
+    }
+
+    [Fact]
+    public async Task RegisterAgent_DuplicateId_ReturnsConflict()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var controller = new AgentsController(db, _apiKeyService);
+        var req = new RegisterAgentRequest("agy", "Antigravity CLI", RuntimeType.CliAgy, TrustTier.LeadHuman, "Persona", "Memory");
+
+        await controller.RegisterAgent(req);
+
+        // Act
+        var result = await controller.RegisterAgent(req);
+
+        // Assert
+        result.Should().BeOfType<ConflictObjectResult>();
     }
 }

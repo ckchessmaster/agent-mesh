@@ -2,6 +2,7 @@ using System.Text.Encodings.Web;
 using AgentMesh.Api.Auth;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Authentication;
@@ -20,6 +21,7 @@ public class ApiKeyAuthenticationHandlerTests
     private readonly IConfiguration _config;
     private readonly AuthenticationScheme _scheme;
     private readonly IOptionsMonitor<ApiKeyAuthenticationOptions> _optionsMonitor;
+    private readonly IApiKeyService _apiKeyService = new ApiKeyService();
 
     public ApiKeyAuthenticationHandlerTests()
     {
@@ -38,7 +40,7 @@ public class ApiKeyAuthenticationHandlerTests
     }
 
     [Fact]
-    public async Task AuthenticateAsync_WithValidBearerToken_Succeeds()
+    public async Task AuthenticateAsync_WithValidMasterBearerToken_Succeeds()
     {
         // Arrange
         using var db = TestDbContextFactory.Create();
@@ -53,12 +55,14 @@ public class ApiKeyAuthenticationHandlerTests
 
         var context = new DefaultHttpContext();
         context.Request.Headers["Authorization"] = $"Bearer {_staticKey}";
+        context.Request.Headers["X-Agent-Id"] = "gemini-spark";
 
         var handler = new ApiKeyAuthenticationHandler(
             _optionsMonitor,
             NullLoggerFactory.Instance,
             UrlEncoder.Default,
             db,
+            _apiKeyService,
             _config);
 
         await handler.InitializeAsync(_scheme, context);
@@ -74,6 +78,47 @@ public class ApiKeyAuthenticationHandlerTests
     }
 
     [Fact]
+    public async Task AuthenticateAsync_WithAgentSpecificToken_Succeeds()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var rawToken = "mesh_tok_test_secret_agent_token_999";
+        var hashedToken = _apiKeyService.HashToken(rawToken);
+
+        db.Agents.Add(new Agent
+        {
+            Id = "agy",
+            Name = "Antigravity CLI",
+            TrustTier = TrustTier.Intern,
+            RuntimeType = RuntimeType.CliAgy,
+            ApiKeyHash = hashedToken
+        });
+        await db.SaveChangesAsync();
+
+        var context = new DefaultHttpContext();
+        context.Request.Headers["Authorization"] = $"Bearer {rawToken}";
+
+        var handler = new ApiKeyAuthenticationHandler(
+            _optionsMonitor,
+            NullLoggerFactory.Instance,
+            UrlEncoder.Default,
+            db,
+            _apiKeyService,
+            _config);
+
+        await handler.InitializeAsync(_scheme, context);
+
+        // Act
+        var result = await handler.AuthenticateAsync();
+
+        // Assert
+        result.Succeeded.Should().BeTrue();
+        result.Principal.Should().NotBeNull();
+        result.Principal!.FindFirst("AgentId")?.Value.Should().Be("agy");
+        result.Principal!.Identity?.Name.Should().Be("Antigravity CLI");
+    }
+
+    [Fact]
     public async Task AuthenticateAsync_WithCustomXApiKeyHeader_Succeeds()
     {
         // Arrange
@@ -86,6 +131,7 @@ public class ApiKeyAuthenticationHandlerTests
             NullLoggerFactory.Instance,
             UrlEncoder.Default,
             db,
+            _apiKeyService,
             _config);
 
         await handler.InitializeAsync(_scheme, context);
@@ -95,7 +141,7 @@ public class ApiKeyAuthenticationHandlerTests
 
         // Assert
         result.Succeeded.Should().BeTrue();
-        result.Principal!.FindFirst("AgentId")?.Value.Should().Be("gemini-spark");
+        result.Principal!.FindFirst("AgentId")?.Value.Should().Be("agy");
     }
 
     [Fact]
@@ -121,6 +167,7 @@ public class ApiKeyAuthenticationHandlerTests
             NullLoggerFactory.Instance,
             UrlEncoder.Default,
             db,
+            _apiKeyService,
             _config);
 
         await handler.InitializeAsync(_scheme, context);
@@ -147,6 +194,7 @@ public class ApiKeyAuthenticationHandlerTests
             NullLoggerFactory.Instance,
             UrlEncoder.Default,
             db,
+            _apiKeyService,
             _config);
 
         await handler.InitializeAsync(_scheme, context);
@@ -156,11 +204,11 @@ public class ApiKeyAuthenticationHandlerTests
 
         // Assert
         result.Succeeded.Should().BeFalse();
-        result.Failure?.Message.Should().Contain("Invalid or missing API Key");
+        result.Failure?.Message.Should().Contain("Invalid or revoked");
     }
 
     [Fact]
-    public async Task AuthenticateAsync_WithMissingKey_Fails()
+    public async Task AuthenticateAsync_WithMissingKey_ReturnsNoResult()
     {
         // Arrange
         using var db = TestDbContextFactory.Create();
@@ -171,6 +219,7 @@ public class ApiKeyAuthenticationHandlerTests
             NullLoggerFactory.Instance,
             UrlEncoder.Default,
             db,
+            _apiKeyService,
             _config);
 
         await handler.InitializeAsync(_scheme, context);
@@ -179,6 +228,6 @@ public class ApiKeyAuthenticationHandlerTests
         var result = await handler.AuthenticateAsync();
 
         // Assert
-        result.Succeeded.Should().BeFalse();
+        result.None.Should().BeTrue();
     }
 }

@@ -26,6 +26,15 @@ public class AgentSessionConfiguration : IEntityTypeConfiguration<AgentSession>
             .HasDefaultValue("{}")
             .IsRequired();
 
+        builder.Property(s => s.CreatorAgentId)
+            .HasMaxLength(64);
+
+        builder.HasOne(s => s.CreatorAgent)
+            .WithMany()
+            .HasForeignKey(s => s.CreatorAgentId)
+            .OnDelete(DeleteBehavior.SetNull)
+            .IsRequired(false);
+
         builder.Property(s => s.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")
             .IsRequired();
