@@ -15,11 +15,14 @@ import {
   Terminal,
   Activity,
   Layers,
-  MessageSquare
+  MessageSquare,
+  LogOut,
+  UserCheck
 } from 'lucide-react';
 import { api } from './services/api';
 import type { SystemStatusResponse, ServiceHealth, Agent } from './types';
 import { SessionLedger } from './components/SessionLedger';
+import { useAuth } from './auth/AuthProvider';
 
 interface ServiceCardConfig {
   key: string;
@@ -83,6 +86,8 @@ const SERVICE_CONFIGS: ServiceCardConfig[] = [
 ];
 
 export default function App() {
+  const auth = useAuth();
+  const userEmail = auth?.user?.profile?.email || auth?.user?.profile?.name || 'admin@agentmesh.local';
   const [activeTab, setActiveTab] = useState<'health' | 'sessions'>('health');
   const [agents, setAgents] = useState<Agent[]>([]);
   const [statusData, setStatusData] = useState<SystemStatusResponse | null>(null);
@@ -214,6 +219,21 @@ export default function App() {
             >
               <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-sky-400' : ''}`} />
             </button>
+
+            {/* User SSO Profile & Sign Out */}
+            <div className="flex items-center gap-2 pl-3 border-l border-slate-800/80">
+              <div className="flex items-center gap-1.5 text-xs bg-slate-900 border border-slate-800 text-slate-300 px-2.5 py-1 rounded-lg">
+                <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="font-mono text-[11px]">{userEmail}</span>
+              </div>
+              <button
+                onClick={() => auth?.signoutRedirect?.()}
+                title="Sign Out"
+                className="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-slate-800/80 rounded-lg border border-slate-800 transition"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       </header>

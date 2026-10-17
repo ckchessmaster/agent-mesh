@@ -1,10 +1,14 @@
+using System.Security.Claims;
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Tools;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Storage;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 using Temporalio.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -20,8 +24,68 @@ builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespa
 // Configure Authentication & Authorization
 builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();
 builder.Services.AddHttpContextAccessor();
-builder.Services.AddAuthentication(ApiKeyAuthenticationOptions.DefaultScheme)
-    .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationOptions.DefaultScheme, null);
+
+var oidcAuthority = builder.Configuration["Oidc:Authority"] ?? "http://localhost:8085/dex";
+var oidcClientId = builder.Configuration["Oidc:ClientId"] ?? "agentmesh-dashboard";
+var requireHttpsMetadata = builder.Configuration.GetValue<bool>("Oidc:RequireHttpsMetadata", false);
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = AuthConstants.CompositeScheme;
+    options.DefaultChallengeScheme = AuthConstants.CompositeScheme;
+})
+.AddScheme<AuthenticationSchemeOptions, CompositeAuthenticationHandler>(AuthConstants.CompositeScheme, null)
+.AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>(AuthConstants.ApiKeyScheme, null)
+.AddJwtBearer(AuthConstants.JwtBearerScheme, options =>
+{
+    options.Authority = oidcAuthority;
+    options.Audience = oidcClientId;
+    options.RequireHttpsMetadata = requireHttpsMetadata;
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidIssuer = oidcAuthority,
+        ValidateAudience = false,
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromMinutes(2)
+    };
+    options.Events = new JwtBearerEvents
+    {
+        OnTokenValidated = context =>
+        {
+            if (context.Principal?.Identity is ClaimsIdentity identity)
+            {
+                var email = identity.FindFirst(ClaimTypes.Email)?.Value
+                    ?? identity.FindFirst("email")?.Value
+                    ?? identity.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                    ?? "admin@agentmesh.local";
+
+                var name = identity.FindFirst(ClaimTypes.Name)?.Value
+                    ?? identity.FindFirst("name")?.Value
+                    ?? email;
+
+                if (!identity.HasClaim(c => c.Type == ClaimTypes.NameIdentifier))
+                {
+                    identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, email));
+                }
+                if (!identity.HasClaim(c => c.Type == "AgentId"))
+                {
+                    identity.AddClaim(new Claim("AgentId", "operator"));
+                }
+                if (!identity.HasClaim(c => c.Type == "TrustTier"))
+                {
+                    identity.AddClaim(new Claim("TrustTier", "3"));
+                }
+                if (!identity.HasClaim(c => c.Type == ClaimTypes.Role))
+                {
+                    identity.AddClaim(new Claim(ClaimTypes.Role, "Admin"));
+                    identity.AddClaim(new Claim(ClaimTypes.Role, "Operator"));
+                }
+            }
+            return Task.CompletedTask;
+        }
+    };
+});
 builder.Services.AddAuthorization();
 
 // Configure SeaweedFS S3 Storage

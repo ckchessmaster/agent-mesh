@@ -13,6 +13,22 @@ vi.mock('../services/api', () => ({
   },
 }));
 
+vi.mock('../auth/AuthProvider', () => ({
+  useAuth: vi.fn(() => ({
+    isAuthenticated: true,
+    isLoading: false,
+    user: {
+      profile: {
+        email: 'admin@agentmesh.local',
+        name: 'admin'
+      },
+      access_token: 'mock-jwt-token'
+    },
+    signoutRedirect: vi.fn()
+  })),
+  AppAuthProvider: ({ children }: { children: any }) => children
+}));
+
 describe('App - Health Cockpit & Sessions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
