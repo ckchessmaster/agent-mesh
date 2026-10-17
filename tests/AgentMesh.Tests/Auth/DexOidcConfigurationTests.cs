@@ -29,10 +29,11 @@ public class DexOidcConfigurationTests
         yaml.Should().Contain("allowedOrigins:");
         yaml.Should().Contain("http://localhost:3000");
 
-        // Assert: client must be agentmesh-dashboard with PKCE / public flag
+        // Assert: client must be agentmesh-dashboard with PKCE / public flag (no secret for public PKCE clients)
         yaml.Should().Contain("id: agentmesh-dashboard");
         yaml.Should().Contain("http://localhost:3000/auth/callback");
         yaml.Should().Contain("public: true");
+        yaml.Should().NotContain("secret: agentmesh-local-secret");
 
         // Assert: admin user exists
         yaml.Should().Contain("email: \"admin@agentmesh.local\"");

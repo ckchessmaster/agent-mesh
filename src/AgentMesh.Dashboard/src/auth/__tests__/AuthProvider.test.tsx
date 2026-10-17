@@ -65,6 +65,28 @@ describe('AppAuthProvider & AuthGate', () => {
     expect(mockSigninRedirect).toHaveBeenCalled();
   });
 
+  it('renders error UI when an error occurs during callback processing even if hasAuthParams is true', () => {
+    mockUseOidcAuth.mockReturnValue({
+      isLoading: false,
+      isAuthenticated: false,
+      error: new Error('missing client_secret on token request'),
+      signinRedirect: mockSigninRedirect,
+      activeNavigator: null,
+      user: null
+    });
+
+    render(
+      <AppAuthProvider>
+        <div>Protected App Content</div>
+      </AppAuthProvider>
+    );
+
+    // It should render the error UI and NOT get stuck in the loading spinner
+    expect(screen.getByText('SSO Authentication Failed')).toBeInTheDocument();
+    expect(screen.getByText('missing client_secret on token request')).toBeInTheDocument();
+    expect(screen.queryByText('Authenticating with AgentMesh SSO...')).not.toBeInTheDocument();
+  });
+
   it('renders children when user is authenticated', () => {
     mockUseOidcAuth.mockReturnValue({
       isLoading: false,

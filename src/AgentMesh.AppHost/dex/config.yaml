@@ -20,7 +20,6 @@ staticClients:
       - 'http://localhost:3000/auth/callback'
       - 'http://127.0.0.1:3000/auth/callback'
     name: 'AgentMesh Dashboard'
-    secret: agentmesh-local-secret
     public: true
 
 staticPasswords:
