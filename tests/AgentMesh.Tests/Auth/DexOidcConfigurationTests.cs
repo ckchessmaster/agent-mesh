@@ -36,7 +36,7 @@ public class DexOidcConfigurationTests
         yaml.Should().NotContain("secret: agentmesh-local-secret");
 
         // Assert: admin user exists
-        yaml.Should().Contain("email: \"admin@agentmesh.local\"");
+        yaml.Should().Contain("email: \"admin\"");
         yaml.Should().Contain("skipApprovalScreen: true");
     }
 }

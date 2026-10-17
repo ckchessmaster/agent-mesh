@@ -87,7 +87,7 @@ const SERVICE_CONFIGS: ServiceCardConfig[] = [
 
 export default function App() {
   const auth = useAuth();
-  const userEmail = auth?.user?.profile?.email || auth?.user?.profile?.name || 'admin@agentmesh.local';
+  const userEmail = auth?.user?.profile?.email || auth?.user?.profile?.name || 'admin';
   const [activeTab, setActiveTab] = useState<'health' | 'sessions'>('health');
   const [agents, setAgents] = useState<Agent[]>([]);
   const [statusData, setStatusData] = useState<SystemStatusResponse | null>(null);

@@ -23,9 +23,15 @@ staticClients:
     public: true
 
 staticPasswords:
-  - email: "admin@agentmesh.local"
+  - email: "admin"
     hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
     username: "admin"
     userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+    groups:
+      - "admin"
+  - email: "admin@agentmesh.local"
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: "admin"
+    userID: "08a8684b-db88-4b73-90a9-3cd1661f5467"
     groups:
       - "admin"
