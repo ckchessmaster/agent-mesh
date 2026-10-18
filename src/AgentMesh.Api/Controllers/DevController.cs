@@ -28,6 +28,7 @@ public class DevController(AgentMeshDbContext db, IHubContext<AgentMeshHub> hubC
         db.Agents.RemoveRange(agents);
 
         await db.SaveChangesAsync();
+        AgentMeshHub.ClearConnections();
 
         await hubContext.Clients.All.SendAsync("MeshReset", new { timestamp = DateTimeOffset.UtcNow });
 

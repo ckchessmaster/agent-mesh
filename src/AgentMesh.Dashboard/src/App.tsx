@@ -242,7 +242,7 @@ export default function App() {
         id: newAgentId.trim().toLowerCase(),
         name: newAgentName.trim(),
         role: newAgentRole.trim() || 'Autonomous Agent',
-        status: 'online'
+        status: 'offline'
       });
       setNewAgentId('');
       setNewAgentName('');
@@ -444,8 +444,10 @@ export default function App() {
               agents.map((agent) => {
                 const agentSessions = sessions.filter((s) => s.creatorAgentId === agent.id);
                 const isAgentSelected = selectedAgent?.id === agent.id;
+                const isOffline = agent.status === 'offline';
                 const isBusy =
-                  agent.status === 'busy' || agentSessions.some((s) => s.status === 'thinking');
+                  !isOffline &&
+                  (agent.status === 'busy' || agentSessions.some((s) => s.status === 'thinking'));
 
                 return (
                   <div
@@ -469,15 +471,28 @@ export default function App() {
                       <div className="flex items-start gap-2.5 min-w-0">
                         <span
                           className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${
-                            isBusy
-                              ? 'bg-amber-400 animate-pulse'
-                              : agent.status === 'offline'
+                            isOffline
                               ? 'bg-slate-600'
+                              : isBusy
+                              ? 'bg-amber-400 animate-pulse'
                               : 'bg-emerald-400'
                           }`}
                         />
                         <div className="min-w-0">
-                          <div className="text-xs font-bold text-white truncate">{agent.name}</div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-bold text-white truncate">{agent.name}</span>
+                            <span
+                              className={`text-[9px] font-mono uppercase px-1.5 py-0.2 rounded ${
+                                isOffline
+                                  ? 'bg-slate-800 text-slate-400'
+                                  : isBusy
+                                  ? 'bg-amber-500/20 text-amber-300'
+                                  : 'bg-emerald-500/20 text-emerald-300'
+                              }`}
+                            >
+                              {isOffline ? 'offline' : isBusy ? 'busy' : 'online'}
+                            </span>
+                          </div>
                           <div className="text-[11px] font-mono text-slate-400 truncate">
                             @{agent.id} · {agent.role || 'Agent'}
                           </div>
@@ -785,10 +800,25 @@ export default function App() {
                 )}
 
                 {selectedSession.status === 'thinking' && (
-                  <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-indigo-950/20 border border-indigo-500/20 text-xs text-indigo-300 w-fit">
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                    <span>Agent is reasoning...</span>
-                  </div>
+                  selectedAgent?.status === 'offline' ? (
+                    <div className="flex flex-col gap-1.5 px-4 py-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-xs text-amber-200 max-w-xl">
+                      <div className="flex items-center gap-2 font-semibold text-amber-300">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                        <span>Agent @{selectedAgent.id} is offline (waiting for CLI connection)</span>
+                      </div>
+                      <p className="text-slate-300 leading-relaxed">
+                        Connect the agent runner from your terminal to process this prompt:
+                      </p>
+                      <code className="bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 font-mono text-sky-300 select-all">
+                        agentmesh start {selectedAgent.id}
+                      </code>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-indigo-950/20 border border-indigo-500/20 text-xs text-indigo-300 w-fit">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                      <span>Agent is reasoning...</span>
+                    </div>
+                  )
                 )}
 
                 <div ref={timelineEndRef} />

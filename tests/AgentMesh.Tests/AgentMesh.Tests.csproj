@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -26,6 +26,7 @@
     <ProjectReference Include="..\..\src\AgentMesh.Core\AgentMesh.Core.csproj" />
     <ProjectReference Include="..\..\src\AgentMesh.Infrastructure\AgentMesh.Infrastructure.csproj" />
     <ProjectReference Include="..\..\src\AgentMesh.Api\AgentMesh.Api.csproj" />
+    <ProjectReference Include="..\..\src\AgentMesh.Cli\AgentMesh.Cli.csproj" />
     <ProjectReference Include="..\..\src\AgentMesh.Worker\AgentMesh.Worker.csproj" />
     <ProjectReference Include="..\..\src\AgentMesh.ServiceDefaults\AgentMesh.ServiceDefaults.csproj" />
   </ItemGroup>

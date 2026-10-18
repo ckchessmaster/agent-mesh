@@ -213,8 +213,14 @@ public class SessionsController(
             var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == session.CreatorAgentId);
             if (agent != null)
             {
-                agent.Status = session.Status == "thinking" ? "busy" : "online";
-                agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                var isFromAgent = string.Equals(senderId, agent.Id, StringComparison.OrdinalIgnoreCase);
+                var isConnected = isFromAgent || AgentMeshHub.IsAgentConnected(agent.Id) || agent.Status is "online" or "busy";
+
+                if (isConnected)
+                {
+                    agent.Status = session.Status == "thinking" ? "busy" : "online";
+                    agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                }
             }
         }
 
@@ -224,6 +230,19 @@ public class SessionsController(
 
         await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", messageDto);
         await hubContext.Clients.All.SendAsync("ReceiveMessage", messageDto);
+
+        if (eventType == "prompt" && !string.IsNullOrWhiteSpace(message.TargetAgentId))
+        {
+            var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
+            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+            {
+                sessionId = id,
+                messageId = message.Id,
+                agentId = message.TargetAgentId.Trim().ToLowerInvariant(),
+                prompt = message.Content,
+                sender = message.SenderAgentId
+            });
+        }
 
         return CreatedAtAction(nameof(GetMessages), new { id }, messageDto);
     }

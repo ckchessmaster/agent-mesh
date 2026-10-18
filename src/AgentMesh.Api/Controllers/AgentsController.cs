@@ -44,7 +44,7 @@ public class AgentsController(
             Id = normalizedId,
             Name = req.Name.Trim(),
             Role = req.Role ?? "Autonomous Agent",
-            Status = req.Status ?? "online",
+            Status = req.Status ?? (AgentMeshHub.IsAgentConnected(normalizedId) ? "online" : "offline"),
             RuntimeType = req.RuntimeType,
             TrustTier = req.TrustTier,
             PersonaPrompt = req.PersonaPrompt ?? $"Autonomous AI Agent ({normalizedId})",
@@ -69,7 +69,7 @@ public class AgentsController(
         {
             agent = dto,
             token = rawToken,
-            instructions = "Include 'Authorization: Bearer <token>' in your HTTP and MCP requests."
+            instructions = $"Run 'agentmesh start {agent.Id}' or include 'Authorization: Bearer <token>' in your agent requests."
         });
     }
 
@@ -224,9 +224,10 @@ public class AgentsController(
 
         db.AgentSessions.Add(session);
 
+        SessionMessage? promptMsg = null;
         if (hasInitialPrompt)
         {
-            var promptMsg = new SessionMessage
+            promptMsg = new SessionMessage
             {
                 SessionId = session.Id,
                 SenderAgentId = "operator",
@@ -236,8 +237,11 @@ public class AgentsController(
                 CreatedAt = DateTimeOffset.UtcNow
             };
             db.SessionMessages.Add(promptMsg);
-            agent.Status = "busy";
-            agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+            if (AgentMeshHub.IsAgentConnected(normalizedId))
+            {
+                agent.Status = "busy";
+                agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+            }
         }
 
         await db.SaveChangesAsync();
@@ -254,6 +258,18 @@ public class AgentsController(
                 session.CreatedAt,
                 session.UpdatedAt
             ));
+
+            if (promptMsg != null)
+            {
+                await hubContext.Clients.Group($"agent-{normalizedId}").SendAsync("PromptReceived", new
+                {
+                    sessionId = session.Id,
+                    messageId = promptMsg.Id,
+                    agentId = normalizedId,
+                    prompt = promptMsg.Content,
+                    sender = promptMsg.SenderAgentId
+                });
+            }
         }
 
         return CreatedAtAction("GetSession", "Sessions", new { id = session.Id }, session);
