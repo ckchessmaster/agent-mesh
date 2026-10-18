@@ -80,7 +80,7 @@ public static class Program
         {
             case "tui":
             {
-                var tui = new DashboardTui(config, meshClient, manager);
+                var tui = new DashboardTui(config, configStore, meshClient, manager);
                 await tui.RunAsync(subArgs, cts.Token);
                 return 0;
             }

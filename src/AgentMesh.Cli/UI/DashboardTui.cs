@@ -7,19 +7,32 @@ namespace AgentMesh.Cli.UI;
 public class DashboardTui
 {
     private readonly CliConfig _config;
+    private readonly ConfigStore _configStore;
     private readonly MeshClient _meshClient;
     private readonly AgentProcessManager _manager;
+    private int _selectedIndex;
+    private int _needsRedraw = 1;
+    private readonly object _renderLock = new();
 
-    public DashboardTui(CliConfig config, MeshClient meshClient, AgentProcessManager manager)
+    public DashboardTui(CliConfig config, ConfigStore configStore, MeshClient meshClient, AgentProcessManager manager)
     {
         _config = config;
+        _configStore = configStore;
         _meshClient = meshClient;
         _manager = manager;
+
+        _manager.OnStateChanged += () => Interlocked.Exchange(ref _needsRedraw, 1);
     }
 
     public async Task RunAsync(IEnumerable<string>? initialAgentsToStart = null, CancellationToken ct = default)
     {
-        AnsiConsole.Clear();
+        var isHealthy = await _meshClient.CheckHealthAsync(ct);
+
+        // Sync any agents registered in the Web Cockpit into our local preset list
+        if (isHealthy)
+        {
+            await SyncRemoteAgentsAsync(ct);
+        }
 
         if (initialAgentsToStart != null)
         {
@@ -36,123 +49,149 @@ public class DashboardTui
             }
         }
 
-        var isHealthy = await _meshClient.CheckHealthAsync(ct);
-        var lastHealthCheck = DateTimeOffset.UtcNow;
+        Interlocked.Exchange(ref _needsRedraw, 1);
         var exitRequested = false;
 
         while (!exitRequested && !ct.IsCancellationRequested)
         {
-            if ((DateTimeOffset.UtcNow - lastHealthCheck).TotalSeconds > 5)
+            if (Interlocked.Exchange(ref _needsRedraw, 0) == 1)
             {
-                isHealthy = await _meshClient.CheckHealthAsync(ct);
-                lastHealthCheck = DateTimeOffset.UtcNow;
+                RenderScreen(isHealthy);
             }
 
-            RenderScreen(isHealthy);
-
-            // Wait up to 600ms for a keypress before refreshing the TUI
-            var waitStart = DateTime.UtcNow;
-            while ((DateTime.UtcNow - waitStart).TotalMilliseconds < 600 && !ct.IsCancellationRequested)
+            if (Console.KeyAvailable)
             {
-                if (Console.KeyAvailable)
+                var key = Console.ReadKey(intercept: true);
+                exitRequested = await HandleKeyPressAsync(key, ct);
+                if (!exitRequested)
                 {
-                    var key = Console.ReadKey(intercept: true);
-                    exitRequested = await HandleKeyPressAsync(key, ct);
-                    break;
+                    isHealthy = await _meshClient.CheckHealthAsync(ct);
+                    Interlocked.Exchange(ref _needsRedraw, 1);
                 }
+            }
+            else
+            {
                 await Task.Delay(50, ct);
             }
         }
 
-        AnsiConsole.MarkupLine("\n[yellow]Disconnecting agents from Mesh...[/]");
+        AnsiConsole.MarkupLine("\n[yellow]Disconnecting running agents from Mesh...[/]");
         await _manager.StopAllAsync();
         AnsiConsole.MarkupLine("[green]All agents disconnected cleanly.[/]");
     }
 
+    private async Task SyncRemoteAgentsAsync(CancellationToken ct)
+    {
+        try
+        {
+            var remoteAgents = await _meshClient.GetMeshAgentsAsync(ct);
+            var changed = false;
+            foreach (var remote in remoteAgents)
+            {
+                if (!_config.Agents.ContainsKey(remote.Id))
+                {
+                    _configStore.ResolveOrCreatePreset(_config, remote.Id, customRole: remote.Role);
+                    changed = true;
+                }
+            }
+            if (changed)
+            {
+                _configStore.Save(_config);
+            }
+        }
+        catch
+        {
+            // Ignore if offline
+        }
+    }
+
     private void RenderScreen(bool meshHealthy)
     {
-        Console.SetCursorPosition(0, 0);
-
-        var healthBadge = meshHealthy
-            ? "[bold black on green] MESH ONLINE [/]"
-            : "[bold white on red] MESH UNREACHABLE [/]";
-
-        var header = new Panel(
-            new Markup($"[bold skyblue1]AgentMesh Local Multi-Agent Runner[/]   {healthBadge}   [grey]Target:[/] [underline]{Markup.Escape(_config.MeshUrl)}[/]"))
+        lock (_renderLock)
         {
-            Border = BoxBorder.Rounded,
-            BorderStyle = new Style(Color.SkyBlue1)
-        };
+            AnsiConsole.Clear();
 
-        var states = _manager.GetAllAgentStates();
-        var table = new Table()
-            .Border(TableBorder.Rounded)
-            .BorderColor(Color.Grey35)
-            .Expand()
-            .AddColumn(new TableColumn("[grey]#[/]").Centered())
-            .AddColumn("[bold]Agent ID[/]")
-            .AddColumn("[bold]Display Name[/]")
-            .AddColumn("[bold]Adapter[/]")
-            .AddColumn("[bold]Role[/]")
-            .AddColumn("[bold]Status[/]")
-            .AddColumn(new TableColumn("[bold]Prompts[/]").RightAligned())
-            .AddColumn("[bold]Last Activity[/]");
+            var healthBadge = meshHealthy
+                ? "[bold black on green] MESH ONLINE [/]"
+                : "[bold white on red] MESH OFFLINE [/]";
 
-        for (var i = 0; i < states.Count; i++)
-        {
-            var s = states[i];
-            var statusMarkup = s.State switch
+            // Format endpoint without "http://localhost:PORT" so VS Code terminal never spams port-forward popups
+            var displayTarget = FormatSafeEndpoint(_config.MeshUrl);
+
+            AnsiConsole.MarkupLine($"[bold skyblue1]AgentMesh Multi-Agent CLI[/]  {healthBadge}  [grey]Endpoint:[/] [white]{Markup.Escape(displayTarget)}[/]");
+            AnsiConsole.WriteLine();
+
+            var states = _manager.GetAllAgentStates();
+            if (_selectedIndex >= states.Count) _selectedIndex = Math.Max(0, states.Count - 1);
+
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .BorderColor(Color.Grey35)
+                .AddColumn(new TableColumn("[grey]#[/]").Centered())
+                .AddColumn("[bold]Agent ID[/]")
+                .AddColumn("[bold]Name[/]")
+                .AddColumn("[bold]Adapter[/]")
+                .AddColumn("[bold]Status[/]")
+                .AddColumn(new TableColumn("[bold]Prompts[/]").RightAligned())
+                .AddColumn("[bold]Last Activity / Info[/]");
+
+            for (var i = 0; i < states.Count; i++)
             {
-                RunnerConnectionState.Online => "[bold green]● ONLINE[/]",
-                RunnerConnectionState.Busy => "[bold yellow]◐ BUSY (THINKING)[/]",
-                RunnerConnectionState.Connecting => "[bold cyan]◌ CONNECTING[/]",
-                RunnerConnectionState.Error => "[bold red]✖ ERROR[/]",
-                _ => "[grey]○ OFFLINE[/]"
+                var s = states[i];
+                var isSelected = i == _selectedIndex;
+                var selector = isSelected ? $"[bold skyblue1]> {i + 1}[/]" : $"[grey]  {i + 1}[/]";
+
+                var statusMarkup = s.State switch
+                {
+                    RunnerConnectionState.Online => "[bold green]● ONLINE[/]",
+                    RunnerConnectionState.Busy => "[bold yellow]◐ BUSY[/]",
+                    RunnerConnectionState.Connecting => "[bold cyan]◌ STARTING[/]",
+                    RunnerConnectionState.Error => "[bold red]✖ ERROR[/]",
+                    _ => "[grey]○ OFFLINE[/]"
+                };
+
+                var info = !string.IsNullOrWhiteSpace(s.LastError)
+                    ? $"[red]{Markup.Escape(s.LastError)}[/]"
+                    : s.LastActivityAt.HasValue
+                        ? $"[grey]{s.LastActivityAt.Value.ToLocalTime():HH:mm:ss}[/]"
+                        : $"[dim]{Markup.Escape(s.Role)}[/]";
+
+                table.AddRow(
+                    selector,
+                    isSelected ? $"[bold skyblue1]@{Markup.Escape(s.Id)}[/]" : $"[white]@{Markup.Escape(s.Id)}[/]",
+                    Markup.Escape(s.Name),
+                    $"[cyan]{Markup.Escape(s.AdapterType)}[/]",
+                    statusMarkup,
+                    s.PromptsHandled.ToString(),
+                    info
+                );
+            }
+
+            AnsiConsole.Write(table);
+
+            var logs = _manager.GetRecentLogs(6);
+            var logLines = logs.Count == 0
+                ? "[grey italic]Press [bold white]Enter/Space[/] or [bold white]1-9[/] to connect an agent to the Mesh.[/]"
+                : string.Join("\n", logs.Select(l =>
+                    $"[grey]{l.Timestamp:HH:mm:ss}[/] [bold skyblue1]@{Markup.Escape(l.AgentId),-10}[/] {Markup.Escape(l.Message)}"));
+
+            var logPanel = new Panel(new Markup(logLines))
+            {
+                Header = new PanelHeader(" [bold]Activity Log[/] "),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(Color.Grey35)
             };
 
-            var lastAct = s.LastActivityAt.HasValue
-                ? s.LastActivityAt.Value.ToLocalTime().ToString("HH:mm:ss")
-                : "-";
-
-            table.AddRow(
-                $"[skyblue1]{i + 1}[/]",
-                $"[bold white]@{Markup.Escape(s.Id)}[/]",
-                Markup.Escape(s.Name),
-                $"[cyan]{Markup.Escape(s.AdapterType)}[/]",
-                $"[grey]{Markup.Escape(s.Role)}[/]",
-                statusMarkup,
-                s.PromptsHandled.ToString(),
-                $"[grey]{lastAct}[/]"
-            );
+            AnsiConsole.Write(logPanel);
+            AnsiConsole.MarkupLine(
+                " [bold skyblue1][[↑/↓]][/] Select  " +
+                "[bold green][[Enter/Space]][/] Toggle Selected  " +
+                "[bold skyblue1][[1-9]][/] Toggle #  " +
+                "[bold green][[A]][/] Start All  " +
+                "[bold yellow][[S]][/] Stop All  " +
+                "[bold cyan][[N]][/] New Agent  " +
+                "[bold red][[Q]][/] Quit");
         }
-
-        var logs = _manager.GetRecentLogs(12);
-        var logLines = logs.Count == 0
-            ? "[grey italic]No agent activity yet. Press [bold white]1-9[/] to start an agent or [bold white]A[/] to start all.[/]"
-            : string.Join("\n", logs.Select(l =>
-                $"[grey]{l.Timestamp:HH:mm:ss}[/] [bold skyblue1]@{Markup.Escape(l.AgentId),-10}[/] {Markup.Escape(l.Message)}"));
-
-        var logPanel = new Panel(new Markup(logLines))
-        {
-            Header = new PanelHeader(" [bold]Live Trajectory & Hub Events[/] "),
-            Border = BoxBorder.Rounded,
-            BorderStyle = new Style(Color.Grey35),
-            Expand = true
-        };
-
-        var controls = new Markup(
-            " [bold skyblue1][[1-9]][/] Toggle Agent   " +
-            "[bold green][[A]][/] Start All   " +
-            "[bold yellow][[S]][/] Stop All   " +
-            "[bold cyan][[N]][/] New Agent   " +
-            "[bold red][[Q]][/] Quit & Disconnect");
-
-        AnsiConsole.Write(header);
-        AnsiConsole.Write(table);
-        AnsiConsole.Write(logPanel);
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(controls);
-        AnsiConsole.WriteLine();
     }
 
     private async Task<bool> HandleKeyPressAsync(ConsoleKeyInfo key, CancellationToken ct)
@@ -164,28 +203,47 @@ public class DashboardTui
 
         var states = _manager.GetAllAgentStates();
 
-        if (key.Key >= ConsoleKey.D1 && key.Key <= ConsoleKey.D9)
+        if (key.Key == ConsoleKey.UpArrow)
         {
-            var idx = key.Key - ConsoleKey.D1;
-            if (idx < states.Count)
+            if (states.Count > 0)
             {
-                var target = states[idx];
-                if (_manager.IsRunning(target.Id))
-                {
-                    await _manager.StopAgentAsync(target.Id);
-                }
-                else
-                {
-                    try { await _manager.StartAgentAsync(target.Id, ct: ct); } catch { }
-                }
-                AnsiConsole.Clear();
+                _selectedIndex = (_selectedIndex - 1 + states.Count) % states.Count;
             }
             return false;
         }
 
-        switch (key.Key)
+        if (key.Key == ConsoleKey.DownArrow)
         {
-            case ConsoleKey.A:
+            if (states.Count > 0)
+            {
+                _selectedIndex = (_selectedIndex + 1) % states.Count;
+            }
+            return false;
+        }
+
+        if (key.Key is ConsoleKey.Enter or ConsoleKey.Spacebar)
+        {
+            if (_selectedIndex >= 0 && _selectedIndex < states.Count)
+            {
+                await ToggleAgentAsync(states[_selectedIndex].Id, ct);
+            }
+            return false;
+        }
+
+        if (key.KeyChar >= '1' && key.KeyChar <= '9')
+        {
+            var idx = key.KeyChar - '1';
+            if (idx < states.Count)
+            {
+                _selectedIndex = idx;
+                await ToggleAgentAsync(states[idx].Id, ct);
+            }
+            return false;
+        }
+
+        switch (char.ToUpperInvariant(key.KeyChar))
+        {
+            case 'A':
                 foreach (var s in states)
                 {
                     if (!_manager.IsRunning(s.Id))
@@ -193,17 +251,19 @@ public class DashboardTui
                         try { await _manager.StartAgentAsync(s.Id, ct: ct); } catch { }
                     }
                 }
-                AnsiConsole.Clear();
                 break;
 
-            case ConsoleKey.S:
+            case 'S':
                 await _manager.StopAllAsync();
-                AnsiConsole.Clear();
                 break;
 
-            case ConsoleKey.N:
-                AnsiConsole.Clear();
-                var newId = AnsiConsole.Ask<string>("Enter new [bold skyblue1]Agent ID[/] (e.g. [green]test[/], [green]agy-dev[/], [green]claude-review[/]):");
+            case 'R':
+                await SyncRemoteAgentsAsync(ct);
+                break;
+
+            case 'N':
+                AnsiConsole.WriteLine();
+                var newId = AnsiConsole.Ask<string>("Enter new [bold skyblue1]Agent ID[/] (e.g. [green]test[/], [green]agy-dev[/]):");
                 if (!string.IsNullOrWhiteSpace(newId))
                 {
                     try
@@ -215,10 +275,37 @@ public class DashboardTui
                         // Logged in manager
                     }
                 }
-                AnsiConsole.Clear();
                 break;
         }
 
         return false;
+    }
+
+    private async Task ToggleAgentAsync(string agentId, CancellationToken ct)
+    {
+        if (_manager.IsRunning(agentId))
+        {
+            await _manager.StopAgentAsync(agentId);
+        }
+        else
+        {
+            try
+            {
+                await _manager.StartAgentAsync(agentId, ct: ct);
+            }
+            catch
+            {
+                // Error is stored on runner state and logged in Activity Log
+            }
+        }
+    }
+
+    private static string FormatSafeEndpoint(string rawUrl)
+    {
+        if (Uri.TryCreate(rawUrl, UriKind.Absolute, out var uri))
+        {
+            return $"{uri.Host} (port {uri.Port})";
+        }
+        return rawUrl.Replace("://", " ").Replace(":", " port ");
     }
 }

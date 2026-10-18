@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -11,7 +12,9 @@ public class AgentRunnerInstance : IAsyncDisposable
     private readonly MeshClient _meshClient;
     private readonly string _meshUrl;
     private readonly Action<string, string> _onLog;
+    private readonly Action _onStateChanged;
     private readonly CancellationTokenSource _cts = new();
+    private readonly ConcurrentDictionary<Guid, byte> _processedMessages = new();
 
     private HubConnection? _hubConnection;
     private string? _agentToken;
@@ -22,12 +25,14 @@ public class AgentRunnerInstance : IAsyncDisposable
         AgentPresetConfig preset,
         MeshClient meshClient,
         string meshUrl,
-        Action<string, string> onLog)
+        Action<string, string> onLog,
+        Action onStateChanged)
     {
         _preset = preset;
         _meshClient = meshClient;
         _meshUrl = meshUrl.TrimEnd('/');
         _onLog = onLog;
+        _onStateChanged = onStateChanged;
 
         State = new AgentRuntimeState
         {
@@ -43,7 +48,8 @@ public class AgentRunnerInstance : IAsyncDisposable
     {
         State.State = RunnerConnectionState.Connecting;
         State.LastError = null;
-        _onLog(_preset.Id, $"Registering agent @{_preset.Id} ({_preset.Name}) with Mesh...");
+        _onStateChanged();
+        _onLog(_preset.Id, $"Registering @{_preset.Id} ({_preset.Name}) with Mesh...");
 
         _agentToken = await _meshClient.EnsureAgentRegisteredAsync(_preset, ct);
 
@@ -65,29 +71,79 @@ public class AgentRunnerInstance : IAsyncDisposable
             await HandlePromptAsync(ev, _cts.Token);
         });
 
+        // Also listen to ReceiveMessage so prompts are caught even if backend is running an older hub build
+        _hubConnection.On<JsonElement>("ReceiveMessage", async (msgElem) =>
+        {
+            try
+            {
+                var evType = msgElem.TryGetProperty("eventType", out var et) ? et.GetString() : null;
+                if (!string.Equals(evType, "prompt", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                var targetAgent = msgElem.TryGetProperty("targetAgentId", out var ta) ? ta.GetString() : null;
+                if (!string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                if (!msgElem.TryGetProperty("sessionId", out var sidProp) || !Guid.TryParse(sidProp.GetString(), out var sessionId))
+                    return;
+
+                var msgId = msgElem.TryGetProperty("id", out var idProp) && Guid.TryParse(idProp.GetString(), out var parsedId)
+                    ? parsedId
+                    : Guid.NewGuid();
+
+                var content = msgElem.TryGetProperty("content", out var cProp) ? cProp.GetString() ?? "" : "";
+                var sender = msgElem.TryGetProperty("senderAgentId", out var sProp) ? sProp.GetString() ?? "operator" : "operator";
+
+                await HandlePromptAsync(new PromptReceivedEvent
+                {
+                    SessionId = sessionId,
+                    MessageId = msgId,
+                    AgentId = _preset.Id,
+                    Prompt = content,
+                    Sender = sender
+                }, _cts.Token);
+            }
+            catch
+            {
+                // Ignore malformed broadcast
+            }
+        });
+
         _hubConnection.Reconnected += async (_) =>
         {
             State.State = RunnerConnectionState.Online;
-            _onLog(_preset.Id, $"Reconnected to Mesh hub. Re-announcing @{_preset.Id}...");
+            _onStateChanged();
+            _onLog(_preset.Id, $"Reconnected to Mesh hub.");
+            await _meshClient.SetAgentStatusAsync(_preset, "online");
             if (_hubConnection != null)
             {
-                await _hubConnection.InvokeAsync("RegisterAgentRunner", _preset.Id);
+                try { await _hubConnection.InvokeAsync("RegisterAgentRunner", _preset.Id); } catch { }
             }
         };
 
         _hubConnection.Closed += (_) =>
         {
             State.State = RunnerConnectionState.Offline;
+            _onStateChanged();
             _onLog(_preset.Id, $"Disconnected from Mesh hub.");
             return Task.CompletedTask;
         };
 
         await _hubConnection.StartAsync(ct);
-        await _hubConnection.InvokeAsync("RegisterAgentRunner", _preset.Id, ct);
+
+        try
+        {
+            await _hubConnection.InvokeAsync("RegisterAgentRunner", _preset.Id, ct);
+        }
+        catch
+        {
+            // Ignore if the running backend hub doesn't expose RegisterAgentRunner yet; HTTP upsert already set status="online"
+        }
 
         State.State = RunnerConnectionState.Online;
         State.LastActivityAt = DateTimeOffset.UtcNow;
-        _onLog(_preset.Id, $"Connected and ONLINE (adapter: {_preset.AdapterType})");
+        _onStateChanged();
+        _onLog(_preset.Id, $"ONLINE & listening for prompts (adapter: {_preset.AdapterType})");
 
         // Process any prompts that were queued while this agent was offline
         var pendingPrompts = await _meshClient.GetPendingPromptsForAgentAsync(_preset.Id, _agentToken, ct);
@@ -100,18 +156,24 @@ public class AgentRunnerInstance : IAsyncDisposable
 
     private async Task HandlePromptAsync(PromptReceivedEvent ev, CancellationToken ct)
     {
+        if (ev.MessageId != Guid.Empty && !_processedMessages.TryAdd(ev.MessageId, 1))
+        {
+            return; // Already processing or processed this prompt
+        }
+
         try
         {
             State.State = RunnerConnectionState.Busy;
             State.ActiveSessionId = ev.SessionId;
             State.LastActivityAt = DateTimeOffset.UtcNow;
+            _onStateChanged();
 
-            _onLog(_preset.Id, $"Prompt received [{ev.SessionId.ToString()[..8]}] from {ev.Sender}: {ev.Prompt}");
+            _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender}: {ev.Prompt}");
 
             var adapter = AgentAdapterFactory.Create(_preset);
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>
             {
-                _onLog(_preset.Id, $"Streaming {trajectoryEv.EventType}: {Truncate(trajectoryEv.Content, 80)}");
+                _onLog(_preset.Id, $"-> {trajectoryEv.EventType}: {Truncate(trajectoryEv.Content, 70)}");
                 await _meshClient.PostTrajectoryEventAsync(
                     ev.SessionId,
                     _preset.Id,
@@ -124,12 +186,14 @@ public class AgentRunnerInstance : IAsyncDisposable
             State.State = RunnerConnectionState.Online;
             State.ActiveSessionId = null;
             State.LastActivityAt = DateTimeOffset.UtcNow;
-            _onLog(_preset.Id, $"Completed session [{ev.SessionId.ToString()[..8]}] turn.");
+            _onStateChanged();
+            _onLog(_preset.Id, $"Completed session [{ev.SessionId.ToString()[..8]}] response.");
         }
         catch (Exception ex)
         {
             State.State = RunnerConnectionState.Online;
             State.LastError = ex.Message;
+            _onStateChanged();
             _onLog(_preset.Id, $"Error executing prompt: {ex.Message}");
 
             try
@@ -155,6 +219,7 @@ public class AgentRunnerInstance : IAsyncDisposable
     public async Task StopAsync()
     {
         await _cts.CancelAsync();
+        await _meshClient.SetAgentStatusAsync(_preset, "offline");
         if (_hubConnection != null)
         {
             try
@@ -169,7 +234,8 @@ public class AgentRunnerInstance : IAsyncDisposable
             _hubConnection = null;
         }
         State.State = RunnerConnectionState.Offline;
-        _onLog(_preset.Id, $"Stopped @{_preset.Id}.");
+        _onStateChanged();
+        _onLog(_preset.Id, $"Stopped @{_preset.Id} (status -> offline).");
     }
 
     public async ValueTask DisposeAsync()
@@ -194,6 +260,7 @@ public class AgentProcessManager : IAsyncDisposable
     private readonly ConcurrentQueue<(DateTimeOffset Timestamp, string AgentId, string Message)> _activityLogs = new();
 
     public event Action<string, string>? OnActivityLog;
+    public event Action? OnStateChanged;
 
     public AgentProcessManager(CliConfig config, ConfigStore configStore, MeshClient meshClient)
     {
@@ -202,7 +269,7 @@ public class AgentProcessManager : IAsyncDisposable
         _meshClient = meshClient;
     }
 
-    public IReadOnlyList<(DateTimeOffset Timestamp, string AgentId, string Message)> GetRecentLogs(int count = 25) =>
+    public IReadOnlyList<(DateTimeOffset Timestamp, string AgentId, string Message)> GetRecentLogs(int count = 10) =>
         _activityLogs.TakeLast(count).ToList();
 
     public IReadOnlyList<AgentRuntimeState> GetAllAgentStates()
@@ -247,7 +314,7 @@ public class AgentProcessManager : IAsyncDisposable
         }
 
         var preset = _configStore.ResolveOrCreatePreset(_config, normalizedId, customCommand, customRole);
-        var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog);
+        var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog, () => OnStateChanged?.Invoke());
         _runners[normalizedId] = runner;
 
         try
@@ -258,7 +325,8 @@ public class AgentProcessManager : IAsyncDisposable
         {
             runner.State.State = RunnerConnectionState.Error;
             runner.State.LastError = ex.Message;
-            RecordLog(normalizedId, $"Failed to connect to Mesh at {_config.MeshUrl}: {ex.Message}");
+            OnStateChanged?.Invoke();
+            RecordLog(normalizedId, $"Failed to connect: {ex.Message}");
             throw;
         }
 
@@ -271,6 +339,7 @@ public class AgentProcessManager : IAsyncDisposable
         if (_runners.TryRemove(normalizedId, out var runner))
         {
             await runner.DisposeAsync();
+            OnStateChanged?.Invoke();
         }
     }
 
@@ -291,6 +360,7 @@ public class AgentProcessManager : IAsyncDisposable
             _activityLogs.TryDequeue(out _);
         }
         OnActivityLog?.Invoke(agentId, message);
+        OnStateChanged?.Invoke();
     }
 
     public async ValueTask DisposeAsync()

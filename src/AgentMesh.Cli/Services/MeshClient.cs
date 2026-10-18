@@ -92,6 +92,28 @@ public class MeshClient
         return preset.Token ?? _config.MasterToken;
     }
 
+    public async Task SetAgentStatusAsync(AgentPresetConfig preset, string status, CancellationToken ct = default)
+    {
+        try
+        {
+            var capabilitiesJson = JsonSerializer.Serialize(preset.Capabilities);
+            using var req = CreateRequest(HttpMethod.Post, "api/agents", preset.Token ?? _config.MasterToken, preset.Id);
+            req.Content = JsonContent.Create(new
+            {
+                id = preset.Id,
+                name = preset.Name,
+                role = preset.Role,
+                status,
+                capabilitiesJson
+            });
+            using var res = await _http.SendAsync(req, ct);
+        }
+        catch
+        {
+            // Ignore errors during shutdown status update
+        }
+    }
+
     public async Task PostTrajectoryEventAsync(
         Guid sessionId,
         string agentId,
