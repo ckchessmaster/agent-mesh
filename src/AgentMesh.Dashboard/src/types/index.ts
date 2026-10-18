@@ -105,6 +105,12 @@ export interface ModeOption {
   description: string;
 }
 
+export interface TierOption {
+  id: string;
+  label: string;
+  description: string;
+}
+
 export interface ModelCapability {
   id: string;
   name: string;
@@ -116,6 +122,7 @@ export interface RuntimeCapabilities {
   name: string;
   modes: ModeOption[];
   models: ModelCapability[];
+  tiers?: TierOption[];
 }
 
 export interface SystemCapabilitiesResponse {
@@ -132,5 +139,43 @@ export interface FilesystemBrowseResponse {
   currentPath: string;
   parentPath: string | null;
   directories: DirectoryItem[];
+}
+
+export interface QuotaBucket {
+  id: string;
+  name: string;
+  description?: string | null;
+  window?: string | null;
+  remainingFraction: number;
+  resetTime?: string | null;
+}
+
+export interface QuotaGroup {
+  name: string;
+  description?: string | null;
+  buckets: QuotaBucket[];
+}
+
+export interface ProviderQuotaInfo {
+  provider: string;
+  planName: string;
+  primaryRemainingFraction: number;
+  groups: QuotaGroup[];
+}
+
+export interface LifetimeTokens {
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number;
+  totalTokens: number;
+  totalDurationSeconds: number;
+}
+
+export interface AgentUsageResponse {
+  agentId: string;
+  agentName: string;
+  sessionCount: number;
+  lifetimeTokens: LifetimeTokens;
+  providerQuota?: ProviderQuotaInfo | null;
 }
 

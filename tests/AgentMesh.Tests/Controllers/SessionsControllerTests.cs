@@ -151,14 +151,16 @@ public class SessionsControllerTests
             workingDirectory: "/tmp/custom-workdir",
             model: "gemini-2.5-pro",
             effort: "high",
-            mode: "plan");
+            mode: "plan",
+            tier: "intelligence");
 
-        var (workDir, model, effort, mode) = SessionsController.ExtractSessionSettings(merged);
+        var (workDir, model, effort, mode, tier) = SessionsController.ExtractSessionSettings(merged);
 
         workDir.Should().Be("/tmp/custom-workdir");
         model.Should().Be("gemini-2.5-pro");
         effort.Should().Be("high");
         mode.Should().Be("plan");
+        tier.Should().Be("intelligence");
         merged.Should().Contain("\"custom\":\"key\"");
     }
 

@@ -34,7 +34,10 @@ public class SystemControllerTests
         var copilot = response.AgentRuntimes["copilot"];
         copilot.Adapter.Should().Be("copilot");
         copilot.Modes.Should().Contain(m => m.Id == "autopilot");
-        copilot.Models.Should().Contain(m => m.Id == "claude-3.7-sonnet");
+        copilot.Models.Should().Contain(m => m.Id == "gpt-6.1-sol");
+        copilot.Models.Should().Contain(m => m.Id == "claude-sonnet-5.5");
+        copilot.Tiers.Should().NotBeNull();
+        copilot.Tiers!.Should().Contain(t => t.Id == "intelligence");
     }
 
     [Fact]

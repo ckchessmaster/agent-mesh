@@ -1,6 +1,7 @@
 import type {
   Agent,
   AgentSession,
+  AgentUsageResponse,
   FilesystemBrowseResponse,
   SessionMessage,
   StagedJob,
@@ -35,6 +36,7 @@ export interface SessionControlOptions {
   model?: string;
   effort?: string;
   mode?: string;
+  tier?: string;
 }
 
 export const api = {
@@ -60,6 +62,12 @@ export const api = {
   async getAgents(): Promise<Agent[]> {
     const res = await fetch('/api/agents', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load agents: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getAgentUsage(agentId: string): Promise<AgentUsageResponse> {
+    const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/usage`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load agent usage: ${res.statusText}`);
     return res.json();
   },
 
@@ -145,7 +153,8 @@ export const api = {
         workingDirectory: options?.workingDirectory,
         model: options?.model,
         effort: options?.effort,
-        mode: options?.mode
+        mode: options?.mode,
+        tier: options?.tier
       })
     });
     if (!res.ok) throw new Error(`Failed to create agent session: ${res.statusText}`);
@@ -176,7 +185,8 @@ export const api = {
         workingDirectory: options?.workingDirectory,
         model: options?.model,
         effort: options?.effort,
-        mode: options?.mode
+        mode: options?.mode,
+        tier: options?.tier
       })
     });
     if (!res.ok) throw new Error(`Failed to create session: ${res.statusText}`);
@@ -190,6 +200,25 @@ export const api = {
       body: JSON.stringify({ status })
     });
     if (!res.ok) throw new Error(`Failed to update session: ${res.statusText}`);
+    return res.json();
+  },
+
+  async updateSessionControls(
+    id: string,
+    params: {
+      model?: string;
+      effort?: string;
+      tier?: string;
+      mode?: string;
+      workingDirectory?: string;
+    }
+  ): Promise<AgentSession> {
+    const res = await fetch(`/api/sessions/${id}`, {
+      method: 'PATCH',
+      headers: getHeaders(),
+      body: JSON.stringify(params)
+    });
+    if (!res.ok) throw new Error(`Failed to update session controls: ${res.statusText}`);
     return res.json();
   },
 

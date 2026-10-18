@@ -5,7 +5,6 @@ import { api } from '../services/api';
 import type {
   Agent,
   AgentSession,
-  FilesystemBrowseResponse,
   SessionMessage,
   SystemCapabilitiesResponse,
   SystemStatusResponse
@@ -49,10 +48,44 @@ vi.mock('../services/api', () => ({
       ]
     }),
     getAgents: vi.fn().mockResolvedValue([]),
+    getAgentUsage: vi.fn().mockResolvedValue({
+      agentId: 'agy-core',
+      agentName: 'Agy Lead Architect',
+      sessionCount: 3,
+      lifetimeTokens: {
+        inputTokens: 12400,
+        outputTokens: 4200,
+        thinkingTokens: 1800,
+        totalTokens: 18400,
+        totalDurationSeconds: 14.2
+      },
+      providerQuota: {
+        provider: 'agy',
+        planName: 'Pro Tier',
+        primaryRemainingFraction: 0.88,
+        groups: [
+          {
+            name: 'Main Buckets',
+            description: 'Core quota',
+            buckets: [
+              {
+                id: 'gemini-weekly',
+                name: 'Gemini Weekly',
+                description: 'Standard quota',
+                window: 'weekly',
+                remainingFraction: 0.88,
+                resetTime: '2026-10-24T14:07:55Z'
+              }
+            ]
+          }
+        ]
+      }
+    }),
     getSessions: vi.fn().mockResolvedValue([]),
     getSessionMessages: vi.fn().mockResolvedValue([]),
     resetMesh: vi.fn(),
     createAgentSession: vi.fn(),
+    updateSessionControls: vi.fn(),
     postSessionMessage: vi.fn(),
     upsertAgent: vi.fn()
   }
@@ -443,9 +476,190 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
           workingDirectory: '/workspace/agent-mesh/docs',
           model: 'gpt-oss-120b',
           effort: 'medium',
-          mode: 'plan'
+          mode: 'plan',
+          tier: undefined
         }
       );
+    });
+  });
+
+  it('displays agent quota and usage badge on sidebar card and opens detail modal', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-core',
+      name: 'Agy Lead Architect',
+      role: 'Principal Engineer',
+      status: 'online',
+      runtimeType: 'CliAgy',
+      trustTier: 4,
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getAgentUsage).mockResolvedValue({
+      agentId: 'agy-core',
+      agentName: 'Agy Lead Architect',
+      sessionCount: 5,
+      lifetimeTokens: {
+        inputTokens: 12400,
+        outputTokens: 4200,
+        thinkingTokens: 1800,
+        totalTokens: 18400,
+        totalDurationSeconds: 14.2
+      },
+      providerQuota: {
+        provider: 'agy',
+        planName: 'Pro Tier',
+        primaryRemainingFraction: 0.88,
+        groups: [
+          {
+            name: 'Core Buckets',
+            description: null,
+            buckets: [
+              {
+                id: 'gemini-weekly',
+                name: 'Gemini Weekly',
+                description: 'Weekly quota limit',
+                window: 'weekly',
+                remainingFraction: 0.88,
+                resetTime: '2026-10-24T14:07:55Z'
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/88% quota · 18.4k tokens/i)).toBeInTheDocument();
+    });
+
+    // Click the quota pill
+    fireEvent.click(screen.getByText(/88% quota · 18.4k tokens/i));
+
+    // Verify modal is open
+    await waitFor(() => {
+      expect(screen.getByRole('dialog', { name: 'Agent Quota and Usage Details' })).toBeInTheDocument();
+      expect(screen.getByText('Lifetime Token Consumption')).toBeInTheDocument();
+      expect(screen.getByText('18,400')).toBeInTheDocument();
+      expect(screen.getByText('88.0% Remaining')).toBeInTheDocument();
+      expect(screen.getByText('Gemini Weekly')).toBeInTheDocument();
+    });
+
+    // Close modal
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog', { name: 'Agent Quota and Usage Details' })).not.toBeInTheDocument();
+  });
+
+  it('allows changing model and effort mid-flight from active session header', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-core',
+      name: 'Agy Lead Architect',
+      status: 'online',
+      runtimeType: 'CliAgy',
+      trustTier: 4,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-42',
+      title: 'Active Optimization Task',
+      status: 'active',
+      metadataJson: JSON.stringify({
+        model: 'gemini-4-argon',
+        effort: 'medium'
+      }),
+      creatorAgentId: 'agy-core',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.updateSessionControls).mockResolvedValue({
+      ...mockSession,
+      metadataJson: JSON.stringify({
+        model: 'gpt-oss-120b',
+        effort: 'medium'
+      })
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Active Optimization Task').length).toBeGreaterThan(0);
+      expect(screen.getByText('gemini-4-argon')).toBeInTheDocument();
+    });
+
+    // Click model badge to open popover
+    fireEvent.click(screen.getByRole('button', { name: /gemini-4-argon/i }));
+
+    expect(screen.getByText('Switch Session Model')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /GPT-OSS 120b/i })).toBeInTheDocument();
+
+    // Select GPT-OSS 120b
+    fireEvent.click(screen.getByRole('button', { name: /GPT-OSS 120b/i }));
+
+    await waitFor(() => {
+      expect(api.updateSessionControls).toHaveBeenCalledWith('session-42', {
+        model: 'gpt-oss-120b'
+      });
+    });
+  });
+
+  it('renders Copilot optimization tiers when runtime defines tiers', async () => {
+    const mockCopilotAgent: Agent = {
+      id: 'copilot-cli',
+      name: 'GitHub Copilot CLI',
+      role: 'Copilot Assistant',
+      status: 'online',
+      runtimeType: 'CliCopilot',
+      trustTier: 3,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockCopilotCaps: SystemCapabilitiesResponse = {
+      workspace: {
+        defaultSandboxPath: '~/.agentmesh/workspaces/<session-id>',
+        currentDirectory: '/workspace/agent-mesh',
+        userHome: '/home/testuser',
+        bookmarks: []
+      },
+      agentRuntimes: {
+        copilot: {
+          adapter: 'copilot',
+          name: 'GitHub Copilot CLI',
+          modes: [{ id: 'autopilot', label: 'Autopilot', description: 'Auto' }],
+          models: [{ id: 'gpt-6.1-sol', name: 'GPT 6.1 Sol', efforts: ['low', 'medium', 'high'] }],
+          tiers: [
+            { id: 'auto', label: 'Auto (Recommended)', description: 'Auto optimize' },
+            { id: 'efficiency', label: 'Efficiency', description: 'Fast' },
+            { id: 'intelligence', label: 'Intelligence', description: 'Deep reasoning' }
+          ]
+        }
+      }
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockCopilotAgent]);
+    vi.mocked(api.getCapabilities).mockResolvedValue(mockCopilotCaps);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('GitHub Copilot CLI')).toBeInTheDocument();
+    });
+
+    // Open New Session composer
+    const newSessionBtns = screen.getAllByRole('button', { name: /New Session with GitHub Copilot CLI/i });
+    fireEvent.click(newSessionBtns[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Start New Session with GitHub Copilot CLI')).toBeInTheDocument();
+      expect(screen.getByText('Optimize For (Tier)')).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Auto (Recommended)' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Efficiency' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Intelligence' })).toBeInTheDocument();
     });
   });
 });

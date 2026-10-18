@@ -19,12 +19,16 @@ import {
   Folder,
   FolderOpen,
   ChevronUp,
+  ChevronDown,
   Home,
   X,
   Check,
   RotateCcw,
   Zap,
-  Sliders
+  Sliders,
+  BarChart2,
+  Layers,
+  Clock
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -32,6 +36,7 @@ import { useAuth } from './auth/AuthProvider';
 import type {
   Agent,
   AgentSession,
+  AgentUsageResponse,
   FilesystemBrowseResponse,
   SessionMessage,
   SystemCapabilitiesResponse,
@@ -69,6 +74,15 @@ export default function App() {
   const [newSessionModel, setNewSessionModel] = useState('');
   const [newSessionEffort, setNewSessionEffort] = useState('');
   const [newSessionMode, setNewSessionMode] = useState('');
+  const [newSessionTier, setNewSessionTier] = useState('');
+
+  // Agent Quota & Usage details modal state
+  const [agentUsages, setAgentUsages] = useState<Record<string, AgentUsageResponse>>({});
+  const [selectedUsageAgent, setSelectedUsageAgent] = useState<Agent | null>(null);
+  const [showUsageModal, setShowUsageModal] = useState(false);
+
+  // Active session inline control edit popover state
+  const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | null>(null);
 
   // Quick Register Agent modal/drawer state
   const [showRegisterModal, setShowRegisterModal] = useState(false);
@@ -94,6 +108,20 @@ export default function App() {
         setCapabilities(capsRes);
       }
       setApiError(null);
+
+      // Fetch usage stats & quotas in parallel for all agents
+      const usages: Record<string, AgentUsageResponse> = {};
+      await Promise.all(
+        agentsRes.map(async (agent) => {
+          try {
+            const u = await api.getAgentUsage(agent.id);
+            usages[agent.id] = u;
+          } catch {
+            // Usage might not be available yet or endpoint error
+          }
+        })
+      );
+      setAgentUsages(usages);
 
       // Auto-select first agent & session if none selected
       setSelectedAgentId((prevAgent) => {
@@ -266,6 +294,10 @@ export default function App() {
     return currentRuntimeCaps?.modes || [];
   }, [currentRuntimeCaps]);
 
+  const availableTiers = useMemo(() => {
+    return currentRuntimeCaps?.tiers || [];
+  }, [currentRuntimeCaps]);
+
   const selectedModelCap = useMemo(() => {
     if (!newSessionModel || !currentRuntimeCaps) return null;
     return currentRuntimeCaps.models.find((m) => m.id === newSessionModel) || null;
@@ -282,7 +314,7 @@ export default function App() {
     }
   }, [availableEfforts, newSessionEffort]);
 
-  // Sync / validate model and mode when agent changes
+  // Sync / validate model, mode, tier when agent changes
   useEffect(() => {
     if (newSessionModel && availableModels.length > 0 && !availableModels.some((m) => m.id === newSessionModel)) {
       setNewSessionModel('');
@@ -290,7 +322,10 @@ export default function App() {
     if (newSessionMode && availableModes.length > 0 && !availableModes.some((m) => m.id === newSessionMode)) {
       setNewSessionMode('');
     }
-  }, [availableModels, availableModes, newSessionModel, newSessionMode]);
+    if (newSessionTier && availableTiers.length > 0 && !availableTiers.some((t) => t.id === newSessionTier)) {
+      setNewSessionTier('');
+    }
+  }, [availableModels, availableModes, availableTiers, newSessionModel, newSessionMode, newSessionTier]);
 
   const handleCreateSession = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -307,7 +342,8 @@ export default function App() {
           workingDirectory: newSessionWorkDir.trim() || undefined,
           model: newSessionModel.trim() || undefined,
           effort: newSessionEffort.trim() || undefined,
-          mode: newSessionMode.trim() || undefined
+          mode: newSessionMode.trim() || undefined,
+          tier: newSessionTier.trim() || undefined
         }
       );
       setNewSessionTitle('');
@@ -316,12 +352,34 @@ export default function App() {
       setNewSessionModel('');
       setNewSessionEffort('');
       setNewSessionMode('');
+      setNewSessionTier('');
       setIsCreatingSession(false);
       await fetchAllData();
       setSelectedSessionId(created.id);
       await fetchSessionEvents(created.id);
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Failed to create session');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const handleUpdateSessionControl = async (params: {
+    model?: string;
+    effort?: string;
+    tier?: string;
+    mode?: string;
+    workingDirectory?: string;
+  }) => {
+    if (!selectedSessionId) return;
+    setIsActionPending(true);
+    try {
+      await api.updateSessionControls(selectedSessionId, params);
+      setEditingSessionControl(null);
+      await fetchAllData();
+      await fetchSessionEvents(selectedSessionId);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to update session controls');
     } finally {
       setIsActionPending(false);
     }
@@ -382,6 +440,17 @@ export default function App() {
       return null;
     }
   }, [selectedSession?.metadataJson]);
+
+  const sessionModelCap = useMemo(() => {
+    if (!selectedSessionMetadata?.model || !currentRuntimeCaps) return null;
+    return currentRuntimeCaps.models.find((m) => m.id === selectedSessionMetadata.model) || null;
+  }, [currentRuntimeCaps, selectedSessionMetadata?.model]);
+
+  const sessionAvailableEfforts = useMemo(() => {
+    if (sessionModelCap && sessionModelCap.efforts.length > 0) return sessionModelCap.efforts;
+    const allEfforts = Array.from(new Set(currentRuntimeCaps?.models.flatMap((m) => m.efforts) || []));
+    return allEfforts.length > 0 ? allEfforts : ['low', 'medium', 'high'];
+  }, [sessionModelCap, currentRuntimeCaps]);
 
   return (
     <div className="min-h-screen h-screen bg-slate-950 text-slate-100 flex flex-col font-sans overflow-hidden">
@@ -571,6 +640,7 @@ export default function App() {
                 const isBusy =
                   !isOffline &&
                   (agent.status === 'busy' || agentSessions.some((s) => s.status === 'thinking'));
+                const usage = agentUsages[agent.id];
 
                 return (
                   <div
@@ -619,6 +689,38 @@ export default function App() {
                           <div className="text-[11px] font-mono text-slate-400 truncate">
                             @{agent.id} · {agent.role || 'Agent'}
                           </div>
+                          {usage && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedUsageAgent(agent);
+                                setShowUsageModal(true);
+                              }}
+                              className="mt-1.5 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-950/70 hover:bg-slate-800 text-[10px] font-mono text-slate-300 border border-slate-800 hover:border-slate-700 transition cursor-pointer max-w-full"
+                              title="Click to view full quota and lifetime token usage"
+                            >
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                                  usage.providerQuota
+                                    ? usage.providerQuota.primaryRemainingFraction > 0.3
+                                      ? 'bg-emerald-400'
+                                      : 'bg-rose-400'
+                                    : 'bg-sky-400'
+                                }`}
+                              />
+                              <span className="truncate">
+                                {usage.providerQuota
+                                  ? `${Math.round(usage.providerQuota.primaryRemainingFraction * 100)}% quota`
+                                  : 'Quota'}
+                                {' · '}
+                                {usage.lifetimeTokens.totalTokens > 0
+                                  ? `${(usage.lifetimeTokens.totalTokens / 1000).toFixed(1)}k tokens`
+                                  : '0 tokens'}
+                              </span>
+                              <BarChart2 className="w-2.5 h-2.5 text-slate-500 hover:text-sky-400 ml-1 shrink-0" />
+                            </button>
+                          )}
                         </div>
                       </div>
 
@@ -838,7 +940,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-3 gap-2.5">
+                  <div className={`grid ${availableTiers.length > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'} gap-2.5`}>
                     {/* Model Selection Dropdown */}
                     <div className="space-y-1">
                       <label className="block text-[11px] font-medium text-slate-400">
@@ -911,6 +1013,27 @@ export default function App() {
                         )}
                       </select>
                     </div>
+
+                    {/* Copilot Tier / Optimize For Dropdown */}
+                    {availableTiers.length > 0 && (
+                      <div className="space-y-1">
+                        <label className="block text-[11px] font-medium text-slate-400">
+                          Optimize For (Tier)
+                        </label>
+                        <select
+                          value={newSessionTier}
+                          onChange={(e) => setNewSessionTier(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 cursor-pointer"
+                        >
+                          <option value="">Default Tier</option>
+                          {availableTiers.map((t) => (
+                            <option key={t.id} value={t.id}>
+                              {t.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -968,22 +1091,181 @@ export default function App() {
                           : `~/.agentmesh/workspaces/${selectedSession.id.slice(0, 8)}...`}
                       </span>
                     </span>
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80">
-                      <Cpu className="w-3 h-3 text-purple-400 shrink-0" />
-                      <span>{selectedSessionMetadata?.model || 'default'}</span>
-                    </span>
-                    {selectedSessionMetadata?.effort && (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80">
-                        <Brain className="w-3 h-3 text-indigo-400 shrink-0" />
-                        <span>{selectedSessionMetadata.effort}</span>
-                      </span>
+
+                    {/* Backdrop to close inline popover */}
+                    {editingSessionControl && (
+                      <div
+                        className="fixed inset-0 z-30"
+                        onClick={() => setEditingSessionControl(null)}
+                      />
                     )}
-                    {selectedSessionMetadata?.mode && (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80">
-                        <Sliders className="w-3 h-3 text-amber-400 shrink-0" />
-                        <span>{selectedSessionMetadata.mode}</span>
-                      </span>
+
+                    {/* Model Selector Badge & Popover */}
+                    <div className="relative inline-block">
+                      <button
+                        type="button"
+                        onClick={() => setEditingSessionControl((prev) => (prev === 'model' ? null : 'model'))}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
+                        title="Click to change model for this session"
+                      >
+                        <Cpu className="w-3 h-3 text-purple-400 shrink-0" />
+                        <span>{selectedSessionMetadata?.model || 'default model'}</span>
+                        <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
+                      </button>
+                      {editingSessionControl === 'model' && (
+                        <div className="absolute left-0 top-full mt-1.5 z-40 w-64 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
+                          <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                            Switch Session Model
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateSessionControl({ model: '' })}
+                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                          >
+                            <span>Default Model</span>
+                            {!selectedSessionMetadata?.model && <Check className="w-3 h-3 text-sky-400" />}
+                          </button>
+                          {availableModels.map((m) => (
+                            <button
+                              key={m.id}
+                              type="button"
+                              onClick={() => handleUpdateSessionControl({ model: m.id })}
+                              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                            >
+                              <span className="truncate">{m.name || m.id}</span>
+                              {selectedSessionMetadata?.model === m.id && <Check className="w-3 h-3 text-sky-400" />}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Effort Selector Badge & Popover */}
+                    {(selectedSessionMetadata?.effort || sessionAvailableEfforts.length > 0) && (
+                      <div className="relative inline-block">
+                        <button
+                          type="button"
+                          onClick={() => setEditingSessionControl((prev) => (prev === 'effort' ? null : 'effort'))}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
+                          title="Click to change reasoning effort"
+                        >
+                          <Brain className="w-3 h-3 text-indigo-400 shrink-0" />
+                          <span>{selectedSessionMetadata?.effort || 'effort'}</span>
+                          <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
+                        </button>
+                        {editingSessionControl === 'effort' && (
+                          <div className="absolute left-0 top-full mt-1.5 z-40 w-44 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
+                            <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                              Reasoning Effort
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateSessionControl({ effort: '' })}
+                              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                            >
+                              <span>Default</span>
+                              {!selectedSessionMetadata?.effort && <Check className="w-3 h-3 text-sky-400" />}
+                            </button>
+                            {sessionAvailableEfforts.map((eff) => (
+                              <button
+                                key={eff}
+                                type="button"
+                                onClick={() => handleUpdateSessionControl({ effort: eff })}
+                                className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                              >
+                                <span>{eff}</span>
+                                {selectedSessionMetadata?.effort === eff && <Check className="w-3 h-3 text-sky-400" />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     )}
+
+                    {/* Tier Selector Badge & Popover (for Copilot optimize-for) */}
+                    {(selectedSessionMetadata?.tier || availableTiers.length > 0) && (
+                      <div className="relative inline-block">
+                        <button
+                          type="button"
+                          onClick={() => setEditingSessionControl((prev) => (prev === 'tier' ? null : 'tier'))}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
+                          title="Click to change optimization tier"
+                        >
+                          <Layers className="w-3 h-3 text-teal-400 shrink-0" />
+                          <span>{selectedSessionMetadata?.tier || 'tier'}</span>
+                          <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
+                        </button>
+                        {editingSessionControl === 'tier' && (
+                          <div className="absolute left-0 top-full mt-1.5 z-40 w-48 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
+                            <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                              Optimization Tier
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateSessionControl({ tier: '' })}
+                              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                            >
+                              <span>Default Tier</span>
+                              {!selectedSessionMetadata?.tier && <Check className="w-3 h-3 text-sky-400" />}
+                            </button>
+                            {availableTiers.map((t) => (
+                              <button
+                                key={t.id}
+                                type="button"
+                                onClick={() => handleUpdateSessionControl({ tier: t.id })}
+                                className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                              >
+                                <span>{t.label}</span>
+                                {selectedSessionMetadata?.tier === t.id && <Check className="w-3 h-3 text-sky-400" />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Mode Selector Badge & Popover */}
+                    {(selectedSessionMetadata?.mode || availableModes.length > 0) && (
+                      <div className="relative inline-block">
+                        <button
+                          type="button"
+                          onClick={() => setEditingSessionControl((prev) => (prev === 'mode' ? null : 'mode'))}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
+                          title="Click to change execution mode"
+                        >
+                          <Sliders className="w-3 h-3 text-amber-400 shrink-0" />
+                          <span>{selectedSessionMetadata?.mode || 'mode'}</span>
+                          <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
+                        </button>
+                        {editingSessionControl === 'mode' && (
+                          <div className="absolute left-0 top-full mt-1.5 z-40 w-48 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
+                            <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                              Execution Mode
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateSessionControl({ mode: '' })}
+                              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                            >
+                              <span>Default Mode</span>
+                              {!selectedSessionMetadata?.mode && <Check className="w-3 h-3 text-sky-400" />}
+                            </button>
+                            {availableModes.map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => handleUpdateSessionControl({ mode: m.id })}
+                                className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                              >
+                                <span>{m.label}</span>
+                                {selectedSessionMetadata?.mode === m.id && <Check className="w-3 h-3 text-sky-400" />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     {selectedSessionMetadata?.cumulativeUsage?.totalTokens ? (
                       <span
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30"
@@ -1491,6 +1773,228 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Agent Quota & Usage Details Modal */}
+      {showUsageModal && selectedUsageAgent && (() => {
+        const usage = agentUsages[selectedUsageAgent.id];
+        return (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Agent Quota and Usage Details"
+            className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <div className="max-w-2xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
+              {/* Header */}
+              <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                    <BarChart2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <span>{selectedUsageAgent.name}</span>
+                      <span className="text-[10px] font-mono text-slate-400 font-normal">
+                        @{selectedUsageAgent.id}
+                      </span>
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Lifetime session token metrics & real-time provider quotas
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowUsageModal(false)}
+                  className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Modal Body */}
+              <div className="flex-1 overflow-y-auto p-5 space-y-5">
+                {/* Lifetime Usage Cards */}
+                <div>
+                  <div className="flex items-center justify-between mb-2.5">
+                    <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider font-mono">
+                      Lifetime Token Consumption
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-400">
+                      {usage?.sessionCount || 0} sessions · {(usage?.lifetimeTokens?.totalDurationSeconds || 0).toFixed(1)}s processing
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                    <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                      <span className="text-[10px] font-mono text-slate-500 uppercase block">Total Tokens</span>
+                      <span className="text-base font-bold text-white font-mono mt-0.5 block">
+                        {(usage?.lifetimeTokens?.totalTokens || 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                      <span className="text-[10px] font-mono text-slate-500 uppercase block">Prompt / Input</span>
+                      <span className="text-base font-bold text-sky-300 font-mono mt-0.5 block">
+                        {(usage?.lifetimeTokens?.inputTokens || 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                      <span className="text-[10px] font-mono text-slate-500 uppercase block">Completion / Out</span>
+                      <span className="text-base font-bold text-emerald-300 font-mono mt-0.5 block">
+                        {(usage?.lifetimeTokens?.outputTokens || 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                      <span className="text-[10px] font-mono text-slate-500 uppercase block">Reasoning / Think</span>
+                      <span className="text-base font-bold text-purple-300 font-mono mt-0.5 block">
+                        {(usage?.lifetimeTokens?.thinkingTokens || 0).toLocaleString()}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Real-time Provider Quota Meters */}
+                <div>
+                  <div className="flex items-center justify-between mb-2.5">
+                    <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider font-mono">
+                      Provider Quota & Rate Limits
+                    </span>
+                    {usage?.providerQuota && (
+                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30">
+                        {usage.providerQuota.provider.toUpperCase()} · {usage.providerQuota.planName}
+                      </span>
+                    )}
+                  </div>
+
+                  {usage?.providerQuota ? (
+                    <div className="space-y-4 bg-slate-950/60 border border-slate-800 rounded-xl p-4">
+                      {/* Primary Overall Meter */}
+                      <div>
+                        <div className="flex items-center justify-between text-xs font-mono mb-1.5">
+                          <span className="text-slate-300 font-semibold">Primary Quota Availability</span>
+                          <span
+                            className={`font-bold ${
+                              usage.providerQuota.primaryRemainingFraction > 0.4
+                                ? 'text-emerald-400'
+                                : usage.providerQuota.primaryRemainingFraction > 0.15
+                                ? 'text-amber-400'
+                                : 'text-rose-400'
+                            }`}
+                          >
+                            {(usage.providerQuota.primaryRemainingFraction * 100).toFixed(1)}% Remaining
+                          </span>
+                        </div>
+                        <div className="h-2.5 w-full bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-500 ${
+                              usage.providerQuota.primaryRemainingFraction > 0.4
+                                ? 'bg-emerald-500'
+                                : usage.providerQuota.primaryRemainingFraction > 0.15
+                                ? 'bg-amber-500'
+                                : 'bg-rose-500'
+                            }`}
+                            style={{
+                              width: `${Math.min(100, Math.max(0, usage.providerQuota.primaryRemainingFraction * 100))}%`
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Quota Groups & Individual Buckets */}
+                      <div className="space-y-3 pt-2 border-t border-slate-800/80">
+                        {usage.providerQuota.groups.map((group) => (
+                          <div key={group.name} className="space-y-2">
+                            <div className="text-[11px] font-mono text-slate-400 font-medium">
+                              {group.name}
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              {group.buckets.map((bucket) => {
+                                const pct = Math.round(bucket.remainingFraction * 100);
+                                return (
+                                  <div
+                                    key={bucket.id}
+                                    className="bg-slate-900/90 border border-slate-800 rounded-lg p-2.5 space-y-1.5"
+                                  >
+                                    <div className="flex items-center justify-between text-xs font-mono">
+                                      <span className="font-semibold text-slate-200 truncate" title={bucket.id}>
+                                        {bucket.name || bucket.id}
+                                      </span>
+                                      {bucket.window && (
+                                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700 shrink-0">
+                                          {bucket.window}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                                      <span>Remaining</span>
+                                      <span
+                                        className={`font-semibold ${
+                                          pct > 40
+                                            ? 'text-emerald-400'
+                                            : pct > 15
+                                            ? 'text-amber-400'
+                                            : 'text-rose-400'
+                                        }`}
+                                      >
+                                        {(bucket.remainingFraction * 100).toFixed(1)}%
+                                      </span>
+                                    </div>
+                                    <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full rounded-full transition-all duration-300 ${
+                                          pct > 40
+                                            ? 'bg-emerald-500'
+                                            : pct > 15
+                                            ? 'bg-amber-500'
+                                            : 'bg-rose-500'
+                                        }`}
+                                        style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+                                      />
+                                    </div>
+                                    {bucket.resetTime && (
+                                      <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1 pt-0.5 truncate">
+                                        <Clock className="w-2.5 h-2.5 shrink-0" />
+                                        <span className="truncate">
+                                          Resets {new Date(bucket.resetTime).toLocaleDateString()} {new Date(bucket.resetTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 text-slate-400 text-xs space-y-1.5">
+                      <div className="flex items-center gap-2 text-slate-300 font-semibold">
+                        <Cpu className="w-4 h-4 text-sky-400" />
+                        <span>Local Mesh Token Tracking Active</span>
+                      </div>
+                      <p className="leading-relaxed">
+                        Real-time provider quota introspection is supported for Antigravity CLI (<code className="text-sky-300">agy</code>) via <code className="text-sky-300">/usage</code>.
+                        For this agent runtime, token metrics are aggregated from session execution events.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="px-5 py-3 border-t border-slate-800 bg-slate-950 flex items-center justify-end shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowUsageModal(false)}
+                  className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-white transition cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

@@ -94,7 +94,8 @@ public class SessionsController(
         string? workingDirectory,
         string? model,
         string? effort,
-        string? mode)
+        string? mode,
+        string? tier = null)
     {
         var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrWhiteSpace(existingJson))
@@ -112,15 +113,20 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(workingDirectory)) dict["workingDirectory"] = workingDirectory.Trim();
         if (!string.IsNullOrWhiteSpace(model)) dict["model"] = model.Trim();
-        if (!string.IsNullOrWhiteSpace(effort)) dict["effort"] = effort.Trim();
+        if (effort != null)
+        {
+            if (string.IsNullOrWhiteSpace(effort)) dict.Remove("effort");
+            else dict["effort"] = effort.Trim();
+        }
         if (!string.IsNullOrWhiteSpace(mode)) dict["mode"] = mode.Trim();
+        if (!string.IsNullOrWhiteSpace(tier)) dict["tier"] = tier.Trim();
 
         return System.Text.Json.JsonSerializer.Serialize(dict);
     }
 
-    public static (string? workingDirectory, string? model, string? effort, string? mode) ExtractSessionSettings(string? metadataJson)
+    public static (string? workingDirectory, string? model, string? effort, string? mode, string? tier) ExtractSessionSettings(string? metadataJson)
     {
-        if (string.IsNullOrWhiteSpace(metadataJson)) return (null, null, null, null);
+        if (string.IsNullOrWhiteSpace(metadataJson)) return (null, null, null, null, null);
         try
         {
             using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
@@ -129,11 +135,12 @@ public class SessionsController(
             var model = root.TryGetProperty("model", out var m) ? m.GetString() : null;
             var effort = root.TryGetProperty("effort", out var e) ? e.GetString() : null;
             var mode = root.TryGetProperty("mode", out var md) ? md.GetString() : null;
-            return (workDir, model, effort, mode);
+            var tier = root.TryGetProperty("tier", out var tr) ? tr.GetString() : null;
+            return (workDir, model, effort, mode, tier);
         }
         catch
         {
-            return (null, null, null, null);
+            return (null, null, null, null, null);
         }
     }
 
@@ -341,7 +348,7 @@ public class SessionsController(
 
         if (eventType == "prompt" && !string.IsNullOrWhiteSpace(message.TargetAgentId))
         {
-            var (workDir, model, effort, mode) = ExtractSessionSettings(session.MetadataJson);
+            var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
             {
@@ -353,7 +360,8 @@ public class SessionsController(
                 workingDirectory = workDir,
                 model = model,
                 effort = effort,
-                mode = mode
+                mode = mode,
+                tier = tier
             });
         }
 
@@ -379,9 +387,48 @@ public class SessionsController(
             session.Status = req.Status.Trim().ToLowerInvariant();
         }
 
-        if (req.MetadataJson != null)
+        var (oldWorkDir, oldModel, oldEffort, oldMode, oldTier) = ExtractSessionSettings(session.MetadataJson);
+
+        if (req.MetadataJson != null || req.Model != null || req.Effort != null || req.Tier != null || req.Mode != null || req.WorkingDirectory != null)
         {
-            session.MetadataJson = req.MetadataJson;
+            session.MetadataJson = MergeSessionMetadata(
+                req.MetadataJson ?? session.MetadataJson,
+                req.WorkingDirectory,
+                req.Model,
+                req.Effort,
+                req.Mode,
+                req.Tier
+            );
+        }
+
+        // Detect control parameter changes and append audit event
+        var changes = new List<string>();
+        if (!string.IsNullOrWhiteSpace(req.Model) && req.Model != oldModel)
+            changes.Add($"Model changed to '{req.Model}'");
+        if (req.Effort != null && req.Effort != oldEffort)
+            changes.Add(string.IsNullOrWhiteSpace(req.Effort) ? "Reasoning effort reset to default" : $"Effort set to '{req.Effort}'");
+        if (!string.IsNullOrWhiteSpace(req.Tier) && req.Tier != oldTier)
+            changes.Add($"Tier set to '{req.Tier}'");
+        if (!string.IsNullOrWhiteSpace(req.Mode) && req.Mode != oldMode)
+            changes.Add($"Mode set to '{req.Mode}'");
+        if (!string.IsNullOrWhiteSpace(req.WorkingDirectory) && req.WorkingDirectory != oldWorkDir)
+            changes.Add($"Working directory set to '{req.WorkingDirectory}'");
+
+        if (changes.Count > 0)
+        {
+            var auditMsg = new SessionMessage
+            {
+                SessionId = session.Id,
+                SenderAgentId = "system",
+                TargetAgentId = session.CreatorAgentId,
+                EventType = "system",
+                Content = $"⚙️ Session updated: {string.Join(", ", changes)}",
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            db.SessionMessages.Add(auditMsg);
+            var auditDto = ToMessageDto(auditMsg);
+            await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", auditDto);
+            await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
         }
 
         session.UpdatedAt = DateTimeOffset.UtcNow;
@@ -415,7 +462,8 @@ public record CreateSessionRequest(
     string? WorkingDirectory = null,
     string? Model = null,
     string? Effort = null,
-    string? Mode = null
+    string? Mode = null,
+    string? Tier = null
 );
 
 public record PostMessageRequest(
@@ -429,7 +477,16 @@ public record PostMessageRequest(
     string? ToolResultJson = null
 );
 
-public record UpdateSessionRequest(string? Title = null, string? Status = null, string? MetadataJson = null);
+public record UpdateSessionRequest(
+    string? Title = null,
+    string? Status = null,
+    string? MetadataJson = null,
+    string? Model = null,
+    string? Effort = null,
+    string? Tier = null,
+    string? Mode = null,
+    string? WorkingDirectory = null
+);
 
 public record SessionSummaryDto(
     Guid Id,

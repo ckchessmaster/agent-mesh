@@ -53,14 +53,52 @@ public class SystemController : ControllerBase
                 Modes: new List<ModeOptionDto>
                 {
                     new("autopilot", "Autopilot", "Executes prompt autonomously up to continuation limit"),
-                    new("plan", "Plan Mode", "Analyzes task and creates an implementation plan")
+                    new("plan", "Plan Mode", "Analyzes task and creates an implementation plan"),
+                    new("interactive", "Interactive", "Standard interactive guidance and chat")
                 },
                 Models: new List<ModelCapabilityDto>
                 {
-                    new("claude-3.7-sonnet", "Claude 3.7 Sonnet", new[] { "low", "medium", "high" }),
-                    new("claude-3.5-sonnet", "Claude 3.5 Sonnet", Array.Empty<string>()),
-                    new("gpt-4o", "GPT-4o", Array.Empty<string>()),
-                    new("o3-mini", "o3-mini", new[] { "low", "medium", "high" })
+                    // GPT Models
+                    new("gpt-6.1-sol", "GPT-6.1 Sol", new[] { "low", "medium", "high" }),
+                    new("gpt-6-sol", "GPT-6 Sol", new[] { "low", "medium", "high" }),
+                    new("gpt-6-luna", "GPT-6 Luna", new[] { "low", "medium", "high" }),
+                    new("gpt-6-astra", "GPT-6 Astra", new[] { "low", "medium", "high" }),
+                    new("gpt-5.6-sol", "GPT-5.6 Sol", new[] { "low", "medium", "high" }),
+                    new("gpt-5.6-terra", "GPT-5.6 Terra", new[] { "low", "medium", "high" }),
+                    new("gpt-5.6-luna", "GPT-5.6 Luna", new[] { "low", "medium", "high" }),
+                    new("gpt-5.5", "GPT-5.5", new[] { "low", "medium", "high" }),
+                    new("gpt-5.4", "GPT-5.4", new[] { "low", "medium", "high" }),
+                    new("gpt-5.4-mini", "GPT-5.4 Mini", Array.Empty<string>()),
+                    new("gpt-5.3-codex", "GPT-5.3 Codex", new[] { "low", "medium", "high" }),
+                    new("gpt-5-mini", "GPT-5 Mini", Array.Empty<string>()),
+                    // Claude Models
+                    new("claude-sonnet-5.5", "Claude Sonnet 5.5", new[] { "low", "medium", "high" }),
+                    new("claude-sonnet-5", "Claude Sonnet 5", new[] { "low", "medium", "high" }),
+                    new("claude-fable-5.1", "Claude Fable 5.1", new[] { "low", "medium", "high" }),
+                    new("claude-fable-5", "Claude Fable 5", new[] { "low", "medium", "high" }),
+                    new("claude-opus-5.5", "Claude Opus 5.5", new[] { "low", "medium", "high" }),
+                    new("claude-opus-5", "Claude Opus 5", new[] { "low", "medium", "high" }),
+                    new("claude-opus-4.8", "Claude Opus 4.8", new[] { "low", "medium", "high" }),
+                    new("claude-opus-4.8-fast", "Claude Opus 4.8 Fast", Array.Empty<string>()),
+                    new("claude-sonnet-4.6", "Claude Sonnet 4.6", new[] { "low", "medium", "high" }),
+                    new("claude-haiku-5.5", "Claude Haiku 5.5", Array.Empty<string>()),
+                    new("claude-haiku-4.5", "Claude Haiku 4.5", Array.Empty<string>()),
+                    // Specialized & Reasoning Models
+                    new("mai-code-1.1-flash", "MAI Code 1.1 Flash", Array.Empty<string>()),
+                    new("gemini-4-argon", "Gemini 4 Argon", new[] { "low", "medium", "high" }),
+                    new("gemini-3.8-flash", "Gemini 3.8 Flash", new[] { "low", "medium", "high" }),
+                    new("gemini-3.7-flash", "Gemini 3.7 Flash", new[] { "low", "medium", "high" }),
+                    new("grok-4.7", "Grok 4.7", new[] { "low", "medium", "high" }),
+                    new("grok-4.6", "Grok 4.6", new[] { "low", "medium", "high" }),
+                    new("grok-4.5", "Grok 4.5", new[] { "low", "medium", "high" }),
+                    new("kimi-k3", "Kimi k3", new[] { "low", "medium", "high" })
+                },
+                Tiers: new List<TierOptionDto>
+                {
+                    new("auto", "Auto", "Automatically select the best available model for each task"),
+                    new("efficiency", "Efficiency", "Favors faster models while preserving quality needed for the task"),
+                    new("balance", "Balance", "Balances model quality and speed while adapting to each task"),
+                    new("intelligence", "Intelligence", "Favors stronger models for complex work while remaining adaptive")
                 }
             ),
             ["claude"] = new(
@@ -326,13 +364,16 @@ public record WorkspaceDefaultsDto(
 
 public record ModeOptionDto(string Id, string Label, string Description);
 
+public record TierOptionDto(string Id, string Label, string Description);
+
 public record ModelCapabilityDto(string Id, string Name, IReadOnlyCollection<string> Efforts);
 
 public record RuntimeCapabilitiesDto(
     string Adapter,
     string Name,
     List<ModeOptionDto> Modes,
-    List<ModelCapabilityDto> Models
+    List<ModelCapabilityDto> Models,
+    List<TierOptionDto>? Tiers = null
 );
 
 public record SystemCapabilitiesResponse(

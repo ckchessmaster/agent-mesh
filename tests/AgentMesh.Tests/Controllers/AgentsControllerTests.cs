@@ -109,4 +109,67 @@ public class AgentsControllerTests
         // Assert
         result.Should().BeOfType<ConflictObjectResult>();
     }
+
+    [Fact]
+    public async Task GetAgentUsage_AggregatesLifetimeTokens_AcrossSessions()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var agent = new Agent { Id = "agy-test", Name = "Agy Test", TrustTier = TrustTier.SeniorManager, RuntimeType = RuntimeType.CliAgy };
+        db.Agents.Add(agent);
+
+        var s1 = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Session 1",
+            CreatorAgentId = "agy-test",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                cumulativeUsage = new
+                {
+                    inputTokens = 1000L,
+                    outputTokens = 200L,
+                    thinkingTokens = 50L,
+                    totalTokens = 1250L,
+                    totalDurationSeconds = 2.5
+                }
+            })
+        };
+        var s2 = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Session 2",
+            CreatorAgentId = "agy-test",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                cumulativeUsage = new
+                {
+                    inputTokens = 3000L,
+                    outputTokens = 400L,
+                    thinkingTokens = 100L,
+                    totalTokens = 3500L,
+                    totalDurationSeconds = 4.0
+                }
+            })
+        };
+        db.AgentSessions.AddRange(s1, s2);
+        await db.SaveChangesAsync();
+
+        var controller = new AgentsController(db, _apiKeyService);
+
+        // Act
+        var result = await controller.GetAgentUsage("agy-test");
+
+        // Assert
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        var usage = okResult.Value.Should().BeOfType<AgentUsageResponse>().Subject;
+
+        usage.AgentId.Should().Be("agy-test");
+        usage.SessionCount.Should().Be(2);
+        usage.LifetimeTokens.InputTokens.Should().Be(4000);
+        usage.LifetimeTokens.OutputTokens.Should().Be(600);
+        usage.LifetimeTokens.ThinkingTokens.Should().Be(150);
+        usage.LifetimeTokens.TotalTokens.Should().Be(4750);
+        usage.LifetimeTokens.TotalDurationSeconds.Should().Be(6.5);
+    }
 }
