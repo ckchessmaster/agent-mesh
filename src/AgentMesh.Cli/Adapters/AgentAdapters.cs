@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -27,6 +28,66 @@ public static class AgentAdapterFactory
             "agy" => new AgyAdapter(),
             _ => new GenericCommandAdapter()
         };
+    }
+
+    public static string? ResolveExecutablePath(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return null;
+        if (File.Exists(command)) return Path.GetFullPath(command);
+
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var candidateDirs = new List<string>();
+
+        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        candidateDirs.AddRange(pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries));
+
+        if (!string.IsNullOrWhiteSpace(home))
+        {
+            candidateDirs.Add(Path.Combine(home, ".local", "bin"));
+            candidateDirs.Add(Path.Combine(home, ".gemini", "antigravity-cli", "bin"));
+        }
+
+        var extensions = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? new[] { "", ".exe", ".cmd", ".bat", ".ps1" }
+            : new[] { "" };
+
+        foreach (var dir in candidateDirs)
+        {
+            foreach (var ext in extensions)
+            {
+                try
+                {
+                    var fullPath = Path.Combine(dir, command + ext);
+                    if (File.Exists(fullPath)) return fullPath;
+                }
+                catch
+                {
+                    // Ignore invalid path segments
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public static bool IsExecutableOnPath(string command) =>
+        ResolveExecutablePath(command) != null;
+
+    public static string ResolveWorkspaceDirectory()
+    {
+        var cwd = Environment.CurrentDirectory;
+        // If user launched the binary from inside dist/cli/linux-x64, walk up to repo root if applicable
+        var normalized = cwd.Replace('\\', '/');
+        var distIdx = normalized.IndexOf("/dist/cli", StringComparison.OrdinalIgnoreCase);
+        if (distIdx > 0)
+        {
+            var repoRoot = cwd[..distIdx];
+            if (Directory.Exists(repoRoot))
+            {
+                return repoRoot;
+            }
+        }
+        return cwd;
     }
 
     public static bool TryParseJsonEventLine(string line, out TrajectoryEventPayload? payload)
@@ -96,29 +157,6 @@ public static class AgentAdapterFactory
         }
     }
 
-    public static bool IsExecutableOnPath(string command)
-    {
-        if (string.IsNullOrWhiteSpace(command)) return false;
-        if (File.Exists(command)) return true;
-
-        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        var paths = pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
-        var extensions = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? new[] { "", ".exe", ".cmd", ".bat", ".ps1" }
-            : new[] { "" };
-
-        foreach (var dir in paths)
-        {
-            foreach (var ext in extensions)
-            {
-                var fullPath = Path.Combine(dir, command + ext);
-                if (File.Exists(fullPath)) return true;
-            }
-        }
-
-        return false;
-    }
-
     public static async Task<(int ExitCode, string StdOut, string StdErr)> RunShellCommandAsync(
         string command,
         string workingDirectory,
@@ -162,6 +200,8 @@ public static class AgentAdapterFactory
 
 public class AgyAdapter : IAgentAdapter
 {
+    private static readonly ConcurrentDictionary<Guid, string> SessionConversations = new();
+
     public string AdapterType => "agy";
 
     public async Task ExecutePromptAsync(
@@ -170,76 +210,248 @@ public class AgyAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = Environment.CurrentDirectory;
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var agyPath = AgentAdapterFactory.ResolveExecutablePath(preset.Command ?? "agy")
+                      ?? AgentAdapterFactory.ResolveExecutablePath("agy");
 
+        if (agyPath != null)
+        {
+            await ExecuteRealAgyStreamAsync(agyPath, cwd, preset, promptEvent, onEvent, ct);
+            return;
+        }
+
+        // Fallback only if agy binary is not installed on the system
+        await ExecuteFallbackShellAsync(cwd, preset, promptEvent, onEvent, ct);
+    }
+
+    private static async Task ExecuteRealAgyStreamAsync(
+        string agyExecutable,
+        string cwd,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = agyExecutable,
+            WorkingDirectory = cwd,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        if (SessionConversations.TryGetValue(promptEvent.SessionId, out var existingConvId) &&
+            !string.IsNullOrWhiteSpace(existingConvId))
+        {
+            psi.ArgumentList.Add("--conversation");
+            psi.ArgumentList.Add(existingConvId);
+        }
+
+        psi.ArgumentList.Add("-p");
+        psi.ArgumentList.Add(promptEvent.Prompt);
+        psi.ArgumentList.Add("--output-format");
+        psi.ArgumentList.Add("stream-json");
+        psi.ArgumentList.Add("--dangerously-skip-permissions");
+
+        using var proc = new Process { StartInfo = psi };
+        proc.Start();
+
+        var streamedResponseBuilder = new StringBuilder();
+        var emittedFinalResult = false;
+
+        while (await proc.StandardOutput.ReadLineAsync(ct) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("event", out var evProp)) continue;
+
+                var evName = evProp.GetString();
+
+                if (evName == "init")
+                {
+                    if (root.TryGetProperty("conversation_id", out var convProp))
+                    {
+                        var convId = convProp.GetString();
+                        if (!string.IsNullOrWhiteSpace(convId))
+                        {
+                            SessionConversations[promptEvent.SessionId] = convId;
+                        }
+                    }
+                }
+                else if (evName == "step_update" && root.TryGetProperty("step_update", out var step))
+                {
+                    var stepType = step.TryGetProperty("step_type", out var stProp) ? stProp.GetString() : null;
+                    var state = step.TryGetProperty("state", out var stateProp) ? stateProp.GetString() : null;
+
+                    if (stepType == "agent_response")
+                    {
+                        if (step.TryGetProperty("text_delta", out var tdProp))
+                        {
+                            var delta = tdProp.GetString();
+                            if (!string.IsNullOrEmpty(delta))
+                            {
+                                streamedResponseBuilder.Append(delta);
+                            }
+                        }
+
+                        if (state == "DONE" && step.TryGetProperty("usage", out var usageProp))
+                        {
+                            var thinkingTokens = usageProp.TryGetProperty("thinking_tokens", out var ttProp) ? ttProp.GetInt32() : 0;
+                            var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
+
+                            // Emit thought indicator when the model completed a reasoning step before calling a tool
+                            if (thinkingTokens > 0 && streamedResponseBuilder.Length == 0)
+                            {
+                                await onEvent(new TrajectoryEventPayload
+                                {
+                                    EventType = "thought",
+                                    Content = $"Model reasoned ({thinkingTokens} thinking tokens in {duration:F1}s)"
+                                });
+                            }
+                        }
+                    }
+                    else if (stepType == "tool")
+                    {
+                        var toolName = step.TryGetProperty("tool_name", out var tnProp) ? tnProp.GetString() ?? "tool" : "tool";
+                        string? argsJson = null;
+                        string? outputText = null;
+                        var summary = $"Executing {toolName}";
+
+                        if (step.TryGetProperty("tool_info", out var tiProp))
+                        {
+                            if (tiProp.TryGetProperty("parameters", out var paramsProp))
+                            {
+                                argsJson = paramsProp.GetRawText();
+                                if (paramsProp.TryGetProperty("CommandLine", out var cmdProp))
+                                {
+                                    summary = $"Running command: {cmdProp.GetString()}";
+                                }
+                                else if (paramsProp.TryGetProperty("AbsolutePath", out var pathProp))
+                                {
+                                    summary = $"Inspecting file: {Path.GetFileName(pathProp.GetString())}";
+                                }
+                            }
+                            if (tiProp.TryGetProperty("output", out var outProp))
+                            {
+                                outputText = outProp.ValueKind == JsonValueKind.String
+                                    ? outProp.GetString()
+                                    : outProp.GetRawText();
+                            }
+                        }
+
+                        if (state == "ACTIVE")
+                        {
+                            await onEvent(new TrajectoryEventPayload
+                            {
+                                EventType = "tool_call",
+                                ToolName = toolName,
+                                Content = summary,
+                                ToolArgsJson = argsJson
+                            });
+                        }
+                        else if (state == "DONE")
+                        {
+                            var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
+                            await onEvent(new TrajectoryEventPayload
+                            {
+                                EventType = "tool_result",
+                                ToolName = toolName,
+                                Content = $"Completed in {duration:F2}s",
+                                ToolResultJson = outputText
+                            });
+                        }
+                    }
+                }
+                else if (evName == "result" && root.TryGetProperty("result", out var resElem))
+                {
+                    var responseText = resElem.TryGetProperty("response", out var respProp)
+                        ? respProp.GetString()?.Trim()
+                        : null;
+
+                    if (string.IsNullOrWhiteSpace(responseText))
+                    {
+                        responseText = streamedResponseBuilder.ToString().Trim();
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(responseText))
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = responseText
+                        });
+                        emittedFinalResult = true;
+                    }
+                }
+            }
+            catch
+            {
+                // Non-JSON line fallback
+                streamedResponseBuilder.AppendLine(line);
+            }
+        }
+
+        var stdErr = await proc.StandardError.ReadToEndAsync(ct);
+        await proc.WaitForExitAsync(ct);
+
+        if (!emittedFinalResult)
+        {
+            var fallbackText = streamedResponseBuilder.ToString().Trim();
+            if (string.IsNullOrWhiteSpace(fallbackText) && !string.IsNullOrWhiteSpace(stdErr))
+            {
+                fallbackText = stdErr.Trim();
+            }
+            if (string.IsNullOrWhiteSpace(fallbackText))
+            {
+                fallbackText = $"Agent `@{preset.Id}` finished execution (exit code {proc.ExitCode}).";
+            }
+
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "response",
+                Content = fallbackText
+            });
+        }
+    }
+
+    private static async Task ExecuteFallbackShellAsync(
+        string cwd,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
         await onEvent(new TrajectoryEventPayload
         {
             EventType = "thought",
-            Content = $"[Antigravity CLI @{preset.Id}] Processing prompt from {promptEvent.Sender}: \"{promptEvent.Prompt}\"\nWorkspace: {cwd}"
+            Content = $"[@{preset.Id}] Processing prompt from {promptEvent.Sender}: \"{promptEvent.Prompt}\" in {cwd}"
         });
 
-        // Determine diagnostic tool to run based on prompt
         var diagnosticCmd = SelectWorkspaceCommand(promptEvent.Prompt);
-        var toolArgs = JsonSerializer.Serialize(new { command = diagnosticCmd, cwd }, new JsonSerializerOptions { WriteIndented = true });
-
-        await onEvent(new TrajectoryEventPayload
-        {
-            EventType = "tool_call",
-            ToolName = "run_command",
-            Content = $"Executing workspace inspection: {diagnosticCmd}",
-            ToolArgsJson = toolArgs
-        });
-
         var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync(diagnosticCmd, cwd, ct);
         var combinedOutput = string.IsNullOrWhiteSpace(stdOut) ? stdErr : stdOut;
-        if (string.IsNullOrWhiteSpace(combinedOutput))
-        {
-            combinedOutput = "(Command completed with no output)";
-        }
-
-        await onEvent(new TrajectoryEventPayload
-        {
-            EventType = "tool_result",
-            ToolName = "run_command",
-            Content = $"Exit code {exitCode}",
-            ToolResultJson = combinedOutput.Length > 4000 ? combinedOutput[..4000] + "\n... (truncated)" : combinedOutput
-        });
 
         await onEvent(new TrajectoryEventPayload
         {
             EventType = "response",
-            Content = $"**Agent `@{preset.Id}` ({preset.Name}) completed execution.**\n\n" +
-                      $"- **Prompt**: `{promptEvent.Prompt}`\n" +
-                      $"- **Executed**: `{diagnosticCmd}` (exit code `{exitCode}`)\n\n" +
-                      $"```\n{(combinedOutput.Length > 1500 ? combinedOutput[..1500] + "\n..." : combinedOutput)}\n```"
+            Content = string.IsNullOrWhiteSpace(combinedOutput)
+                ? $"Command `{diagnosticCmd}` completed (exit code {exitCode})."
+                : combinedOutput
         });
     }
 
     internal static string SelectWorkspaceCommand(string prompt)
     {
         var trimmed = prompt.Trim();
-        if (trimmed.StartsWith("$ "))
-        {
-            return trimmed[2..].Trim();
-        }
-        if (trimmed.StartsWith("run ", StringComparison.OrdinalIgnoreCase))
-        {
-            return trimmed[4..].Trim();
-        }
-
-        var lower = trimmed.ToLowerInvariant();
-        if (lower.Contains("git") || lower.Contains("status") || lower.Contains("branch") || lower.Contains("commit"))
-        {
-            return "git status -sb && git log -n 3 --oneline";
-        }
-        if (lower.Contains("test") || lower.Contains("build"))
-        {
-            return "dotnet --version && git status -sb";
-        }
-
-        return RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? "dir /b"
-            : "ls -la";
+        if (trimmed.StartsWith("$ ")) return trimmed[2..].Trim();
+        if (trimmed.StartsWith("run ", StringComparison.OrdinalIgnoreCase)) return trimmed[4..].Trim();
+        return RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "dir /b" : "ls -la";
     }
 }
 
@@ -253,36 +465,20 @@ public class ClaudeAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = Environment.CurrentDirectory;
-        var hasClaudeBinary = AgentAdapterFactory.IsExecutableOnPath(preset.Command ?? "claude");
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var claudePath = AgentAdapterFactory.ResolveExecutablePath(preset.Command ?? "claude");
 
-        await onEvent(new TrajectoryEventPayload
-        {
-            EventType = "thought",
-            Content = $"[Claude Code @{preset.Id}] Analyzing request: \"{promptEvent.Prompt}\" in {cwd}"
-        });
-
-        if (hasClaudeBinary)
+        if (claudePath != null)
         {
             await onEvent(new TrajectoryEventPayload
             {
-                EventType = "tool_call",
-                ToolName = "claude_cli",
-                Content = "Invoking claude -p headless execution",
-                ToolArgsJson = JsonSerializer.Serialize(new { command = "claude", args = new[] { "-p", promptEvent.Prompt } })
+                EventType = "thought",
+                Content = $"[Claude Code @{preset.Id}] Executing prompt via {claudePath}..."
             });
 
             var escapedPrompt = promptEvent.Prompt.Replace("\"", "\\\"");
-            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"claude -p \"{escapedPrompt}\"", cwd, ct);
+            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\" -p \"{escapedPrompt}\"", cwd, ct);
             var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut : stdErr;
-
-            await onEvent(new TrajectoryEventPayload
-            {
-                EventType = "tool_result",
-                ToolName = "claude_cli",
-                Content = $"claude exited with code {exitCode}",
-                ToolResultJson = output
-            });
 
             await onEvent(new TrajectoryEventPayload
             {
@@ -294,7 +490,6 @@ public class ClaudeAdapter : IAgentAdapter
             return;
         }
 
-        // Fallback workspace inspection when claude binary is not installed locally
         var fallback = new AgyAdapter();
         await fallback.ExecutePromptAsync(preset, promptEvent, onEvent, ct);
     }
@@ -310,6 +505,48 @@ public class CopilotAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var copilotPath = AgentAdapterFactory.ResolveExecutablePath("copilot");
+
+        if (copilotPath != null)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[GitHub Copilot CLI @{preset.Id}] Running prompt via {copilotPath}..."
+            });
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = copilotPath,
+                WorkingDirectory = cwd,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add("-p");
+            psi.ArgumentList.Add(promptEvent.Prompt);
+            psi.ArgumentList.Add("--allow-all");
+            psi.ArgumentList.Add("--no-color");
+
+            using var proc = new Process { StartInfo = psi };
+            proc.Start();
+            var stdOut = await proc.StandardOutput.ReadToEndAsync(ct);
+            var stdErr = await proc.StandardError.ReadToEndAsync(ct);
+            await proc.WaitForExitAsync(ct);
+
+            var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut.Trim() : stdErr.Trim();
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "response",
+                Content = string.IsNullOrWhiteSpace(output)
+                    ? $"Copilot CLI finished (exit code {proc.ExitCode})."
+                    : output
+            });
+            return;
+        }
+
         var fallback = new AgyAdapter();
         await fallback.ExecutePromptAsync(preset, promptEvent, onEvent, ct);
     }
@@ -325,10 +562,11 @@ public class GenericCommandAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = Environment.CurrentDirectory;
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
 
-        // If user configured a custom command, run it and parse JSONL or plain text output
-        if (!string.IsNullOrWhiteSpace(preset.Command))
+        // If user configured a custom command (not empty and not default 'agy'), run it and parse JSONL or plain text output
+        if (!string.IsNullOrWhiteSpace(preset.Command) &&
+            !string.Equals(preset.Command, "agy", StringComparison.OrdinalIgnoreCase))
         {
             await onEvent(new TrajectoryEventPayload
             {
@@ -370,7 +608,6 @@ public class GenericCommandAdapter : IAgentAdapter
             using var proc = new Process { StartInfo = psi };
             proc.Start();
 
-            // Write prompt JSON to stdin and close (ignore Broken Pipe if process doesn't read stdin)
             try
             {
                 var stdinPayload = JsonSerializer.Serialize(promptEvent);
@@ -426,7 +663,7 @@ public class GenericCommandAdapter : IAgentAdapter
             return;
         }
 
-        // Default workspace execution when no custom command is provided
+        // Delegate to real Antigravity CLI adapter
         var agyAdapter = new AgyAdapter();
         await agyAdapter.ExecutePromptAsync(preset, promptEvent, onEvent, ct);
     }
