@@ -2,11 +2,52 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
-import type { Agent, AgentSession, SessionMessage, SystemStatusResponse } from '../types';
+import type {
+  Agent,
+  AgentSession,
+  FilesystemBrowseResponse,
+  SessionMessage,
+  SystemCapabilitiesResponse,
+  SystemStatusResponse
+} from '../types';
 
 vi.mock('../services/api', () => ({
   api: {
     getStatus: vi.fn(),
+    getCapabilities: vi.fn().mockResolvedValue({
+      workspace: {
+        defaultSandboxPath: '~/.agentmesh/workspaces/<session-id>',
+        currentDirectory: '/workspace/agent-mesh',
+        userHome: '/home/testuser',
+        bookmarks: [
+          { label: 'Default Sandbox', path: '', description: 'Sandbox' },
+          { label: 'Current Project', path: '/workspace/agent-mesh', description: 'Project' },
+          { label: 'User Home', path: '/home/testuser', description: 'Home' }
+        ]
+      },
+      agentRuntimes: {
+        agy: {
+          adapter: 'agy',
+          name: 'Antigravity CLI (agy)',
+          modes: [
+            { id: 'auto', label: 'Auto (Autonomous)', description: 'Auto execution' },
+            { id: 'plan', label: 'Plan Only', description: 'Plan only' }
+          ],
+          models: [
+            { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] },
+            { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'] }
+          ]
+        }
+      }
+    }),
+    browseFilesystem: vi.fn().mockResolvedValue({
+      currentPath: '/workspace/agent-mesh',
+      parentPath: '/workspace',
+      directories: [
+        { name: 'src', path: '/workspace/agent-mesh/src' },
+        { name: 'docs', path: '/workspace/agent-mesh/docs' }
+      ]
+    }),
     getAgents: vi.fn().mockResolvedValue([]),
     getSessions: vi.fn().mockResolvedValue([]),
     getSessionMessages: vi.fn().mockResolvedValue([]),
@@ -43,9 +84,45 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     }
   };
 
+  const mockCaps: SystemCapabilitiesResponse = {
+    workspace: {
+      defaultSandboxPath: '~/.agentmesh/workspaces/<session-id>',
+      currentDirectory: '/workspace/agent-mesh',
+      userHome: '/home/testuser',
+      bookmarks: [
+        { label: 'Default Sandbox', path: '', description: 'Sandbox' },
+        { label: 'Current Project', path: '/workspace/agent-mesh', description: 'Project' },
+        { label: 'User Home', path: '/home/testuser', description: 'Home' }
+      ]
+    },
+    agentRuntimes: {
+      agy: {
+        adapter: 'agy',
+        name: 'Antigravity CLI (agy)',
+        modes: [
+          { id: 'auto', label: 'Auto (Autonomous)', description: 'Auto execution' },
+          { id: 'plan', label: 'Plan Only', description: 'Plan only' }
+        ],
+        models: [
+          { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] },
+          { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'] }
+        ]
+      }
+    }
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(api.getStatus).mockResolvedValue(mockHealthyStatus);
+    vi.mocked(api.getCapabilities).mockResolvedValue(mockCaps);
+    vi.mocked(api.browseFilesystem).mockResolvedValue({
+      currentPath: '/workspace/agent-mesh',
+      parentPath: '/workspace',
+      directories: [
+        { name: 'src', path: '/workspace/agent-mesh/src' },
+        { name: 'docs', path: '/workspace/agent-mesh/docs' }
+      ]
+    });
     vi.mocked(api.getAgents).mockResolvedValue([]);
     vi.mocked(api.getSessions).mockResolvedValue([]);
     vi.mocked(api.getSessionMessages).mockResolvedValue([]);
@@ -246,4 +323,130 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       expect(screen.getByText('⚡ 2,850 tokens (4.2s)')).toBeInTheDocument();
     });
   });
+
+  it('supports directory preset chips, interactive folder picker modal, and dynamic model/effort/mode controls', async () => {
+    const mockAgents: Agent[] = [
+      {
+        id: 'agy-core',
+        name: 'Agy Lead Architect',
+        role: 'Codebase Engineer',
+        status: 'online',
+        runtimeType: 'CliAgy',
+        trustTier: 3,
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    vi.mocked(api.getAgents).mockResolvedValue(mockAgents);
+    vi.mocked(api.getSessions).mockResolvedValue([]);
+    vi.mocked(api.createAgentSession).mockResolvedValue({
+      id: 'sess-new-1',
+      title: 'Dynamic Controls Session',
+      status: 'active',
+      metadataJson: '{}',
+      creatorAgentId: 'agy-core',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Agy Lead Architect')).toBeInTheDocument();
+    });
+
+    // Open New Session composer
+    const newSessionBtns = screen.getAllByRole('button', { name: /New Session with Agy Lead Architect/i });
+    fireEvent.click(newSessionBtns[0]);
+
+    expect(screen.getByText('Start New Session with Agy Lead Architect')).toBeInTheDocument();
+    expect(screen.getByText('Default Sandbox Workspace')).toBeInTheDocument();
+
+    // Check quick bookmarks are visible
+    expect(screen.getByText('⚡ Default Sandbox')).toBeInTheDocument();
+    expect(screen.getByText('Current Project')).toBeInTheDocument();
+    expect(screen.getByText('User Home')).toBeInTheDocument();
+
+    // Model, Effort, and Mode inputs are selects
+    const allSelects = screen.getAllByRole('combobox');
+    const modelDropdown = allSelects[0];
+    const effortDropdown = allSelects[1];
+    const modeDropdown = allSelects[2];
+
+    expect(modelDropdown).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Default Model' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Gemini 4 Argon' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'GPT-OSS 120b' })).toBeInTheDocument();
+
+    // Initially with default model, effort is disabled (Not applicable)
+    expect(effortDropdown).toBeDisabled();
+    expect(screen.getByRole('option', { name: 'Not applicable' })).toBeInTheDocument();
+
+    // Mode dropdown shows runtime modes
+    expect(screen.getByRole('option', { name: 'Auto (Autonomous)' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Plan Only' })).toBeInTheDocument();
+
+    // Select Gemini 4 Argon -> Effort enables with low, medium, high
+    fireEvent.change(modelDropdown, { target: { value: 'gemini-4-argon' } });
+    expect(effortDropdown).not.toBeDisabled();
+    expect(screen.getByRole('option', { name: 'low' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'medium' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument();
+
+    // Select GPT-OSS 120b -> Effort updates to ONLY medium
+    fireEvent.change(modelDropdown, { target: { value: 'gpt-oss-120b' } });
+    expect(effortDropdown).not.toBeDisabled();
+    expect(screen.queryByRole('option', { name: 'low' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'high' })).not.toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'medium' })).toBeInTheDocument();
+    fireEvent.change(effortDropdown, { target: { value: 'medium' } });
+
+    // Select Mode
+    fireEvent.change(modeDropdown, { target: { value: 'plan' } });
+
+    // Test quick preset bookmark click
+    fireEvent.click(screen.getByText('Current Project'));
+    expect(screen.getByText('/workspace/agent-mesh')).toBeInTheDocument();
+
+    // Test opening interactive Folder Picker modal
+    fireEvent.click(screen.getByRole('button', { name: /Browse.../i }));
+    expect(screen.getByRole('dialog', { name: 'Select Working Directory' })).toBeInTheDocument();
+    expect(api.browseFilesystem).toHaveBeenCalled();
+
+    // In modal, directories should be listed
+    await waitFor(() => {
+      expect(screen.getByText('docs')).toBeInTheDocument();
+      expect(screen.getByText('src')).toBeInTheDocument();
+    });
+
+    // Click "Select" next to "docs"
+    const selectDocsBtn = screen.getAllByRole('button', { name: 'Select' })[1];
+    fireEvent.click(selectDocsBtn);
+
+    // Modal closes and working directory updates to docs
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByText('/workspace/agent-mesh/docs')).toBeInTheDocument();
+
+    // Fill title and submit
+    fireEvent.change(screen.getByPlaceholderText(/Refactor authentication middleware/i), {
+      target: { value: 'Dynamic Session Test' }
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Launch Session/i }));
+
+    await waitFor(() => {
+      expect(api.createAgentSession).toHaveBeenCalledWith(
+        'agy-core',
+        'Dynamic Session Test',
+        undefined,
+        {
+          workingDirectory: '/workspace/agent-mesh/docs',
+          model: 'gpt-oss-120b',
+          effort: 'medium',
+          mode: 'plan'
+        }
+      );
+    });
+  });
 });
+

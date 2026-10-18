@@ -1,4 +1,12 @@
-import type { Agent, AgentSession, SessionMessage, StagedJob, SystemStatusResponse } from '../types';
+import type {
+  Agent,
+  AgentSession,
+  FilesystemBrowseResponse,
+  SessionMessage,
+  StagedJob,
+  SystemCapabilitiesResponse,
+  SystemStatusResponse
+} from '../types';
 
 let tokenProvider: (() => string | null) | null = null;
 
@@ -33,6 +41,19 @@ export const api = {
   async getStatus(): Promise<SystemStatusResponse> {
     const res = await fetch('/api/status', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load system status: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getCapabilities(): Promise<SystemCapabilitiesResponse> {
+    const res = await fetch('/api/system/capabilities', { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load system capabilities: ${res.statusText}`);
+    return res.json();
+  },
+
+  async browseFilesystem(path?: string): Promise<FilesystemBrowseResponse> {
+    const query = path ? `?path=${encodeURIComponent(path)}` : '';
+    const res = await fetch(`/api/system/filesystem${query}`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to browse directory: ${res.statusText}`);
     return res.json();
   },
 

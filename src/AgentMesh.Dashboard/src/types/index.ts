@@ -85,3 +85,52 @@ export interface SystemStatusResponse {
     [key: string]: ServiceHealth | undefined;
   };
 }
+
+export interface DirectoryBookmark {
+  label: string;
+  path: string;
+  description: string;
+}
+
+export interface WorkspaceDefaults {
+  defaultSandboxPath: string;
+  currentDirectory: string;
+  userHome: string;
+  bookmarks: DirectoryBookmark[];
+}
+
+export interface ModeOption {
+  id: string;
+  label: string;
+  description: string;
+}
+
+export interface ModelCapability {
+  id: string;
+  name: string;
+  efforts: string[];
+}
+
+export interface RuntimeCapabilities {
+  adapter: string;
+  name: string;
+  modes: ModeOption[];
+  models: ModelCapability[];
+}
+
+export interface SystemCapabilitiesResponse {
+  workspace: WorkspaceDefaults;
+  agentRuntimes: Record<string, RuntimeCapabilities>;
+}
+
+export interface DirectoryItem {
+  name: string;
+  path: string;
+}
+
+export interface FilesystemBrowseResponse {
+  currentPath: string;
+  parentPath: string | null;
+  directories: DirectoryItem[];
+}
+

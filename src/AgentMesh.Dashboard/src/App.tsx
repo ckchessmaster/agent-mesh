@@ -17,13 +17,26 @@ import {
   Activity,
   Cpu,
   Folder,
+  FolderOpen,
+  ChevronUp,
+  Home,
+  X,
+  Check,
+  RotateCcw,
   Zap,
   Sliders
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
 import { useAuth } from './auth/AuthProvider';
-import type { Agent, AgentSession, SessionMessage, SystemStatusResponse } from './types';
+import type {
+  Agent,
+  AgentSession,
+  FilesystemBrowseResponse,
+  SessionMessage,
+  SystemCapabilitiesResponse,
+  SystemStatusResponse
+} from './types';
 
 export default function App() {
   const auth = useAuth();
@@ -36,9 +49,16 @@ export default function App() {
   const [events, setEvents] = useState<SessionMessage[]>([]);
 
   const [statusData, setStatusData] = useState<SystemStatusResponse | null>(null);
+  const [capabilities, setCapabilities] = useState<SystemCapabilitiesResponse | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isActionPending, setIsActionPending] = useState<boolean>(false);
+
+  // Folder picker modal state
+  const [showFolderPicker, setShowFolderPicker] = useState<boolean>(false);
+  const [browseData, setBrowseData] = useState<FilesystemBrowseResponse | null>(null);
+  const [isBrowsing, setIsBrowsing] = useState<boolean>(false);
+  const [browseError, setBrowseError] = useState<string | null>(null);
 
   // Prompt & New Session state
   const [promptInput, setPromptInput] = useState('');
@@ -61,14 +81,18 @@ export default function App() {
 
   const fetchAllData = useCallback(async () => {
     try {
-      const [statusRes, agentsRes, sessionsRes] = await Promise.all([
+      const [statusRes, agentsRes, sessionsRes, capsRes] = await Promise.all([
         api.getStatus(),
         api.getAgents(),
-        api.getSessions('all')
+        api.getSessions('all'),
+        api.getCapabilities().catch(() => null)
       ]);
       setStatusData(statusRes);
       setAgents(agentsRes);
       setSessions(sessionsRes);
+      if (capsRes) {
+        setCapabilities(capsRes);
+      }
       setApiError(null);
 
       // Auto-select first agent & session if none selected
@@ -191,9 +215,86 @@ export default function App() {
     }
   };
 
+  const loadBrowseDirectory = useCallback(async (path?: string) => {
+    setIsBrowsing(true);
+    setBrowseError(null);
+    try {
+      const res = await api.browseFilesystem(path);
+      setBrowseData(res);
+    } catch (err) {
+      setBrowseError(err instanceof Error ? err.message : 'Failed to browse directory');
+    } finally {
+      setIsBrowsing(false);
+    }
+  }, []);
+
+  const openFolderPicker = useCallback(() => {
+    const initialPath = newSessionWorkDir || capabilities?.workspace?.currentDirectory || undefined;
+    loadBrowseDirectory(initialPath);
+    setShowFolderPicker(true);
+  }, [newSessionWorkDir, capabilities?.workspace?.currentDirectory, loadBrowseDirectory]);
+
+  const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
+  const activeCreationAgent =
+    agents.find((a) => a.id === selectedAgentId) || agents[0] || null;
+  const selectedAgent = isCreatingSession
+    ? activeCreationAgent
+    : agents.find((a) => a.id === (selectedSession?.creatorAgentId || selectedAgentId)) || null;
+
+  const currentRuntimeCaps = useMemo(() => {
+    if (!capabilities) return null;
+    const agent = isCreatingSession ? activeCreationAgent : selectedAgent;
+    if (!agent) return capabilities.agentRuntimes['agy'] || null;
+
+    const idLower = agent.id.toLowerCase();
+    const nameLower = agent.name.toLowerCase();
+    let key = 'agy';
+    if (idLower.includes('copilot') || nameLower.includes('copilot')) key = 'copilot';
+    else if (idLower.includes('claude') || nameLower.includes('claude')) key = 'claude';
+    else if (idLower.includes('agy') || idLower.includes('antigravity') || nameLower.includes('agy') || nameLower.includes('antigravity')) key = 'agy';
+    else if (capabilities.agentRuntimes[agent.id]) key = agent.id;
+    else key = 'agy';
+
+    return capabilities.agentRuntimes[key] || capabilities.agentRuntimes['agy'] || null;
+  }, [capabilities, isCreatingSession, activeCreationAgent, selectedAgent]);
+
+  const availableModels = useMemo(() => {
+    return currentRuntimeCaps?.models || [];
+  }, [currentRuntimeCaps]);
+
+  const availableModes = useMemo(() => {
+    return currentRuntimeCaps?.modes || [];
+  }, [currentRuntimeCaps]);
+
+  const selectedModelCap = useMemo(() => {
+    if (!newSessionModel || !currentRuntimeCaps) return null;
+    return currentRuntimeCaps.models.find((m) => m.id === newSessionModel) || null;
+  }, [currentRuntimeCaps, newSessionModel]);
+
+  const availableEfforts = useMemo(() => {
+    return selectedModelCap?.efforts || [];
+  }, [selectedModelCap]);
+
+  // Sync / validate effort when model changes
+  useEffect(() => {
+    if (newSessionEffort && !availableEfforts.includes(newSessionEffort)) {
+      setNewSessionEffort('');
+    }
+  }, [availableEfforts, newSessionEffort]);
+
+  // Sync / validate model and mode when agent changes
+  useEffect(() => {
+    if (newSessionModel && availableModels.length > 0 && !availableModels.some((m) => m.id === newSessionModel)) {
+      setNewSessionModel('');
+    }
+    if (newSessionMode && availableModes.length > 0 && !availableModes.some((m) => m.id === newSessionMode)) {
+      setNewSessionMode('');
+    }
+  }, [availableModels, availableModes, newSessionModel, newSessionMode]);
+
   const handleCreateSession = async (e: React.FormEvent) => {
     e.preventDefault();
-    const targetAgent = selectedAgentId || agents[0]?.id;
+    const targetAgent = selectedAgentId || activeCreationAgent?.id || agents[0]?.id;
     if (!targetAgent || !newSessionTitle.trim()) return;
 
     setIsActionPending(true);
@@ -272,10 +373,6 @@ export default function App() {
       setIsActionPending(false);
     }
   };
-
-  const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
-  const selectedAgent =
-    agents.find((a) => a.id === (selectedSession?.creatorAgentId || selectedAgentId)) || null;
 
   const selectedSessionMetadata = useMemo(() => {
     if (!selectedSession?.metadataJson) return null;
@@ -633,60 +730,163 @@ export default function App() {
                 </div>
 
                 {/* Session Controls: Working Directory & Model Parameters */}
-                <div className="pt-2 border-t border-slate-800/80 space-y-3">
+                <div className="pt-2 border-t border-slate-800/80 space-y-3.5">
                   <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-300">
                     <Sliders className="w-3.5 h-3.5 text-sky-400" />
                     <span>Agent Execution Controls</span>
                   </div>
 
-                  <div className="space-y-1">
-                    <label className="block text-[11px] font-medium text-slate-400">
-                      Working Directory
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="~/.agentmesh/workspaces/<session-id> (default persistent sandbox)"
-                      value={newSessionWorkDir}
-                      onChange={(e) => setNewSessionWorkDir(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
-                    />
-                    <p className="text-[10px] text-slate-500 font-mono">
-                      Safe default sandbox created under ~/.agentmesh/workspaces/ if left blank.
-                    </p>
+                  {/* Working Directory Selection */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="block text-[11px] font-medium text-slate-400">
+                        Working Directory
+                      </label>
+                      {newSessionWorkDir && (
+                        <button
+                          type="button"
+                          onClick={() => setNewSessionWorkDir('')}
+                          className="text-[10px] text-sky-400 hover:text-sky-300 flex items-center gap-1 cursor-pointer"
+                        >
+                          <RotateCcw className="w-2.5 h-2.5" />
+                          <span>Reset to Sandbox</span>
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <div
+                        onClick={openFolderPicker}
+                        className="flex-1 min-w-0 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-lg px-3 py-2 flex items-center gap-2.5 cursor-pointer transition group"
+                      >
+                        <div
+                          className={`p-1.5 rounded-md ${
+                            newSessionWorkDir
+                              ? 'bg-sky-500/10 text-sky-400'
+                              : 'bg-emerald-500/10 text-emerald-400'
+                          }`}
+                        >
+                          <Folder className="w-4 h-4" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-semibold text-white truncate">
+                              {newSessionWorkDir
+                                ? newSessionWorkDir.split(/[\\/]/).filter(Boolean).pop() || newSessionWorkDir
+                                : 'Default Sandbox Workspace'}
+                            </span>
+                            <span
+                              className={`text-[9px] font-mono px-1.5 py-0.2 rounded border ${
+                                newSessionWorkDir
+                                  ? 'bg-sky-500/10 text-sky-300 border-sky-500/20'
+                                  : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+                              }`}
+                            >
+                              {newSessionWorkDir ? 'Custom Path' : 'Safe Isolated'}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-slate-400 font-mono truncate mt-0.5">
+                            {newSessionWorkDir || '~/.agentmesh/workspaces/<session-id>'}
+                          </p>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={openFolderPicker}
+                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 hover:border-slate-600 text-xs font-medium flex items-center gap-1.5 transition shrink-0 cursor-pointer"
+                      >
+                        <FolderOpen className="w-3.5 h-3.5 text-sky-400" />
+                        <span>Browse...</span>
+                      </button>
+                    </div>
+
+                    {/* Quick Preset Bookmark Chips */}
+                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                      <span className="text-[10px] text-slate-500 font-medium mr-1">Quick Select:</span>
+                      <button
+                        type="button"
+                        onClick={() => setNewSessionWorkDir('')}
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded-md border transition cursor-pointer ${
+                          !newSessionWorkDir
+                            ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 font-semibold'
+                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200 hover:border-slate-700'
+                        }`}
+                      >
+                        ⚡ Default Sandbox
+                      </button>
+                      {capabilities?.workspace?.bookmarks
+                        ?.filter((b) => b.path)
+                        .map((bookmark) => {
+                          const isSelected = newSessionWorkDir === bookmark.path;
+                          return (
+                            <button
+                              key={bookmark.label}
+                              type="button"
+                              onClick={() => setNewSessionWorkDir(bookmark.path)}
+                              title={bookmark.path}
+                              className={`text-[10px] font-mono px-2 py-0.5 rounded-md border transition cursor-pointer ${
+                                isSelected
+                                  ? 'bg-sky-500/20 text-sky-300 border-sky-500/40 font-semibold'
+                                  : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200 hover:border-slate-700'
+                              }`}
+                            >
+                              {bookmark.label}
+                            </button>
+                          );
+                        })}
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-3 gap-2.5">
+                    {/* Model Selection Dropdown */}
                     <div className="space-y-1">
                       <label className="block text-[11px] font-medium text-slate-400">
                         Model
                       </label>
-                      <input
-                        type="text"
-                        placeholder="default / gemini-2.5-pro"
+                      <select
                         value={newSessionModel}
                         onChange={(e) => setNewSessionModel(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="block text-[11px] font-medium text-slate-400">
-                        Reasoning Effort
-                      </label>
-                      <select
-                        value={newSessionEffort}
-                        onChange={(e) => setNewSessionEffort(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500 cursor-pointer"
                       >
-                        <option value="">Default</option>
-                        <option value="low">low</option>
-                        <option value="medium">medium</option>
-                        <option value="high">high</option>
-                        <option value="xhigh">xhigh</option>
-                        <option value="max">max</option>
+                        <option value="">Default Model</option>
+                        {availableModels.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.name || m.id}
+                          </option>
+                        ))}
                       </select>
                     </div>
 
+                    {/* Reasoning Effort Dropdown (tied to model) */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <label className="block text-[11px] font-medium text-slate-400">
+                          Reasoning Effort
+                        </label>
+                      </div>
+                      <select
+                        value={newSessionEffort}
+                        onChange={(e) => setNewSessionEffort(e.target.value)}
+                        disabled={availableEfforts.length === 0}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                      >
+                        {availableEfforts.length === 0 ? (
+                          <option value="">Not applicable</option>
+                        ) : (
+                          <>
+                            <option value="">Default Effort</option>
+                            {availableEfforts.map((eff) => (
+                              <option key={eff} value={eff}>
+                                {eff}
+                              </option>
+                            ))}
+                          </>
+                        )}
+                      </select>
+                    </div>
+
+                    {/* Execution Mode Dropdown (tied to system) */}
                     <div className="space-y-1">
                       <label className="block text-[11px] font-medium text-slate-400">
                         Mode
@@ -694,12 +894,21 @@ export default function App() {
                       <select
                         value={newSessionMode}
                         onChange={(e) => setNewSessionMode(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+                        disabled={availableModes.length === 0}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
                       >
-                        <option value="">Default</option>
-                        <option value="auto">auto</option>
-                        <option value="plan">plan</option>
-                        <option value="accept-edits">accept-edits</option>
+                        {availableModes.length === 0 ? (
+                          <option value="">Not supported</option>
+                        ) : (
+                          <>
+                            <option value="">Default Mode</option>
+                            {availableModes.map((mode) => (
+                              <option key={mode.id} value={mode.id}>
+                                {mode.label}
+                              </option>
+                            ))}
+                          </>
+                        )}
                       </select>
                     </div>
                   </div>
@@ -1057,6 +1266,231 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* Interactive Folder Picker Modal */}
+      {showFolderPicker && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Select Working Directory"
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div className="max-w-2xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
+            {/* Header */}
+            <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                  <FolderOpen className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Select Working Directory</h3>
+                  <p className="text-xs text-slate-400">Browse host filesystem for isolated session execution</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowFolderPicker(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Navigation & Breadcrumbs Bar */}
+            <div className="px-5 py-2.5 bg-slate-950/60 border-b border-slate-800/80 flex items-center gap-2 text-xs">
+              <button
+                type="button"
+                disabled={!browseData?.parentPath || isBrowsing}
+                onClick={() => browseData?.parentPath && loadBrowseDirectory(browseData.parentPath)}
+                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                title="Go up to parent folder"
+              >
+                <ChevronUp className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                disabled={isBrowsing}
+                onClick={() => capabilities?.workspace.userHome && loadBrowseDirectory(capabilities.workspace.userHome)}
+                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 transition cursor-pointer"
+                title="Go to User Home"
+              >
+                <Home className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                disabled={isBrowsing}
+                onClick={() => loadBrowseDirectory(browseData?.currentPath)}
+                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 transition cursor-pointer"
+                title="Refresh current folder"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isBrowsing ? 'animate-spin' : ''}`} />
+              </button>
+
+              <div className="h-4 w-px bg-slate-800 mx-1" />
+
+              {/* Breadcrumb Path */}
+              <div className="flex-1 min-w-0 flex items-center gap-1 overflow-x-auto font-mono text-[11px] text-slate-300 py-0.5">
+                {browseData?.currentPath ? (
+                  browseData.currentPath
+                    .split('/')
+                    .map((segment, idx, arr) => {
+                      if (!segment && idx === 0) {
+                        return (
+                          <button
+                            key="root"
+                            type="button"
+                            onClick={() => loadBrowseDirectory('/')}
+                            className="hover:text-sky-400 font-bold px-1 rounded hover:bg-slate-800/50 cursor-pointer"
+                          >
+                            /
+                          </button>
+                        );
+                      }
+                      if (!segment) return null;
+                      const subPath = arr.slice(0, idx + 1).join('/') || '/';
+                      const isLast = idx === arr.length - 1;
+                      return (
+                        <div key={subPath} className="flex items-center gap-1 shrink-0">
+                          <span className="text-slate-600">/</span>
+                          <button
+                            type="button"
+                            onClick={() => loadBrowseDirectory(subPath)}
+                            className={`px-1 py-0.5 rounded transition cursor-pointer ${
+                              isLast
+                                ? 'text-sky-400 font-bold bg-sky-950/40 border border-sky-500/30'
+                                : 'hover:text-white hover:bg-slate-800/60 text-slate-300'
+                            }`}
+                          >
+                            {segment}
+                          </button>
+                        </div>
+                      );
+                    })
+                ) : (
+                  <span className="text-slate-500 italic">Reading directory...</span>
+                )}
+              </div>
+            </div>
+
+            {/* Quick Preset Location Chips in Picker */}
+            {capabilities?.workspace?.bookmarks && (
+              <div className="px-5 py-2 bg-slate-900/50 border-b border-slate-800/50 flex flex-wrap items-center gap-1.5 text-[11px]">
+                <span className="text-slate-500 text-[10px] uppercase font-mono tracking-wider mr-1">Bookmarks:</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNewSessionWorkDir('');
+                    setShowFolderPicker(false);
+                  }}
+                  className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 transition cursor-pointer"
+                >
+                  ⚡ Sandbox Default
+                </button>
+                {capabilities.workspace.bookmarks
+                  .filter((b) => b.path)
+                  .map((bookmark) => (
+                    <button
+                      key={bookmark.label}
+                      type="button"
+                      onClick={() => loadBrowseDirectory(bookmark.path)}
+                      className={`px-2 py-0.5 rounded border transition cursor-pointer ${
+                        browseData?.currentPath === bookmark.path
+                          ? 'bg-sky-500/20 text-sky-300 border-sky-500/40 font-semibold'
+                          : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
+                      }`}
+                    >
+                      {bookmark.label}
+                    </button>
+                  ))}
+              </div>
+            )}
+
+            {/* Directory Listing Body */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-1">
+              {isBrowsing ? (
+                <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
+                  <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
+                  <span>Loading directory contents...</span>
+                </div>
+              ) : browseError ? (
+                <div className="p-4 rounded-xl bg-rose-950/30 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
+                  <span>{browseError}</span>
+                  <button
+                    type="button"
+                    onClick={() => loadBrowseDirectory(capabilities?.workspace.currentDirectory)}
+                    className="px-2.5 py-1 rounded bg-rose-900/50 hover:bg-rose-900 text-rose-200 border border-rose-500/40 text-[11px] cursor-pointer"
+                  >
+                    Return to Project
+                  </button>
+                </div>
+              ) : browseData?.directories.length === 0 ? (
+                <div className="py-10 text-center text-slate-500 text-xs italic">
+                  No accessible subdirectories in this folder
+                </div>
+              ) : (
+                browseData?.directories.map((dir) => (
+                  <div
+                    key={dir.path}
+                    className="group flex items-center justify-between p-2 rounded-lg hover:bg-slate-800/60 border border-transparent hover:border-slate-800 transition"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => loadBrowseDirectory(dir.path)}
+                      className="flex-1 flex items-center gap-2.5 text-left text-xs text-slate-200 group-hover:text-sky-300 font-mono transition cursor-pointer"
+                    >
+                      <Folder className="w-4 h-4 text-sky-400 shrink-0" />
+                      <span className="truncate">{dir.name}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNewSessionWorkDir(dir.path);
+                        setShowFolderPicker(false);
+                      }}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white text-[11px] font-medium opacity-80 group-hover:opacity-100 transition cursor-pointer"
+                    >
+                      Select
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 py-3 border-t border-slate-800 bg-slate-950 flex items-center justify-between shrink-0">
+              <div className="min-w-0 pr-3">
+                <span className="text-[10px] text-slate-500 uppercase font-mono block">Current Folder</span>
+                <p className="text-xs font-mono text-slate-300 truncate" title={browseData?.currentPath}>
+                  {browseData?.currentPath || 'None'}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowFolderPicker(false)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={!browseData?.currentPath}
+                  onClick={() => {
+                    if (browseData?.currentPath) {
+                      setNewSessionWorkDir(browseData.currentPath);
+                      setShowFolderPicker(false);
+                    }
+                  }}
+                  className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-sky-600 hover:bg-sky-500 text-white flex items-center gap-1.5 transition disabled:opacity-40 cursor-pointer"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Choose This Folder</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
