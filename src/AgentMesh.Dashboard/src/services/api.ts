@@ -149,8 +149,7 @@ export const api = {
     content: string,
     targetAgentId?: string,
     senderAgentId = 'operator',
-    eventType = 'prompt',
-    simulateExecution = true
+    eventType = 'prompt'
   ): Promise<SessionMessage> {
     const res = await fetch(`/api/sessions/${sessionId}/events`, {
       method: 'POST',
@@ -159,8 +158,7 @@ export const api = {
         content,
         targetAgentId,
         senderAgentId,
-        eventType,
-        simulateExecution
+        eventType
       })
     });
     if (!res.ok) throw new Error(`Failed to post session event: ${res.statusText}`);
@@ -173,15 +171,6 @@ export const api = {
       headers: getHeaders()
     });
     if (!res.ok) throw new Error(`Failed to reset mesh data: ${res.statusText}`);
-    return res.json();
-  },
-
-  async seedDemo(): Promise<{ status: string; agentId: string; sessionId: string; eventCount: number }> {
-    const res = await fetch('/api/dev/seed-demo', {
-      method: 'POST',
-      headers: getHeaders()
-    });
-    if (!res.ok) throw new Error(`Failed to seed demo data: ${res.statusText}`);
     return res.json();
   }
 };

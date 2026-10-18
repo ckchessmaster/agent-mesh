@@ -10,7 +10,6 @@ vi.mock('../services/api', () => ({
     getAgents: vi.fn().mockResolvedValue([]),
     getSessions: vi.fn().mockResolvedValue([]),
     getSessionMessages: vi.fn().mockResolvedValue([]),
-    seedDemo: vi.fn(),
     resetMesh: vi.fn(),
     createAgentSession: vi.fn(),
     postSessionMessage: vi.fn(),
@@ -156,13 +155,7 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     });
   });
 
-  it('triggers seedDemo and resetMesh from header buttons', async () => {
-    vi.mocked(api.seedDemo).mockResolvedValue({
-      status: 'seeded',
-      agentId: 'agy-core',
-      sessionId: 'session-999',
-      eventCount: 8
-    });
+  it('triggers resetMesh from Clear Mesh Data header button', async () => {
     vi.mocked(api.resetMesh).mockResolvedValue({
       status: 'reset',
       message: 'Purged'

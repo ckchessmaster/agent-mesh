@@ -6,7 +6,6 @@ import {
   Send,
   Plus,
   Trash2,
-  Sparkles,
   RefreshCw,
   CheckCircle2,
   AlertTriangle,
@@ -40,7 +39,6 @@ export default function App() {
 
   // Prompt & New Session state
   const [promptInput, setPromptInput] = useState('');
-  const [simulateResponse, setSimulateResponse] = useState(true);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [newSessionTitle, setNewSessionTitle] = useState('');
   const [newSessionPrompt, setNewSessionPrompt] = useState('');
@@ -145,21 +143,12 @@ export default function App() {
       setSelectedSessionId(null);
     };
 
-    const handleMeshSeeded = (payload: { agentId: string; sessionId: string }) => {
-      fetchAllData().then(() => {
-        setSelectedAgentId(payload.agentId);
-        setSelectedSessionId(payload.sessionId);
-        fetchSessionEvents(payload.sessionId);
-      });
-    };
-
     connection.on('ReceiveMessage', handleReceiveMessage);
     connection.on('SessionCreated', handleSessionCreated);
     connection.on('SessionUpdated', handleSessionUpdated);
     connection.on('AgentRegistered', handleSessionUpdated);
     connection.on('AgentUpdated', handleSessionUpdated);
     connection.on('MeshReset', handleMeshReset);
-    connection.on('MeshSeeded', handleMeshSeeded);
 
     return () => {
       connection.off('ReceiveMessage', handleReceiveMessage);
@@ -168,7 +157,6 @@ export default function App() {
       connection.off('AgentRegistered', handleSessionUpdated);
       connection.off('AgentUpdated', handleSessionUpdated);
       connection.off('MeshReset', handleMeshReset);
-      connection.off('MeshSeeded', handleMeshSeeded);
     };
   }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents]);
 
@@ -178,22 +166,6 @@ export default function App() {
       timelineEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [events.length]);
-
-  const handleSeedDemo = async () => {
-    setIsActionPending(true);
-    try {
-      const res = await api.seedDemo();
-      await fetchAllData();
-      setSelectedAgentId(res.agentId);
-      setSelectedSessionId(res.sessionId);
-      await fetchSessionEvents(res.sessionId);
-      setIsCreatingSession(false);
-    } catch (err) {
-      setApiError(err instanceof Error ? err.message : 'Failed to seed demo data');
-    } finally {
-      setIsActionPending(false);
-    }
-  };
 
   const handleResetMesh = async () => {
     setIsActionPending(true);
@@ -251,8 +223,7 @@ export default function App() {
         text,
         currentSession?.creatorAgentId || selectedAgentId || 'agy-core',
         userEmail,
-        'prompt',
-        simulateResponse
+        'prompt'
       );
       setEvents((prev) => (prev.some((m) => m.id === createdMsg.id) ? prev : [...prev, createdMsg]));
       await fetchAllData();
@@ -328,16 +299,6 @@ export default function App() {
 
         {/* Developer Controls & Auth */}
         <div className="flex items-center gap-2.5">
-          <button
-            onClick={handleSeedDemo}
-            disabled={isActionPending}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition disabled:opacity-50 cursor-pointer"
-            title="Seed a sample live agent and full reasoning session"
-          >
-            <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-            <span>Seed Demo Agent</span>
-          </button>
-
           <button
             onClick={handleResetMesh}
             disabled={isActionPending}
@@ -467,16 +428,16 @@ export default function App() {
                 <div>
                   <h3 className="text-xs font-semibold text-slate-300">No Agents Connected</h3>
                   <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
-                    Database is clean. Connect an external CLI agent or seed a demo agent to inspect a live session.
+                    Connect an external CLI agent or register an agent to start a session.
                   </p>
                 </div>
                 <button
-                  onClick={handleSeedDemo}
+                  onClick={() => setShowRegisterModal(true)}
                   disabled={isActionPending}
-                  className="w-full py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  className="w-full py-2 px-3 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
                 >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Seed Demo Agent</span>
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Register Agent</span>
                 </button>
               </div>
             ) : (
@@ -856,15 +817,9 @@ export default function App() {
                   </button>
                 </div>
                 <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
-                  <label className="flex items-center gap-1.5 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={simulateResponse}
-                      onChange={(e) => setSimulateResponse(e.target.checked)}
-                      className="rounded border-slate-700 bg-slate-900 text-sky-500"
-                    />
-                    <span>Simulate live agent thinking & tool calls on prompt</span>
-                  </label>
+                  <span className="font-mono text-slate-500">
+                    Agent: @{selectedSession.creatorAgentId || selectedAgent?.id || 'agy'}
+                  </span>
                   <span className="font-mono text-slate-500">
                     Session ID: {selectedSession.id.slice(0, 8)}
                   </span>
@@ -879,26 +834,25 @@ export default function App() {
               <div className="max-w-md space-y-1.5">
                 <h2 className="text-lg font-bold text-white">Agent Session Observatory</h2>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  Select an agent on the left to inspect its reasoning sessions, or click{' '}
-                  <strong className="text-indigo-300">Seed Demo Agent</strong> to populate a realistic multi-step agent trajectory.
+                  Select a connected agent on the left to inspect its sessions, or connect a live CLI agent to stream reasoning steps and tool executions.
                 </p>
               </div>
               <div className="flex items-center gap-3">
-                <button
-                  onClick={handleSeedDemo}
-                  disabled={isActionPending}
-                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
-                >
-                  <Sparkles className="w-4 h-4" />
-                  <span>Seed Demo Agent & Session</span>
-                </button>
-                {selectedAgent && (
+                {selectedAgent ? (
                   <button
                     onClick={() => setIsCreatingSession(true)}
-                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
+                    className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
                   >
                     <Plus className="w-4 h-4" />
                     <span>New Session with {selectedAgent.name}</span>
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => setShowRegisterModal(true)}
+                    className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Register Agent</span>
                   </button>
                 )}
               </div>

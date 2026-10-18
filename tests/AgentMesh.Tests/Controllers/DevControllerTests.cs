@@ -1,5 +1,6 @@
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Core.Models;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Mvc;
@@ -26,29 +27,32 @@ public class DevControllerTests
     }
 
     [Fact]
-    public async Task SeedDemo_PopulatesDemoAgentSessionAndTrajectoryEvents_ThenResetMeshPurgesAll()
+    public async Task ResetMesh_PurgesAllAgentsSessionsAndEvents()
     {
         // Arrange
         using var db = TestDbContextFactory.Create();
+        var agent = new Agent { Id = "agy-core", Name = "Agy Lead", Role = "Architect" };
+        var session = new AgentSession { Id = Guid.NewGuid(), Title = "Test Session", CreatorAgentId = "agy-core" };
+        var message = new SessionMessage
+        {
+            Id = Guid.NewGuid(),
+            SessionId = session.Id,
+            SenderAgentId = "agy-core",
+            EventType = "thought",
+            Content = "Reasoning..."
+        };
+
+        db.Agents.Add(agent);
+        db.AgentSessions.Add(session);
+        db.SessionMessages.Add(message);
+        await db.SaveChangesAsync();
+
         var controller = new DevController(db, _mockHubContext.Object);
 
-        // Act 1: Seed Demo
-        var seedResult = await controller.SeedDemo();
-
-        // Assert 1: Seeded
-        seedResult.Should().BeOfType<OkObjectResult>();
-        db.Agents.Should().ContainSingle(a => a.Id == "agy-core");
-        db.AgentSessions.Should().ContainSingle(s => s.CreatorAgentId == "agy-core");
-        db.SessionMessages.Should().HaveCount(8);
-        db.SessionMessages.Select(m => m.EventType).Should().Contain(new[]
-        {
-            "prompt", "thought", "tool_call", "tool_result", "response"
-        });
-
-        // Act 2: Reset Mesh
+        // Act
         var resetResult = await controller.ResetMesh();
 
-        // Assert 2: Purged
+        // Assert
         resetResult.Should().BeOfType<OkObjectResult>();
         db.Agents.Should().BeEmpty();
         db.AgentSessions.Should().BeEmpty();
