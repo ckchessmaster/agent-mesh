@@ -9,7 +9,11 @@ public class SessionMessage
     public Agent? SenderAgent { get; set; }
     public string? TargetAgentId { get; set; }
     public Agent? TargetAgent { get; set; }
+    public string EventType { get; set; } = "response"; // prompt, thought, tool_call, tool_result, response
     public string Content { get; set; } = string.Empty;
+    public string? ToolName { get; set; }
+    public string? ToolArgsJson { get; set; }
+    public string? ToolResultJson { get; set; }
     public string? StructuredPayloadJson { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

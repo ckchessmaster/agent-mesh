@@ -1,530 +1,911 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import {
-  Shield,
-  Database,
-  Zap,
-  Clock,
-  HardDrive,
-  Server,
+  Bot,
+  Brain,
+  Terminal,
+  Send,
+  Plus,
+  Trash2,
+  Sparkles,
+  RefreshCw,
   CheckCircle2,
   AlertTriangle,
-  XCircle,
-  RefreshCw,
-  ExternalLink,
-  Code2,
-  Terminal,
-  Activity,
-  Layers,
-  MessageSquare,
   LogOut,
-  UserCheck
+  User,
+  Wrench,
+  MessageSquare,
+  ChevronRight,
+  Activity,
+  Cpu
 } from 'lucide-react';
 import { api } from './services/api';
-import type { SystemStatusResponse, ServiceHealth, Agent } from './types';
-import { SessionLedger } from './components/SessionLedger';
+import { useSignalR } from './hooks/useSignalR';
 import { useAuth } from './auth/AuthProvider';
-
-interface ServiceCardConfig {
-  key: string;
-  name: string;
-  category: 'core' | 'infra';
-  icon: typeof Server;
-  accent: string;
-  defaultDescription: string;
-  portInfo?: string;
-  externalLink?: string;
-}
-
-const SERVICE_CONFIGS: ServiceCardConfig[] = [
-  {
-    key: 'api',
-    name: 'ASP.NET Core 10 Web API',
-    category: 'core',
-    icon: Server,
-    accent: 'sky',
-    defaultDescription: 'Central control plane, health monitoring & MCP router',
-    portInfo: ':5000'
-  },
-  {
-    key: 'postgres',
-    name: 'PostgreSQL Relational DB',
-    category: 'infra',
-    icon: Database,
-    accent: 'blue',
-    defaultDescription: 'Relational persistence store for agent state, sessions & jobs',
-    portInfo: ':5432 (agentdb) / :5050 (pgAdmin)',
-    externalLink: 'http://localhost:5050'
-  },
-  {
-    key: 'redis',
-    name: 'Redis Distributed Cache',
-    category: 'infra',
-    icon: Zap,
-    accent: 'rose',
-    defaultDescription: 'In-memory pub/sub, distributed caching & rate limiting',
-    portInfo: ':6379'
-  },
-  {
-    key: 'temporal',
-    name: 'Temporal Dev Server',
-    category: 'infra',
-    icon: Clock,
-    accent: 'purple',
-    defaultDescription: 'Durable execution engine & human-in-the-loop signal orchestrator',
-    portInfo: ':7233 (gRPC) / :8233 (UI)',
-    externalLink: 'http://localhost:8233'
-  },
-  {
-    key: 's3',
-    name: 'SeaweedFS S3 Storage',
-    category: 'infra',
-    icon: HardDrive,
-    accent: 'amber',
-    defaultDescription: 'S3-compatible object storage for artifact offloading',
-    portInfo: ':8333 (S3) / :9333 (Master)'
-  }
-];
+import type { Agent, AgentSession, SessionMessage, SystemStatusResponse } from './types';
 
 export default function App() {
   const auth = useAuth();
   const userEmail = auth?.user?.profile?.email || auth?.user?.profile?.name || 'admin';
-  const [activeTab, setActiveTab] = useState<'health' | 'sessions'>('health');
+
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [sessions, setSessions] = useState<AgentSession[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [events, setEvents] = useState<SessionMessage[]>([]);
+
   const [statusData, setStatusData] = useState<SystemStatusResponse | null>(null);
+  const [apiError, setApiError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
-  const [showRawJson, setShowRawJson] = useState<boolean>(false);
-  const [copySuccess, setCopySuccess] = useState<boolean>(false);
+  const [isActionPending, setIsActionPending] = useState<boolean>(false);
 
-  useEffect(() => {
-    api.getAgents().then(setAgents).catch(() => {});
-  }, []);
+  // Prompt & New Session state
+  const [promptInput, setPromptInput] = useState('');
+  const [simulateResponse, setSimulateResponse] = useState(true);
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const [newSessionTitle, setNewSessionTitle] = useState('');
+  const [newSessionPrompt, setNewSessionPrompt] = useState('');
 
-  const fetchStatus = useCallback(async () => {
-    setIsLoading(true);
+  // Quick Register Agent modal/drawer state
+  const [showRegisterModal, setShowRegisterModal] = useState(false);
+  const [newAgentId, setNewAgentId] = useState('');
+  const [newAgentName, setNewAgentName] = useState('');
+  const [newAgentRole, setNewAgentRole] = useState('Codebase Engineer');
+
+  const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const { connection, connected: signalRConnected } = useSignalR('/hubs/agent-mesh');
+
+  const fetchAllData = useCallback(async () => {
     try {
-      const data = await api.getStatus();
-      setStatusData(data);
-      setLastUpdated(new Date());
-      setErrorMessage(null);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to connect to API gateway';
-      setErrorMessage(msg);
+      const [statusRes, agentsRes, sessionsRes] = await Promise.all([
+        api.getStatus(),
+        api.getAgents(),
+        api.getSessions('all')
+      ]);
+      setStatusData(statusRes);
+      setAgents(agentsRes);
+      setSessions(sessionsRes);
+      setApiError(null);
+
+      // Auto-select first agent & session if none selected
+      setSelectedAgentId((prevAgent) => {
+        const nextAgent = prevAgent && agentsRes.some((a) => a.id === prevAgent)
+          ? prevAgent
+          : agentsRes[0]?.id || null;
+        return nextAgent;
+      });
+
+      setSelectedSessionId((prevSession) => {
+        if (prevSession && sessionsRes.some((s) => s.id === prevSession)) {
+          return prevSession;
+        }
+        return sessionsRes[0]?.id || null;
+      });
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Unable to reach AgentMesh API');
     } finally {
       setIsLoading(false);
     }
   }, []);
 
+  const fetchSessionEvents = useCallback(async (sessionId: string) => {
+    try {
+      const msgs = await api.getSessionMessages(sessionId);
+      setEvents(msgs);
+    } catch (err) {
+      console.error('Failed to load session events:', err);
+    }
+  }, []);
+
   useEffect(() => {
-    fetchStatus();
-    if (!autoRefresh) return;
+    fetchAllData();
+  }, [fetchAllData]);
 
-    const interval = setInterval(() => {
-      fetchStatus();
-    }, 5000);
+  useEffect(() => {
+    if (selectedSessionId) {
+      fetchSessionEvents(selectedSessionId);
+      if (connection && signalRConnected) {
+        connection.invoke('JoinSession', selectedSessionId).catch(() => {});
+      }
+    } else {
+      setEvents([]);
+    }
+  }, [selectedSessionId, fetchSessionEvents, connection, signalRConnected]);
 
-    return () => clearInterval(interval);
-  }, [fetchStatus, autoRefresh]);
+  // Real-time SignalR listeners
+  useEffect(() => {
+    if (!connection) return;
 
-  const copyToClipboard = () => {
-    if (!statusData) return;
-    navigator.clipboard.writeText(JSON.stringify(statusData, null, 2));
-    setCopySuccess(true);
-    setTimeout(() => setCopySuccess(false), 2000);
+    const handleReceiveMessage = (msg: SessionMessage) => {
+      if (msg.sessionId === selectedSessionId) {
+        setEvents((prev) => {
+          if (prev.some((e) => e.id === msg.id)) return prev;
+          return [...prev, msg];
+        });
+      }
+      fetchAllData();
+    };
+
+    const handleSessionCreated = (session: AgentSession) => {
+      fetchAllData();
+      setSelectedSessionId(session.id);
+      if (session.creatorAgentId) {
+        setSelectedAgentId(session.creatorAgentId);
+      }
+    };
+
+    const handleSessionUpdated = () => {
+      fetchAllData();
+    };
+
+    const handleMeshReset = () => {
+      setAgents([]);
+      setSessions([]);
+      setEvents([]);
+      setSelectedAgentId(null);
+      setSelectedSessionId(null);
+    };
+
+    const handleMeshSeeded = (payload: { agentId: string; sessionId: string }) => {
+      fetchAllData().then(() => {
+        setSelectedAgentId(payload.agentId);
+        setSelectedSessionId(payload.sessionId);
+        fetchSessionEvents(payload.sessionId);
+      });
+    };
+
+    connection.on('ReceiveMessage', handleReceiveMessage);
+    connection.on('SessionCreated', handleSessionCreated);
+    connection.on('SessionUpdated', handleSessionUpdated);
+    connection.on('AgentRegistered', handleSessionUpdated);
+    connection.on('AgentUpdated', handleSessionUpdated);
+    connection.on('MeshReset', handleMeshReset);
+    connection.on('MeshSeeded', handleMeshSeeded);
+
+    return () => {
+      connection.off('ReceiveMessage', handleReceiveMessage);
+      connection.off('SessionCreated', handleSessionCreated);
+      connection.off('SessionUpdated', handleSessionUpdated);
+      connection.off('AgentRegistered', handleSessionUpdated);
+      connection.off('AgentUpdated', handleSessionUpdated);
+      connection.off('MeshReset', handleMeshReset);
+      connection.off('MeshSeeded', handleMeshSeeded);
+    };
+  }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents]);
+
+  // Auto-scroll timeline when new events arrive
+  useEffect(() => {
+    if (typeof timelineEndRef.current?.scrollIntoView === 'function') {
+      timelineEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [events.length]);
+
+  const handleSeedDemo = async () => {
+    setIsActionPending(true);
+    try {
+      const res = await api.seedDemo();
+      await fetchAllData();
+      setSelectedAgentId(res.agentId);
+      setSelectedSessionId(res.sessionId);
+      await fetchSessionEvents(res.sessionId);
+      setIsCreatingSession(false);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to seed demo data');
+    } finally {
+      setIsActionPending(false);
+    }
   };
 
-  const services = statusData?.services || {};
-  const isAllHealthy = statusData?.status === 'Healthy';
-  const healthyCount = Object.values(services).filter(
-    (s: ServiceHealth | undefined) => s?.status === 'Healthy'
-  ).length;
-  const totalCount = SERVICE_CONFIGS.length;
+  const handleResetMesh = async () => {
+    setIsActionPending(true);
+    try {
+      await api.resetMesh();
+      setAgents([]);
+      setSessions([]);
+      setEvents([]);
+      setSelectedAgentId(null);
+      setSelectedSessionId(null);
+      setIsCreatingSession(false);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to reset mesh data');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const handleCreateSession = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetAgent = selectedAgentId || agents[0]?.id;
+    if (!targetAgent || !newSessionTitle.trim()) return;
+
+    setIsActionPending(true);
+    try {
+      const created = await api.createAgentSession(
+        targetAgent,
+        newSessionTitle.trim(),
+        newSessionPrompt.trim() || undefined
+      );
+      setNewSessionTitle('');
+      setNewSessionPrompt('');
+      setIsCreatingSession(false);
+      await fetchAllData();
+      setSelectedSessionId(created.id);
+      await fetchSessionEvents(created.id);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to create session');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const handleSendPrompt = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedSessionId || !promptInput.trim()) return;
+
+    const text = promptInput.trim();
+    setPromptInput('');
+    const currentSession = sessions.find((s) => s.id === selectedSessionId);
+
+    try {
+      const createdMsg = await api.postSessionMessage(
+        selectedSessionId,
+        text,
+        currentSession?.creatorAgentId || selectedAgentId || 'agy-core',
+        userEmail,
+        'prompt',
+        simulateResponse
+      );
+      setEvents((prev) => (prev.some((m) => m.id === createdMsg.id) ? prev : [...prev, createdMsg]));
+      await fetchAllData();
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to send prompt');
+    }
+  };
+
+  const handleRegisterAgent = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newAgentId.trim() || !newAgentName.trim()) return;
+
+    setIsActionPending(true);
+    try {
+      const created = await api.upsertAgent({
+        id: newAgentId.trim().toLowerCase(),
+        name: newAgentName.trim(),
+        role: newAgentRole.trim() || 'Autonomous Agent',
+        status: 'online'
+      });
+      setNewAgentId('');
+      setNewAgentName('');
+      setShowRegisterModal(false);
+      await fetchAllData();
+      setSelectedAgentId(created.id);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to register agent');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
+  const selectedAgent =
+    agents.find((a) => a.id === (selectedSession?.creatorAgentId || selectedAgentId)) || null;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500/30 selection:text-sky-200">
-      {/* Top Header */}
-      <header className="border-b border-slate-800/80 bg-slate-900/90 backdrop-blur sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-6">
-            <div className="flex items-center gap-3">
-              <div className="p-2.5 bg-gradient-to-br from-sky-500/20 to-indigo-500/20 border border-sky-500/30 rounded-xl text-sky-400 shadow-sm shadow-sky-950">
-                <Shield className="w-5 h-5" />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="font-black text-lg tracking-tight bg-gradient-to-r from-sky-400 via-indigo-300 to-emerald-400 bg-clip-text text-transparent">
-                    AgentMesh
-                  </span>
-                  <span className="text-[10px] uppercase font-bold tracking-widest px-2 py-0.5 rounded-full bg-slate-800/80 text-sky-300 border border-slate-700/80">
-                    Aspire Skeleton v1.0
-                  </span>
-                </div>
-                <p className="text-[11px] text-slate-400">
-                  Core Infrastructure & Agent Control Plane
-                </p>
-              </div>
-            </div>
-
-            {/* Top Navigation Tabs */}
-            <nav className="flex items-center gap-1 bg-slate-950/80 p-1 rounded-xl border border-slate-800/80">
-              <button
-                onClick={() => setActiveTab('health')}
-                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 ${
-                  activeTab === 'health'
-                    ? 'bg-sky-600/30 text-sky-300 border border-sky-500/40 shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Activity className="w-3.5 h-3.5" />
-                System Health
-              </button>
-
-              <button
-                onClick={() => setActiveTab('sessions')}
-                className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition flex items-center gap-1.5 ${
-                  activeTab === 'sessions'
-                    ? 'bg-sky-600/30 text-sky-300 border border-sky-500/40 shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <MessageSquare className="w-3.5 h-3.5" />
-                Sessions
-              </button>
-            </nav>
+    <div className="min-h-screen h-screen bg-slate-950 text-slate-100 flex flex-col font-sans overflow-hidden">
+      {/* Top Bar */}
+      <header className="h-14 border-b border-slate-800/80 bg-slate-900/70 backdrop-blur px-5 flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+            <Cpu className="w-4 h-4" />
+          </div>
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-base font-bold tracking-tight text-white">AgentMesh</h1>
+            <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+              Session Cockpit MVP
+            </span>
           </div>
 
-          <div className="flex items-center gap-3">
-            {/* Auto-Refresh Toggle */}
-            <button
-              onClick={() => setAutoRefresh(!autoRefresh)}
-              className={`px-2.5 py-1 text-xs rounded-lg border font-mono transition flex items-center gap-1.5 ${
-                autoRefresh
-                  ? 'bg-slate-900 border-sky-500/40 text-sky-300'
-                  : 'bg-slate-900/50 border-slate-800 text-slate-500 hover:text-slate-300'
+          {/* System Health Pill */}
+          <div className="hidden md:flex items-center gap-2 ml-3 pl-3 border-l border-slate-800 text-xs">
+            <span
+              className={`w-2 h-2 rounded-full ${
+                apiError
+                  ? 'bg-rose-500'
+                  : statusData?.status === 'Healthy'
+                  ? 'bg-emerald-400'
+                  : 'bg-amber-400'
               }`}
-              title={autoRefresh ? 'Auto-refresh every 5s' : 'Auto-refresh paused'}
-            >
-              <Activity className={`w-3.5 h-3.5 ${autoRefresh ? 'animate-pulse text-sky-400' : ''}`} />
-              Auto (5s): {autoRefresh ? 'ON' : 'OFF'}
-            </button>
+            />
+            <span className="text-slate-400">
+              {apiError ? 'API Offline' : statusData?.status === 'Healthy' ? 'Mesh Healthy' : 'Connecting...'}
+            </span>
+            {signalRConnected && (
+              <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/60 border border-emerald-500/30 px-1.5 py-0.5 rounded">
+                LIVE
+              </span>
+            )}
+          </div>
+        </div>
 
-            {/* Manual Refresh Button */}
-            <button
-              onClick={fetchStatus}
-              disabled={isLoading}
-              className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800/80 border border-slate-800 transition disabled:opacity-50"
-              title="Refresh status now"
-            >
-              <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-sky-400' : ''}`} />
-            </button>
+        {/* Developer Controls & Auth */}
+        <div className="flex items-center gap-2.5">
+          <button
+            onClick={handleSeedDemo}
+            disabled={isActionPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition disabled:opacity-50 cursor-pointer"
+            title="Seed a sample live agent and full reasoning session"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Seed Demo Agent</span>
+          </button>
 
-            {/* User SSO Profile & Sign Out */}
-            <div className="flex items-center gap-2 pl-3 border-l border-slate-800/80">
-              <div className="flex items-center gap-1.5 text-xs bg-slate-900 border border-slate-800 text-slate-300 px-2.5 py-1 rounded-lg">
-                <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="font-mono text-[11px]">{userEmail}</span>
-              </div>
+          <button
+            onClick={handleResetMesh}
+            disabled={isActionPending}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 transition disabled:opacity-50 cursor-pointer"
+            title="Purge all agents, sessions, and events from PostgreSQL"
+          >
+            <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+            <span>Clear Mesh Data</span>
+          </button>
+
+          <div className="h-5 w-px bg-slate-800 mx-1" />
+
+          <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs">
+            <User className="w-3.5 h-3.5 text-sky-400" />
+            <span className="font-mono text-slate-300">{userEmail}</span>
+            {auth?.signoutRedirect && (
               <button
-                onClick={() => auth?.signoutRedirect?.()}
-                title="Sign Out"
-                className="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-slate-800/80 rounded-lg border border-slate-800 transition"
+                onClick={() => auth.signoutRedirect()}
+                className="text-slate-500 hover:text-rose-400 ml-1 transition cursor-pointer"
+                title="Sign out"
               >
                 <LogOut className="w-3.5 h-3.5" />
               </button>
-            </div>
+            )}
           </div>
         </div>
       </header>
 
-      {/* Main Body */}
-      <main className="max-w-7xl mx-auto px-6 py-8 flex-1 w-full space-y-8">
-        {/* Connection Error Banner */}
-        {errorMessage && (
-          <div className="bg-rose-950/40 border border-rose-500/40 rounded-xl p-4 flex items-start gap-3 text-rose-200">
-            <XCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <h4 className="font-semibold text-sm">API Gateway Unreachable</h4>
-              <p className="text-xs text-rose-300/80 mt-1">{errorMessage}</p>
-              <p className="text-[11px] text-rose-400/60 mt-1 font-mono">
-                Ensure Aspire AppHost is running: <code className="bg-black/30 px-1 py-0.5 rounded">dotnet run --project src/AgentMesh.AppHost</code>
-              </p>
-            </div>
+      {/* API Error Banner */}
+      {apiError && (
+        <div className="bg-rose-950/80 border-b border-rose-500/40 px-5 py-2.5 flex items-center justify-between text-xs text-rose-200 shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span className="font-semibold">API Gateway Unreachable:</span>
+            <span className="font-mono">{apiError}</span>
           </div>
-        )}
+          <button
+            onClick={() => {
+              setApiError(null);
+              fetchAllData();
+            }}
+            className="px-2.5 py-1 rounded bg-rose-900/60 hover:bg-rose-800 text-rose-100 font-medium transition cursor-pointer"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
-        {activeTab === 'health' ? (
-          <>
-            {/* High-Level Overview Metrics */}
-            <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          {/* Card 1: System Status */}
-          <div className="bg-slate-900/80 border border-slate-800/80 rounded-xl p-5 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Mesh Status</span>
-              {isAllHealthy ? (
-                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-              ) : (
-                <AlertTriangle className="w-4 h-4 text-amber-400" />
-              )}
-            </div>
-            <div className="mt-2 flex items-baseline gap-2">
-              <span className={`text-2xl font-black ${isAllHealthy ? 'text-emerald-400' : 'text-amber-400'}`}>
-                {statusData?.status || (isLoading ? 'Checking...' : 'Offline')}
+      {/* Main Split View */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Left Sidebar: Connected Agents & Their Sessions */}
+        <aside className="w-80 border-r border-slate-800/80 bg-slate-900/40 flex flex-col shrink-0">
+          <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Bot className="w-4 h-4 text-sky-400" />
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                Connected Agents ({agents.length})
               </span>
             </div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              {isAllHealthy ? 'All services operational' : 'One or more services degraded'}
-            </p>
+            <button
+              onClick={() => setShowRegisterModal((v) => !v)}
+              className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Agent</span>
+            </button>
           </div>
 
-          {/* Card 2: Services Verified */}
-          <div className="bg-slate-900/80 border border-slate-800/80 rounded-xl p-5 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Verified Services</span>
-              <Layers className="w-4 h-4 text-sky-400" />
-            </div>
-            <div className="mt-2 flex items-baseline gap-2">
-              <span className="text-2xl font-black text-sky-400">
-                {healthyCount} <span className="text-sm font-normal text-slate-400">/ {totalCount}</span>
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Postgres, Redis, Temporal, S3, API
-            </p>
-          </div>
-
-          {/* Card 3: Runtime Environment */}
-          <div className="bg-slate-900/80 border border-slate-800/80 rounded-xl p-5 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Host Platform</span>
-              <Terminal className="w-4 h-4 text-purple-400" />
-            </div>
-            <div className="mt-2 flex items-baseline gap-2">
-              <span className="text-lg font-bold text-slate-200">
-                .NET 10 Aspire
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-400 mt-1 font-mono">
-              Rootless Podman Containers
-            </p>
-          </div>
-
-          {/* Card 4: Last Heartbeat */}
-          <div className="bg-slate-900/80 border border-slate-800/80 rounded-xl p-5 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Last Check</span>
-              <Clock className="w-4 h-4 text-emerald-400" />
-            </div>
-            <div className="mt-2 flex items-baseline gap-2">
-              <span className="text-sm font-mono text-slate-300">
-                {lastUpdated ? lastUpdated.toLocaleTimeString() : 'Pending'}
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Active polling every 5s
-            </p>
-          </div>
-        </section>
-
-        {/* Detailed Service Health Cards */}
-        <section className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-base font-bold text-white tracking-tight flex items-center gap-2">
-              <Activity className="w-4 h-4 text-sky-400" />
-              Infrastructure & Service Mesh Health
-            </h2>
-            <span className="text-xs text-slate-400">
-              Validated via live ping & gRPC health probes
-            </span>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-            {SERVICE_CONFIGS.map((config) => {
-              const svcHealth = services[config.key] as ServiceHealth | undefined;
-              const isHealthy = svcHealth?.status === 'Healthy';
-              const isDegraded = svcHealth && !isHealthy;
-              const Icon = config.icon;
-
-              return (
-                <div
-                  key={config.key}
-                  className="bg-slate-900/70 border border-slate-800/90 hover:border-slate-700/80 rounded-xl p-5 transition flex flex-col justify-between shadow-sm relative overflow-hidden group"
+          {/* Inline Register Agent Drawer */}
+          {showRegisterModal && (
+            <form
+              onSubmit={handleRegisterAgent}
+              className="p-3.5 bg-slate-900/90 border-b border-slate-800 space-y-2.5 text-xs"
+            >
+              <div className="font-semibold text-slate-200">Register Live Agent</div>
+              <input
+                type="text"
+                placeholder="Agent ID (e.g. agy-cli)"
+                value={newAgentId}
+                onChange={(e) => setNewAgentId(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
+                required
+              />
+              <input
+                type="text"
+                placeholder="Display Name (e.g. Agy Local CLI)"
+                value={newAgentName}
+                onChange={(e) => setNewAgentName(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
+                required
+              />
+              <input
+                type="text"
+                placeholder="Role (e.g. Codebase Engineer)"
+                value={newAgentRole}
+                onChange={(e) => setNewAgentRole(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
+              />
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowRegisterModal(false)}
+                  className="px-2.5 py-1 rounded text-slate-400 hover:text-slate-200"
                 >
-                  {/* Status Indicator Bar at top */}
-                  <div
-                    className={`absolute top-0 left-0 right-0 h-1 transition-colors ${
-                      isHealthy
-                        ? 'bg-emerald-500'
-                        : isDegraded
-                        ? 'bg-rose-500'
-                        : 'bg-slate-700'
-                    }`}
-                  />
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium"
+                >
+                  Register
+                </button>
+              </div>
+            </form>
+          )}
 
-                  <div>
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2 rounded-lg bg-slate-800/90 text-sky-400 border border-slate-700/50">
-                          <Icon className="w-5 h-5" />
-                        </div>
-                        <div>
-                          <h3 className="text-sm font-bold text-white group-hover:text-sky-300 transition-colors">
-                            {config.name}
-                          </h3>
-                          {config.portInfo && (
-                            <span className="text-[11px] font-mono text-slate-400">
-                              {config.portInfo}
-                            </span>
-                          )}
+          {/* Agent & Session List */}
+          <div className="flex-1 overflow-y-auto p-3 space-y-4">
+            {isLoading ? (
+              <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
+                <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
+                <span>Loading agents...</span>
+              </div>
+            ) : agents.length === 0 ? (
+              <div className="p-5 rounded-xl border border-dashed border-slate-800 bg-slate-900/30 text-center space-y-3 my-4">
+                <Bot className="w-8 h-8 text-slate-600 mx-auto" />
+                <div>
+                  <h3 className="text-xs font-semibold text-slate-300">No Agents Connected</h3>
+                  <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                    Database is clean. Connect an external CLI agent or seed a demo agent to inspect a live session.
+                  </p>
+                </div>
+                <button
+                  onClick={handleSeedDemo}
+                  disabled={isActionPending}
+                  className="w-full py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Seed Demo Agent</span>
+                </button>
+              </div>
+            ) : (
+              agents.map((agent) => {
+                const agentSessions = sessions.filter((s) => s.creatorAgentId === agent.id);
+                const isAgentSelected = selectedAgent?.id === agent.id;
+                const isBusy =
+                  agent.status === 'busy' || agentSessions.some((s) => s.status === 'thinking');
+
+                return (
+                  <div
+                    key={agent.id}
+                    className={`rounded-xl border transition ${
+                      isAgentSelected
+                        ? 'border-slate-700 bg-slate-900/80'
+                        : 'border-slate-800/70 bg-slate-900/30 hover:border-slate-800'
+                    }`}
+                  >
+                    {/* Agent Header */}
+                    <div
+                      onClick={() => {
+                        setSelectedAgentId(agent.id);
+                        if (agentSessions.length > 0 && !agentSessions.some((s) => s.id === selectedSessionId)) {
+                          setSelectedSessionId(agentSessions[0].id);
+                        }
+                      }}
+                      className="p-3 flex items-start justify-between cursor-pointer"
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <span
+                          className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${
+                            isBusy
+                              ? 'bg-amber-400 animate-pulse'
+                              : agent.status === 'offline'
+                              ? 'bg-slate-600'
+                              : 'bg-emerald-400'
+                          }`}
+                        />
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold text-white truncate">{agent.name}</div>
+                          <div className="text-[11px] font-mono text-slate-400 truncate">
+                            @{agent.id} · {agent.role || 'Agent'}
+                          </div>
                         </div>
                       </div>
 
-                      {/* Status Badge */}
-                      <span
-                        className={`text-xs font-semibold px-2.5 py-0.5 rounded-full border flex items-center gap-1 shrink-0 ${
-                          isHealthy
-                            ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-400'
-                            : isDegraded
-                            ? 'bg-rose-950/60 border-rose-500/40 text-rose-400'
-                            : 'bg-slate-800 border-slate-700 text-slate-400'
-                        }`}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedAgentId(agent.id);
+                          setIsCreatingSession(true);
+                        }}
+                        className="p-1 rounded-md bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition shrink-0 cursor-pointer"
+                        title={`New Session with ${agent.name}`}
                       >
-                        {isHealthy ? (
-                          <>
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                            Healthy
-                          </>
-                        ) : isDegraded ? (
-                          <>
-                            <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-                            Unhealthy
-                          </>
-                        ) : (
-                          'Probing...'
-                        )}
-                      </span>
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
                     </div>
 
-                    <p className="text-xs text-slate-400 mt-3 leading-relaxed">
-                      {svcHealth?.description || config.defaultDescription}
-                    </p>
-                  </div>
-
-                  <div className="mt-4 pt-3 border-t border-slate-800/70 flex items-center justify-between text-xs">
-                    <div className="font-mono text-[11px] text-slate-400">
-                      {svcHealth?.latencyMs !== undefined ? (
-                        <span>
-                          Latency:{' '}
-                          <span
-                            className={
-                              svcHealth.latencyMs < 50
-                                ? 'text-emerald-400 font-bold'
-                                : 'text-amber-400 font-bold'
-                            }
-                          >
-                            {svcHealth.latencyMs}ms
-                          </span>
-                        </span>
+                    {/* Agent's Sessions */}
+                    <div className="px-2 pb-2 space-y-1">
+                      {agentSessions.length === 0 ? (
+                        <div className="px-2 py-1.5 text-[11px] text-slate-500 italic">
+                          No sessions yet
+                        </div>
                       ) : (
-                        <span>Latency: --</span>
+                        agentSessions.map((session) => {
+                          const isSelected = session.id === selectedSessionId && !isCreatingSession;
+                          const isThinking = session.status === 'thinking';
+
+                          return (
+                            <button
+                              key={session.id}
+                              onClick={() => {
+                                setSelectedAgentId(agent.id);
+                                setSelectedSessionId(session.id);
+                                setIsCreatingSession(false);
+                              }}
+                              className={`w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
+                                isSelected
+                                  ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 font-medium'
+                                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200 border border-transparent'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                {isThinking ? (
+                                  <RefreshCw className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
+                                ) : (
+                                  <MessageSquare className="w-3 h-3 text-slate-500 shrink-0" />
+                                )}
+                                <span className="truncate">{session.title}</span>
+                              </div>
+                              <ChevronRight className="w-3 h-3 opacity-50 shrink-0" />
+                            </button>
+                          );
+                        })
                       )}
                     </div>
-
-                    {config.externalLink && (
-                      <a
-                        href={config.externalLink}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1 font-semibold text-[11px] transition"
-                      >
-                        Open UI <ExternalLink className="w-3 h-3" />
-                      </a>
-                    )}
                   </div>
-                </div>
-              );
-            })}
-
-            {/* Extra Card: Temporal Worker Host */}
-            <div className="bg-slate-900/70 border border-slate-800/90 rounded-xl p-5 flex flex-col justify-between shadow-sm relative overflow-hidden">
-              <div className="absolute top-0 left-0 right-0 h-1 bg-sky-500" />
-              <div>
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 rounded-lg bg-slate-800/90 text-sky-400 border border-slate-700/50">
-                      <Terminal className="w-5 h-5" />
-                    </div>
-                    <div>
-                      <h3 className="text-sm font-bold text-white">Temporal Worker Host</h3>
-                      <span className="text-[11px] font-mono text-slate-400">
-                        agent-task-queue
-                      </span>
-                    </div>
-                  </div>
-                  <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full border bg-sky-950/60 border-sky-500/40 text-sky-400 flex items-center gap-1 shrink-0">
-                    <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
-                    Ready
-                  </span>
-                </div>
-
-                <p className="text-xs text-slate-400 mt-3 leading-relaxed">
-                  Background worker polling Temporal task queue for deterministic workflows and activities.
-                </p>
-              </div>
-
-              <div className="mt-4 pt-3 border-t border-slate-800/70 flex items-center justify-between text-xs">
-                <span className="text-slate-400 text-[11px]">Workflows: AgentTaskWorkflow</span>
-                <span className="text-emerald-400 font-mono text-[11px]">Registered</span>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Raw Diagnostics Inspector (Collapsible) */}
-        <section className="bg-slate-900/60 border border-slate-800/80 rounded-xl p-5 shadow-sm">
-          <div className="flex items-center justify-between">
-            <button
-              onClick={() => setShowRawJson(!showRawJson)}
-              className="flex items-center gap-2 text-xs font-bold text-slate-300 hover:text-white transition"
-            >
-              <Code2 className="w-4 h-4 text-sky-400" />
-              <span>Diagnostic Raw JSON Payload (/api/status)</span>
-              <span className="text-[10px] text-slate-400 font-normal">
-                {showRawJson ? '(Click to collapse)' : '(Click to expand)'}
-              </span>
-            </button>
-
-            {showRawJson && (
-              <button
-                onClick={copyToClipboard}
-                className="text-xs font-mono px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition"
-              >
-                {copySuccess ? 'Copied!' : 'Copy JSON'}
-              </button>
+                );
+              })
             )}
           </div>
+        </aside>
 
-          {showRawJson && (
-            <div className="mt-4">
-              <pre className="bg-slate-950/90 border border-slate-800/90 rounded-lg p-4 text-xs font-mono text-sky-300/90 overflow-x-auto max-h-96">
-                {statusData ? JSON.stringify(statusData, null, 2) : 'No diagnostic data available.'}
-              </pre>
+        {/* Right Main Panel: Active Session Trajectory or New Session Composer */}
+        <main className="flex-1 flex flex-col bg-slate-950 overflow-hidden">
+          {isCreatingSession && selectedAgent ? (
+            <div className="flex-1 flex items-center justify-center p-6">
+              <form
+                onSubmit={handleCreateSession}
+                className="max-w-lg w-full bg-slate-900/70 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl"
+              >
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                    <Bot className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-bold text-white">
+                      Start New Session with {selectedAgent.name}
+                    </h2>
+                    <p className="text-xs text-slate-400 font-mono">@{selectedAgent.id}</p>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-semibold text-slate-300">
+                    Session Objective / Title
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Refactor authentication middleware"
+                    value={newSessionTitle}
+                    onChange={(e) => setNewSessionTitle(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
+                    required
+                    autoFocus
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-semibold text-slate-300">
+                    Initial Prompt (Optional)
+                  </label>
+                  <textarea
+                    rows={3}
+                    placeholder="Enter an initial instruction for the agent to begin reasoning..."
+                    value={newSessionPrompt}
+                    onChange={(e) => setNewSessionPrompt(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
+                  />
+                </div>
+
+                <div className="flex items-center justify-end gap-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsCreatingSession(false)}
+                    className="px-4 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isActionPending}
+                    className="px-4 py-2 rounded-lg text-xs font-semibold bg-sky-600 hover:bg-sky-500 text-white transition cursor-pointer"
+                  >
+                    Launch Session
+                  </button>
+                </div>
+              </form>
+            </div>
+          ) : selectedSession ? (
+            <>
+              {/* Active Session Header */}
+              <div className="px-6 py-3.5 border-b border-slate-800/80 bg-slate-900/30 flex items-center justify-between shrink-0">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2.5">
+                    <h2 className="text-sm font-bold text-white truncate">
+                      {selectedSession.title}
+                    </h2>
+                    <span
+                      className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${
+                        selectedSession.status === 'thinking'
+                          ? 'bg-amber-500/10 text-amber-300 border-amber-500/30 animate-pulse'
+                          : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                      }`}
+                    >
+                      {selectedSession.status === 'thinking' ? 'Thinking...' : selectedSession.status}
+                    </span>
+                  </div>
+                  <div className="text-xs text-slate-400 flex items-center gap-2 mt-0.5 font-mono">
+                    <span>Agent: {selectedAgent?.name || selectedSession.creatorAgentId || 'agy'}</span>
+                    <span>·</span>
+                    <span>{events.length} trajectory events</span>
+                  </div>
+                </div>
+
+                {selectedAgent && (
+                  <button
+                    onClick={() => setIsCreatingSession(true)}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center gap-1.5 transition cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>New Session</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Trajectory Events Stream */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                {events.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 space-y-2">
+                    <Activity className="w-8 h-8 text-slate-700" />
+                    <p className="text-sm font-medium text-slate-400">Session initialized</p>
+                    <p className="text-xs max-w-sm">
+                      Send a prompt below or stream events from your CLI agent to see live reasoning, tool calls, and outputs.
+                    </p>
+                  </div>
+                ) : (
+                  events.map((ev) => {
+                    const type = ev.eventType || 'response';
+
+                    if (type === 'prompt') {
+                      return (
+                        <div key={ev.id} className="flex justify-end">
+                          <div className="max-w-2xl bg-sky-600/15 border border-sky-500/30 rounded-2xl rounded-tr-sm px-4 py-3 text-slate-100">
+                            <div className="flex items-center justify-between gap-4 text-[11px] font-mono text-sky-400 mb-1">
+                              <span>Prompt ({ev.senderAgentId})</span>
+                              <span>{new Date(ev.createdAt).toLocaleTimeString()}</span>
+                            </div>
+                            <p className="text-sm whitespace-pre-wrap leading-relaxed">{ev.content}</p>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    if (type === 'thought') {
+                      return (
+                        <details
+                          key={ev.id}
+                          open
+                          className="group bg-indigo-950/20 border border-indigo-500/25 rounded-xl overflow-hidden"
+                        >
+                          <summary className="px-4 py-2.5 cursor-pointer flex items-center justify-between text-xs font-medium text-indigo-300 hover:bg-indigo-950/30 select-none">
+                            <div className="flex items-center gap-2">
+                              <Brain className="w-4 h-4 text-indigo-400 shrink-0" />
+                              <span>Agent Reasoning / Thought</span>
+                              <span className="text-[11px] font-mono text-indigo-400/70">
+                                @{ev.senderAgentId}
+                              </span>
+                            </div>
+                            <span className="text-[11px] font-mono text-slate-500">
+                              {new Date(ev.createdAt).toLocaleTimeString()}
+                            </span>
+                          </summary>
+                          <div className="px-4 pb-3 pt-1 text-xs text-slate-300 font-mono leading-relaxed whitespace-pre-wrap border-t border-indigo-500/10">
+                            {ev.content}
+                          </div>
+                        </details>
+                      );
+                    }
+
+                    if (type === 'tool_call') {
+                      return (
+                        <details
+                          key={ev.id}
+                          className="bg-amber-950/15 border border-amber-500/25 rounded-xl overflow-hidden"
+                        >
+                          <summary className="px-4 py-2.5 cursor-pointer flex items-center justify-between text-xs font-medium text-amber-300 hover:bg-amber-950/25 select-none">
+                            <div className="flex items-center gap-2">
+                              <Wrench className="w-4 h-4 text-amber-400 shrink-0" />
+                              <span className="font-mono font-bold text-amber-200">
+                                {ev.toolName || 'tool_call'}
+                              </span>
+                              <span className="text-slate-300">{ev.content}</span>
+                            </div>
+                            <span className="text-[11px] font-mono text-slate-500">
+                              {new Date(ev.createdAt).toLocaleTimeString()}
+                            </span>
+                          </summary>
+                          {ev.toolArgsJson && (
+                            <div className="px-4 py-2.5 bg-slate-950/80 border-t border-amber-500/15">
+                              <div className="text-[10px] font-mono uppercase text-slate-500 mb-1">
+                                Arguments
+                              </div>
+                              <pre className="text-xs font-mono text-amber-200/90 overflow-x-auto">
+                                {ev.toolArgsJson}
+                              </pre>
+                            </div>
+                          )}
+                        </details>
+                      );
+                    }
+
+                    if (type === 'tool_result') {
+                      return (
+                        <details
+                          key={ev.id}
+                          className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden"
+                        >
+                          <summary className="px-4 py-2 cursor-pointer flex items-center justify-between text-xs text-slate-300 hover:bg-slate-900 select-none">
+                            <div className="flex items-center gap-2">
+                              <Terminal className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              <span className="font-mono text-emerald-400">
+                                {ev.toolName ? `${ev.toolName} →` : 'Tool Output'}
+                              </span>
+                              <span className="text-slate-400">{ev.content}</span>
+                            </div>
+                            <span className="text-[11px] font-mono text-slate-500">
+                              {new Date(ev.createdAt).toLocaleTimeString()}
+                            </span>
+                          </summary>
+                          {ev.toolResultJson && (
+                            <div className="px-4 py-2.5 bg-slate-950 border-t border-slate-800">
+                              <pre className="text-xs font-mono text-slate-300 overflow-x-auto whitespace-pre-wrap">
+                                {ev.toolResultJson}
+                              </pre>
+                            </div>
+                          )}
+                        </details>
+                      );
+                    }
+
+                    // Default: 'response'
+                    return (
+                      <div
+                        key={ev.id}
+                        className="bg-slate-900/90 border border-slate-800 rounded-2xl rounded-tl-sm px-5 py-4 text-slate-100 shadow-lg"
+                      >
+                        <div className="flex items-center justify-between text-xs font-mono text-emerald-400 mb-2">
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 className="w-4 h-4" />
+                            <span className="font-bold">@{ev.senderAgentId}</span>
+                          </div>
+                          <span className="text-slate-500">
+                            {new Date(ev.createdAt).toLocaleTimeString()}
+                          </span>
+                        </div>
+                        <div className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200">
+                          {ev.content}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+
+                {selectedSession.status === 'thinking' && (
+                  <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-indigo-950/20 border border-indigo-500/20 text-xs text-indigo-300 w-fit">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                    <span>Agent is reasoning...</span>
+                  </div>
+                )}
+
+                <div ref={timelineEndRef} />
+              </div>
+
+              {/* Bottom Prompt Bar */}
+              <form
+                onSubmit={handleSendPrompt}
+                className="p-4 border-t border-slate-800/80 bg-slate-900/50 shrink-0 space-y-2"
+              >
+                <div className="flex items-center gap-2.5">
+                  <input
+                    type="text"
+                    placeholder={`Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'}...`}
+                    value={promptInput}
+                    onChange={(e) => setPromptInput(e.target.value)}
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!promptInput.trim()}
+                    className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Send</span>
+                  </button>
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
+                  <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={simulateResponse}
+                      onChange={(e) => setSimulateResponse(e.target.checked)}
+                      className="rounded border-slate-700 bg-slate-900 text-sky-500"
+                    />
+                    <span>Simulate live agent thinking & tool calls on prompt</span>
+                  </label>
+                  <span className="font-mono text-slate-500">
+                    Session ID: {selectedSession.id.slice(0, 8)}
+                  </span>
+                </div>
+              </form>
+            </>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
+              <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-sky-400">
+                <Bot className="w-7 h-7" />
+              </div>
+              <div className="max-w-md space-y-1.5">
+                <h2 className="text-lg font-bold text-white">Agent Session Observatory</h2>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Select an agent on the left to inspect its reasoning sessions, or click{' '}
+                  <strong className="text-indigo-300">Seed Demo Agent</strong> to populate a realistic multi-step agent trajectory.
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={handleSeedDemo}
+                  disabled={isActionPending}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  <span>Seed Demo Agent & Session</span>
+                </button>
+                {selectedAgent && (
+                  <button
+                    onClick={() => setIsCreatingSession(true)}
+                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>New Session with {selectedAgent.name}</span>
+                  </button>
+                )}
+              </div>
             </div>
           )}
-        </section>
-      </>
-    ) : (
-      <section>
-        <SessionLedger agents={agents} />
-      </section>
-    )}
-      </main>
-
-      {/* Footer */}
-      <footer className="border-t border-slate-800/70 py-4 text-center text-xs text-slate-400 bg-slate-950">
-        AgentMesh Control Plane &copy; 2026. Powered by .NET 10, Aspire, Temporal, and React 19.
-      </footer>
+        </main>
+      </div>
     </div>
   );
 }

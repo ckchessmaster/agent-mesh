@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Security.Claims;
 using System.Text.Json;
+using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
@@ -46,6 +47,7 @@ public class SessionTools(
         [Description("Human-readable display name, e.g. 'Antigravity CLI'")] string name,
         [Description("Runtime environment type: 'Cli', 'Subagent', 'Cloud', 'Copilot', or 'Ide'")] string runtimeType = "Cli",
         [Description("Optional persona prompt or core mission description")] string? personaPrompt = null,
+        [Description("Optional role description, e.g. 'Lead Engineer'")] string? role = null,
         CancellationToken ct = default)
     {
         var normalizedId = agentId.Trim().ToLowerInvariant();
@@ -53,14 +55,20 @@ public class SessionTools(
         var existing = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
         if (existing != null)
         {
+            existing.Status = "online";
+            existing.LastHeartbeatAt = DateTimeOffset.UtcNow;
+            existing.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+
             return JsonSerializer.Serialize(new
             {
                 status = "already_registered",
                 agentId = existing.Id,
                 name = existing.Name,
+                role = existing.Role,
                 runtimeType = existing.RuntimeType.ToString(),
                 trustTier = existing.TrustTier.ToString(),
-                message = $"Agent '{normalizedId}' is already registered."
+                message = $"Agent '{normalizedId}' is already registered and marked online."
             }, new JsonSerializerOptions { WriteIndented = true });
         }
 
@@ -76,11 +84,15 @@ public class SessionTools(
         {
             Id = normalizedId,
             Name = name.Trim(),
+            Role = role ?? "Autonomous Agent",
+            Status = "online",
             RuntimeType = parsedRuntime,
             TrustTier = TrustTier.Intern,
             PersonaPrompt = personaPrompt ?? $"Autonomous Agent ({normalizedId})",
             MemorySummary = string.Empty,
+            CapabilitiesJson = "[]",
             ApiKeyHash = hashedToken,
+            LastHeartbeatAt = DateTimeOffset.UtcNow,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
         };
@@ -94,6 +106,7 @@ public class SessionTools(
             status = "registered",
             agentId = agent.Id,
             name = agent.Name,
+            role = agent.Role,
             runtimeType = agent.RuntimeType.ToString(),
             token = rawToken,
             instructions = "Set 'Authorization: Bearer <token>' in your MCP client headers for all future tool calls."
@@ -101,7 +114,7 @@ public class SessionTools(
     }
 
     [McpServerTool(Name = "create_session")]
-    [Description("Creates a new collaborative session workspace for agy and records it in PostgreSQL.")]
+    [Description("Creates a new session strictly owned by an agent and records it in PostgreSQL.")]
     public async Task<string> CreateSession(
         [Description("Descriptive title for the work session")] string title,
         [Description("Optional JSON metadata string describing branch, directory, or objectives")] string? metadataJson = null,
@@ -132,6 +145,7 @@ public class SessionTools(
             {
                 SessionId = session.Id,
                 SenderAgentId = callerAgentId,
+                EventType = "prompt",
                 Content = initialMessage.Trim(),
                 CreatedAt = DateTimeOffset.UtcNow
             });
@@ -156,7 +170,7 @@ public class SessionTools(
     }
 
     [McpServerTool(Name = "list_sessions")]
-    [Description("Lists active and past sessions for agy, ordered by most recently updated.")]
+    [Description("Lists active and past sessions, ordered by most recently updated.")]
     public async Task<string> ListSessions(
         [Description("Optional filter: 'active', 'completed', or 'all' (default is 'active')")] string? status = "active",
         CancellationToken ct = default)
@@ -187,7 +201,7 @@ public class SessionTools(
     }
 
     [McpServerTool(Name = "get_session")]
-    [Description("Retrieves details of a specific session including full message ledger history.")]
+    [Description("Retrieves details of a specific session including full trajectory history.")]
     public async Task<string> GetSession(
         [Description("The GUID string of the session to retrieve")] string sessionId,
         CancellationToken ct = default)
@@ -199,13 +213,22 @@ public class SessionTools(
 
         var session = await db.AgentSessions
             .AsNoTracking()
-            .Include(s => s.CreatorAgent)
             .Include(s => s.Messages.OrderBy(m => m.CreatedAt))
             .FirstOrDefaultAsync(s => s.Id == id, ct);
 
         if (session == null)
         {
             return JsonSerializer.Serialize(new { error = $"Session '{sessionId}' not found." });
+        }
+
+        string? creatorAgentName = null;
+        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        {
+            creatorAgentName = await db.Agents
+                .AsNoTracking()
+                .Where(a => a.Id == session.CreatorAgentId)
+                .Select(a => a.Name)
+                .FirstOrDefaultAsync(ct);
         }
 
         var result = new
@@ -215,7 +238,7 @@ public class SessionTools(
             session.Status,
             session.MetadataJson,
             session.CreatorAgentId,
-            CreatorAgentName = session.CreatorAgent?.Name,
+            CreatorAgentName = creatorAgentName,
             session.CreatedAt,
             session.UpdatedAt,
             Messages = session.Messages.Select(m => new
@@ -223,7 +246,11 @@ public class SessionTools(
                 m.Id,
                 m.SenderAgentId,
                 m.TargetAgentId,
+                m.EventType,
                 m.Content,
+                m.ToolName,
+                m.ToolArgsJson,
+                m.ToolResultJson,
                 m.StructuredPayloadJson,
                 m.CreatedAt
             })
@@ -232,13 +259,45 @@ public class SessionTools(
         return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
     }
 
+    [McpServerTool(Name = "append_thought")]
+    [Description("Streams a reasoning / chain-of-thought step into the agent session timeline.")]
+    public Task<string> AppendThought(
+        [Description("The GUID string of the session")] string sessionId,
+        [Description("The internal reasoning or thought content")] string thought,
+        CancellationToken ct = default) =>
+        AddSessionMessage(sessionId, thought, eventType: "thought", ct: ct);
+
+    [McpServerTool(Name = "record_tool_call")]
+    [Description("Records a tool invocation in the agent session timeline.")]
+    public Task<string> RecordToolCall(
+        [Description("The GUID string of the session")] string sessionId,
+        [Description("Name of the invoked tool, e.g. 'run_command'")] string toolName,
+        [Description("JSON string of tool arguments")] string toolArgsJson,
+        [Description("Brief summary of the tool invocation")] string summary = "Invoking tool",
+        CancellationToken ct = default) =>
+        AddSessionMessage(sessionId, summary, eventType: "tool_call", toolName: toolName, toolArgsJson: toolArgsJson, ct: ct);
+
+    [McpServerTool(Name = "record_tool_result")]
+    [Description("Records the output/result of a tool invocation in the agent session timeline.")]
+    public Task<string> RecordToolResult(
+        [Description("The GUID string of the session")] string sessionId,
+        [Description("Name of the invoked tool")] string toolName,
+        [Description("Output or result of the tool execution")] string toolResult,
+        [Description("Brief summary of the tool completion")] string summary = "Tool execution completed",
+        CancellationToken ct = default) =>
+        AddSessionMessage(sessionId, summary, eventType: "tool_result", toolName: toolName, toolResultJson: toolResult, ct: ct);
+
     [McpServerTool(Name = "add_session_message")]
-    [Description("Appends a message or status update into the session ledger transcript.")]
+    [Description("Appends a trajectory event or message into the session ledger transcript.")]
     public async Task<string> AddSessionMessage(
         [Description("The GUID string of the session")] string sessionId,
-        [Description("Message content or text update from agy")] string content,
+        [Description("Message content or text update from the agent")] string content,
         [Description("Optional target recipient agent ID")] string? targetAgentId = null,
         [Description("Optional JSON payload with structured data")] string? structuredPayloadJson = null,
+        [Description("Trajectory event type: 'prompt', 'thought', 'tool_call', 'tool_result', or 'response'")] string eventType = "response",
+        [Description("Optional tool name when eventType is 'tool_call' or 'tool_result'")] string? toolName = null,
+        [Description("Optional JSON arguments when eventType is 'tool_call'")] string? toolArgsJson = null,
+        [Description("Optional output when eventType is 'tool_result'")] string? toolResultJson = null,
         CancellationToken ct = default)
     {
         if (!Guid.TryParse(sessionId, out var id))
@@ -258,26 +317,46 @@ public class SessionTools(
             return UnauthorizedResponse();
         }
 
+        var normalizedEventType = string.IsNullOrWhiteSpace(eventType) ? "response" : eventType.Trim().ToLowerInvariant();
+
         var message = new SessionMessage
         {
             SessionId = id,
             SenderAgentId = senderId,
-            TargetAgentId = targetAgentId,
+            TargetAgentId = targetAgentId ?? session.CreatorAgentId,
+            EventType = normalizedEventType,
             Content = content.Trim(),
+            ToolName = toolName,
+            ToolArgsJson = toolArgsJson,
+            ToolResultJson = toolResultJson,
             StructuredPayloadJson = structuredPayloadJson,
             CreatedAt = DateTimeOffset.UtcNow
         };
 
         db.SessionMessages.Add(message);
         session.UpdatedAt = DateTimeOffset.UtcNow;
+        session.Status = normalizedEventType is "prompt" or "thought" or "tool_call" ? "thinking" : "active";
         await db.SaveChangesAsync(ct);
 
-        logger.LogInformation("Message appended to session {SessionId} by {SenderId}", id, senderId);
+        logger.LogInformation("Event ({EventType}) appended to session {SessionId} by {SenderId}", normalizedEventType, id, senderId);
 
         if (hubContext != null)
         {
-            await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", message, ct);
-            await hubContext.Clients.All.SendAsync("ReceiveMessage", message, ct);
+            var dto = new SessionMessageDto(
+                message.Id,
+                message.SessionId,
+                message.SenderAgentId,
+                message.TargetAgentId,
+                message.Content,
+                message.StructuredPayloadJson,
+                message.CreatedAt,
+                message.EventType,
+                message.ToolName,
+                message.ToolArgsJson,
+                message.ToolResultJson
+            );
+            await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", dto, ct);
+            await hubContext.Clients.All.SendAsync("ReceiveMessage", dto, ct);
         }
 
         return JsonSerializer.Serialize(new
@@ -285,16 +364,17 @@ public class SessionTools(
             status = "appended",
             messageId = message.Id,
             sessionId = message.SessionId,
+            eventType = message.EventType,
             senderAgentId = message.SenderAgentId,
             createdAt = message.CreatedAt
         }, new JsonSerializerOptions { WriteIndented = true });
     }
 
     [McpServerTool(Name = "update_session_status")]
-    [Description("Updates the status of an agent session ('active', 'completed', or 'archived').")]
+    [Description("Updates the status of an agent session ('active', 'thinking', 'completed', or 'archived').")]
     public async Task<string> UpdateSessionStatus(
         [Description("The GUID string of the session")] string sessionId,
-        [Description("New status: 'active', 'completed', or 'archived'")] string status,
+        [Description("New status: 'active', 'thinking', 'completed', or 'archived'")] string status,
         CancellationToken ct = default)
     {
         if (!Guid.TryParse(sessionId, out var id))

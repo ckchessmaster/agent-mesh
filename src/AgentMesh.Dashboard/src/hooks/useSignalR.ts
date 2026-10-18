@@ -6,28 +6,39 @@ export function useSignalR(hubUrl: string = '/hubs/agent-mesh') {
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
-    const conn = new signalR.HubConnectionBuilder()
-      .withUrl(hubUrl)
-      .withAutomaticReconnect([0, 2000, 5000, 10000])
-      .configureLogging(signalR.LogLevel.Information)
-      .build();
+    let conn: signalR.HubConnection | null = null;
+    try {
+      const origin =
+        typeof window !== 'undefined' && window.location?.origin?.startsWith('http')
+          ? window.location.origin
+          : 'http://localhost:3000';
+      const resolvedUrl = hubUrl.startsWith('http') ? hubUrl : `${origin}${hubUrl}`;
 
-    conn.onreconnecting(() => setConnected(false));
-    conn.onreconnected(() => setConnected(true));
-    conn.onclose(() => setConnected(false));
+      conn = new signalR.HubConnectionBuilder()
+        .withUrl(resolvedUrl)
+        .withAutomaticReconnect([0, 2000, 5000, 10000])
+        .configureLogging(signalR.LogLevel.Warning)
+        .build();
 
-    conn.start()
-      .then(() => {
-        setConnected(true);
-        setConnection(conn);
-      })
-      .catch((err) => {
-        console.warn('SignalR Connection Error (will retry):', err);
-        setConnected(false);
-      });
+      conn.onreconnecting(() => setConnected(false));
+      conn.onreconnected(() => setConnected(true));
+      conn.onclose(() => setConnected(false));
+
+      conn
+        .start()
+        .then(() => {
+          setConnected(true);
+          setConnection(conn);
+        })
+        .catch(() => {
+          setConnected(false);
+        });
+    } catch {
+      setConnected(false);
+    }
 
     return () => {
-      conn.stop();
+      conn?.stop().catch(() => {});
     };
   }, [hubUrl]);
 

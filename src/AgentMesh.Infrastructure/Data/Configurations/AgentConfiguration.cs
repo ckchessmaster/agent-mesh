@@ -20,6 +20,16 @@ public class AgentConfiguration : IEntityTypeConfiguration<Agent>
             .HasMaxLength(128)
             .IsRequired();
 
+        builder.Property(a => a.Role)
+            .HasMaxLength(128)
+            .HasDefaultValue("Autonomous Agent")
+            .IsRequired();
+
+        builder.Property(a => a.Status)
+            .HasMaxLength(32)
+            .HasDefaultValue("online")
+            .IsRequired();
+
         builder.Property(a => a.RuntimeType)
             .HasConversion<string>()
             .HasMaxLength(32)
@@ -36,8 +46,18 @@ public class AgentConfiguration : IEntityTypeConfiguration<Agent>
             .HasDefaultValue(string.Empty)
             .IsRequired();
 
+        builder.Property(a => a.CapabilitiesJson)
+            .HasColumnName("capabilities")
+            .HasColumnType("jsonb")
+            .HasDefaultValue("[]")
+            .IsRequired();
+
         builder.Property(a => a.ApiKeyHash)
             .HasMaxLength(128);
+
+        builder.Property(a => a.LastHeartbeatAt)
+            .HasDefaultValueSql("CURRENT_TIMESTAMP")
+            .IsRequired();
 
         builder.Property(a => a.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")
@@ -46,5 +66,7 @@ public class AgentConfiguration : IEntityTypeConfiguration<Agent>
         builder.Property(a => a.UpdatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")
             .IsRequired();
+
+        builder.Ignore(a => a.SentMessages);
     }
 }

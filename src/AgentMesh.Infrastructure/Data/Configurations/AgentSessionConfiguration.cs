@@ -29,11 +29,10 @@ public class AgentSessionConfiguration : IEntityTypeConfiguration<AgentSession>
         builder.Property(s => s.CreatorAgentId)
             .HasMaxLength(64);
 
-        builder.HasOne(s => s.CreatorAgent)
-            .WithMany()
-            .HasForeignKey(s => s.CreatorAgentId)
-            .OnDelete(DeleteBehavior.SetNull)
-            .IsRequired(false);
+        builder.HasIndex(s => s.CreatorAgentId)
+            .HasDatabaseName("ix_agent_sessions_creator_agent_id");
+
+        builder.Ignore(s => s.CreatorAgent);
 
         builder.Property(s => s.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")

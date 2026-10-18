@@ -18,8 +18,23 @@ public class SessionMessageConfiguration : IEntityTypeConfiguration<SessionMessa
         builder.Property(m => m.TargetAgentId)
             .HasMaxLength(64);
 
+        builder.Property(m => m.EventType)
+            .HasMaxLength(32)
+            .HasDefaultValue("response")
+            .IsRequired();
+
         builder.Property(m => m.Content)
             .IsRequired();
+
+        builder.Property(m => m.ToolName)
+            .HasMaxLength(128);
+
+        builder.Property(m => m.ToolArgsJson)
+            .HasColumnName("tool_args")
+            .HasColumnType("jsonb");
+
+        builder.Property(m => m.ToolResultJson)
+            .HasColumnName("tool_result");
 
         builder.Property(m => m.StructuredPayloadJson)
             .HasColumnName("structured_payload")
@@ -37,15 +52,7 @@ public class SessionMessageConfiguration : IEntityTypeConfiguration<SessionMessa
             .HasForeignKey(m => m.SessionId)
             .OnDelete(DeleteBehavior.Cascade);
 
-        builder.HasOne(m => m.SenderAgent)
-            .WithMany(a => a.SentMessages)
-            .HasForeignKey(m => m.SenderAgentId)
-            .OnDelete(DeleteBehavior.Restrict);
-
-        builder.HasOne(m => m.TargetAgent)
-            .WithMany()
-            .HasForeignKey(m => m.TargetAgentId)
-            .OnDelete(DeleteBehavior.Restrict)
-            .IsRequired(false);
+        builder.Ignore(m => m.SenderAgent);
+        builder.Ignore(m => m.TargetAgent);
     }
 }

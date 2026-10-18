@@ -1,10 +1,15 @@
 export interface Agent {
   id: string;
   name: string;
+  role?: string;
+  status?: 'online' | 'busy' | 'offline' | string;
   runtimeType: number | string;
   trustTier: number;
   personaPrompt?: string;
   memorySummary?: string;
+  capabilitiesJson?: string;
+  lastHeartbeatAt?: string;
+  sessionCount?: number;
   createdAt: string;
   updatedAt?: string;
 }
@@ -32,7 +37,7 @@ export interface StagedJob {
 export interface AgentSession {
   id: string;
   title: string;
-  status: string;
+  status: 'active' | 'thinking' | 'waiting_for_input' | 'completed' | 'failed' | string;
   metadataJson: string;
   creatorAgentId?: string | null;
   creatorAgentName?: string | null;
@@ -42,12 +47,18 @@ export interface AgentSession {
   messages?: SessionMessage[];
 }
 
+export type SessionEventType = 'prompt' | 'thought' | 'tool_call' | 'tool_result' | 'response' | string;
+
 export interface SessionMessage {
   id: string;
   sessionId: string;
   senderAgentId: string;
   targetAgentId?: string | null;
+  eventType?: SessionEventType;
   content: string;
+  toolName?: string | null;
+  toolArgsJson?: string | null;
+  toolResultJson?: string | null;
   structuredPayloadJson?: string | null;
   createdAt: string;
 }

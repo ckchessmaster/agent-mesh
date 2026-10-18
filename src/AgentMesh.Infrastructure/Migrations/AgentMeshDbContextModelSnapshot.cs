@@ -34,10 +34,23 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(128)")
                         .HasColumnName("api_key_hash");
 
+                    b.Property<string>("CapabilitiesJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("[]")
+                        .HasColumnName("capabilities");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<DateTimeOffset>("LastHeartbeatAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("last_heartbeat_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
 
                     b.Property<string>("MemorySummary")
@@ -58,11 +71,27 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("text")
                         .HasColumnName("persona_prompt");
 
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasDefaultValue("Autonomous Agent")
+                        .HasColumnName("role");
+
                     b.Property<string>("RuntimeType")
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)")
                         .HasColumnName("runtime_type");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasDefaultValue("online")
+                        .HasColumnName("status");
 
                     b.Property<int>("TrustTier")
                         .ValueGeneratedOnAdd()
@@ -257,6 +286,14 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnName("created_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
 
+                    b.Property<string>("EventType")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasDefaultValue("response")
+                        .HasColumnName("event_type");
+
                     b.Property<string>("SenderAgentId")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -276,17 +313,24 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("target_agent_id");
 
+                    b.Property<string>("ToolArgsJson")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("tool_args");
+
+                    b.Property<string>("ToolName")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("tool_name");
+
+                    b.Property<string>("ToolResultJson")
+                        .HasColumnType("text")
+                        .HasColumnName("tool_result");
+
                     b.HasKey("Id")
                         .HasName("pk_session_messages");
 
-                    b.HasIndex("SenderAgentId")
-                        .HasDatabaseName("ix_session_messages_sender_agent_id");
-
                     b.HasIndex("SessionId")
                         .HasDatabaseName("idx_session_messages_session");
-
-                    b.HasIndex("TargetAgentId")
-                        .HasDatabaseName("ix_session_messages_target_agent_id");
 
                     b.ToTable("session_messages", (string)null);
                 });
@@ -312,26 +356,8 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Navigation("Session");
                 });
 
-            modelBuilder.Entity("AgentMesh.Core.Models.AgentSession", b =>
-                {
-                    b.HasOne("AgentMesh.Core.Models.Agent", "CreatorAgent")
-                        .WithMany()
-                        .HasForeignKey("CreatorAgentId")
-                        .OnDelete(DeleteBehavior.SetNull)
-                        .HasConstraintName("fk_agent_sessions_agents_creator_agent_id");
-
-                    b.Navigation("CreatorAgent");
-                });
-
             modelBuilder.Entity("AgentMesh.Core.Models.SessionMessage", b =>
                 {
-                    b.HasOne("AgentMesh.Core.Models.Agent", "SenderAgent")
-                        .WithMany("SentMessages")
-                        .HasForeignKey("SenderAgentId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired()
-                        .HasConstraintName("fk_session_messages_agents_sender_agent_id");
-
                     b.HasOne("AgentMesh.Core.Models.AgentSession", "Session")
                         .WithMany("Messages")
                         .HasForeignKey("SessionId")
@@ -339,24 +365,12 @@ namespace AgentMesh.Infrastructure.Migrations
                         .IsRequired()
                         .HasConstraintName("fk_session_messages_agent_sessions_session_id");
 
-                    b.HasOne("AgentMesh.Core.Models.Agent", "TargetAgent")
-                        .WithMany()
-                        .HasForeignKey("TargetAgentId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .HasConstraintName("fk_session_messages_agents_target_agent_id");
-
-                    b.Navigation("SenderAgent");
-
                     b.Navigation("Session");
-
-                    b.Navigation("TargetAgent");
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.Agent", b =>
                 {
                     b.Navigation("RequestedJobs");
-
-                    b.Navigation("SentMessages");
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.AgentSession", b =>

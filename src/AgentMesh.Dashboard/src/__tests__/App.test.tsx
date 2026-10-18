@@ -2,15 +2,20 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
-import type { SystemStatusResponse } from '../types';
+import type { Agent, AgentSession, SessionMessage, SystemStatusResponse } from '../types';
 
 vi.mock('../services/api', () => ({
   api: {
     getStatus: vi.fn(),
     getAgents: vi.fn().mockResolvedValue([]),
     getSessions: vi.fn().mockResolvedValue([]),
-    getSessionMessages: vi.fn().mockResolvedValue([])
-  },
+    getSessionMessages: vi.fn().mockResolvedValue([]),
+    seedDemo: vi.fn(),
+    resetMesh: vi.fn(),
+    createAgentSession: vi.fn(),
+    postSessionMessage: vi.fn(),
+    upsertAgent: vi.fn()
+  }
 }));
 
 vi.mock('../auth/AuthProvider', () => ({
@@ -19,51 +24,43 @@ vi.mock('../auth/AuthProvider', () => ({
     isLoading: false,
     user: {
       profile: {
-        email: 'admin@agentmesh.local',
+        email: 'admin',
         name: 'admin'
       },
       access_token: 'mock-jwt-token'
     },
     signoutRedirect: vi.fn()
   })),
-  AppAuthProvider: ({ children }: { children: any }) => children
+  AppAuthProvider: ({ children }: { children: React.ReactNode }) => children
 }));
 
-describe('App - Health Cockpit & Sessions', () => {
+describe('App - Agent-Centric Session Cockpit MVP', () => {
+  const mockHealthyStatus: SystemStatusResponse = {
+    status: 'Healthy',
+    timestamp: new Date().toISOString(),
+    environment: 'Development',
+    services: {
+      api: { status: 'Healthy', latencyMs: 2, description: 'ASP.NET Core 10 Web API' }
+    }
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.getStatus).mockResolvedValue(mockHealthyStatus);
     vi.mocked(api.getAgents).mockResolvedValue([]);
     vi.mocked(api.getSessions).mockResolvedValue([]);
     vi.mocked(api.getSessionMessages).mockResolvedValue([]);
   });
 
-  it('renders loading or error state and service card titles', async () => {
-    const mockStatus: SystemStatusResponse = {
-      status: 'Healthy',
-      timestamp: new Date().toISOString(),
-      environment: 'Development',
-      services: {
-        api: { status: 'Healthy', latencyMs: 2, description: 'ASP.NET Core 10 Web API' },
-        postgres: { status: 'Healthy', latencyMs: 4, description: 'PostgreSQL 18 Database' },
-        redis: { status: 'Healthy', latencyMs: 1, description: 'Redis 8.6 Cache' },
-        temporal: { status: 'Healthy', latencyMs: 3, description: 'Temporal Dev Server' },
-        s3: { status: 'Healthy', latencyMs: 5, description: 'SeaweedFS S3 Storage' },
-      },
-    };
-
-    vi.mocked(api.getStatus).mockResolvedValueOnce(mockStatus);
-
+  it('renders clean empty state when no agents are connected', async () => {
     render(<App />);
 
     expect(screen.getByText('AgentMesh')).toBeInTheDocument();
-    expect(screen.getByText('Aspire Skeleton v1.0')).toBeInTheDocument();
+    expect(screen.getByText('Session Cockpit MVP')).toBeInTheDocument();
 
     await waitFor(() => {
-      expect(screen.getByText('ASP.NET Core 10 Web API')).toBeInTheDocument();
-      expect(screen.getByText('PostgreSQL Relational DB')).toBeInTheDocument();
-      expect(screen.getByText('Redis Distributed Cache')).toBeInTheDocument();
-      expect(screen.getByText('Temporal Dev Server')).toBeInTheDocument();
-      expect(screen.getByText('SeaweedFS S3 Storage')).toBeInTheDocument();
+      expect(screen.getByText('No Agents Connected')).toBeInTheDocument();
+      expect(screen.getByText('Agent Session Observatory')).toBeInTheDocument();
     });
   });
 
@@ -73,35 +70,113 @@ describe('App - Health Cockpit & Sessions', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText('API Gateway Unreachable')).toBeInTheDocument();
+      expect(screen.getByText('API Gateway Unreachable:')).toBeInTheDocument();
       expect(screen.getByText('Network connection refused')).toBeInTheDocument();
     });
   });
 
-  it('switches between System Health and Sessions tabs', async () => {
-    vi.mocked(api.getStatus).mockResolvedValueOnce({
-      status: 'Healthy',
-      timestamp: new Date().toISOString(),
-      environment: 'Development',
-      services: {}
+  it('renders connected agents, their sessions, and full trajectory events (prompt, thought, tool_call, response)', async () => {
+    const mockAgents: Agent[] = [
+      {
+        id: 'agy-core',
+        name: 'Agy Lead Architect',
+        role: 'Codebase Engineer',
+        status: 'online',
+        runtimeType: 'CliAgy',
+        trustTier: 3,
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const mockSessions: AgentSession[] = [
+      {
+        id: 'session-12345678',
+        title: 'Fix OIDC Token Handshake',
+        status: 'active',
+        metadataJson: '{}',
+        creatorAgentId: 'agy-core',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    ];
+
+    const mockEvents: SessionMessage[] = [
+      {
+        id: 'ev-1',
+        sessionId: 'session-12345678',
+        senderAgentId: 'admin',
+        eventType: 'prompt',
+        content: 'Why is token verification failing?',
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: 'ev-2',
+        sessionId: 'session-12345678',
+        senderAgentId: 'agy-core',
+        eventType: 'thought',
+        content: 'Inspecting Dex staticClients configuration...',
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: 'ev-3',
+        sessionId: 'session-12345678',
+        senderAgentId: 'agy-core',
+        eventType: 'tool_call',
+        toolName: 'view_file',
+        content: 'Reading dex/config.yaml',
+        toolArgsJson: '{"path":"dex/config.yaml"}',
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: 'ev-4',
+        sessionId: 'session-12345678',
+        senderAgentId: 'agy-core',
+        eventType: 'response',
+        content: 'Removed client secret from public PKCE client.',
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    vi.mocked(api.getAgents).mockResolvedValue(mockAgents);
+    vi.mocked(api.getSessions).mockResolvedValue(mockSessions);
+    vi.mocked(api.getSessionMessages).mockResolvedValue(mockEvents);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Agy Lead Architect')).toBeInTheDocument();
+      expect(screen.getAllByText('Fix OIDC Token Handshake').length).toBeGreaterThan(0);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Why is token verification failing?')).toBeInTheDocument();
+      expect(screen.getByText('Inspecting Dex staticClients configuration...')).toBeInTheDocument();
+      expect(screen.getByText('view_file')).toBeInTheDocument();
+      expect(screen.getByText('Removed client secret from public PKCE client.')).toBeInTheDocument();
+    });
+  });
+
+  it('triggers seedDemo and resetMesh from header buttons', async () => {
+    vi.mocked(api.seedDemo).mockResolvedValue({
+      status: 'seeded',
+      agentId: 'agy-core',
+      sessionId: 'session-999',
+      eventCount: 8
+    });
+    vi.mocked(api.resetMesh).mockResolvedValue({
+      status: 'reset',
+      message: 'Purged'
     });
 
     render(<App />);
 
-    // Switch to Sessions tab
-    const sessionsTabButton = screen.getByRole('button', { name: /sessions/i });
-    fireEvent.click(sessionsTabButton);
-
     await waitFor(() => {
-      expect(screen.getByPlaceholderText(/search sessions or agents/i)).toBeInTheDocument();
+      expect(screen.getByText('Clear Mesh Data')).toBeInTheDocument();
     });
 
-    // Switch back to System Health tab
-    const healthTabButton = screen.getByRole('button', { name: /system health/i });
-    fireEvent.click(healthTabButton);
-
+    fireEvent.click(screen.getByText('Clear Mesh Data'));
     await waitFor(() => {
-      expect(screen.getByText('Mesh Status')).toBeInTheDocument();
+      expect(api.resetMesh).toHaveBeenCalledTimes(1);
     });
   });
 });

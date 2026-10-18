@@ -18,7 +18,7 @@ const getHeaders = (): Record<string, string> => {
   return {
     'Content-Type': 'application/json',
     'Authorization': 'Bearer mesh-default-secret-key',
-    'X-Agent-Id': 'gemini-spark'
+    'X-Agent-Id': 'agy-core'
   };
 };
 
@@ -38,10 +38,12 @@ export const api = {
   async registerAgent(req: {
     id: string;
     name: string;
+    role?: string;
     runtimeType?: number;
     trustTier?: number;
     personaPrompt?: string;
     memorySummary?: string;
+    capabilitiesJson?: string;
   }): Promise<{ agent: Agent; token: string; instructions: string }> {
     const res = await fetch('/api/agents/register', {
       method: 'POST',
@@ -49,6 +51,22 @@ export const api = {
       body: JSON.stringify(req)
     });
     if (!res.ok) throw new Error(`Failed to register agent: ${res.statusText}`);
+    return res.json();
+  },
+
+  async upsertAgent(req: {
+    id: string;
+    name: string;
+    role?: string;
+    status?: string;
+    capabilitiesJson?: string;
+  }): Promise<Agent> {
+    const res = await fetch('/api/agents', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to register/update agent: ${res.statusText}`);
     return res.json();
   },
 
@@ -78,17 +96,33 @@ export const api = {
     return res.json();
   },
 
+  async getAgentSessions(agentId: string): Promise<AgentSession[]> {
+    const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load agent sessions: ${res.statusText}`);
+    return res.json();
+  },
+
+  async createAgentSession(agentId: string, title: string, initialPrompt?: string): Promise<AgentSession> {
+    const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ title, initialPrompt })
+    });
+    if (!res.ok) throw new Error(`Failed to create agent session: ${res.statusText}`);
+    return res.json();
+  },
+
   async getSession(id: string): Promise<AgentSession> {
     const res = await fetch(`/api/sessions/${id}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load session details: ${res.statusText}`);
     return res.json();
   },
 
-  async createSession(title: string, metadataJson?: string, initialMessage?: string): Promise<AgentSession> {
+  async createSession(title: string, metadataJson?: string, initialMessage?: string, creatorAgentId = 'agy-core'): Promise<AgentSession> {
     const res = await fetch('/api/sessions', {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ title, metadataJson: metadataJson || '{}', initialMessage, creatorAgentId: 'operator' })
+      body: JSON.stringify({ title, metadataJson: metadataJson || '{}', initialMessage, creatorAgentId })
     });
     if (!res.ok) throw new Error(`Failed to create session: ${res.statusText}`);
     return res.json();
@@ -105,8 +139,8 @@ export const api = {
   },
 
   async getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
-    const res = await fetch(`/api/sessions/${sessionId}/messages`, { headers: getHeaders() });
-    if (!res.ok) throw new Error(`Failed to load session messages: ${res.statusText}`);
+    const res = await fetch(`/api/sessions/${sessionId}/events`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load session events: ${res.statusText}`);
     return res.json();
   },
 
@@ -114,14 +148,40 @@ export const api = {
     sessionId: string,
     content: string,
     targetAgentId?: string,
-    senderAgentId = 'operator'
+    senderAgentId = 'operator',
+    eventType = 'prompt',
+    simulateExecution = true
   ): Promise<SessionMessage> {
-    const res = await fetch(`/api/sessions/${sessionId}/messages`, {
+    const res = await fetch(`/api/sessions/${sessionId}/events`, {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ content, targetAgentId, senderAgentId })
+      body: JSON.stringify({
+        content,
+        targetAgentId,
+        senderAgentId,
+        eventType,
+        simulateExecution
+      })
     });
-    if (!res.ok) throw new Error(`Failed to post message: ${res.statusText}`);
+    if (!res.ok) throw new Error(`Failed to post session event: ${res.statusText}`);
+    return res.json();
+  },
+
+  async resetMesh(): Promise<{ status: string; message: string }> {
+    const res = await fetch('/api/dev/reset-mesh', {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to reset mesh data: ${res.statusText}`);
+    return res.json();
+  },
+
+  async seedDemo(): Promise<{ status: string; agentId: string; sessionId: string; eventCount: number }> {
+    const res = await fetch('/api/dev/seed-demo', {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to seed demo data: ${res.statusText}`);
     return res.json();
   }
 };
