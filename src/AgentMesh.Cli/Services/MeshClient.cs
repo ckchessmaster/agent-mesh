@@ -130,7 +130,8 @@ public class MeshClient
             content = ev.Content,
             toolName = ev.ToolName,
             toolArgsJson = ev.ToolArgsJson,
-            toolResultJson = ev.ToolResultJson
+            toolResultJson = ev.ToolResultJson,
+            structuredPayloadJson = ev.StructuredPayloadJson
         });
 
         using var res = await _http.SendAsync(req, ct);
@@ -156,6 +157,21 @@ public class MeshClient
                 if (!sElem.TryGetProperty("id", out var idProp) || !Guid.TryParse(idProp.GetString(), out var sessionId))
                     continue;
 
+                string? workDir = null, model = null, effort = null, mode = null;
+                if (sElem.TryGetProperty("metadataJson", out var metaProp) && !string.IsNullOrWhiteSpace(metaProp.GetString()))
+                {
+                    try
+                    {
+                        using var mDoc = JsonDocument.Parse(metaProp.GetString()!);
+                        var mRoot = mDoc.RootElement;
+                        if (mRoot.TryGetProperty("workingDirectory", out var wd)) workDir = wd.GetString();
+                        if (mRoot.TryGetProperty("model", out var m)) model = m.GetString();
+                        if (mRoot.TryGetProperty("effort", out var ef)) effort = ef.GetString();
+                        if (mRoot.TryGetProperty("mode", out var md)) mode = md.GetString();
+                    }
+                    catch { }
+                }
+
                 using var eventsReq = CreateRequest(HttpMethod.Get, $"api/sessions/{sessionId}/events", token, agentId);
                 using var eventsRes = await _http.SendAsync(eventsReq, ct);
                 if (!eventsRes.IsSuccessStatusCode) continue;
@@ -180,7 +196,11 @@ public class MeshClient
                         MessageId = msgId,
                         AgentId = agentId,
                         Prompt = content,
-                        Sender = sender
+                        Sender = sender,
+                        WorkingDirectory = workDir,
+                        Model = model,
+                        Effort = effort,
+                        Mode = mode
                     });
                 }
             }

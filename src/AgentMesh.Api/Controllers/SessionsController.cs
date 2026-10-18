@@ -89,6 +89,107 @@ public class SessionsController(
         return Ok(dto);
     }
 
+    public static string MergeSessionMetadata(
+        string? existingJson,
+        string? workingDirectory,
+        string? model,
+        string? effort,
+        string? mode)
+    {
+        var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(existingJson))
+        {
+            try
+            {
+                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(existingJson);
+                if (parsed != null)
+                {
+                    foreach (var (k, v) in parsed) dict[k] = v;
+                }
+            }
+            catch { }
+        }
+
+        if (!string.IsNullOrWhiteSpace(workingDirectory)) dict["workingDirectory"] = workingDirectory.Trim();
+        if (!string.IsNullOrWhiteSpace(model)) dict["model"] = model.Trim();
+        if (!string.IsNullOrWhiteSpace(effort)) dict["effort"] = effort.Trim();
+        if (!string.IsNullOrWhiteSpace(mode)) dict["mode"] = mode.Trim();
+
+        return System.Text.Json.JsonSerializer.Serialize(dict);
+    }
+
+    public static (string? workingDirectory, string? model, string? effort, string? mode) ExtractSessionSettings(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return (null, null, null, null);
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
+            var root = doc.RootElement;
+            var workDir = root.TryGetProperty("workingDirectory", out var wd) ? wd.GetString() : null;
+            var model = root.TryGetProperty("model", out var m) ? m.GetString() : null;
+            var effort = root.TryGetProperty("effort", out var e) ? e.GetString() : null;
+            var mode = root.TryGetProperty("mode", out var md) ? md.GetString() : null;
+            return (workDir, model, effort, mode);
+        }
+        catch
+        {
+            return (null, null, null, null);
+        }
+    }
+
+    public static string AccumulateUsageMetadata(string? metadataJson, string? structuredPayloadJson)
+    {
+        if (string.IsNullOrWhiteSpace(structuredPayloadJson)) return metadataJson ?? "{}";
+        try
+        {
+            using var payloadDoc = System.Text.Json.JsonDocument.Parse(structuredPayloadJson);
+            if (!payloadDoc.RootElement.TryGetProperty("usage", out var usageElem)) return metadataJson ?? "{}";
+
+            var input = usageElem.TryGetProperty("inputTokens", out var ip) ? ip.GetInt64() : 0;
+            var output = usageElem.TryGetProperty("outputTokens", out var op) ? op.GetInt64() : 0;
+            var thinking = usageElem.TryGetProperty("thinkingTokens", out var tp) ? tp.GetInt64() : 0;
+            var total = usageElem.TryGetProperty("totalTokens", out var totp) ? totp.GetInt64() : (input + output);
+            var duration = usageElem.TryGetProperty("durationSeconds", out var dp) ? dp.GetDouble() : 0.0;
+
+            var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(metadataJson))
+            {
+                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson);
+                if (parsed != null)
+                {
+                    foreach (var (k, v) in parsed) dict[k] = v;
+                }
+            }
+
+            long existingInput = 0, existingOutput = 0, existingThinking = 0, existingTotal = 0;
+            double existingDuration = 0.0;
+
+            if (dict.TryGetValue("cumulativeUsage", out var existingUsageObj) && existingUsageObj is System.Text.Json.JsonElement existingElem)
+            {
+                if (existingElem.TryGetProperty("inputTokens", out var ei)) existingInput = ei.GetInt64();
+                if (existingElem.TryGetProperty("outputTokens", out var eo)) existingOutput = eo.GetInt64();
+                if (existingElem.TryGetProperty("thinkingTokens", out var et)) existingThinking = et.GetInt64();
+                if (existingElem.TryGetProperty("totalTokens", out var etot)) existingTotal = etot.GetInt64();
+                if (existingElem.TryGetProperty("totalDurationSeconds", out var ed)) existingDuration = ed.GetDouble();
+            }
+
+            dict["cumulativeUsage"] = new
+            {
+                inputTokens = existingInput + input,
+                outputTokens = existingOutput + output,
+                thinkingTokens = existingThinking + thinking,
+                totalTokens = existingTotal + total,
+                totalDurationSeconds = existingDuration + duration
+            };
+
+            return System.Text.Json.JsonSerializer.Serialize(dict);
+        }
+        catch
+        {
+            return metadataJson ?? "{}";
+        }
+    }
+
     [HttpPost]
     public async Task<IActionResult> CreateSession([FromBody] CreateSessionRequest req)
     {
@@ -103,11 +204,13 @@ public class SessionsController(
               ?? User?.FindFirst("AgentId")?.Value
               ?? "agy";
 
+        var initialMetadata = MergeSessionMetadata(req.MetadataJson, req.WorkingDirectory, req.Model, req.Effort, req.Mode);
+
         var session = new AgentSession
         {
             Title = req.Title.Trim(),
             Status = "active",
-            MetadataJson = req.MetadataJson ?? "{}",
+            MetadataJson = initialMetadata,
             CreatorAgentId = callerAgentId,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
@@ -196,6 +299,11 @@ public class SessionsController(
             CreatedAt = DateTimeOffset.UtcNow
         };
 
+        if (!string.IsNullOrWhiteSpace(req.StructuredPayloadJson))
+        {
+            session.MetadataJson = AccumulateUsageMetadata(session.MetadataJson, req.StructuredPayloadJson);
+        }
+
         db.SessionMessages.Add(message);
         session.UpdatedAt = DateTimeOffset.UtcNow;
 
@@ -233,6 +341,7 @@ public class SessionsController(
 
         if (eventType == "prompt" && !string.IsNullOrWhiteSpace(message.TargetAgentId))
         {
+            var (workDir, model, effort, mode) = ExtractSessionSettings(session.MetadataJson);
             var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
             {
@@ -240,7 +349,11 @@ public class SessionsController(
                 messageId = message.Id,
                 agentId = message.TargetAgentId.Trim().ToLowerInvariant(),
                 prompt = message.Content,
-                sender = message.SenderAgentId
+                sender = message.SenderAgentId,
+                workingDirectory = workDir,
+                model = model,
+                effort = effort,
+                mode = mode
             });
         }
 
@@ -294,7 +407,16 @@ public class SessionsController(
     );
 }
 
-public record CreateSessionRequest(string Title, string? MetadataJson = null, string? InitialMessage = null, string? CreatorAgentId = null);
+public record CreateSessionRequest(
+    string Title,
+    string? MetadataJson = null,
+    string? InitialMessage = null,
+    string? CreatorAgentId = null,
+    string? WorkingDirectory = null,
+    string? Model = null,
+    string? Effort = null,
+    string? Mode = null
+);
 
 public record PostMessageRequest(
     string Content,

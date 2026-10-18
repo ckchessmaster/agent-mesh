@@ -142,4 +142,63 @@ public class SessionsControllerTests
         msgs[0].Content.Should().Be("First message");
         msgs[1].Content.Should().Be("Second message");
     }
+
+    [Fact]
+    public void MergeAndExtractSessionSettings_HandlesExplicitSettings_Correctly()
+    {
+        var merged = SessionsController.MergeSessionMetadata(
+            existingJson: "{\"custom\":\"key\"}",
+            workingDirectory: "/tmp/custom-workdir",
+            model: "gemini-2.5-pro",
+            effort: "high",
+            mode: "plan");
+
+        var (workDir, model, effort, mode) = SessionsController.ExtractSessionSettings(merged);
+
+        workDir.Should().Be("/tmp/custom-workdir");
+        model.Should().Be("gemini-2.5-pro");
+        effort.Should().Be("high");
+        mode.Should().Be("plan");
+        merged.Should().Contain("\"custom\":\"key\"");
+    }
+
+    [Fact]
+    public void AccumulateUsageMetadata_AggregatesTokensAndDuration_OverMultipleTurns()
+    {
+        var turn1Payload = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            usage = new
+            {
+                inputTokens = 1000,
+                outputTokens = 150,
+                thinkingTokens = 40,
+                totalTokens = 1150,
+                durationSeconds = 1.5
+            }
+        });
+
+        var turn2Payload = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            usage = new
+            {
+                inputTokens = 500,
+                outputTokens = 100,
+                thinkingTokens = 20,
+                totalTokens = 600,
+                durationSeconds = 2.0
+            }
+        });
+
+        var metaAfterTurn1 = SessionsController.AccumulateUsageMetadata("{}", turn1Payload);
+        var metaAfterTurn2 = SessionsController.AccumulateUsageMetadata(metaAfterTurn1, turn2Payload);
+
+        using var doc = System.Text.Json.JsonDocument.Parse(metaAfterTurn2);
+        var cumulative = doc.RootElement.GetProperty("cumulativeUsage");
+
+        cumulative.GetProperty("inputTokens").GetInt64().Should().Be(1500);
+        cumulative.GetProperty("outputTokens").GetInt64().Should().Be(250);
+        cumulative.GetProperty("thinkingTokens").GetInt64().Should().Be(60);
+        cumulative.GetProperty("totalTokens").GetInt64().Should().Be(1750);
+        cumulative.GetProperty("totalDurationSeconds").GetDouble().Should().BeApproximately(3.5, 0.01);
+    }
 }

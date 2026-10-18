@@ -172,4 +172,78 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       expect(api.resetMesh).toHaveBeenCalledTimes(1);
     });
   });
+
+  it('renders session parameter badges and token usage telemetry in active session and trajectory', async () => {
+    const mockAgents: Agent[] = [
+      {
+        id: 'agy-core',
+        name: 'Agy Lead Architect',
+        role: 'Codebase Engineer',
+        status: 'online',
+        runtimeType: 'CliAgy',
+        trustTier: 3,
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const mockSessions: AgentSession[] = [
+      {
+        id: 'sess-telemetry-1',
+        title: 'Telemetry Session',
+        status: 'active',
+        metadataJson: JSON.stringify({
+          workingDirectory: '/home/user/workspace/proj',
+          model: 'gemini-2.5-pro',
+          effort: 'high',
+          mode: 'plan',
+          cumulativeUsage: {
+            inputTokens: 2500,
+            outputTokens: 350,
+            thinkingTokens: 120,
+            totalTokens: 2850,
+            totalDurationSeconds: 4.2
+          }
+        }),
+        creatorAgentId: 'agy-core',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    ];
+
+    const mockEvents: SessionMessage[] = [
+      {
+        id: 'ev-usage-1',
+        sessionId: 'sess-telemetry-1',
+        senderAgentId: 'agy-core',
+        eventType: 'response',
+        content: 'Plan generated successfully.',
+        structuredPayloadJson: JSON.stringify({
+          usage: {
+            inputTokens: 2500,
+            outputTokens: 350,
+            thinkingTokens: 120,
+            totalTokens: 2850,
+            durationSeconds: 4.2
+          }
+        }),
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    vi.mocked(api.getAgents).mockResolvedValue(mockAgents);
+    vi.mocked(api.getSessions).mockResolvedValue(mockSessions);
+    vi.mocked(api.getSessionMessages).mockResolvedValue(mockEvents);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Telemetry Session').length).toBeGreaterThan(0);
+      expect(screen.getByText('gemini-2.5-pro')).toBeInTheDocument();
+      expect(screen.getByText('high')).toBeInTheDocument();
+      expect(screen.getByText('plan')).toBeInTheDocument();
+      expect(screen.getByText('/home/user/workspace/proj')).toBeInTheDocument();
+      expect(screen.getByText('2,850 tokens (4.2s)')).toBeInTheDocument();
+      expect(screen.getByText('⚡ 2,850 tokens (4.2s)')).toBeInTheDocument();
+    });
+  });
 });

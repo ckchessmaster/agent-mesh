@@ -22,6 +22,13 @@ const getHeaders = (): Record<string, string> => {
   };
 };
 
+export interface SessionControlOptions {
+  workingDirectory?: string;
+  model?: string;
+  effort?: string;
+  mode?: string;
+}
+
 export const api = {
   async getStatus(): Promise<SystemStatusResponse> {
     const res = await fetch('/api/status', { headers: getHeaders() });
@@ -102,11 +109,23 @@ export const api = {
     return res.json();
   },
 
-  async createAgentSession(agentId: string, title: string, initialPrompt?: string): Promise<AgentSession> {
+  async createAgentSession(
+    agentId: string,
+    title: string,
+    initialPrompt?: string,
+    options?: SessionControlOptions
+  ): Promise<AgentSession> {
     const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ title, initialPrompt })
+      body: JSON.stringify({
+        title,
+        initialPrompt,
+        workingDirectory: options?.workingDirectory,
+        model: options?.model,
+        effort: options?.effort,
+        mode: options?.mode
+      })
     });
     if (!res.ok) throw new Error(`Failed to create agent session: ${res.statusText}`);
     return res.json();
@@ -118,11 +137,26 @@ export const api = {
     return res.json();
   },
 
-  async createSession(title: string, metadataJson?: string, initialMessage?: string, creatorAgentId = 'agy-core'): Promise<AgentSession> {
+  async createSession(
+    title: string,
+    metadataJson?: string,
+    initialMessage?: string,
+    creatorAgentId = 'agy-core',
+    options?: SessionControlOptions
+  ): Promise<AgentSession> {
     const res = await fetch('/api/sessions', {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ title, metadataJson: metadataJson || '{}', initialMessage, creatorAgentId })
+      body: JSON.stringify({
+        title,
+        metadataJson: metadataJson || '{}',
+        initialMessage,
+        creatorAgentId,
+        workingDirectory: options?.workingDirectory,
+        model: options?.model,
+        effort: options?.effort,
+        mode: options?.mode
+      })
     });
     if (!res.ok) throw new Error(`Failed to create session: ${res.statusText}`);
     return res.json();

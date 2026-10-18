@@ -212,11 +212,12 @@ public class AgentsController(
         }
 
         var hasInitialPrompt = !string.IsNullOrWhiteSpace(req.InitialPrompt);
+        var initialMetadata = SessionsController.MergeSessionMetadata(req.MetadataJson, req.WorkingDirectory, req.Model, req.Effort, req.Mode);
         var session = new AgentSession
         {
             Title = req.Title.Trim(),
             Status = hasInitialPrompt ? "thinking" : "active",
-            MetadataJson = req.MetadataJson ?? "{}",
+            MetadataJson = initialMetadata,
             CreatorAgentId = normalizedId,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
@@ -261,13 +262,18 @@ public class AgentsController(
 
             if (promptMsg != null)
             {
+                var (workDir, model, effort, mode) = SessionsController.ExtractSessionSettings(session.MetadataJson);
                 await hubContext.Clients.Group($"agent-{normalizedId}").SendAsync("PromptReceived", new
                 {
                     sessionId = session.Id,
                     messageId = promptMsg.Id,
                     agentId = normalizedId,
                     prompt = promptMsg.Content,
-                    sender = promptMsg.SenderAgentId
+                    sender = promptMsg.SenderAgentId,
+                    workingDirectory = workDir,
+                    model = model,
+                    effort = effort,
+                    mode = mode
                 });
             }
         }
@@ -305,7 +311,11 @@ public record RegisterAgentRequest(
 public record CreateAgentSessionRequest(
     string Title,
     string? InitialPrompt = null,
-    string? MetadataJson = null
+    string? MetadataJson = null,
+    string? WorkingDirectory = null,
+    string? Model = null,
+    string? Effort = null,
+    string? Mode = null
 );
 
 public record AgentDto(

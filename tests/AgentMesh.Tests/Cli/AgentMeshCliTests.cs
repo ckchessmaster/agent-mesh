@@ -151,4 +151,73 @@ public class AgentMeshCliTests
         AgentMeshHub.IsAgentConnected("test-runner").Should().BeFalse();
         (await db.Agents.FindAsync("test-runner"))!.Status.Should().Be("offline");
     }
+
+    [Fact]
+    public async Task GenericCommandAdapter_ExecutesInSpecifiedWorkingDirectory()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"agentmesh-workdir-{Guid.NewGuid()}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+            var preset = new AgentPresetConfig
+            {
+                Id = "workdir-bot",
+                Name = "WorkDir Bot",
+                AdapterType = "generic",
+                Command = isWindows ? "cd" : "pwd"
+            };
+
+            var promptEv = new PromptReceivedEvent
+            {
+                SessionId = Guid.NewGuid(),
+                MessageId = Guid.NewGuid(),
+                AgentId = "workdir-bot",
+                Prompt = "where am i",
+                WorkingDirectory = tempDir
+            };
+
+            var events = new List<TrajectoryEventPayload>();
+            var adapter = AgentAdapterFactory.Create(preset);
+
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            var resp = events.FirstOrDefault(e => e.EventType == "response");
+            resp.Should().NotBeNull();
+            resp!.Content.Trim().Replace('\\', '/').Should().Contain(Path.GetFileName(tempDir));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public void PromptReceivedEvent_DeserializesControlParameters()
+    {
+        var json = """
+        {
+            "sessionId": "a0000000-0000-0000-0000-000000000001",
+            "messageId": "b0000000-0000-0000-0000-000000000002",
+            "agentId": "agy",
+            "prompt": "Refactor API",
+            "sender": "operator",
+            "workingDirectory": "/var/workspace",
+            "model": "gemini-2.5-pro",
+            "effort": "max",
+            "mode": "auto"
+        }
+        """;
+
+        var ev = System.Text.Json.JsonSerializer.Deserialize<PromptReceivedEvent>(json);
+        ev.Should().NotBeNull();
+        ev!.WorkingDirectory.Should().Be("/var/workspace");
+        ev.Model.Should().Be("gemini-2.5-pro");
+        ev.Effort.Should().Be("max");
+        ev.Mode.Should().Be("auto");
+    }
 }

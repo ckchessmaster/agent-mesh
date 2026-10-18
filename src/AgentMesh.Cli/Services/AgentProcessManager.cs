@@ -93,6 +93,10 @@ public class AgentRunnerInstance : IAsyncDisposable
 
                 var content = msgElem.TryGetProperty("content", out var cProp) ? cProp.GetString() ?? "" : "";
                 var sender = msgElem.TryGetProperty("senderAgentId", out var sProp) ? sProp.GetString() ?? "operator" : "operator";
+                var workDir = msgElem.TryGetProperty("workingDirectory", out var wd) ? wd.GetString() : null;
+                var model = msgElem.TryGetProperty("model", out var m) ? m.GetString() : null;
+                var effort = msgElem.TryGetProperty("effort", out var ef) ? ef.GetString() : null;
+                var mode = msgElem.TryGetProperty("mode", out var md) ? md.GetString() : null;
 
                 await HandlePromptAsync(new PromptReceivedEvent
                 {
@@ -100,7 +104,11 @@ public class AgentRunnerInstance : IAsyncDisposable
                     MessageId = msgId,
                     AgentId = _preset.Id,
                     Prompt = content,
-                    Sender = sender
+                    Sender = sender,
+                    WorkingDirectory = workDir,
+                    Model = model,
+                    Effort = effort,
+                    Mode = mode
                 }, _cts.Token);
             }
             catch
@@ -168,11 +176,46 @@ public class AgentRunnerInstance : IAsyncDisposable
             State.LastActivityAt = DateTimeOffset.UtcNow;
             _onStateChanged();
 
-            _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender}: {ev.Prompt}");
+            // Resolve working directory: explicit working directory or persistent sandbox workspace
+            var effectiveWorkDir = !string.IsNullOrWhiteSpace(ev.WorkingDirectory)
+                ? ev.WorkingDirectory.Trim()
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "workspaces", ev.SessionId.ToString());
+
+            try
+            {
+                Directory.CreateDirectory(effectiveWorkDir);
+            }
+            catch (Exception ex)
+            {
+                _onLog(_preset.Id, $"Warning: Could not create workspace directory '{effectiveWorkDir}': {ex.Message}");
+            }
+
+            ev.WorkingDirectory = effectiveWorkDir;
+
+            _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender}: {ev.Prompt} (cwd: {effectiveWorkDir})");
 
             var adapter = AgentAdapterFactory.Create(_preset);
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>
             {
+                if (!string.IsNullOrWhiteSpace(trajectoryEv.StructuredPayloadJson))
+                {
+                    try
+                    {
+                        using var pDoc = JsonDocument.Parse(trajectoryEv.StructuredPayloadJson);
+                        if (pDoc.RootElement.TryGetProperty("usage", out var uElem))
+                        {
+                            var total = uElem.TryGetProperty("totalTokens", out var tot)
+                                ? tot.GetInt64()
+                                : (uElem.TryGetProperty("inputTokens", out var ip) ? ip.GetInt64() : 0) +
+                                  (uElem.TryGetProperty("outputTokens", out var op) ? op.GetInt64() : 0);
+                            var dur = uElem.TryGetProperty("durationSeconds", out var d) ? d.GetDouble() : 0;
+                            State.TotalTokensUsed += total;
+                            State.TotalDurationSeconds += dur;
+                        }
+                    }
+                    catch { }
+                }
+
                 _onLog(_preset.Id, $"-> {trajectoryEv.EventType}: {Truncate(trajectoryEv.Content, 70)}");
                 await _meshClient.PostTrajectoryEventAsync(
                     ev.SessionId,
@@ -187,7 +230,7 @@ public class AgentRunnerInstance : IAsyncDisposable
             State.ActiveSessionId = null;
             State.LastActivityAt = DateTimeOffset.UtcNow;
             _onStateChanged();
-            _onLog(_preset.Id, $"Completed session [{ev.SessionId.ToString()[..8]}] response.");
+            _onLog(_preset.Id, $"Completed session [{ev.SessionId.ToString()[..8]}] response (total tokens: {State.TotalTokensUsed:N0}).");
         }
         catch (Exception ex)
         {

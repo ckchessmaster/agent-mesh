@@ -37,6 +37,18 @@ public class PromptReceivedEvent
 
     [JsonPropertyName("sender")]
     public string Sender { get; set; } = "operator";
+
+    [JsonPropertyName("workingDirectory")]
+    public string? WorkingDirectory { get; set; }
+
+    [JsonPropertyName("model")]
+    public string? Model { get; set; }
+
+    [JsonPropertyName("effort")]
+    public string? Effort { get; set; }
+
+    [JsonPropertyName("mode")]
+    public string? Mode { get; set; }
 }
 
 public class TrajectoryEventPayload
@@ -46,6 +58,7 @@ public class TrajectoryEventPayload
     public string? ToolName { get; set; }
     public string? ToolArgsJson { get; set; }
     public string? ToolResultJson { get; set; }
+    public string? StructuredPayloadJson { get; set; }
 }
 
 public enum RunnerConnectionState
@@ -66,6 +79,8 @@ public class AgentRuntimeState
     public RunnerConnectionState State { get; set; } = RunnerConnectionState.Offline;
     public Guid? ActiveSessionId { get; set; }
     public int PromptsHandled { get; set; }
+    public long TotalTokensUsed { get; set; }
+    public double TotalDurationSeconds { get; set; }
     public DateTimeOffset? LastActivityAt { get; set; }
     public string? LastError { get; set; }
 }

@@ -210,7 +210,10 @@ public class AgyAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
+            ? promptEvent.WorkingDirectory
+            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+
         var agyPath = AgentAdapterFactory.ResolveExecutablePath(preset.Command ?? "agy")
                       ?? AgentAdapterFactory.ResolveExecutablePath("agy");
 
@@ -249,6 +252,24 @@ public class AgyAdapter : IAgentAdapter
             psi.ArgumentList.Add(existingConvId);
         }
 
+        if (!string.IsNullOrWhiteSpace(promptEvent.Model))
+        {
+            psi.ArgumentList.Add("--model");
+            psi.ArgumentList.Add(promptEvent.Model.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.Effort))
+        {
+            psi.ArgumentList.Add("--effort");
+            psi.ArgumentList.Add(promptEvent.Effort.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.Mode))
+        {
+            psi.ArgumentList.Add("--mode");
+            psi.ArgumentList.Add(promptEvent.Mode.Trim());
+        }
+
         psi.ArgumentList.Add("-p");
         psi.ArgumentList.Add(promptEvent.Prompt);
         psi.ArgumentList.Add("--output-format");
@@ -260,6 +281,8 @@ public class AgyAdapter : IAgentAdapter
 
         var streamedResponseBuilder = new StringBuilder();
         var emittedFinalResult = false;
+        long lastInputTokens = 0, lastOutputTokens = 0, lastThinkingTokens = 0, lastTotalTokens = 0;
+        double lastDuration = 0;
 
         while (await proc.StandardOutput.ReadLineAsync(ct) is { } line)
         {
@@ -304,6 +327,12 @@ public class AgyAdapter : IAgentAdapter
                         {
                             var thinkingTokens = usageProp.TryGetProperty("thinking_tokens", out var ttProp) ? ttProp.GetInt32() : 0;
                             var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
+
+                            if (usageProp.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
+                            if (usageProp.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
+                            if (usageProp.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
+                            if (usageProp.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
+                            if (duration > 0) lastDuration = duration;
 
                             // Emit thought indicator when the model completed a reasoning step before calling a tool
                             if (thinkingTokens > 0 && streamedResponseBuilder.Length == 0)
@@ -379,12 +408,43 @@ public class AgyAdapter : IAgentAdapter
                         responseText = streamedResponseBuilder.ToString().Trim();
                     }
 
+                    if (resElem.TryGetProperty("duration_seconds", out var rDur)) lastDuration = rDur.GetDouble();
+                    if (resElem.TryGetProperty("usage", out var rUsage))
+                    {
+                        if (rUsage.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
+                        if (rUsage.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
+                        if (rUsage.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
+                        if (rUsage.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
+                    }
+
+                    if (lastTotalTokens == 0 && (lastInputTokens > 0 || lastOutputTokens > 0))
+                    {
+                        lastTotalTokens = lastInputTokens + lastOutputTokens;
+                    }
+
+                    string? structuredJson = null;
+                    if (lastTotalTokens > 0 || lastDuration > 0)
+                    {
+                        structuredJson = JsonSerializer.Serialize(new
+                        {
+                            usage = new
+                            {
+                                inputTokens = lastInputTokens,
+                                outputTokens = lastOutputTokens,
+                                thinkingTokens = lastThinkingTokens,
+                                totalTokens = lastTotalTokens,
+                                durationSeconds = lastDuration
+                            }
+                        });
+                    }
+
                     if (!string.IsNullOrWhiteSpace(responseText))
                     {
                         await onEvent(new TrajectoryEventPayload
                         {
                             EventType = "response",
-                            Content = responseText
+                            Content = responseText,
+                            StructuredPayloadJson = structuredJson
                         });
                         emittedFinalResult = true;
                     }
@@ -412,10 +472,32 @@ public class AgyAdapter : IAgentAdapter
                 fallbackText = $"Agent `@{preset.Id}` finished execution (exit code {proc.ExitCode}).";
             }
 
+            if (lastTotalTokens == 0 && (lastInputTokens > 0 || lastOutputTokens > 0))
+            {
+                lastTotalTokens = lastInputTokens + lastOutputTokens;
+            }
+
+            string? structuredJson = null;
+            if (lastTotalTokens > 0 || lastDuration > 0)
+            {
+                structuredJson = JsonSerializer.Serialize(new
+                {
+                    usage = new
+                    {
+                        inputTokens = lastInputTokens,
+                        outputTokens = lastOutputTokens,
+                        thinkingTokens = lastThinkingTokens,
+                        totalTokens = lastTotalTokens,
+                        durationSeconds = lastDuration
+                    }
+                });
+            }
+
             await onEvent(new TrajectoryEventPayload
             {
                 EventType = "response",
-                Content = fallbackText
+                Content = fallbackText,
+                StructuredPayloadJson = structuredJson
             });
         }
     }
@@ -465,7 +547,9 @@ public class ClaudeAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
+            ? promptEvent.WorkingDirectory
+            : AgentAdapterFactory.ResolveWorkspaceDirectory();
         var claudePath = AgentAdapterFactory.ResolveExecutablePath(preset.Command ?? "claude");
 
         if (claudePath != null)
@@ -505,7 +589,9 @@ public class CopilotAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
+            ? promptEvent.WorkingDirectory
+            : AgentAdapterFactory.ResolveWorkspaceDirectory();
         var copilotPath = AgentAdapterFactory.ResolveExecutablePath("copilot");
 
         if (copilotPath != null)
@@ -525,6 +611,19 @@ public class CopilotAdapter : IAgentAdapter
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+
+            if (!string.IsNullOrWhiteSpace(promptEvent.Model))
+            {
+                psi.ArgumentList.Add("--model");
+                psi.ArgumentList.Add(promptEvent.Model.Trim());
+            }
+
+            if (!string.IsNullOrWhiteSpace(promptEvent.Mode))
+            {
+                psi.ArgumentList.Add("--mode");
+                psi.ArgumentList.Add(promptEvent.Mode.Trim());
+            }
+
             psi.ArgumentList.Add("-p");
             psi.ArgumentList.Add(promptEvent.Prompt);
             psi.ArgumentList.Add("--allow-all");
@@ -562,7 +661,9 @@ public class GenericCommandAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
+            ? promptEvent.WorkingDirectory
+            : AgentAdapterFactory.ResolveWorkspaceDirectory();
 
         // If user configured a custom command (not empty and not default 'agy'), run it and parse JSONL or plain text output
         if (!string.IsNullOrWhiteSpace(preset.Command) &&

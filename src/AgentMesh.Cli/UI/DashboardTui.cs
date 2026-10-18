@@ -133,6 +133,7 @@ public class DashboardTui
                 .AddColumn("[bold]Adapter[/]")
                 .AddColumn("[bold]Status[/]")
                 .AddColumn(new TableColumn("[bold]Prompts[/]").RightAligned())
+                .AddColumn(new TableColumn("[bold]Tokens[/]").RightAligned())
                 .AddColumn("[bold]Last Activity / Info[/]");
 
             for (var i = 0; i < states.Count; i++)
@@ -150,6 +151,10 @@ public class DashboardTui
                     _ => "[grey]○ OFFLINE[/]"
                 };
 
+                var tokenDisplay = s.TotalTokensUsed > 0
+                    ? $"[bold skyblue1]{s.TotalTokensUsed:N0}[/]"
+                    : "[grey]-[/]";
+
                 var info = !string.IsNullOrWhiteSpace(s.LastError)
                     ? $"[red]{Markup.Escape(s.LastError)}[/]"
                     : s.LastActivityAt.HasValue
@@ -163,6 +168,7 @@ public class DashboardTui
                     $"[cyan]{Markup.Escape(s.AdapterType)}[/]",
                     statusMarkup,
                     s.PromptsHandled.ToString(),
+                    tokenDisplay,
                     info
                 );
             }

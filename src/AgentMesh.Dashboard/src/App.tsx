@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Bot,
   Brain,
@@ -15,7 +15,10 @@ import {
   MessageSquare,
   ChevronRight,
   Activity,
-  Cpu
+  Cpu,
+  Folder,
+  Zap,
+  Sliders
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -42,6 +45,10 @@ export default function App() {
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [newSessionTitle, setNewSessionTitle] = useState('');
   const [newSessionPrompt, setNewSessionPrompt] = useState('');
+  const [newSessionWorkDir, setNewSessionWorkDir] = useState('');
+  const [newSessionModel, setNewSessionModel] = useState('');
+  const [newSessionEffort, setNewSessionEffort] = useState('');
+  const [newSessionMode, setNewSessionMode] = useState('');
 
   // Quick Register Agent modal/drawer state
   const [showRegisterModal, setShowRegisterModal] = useState(false);
@@ -194,10 +201,20 @@ export default function App() {
       const created = await api.createAgentSession(
         targetAgent,
         newSessionTitle.trim(),
-        newSessionPrompt.trim() || undefined
+        newSessionPrompt.trim() || undefined,
+        {
+          workingDirectory: newSessionWorkDir.trim() || undefined,
+          model: newSessionModel.trim() || undefined,
+          effort: newSessionEffort.trim() || undefined,
+          mode: newSessionMode.trim() || undefined
+        }
       );
       setNewSessionTitle('');
       setNewSessionPrompt('');
+      setNewSessionWorkDir('');
+      setNewSessionModel('');
+      setNewSessionEffort('');
+      setNewSessionMode('');
       setIsCreatingSession(false);
       await fetchAllData();
       setSelectedSessionId(created.id);
@@ -259,6 +276,15 @@ export default function App() {
   const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
   const selectedAgent =
     agents.find((a) => a.id === (selectedSession?.creatorAgentId || selectedAgentId)) || null;
+
+  const selectedSessionMetadata = useMemo(() => {
+    if (!selectedSession?.metadataJson) return null;
+    try {
+      return JSON.parse(selectedSession.metadataJson) as Record<string, any>;
+    } catch {
+      return null;
+    }
+  }, [selectedSession?.metadataJson]);
 
   return (
     <div className="min-h-screen h-screen bg-slate-950 text-slate-100 flex flex-col font-sans overflow-hidden">
@@ -598,12 +624,85 @@ export default function App() {
                     Initial Prompt (Optional)
                   </label>
                   <textarea
-                    rows={3}
+                    rows={2}
                     placeholder="Enter an initial instruction for the agent to begin reasoning..."
                     value={newSessionPrompt}
                     onChange={(e) => setNewSessionPrompt(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
                   />
+                </div>
+
+                {/* Session Controls: Working Directory & Model Parameters */}
+                <div className="pt-2 border-t border-slate-800/80 space-y-3">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-300">
+                    <Sliders className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Agent Execution Controls</span>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-medium text-slate-400">
+                      Working Directory
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="~/.agentmesh/workspaces/<session-id> (default persistent sandbox)"
+                      value={newSessionWorkDir}
+                      onChange={(e) => setNewSessionWorkDir(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
+                    />
+                    <p className="text-[10px] text-slate-500 font-mono">
+                      Safe default sandbox created under ~/.agentmesh/workspaces/ if left blank.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2.5">
+                    <div className="space-y-1">
+                      <label className="block text-[11px] font-medium text-slate-400">
+                        Model
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="default / gemini-2.5-pro"
+                        value={newSessionModel}
+                        onChange={(e) => setNewSessionModel(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="block text-[11px] font-medium text-slate-400">
+                        Reasoning Effort
+                      </label>
+                      <select
+                        value={newSessionEffort}
+                        onChange={(e) => setNewSessionEffort(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+                      >
+                        <option value="">Default</option>
+                        <option value="low">low</option>
+                        <option value="medium">medium</option>
+                        <option value="high">high</option>
+                        <option value="xhigh">xhigh</option>
+                        <option value="max">max</option>
+                      </select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="block text-[11px] font-medium text-slate-400">
+                        Mode
+                      </label>
+                      <select
+                        value={newSessionMode}
+                        onChange={(e) => setNewSessionMode(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+                      >
+                        <option value="">Default</option>
+                        <option value="auto">auto</option>
+                        <option value="plan">plan</option>
+                        <option value="accept-edits">accept-edits</option>
+                      </select>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-end gap-2.5 pt-2">
@@ -627,7 +726,7 @@ export default function App() {
           ) : selectedSession ? (
             <>
               {/* Active Session Header */}
-              <div className="px-6 py-3.5 border-b border-slate-800/80 bg-slate-900/30 flex items-center justify-between shrink-0">
+              <div className="px-6 py-3 border-b border-slate-800/80 bg-slate-900/30 flex items-center justify-between shrink-0">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2.5">
                     <h2 className="text-sm font-bold text-white truncate">
@@ -643,10 +742,53 @@ export default function App() {
                       {selectedSession.status === 'thinking' ? 'Thinking...' : selectedSession.status}
                     </span>
                   </div>
-                  <div className="text-xs text-slate-400 flex items-center gap-2 mt-0.5 font-mono">
-                    <span>Agent: {selectedAgent?.name || selectedSession.creatorAgentId || 'agy'}</span>
-                    <span>·</span>
-                    <span>{events.length} trajectory events</span>
+
+                  <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-[11px]">
+                    <span className="text-slate-400">
+                      Agent: <strong className="text-slate-200">@{selectedAgent?.id || selectedSession.creatorAgentId || 'agy'}</strong>
+                    </span>
+                    <span className="text-slate-600">·</span>
+                    <span
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80 truncate max-w-xs"
+                      title={selectedSessionMetadata?.workingDirectory || `~/.agentmesh/workspaces/${selectedSession.id}`}
+                    >
+                      <Folder className="w-3 h-3 text-sky-400 shrink-0" />
+                      <span className="truncate">
+                        {selectedSessionMetadata?.workingDirectory
+                          ? selectedSessionMetadata.workingDirectory
+                          : `~/.agentmesh/workspaces/${selectedSession.id.slice(0, 8)}...`}
+                      </span>
+                    </span>
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80">
+                      <Cpu className="w-3 h-3 text-purple-400 shrink-0" />
+                      <span>{selectedSessionMetadata?.model || 'default'}</span>
+                    </span>
+                    {selectedSessionMetadata?.effort && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80">
+                        <Brain className="w-3 h-3 text-indigo-400 shrink-0" />
+                        <span>{selectedSessionMetadata.effort}</span>
+                      </span>
+                    )}
+                    {selectedSessionMetadata?.mode && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80">
+                        <Sliders className="w-3 h-3 text-amber-400 shrink-0" />
+                        <span>{selectedSessionMetadata.mode}</span>
+                      </span>
+                    )}
+                    {selectedSessionMetadata?.cumulativeUsage?.totalTokens ? (
+                      <span
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30"
+                        title={`In: ${selectedSessionMetadata.cumulativeUsage.inputTokens || 0} | Out: ${selectedSessionMetadata.cumulativeUsage.outputTokens || 0} | Think: ${selectedSessionMetadata.cumulativeUsage.thinkingTokens || 0}`}
+                      >
+                        <Zap className="w-3 h-3 text-sky-400 shrink-0" />
+                        <span>
+                          {selectedSessionMetadata.cumulativeUsage.totalTokens.toLocaleString()} tokens
+                          {selectedSessionMetadata.cumulativeUsage.totalDurationSeconds
+                            ? ` (${selectedSessionMetadata.cumulativeUsage.totalDurationSeconds.toFixed(1)}s)`
+                            : ''}
+                        </span>
+                      </span>
+                    ) : null}
                   </div>
                 </div>
 
@@ -777,6 +919,20 @@ export default function App() {
                     }
 
                     // Default: 'response'
+                    let usage: {
+                      inputTokens?: number;
+                      outputTokens?: number;
+                      thinkingTokens?: number;
+                      totalTokens?: number;
+                      durationSeconds?: number;
+                    } | null = null;
+                    if (ev.structuredPayloadJson) {
+                      try {
+                        const parsed = JSON.parse(ev.structuredPayloadJson);
+                        if (parsed.usage) usage = parsed.usage;
+                      } catch {}
+                    }
+
                     return (
                       <div
                         key={ev.id}
@@ -787,9 +943,20 @@ export default function App() {
                             <CheckCircle2 className="w-4 h-4" />
                             <span className="font-bold">@{ev.senderAgentId}</span>
                           </div>
-                          <span className="text-slate-500">
-                            {new Date(ev.createdAt).toLocaleTimeString()}
-                          </span>
+                          <div className="flex items-center gap-2.5">
+                            {usage && (
+                              <span
+                                className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/25"
+                                title={`In: ${usage.inputTokens || 0} | Out: ${usage.outputTokens || 0} | Think: ${usage.thinkingTokens || 0}`}
+                              >
+                                ⚡ {(usage.totalTokens || ((usage.inputTokens || 0) + (usage.outputTokens || 0))).toLocaleString()} tokens
+                                {usage.durationSeconds ? ` (${usage.durationSeconds.toFixed(1)}s)` : ''}
+                              </span>
+                            )}
+                            <span className="text-slate-500">
+                              {new Date(ev.createdAt).toLocaleTimeString()}
+                            </span>
+                          </div>
                         </div>
                         <div className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200">
                           {ev.content}
