@@ -197,6 +197,80 @@ public class SessionsController(
         }
     }
 
+    public static List<QueuedPromptDto> ExtractPromptQueue(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return new();
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
+            if (doc.RootElement.TryGetProperty("promptQueue", out var qElem) && qElem.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                return System.Text.Json.JsonSerializer.Deserialize<List<QueuedPromptDto>>(qElem.GetRawText(), new System.Text.Json.JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? new();
+            }
+        }
+        catch { }
+        return new();
+    }
+
+    public static string UpdatePromptQueueMetadata(string? metadataJson, List<QueuedPromptDto> queue)
+    {
+        try
+        {
+            var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(metadataJson))
+            {
+                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson);
+                if (parsed != null)
+                {
+                    foreach (var (k, v) in parsed) dict[k] = v;
+                }
+            }
+            dict["promptQueue"] = queue;
+            return System.Text.Json.JsonSerializer.Serialize(dict);
+        }
+        catch
+        {
+            return metadataJson ?? "{}";
+        }
+    }
+
+    private async Task TriggerStopInternalAsync(AgentSession session)
+    {
+        var auditMsg = new SessionMessage
+        {
+            SessionId = session.Id,
+            SenderAgentId = "system",
+            TargetAgentId = session.CreatorAgentId,
+            EventType = "system",
+            Content = "🛑 Interrupted by operator for new prompt.",
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.SessionMessages.Add(auditMsg);
+        var auditDto = ToMessageDto(auditMsg);
+        await hubContext.Clients.Group($"session-{session.Id}").SendAsync("ReceiveMessage", auditDto);
+        await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
+
+        await hubContext.Clients.Group($"session-{session.Id}").SendAsync("StopExecution", new
+        {
+            sessionId = session.Id,
+            agentId = session.CreatorAgentId,
+            reason = "Interrupted by incoming prompt"
+        });
+        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        {
+            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+            await hubContext.Clients.Group(targetGroup).SendAsync("StopExecution", new
+            {
+                sessionId = session.Id,
+                agentId = session.CreatorAgentId,
+                reason = "Interrupted by incoming prompt"
+            });
+        }
+    }
+
     [HttpPost]
     public async Task<IActionResult> CreateSession([FromBody] CreateSessionRequest req)
     {
@@ -211,7 +285,7 @@ public class SessionsController(
               ?? User?.FindFirst("AgentId")?.Value
               ?? "agy";
 
-        var initialMetadata = MergeSessionMetadata(req.MetadataJson, req.WorkingDirectory, req.Model, req.Effort, req.Mode);
+        var initialMetadata = MergeSessionMetadata(req.MetadataJson, req.WorkingDirectory, req.Model, req.Effort, req.Mode, req.Tier);
 
         var session = new AgentSession
         {
@@ -364,6 +438,68 @@ public class SessionsController(
                 tier = tier
             });
         }
+        else if (eventType == "response")
+        {
+            // Auto-advance queued prompts sequentially if any are pending
+            var queue = ExtractPromptQueue(session.MetadataJson);
+            if (queue.Count > 0)
+            {
+                var nextPrompt = queue[0];
+                queue.RemoveAt(0);
+                session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
+
+                var nextMsg = new SessionMessage
+                {
+                    SessionId = id,
+                    SenderAgentId = nextPrompt.Sender,
+                    TargetAgentId = session.CreatorAgentId,
+                    EventType = "prompt",
+                    Content = nextPrompt.Prompt,
+                    CreatedAt = DateTimeOffset.UtcNow
+                };
+                db.SessionMessages.Add(nextMsg);
+                session.Status = "thinking";
+                session.UpdatedAt = DateTimeOffset.UtcNow;
+
+                if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                {
+                    var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == session.CreatorAgentId);
+                    if (agent != null)
+                    {
+                        agent.Status = "busy";
+                        agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                    }
+                }
+
+                await db.SaveChangesAsync();
+
+                var nextDto = ToMessageDto(nextMsg);
+                await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", nextDto);
+                await hubContext.Clients.All.SendAsync("ReceiveMessage", nextDto);
+                await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
+                await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
+                await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+                var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+                if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                {
+                    var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+                    await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+                    {
+                        sessionId = id,
+                        messageId = nextMsg.Id,
+                        agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                        prompt = nextMsg.Content,
+                        sender = nextMsg.SenderAgentId,
+                        workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
+                        model = nextPrompt.Model ?? model,
+                        effort = nextPrompt.Effort ?? effort,
+                        mode = nextPrompt.Mode ?? mode,
+                        tier = nextPrompt.Tier ?? tier
+                    });
+                }
+            }
+        }
 
         return CreatedAtAction(nameof(GetMessages), new { id }, messageDto);
     }
@@ -437,6 +573,344 @@ public class SessionsController(
         await hubContext.Clients.All.SendAsync("SessionUpdated", session);
 
         return Ok(session);
+    }
+
+    [HttpPost("{id:guid}/stop")]
+    public async Task<IActionResult> StopSession(Guid id)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        session.Status = "active";
+        session.UpdatedAt = DateTimeOffset.UtcNow;
+
+        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        {
+            var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == session.CreatorAgentId);
+            if (agent != null && agent.Status == "busy")
+            {
+                agent.Status = "online";
+                agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+            }
+        }
+
+        var auditMsg = new SessionMessage
+        {
+            SessionId = session.Id,
+            SenderAgentId = "system",
+            TargetAgentId = session.CreatorAgentId,
+            EventType = "system",
+            Content = "🛑 Model execution stopped by operator.",
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.SessionMessages.Add(auditMsg);
+        await db.SaveChangesAsync();
+
+        var auditDto = ToMessageDto(auditMsg);
+        await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", auditDto);
+        await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
+
+        await hubContext.Clients.Group($"session-{id}").SendAsync("StopExecution", new
+        {
+            sessionId = id,
+            agentId = session.CreatorAgentId,
+            reason = "Operator clicked stop"
+        });
+
+        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        {
+            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+            await hubContext.Clients.Group(targetGroup).SendAsync("StopExecution", new
+            {
+                sessionId = id,
+                agentId = session.CreatorAgentId,
+                reason = "Operator clicked stop"
+            });
+        }
+
+        await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+        return Ok(new { status = "stopped", sessionId = id });
+    }
+
+    [HttpPost("{id:guid}/commands/{commandId}/stop")]
+    public async Task<IActionResult> StopCommand(Guid id, string commandId)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var auditMsg = new SessionMessage
+        {
+            SessionId = session.Id,
+            SenderAgentId = "system",
+            TargetAgentId = session.CreatorAgentId,
+            EventType = "tool_result",
+            ToolName = "command",
+            Content = $"🛑 Command '{commandId}' stopped by operator.",
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.SessionMessages.Add(auditMsg);
+        await db.SaveChangesAsync();
+
+        var auditDto = ToMessageDto(auditMsg);
+        await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", auditDto);
+        await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
+
+        await hubContext.Clients.Group($"session-{id}").SendAsync("StopCommand", new
+        {
+            sessionId = id,
+            commandId,
+            agentId = session.CreatorAgentId
+        });
+
+        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        {
+            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+            await hubContext.Clients.Group(targetGroup).SendAsync("StopCommand", new
+            {
+                sessionId = id,
+                commandId,
+                agentId = session.CreatorAgentId
+            });
+        }
+
+        return Ok(new { status = "stopped", commandId });
+    }
+
+    [HttpPost("{id:guid}/queue")]
+    public async Task<IActionResult> EnqueuePrompt(Guid id, [FromBody] EnqueuePromptRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Prompt))
+        {
+            return BadRequest(new { error = "Prompt cannot be empty." });
+        }
+
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var senderId = !string.IsNullOrWhiteSpace(req.SenderAgentId)
+            ? req.SenderAgentId.Trim()
+            : User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
+              ?? User?.FindFirst("AgentId")?.Value
+              ?? "operator";
+
+        var queue = ExtractPromptQueue(session.MetadataJson);
+
+        if (req.SendNow)
+        {
+            if (session.Status == "thinking")
+            {
+                await TriggerStopInternalAsync(session);
+            }
+
+            var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var msg = new SessionMessage
+            {
+                SessionId = id,
+                SenderAgentId = senderId,
+                TargetAgentId = session.CreatorAgentId,
+                EventType = "prompt",
+                Content = req.Prompt.Trim(),
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            db.SessionMessages.Add(msg);
+            session.Status = "thinking";
+            session.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+
+            var msgDto = ToMessageDto(msg);
+            await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", msgDto);
+            await hubContext.Clients.All.SendAsync("ReceiveMessage", msgDto);
+            await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+            if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+            {
+                var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+                {
+                    sessionId = id,
+                    messageId = msg.Id,
+                    agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                    prompt = msg.Content,
+                    sender = msg.SenderAgentId,
+                    workingDirectory = req.WorkingDirectory ?? workDir,
+                    model = req.Model ?? model,
+                    effort = req.Effort ?? effort,
+                    mode = req.Mode ?? mode,
+                    tier = req.Tier ?? tier
+                });
+            }
+
+            return Ok(new { session, queue, dispatched = true });
+        }
+
+        // If session is idle and queue is empty, dispatch immediately
+        if (session.Status != "thinking" && queue.Count == 0)
+        {
+            var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var msg = new SessionMessage
+            {
+                SessionId = id,
+                SenderAgentId = senderId,
+                TargetAgentId = session.CreatorAgentId,
+                EventType = "prompt",
+                Content = req.Prompt.Trim(),
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            db.SessionMessages.Add(msg);
+            session.Status = "thinking";
+            session.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+
+            var msgDto = ToMessageDto(msg);
+            await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", msgDto);
+            await hubContext.Clients.All.SendAsync("ReceiveMessage", msgDto);
+            await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+            if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+            {
+                var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+                {
+                    sessionId = id,
+                    messageId = msg.Id,
+                    agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                    prompt = msg.Content,
+                    sender = msg.SenderAgentId,
+                    workingDirectory = req.WorkingDirectory ?? workDir,
+                    model = req.Model ?? model,
+                    effort = req.Effort ?? effort,
+                    mode = req.Mode ?? mode,
+                    tier = req.Tier ?? tier
+                });
+            }
+
+            return Ok(new { session, queue, dispatched = true });
+        }
+
+        // Otherwise enqueue for sequential execution
+        var queuedItem = new QueuedPromptDto(
+            Id: Guid.NewGuid().ToString(),
+            Prompt: req.Prompt.Trim(),
+            Sender: senderId,
+            CreatedAt: DateTimeOffset.UtcNow,
+            Model: req.Model,
+            Effort: req.Effort,
+            Tier: req.Tier,
+            Mode: req.Mode,
+            WorkingDirectory: req.WorkingDirectory
+        );
+        queue.Add(queuedItem);
+
+        session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
+        session.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
+        await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
+        await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+        return Ok(new { session, queue, dispatched = false });
+    }
+
+    [HttpDelete("{id:guid}/queue/{queueItemId}")]
+    public async Task<IActionResult> DequeuePrompt(Guid id, string queueItemId)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var queue = ExtractPromptQueue(session.MetadataJson);
+        queue.RemoveAll(q => string.Equals(q.Id, queueItemId, StringComparison.OrdinalIgnoreCase));
+
+        session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
+        session.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
+        await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
+        await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+        return Ok(queue);
+    }
+
+    [HttpPost("{id:guid}/queue/{queueItemId}/send-now")]
+    public async Task<IActionResult> SendQueuedPromptNow(Guid id, string queueItemId)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var queue = ExtractPromptQueue(session.MetadataJson);
+        var item = queue.FirstOrDefault(q => string.Equals(q.Id, queueItemId, StringComparison.OrdinalIgnoreCase));
+        if (item == null)
+        {
+            return NotFound(new { error = $"Queued prompt '{queueItemId}' not found." });
+        }
+
+        queue.Remove(item);
+        session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
+
+        if (session.Status == "thinking")
+        {
+            await TriggerStopInternalAsync(session);
+        }
+
+        var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+
+        var msg = new SessionMessage
+        {
+            SessionId = id,
+            SenderAgentId = item.Sender,
+            TargetAgentId = session.CreatorAgentId,
+            EventType = "prompt",
+            Content = item.Prompt,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.SessionMessages.Add(msg);
+        session.Status = "thinking";
+        session.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var msgDto = ToMessageDto(msg);
+        await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", msgDto);
+        await hubContext.Clients.All.SendAsync("ReceiveMessage", msgDto);
+        await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
+        await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
+        await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        {
+            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+            {
+                sessionId = id,
+                messageId = msg.Id,
+                agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                prompt = msg.Content,
+                sender = msg.SenderAgentId,
+                workingDirectory = item.WorkingDirectory ?? workDir,
+                model = item.Model ?? model,
+                effort = item.Effort ?? effort,
+                mode = item.Mode ?? mode,
+                tier = item.Tier ?? tier
+            });
+        }
+
+        return Ok(new { session, queue, dispatched = true });
     }
 
     private static SessionMessageDto ToMessageDto(SessionMessage m) => new(
@@ -524,3 +998,27 @@ public record SessionMessageDto(
     string? ToolArgsJson = null,
     string? ToolResultJson = null
 );
+
+public record QueuedPromptDto(
+    string Id,
+    string Prompt,
+    string Sender,
+    DateTimeOffset CreatedAt,
+    string? Model = null,
+    string? Effort = null,
+    string? Tier = null,
+    string? Mode = null,
+    string? WorkingDirectory = null
+);
+
+public record EnqueuePromptRequest(
+    string Prompt,
+    string? SenderAgentId = null,
+    bool SendNow = false,
+    string? Model = null,
+    string? Effort = null,
+    string? Tier = null,
+    string? Mode = null,
+    string? WorkingDirectory = null
+);
+

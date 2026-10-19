@@ -15,6 +15,7 @@ public class AgentRunnerInstance : IAsyncDisposable
     private readonly Action _onStateChanged;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<Guid, byte> _processedMessages = new();
+    private CancellationTokenSource? _activeTurnCts;
 
     private HubConnection? _hubConnection;
     private string? _agentToken;
@@ -117,6 +118,35 @@ public class AgentRunnerInstance : IAsyncDisposable
             }
         });
 
+        _hubConnection.On<JsonElement>("StopExecution", (elem) =>
+        {
+            try
+            {
+                var sidStr = elem.TryGetProperty("sessionId", out var sidProp) ? sidProp.GetString() : null;
+                if (sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId)
+                {
+                    _onLog(_preset.Id, $"🛑 StopExecution received for session {sid.ToString()[..8]}. Aborting active turn.");
+                    _activeTurnCts?.Cancel();
+                }
+            }
+            catch { }
+        });
+
+        _hubConnection.On<JsonElement>("StopCommand", (elem) =>
+        {
+            try
+            {
+                var sidStr = elem.TryGetProperty("sessionId", out var sidProp) ? sidProp.GetString() : null;
+                var cmdId = elem.TryGetProperty("commandId", out var cProp) ? cProp.GetString() : null;
+                if (sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId)
+                {
+                    _onLog(_preset.Id, $"🛑 StopCommand received for command '{cmdId}' in session {sid.ToString()[..8]}. Aborting active turn.");
+                    _activeTurnCts?.Cancel();
+                }
+            }
+            catch { }
+        });
+
         _hubConnection.Reconnected += async (_) =>
         {
             State.State = RunnerConnectionState.Online;
@@ -168,6 +198,10 @@ public class AgentRunnerInstance : IAsyncDisposable
         {
             return; // Already processing or processed this prompt
         }
+
+        using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
+        _activeTurnCts = turnCts;
+        var turnToken = turnCts.Token;
 
         try
         {
@@ -222,8 +256,8 @@ public class AgentRunnerInstance : IAsyncDisposable
                     _preset.Id,
                     _agentToken,
                     trajectoryEv,
-                    ct);
-            }, ct);
+                    turnToken);
+            }, turnToken);
 
             State.PromptsHandled++;
             State.State = RunnerConnectionState.Online;
@@ -232,9 +266,18 @@ public class AgentRunnerInstance : IAsyncDisposable
             _onStateChanged();
             _onLog(_preset.Id, $"Completed session [{ev.SessionId.ToString()[..8]}] response (total tokens: {State.TotalTokensUsed:N0}).");
         }
+        catch (OperationCanceledException)
+        {
+            State.State = RunnerConnectionState.Online;
+            State.ActiveSessionId = null;
+            State.LastActivityAt = DateTimeOffset.UtcNow;
+            _onStateChanged();
+            _onLog(_preset.Id, $"🛑 Execution halted for session [{ev.SessionId.ToString()[..8]}].");
+        }
         catch (Exception ex)
         {
             State.State = RunnerConnectionState.Online;
+            State.ActiveSessionId = null;
             State.LastError = ex.Message;
             _onStateChanged();
             _onLog(_preset.Id, $"Error executing prompt: {ex.Message}");
@@ -255,6 +298,13 @@ public class AgentRunnerInstance : IAsyncDisposable
             catch
             {
                 // Ignore secondary failure
+            }
+        }
+        finally
+        {
+            if (_activeTurnCts == turnCts)
+            {
+                _activeTurnCts = null;
             }
         }
     }

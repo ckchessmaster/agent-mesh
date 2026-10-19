@@ -87,7 +87,12 @@ vi.mock('../services/api', () => ({
     createAgentSession: vi.fn(),
     updateSessionControls: vi.fn(),
     postSessionMessage: vi.fn(),
-    upsertAgent: vi.fn()
+    upsertAgent: vi.fn(),
+    stopSession: vi.fn().mockResolvedValue({ status: 'stopped', sessionId: 's1' }),
+    stopCommand: vi.fn().mockResolvedValue({ status: 'stopped', commandId: 'c1' }),
+    enqueuePrompt: vi.fn().mockResolvedValue({ session: {}, queue: [], dispatched: false }),
+    dequeuePrompt: vi.fn().mockResolvedValue([]),
+    sendQueuedPromptNow: vi.fn().mockResolvedValue({ session: {}, queue: [], dispatched: true })
   }
 }));
 
@@ -662,5 +667,220 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       expect(screen.getByRole('option', { name: 'Intelligence' })).toBeInTheDocument();
     });
   });
+
+  it('renders Stop button beside input bar disabled when idle, enabled when thinking, and stops session on click', async () => {
+    const mockAgent: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      runtimeType: 1,
+      trustTier: 1,
+      status: 'busy',
+      createdAt: new Date().toISOString()
+    };
+
+    const mockThinkingSession: AgentSession = {
+      id: 'session-thinking-1',
+      title: 'Thinking Session',
+      status: 'thinking',
+      metadataJson: JSON.stringify({ model: 'gemini-4-argon' }),
+      creatorAgentId: 'agy',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockThinkingSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Thinking Session').length).toBeGreaterThan(0);
+    });
+
+    // Select the session
+    fireEvent.click(screen.getAllByText('Thinking Session')[0]);
+
+    await waitFor(() => {
+      const stopBtn = screen.getByRole('button', { name: /stop/i });
+      expect(stopBtn).toBeInTheDocument();
+      expect(stopBtn).not.toBeDisabled();
+    });
+
+    const stopButton = screen.getByRole('button', { name: /stop/i });
+    fireEvent.click(stopButton);
+
+    expect(api.stopSession).toHaveBeenCalledWith('session-thinking-1');
+  });
+
+  it('transforms Send button into Queue when session is thinking, and supports split dropdown for Send Now', async () => {
+    const mockAgent: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      runtimeType: 1,
+      trustTier: 1,
+      status: 'busy',
+      createdAt: new Date().toISOString()
+    };
+
+    const mockThinkingSession: AgentSession = {
+      id: 'session-thinking-2',
+      title: 'Thinking Session 2',
+      status: 'thinking',
+      metadataJson: JSON.stringify({ model: 'gemini-4-argon' }),
+      creatorAgentId: 'agy',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockThinkingSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+    vi.mocked(api.enqueuePrompt).mockResolvedValue({
+      session: mockThinkingSession,
+      queue: [{ id: 'q1', prompt: 'Queued prompt message', sender: 'test', createdAt: new Date().toISOString() }],
+      dispatched: false
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Thinking Session 2').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Thinking Session 2')[0]);
+
+    // Input prompt
+    const input = await screen.findByPlaceholderText(/Add instruction to queue for Antigravity CLI/i);
+    fireEvent.change(input, { target: { value: 'Followup instruction' } });
+
+    // The submit button is now "Queue"
+    const queueBtn = screen.getByRole('button', { name: /^queue$/i });
+    expect(queueBtn).toBeInTheDocument();
+
+    // The dropdown toggle button exists
+    const dropdownToggle = screen.getByTitle('More sending options');
+    fireEvent.click(dropdownToggle);
+
+    // "Send Now (Interrupt)" option appears
+    const sendNowOption = await screen.findByText(/Send Now \(Interrupt\)/i);
+    expect(sendNowOption).toBeInTheDocument();
+
+    // Clicking Send Now calls enqueuePrompt with sendNow: true
+    fireEvent.click(sendNowOption);
+
+    expect(api.enqueuePrompt).toHaveBeenCalledWith('session-thinking-2', expect.objectContaining({
+      prompt: 'Followup instruction',
+      sendNow: true
+    }));
+  });
+
+  it('renders queued prompts strip with items, Send Now button, and Remove button', async () => {
+    const mockAgent: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      runtimeType: 1,
+      trustTier: 1,
+      status: 'online',
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSessionWithQueue: AgentSession = {
+      id: 'session-queued-1',
+      title: 'Session With Queue',
+      status: 'active',
+      metadataJson: JSON.stringify({
+        promptQueue: [
+          { id: 'item-1', prompt: 'First queued message', sender: 'operator', createdAt: new Date().toISOString() },
+          { id: 'item-2', prompt: 'Second queued message', sender: 'operator', createdAt: new Date().toISOString() }
+        ]
+      }),
+      creatorAgentId: 'agy',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSessionWithQueue]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Session With Queue').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Session With Queue')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Prompt Queue \(2\)/i)).toBeInTheDocument();
+      expect(screen.getByText('First queued message')).toBeInTheDocument();
+      expect(screen.getByText('Second queued message')).toBeInTheDocument();
+    });
+
+    // Test clicking Send Now on the first queued item
+    const sendNowBtns = screen.getAllByRole('button', { name: /Send Now/i });
+    fireEvent.click(sendNowBtns[0]);
+    expect(api.sendQueuedPromptNow).toHaveBeenCalledWith('session-queued-1', 'item-1');
+
+    // Test clicking remove on the second queued item
+    const removeBtns = screen.getAllByTitle('Remove from queue');
+    fireEvent.click(removeBtns[1]);
+    expect(api.dequeuePrompt).toHaveBeenCalledWith('session-queued-1', 'item-2');
+  });
+
+  it('renders active command pill with Kill Command button when model is running a command', async () => {
+    const mockAgent: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      runtimeType: 1,
+      trustTier: 1,
+      status: 'busy',
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-cmd-1',
+      title: 'Active Command Session',
+      status: 'thinking',
+      metadataJson: JSON.stringify({}),
+      creatorAgentId: 'agy',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const mockToolCallMessage: SessionMessage = {
+      id: 'msg-cmd-1',
+      sessionId: 'session-cmd-1',
+      senderAgentId: 'agy',
+      eventType: 'tool_call',
+      toolName: 'run_command',
+      content: 'Running command: npm test',
+      toolArgsJson: JSON.stringify({ CommandLine: 'npm test' }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([mockToolCallMessage]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Active Command Session').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Active Command Session')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Running command:')).toBeInTheDocument();
+      expect(screen.getByText('npm test')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Kill Command/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Kill Command/i }));
+    expect(api.stopCommand).toHaveBeenCalledWith('session-cmd-1', 'msg-cmd-1');
+  });
 });
+
 

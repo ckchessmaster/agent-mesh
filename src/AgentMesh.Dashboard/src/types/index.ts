@@ -179,3 +179,16 @@ export interface AgentUsageResponse {
   providerQuota?: ProviderQuotaInfo | null;
 }
 
+export interface QueuedPromptItem {
+  id: string;
+  prompt: string;
+  sender: string;
+  createdAt: string;
+  model?: string | null;
+  effort?: string | null;
+  tier?: string | null;
+  mode?: string | null;
+  workingDirectory?: string | null;
+}
+
+

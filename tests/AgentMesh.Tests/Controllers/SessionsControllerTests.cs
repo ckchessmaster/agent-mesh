@@ -203,4 +203,183 @@ public class SessionsControllerTests
         cumulative.GetProperty("totalTokens").GetInt64().Should().Be(1750);
         cumulative.GetProperty("totalDurationSeconds").GetDouble().Should().BeApproximately(3.5, 0.01);
     }
+
+    [Fact]
+    public async Task StopSession_SetsStatusActive_AndBroadcastsStopExecution()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Busy Session",
+            Status = "thinking",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var result = await controller.StopSession(session.Id);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+        session.Status.Should().Be("active");
+
+        // Broadcasted StopExecution signal
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("StopExecution", It.IsAny<object[]>(), default),
+            Times.AtLeastOnce);
+
+        // Saved audit message
+        db.SessionMessages.Should().ContainSingle(m => m.SessionId == session.Id && m.Content.Contains("stopped by operator"));
+    }
+
+    [Fact]
+    public async Task StopCommand_BroadcastsStopCommand_AndAddsAuditMessage()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Command Session",
+            Status = "thinking",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var result = await controller.StopCommand(session.Id, "cmd-99");
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("StopCommand", It.IsAny<object[]>(), default),
+            Times.AtLeastOnce);
+
+        db.SessionMessages.Should().ContainSingle(m => m.SessionId == session.Id && m.Content.Contains("cmd-99"));
+    }
+
+    [Fact]
+    public async Task EnqueuePrompt_AddsToQueue_WhenNotSendNow()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Queue Test Session",
+            Status = "thinking",
+            CreatorAgentId = "agy",
+            MetadataJson = "{}"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var req = new EnqueuePromptRequest("Follow up question", SendNow: false);
+        var result = await controller.EnqueuePrompt(session.Id, req);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+
+        var queue = SessionsController.ExtractPromptQueue(session.MetadataJson);
+        queue.Should().HaveCount(1);
+        queue[0].Prompt.Should().Be("Follow up question");
+
+        // Broadcasted QueueUpdated
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("QueueUpdated", It.IsAny<object[]>(), default),
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task EnqueuePrompt_DispatchesImmediately_WhenSendNow()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Send Now Session",
+            Status = "thinking",
+            CreatorAgentId = "copilot",
+            MetadataJson = "{}"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var req = new EnqueuePromptRequest("Urgent override instruction", SendNow: true);
+        var result = await controller.EnqueuePrompt(session.Id, req);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+        session.Status.Should().Be("thinking");
+
+        // Broadcasted PromptReceived
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("PromptReceived", It.IsAny<object[]>(), default),
+            Times.AtLeastOnce);
+
+        db.SessionMessages.Should().Contain(m => m.Content == "Urgent override instruction");
+    }
+
+    [Fact]
+    public async Task PostMessage_AutoAdvancesQueuedPrompt_WhenTurnCompletes()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var queuedItem = new QueuedPromptDto(
+            Id: "q-1",
+            Prompt: "Next queued task",
+            Sender: "operator",
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+        var initialMetadata = SessionsController.UpdatePromptQueueMetadata("{}", new List<QueuedPromptDto> { queuedItem });
+
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Auto-advance Session",
+            Status = "thinking",
+            CreatorAgentId = "agy",
+            MetadataJson = initialMetadata
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act: agent completes turn by posting response event
+        var req = new PostMessageRequest("Turn 1 complete response", EventType: "response", SenderAgentId: "agy");
+        var result = await controller.PostMessage(session.Id, req);
+
+        // Assert
+        result.Should().BeOfType<CreatedAtActionResult>();
+
+        // Queue should now be empty (item was auto-dispatched)
+        var queue = SessionsController.ExtractPromptQueue(session.MetadataJson);
+        queue.Should().BeEmpty();
+
+        // Dispatched PromptReceived for the queued prompt
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("PromptReceived", It.IsAny<object[]>(), default),
+            Times.AtLeastOnce);
+
+        // New prompt message created in session
+        db.SessionMessages.Should().Contain(m => m.Content == "Next queued task" && m.EventType == "prompt");
+    }
 }
+

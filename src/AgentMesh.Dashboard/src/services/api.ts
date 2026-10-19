@@ -3,6 +3,7 @@ import type {
   AgentSession,
   AgentUsageResponse,
   FilesystemBrowseResponse,
+  QueuedPromptItem,
   SessionMessage,
   StagedJob,
   SystemCapabilitiesResponse,
@@ -248,6 +249,68 @@ export const api = {
     if (!res.ok) throw new Error(`Failed to post session event: ${res.statusText}`);
     return res.json();
   },
+
+  async stopSession(sessionId: string): Promise<{ status: string; sessionId: string }> {
+    const res = await fetch(`/api/sessions/${sessionId}/stop`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to stop session: ${res.statusText}`);
+    return res.json();
+  },
+
+  async stopCommand(sessionId: string, commandId: string): Promise<{ status: string; commandId: string }> {
+    const res = await fetch(`/api/sessions/${sessionId}/commands/${encodeURIComponent(commandId)}/stop`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to stop command: ${res.statusText}`);
+    return res.json();
+  },
+
+  async enqueuePrompt(
+    sessionId: string,
+    req: {
+      prompt: string;
+      senderAgentId?: string;
+      sendNow?: boolean;
+      model?: string;
+      effort?: string;
+      tier?: string;
+      mode?: string;
+      workingDirectory?: string;
+    }
+  ): Promise<{ session: AgentSession; queue: QueuedPromptItem[]; dispatched: boolean }> {
+    const res = await fetch(`/api/sessions/${sessionId}/queue`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to enqueue prompt: ${res.statusText}`);
+    return res.json();
+  },
+
+  async dequeuePrompt(sessionId: string, queueItemId: string): Promise<QueuedPromptItem[]> {
+    const res = await fetch(`/api/sessions/${sessionId}/queue/${encodeURIComponent(queueItemId)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to remove queued prompt: ${res.statusText}`);
+    return res.json();
+  },
+
+  async sendQueuedPromptNow(
+    sessionId: string,
+    queueItemId: string
+  ): Promise<{ session: AgentSession; queue: QueuedPromptItem[]; dispatched: boolean }> {
+    const res = await fetch(`/api/sessions/${sessionId}/queue/${encodeURIComponent(queueItemId)}/send-now`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to send queued prompt immediately: ${res.statusText}`);
+    return res.json();
+  },
+
 
   async resetMesh(): Promise<{ status: string; message: string }> {
     const res = await fetch('/api/dev/reset-mesh', {

@@ -28,7 +28,9 @@ import {
   Sliders,
   BarChart2,
   Layers,
-  Clock
+  Clock,
+  Square,
+  ListPlus
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -38,6 +40,7 @@ import type {
   AgentSession,
   AgentUsageResponse,
   FilesystemBrowseResponse,
+  QueuedPromptItem,
   SessionMessage,
   SystemCapabilitiesResponse,
   SystemStatusResponse
@@ -83,6 +86,10 @@ export default function App() {
 
   // Active session inline control edit popover state
   const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | null>(null);
+
+  // Active prompt queue and Send Now dropdown state
+  const [activeQueue, setActiveQueue] = useState<QueuedPromptItem[]>([]);
+  const [showSendNowDropdown, setShowSendNowDropdown] = useState(false);
 
   // Quick Register Agent modal/drawer state
   const [showRegisterModal, setShowRegisterModal] = useState(false);
@@ -202,9 +209,17 @@ export default function App() {
       setSelectedSessionId(null);
     };
 
+    const handleQueueUpdated = (data: { sessionId: string; queue: QueuedPromptItem[] }) => {
+      if (data.sessionId === selectedSessionId) {
+        setActiveQueue(data.queue || []);
+      }
+      fetchAllData();
+    };
+
     connection.on('ReceiveMessage', handleReceiveMessage);
     connection.on('SessionCreated', handleSessionCreated);
     connection.on('SessionUpdated', handleSessionUpdated);
+    connection.on('QueueUpdated', handleQueueUpdated);
     connection.on('AgentRegistered', handleSessionUpdated);
     connection.on('AgentUpdated', handleSessionUpdated);
     connection.on('MeshReset', handleMeshReset);
@@ -213,6 +228,7 @@ export default function App() {
       connection.off('ReceiveMessage', handleReceiveMessage);
       connection.off('SessionCreated', handleSessionCreated);
       connection.off('SessionUpdated', handleSessionUpdated);
+      connection.off('QueueUpdated', handleQueueUpdated);
       connection.off('AgentRegistered', handleSessionUpdated);
       connection.off('AgentUpdated', handleSessionUpdated);
       connection.off('MeshReset', handleMeshReset);
@@ -391,20 +407,105 @@ export default function App() {
 
     const text = promptInput.trim();
     setPromptInput('');
+    setShowSendNowDropdown(false);
     const currentSession = sessions.find((s) => s.id === selectedSessionId);
+    const isThinking = currentSession?.status === 'thinking';
 
     try {
-      const createdMsg = await api.postSessionMessage(
-        selectedSessionId,
-        text,
-        currentSession?.creatorAgentId || selectedAgentId || 'agy-core',
-        userEmail,
-        'prompt'
-      );
-      setEvents((prev) => (prev.some((m) => m.id === createdMsg.id) ? prev : [...prev, createdMsg]));
-      await fetchAllData();
+      if (isThinking) {
+        // Model is busy: queue the message sequentially by default
+        const res = await api.enqueuePrompt(selectedSessionId, {
+          prompt: text,
+          senderAgentId: userEmail,
+          sendNow: false
+        });
+        setActiveQueue(res.queue || []);
+        await fetchAllData();
+      } else {
+        // Model is idle: dispatch prompt immediately
+        const createdMsg = await api.postSessionMessage(
+          selectedSessionId,
+          text,
+          currentSession?.creatorAgentId || selectedAgentId || 'agy-core',
+          userEmail,
+          'prompt'
+        );
+        setEvents((prev) => (prev.some((m) => m.id === createdMsg.id) ? prev : [...prev, createdMsg]));
+        await fetchAllData();
+      }
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Failed to send prompt');
+    }
+  };
+
+  const handleSendPromptNow = async () => {
+    if (!selectedSessionId || !promptInput.trim()) return;
+
+    const text = promptInput.trim();
+    setPromptInput('');
+    setShowSendNowDropdown(false);
+
+    try {
+      const res = await api.enqueuePrompt(selectedSessionId, {
+        prompt: text,
+        senderAgentId: userEmail,
+        sendNow: true
+      });
+      setActiveQueue(res.queue || []);
+      await fetchAllData();
+      await fetchSessionEvents(selectedSessionId);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to send prompt immediately');
+    }
+  };
+
+  const handleStopSession = async () => {
+    if (!selectedSessionId) return;
+    setIsActionPending(true);
+    try {
+      await api.stopSession(selectedSessionId);
+      await fetchAllData();
+      await fetchSessionEvents(selectedSessionId);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to stop model');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const handleStopCommand = async (commandId: string) => {
+    if (!selectedSessionId) return;
+    setIsActionPending(true);
+    try {
+      await api.stopCommand(selectedSessionId, commandId);
+      await fetchSessionEvents(selectedSessionId);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to stop command');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const handleRemoveFromQueue = async (queueItemId: string) => {
+    if (!selectedSessionId) return;
+    try {
+      const updatedQueue = await api.dequeuePrompt(selectedSessionId, queueItemId);
+      setActiveQueue(updatedQueue || []);
+      await fetchAllData();
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to remove from queue');
+    }
+  };
+
+  const handleSendQueuedNow = async (queueItemId: string) => {
+    if (!selectedSessionId) return;
+    try {
+      const res = await api.sendQueuedPromptNow(selectedSessionId, queueItemId);
+      setActiveQueue(res.queue || []);
+      await fetchAllData();
+      await fetchSessionEvents(selectedSessionId);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to send queued prompt now');
     }
   };
 
@@ -440,6 +541,40 @@ export default function App() {
       return null;
     }
   }, [selectedSession?.metadataJson]);
+
+  useEffect(() => {
+    const q = Array.isArray(selectedSessionMetadata?.promptQueue)
+      ? (selectedSessionMetadata.promptQueue as QueuedPromptItem[])
+      : [];
+    setActiveQueue(q);
+  }, [selectedSessionMetadata?.promptQueue]);
+
+  const activeCommand = useMemo(() => {
+    if (selectedSession?.status !== 'thinking') return null;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i];
+      if (ev.eventType === 'tool_result' || ev.eventType === 'response') {
+        return null;
+      }
+      if (ev.eventType === 'tool_call') {
+        let commandText = ev.content || ev.toolName || 'command';
+        if (ev.toolArgsJson) {
+          try {
+            const parsed = JSON.parse(ev.toolArgsJson);
+            if (parsed.CommandLine) commandText = parsed.CommandLine;
+            else if (parsed.command) commandText = parsed.command;
+          } catch {}
+        }
+        return {
+          id: ev.id,
+          name: ev.toolName || 'command',
+          commandText,
+          createdAt: ev.createdAt
+        };
+      }
+    }
+    return null;
+  }, [selectedSession?.status, events]);
 
   const sessionModelCap = useMemo(() => {
     if (!selectedSessionMetadata?.model || !currentRuntimeCaps) return null;
@@ -1485,25 +1620,159 @@ export default function App() {
               {/* Bottom Prompt Bar */}
               <form
                 onSubmit={handleSendPrompt}
-                className="p-4 border-t border-slate-800/80 bg-slate-900/50 shrink-0 space-y-2"
+                className="p-4 border-t border-slate-800/80 bg-slate-900/50 shrink-0 space-y-2.5"
               >
-                <div className="flex items-center gap-2.5">
+                {/* Active Command Pill */}
+                {activeCommand && (
+                  <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-amber-950/30 border border-amber-500/30 text-xs text-amber-200">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Terminal className="w-3.5 h-3.5 text-amber-400 shrink-0 animate-pulse" />
+                      <span className="font-mono text-amber-300 font-semibold shrink-0">Running command:</span>
+                      <span className="font-mono truncate text-amber-100">{activeCommand.commandText}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleStopCommand(activeCommand.id)}
+                      title="Kill this running command"
+                      className="ml-3 px-2 py-0.5 rounded bg-rose-600/20 hover:bg-rose-600/40 border border-rose-500/40 text-rose-300 hover:text-rose-200 text-[11px] font-semibold flex items-center gap-1 shrink-0 transition cursor-pointer"
+                    >
+                      <Square className="w-2.5 h-2.5 fill-current" />
+                      <span>Kill Command</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Queued Prompts Strip */}
+                {activeQueue.length > 0 && (
+                  <div className="flex flex-col gap-1.5 p-2.5 rounded-xl bg-slate-950/70 border border-slate-800/90 text-xs">
+                    <div className="flex items-center justify-between text-slate-400 font-medium px-1">
+                      <div className="flex items-center gap-1.5 text-sky-400">
+                        <Layers className="w-3.5 h-3.5" />
+                        <span>Prompt Queue ({activeQueue.length})</span>
+                      </div>
+                      <span className="text-[10px] text-slate-500">Auto-advances sequentially on response</span>
+                    </div>
+                    <div className="space-y-1 max-h-32 overflow-y-auto pr-1">
+                      {activeQueue.map((item, idx) => (
+                        <div
+                          key={item.id}
+                          className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900/80 border border-slate-800/60 text-slate-200"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="font-mono text-[10px] text-slate-400 shrink-0">#{idx + 1}</span>
+                            <span className="truncate text-xs font-mono">{item.prompt}</span>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => handleSendQueuedNow(item.id)}
+                              title="Interrupt current turn and run this prompt immediately"
+                              className="px-2 py-0.5 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-semibold flex items-center gap-1 transition cursor-pointer"
+                            >
+                              <Zap className="w-2.5 h-2.5" />
+                              <span>Send Now</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveFromQueue(item.id)}
+                              title="Remove from queue"
+                              className="p-1 rounded hover:bg-slate-800 text-slate-400 hover:text-slate-200 transition cursor-pointer"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Input & Control Bar */}
+                <div className="flex items-center gap-2">
                   <input
                     type="text"
-                    placeholder={`Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'}...`}
+                    placeholder={
+                      selectedSession.status === 'thinking'
+                        ? `Add instruction to queue for ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'}...`
+                        : `Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'}...`
+                    }
                     value={promptInput}
                     onChange={(e) => setPromptInput(e.target.value)}
                     className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
                   />
+
+                  {/* Stop Button: beside the input bar, enabled strictly when thinking */}
                   <button
-                    type="submit"
-                    disabled={!promptInput.trim()}
-                    className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                    type="button"
+                    onClick={handleStopSession}
+                    disabled={selectedSession.status !== 'thinking' || isActionPending}
+                    title={
+                      selectedSession.status === 'thinking'
+                        ? 'Stop model execution (Interrupt)'
+                        : 'Model is idle'
+                    }
+                    className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition ${
+                      selectedSession.status === 'thinking'
+                        ? 'bg-rose-600/90 hover:bg-rose-500 text-white shadow-lg shadow-rose-950/40 cursor-pointer animate-pulse'
+                        : 'bg-slate-800/30 text-slate-600 border border-slate-800/50 cursor-not-allowed opacity-50'
+                    }`}
                   >
-                    <Send className="w-3.5 h-3.5" />
-                    <span>Send</span>
+                    <Square className="w-3.5 h-3.5 fill-current" />
+                    <span>Stop</span>
                   </button>
+
+                  {/* Dynamic Send / Queue Split Button */}
+                  {selectedSession.status === 'thinking' ? (
+                    <div className="relative flex items-center">
+                      <button
+                        type="submit"
+                        disabled={!promptInput.trim()}
+                        title="Add prompt to sequential execution queue"
+                        className="px-3.5 py-2.5 rounded-l-xl bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                      >
+                        <ListPlus className="w-3.5 h-3.5" />
+                        <span>Queue</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowSendNowDropdown((prev) => !prev)}
+                        disabled={!promptInput.trim()}
+                        title="More sending options"
+                        className="px-2 py-2.5 rounded-r-xl bg-amber-700 hover:bg-amber-600 border-l border-amber-800 disabled:opacity-40 text-white transition cursor-pointer"
+                      >
+                        <ChevronDown className="w-3.5 h-3.5" />
+                      </button>
+
+                      {showSendNowDropdown && promptInput.trim() && (
+                        <div className="absolute right-0 bottom-full mb-2 w-56 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1.5 z-50 text-xs">
+                          <button
+                            type="button"
+                            onClick={handleSendPromptNow}
+                            className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-800 text-amber-300 font-semibold flex items-center gap-2 cursor-pointer transition"
+                          >
+                            <Zap className="w-3.5 h-3.5 text-amber-400" />
+                            <div>
+                              <div>Send Now (Interrupt)</div>
+                              <div className="text-[10px] text-slate-400 font-normal">
+                                Stops current turn & runs immediately
+                              </div>
+                            </div>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <button
+                      type="submit"
+                      disabled={!promptInput.trim()}
+                      className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>Send</span>
+                    </button>
+                  )}
                 </div>
+
                 <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
                   <span className="font-mono text-slate-500">
                     Agent: @{selectedSession.creatorAgentId || selectedAgent?.id || 'agy'}

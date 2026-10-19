@@ -185,6 +185,10 @@ public static class AgentAdapterFactory
         }
 
         using var proc = new Process { StartInfo = psi };
+        using var reg = ct.Register(() =>
+        {
+            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+        });
         proc.Start();
 
         var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
@@ -277,6 +281,10 @@ public class AgyAdapter : IAgentAdapter
         psi.ArgumentList.Add("--dangerously-skip-permissions");
 
         using var proc = new Process { StartInfo = psi };
+        using var reg = ct.Register(() =>
+        {
+            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+        });
         proc.Start();
 
         var streamedResponseBuilder = new StringBuilder();
@@ -630,6 +638,10 @@ public class CopilotAdapter : IAgentAdapter
             psi.ArgumentList.Add("--no-color");
 
             using var proc = new Process { StartInfo = psi };
+            using var reg = ct.Register(() =>
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            });
             proc.Start();
             var stdOut = await proc.StandardOutput.ReadToEndAsync(ct);
             var stdErr = await proc.StandardError.ReadToEndAsync(ct);
@@ -707,6 +719,10 @@ public class GenericCommandAdapter : IAgentAdapter
             psi.Environment["AGENTMESH_AGENT_ID"] = preset.Id;
 
             using var proc = new Process { StartInfo = psi };
+            using var reg = ct.Register(() =>
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            });
             proc.Start();
 
             try
