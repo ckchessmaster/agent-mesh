@@ -269,6 +269,12 @@ public class SessionsController(
                 reason = "Interrupted by incoming prompt"
             });
         }
+        await hubContext.Clients.All.SendAsync("StopExecution", new
+        {
+            sessionId = session.Id,
+            agentId = session.CreatorAgentId,
+            reason = "Interrupted by incoming prompt"
+        });
     }
 
     [HttpPost]
@@ -380,6 +386,8 @@ public class SessionsController(
             CreatedAt = DateTimeOffset.UtcNow
         };
 
+        var wasThinking = session.Status == "thinking";
+
         if (!string.IsNullOrWhiteSpace(req.StructuredPayloadJson))
         {
             session.MetadataJson = AccumulateUsageMetadata(session.MetadataJson, req.StructuredPayloadJson);
@@ -438,7 +446,7 @@ public class SessionsController(
                 tier = tier
             });
         }
-        else if (eventType == "response")
+        else if (eventType == "response" && wasThinking)
         {
             // Auto-advance queued prompts sequentially if any are pending
             var queue = ExtractPromptQueue(session.MetadataJson);
@@ -631,6 +639,13 @@ public class SessionsController(
             });
         }
 
+        await hubContext.Clients.All.SendAsync("StopExecution", new
+        {
+            sessionId = id,
+            agentId = session.CreatorAgentId,
+            reason = "Operator clicked stop"
+        });
+
         await hubContext.Clients.All.SendAsync("SessionUpdated", session);
 
         return Ok(new { status = "stopped", sessionId = id });
@@ -679,6 +694,13 @@ public class SessionsController(
                 agentId = session.CreatorAgentId
             });
         }
+
+        await hubContext.Clients.All.SendAsync("StopCommand", new
+        {
+            sessionId = id,
+            commandId,
+            agentId = session.CreatorAgentId
+        });
 
         return Ok(new { status = "stopped", commandId });
     }

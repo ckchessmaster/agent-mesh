@@ -157,6 +157,38 @@ public static class AgentAdapterFactory
         }
     }
 
+    public static void KillProcessTree(Process proc)
+    {
+        try
+        {
+            if (proc.HasExited) return;
+
+            try
+            {
+                proc.Kill(entireProcessTree: true);
+            }
+            catch { }
+
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                try
+                {
+                    var pid = proc.Id;
+                    using var killProc = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "kill",
+                        ArgumentList = { "-9", pid.ToString() },
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    });
+                    killProc?.WaitForExit(500);
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
     public static async Task<(int ExitCode, string StdOut, string StdErr)> RunShellCommandAsync(
         string command,
         string workingDirectory,
@@ -185,20 +217,26 @@ public static class AgentAdapterFactory
         }
 
         using var proc = new Process { StartInfo = psi };
-        using var reg = ct.Register(() =>
-        {
-            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-        });
+        using var reg = ct.Register(() => KillProcessTree(proc));
         proc.Start();
 
-        var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
-        var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
+        try
+        {
+            var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
+            var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
 
-        await proc.WaitForExitAsync(ct);
-        var stdOut = await stdOutTask;
-        var stdErr = await stdErrTask;
+            await proc.WaitForExitAsync(ct);
+            var stdOut = await stdOutTask;
+            var stdErr = await stdErrTask;
 
-        return (proc.ExitCode, stdOut.Trim(), stdErr.Trim());
+            ct.ThrowIfCancellationRequested();
+            return (proc.ExitCode, stdOut.Trim(), stdErr.Trim());
+        }
+        catch (OperationCanceledException)
+        {
+            KillProcessTree(proc);
+            throw;
+        }
     }
 }
 
@@ -281,10 +319,7 @@ public class AgyAdapter : IAgentAdapter
         psi.ArgumentList.Add("--dangerously-skip-permissions");
 
         using var proc = new Process { StartInfo = psi };
-        using var reg = ct.Register(() =>
-        {
-            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-        });
+        using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
         proc.Start();
 
         var streamedResponseBuilder = new StringBuilder();
@@ -292,221 +327,244 @@ public class AgyAdapter : IAgentAdapter
         long lastInputTokens = 0, lastOutputTokens = 0, lastThinkingTokens = 0, lastTotalTokens = 0;
         double lastDuration = 0;
 
-        while (await proc.StandardOutput.ReadLineAsync(ct) is { } line)
+        try
         {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-
-            try
+            while (true)
             {
-                using var doc = JsonDocument.Parse(line);
-                var root = doc.RootElement;
-                if (!root.TryGetProperty("event", out var evProp)) continue;
+                ct.ThrowIfCancellationRequested();
+                var line = await proc.StandardOutput.ReadLineAsync(ct);
+                if (line == null) break;
+                ct.ThrowIfCancellationRequested();
 
-                var evName = evProp.GetString();
+                if (string.IsNullOrWhiteSpace(line)) continue;
 
-                if (evName == "init")
+                try
                 {
-                    if (root.TryGetProperty("conversation_id", out var convProp))
-                    {
-                        var convId = convProp.GetString();
-                        if (!string.IsNullOrWhiteSpace(convId))
-                        {
-                            SessionConversations[promptEvent.SessionId] = convId;
-                        }
-                    }
-                }
-                else if (evName == "step_update" && root.TryGetProperty("step_update", out var step))
-                {
-                    var stepType = step.TryGetProperty("step_type", out var stProp) ? stProp.GetString() : null;
-                    var state = step.TryGetProperty("state", out var stateProp) ? stateProp.GetString() : null;
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+                    if (!root.TryGetProperty("event", out var evProp)) continue;
 
-                    if (stepType == "agent_response")
+                    var evName = evProp.GetString();
+
+                    if (evName == "init")
                     {
-                        if (step.TryGetProperty("text_delta", out var tdProp))
+                        if (root.TryGetProperty("conversation_id", out var convProp))
                         {
-                            var delta = tdProp.GetString();
-                            if (!string.IsNullOrEmpty(delta))
+                            var convId = convProp.GetString();
+                            if (!string.IsNullOrWhiteSpace(convId))
                             {
-                                streamedResponseBuilder.Append(delta);
+                                SessionConversations[promptEvent.SessionId] = convId;
                             }
                         }
+                    }
+                    else if (evName == "step_update" && root.TryGetProperty("step_update", out var step))
+                    {
+                        var stepType = step.TryGetProperty("step_type", out var stProp) ? stProp.GetString() : null;
+                        var state = step.TryGetProperty("state", out var stateProp) ? stateProp.GetString() : null;
 
-                        if (state == "DONE" && step.TryGetProperty("usage", out var usageProp))
+                        if (stepType == "agent_response")
                         {
-                            var thinkingTokens = usageProp.TryGetProperty("thinking_tokens", out var ttProp) ? ttProp.GetInt32() : 0;
-                            var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
+                            if (step.TryGetProperty("text_delta", out var tdProp))
+                            {
+                                var delta = tdProp.GetString();
+                                if (!string.IsNullOrEmpty(delta))
+                                {
+                                    streamedResponseBuilder.Append(delta);
+                                }
+                            }
 
-                            if (usageProp.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
-                            if (usageProp.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
-                            if (usageProp.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
-                            if (usageProp.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
-                            if (duration > 0) lastDuration = duration;
+                            if (state == "DONE" && step.TryGetProperty("usage", out var usageProp))
+                            {
+                                var thinkingTokens = usageProp.TryGetProperty("thinking_tokens", out var ttProp) ? ttProp.GetInt32() : 0;
+                                var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
 
-                            // Emit thought indicator when the model completed a reasoning step before calling a tool
-                            if (thinkingTokens > 0 && streamedResponseBuilder.Length == 0)
+                                if (usageProp.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
+                                if (usageProp.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
+                                if (usageProp.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
+                                if (usageProp.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
+                                if (duration > 0) lastDuration = duration;
+
+                                // Emit thought indicator when the model completed a reasoning step before calling a tool
+                                if (thinkingTokens > 0 && streamedResponseBuilder.Length == 0)
+                                {
+                                    ct.ThrowIfCancellationRequested();
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "thought",
+                                        Content = $"Model reasoned ({thinkingTokens} thinking tokens in {duration:F1}s)"
+                                    });
+                                }
+                            }
+                        }
+                        else if (stepType == "tool")
+                        {
+                            var toolName = step.TryGetProperty("tool_name", out var tnProp) ? tnProp.GetString() ?? "tool" : "tool";
+                            string? argsJson = null;
+                            string? outputText = null;
+                            var summary = $"Executing {toolName}";
+
+                            if (step.TryGetProperty("tool_info", out var tiProp))
+                            {
+                                if (tiProp.TryGetProperty("parameters", out var paramsProp))
+                                {
+                                    argsJson = paramsProp.GetRawText();
+                                    if (paramsProp.TryGetProperty("CommandLine", out var cmdProp))
+                                    {
+                                        summary = $"Running command: {cmdProp.GetString()}";
+                                    }
+                                    else if (paramsProp.TryGetProperty("AbsolutePath", out var pathProp))
+                                    {
+                                        summary = $"Inspecting file: {Path.GetFileName(pathProp.GetString())}";
+                                    }
+                                }
+                                if (tiProp.TryGetProperty("output", out var outProp))
+                                {
+                                    outputText = outProp.ValueKind == JsonValueKind.String
+                                        ? outProp.GetString()
+                                        : outProp.GetRawText();
+                                }
+                            }
+
+                            ct.ThrowIfCancellationRequested();
+                            if (state == "ACTIVE")
                             {
                                 await onEvent(new TrajectoryEventPayload
                                 {
-                                    EventType = "thought",
-                                    Content = $"Model reasoned ({thinkingTokens} thinking tokens in {duration:F1}s)"
+                                    EventType = "tool_call",
+                                    ToolName = toolName,
+                                    Content = summary,
+                                    ToolArgsJson = argsJson
+                                });
+                            }
+                            else if (state == "DONE")
+                            {
+                                var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
+                                await onEvent(new TrajectoryEventPayload
+                                {
+                                    EventType = "tool_result",
+                                    ToolName = toolName,
+                                    Content = $"Completed in {duration:F2}s",
+                                    ToolResultJson = outputText
                                 });
                             }
                         }
                     }
-                    else if (stepType == "tool")
+                    else if (evName == "result" && root.TryGetProperty("result", out var resElem))
                     {
-                        var toolName = step.TryGetProperty("tool_name", out var tnProp) ? tnProp.GetString() ?? "tool" : "tool";
-                        string? argsJson = null;
-                        string? outputText = null;
-                        var summary = $"Executing {toolName}";
+                        var responseText = resElem.TryGetProperty("response", out var respProp)
+                            ? respProp.GetString()?.Trim()
+                            : null;
 
-                        if (step.TryGetProperty("tool_info", out var tiProp))
+                        if (string.IsNullOrWhiteSpace(responseText))
                         {
-                            if (tiProp.TryGetProperty("parameters", out var paramsProp))
-                            {
-                                argsJson = paramsProp.GetRawText();
-                                if (paramsProp.TryGetProperty("CommandLine", out var cmdProp))
-                                {
-                                    summary = $"Running command: {cmdProp.GetString()}";
-                                }
-                                else if (paramsProp.TryGetProperty("AbsolutePath", out var pathProp))
-                                {
-                                    summary = $"Inspecting file: {Path.GetFileName(pathProp.GetString())}";
-                                }
-                            }
-                            if (tiProp.TryGetProperty("output", out var outProp))
-                            {
-                                outputText = outProp.ValueKind == JsonValueKind.String
-                                    ? outProp.GetString()
-                                    : outProp.GetRawText();
-                            }
+                            responseText = streamedResponseBuilder.ToString().Trim();
                         }
 
-                        if (state == "ACTIVE")
+                        if (resElem.TryGetProperty("duration_seconds", out var rDur)) lastDuration = rDur.GetDouble();
+                        if (resElem.TryGetProperty("usage", out var rUsage))
+                        {
+                            if (rUsage.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
+                            if (rUsage.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
+                            if (rUsage.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
+                            if (rUsage.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
+                        }
+
+                        if (lastTotalTokens == 0 && (lastInputTokens > 0 || lastOutputTokens > 0))
+                        {
+                            lastTotalTokens = lastInputTokens + lastOutputTokens;
+                        }
+
+                        string? structuredJson = null;
+                        if (lastTotalTokens > 0 || lastDuration > 0)
+                        {
+                            structuredJson = JsonSerializer.Serialize(new
+                            {
+                                usage = new
+                                {
+                                    inputTokens = lastInputTokens,
+                                    outputTokens = lastOutputTokens,
+                                    thinkingTokens = lastThinkingTokens,
+                                    totalTokens = lastTotalTokens,
+                                    durationSeconds = lastDuration
+                                }
+                            });
+                        }
+
+                        ct.ThrowIfCancellationRequested();
+                        if (!string.IsNullOrWhiteSpace(responseText))
                         {
                             await onEvent(new TrajectoryEventPayload
                             {
-                                EventType = "tool_call",
-                                ToolName = toolName,
-                                Content = summary,
-                                ToolArgsJson = argsJson
+                                EventType = "response",
+                                Content = responseText,
+                                StructuredPayloadJson = structuredJson
                             });
-                        }
-                        else if (state == "DONE")
-                        {
-                            var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
-                            await onEvent(new TrajectoryEventPayload
-                            {
-                                EventType = "tool_result",
-                                ToolName = toolName,
-                                Content = $"Completed in {duration:F2}s",
-                                ToolResultJson = outputText
-                            });
+                            emittedFinalResult = true;
                         }
                     }
                 }
-                else if (evName == "result" && root.TryGetProperty("result", out var resElem))
+                catch (OperationCanceledException)
                 {
-                    var responseText = resElem.TryGetProperty("response", out var respProp)
-                        ? respProp.GetString()?.Trim()
-                        : null;
-
-                    if (string.IsNullOrWhiteSpace(responseText))
-                    {
-                        responseText = streamedResponseBuilder.ToString().Trim();
-                    }
-
-                    if (resElem.TryGetProperty("duration_seconds", out var rDur)) lastDuration = rDur.GetDouble();
-                    if (resElem.TryGetProperty("usage", out var rUsage))
-                    {
-                        if (rUsage.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
-                        if (rUsage.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
-                        if (rUsage.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
-                        if (rUsage.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
-                    }
-
-                    if (lastTotalTokens == 0 && (lastInputTokens > 0 || lastOutputTokens > 0))
-                    {
-                        lastTotalTokens = lastInputTokens + lastOutputTokens;
-                    }
-
-                    string? structuredJson = null;
-                    if (lastTotalTokens > 0 || lastDuration > 0)
-                    {
-                        structuredJson = JsonSerializer.Serialize(new
-                        {
-                            usage = new
-                            {
-                                inputTokens = lastInputTokens,
-                                outputTokens = lastOutputTokens,
-                                thinkingTokens = lastThinkingTokens,
-                                totalTokens = lastTotalTokens,
-                                durationSeconds = lastDuration
-                            }
-                        });
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(responseText))
-                    {
-                        await onEvent(new TrajectoryEventPayload
-                        {
-                            EventType = "response",
-                            Content = responseText,
-                            StructuredPayloadJson = structuredJson
-                        });
-                        emittedFinalResult = true;
-                    }
+                    throw;
+                }
+                catch
+                {
+                    // Non-JSON line fallback
+                    streamedResponseBuilder.AppendLine(line);
                 }
             }
-            catch
-            {
-                // Non-JSON line fallback
-                streamedResponseBuilder.AppendLine(line);
-            }
-        }
 
-        var stdErr = await proc.StandardError.ReadToEndAsync(ct);
-        await proc.WaitForExitAsync(ct);
+            ct.ThrowIfCancellationRequested();
+            var stdErr = await proc.StandardError.ReadToEndAsync(ct);
+            await proc.WaitForExitAsync(ct);
+            ct.ThrowIfCancellationRequested();
 
-        if (!emittedFinalResult)
-        {
-            var fallbackText = streamedResponseBuilder.ToString().Trim();
-            if (string.IsNullOrWhiteSpace(fallbackText) && !string.IsNullOrWhiteSpace(stdErr))
+            if (!emittedFinalResult)
             {
-                fallbackText = stdErr.Trim();
-            }
-            if (string.IsNullOrWhiteSpace(fallbackText))
-            {
-                fallbackText = $"Agent `@{preset.Id}` finished execution (exit code {proc.ExitCode}).";
-            }
-
-            if (lastTotalTokens == 0 && (lastInputTokens > 0 || lastOutputTokens > 0))
-            {
-                lastTotalTokens = lastInputTokens + lastOutputTokens;
-            }
-
-            string? structuredJson = null;
-            if (lastTotalTokens > 0 || lastDuration > 0)
-            {
-                structuredJson = JsonSerializer.Serialize(new
+                var fallbackText = streamedResponseBuilder.ToString().Trim();
+                if (string.IsNullOrWhiteSpace(fallbackText) && !string.IsNullOrWhiteSpace(stdErr))
                 {
-                    usage = new
+                    fallbackText = stdErr.Trim();
+                }
+                if (string.IsNullOrWhiteSpace(fallbackText))
+                {
+                    fallbackText = $"Agent `@{preset.Id}` finished execution (exit code {proc.ExitCode}).";
+                }
+
+                if (lastTotalTokens == 0 && (lastInputTokens > 0 || lastOutputTokens > 0))
+                {
+                    lastTotalTokens = lastInputTokens + lastOutputTokens;
+                }
+
+                string? structuredJson = null;
+                if (lastTotalTokens > 0 || lastDuration > 0)
+                {
+                    structuredJson = JsonSerializer.Serialize(new
                     {
-                        inputTokens = lastInputTokens,
-                        outputTokens = lastOutputTokens,
-                        thinkingTokens = lastThinkingTokens,
-                        totalTokens = lastTotalTokens,
-                        durationSeconds = lastDuration
-                    }
+                        usage = new
+                        {
+                            inputTokens = lastInputTokens,
+                            outputTokens = lastOutputTokens,
+                            thinkingTokens = lastThinkingTokens,
+                            totalTokens = lastTotalTokens,
+                            durationSeconds = lastDuration
+                        }
+                    });
+                }
+
+                ct.ThrowIfCancellationRequested();
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "response",
+                    Content = fallbackText,
+                    StructuredPayloadJson = structuredJson
                 });
             }
-
-            await onEvent(new TrajectoryEventPayload
-            {
-                EventType = "response",
-                Content = fallbackText,
-                StructuredPayloadJson = structuredJson
-            });
+        }
+        catch (OperationCanceledException)
+        {
+            AgentAdapterFactory.KillProcessTree(proc);
+            throw;
         }
     }
 
@@ -517,6 +575,7 @@ public class AgyAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         await onEvent(new TrajectoryEventPayload
         {
             EventType = "thought",
@@ -525,6 +584,7 @@ public class AgyAdapter : IAgentAdapter
 
         var diagnosticCmd = SelectWorkspaceCommand(promptEvent.Prompt);
         var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync(diagnosticCmd, cwd, ct);
+        ct.ThrowIfCancellationRequested();
         var combinedOutput = string.IsNullOrWhiteSpace(stdOut) ? stdErr : stdOut;
 
         await onEvent(new TrajectoryEventPayload
@@ -570,6 +630,7 @@ public class ClaudeAdapter : IAgentAdapter
 
             var escapedPrompt = promptEvent.Prompt.Replace("\"", "\\\"");
             var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\" -p \"{escapedPrompt}\"", cwd, ct);
+            ct.ThrowIfCancellationRequested();
             var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut : stdErr;
 
             await onEvent(new TrajectoryEventPayload
@@ -638,24 +699,34 @@ public class CopilotAdapter : IAgentAdapter
             psi.ArgumentList.Add("--no-color");
 
             using var proc = new Process { StartInfo = psi };
-            using var reg = ct.Register(() =>
-            {
-                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-            });
+            using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
             proc.Start();
-            var stdOut = await proc.StandardOutput.ReadToEndAsync(ct);
-            var stdErr = await proc.StandardError.ReadToEndAsync(ct);
-            await proc.WaitForExitAsync(ct);
 
-            var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut.Trim() : stdErr.Trim();
-            await onEvent(new TrajectoryEventPayload
+            try
             {
-                EventType = "response",
-                Content = string.IsNullOrWhiteSpace(output)
-                    ? $"Copilot CLI finished (exit code {proc.ExitCode})."
-                    : output
-            });
-            return;
+                var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
+                var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
+                await proc.WaitForExitAsync(ct);
+                var stdOut = await stdOutTask;
+                var stdErr = await stdErrTask;
+
+                ct.ThrowIfCancellationRequested();
+
+                var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut.Trim() : stdErr.Trim();
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "response",
+                    Content = string.IsNullOrWhiteSpace(output)
+                        ? $"Copilot CLI finished (exit code {proc.ExitCode})."
+                        : output
+                });
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                AgentAdapterFactory.KillProcessTree(proc);
+                throw;
+            }
         }
 
         var fallback = new AgyAdapter();
@@ -719,10 +790,7 @@ public class GenericCommandAdapter : IAgentAdapter
             psi.Environment["AGENTMESH_AGENT_ID"] = preset.Id;
 
             using var proc = new Process { StartInfo = psi };
-            using var reg = ct.Register(() =>
-            {
-                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-            });
+            using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
             proc.Start();
 
             try
@@ -739,45 +807,61 @@ public class GenericCommandAdapter : IAgentAdapter
             var plainTextBuffer = new StringBuilder();
             var emittedFinalResponse = false;
 
-            while (await proc.StandardOutput.ReadLineAsync(ct) is { } line)
+            try
             {
-                if (AgentAdapterFactory.TryParseJsonEventLine(line, out var parsed) && parsed != null)
+                while (true)
                 {
-                    await onEvent(parsed);
-                    if (parsed.EventType == "response")
+                    ct.ThrowIfCancellationRequested();
+                    var line = await proc.StandardOutput.ReadLineAsync(ct);
+                    if (line == null) break;
+                    ct.ThrowIfCancellationRequested();
+
+                    if (AgentAdapterFactory.TryParseJsonEventLine(line, out var parsed) && parsed != null)
                     {
-                        emittedFinalResponse = true;
+                        await onEvent(parsed);
+                        if (parsed.EventType == "response")
+                        {
+                            emittedFinalResponse = true;
+                        }
+                    }
+                    else
+                    {
+                        plainTextBuffer.AppendLine(line);
                     }
                 }
-                else
+
+                ct.ThrowIfCancellationRequested();
+                var stdErr = await proc.StandardError.ReadToEndAsync(ct);
+                await proc.WaitForExitAsync(ct);
+                ct.ThrowIfCancellationRequested();
+
+                if (!emittedFinalResponse)
                 {
-                    plainTextBuffer.AppendLine(line);
+                    var finalContent = plainTextBuffer.ToString().Trim();
+                    if (string.IsNullOrWhiteSpace(finalContent) && !string.IsNullOrWhiteSpace(stdErr))
+                    {
+                        finalContent = stdErr.Trim();
+                    }
+                    if (string.IsNullOrWhiteSpace(finalContent))
+                    {
+                        finalContent = $"Command `{fullCommand}` finished with exit code {proc.ExitCode}.";
+                    }
+
+                    ct.ThrowIfCancellationRequested();
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = finalContent
+                    });
                 }
+
+                return;
             }
-
-            var stdErr = await proc.StandardError.ReadToEndAsync(ct);
-            await proc.WaitForExitAsync(ct);
-
-            if (!emittedFinalResponse)
+            catch (OperationCanceledException)
             {
-                var finalContent = plainTextBuffer.ToString().Trim();
-                if (string.IsNullOrWhiteSpace(finalContent) && !string.IsNullOrWhiteSpace(stdErr))
-                {
-                    finalContent = stdErr.Trim();
-                }
-                if (string.IsNullOrWhiteSpace(finalContent))
-                {
-                    finalContent = $"Command `{fullCommand}` finished with exit code {proc.ExitCode}.";
-                }
-
-                await onEvent(new TrajectoryEventPayload
-                {
-                    EventType = "response",
-                    Content = finalContent
-                });
+                AgentAdapterFactory.KillProcessTree(proc);
+                throw;
             }
-
-            return;
         }
 
         // Delegate to real Antigravity CLI adapter

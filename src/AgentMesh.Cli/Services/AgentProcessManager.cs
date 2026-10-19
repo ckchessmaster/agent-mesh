@@ -15,6 +15,7 @@ public class AgentRunnerInstance : IAsyncDisposable
     private readonly Action _onStateChanged;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<Guid, byte> _processedMessages = new();
+    private readonly SemaphoreSlim _turnLock = new(1, 1);
     private CancellationTokenSource? _activeTurnCts;
 
     private HubConnection? _hubConnection;
@@ -123,9 +124,14 @@ public class AgentRunnerInstance : IAsyncDisposable
             try
             {
                 var sidStr = elem.TryGetProperty("sessionId", out var sidProp) ? sidProp.GetString() : null;
-                if (sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId)
+                var targetAgent = elem.TryGetProperty("agentId", out var aProp) ? aProp.GetString() : null;
+
+                var matchesAgent = targetAgent == null || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
+                var matchesSession = sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId;
+
+                if (matchesSession || (matchesAgent && State.ActiveSessionId != null))
                 {
-                    _onLog(_preset.Id, $"🛑 StopExecution received for session {sid.ToString()[..8]}. Aborting active turn.");
+                    _onLog(_preset.Id, $"🛑 StopExecution received for session {State.ActiveSessionId?.ToString()[..8] ?? sidStr ?? "unknown"}. Aborting active turn.");
                     _activeTurnCts?.Cancel();
                 }
             }
@@ -138,9 +144,14 @@ public class AgentRunnerInstance : IAsyncDisposable
             {
                 var sidStr = elem.TryGetProperty("sessionId", out var sidProp) ? sidProp.GetString() : null;
                 var cmdId = elem.TryGetProperty("commandId", out var cProp) ? cProp.GetString() : null;
-                if (sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId)
+                var targetAgent = elem.TryGetProperty("agentId", out var aProp) ? aProp.GetString() : null;
+
+                var matchesAgent = targetAgent == null || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
+                var matchesSession = sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId;
+
+                if (matchesSession || (matchesAgent && State.ActiveSessionId != null))
                 {
-                    _onLog(_preset.Id, $"🛑 StopCommand received for command '{cmdId}' in session {sid.ToString()[..8]}. Aborting active turn.");
+                    _onLog(_preset.Id, $"🛑 StopCommand received for command '{cmdId}' in session {State.ActiveSessionId?.ToString()[..8] ?? sidStr ?? "unknown"}. Aborting active turn.");
                     _activeTurnCts?.Cancel();
                 }
             }
@@ -199,6 +210,15 @@ public class AgentRunnerInstance : IAsyncDisposable
             return; // Already processing or processed this prompt
         }
 
+        try
+        {
+            await _turnLock.WaitAsync(_cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
         using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
         _activeTurnCts = turnCts;
         var turnToken = turnCts.Token;
@@ -231,6 +251,8 @@ public class AgentRunnerInstance : IAsyncDisposable
             var adapter = AgentAdapterFactory.Create(_preset);
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>
             {
+                turnToken.ThrowIfCancellationRequested();
+
                 if (!string.IsNullOrWhiteSpace(trajectoryEv.StructuredPayloadJson))
                 {
                     try
@@ -284,16 +306,19 @@ public class AgentRunnerInstance : IAsyncDisposable
 
             try
             {
-                await _meshClient.PostTrajectoryEventAsync(
-                    ev.SessionId,
-                    _preset.Id,
-                    _agentToken,
-                    new TrajectoryEventPayload
-                    {
-                        EventType = "response",
-                        Content = $"⚠️ Agent `@{_preset.Id}` encountered an error while executing prompt: `{ex.Message}`"
-                    },
-                    ct);
+                if (!turnToken.IsCancellationRequested)
+                {
+                    await _meshClient.PostTrajectoryEventAsync(
+                        ev.SessionId,
+                        _preset.Id,
+                        _agentToken,
+                        new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = $"⚠️ Agent `@{_preset.Id}` encountered an error while executing prompt: `{ex.Message}`"
+                        },
+                        ct);
+                }
             }
             catch
             {
@@ -306,6 +331,7 @@ public class AgentRunnerInstance : IAsyncDisposable
             {
                 _activeTurnCts = null;
             }
+            _turnLock.Release();
         }
     }
 
