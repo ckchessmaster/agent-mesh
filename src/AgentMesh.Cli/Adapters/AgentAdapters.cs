@@ -579,6 +579,12 @@ public class AgyAdapter : IAgentAdapter
         if (!string.IsNullOrWhiteSpace(promptEvent.Effort))
         {
             var rawEffort = promptEvent.Effort.Trim();
+            if (rawEffort.Equals("max", StringComparison.OrdinalIgnoreCase) ||
+                rawEffort.Equals("xhigh", StringComparison.OrdinalIgnoreCase))
+            {
+                rawEffort = "high";
+            }
+
             var rawModel = promptEvent.Model?.Trim() ?? "";
             var modelRejectsEffort = (rawModel.Equals("claude-3-7-sonnet", StringComparison.OrdinalIgnoreCase) ||
                                       rawModel.Equals("claude-3-5-sonnet", StringComparison.OrdinalIgnoreCase)) &&
@@ -797,10 +803,14 @@ public class AgyAdapter : IAgentAdapter
                         }
 
                         string? structuredJson = null;
-                        if (lastTotalTokens > 0 || lastDuration > 0)
+                        var effectiveModel = resolvedModel ?? promptEvent.Model;
+                        if (lastTotalTokens > 0 || lastDuration > 0 || !string.IsNullOrWhiteSpace(effectiveModel))
                         {
                             structuredJson = JsonSerializer.Serialize(new
                             {
+                                model = effectiveModel,
+                                effort = promptEvent.Effort,
+                                mode = promptEvent.Mode,
                                 usage = new
                                 {
                                     inputTokens = lastInputTokens,
@@ -870,10 +880,14 @@ public class AgyAdapter : IAgentAdapter
                 }
 
                 string? structuredJson = null;
-                if (lastTotalTokens > 0 || lastDuration > 0)
+                var fallbackEffectiveModel = resolvedModel ?? promptEvent.Model;
+                if (lastTotalTokens > 0 || lastDuration > 0 || !string.IsNullOrWhiteSpace(fallbackEffectiveModel))
                 {
                     structuredJson = JsonSerializer.Serialize(new
                     {
+                        model = fallbackEffectiveModel,
+                        effort = promptEvent.Effort,
+                        mode = promptEvent.Mode,
                         usage = new
                         {
                             inputTokens = lastInputTokens,
@@ -982,10 +996,18 @@ public class ClaudeAdapter : IAgentAdapter
 
                 var cleanedOutput = Regex.Replace(output, @"\(?Note:?\s*I can't see your replies in this non-interactive session\.?.*?(\)|$)", "", RegexOptions.IgnoreCase).Trim();
 
+                var claudePayloadJson = JsonSerializer.Serialize(new
+                {
+                    model = promptEvent.Model ?? "claude-3-7-sonnet",
+                    effort = promptEvent.Effort,
+                    mode = promptEvent.Mode
+                });
+
                 await onEvent(new TrajectoryEventPayload
                 {
                     EventType = "response",
-                    Content = string.IsNullOrWhiteSpace(cleanedOutput) ? output : cleanedOutput
+                    Content = string.IsNullOrWhiteSpace(cleanedOutput) ? output : cleanedOutput,
+                    StructuredPayloadJson = claudePayloadJson
                 });
 
                 await onEvent(new TrajectoryEventPayload
@@ -998,12 +1020,20 @@ public class ClaudeAdapter : IAgentAdapter
                 return;
             }
 
+            var defaultClaudePayloadJson = JsonSerializer.Serialize(new
+            {
+                model = promptEvent.Model ?? "claude-3-7-sonnet",
+                effort = promptEvent.Effort,
+                mode = promptEvent.Mode
+            });
+
             await onEvent(new TrajectoryEventPayload
             {
                 EventType = "response",
                 Content = string.IsNullOrWhiteSpace(output)
                     ? $"Claude CLI completed with exit code {exitCode}."
-                    : output
+                    : output,
+                StructuredPayloadJson = defaultClaudePayloadJson
             });
             return;
         }
@@ -1113,10 +1143,18 @@ public class CopilotAdapter : IAgentAdapter
 
                     var cleanedOutput = Regex.Replace(output, @"\(?Note:?\s*I can't see your replies in this non-interactive session\.?.*?(\)|$)", "", RegexOptions.IgnoreCase).Trim();
 
+                    var copilotPayloadJson = JsonSerializer.Serialize(new
+                    {
+                        model = promptEvent.Model ?? "gpt-4o",
+                        tier = promptEvent.Tier,
+                        mode = promptEvent.Mode
+                    });
+
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "response",
-                        Content = string.IsNullOrWhiteSpace(cleanedOutput) ? output : cleanedOutput
+                        Content = string.IsNullOrWhiteSpace(cleanedOutput) ? output : cleanedOutput,
+                        StructuredPayloadJson = copilotPayloadJson
                     });
 
                     await onEvent(new TrajectoryEventPayload
@@ -1129,12 +1167,20 @@ public class CopilotAdapter : IAgentAdapter
                     return;
                 }
 
+                var defaultCopilotPayloadJson = JsonSerializer.Serialize(new
+                {
+                    model = promptEvent.Model ?? "gpt-4o",
+                    tier = promptEvent.Tier,
+                    mode = promptEvent.Mode
+                });
+
                 await onEvent(new TrajectoryEventPayload
                 {
                     EventType = "response",
                     Content = string.IsNullOrWhiteSpace(output)
                         ? $"Copilot CLI finished (exit code {proc.ExitCode})."
-                        : output
+                        : output,
+                    StructuredPayloadJson = defaultCopilotPayloadJson
                 });
                 return;
             }

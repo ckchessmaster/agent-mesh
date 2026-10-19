@@ -50,6 +50,9 @@ public class PromptReceivedEvent
     [JsonPropertyName("mode")]
     public string? Mode { get; set; }
 
+    [JsonPropertyName("tier")]
+    public string? Tier { get; set; }
+
     [JsonPropertyName("createdAt")]
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

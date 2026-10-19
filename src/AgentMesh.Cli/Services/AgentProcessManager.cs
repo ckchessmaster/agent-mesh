@@ -66,64 +66,6 @@ public class AgentRunnerInstance : IAsyncDisposable
             .WithAutomaticReconnect()
             .Build();
 
-        _hubConnection.On<PromptReceivedEvent>("PromptReceived", async (ev) =>
-        {
-            if (!string.Equals(ev.AgentId, _preset.Id, StringComparison.OrdinalIgnoreCase))
-                return;
-
-            await HandlePromptAsync(ev, _cts.Token);
-        });
-
-        // Also listen to ReceiveMessage so prompts are caught even if backend is running an older hub build
-        _hubConnection.On<JsonElement>("ReceiveMessage", async (msgElem) =>
-        {
-            try
-            {
-                var evType = msgElem.TryGetProperty("eventType", out var et) ? et.GetString() : null;
-                if (!string.Equals(evType, "prompt", StringComparison.OrdinalIgnoreCase))
-                    return;
-
-                var targetAgent = msgElem.TryGetProperty("targetAgentId", out var ta) ? ta.GetString() : null;
-                if (!string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase))
-                    return;
-
-                if (!msgElem.TryGetProperty("sessionId", out var sidProp) || !Guid.TryParse(sidProp.GetString(), out var sessionId))
-                    return;
-
-                var msgId = msgElem.TryGetProperty("id", out var idProp) && Guid.TryParse(idProp.GetString(), out var parsedId)
-                    ? parsedId
-                    : Guid.NewGuid();
-
-                var content = msgElem.TryGetProperty("content", out var cProp) ? cProp.GetString() ?? "" : "";
-                var sender = msgElem.TryGetProperty("senderAgentId", out var sProp) ? sProp.GetString() ?? "operator" : "operator";
-                var workDir = msgElem.TryGetProperty("workingDirectory", out var wd) ? wd.GetString() : null;
-                var model = msgElem.TryGetProperty("model", out var m) ? m.GetString() : null;
-                var effort = msgElem.TryGetProperty("effort", out var ef) ? ef.GetString() : null;
-                var mode = msgElem.TryGetProperty("mode", out var md) ? md.GetString() : null;
-                var createdAt = msgElem.TryGetProperty("createdAt", out var caProp) && caProp.TryGetDateTimeOffset(out var dto)
-                    ? dto
-                    : DateTimeOffset.UtcNow;
-
-                await HandlePromptAsync(new PromptReceivedEvent
-                {
-                    SessionId = sessionId,
-                    MessageId = msgId,
-                    AgentId = _preset.Id,
-                    Prompt = content,
-                    Sender = sender,
-                    WorkingDirectory = workDir,
-                    Model = model,
-                    Effort = effort,
-                    Mode = mode,
-                    CreatedAt = createdAt
-                }, _cts.Token);
-            }
-            catch
-            {
-                // Ignore malformed broadcast
-            }
-        });
-
         static string? GetJsonPropString(JsonElement elem, string name)
         {
             if (elem.ValueKind != JsonValueKind.Object) return null;
@@ -137,6 +79,60 @@ public class AgentRunnerInstance : IAsyncDisposable
             }
             return null;
         }
+
+        _hubConnection.On<PromptReceivedEvent>("PromptReceived", async (ev) =>
+        {
+            var targetAgent = ev.AgentId?.Trim().TrimStart('@');
+            var myAgent = _preset.Id?.Trim().TrimStart('@');
+            if (!string.Equals(targetAgent, myAgent, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            await HandlePromptAsync(ev, _cts.Token);
+        });
+
+        _hubConnection.On<JsonElement>("PromptReceived", async (elem) =>
+        {
+            try
+            {
+                var targetAgent = GetJsonPropString(elem, "agentId")?.Trim().TrimStart('@');
+                var myAgent = _preset.Id?.Trim().TrimStart('@');
+                if (!string.Equals(targetAgent, myAgent, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                var sidStr = GetJsonPropString(elem, "sessionId");
+                if (sidStr == null || !Guid.TryParse(sidStr, out var sessionId)) return;
+
+                var midStr = GetJsonPropString(elem, "messageId");
+                var messageId = (midStr != null && Guid.TryParse(midStr, out var mid)) ? mid : Guid.NewGuid();
+
+                var prompt = GetJsonPropString(elem, "prompt") ?? "";
+                var sender = GetJsonPropString(elem, "sender") ?? "operator";
+                var workDir = GetJsonPropString(elem, "workingDirectory");
+                var model = GetJsonPropString(elem, "model");
+                var effort = GetJsonPropString(elem, "effort");
+                var mode = GetJsonPropString(elem, "mode");
+                var tier = GetJsonPropString(elem, "tier");
+
+                await HandlePromptAsync(new PromptReceivedEvent
+                {
+                    SessionId = sessionId,
+                    MessageId = messageId,
+                    AgentId = _preset.Id,
+                    Prompt = prompt,
+                    Sender = sender,
+                    WorkingDirectory = workDir,
+                    Model = model,
+                    Effort = effort,
+                    Mode = mode,
+                    Tier = tier,
+                    CreatedAt = DateTimeOffset.UtcNow
+                }, _cts.Token);
+            }
+            catch
+            {
+                // Ignore malformed broadcast
+            }
+        });
 
         _hubConnection.On<StopExecutionEvent>("StopExecution", (ev) =>
         {
@@ -324,7 +320,7 @@ public class AgentRunnerInstance : IAsyncDisposable
 
             ev.WorkingDirectory = effectiveWorkDir;
 
-            _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender}: {ev.Prompt} (cwd: {effectiveWorkDir})");
+            _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender} (model: {ev.Model ?? "default"}, effort: {ev.Effort ?? "default"}): {ev.Prompt} (cwd: {effectiveWorkDir})");
 
             var adapter = AgentAdapterFactory.Create(_preset);
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>

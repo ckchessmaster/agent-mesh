@@ -2239,10 +2239,14 @@ export default function App() {
                       totalTokens?: number;
                       durationSeconds?: number;
                     } | null = null;
+                    let responseModel: string | null = null;
+                    let responseEffort: string | null = null;
                     if (ev.structuredPayloadJson) {
                       try {
                         const parsed = JSON.parse(ev.structuredPayloadJson);
                         if (parsed.usage) usage = parsed.usage;
+                        if (parsed.model) responseModel = parsed.model;
+                        if (parsed.effort) responseEffort = parsed.effort;
                       } catch {}
                     }
 
@@ -2265,6 +2269,15 @@ export default function App() {
                             <div className="flex items-center gap-2">
                               <CheckCircle2 className="w-4 h-4" />
                               <span className="font-bold">@{ev.senderAgentId}</span>
+                              {responseModel && (
+                                <span
+                                  className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30"
+                                  title={`Executed with model: ${responseModel}${responseEffort ? ` (${responseEffort} effort)` : ''}`}
+                                >
+                                  <Cpu className="w-3 h-3 text-purple-400 shrink-0" />
+                                  <span>{responseModel}</span>
+                                </span>
+                              )}
                             </div>
                             <div className="flex items-center gap-2.5">
                               {usage && (

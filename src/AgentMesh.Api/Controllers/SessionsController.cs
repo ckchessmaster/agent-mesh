@@ -764,7 +764,7 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+            var promptPayload = new
             {
                 sessionId = id,
                 messageId = message.Id,
@@ -777,7 +777,9 @@ public class SessionsController(
                 mode = mode,
                 tier = tier,
                 createdAt = message.CreatedAt
-            });
+            };
+            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
         else if (eventType == "response" && wasThinking)
         {
@@ -825,7 +827,7 @@ public class SessionsController(
                 if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
                 {
                     var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                    await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+                    var promptPayload = new
                     {
                         sessionId = id,
                         messageId = nextMsg.Id,
@@ -838,7 +840,9 @@ public class SessionsController(
                         mode = nextPrompt.Mode ?? mode,
                         tier = nextPrompt.Tier ?? tier,
                         createdAt = nextMsg.CreatedAt
-                    });
+                    };
+                    await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                    await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
                 }
             }
         }
@@ -1103,7 +1107,7 @@ public class SessionsController(
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
                 var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+                var promptPayload = new
                 {
                     sessionId = id,
                     messageId = msg.Id,
@@ -1116,7 +1120,9 @@ public class SessionsController(
                     mode = req.Mode ?? mode,
                     tier = req.Tier ?? tier,
                     createdAt = msg.CreatedAt
-                });
+                };
+                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
             }
 
             return Ok(new { session, queue, dispatched = true });
@@ -1148,7 +1154,7 @@ public class SessionsController(
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
                 var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+                var promptPayload = new
                 {
                     sessionId = id,
                     messageId = msg.Id,
@@ -1161,7 +1167,9 @@ public class SessionsController(
                     mode = req.Mode ?? mode,
                     tier = req.Tier ?? tier,
                     createdAt = msg.CreatedAt
-                });
+                };
+                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
             }
 
             return Ok(new { session, queue, dispatched = true });
@@ -1265,7 +1273,7 @@ public class SessionsController(
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
             var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+            var promptPayload = new
             {
                 sessionId = id,
                 messageId = msg.Id,
@@ -1278,7 +1286,9 @@ public class SessionsController(
                 mode = item.Mode ?? mode,
                 tier = item.Tier ?? tier,
                 createdAt = msg.CreatedAt
-            });
+            };
+            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
 
         return Ok(new { session, queue, dispatched = true });
@@ -1377,7 +1387,7 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", new
+            var promptPayload = new
             {
                 sessionId = id,
                 messageId = promptMsg.Id,
@@ -1390,7 +1400,9 @@ public class SessionsController(
                 mode = mode,
                 tier = tier,
                 createdAt = promptMsg.CreatedAt
-            });
+            };
+            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
 
         return Ok(new { toolResult = toolResultDto, prompt = promptDto, session });
