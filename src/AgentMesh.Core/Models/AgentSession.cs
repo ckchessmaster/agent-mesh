@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AgentMesh.Core.Models;
 
 public class AgentSession
@@ -7,10 +9,17 @@ public class AgentSession
     public string Status { get; set; } = "active";
     public string MetadataJson { get; set; } = "{}";
     public string? CreatorAgentId { get; set; }
+
+    [JsonIgnore]
     public Agent? CreatorAgent { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 
+    [JsonIgnore]
     public ICollection<SessionMessage> Messages { get; set; } = new List<SessionMessage>();
+
+    [JsonIgnore]
     public ICollection<AgentJob> Jobs { get; set; } = new List<AgentJob>();
 }
+

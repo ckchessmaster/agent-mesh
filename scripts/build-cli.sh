@@ -8,7 +8,7 @@ echo "==================================================="
 echo "  Building AgentMesh CLI Cross-Platform Binaries"
 echo "==================================================="
 
-echo "[1/2] Publishing Linux x64 single-file binary..."
+echo "[1/4] Publishing Linux x64 single-file binary..."
 dotnet publish "${ROOT_DIR}/src/AgentMesh.Cli/AgentMesh.Cli.csproj" \
   -c Release \
   -r linux-x64 \
@@ -17,7 +17,7 @@ dotnet publish "${ROOT_DIR}/src/AgentMesh.Cli/AgentMesh.Cli.csproj" \
   -p:IncludeNativeLibrariesForSelfExtract=true \
   -o "${OUT_DIR}/linux-x64"
 
-echo "[2/2] Publishing Windows x64 single-file binary..."
+echo "[2/4] Publishing Windows x64 single-file binary..."
 dotnet publish "${ROOT_DIR}/src/AgentMesh.Cli/AgentMesh.Cli.csproj" \
   -c Release \
   -r win-x64 \
@@ -26,8 +26,28 @@ dotnet publish "${ROOT_DIR}/src/AgentMesh.Cli/AgentMesh.Cli.csproj" \
   -p:IncludeNativeLibrariesForSelfExtract=true \
   -o "${OUT_DIR}/win-x64"
 
+echo "[3/4] Publishing macOS Apple Silicon (arm64) single-file binary..."
+dotnet publish "${ROOT_DIR}/src/AgentMesh.Cli/AgentMesh.Cli.csproj" \
+  -c Release \
+  -r osx-arm64 \
+  --self-contained true \
+  -p:PublishSingleFile=true \
+  -p:IncludeNativeLibrariesForSelfExtract=true \
+  -o "${OUT_DIR}/osx-arm64"
+
+echo "[4/4] Publishing macOS Intel (x64) single-file binary..."
+dotnet publish "${ROOT_DIR}/src/AgentMesh.Cli/AgentMesh.Cli.csproj" \
+  -c Release \
+  -r osx-x64 \
+  --self-contained true \
+  -p:PublishSingleFile=true \
+  -p:IncludeNativeLibrariesForSelfExtract=true \
+  -o "${OUT_DIR}/osx-x64"
+
 echo "==================================================="
 echo "  Build Complete!"
 echo "  Linux binary:   ${OUT_DIR}/linux-x64/agentmesh"
 echo "  Windows binary: ${OUT_DIR}/win-x64/agentmesh.exe"
+echo "  macOS arm64:    ${OUT_DIR}/osx-arm64/agentmesh"
+echo "  macOS x64:      ${OUT_DIR}/osx-x64/agentmesh"
 echo "==================================================="

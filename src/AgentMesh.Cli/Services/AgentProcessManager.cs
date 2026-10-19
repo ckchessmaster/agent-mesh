@@ -15,6 +15,7 @@ public class AgentRunnerInstance : IAsyncDisposable
     private readonly Action _onStateChanged;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<Guid, byte> _processedMessages = new();
+    private readonly ConcurrentDictionary<Guid, DateTimeOffset> _stoppedSessions = new();
     private readonly SemaphoreSlim _turnLock = new(1, 1);
     private CancellationTokenSource? _activeTurnCts;
 
@@ -99,6 +100,9 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var model = msgElem.TryGetProperty("model", out var m) ? m.GetString() : null;
                 var effort = msgElem.TryGetProperty("effort", out var ef) ? ef.GetString() : null;
                 var mode = msgElem.TryGetProperty("mode", out var md) ? md.GetString() : null;
+                var createdAt = msgElem.TryGetProperty("createdAt", out var caProp) && caProp.TryGetDateTimeOffset(out var dto)
+                    ? dto
+                    : DateTimeOffset.UtcNow;
 
                 await HandlePromptAsync(new PromptReceivedEvent
                 {
@@ -110,7 +114,8 @@ public class AgentRunnerInstance : IAsyncDisposable
                     WorkingDirectory = workDir,
                     Model = model,
                     Effort = effort,
-                    Mode = mode
+                    Mode = mode,
+                    CreatedAt = createdAt
                 }, _cts.Token);
             }
             catch
@@ -119,41 +124,51 @@ public class AgentRunnerInstance : IAsyncDisposable
             }
         });
 
+        static string? GetJsonPropString(JsonElement elem, string name)
+        {
+            if (elem.ValueKind != JsonValueKind.Object) return null;
+            if (elem.TryGetProperty(name, out var p1) && p1.ValueKind == JsonValueKind.String) return p1.GetString();
+            foreach (var prop in elem.EnumerateObject())
+            {
+                if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return prop.Value.ValueKind == JsonValueKind.String ? prop.Value.GetString() : prop.Value.GetRawText();
+                }
+            }
+            return null;
+        }
+
+        _hubConnection.On<StopExecutionEvent>("StopExecution", (ev) =>
+        {
+            HandleStopExecution(ev.SessionId, ev.AgentId);
+        });
+
         _hubConnection.On<JsonElement>("StopExecution", (elem) =>
         {
             try
             {
-                var sidStr = elem.TryGetProperty("sessionId", out var sidProp) ? sidProp.GetString() : null;
-                var targetAgent = elem.TryGetProperty("agentId", out var aProp) ? aProp.GetString() : null;
-
-                var matchesAgent = targetAgent == null || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
-                var matchesSession = sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId;
-
-                if (matchesSession || (matchesAgent && State.ActiveSessionId != null))
-                {
-                    _onLog(_preset.Id, $"🛑 StopExecution received for session {State.ActiveSessionId?.ToString()[..8] ?? sidStr ?? "unknown"}. Aborting active turn.");
-                    _activeTurnCts?.Cancel();
-                }
+                var sidStr = GetJsonPropString(elem, "sessionId");
+                var targetAgent = GetJsonPropString(elem, "agentId");
+                Guid? parsedSid = (sidStr != null && Guid.TryParse(sidStr, out var s)) ? s : null;
+                HandleStopExecution(parsedSid, targetAgent);
             }
             catch { }
+        });
+
+        _hubConnection.On<StopCommandEvent>("StopCommand", (ev) =>
+        {
+            HandleStopCommand(ev.SessionId, ev.CommandId, ev.AgentId);
         });
 
         _hubConnection.On<JsonElement>("StopCommand", (elem) =>
         {
             try
             {
-                var sidStr = elem.TryGetProperty("sessionId", out var sidProp) ? sidProp.GetString() : null;
-                var cmdId = elem.TryGetProperty("commandId", out var cProp) ? cProp.GetString() : null;
-                var targetAgent = elem.TryGetProperty("agentId", out var aProp) ? aProp.GetString() : null;
-
-                var matchesAgent = targetAgent == null || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
-                var matchesSession = sidStr != null && Guid.TryParse(sidStr, out var sid) && sid == State.ActiveSessionId;
-
-                if (matchesSession || (matchesAgent && State.ActiveSessionId != null))
-                {
-                    _onLog(_preset.Id, $"🛑 StopCommand received for command '{cmdId}' in session {State.ActiveSessionId?.ToString()[..8] ?? sidStr ?? "unknown"}. Aborting active turn.");
-                    _activeTurnCts?.Cancel();
-                }
+                var sidStr = GetJsonPropString(elem, "sessionId");
+                var cmdId = GetJsonPropString(elem, "commandId");
+                var targetAgent = GetJsonPropString(elem, "agentId");
+                Guid? parsedSid = (sidStr != null && Guid.TryParse(sidStr, out var s)) ? s : null;
+                HandleStopCommand(parsedSid, cmdId, targetAgent);
             }
             catch { }
         });
@@ -203,11 +218,61 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
     }
 
+    private void HandleStopExecution(Guid? parsedSid, string? targetAgent)
+    {
+        var targetSid = parsedSid ?? State.ActiveSessionId;
+        if (targetSid.HasValue)
+        {
+            _stoppedSessions[targetSid.Value] = DateTimeOffset.UtcNow;
+        }
+
+        var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
+        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
+
+        if (matchesSession || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
+        {
+            _onLog(_preset.Id, $"🛑 StopExecution received for session {targetSid?.ToString()[..8] ?? "unknown"}. Aborting active turn immediately.");
+            try
+            {
+                _activeTurnCts?.Cancel();
+            }
+            catch { }
+        }
+    }
+
+    private void HandleStopCommand(Guid? parsedSid, string? cmdId, string? targetAgent)
+    {
+        var targetSid = parsedSid ?? State.ActiveSessionId;
+        if (targetSid.HasValue)
+        {
+            _stoppedSessions[targetSid.Value] = DateTimeOffset.UtcNow;
+        }
+
+        var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
+        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
+
+        if (matchesSession || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
+        {
+            _onLog(_preset.Id, $"🛑 StopCommand received for command '{cmdId}' in session {targetSid?.ToString()[..8] ?? "unknown"}. Aborting active turn immediately.");
+            try
+            {
+                _activeTurnCts?.Cancel();
+            }
+            catch { }
+        }
+    }
+
     private async Task HandlePromptAsync(PromptReceivedEvent ev, CancellationToken ct)
     {
         if (ev.MessageId != Guid.Empty && !_processedMessages.TryAdd(ev.MessageId, 1))
         {
             return; // Already processing or processed this prompt
+        }
+
+        if (_stoppedSessions.TryGetValue(ev.SessionId, out var stoppedTime) && ev.CreatedAt <= stoppedTime)
+        {
+            _onLog(_preset.Id, $"🛑 Discarding prompt for stopped session {ev.SessionId.ToString()[..8]} received before stop: \"{Truncate(ev.Prompt, 50)}\"");
+            return;
         }
 
         try
@@ -225,6 +290,19 @@ public class AgentRunnerInstance : IAsyncDisposable
 
         try
         {
+            if (_stoppedSessions.TryGetValue(ev.SessionId, out var stoppedAtAfterLock))
+            {
+                if (ev.CreatedAt <= stoppedAtAfterLock)
+                {
+                    _onLog(_preset.Id, $"🛑 Discarding queued prompt for stopped session {ev.SessionId.ToString()[..8]} (queued before stop): \"{Truncate(ev.Prompt, 50)}\"");
+                    return;
+                }
+                else
+                {
+                    _stoppedSessions.TryRemove(ev.SessionId, out _);
+                }
+            }
+
             State.State = RunnerConnectionState.Busy;
             State.ActiveSessionId = ev.SessionId;
             State.LastActivityAt = DateTimeOffset.UtcNow;
@@ -280,6 +358,16 @@ public class AgentRunnerInstance : IAsyncDisposable
                     trajectoryEv,
                     turnToken);
             }, turnToken);
+
+            var convId = AgyAdapter.GetSessionConversationId(ev.SessionId);
+            if (!string.IsNullOrWhiteSpace(convId))
+            {
+                try
+                {
+                    await AgyAdapter.SyncBrainArtifactsAsync(ev.SessionId, convId, _meshClient, turnToken);
+                }
+                catch { }
+            }
 
             State.PromptsHandled++;
             State.State = RunnerConnectionState.Online;

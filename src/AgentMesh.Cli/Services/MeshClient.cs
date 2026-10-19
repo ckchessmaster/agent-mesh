@@ -131,7 +131,8 @@ public class MeshClient
             toolName = ev.ToolName,
             toolArgsJson = ev.ToolArgsJson,
             toolResultJson = ev.ToolResultJson,
-            structuredPayloadJson = ev.StructuredPayloadJson
+            structuredPayloadJson = ev.StructuredPayloadJson,
+            createdAt = ev.CreatedAt
         });
 
         using var res = await _http.SendAsync(req, ct);
@@ -190,6 +191,10 @@ public class MeshClient
                         ? mid
                         : Guid.NewGuid();
 
+                    var createdAt = lastEv.TryGetProperty("createdAt", out var caProp) && caProp.TryGetDateTimeOffset(out var dto)
+                        ? dto
+                        : DateTimeOffset.UtcNow;
+
                     pending.Add(new PromptReceivedEvent
                     {
                         SessionId = sessionId,
@@ -200,7 +205,8 @@ public class MeshClient
                         WorkingDirectory = workDir,
                         Model = model,
                         Effort = effort,
-                        Mode = mode
+                        Mode = mode,
+                        CreatedAt = createdAt
                     });
                 }
             }
@@ -211,6 +217,28 @@ public class MeshClient
         }
 
         return pending;
+    }
+
+    public async Task<bool> SyncSessionArtifactAsync(Guid sessionId, string name, string content, string? summary = null, string? contentType = "text/markdown", CancellationToken ct = default)
+    {
+        try
+        {
+            var token = _config.MasterToken;
+            using var req = CreateRequest(HttpMethod.Post, $"api/sessions/{sessionId}/artifacts", token);
+            req.Content = JsonContent.Create(new
+            {
+                name,
+                content,
+                summary,
+                contentType
+            });
+            using var res = await _http.SendAsync(req, ct);
+            return res.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static HttpRequestMessage CreateRequest(HttpMethod method, string relativeUrl, string token, string? agentId = null)

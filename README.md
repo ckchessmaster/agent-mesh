@@ -101,12 +101,38 @@ agent-mesh/
 │   ├── AgentMesh.Core/                # Domain Entities, Workflow Contracts, DTOs
 │   ├── AgentMesh.Infrastructure/      # EF Core DbContext, Migrations, Repositories
 │   ├── AgentMesh.Api/                 # Web API, Auth Handler, MCP Endpoint (/mcp), SignalR
+│   ├── AgentMesh.Cli/                 # Cross-platform CLI runner for external agents (agy, copilot)
 │   ├── AgentMesh.Worker/              # Temporal Worker, Workflows, Activities
 │   └── AgentMesh.Dashboard/           # React 19 + Vite + Tailwind Frontend
 ├── deploy/
 │   ├── docker/                        # Dockerfiles for API, Worker, Dashboard
 │   └── helm/agent-mesh/               # Production Kubernetes Helm chart
+├── scripts/
+│   └── build-cli.sh                   # Builds single-file CLI binaries for Linux, Windows & macOS
 └── docs/
     ├── architecture-plan.md           # Master system plan
     └── phases/                        # Step-by-step agentic development guides
 ```
+
+---
+
+## AgentMesh CLI Cross-Platform Binaries
+
+The AgentMesh CLI (`agentmesh`) connects external CLI coding harnesses (`agy`, `copilot`) to the AgentMesh control plane, handles real-time trajectory streaming, artifact syncing, execution mode controls, and command interruption.
+
+### Building Binaries
+
+Build self-contained, single-file executables for all platforms:
+
+```bash
+./scripts/build-cli.sh
+```
+
+Binaries are output to `dist/cli/`:
+
+| Platform | Target Identifier | Output Binary |
+| :--- | :--- | :--- |
+| **Linux (x64)** | `linux-x64` | `dist/cli/linux-x64/agentmesh` |
+| **Windows (x64)** | `win-x64` | `dist/cli/win-x64/agentmesh.exe` |
+| **macOS (Apple Silicon M-Series)** | `osx-arm64` | `dist/cli/osx-arm64/agentmesh` |
+| **macOS (Intel x64)** | `osx-x64` | `dist/cli/osx-x64/agentmesh` |

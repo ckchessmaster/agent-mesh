@@ -111,8 +111,10 @@ public class SystemController : ControllerBase
                 },
                 Models: new List<ModelCapabilityDto>
                 {
-                    new("claude-3-7-sonnet", "Claude 3.7 Sonnet", new[] { "low", "medium", "high" }),
-                    new("claude-3-5-sonnet", "Claude 3.5 Sonnet", Array.Empty<string>())
+                    new("claude-sonnet-5-5", "Claude Sonnet 5.5", new[] { "low", "medium", "high" }),
+                    new("claude-opus-5-5", "Claude Opus 5.5", new[] { "low", "medium", "high" }),
+                    new("claude-3-7-sonnet", "Claude 3.7 Sonnet (Legacy)", Array.Empty<string>()),
+                    new("claude-3-5-sonnet", "Claude 3.5 Sonnet (Legacy)", Array.Empty<string>())
                 }
             ),
             ["generic"] = new(

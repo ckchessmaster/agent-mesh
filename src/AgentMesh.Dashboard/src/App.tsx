@@ -30,7 +30,9 @@ import {
   Layers,
   Clock,
   Square,
-  ListPlus
+  ListPlus,
+  HelpCircle,
+  FileText
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -39,12 +41,70 @@ import type {
   Agent,
   AgentSession,
   AgentUsageResponse,
+  AskQuestionItem,
   FilesystemBrowseResponse,
   QueuedPromptItem,
+  QuestionAnswerPayload,
   SessionMessage,
+  SessionArtifact,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from './types';
+import { SlashCommandPalette, SLASH_COMMANDS, type SlashCommandItem } from './components/SlashCommandPalette';
+import { ArtifactViewer } from './components/ArtifactViewer';
+
+function parseTextQuestions(content: string): AskQuestionItem[] {
+  if (!content) return [];
+  const jsonMatch = content.match(/```(?:json:)?ask_question\s*([\s\S]*?)```/i);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      if (Array.isArray(parsed.questions)) return parsed.questions;
+    } catch {}
+  }
+  const lines = content.split('\n');
+  const items: AskQuestionItem[] = [];
+  for (const line of lines) {
+    const qMatch = line.match(/^\s*(?:\d+[\.\)]|[-*])\s+(.+?\?)/);
+    if (qMatch && qMatch[1].trim().length > 5) {
+      const fullQ = qMatch[1].trim();
+      const extractedOptions: string[] = [];
+
+      // Check for parenthesized choices, e.g. (Italian, Mexican, Asian, etc.)
+      const parenMatch = fullQ.match(/\(([^)]+)\)/);
+      if (parenMatch) {
+        const rawChoices = parenMatch[1].split(/[,/]| or /i);
+        for (const choice of rawChoices) {
+          const trimmed = choice.trim().replace(/^etc\.?$/i, '').replace(/^e\.g\.?$/i, '').trim();
+          if (trimmed.length > 1 && trimmed.length < 35 && !extractedOptions.includes(trimmed)) {
+            extractedOptions.push(trimmed);
+          }
+        }
+      }
+
+      // If no paren choices, check for "A or B" pattern
+      if (extractedOptions.length === 0 && fullQ.includes(' or ')) {
+        const cleanedQ = fullQ.replace(/\?$/, '');
+        const orParts = cleanedQ.split(/\s+or\s+/i);
+        if (orParts.length >= 2 && orParts.length <= 4) {
+          for (const part of orParts) {
+            const trimmed = part.trim();
+            if (trimmed.length > 2 && trimmed.length < 35 && !extractedOptions.includes(trimmed)) {
+              extractedOptions.push(trimmed);
+            }
+          }
+        }
+      }
+
+      items.push({
+        question: fullQ,
+        options: extractedOptions,
+        is_multi_select: false
+      });
+    }
+  }
+  return items;
+}
 
 export default function App() {
   const auth = useAuth();
@@ -96,6 +156,23 @@ export default function App() {
   const [newAgentId, setNewAgentId] = useState('');
   const [newAgentName, setNewAgentName] = useState('');
   const [newAgentRole, setNewAgentRole] = useState('Codebase Engineer');
+
+  // Interactive Question & Answer state (keyed by toolCallId)
+  const [questionAnswers, setQuestionAnswers] = useState<
+    Record<string, { selectedOptions: Record<number, string[]>; customTexts: Record<number, string> }>
+  >({});
+  const [submittingQuestionId, setSubmittingQuestionId] = useState<string | null>(null);
+
+  // Artifacts state
+  const [artifacts, setArtifacts] = useState<SessionArtifact[]>([]);
+  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
+  const [showArtifactsPanel, setShowArtifactsPanel] = useState(false);
+  const [artifactPanelWidth, setArtifactPanelWidth] = useState(480);
+  const [isResizingArtifacts, setIsResizingArtifacts] = useState(false);
+
+  // Slash command palette state
+  const [slashPaletteOpen, setSlashPaletteOpen] = useState(false);
+  const [slashPaletteIndex, setSlashPaletteIndex] = useState(0);
 
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const { connection, connected: signalRConnected } = useSignalR('/hubs/agent-mesh');
@@ -160,6 +237,18 @@ export default function App() {
     }
   }, []);
 
+  const fetchSessionArtifacts = useCallback(async (sessionId: string) => {
+    try {
+      const list = await api.getSessionArtifacts(sessionId);
+      setArtifacts(list);
+      if (list.length > 0) {
+        setSelectedArtifactId((prev) => (prev && list.some((a) => a.id === prev) ? prev : list[0].id));
+      }
+    } catch {
+      setArtifacts([]);
+    }
+  }, []);
+
   useEffect(() => {
     fetchAllData();
   }, [fetchAllData]);
@@ -167,13 +256,40 @@ export default function App() {
   useEffect(() => {
     if (selectedSessionId) {
       fetchSessionEvents(selectedSessionId);
+      fetchSessionArtifacts(selectedSessionId);
       if (connection && signalRConnected) {
         connection.invoke('JoinSession', selectedSessionId).catch(() => {});
       }
     } else {
       setEvents([]);
+      setArtifacts([]);
+      setSelectedArtifactId(null);
     }
-  }, [selectedSessionId, fetchSessionEvents, connection, signalRConnected]);
+  }, [selectedSessionId, fetchSessionEvents, fetchSessionArtifacts, connection, signalRConnected]);
+
+  // Handle panel resizing
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isResizingArtifacts) return;
+      const newWidth = window.innerWidth - e.clientX;
+      if (newWidth >= 300 && newWidth <= Math.min(850, window.innerWidth - 300)) {
+        setArtifactPanelWidth(newWidth);
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsResizingArtifacts(false);
+    };
+
+    if (isResizingArtifacts) {
+      window.addEventListener('mousemove', handleMouseMove);
+      window.addEventListener('mouseup', handleMouseUp);
+    }
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizingArtifacts]);
 
   // Real-time SignalR listeners
   useEffect(() => {
@@ -199,12 +315,16 @@ export default function App() {
 
     const handleSessionUpdated = () => {
       fetchAllData();
+      if (selectedSessionId) {
+        fetchSessionArtifacts(selectedSessionId);
+      }
     };
 
     const handleMeshReset = () => {
       setAgents([]);
       setSessions([]);
       setEvents([]);
+      setArtifacts([]);
       setSelectedAgentId(null);
       setSelectedSessionId(null);
     };
@@ -216,10 +336,32 @@ export default function App() {
       fetchAllData();
     };
 
+    const handleArtifactCreated = (artifact: SessionArtifact) => {
+      if (artifact.sessionId === selectedSessionId) {
+        setArtifacts((prev) => {
+          const exists = prev.some((a) => a.id === artifact.id || a.name === artifact.name);
+          return exists
+            ? prev.map((a) => (a.id === artifact.id || a.name === artifact.name ? artifact : a))
+            : [...prev, artifact];
+        });
+        setSelectedArtifactId((prev) => prev ?? artifact.id);
+      }
+    };
+
+    const handleArtifactUpdated = (artifact: SessionArtifact) => {
+      if (artifact.sessionId === selectedSessionId) {
+        setArtifacts((prev) =>
+          prev.map((a) => (a.id === artifact.id || a.name === artifact.name ? artifact : a))
+        );
+      }
+    };
+
     connection.on('ReceiveMessage', handleReceiveMessage);
     connection.on('SessionCreated', handleSessionCreated);
     connection.on('SessionUpdated', handleSessionUpdated);
     connection.on('QueueUpdated', handleQueueUpdated);
+    connection.on('ArtifactCreated', handleArtifactCreated);
+    connection.on('ArtifactUpdated', handleArtifactUpdated);
     connection.on('AgentRegistered', handleSessionUpdated);
     connection.on('AgentUpdated', handleSessionUpdated);
     connection.on('MeshReset', handleMeshReset);
@@ -229,11 +371,13 @@ export default function App() {
       connection.off('SessionCreated', handleSessionCreated);
       connection.off('SessionUpdated', handleSessionUpdated);
       connection.off('QueueUpdated', handleQueueUpdated);
+      connection.off('ArtifactCreated', handleArtifactCreated);
+      connection.off('ArtifactUpdated', handleArtifactUpdated);
       connection.off('AgentRegistered', handleSessionUpdated);
       connection.off('AgentUpdated', handleSessionUpdated);
       connection.off('MeshReset', handleMeshReset);
     };
-  }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents]);
+  }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents, fetchSessionArtifacts]);
 
   // Auto-scroll timeline when new events arrive
   useEffect(() => {
@@ -401,13 +545,232 @@ export default function App() {
     }
   };
 
+  const emitSystemMessage = async (content: string) => {
+    const msgId = `sys-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const sysMsg: SessionMessage = {
+      id: msgId,
+      sessionId: selectedSessionId || '',
+      senderAgentId: 'system',
+      eventType: 'system',
+      content,
+      createdAt: new Date().toISOString()
+    };
+    setEvents((prev) => [...prev, sysMsg]);
+    if (selectedSessionId) {
+      try {
+        await api.postSessionMessage(selectedSessionId, content, 'system', 'system', 'system');
+      } catch {
+        // Optimistic event was already added
+      }
+    }
+  };
+
+  const handleExecuteMeshCommand = async (commandText: string): Promise<boolean> => {
+    const trimmed = commandText.trim();
+    const parts = trimmed.split(/\s+/);
+    const root = parts[0]?.toLowerCase();
+    const isMesh = root === '/mesh' || root === '\\mesh';
+
+    if (!isMesh) {
+      return false;
+    }
+
+    const subCmd = parts[1]?.toLowerCase();
+    const arg = parts.slice(2).join(' ').trim();
+
+    if (!subCmd || subCmd === 'help') {
+      await emitSystemMessage(
+        '💡 **AgentMesh Command Reference**\n\n' +
+        '• **`/mesh stop`**: Halt active model execution immediately (<500ms)\n' +
+        '• **`/mesh mode <plan|auto|accept-edits>`**: Switch session execution mode\n' +
+        '• **`/mesh model <model-id>`**: Set active model (e.g. gemini-3.8-flash)\n' +
+        '• **`/mesh effort <low|medium|high|max>`**: Set reasoning effort\n' +
+        '• **`/mesh artifacts`**: Toggle side-by-side Artifacts panel\n' +
+        '• **`/mesh queue <prompt>`**: Enqueue prompt sequentially\n' +
+        '• **`/mesh clear`**: Clear event timeline filters\n\n' +
+        '*Agent Workflows*: `/plan`, `/grill-me`, `/goal`, `/compact`, `/browser`, `/schedule`, `/skills`, `/help`'
+      );
+      return true;
+    }
+
+    if (subCmd === 'stop') {
+      await handleStopSession();
+      await emitSystemMessage('🛑 Stop signal dispatched for active model execution.');
+      return true;
+    }
+
+    if (subCmd === 'artifacts') {
+      setShowArtifactsPanel((prev) => !prev);
+      await emitSystemMessage(`Side-by-side Artifacts panel ${!showArtifactsPanel ? 'opened' : 'closed'}.`);
+      return true;
+    }
+
+    if (subCmd === 'clear') {
+      setEvents([]);
+      return true;
+    }
+
+    if (subCmd === 'effort') {
+      if (arg) {
+        const eff = arg.toLowerCase();
+        if (['low', 'medium', 'high', 'max'].includes(eff)) {
+          await handleUpdateSessionControl({ effort: eff });
+          await emitSystemMessage(`✓ Reasoning effort set to "${eff}" for active session.`);
+        } else {
+          await emitSystemMessage(`⚠️ Invalid effort level "${arg}". Supported levels: low, medium, high, max.`);
+        }
+      } else {
+        const currentEffort = selectedSessionMetadata?.effort || 'medium';
+        await emitSystemMessage(
+          `⚙️ **Reasoning Effort Configuration**\n\n` +
+          `• Current Level: **\`${currentEffort}\`**\n` +
+          `• Supported Levels: \`low\` | \`medium\` | \`high\` | \`max\`\n` +
+          `• Usage: \`/mesh effort <level>\` (e.g. \`/mesh effort high\`)`
+        );
+      }
+      return true;
+    }
+
+    if (subCmd === 'model') {
+      if (arg) {
+        await handleUpdateSessionControl({ model: arg });
+        await emitSystemMessage(`✓ Model updated to "${arg}" for active session.`);
+      } else {
+        const currentModel = selectedSessionMetadata?.model || 'default';
+        const modelList = availableModels.length > 0
+          ? availableModels.map((m) => `  - \`${m.id}\`${m.name ? ` (${m.name})` : ''}`).join('\n')
+          : '  - Default system model';
+        await emitSystemMessage(
+          `⚙️ **Model Configuration**\n\n` +
+          `• Current Model: **\`${currentModel}\`**\n` +
+          `• Available Models:\n${modelList}\n\n` +
+          `• Usage: \`/mesh model <model-id>\` (e.g. \`/mesh model gemini-3.8-flash\`)`
+        );
+      }
+      return true;
+    }
+
+    if (subCmd === 'mode') {
+      if (arg) {
+        const m = arg.toLowerCase();
+        if (['plan', 'auto', 'accept-edits'].includes(m)) {
+          await handleUpdateSessionControl({ mode: m });
+          await emitSystemMessage(`✓ Execution mode set to "${m}" for active session.`);
+        } else {
+          await emitSystemMessage(`⚠️ Invalid mode "${arg}". Supported modes: plan, auto, accept-edits.`);
+        }
+      } else {
+        const currentMode = selectedSessionMetadata?.mode || 'auto';
+        await emitSystemMessage(
+          `⚙️ **Execution Mode Configuration**\n\n` +
+          `• Current Mode: **\`${currentMode}\`**\n` +
+          `• Supported Modes: \`plan\` | \`auto\` | \`accept-edits\`\n` +
+          `• Usage: \`/mesh mode <mode>\` (e.g. \`/mesh mode plan\`)`
+        );
+      }
+      return true;
+    }
+
+    if (subCmd === 'queue') {
+      if (arg && selectedSessionId) {
+        const res = await api.enqueuePrompt(selectedSessionId, {
+          prompt: arg,
+          senderAgentId: userEmail,
+          sendNow: false
+        });
+        setActiveQueue(res.queue || []);
+        await fetchAllData();
+        await emitSystemMessage(`✓ Prompt enqueued sequentially (${(res.queue || []).length} prompt(s) in queue).`);
+      } else {
+        await emitSystemMessage(
+          `📋 **Prompt Queue Status**\n\n` +
+          `• Pending in Queue: **${activeQueue.length}** prompt(s)\n` +
+          `• Usage: \`/mesh queue <prompt>\` to enqueue a prompt sequentially.`
+        );
+      }
+      return true;
+    }
+
+    // Any unrecognized /mesh or \mesh subcommand
+    await emitSystemMessage(`⚠️ Unknown mesh subcommand: "${subCmd}". Type \`/mesh help\` for available commands.`);
+    return true;
+  };
+
+  const handleSelectSlashCommand = (cmd: SlashCommandItem) => {
+    setSlashPaletteOpen(false);
+    if (cmd.executeImmediately) {
+      handleExecuteMeshCommand(cmd.command);
+      setPromptInput('');
+    } else {
+      setPromptInput(cmd.insertText || `${cmd.command} `);
+    }
+  };
+
+  const handlePromptChange = (val: string) => {
+    setPromptInput(val);
+    if (val.startsWith('/') || val.startsWith('\\')) {
+      setSlashPaletteOpen(true);
+      setSlashPaletteIndex(0);
+    } else {
+      setSlashPaletteOpen(false);
+    }
+  };
+
+  const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (slashPaletteOpen) {
+      const cleanQuery = (promptInput.startsWith('/') || promptInput.startsWith('\\'))
+        ? promptInput.slice(1).trim().toLowerCase()
+        : promptInput.trim().toLowerCase();
+      const filtered = SLASH_COMMANDS.filter((cmd) => {
+        if (!cleanQuery) return true;
+        const cmdBody = cmd.command.slice(1).toLowerCase();
+        return (
+          cmdBody.includes(cleanQuery) ||
+          cmd.label.toLowerCase().includes(cleanQuery) ||
+          cmd.description.toLowerCase().includes(cleanQuery)
+        );
+      });
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSlashPaletteIndex((prev) => (filtered.length > 0 ? (prev + 1) % filtered.length : 0));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSlashPaletteIndex((prev) => (filtered.length > 0 ? (prev - 1 + filtered.length) % filtered.length : 0));
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setSlashPaletteOpen(false);
+        return;
+      }
+      if ((e.key === 'Enter' || e.key === 'Tab') && filtered.length > 0) {
+        const selected = filtered[slashPaletteIndex] || filtered[0];
+        if (selected && selected.command !== promptInput.trim()) {
+          e.preventDefault();
+          handleSelectSlashCommand(selected);
+          return;
+        }
+      }
+    }
+  };
+
   const handleSendPrompt = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedSessionId || !promptInput.trim()) return;
 
     const text = promptInput.trim();
     setPromptInput('');
+    setSlashPaletteOpen(false);
     setShowSendNowDropdown(false);
+
+    if (text.startsWith('/mesh') || text.startsWith('\\mesh')) {
+      await handleExecuteMeshCommand(text);
+      return;
+    }
+
     const currentSession = sessions.find((s) => s.id === selectedSessionId);
     const isThinking = currentSession?.status === 'thinking';
 
@@ -444,6 +807,11 @@ export default function App() {
     const text = promptInput.trim();
     setPromptInput('');
     setShowSendNowDropdown(false);
+
+    if (text.startsWith('/mesh') || text.startsWith('\\mesh')) {
+      await handleExecuteMeshCommand(text);
+      return;
+    }
 
     try {
       const res = await api.enqueuePrompt(selectedSessionId, {
@@ -506,6 +874,41 @@ export default function App() {
       await fetchSessionEvents(selectedSessionId);
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Failed to send queued prompt now');
+    }
+  };
+
+  const handleSubmitAnswers = async (toolCallId: string, parsedQuestions: AskQuestionItem[]) => {
+    if (!selectedSessionId) return;
+    setSubmittingQuestionId(toolCallId);
+    try {
+      const curAnswers = questionAnswers[toolCallId] || { selectedOptions: {}, customTexts: {} };
+      const answers: QuestionAnswerPayload[] = parsedQuestions.map((q, idx) => ({
+        questionIndex: idx,
+        question: q.question,
+        selectedOptions: curAnswers.selectedOptions[idx] || [],
+        customText: curAnswers.customTexts[idx] || ''
+      }));
+
+      await api.submitQuestionAnswer(selectedSessionId, {
+        toolCallId,
+        answers
+      });
+
+      setQuestionAnswers((prev) => {
+        const next = { ...prev };
+        delete next[toolCallId];
+        return next;
+      });
+
+      await fetchAllData();
+      if (selectedSessionId) {
+        await fetchSessionEvents(selectedSessionId);
+      }
+    } catch (err) {
+      console.error('Failed to submit question answer:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to submit answer');
+    } finally {
+      setSubmittingQuestionId(null);
     }
   };
 
@@ -898,7 +1301,9 @@ export default function App() {
                               }`}
                             >
                               <div className="flex items-center gap-2 min-w-0">
-                                {isThinking ? (
+                                {session.status === 'waiting_for_input' ? (
+                                  <span className="w-2.5 h-2.5 rounded-full bg-amber-400 border border-amber-300 animate-ping shrink-0" title="Human input required" />
+                                ) : isThinking ? (
                                   <RefreshCw className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
                                 ) : (
                                   <MessageSquare className="w-3 h-3 text-slate-500 shrink-0" />
@@ -1200,13 +1605,19 @@ export default function App() {
                       {selectedSession.title}
                     </h2>
                     <span
-                      className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${
+                      className={`text-[11px] font-mono px-2.5 py-0.5 rounded-full border ${
                         selectedSession.status === 'thinking'
                           ? 'bg-amber-500/10 text-amber-300 border-amber-500/30 animate-pulse'
+                          : selectedSession.status === 'waiting_for_input'
+                          ? 'bg-amber-500/20 text-amber-200 border-amber-400 font-semibold shadow-sm animate-pulse flex items-center gap-1.5'
                           : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
                       }`}
                     >
-                      {selectedSession.status === 'thinking' ? 'Thinking...' : selectedSession.status}
+                      {selectedSession.status === 'thinking'
+                        ? 'Thinking...'
+                        : selectedSession.status === 'waiting_for_input'
+                        ? 'Waiting for Input'
+                        : selectedSession.status}
                     </span>
                   </div>
 
@@ -1418,19 +1829,43 @@ export default function App() {
                   </div>
                 </div>
 
-                {selectedAgent && (
+                <div className="flex items-center gap-2">
                   <button
-                    onClick={() => setIsCreatingSession(true)}
-                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center gap-1.5 transition cursor-pointer"
+                    type="button"
+                    onClick={() => setShowArtifactsPanel((prev) => !prev)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer border ${
+                      showArtifactsPanel
+                        ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/50 shadow-sm'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+                    }`}
+                    title="Toggle Artifacts viewer panel"
                   >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>New Session</span>
+                    <FileText className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Artifacts</span>
+                    {artifacts.length > 0 && (
+                      <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                        {artifacts.length}
+                      </span>
+                    )}
                   </button>
-                )}
+
+                  {selectedAgent && (
+                    <button
+                      onClick={() => setIsCreatingSession(true)}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>New Session</span>
+                    </button>
+                  )}
+                </div>
               </div>
 
-              {/* Trajectory Events Stream */}
-              <div className="flex-1 overflow-y-auto p-6 space-y-4">
+              {/* Split Body: Left Chat Stream + Right Artifacts Panel */}
+              <div className="flex-1 flex min-h-0 overflow-hidden relative">
+                <div className="flex-1 flex flex-col min-w-0 min-h-0">
+                  {/* Trajectory Events Stream */}
+                  <div className="flex-1 overflow-y-auto p-6 space-y-4">
                 {events.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 space-y-2">
                     <Activity className="w-8 h-8 text-slate-700" />
@@ -1439,9 +1874,232 @@ export default function App() {
                       Send a prompt below or stream events from your CLI agent to see live reasoning, tool calls, and outputs.
                     </p>
                   </div>
-                ) : (
-                  events.map((ev) => {
+                ) : (() => {
+                  const renderQuestionCard = (
+                    cardKey: string,
+                    targetId: string,
+                    eventCreatedAt: string,
+                    parsedQuestions: AskQuestionItem[]
+                  ) => {
+                    const matchingAnswer = events.find((res) => {
+                      if (res.eventType !== 'tool_result' || res.toolName !== 'ask_question') return false;
+                      if (res.structuredPayloadJson) {
+                        try {
+                          const p = JSON.parse(res.structuredPayloadJson);
+                          if (p.toolCallId === targetId) return true;
+                        } catch {}
+                      }
+                      return new Date(res.createdAt).getTime() > new Date(eventCreatedAt).getTime();
+                    });
+
+                    const curAnswers = questionAnswers[targetId] || { selectedOptions: {}, customTexts: {} };
+                    const hasAnyAnswerInput = parsedQuestions.some((_, idx) => {
+                      const opts = curAnswers.selectedOptions[idx] || [];
+                      const text = (curAnswers.customTexts[idx] || '').trim();
+                      return opts.length > 0 || text.length > 0;
+                    });
+
+                    if (matchingAnswer) {
+                      return (
+                        <div
+                          key={`ans-${cardKey}`}
+                          className="bg-emerald-950/15 border border-emerald-500/30 rounded-2xl p-5 shadow-sm space-y-3"
+                        >
+                          <div className="flex items-center justify-between pb-2.5 border-b border-emerald-500/20">
+                            <div className="flex items-center gap-2 text-xs font-semibold text-emerald-300">
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                              <span>Agent Question — Answered</span>
+                            </div>
+                            <span className="text-[11px] font-mono text-slate-500">
+                              {new Date(matchingAnswer.createdAt || eventCreatedAt).toLocaleTimeString()}
+                            </span>
+                          </div>
+
+                          <div className="space-y-3">
+                            {parsedQuestions.map((q, idx) => (
+                              <div key={idx} className="space-y-1.5">
+                                <div className="text-xs font-medium text-slate-200">
+                                  {q.question}
+                                </div>
+                                <div className="text-xs text-emerald-300 font-mono bg-emerald-950/40 border border-emerald-500/30 rounded-lg px-3 py-2 whitespace-pre-wrap">
+                                  {matchingAnswer.content || 'Answer submitted'}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div
+                        key={`q-${cardKey}`}
+                        className="bg-amber-950/20 border border-amber-500/40 rounded-2xl p-5 shadow-lg space-y-4"
+                      >
+                        <div className="flex items-center justify-between pb-3 border-b border-amber-500/20">
+                          <div className="flex items-center gap-2">
+                            <HelpCircle className="w-5 h-5 text-amber-400 shrink-0 animate-pulse" />
+                            <div>
+                              <span className="text-xs font-bold text-amber-200 uppercase tracking-wider block">
+                                Agent Question — Human Input Required
+                              </span>
+                              <span className="text-[11px] text-slate-400">
+                                The model paused to request operator direction before proceeding
+                              </span>
+                            </div>
+                          </div>
+                          <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
+                            Pending Input
+                          </span>
+                        </div>
+
+                        <div className="space-y-4">
+                          {parsedQuestions.map((q, idx) => {
+                            const selectedOpts = curAnswers.selectedOptions[idx] || [];
+                            const customText = curAnswers.customTexts[idx] || '';
+
+                            return (
+                              <div key={idx} className="space-y-2.5">
+                                <div className="text-xs font-semibold text-slate-100 flex items-center gap-1.5">
+                                  <span className="w-5 h-5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 inline-flex items-center justify-center text-[10px] shrink-0">
+                                    {idx + 1}
+                                  </span>
+                                  <span>{q.question}</span>
+                                  {q.is_multi_select && (
+                                    <span className="text-[10px] font-normal text-slate-400 font-mono">
+                                      (multi-select)
+                                    </span>
+                                  )}
+                                </div>
+
+                                {q.options && q.options.length > 0 && (
+                                  <div className="flex flex-wrap gap-2 pt-1">
+                                    {q.options.map((opt) => {
+                                      const isSelected = selectedOpts.includes(opt);
+                                      return (
+                                        <button
+                                          key={opt}
+                                          type="button"
+                                          onClick={() => {
+                                            setQuestionAnswers((prev) => {
+                                              const cur = prev[targetId] || { selectedOptions: {}, customTexts: {} };
+                                              const existing = cur.selectedOptions[idx] || [];
+                                              let nextSelected: string[];
+                                              if (q.is_multi_select) {
+                                                nextSelected = existing.includes(opt)
+                                                  ? existing.filter((x) => x !== opt)
+                                                  : [...existing, opt];
+                                              } else {
+                                                nextSelected = existing.includes(opt) ? [] : [opt];
+                                              }
+                                              return {
+                                                ...prev,
+                                                [targetId]: {
+                                                  ...cur,
+                                                  selectedOptions: {
+                                                    ...cur.selectedOptions,
+                                                    [idx]: nextSelected
+                                                  }
+                                                }
+                                              };
+                                            });
+                                          }}
+                                          className={`px-3 py-1.5 rounded-xl text-xs font-medium border transition cursor-pointer flex items-center gap-1.5 ${
+                                            isSelected
+                                              ? 'bg-sky-500/25 text-sky-200 border-sky-400 font-semibold shadow-sm'
+                                              : 'bg-slate-900/80 text-slate-300 border-slate-700/80 hover:bg-slate-800 hover:text-slate-100'
+                                          }`}
+                                        >
+                                          {isSelected ? (
+                                            <Check className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                                          ) : (
+                                            <span className="w-3.5 h-3.5 rounded-full border border-slate-600 shrink-0 inline-block" />
+                                          )}
+                                          <span>{opt}</span>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+
+                                <div className="pt-1">
+                                  <input
+                                    type="text"
+                                    value={customText}
+                                    onChange={(e) => {
+                                      const val = e.target.value;
+                                      setQuestionAnswers((prev) => {
+                                        const cur = prev[targetId] || { selectedOptions: {}, customTexts: {} };
+                                        return {
+                                          ...prev,
+                                          [targetId]: {
+                                            ...cur,
+                                            customTexts: {
+                                              ...cur.customTexts,
+                                              [idx]: val
+                                            }
+                                          }
+                                        };
+                                      });
+                                    }}
+                                    placeholder={
+                                      q.options && q.options.length > 0
+                                        ? "Or type a custom write-in response..."
+                                        : "Type your response to this question..."
+                                    }
+                                    className="w-full bg-slate-900/90 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 transition"
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        <div className="flex items-center justify-end gap-2 pt-2 border-t border-amber-500/20">
+                          <button
+                            type="button"
+                            disabled={!hasAnyAnswerInput || submittingQuestionId === targetId}
+                            onClick={() => handleSubmitAnswers(targetId, parsedQuestions)}
+                            className="px-4 py-2 rounded-xl text-xs font-semibold bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white transition flex items-center gap-1.5 shadow-md cursor-pointer"
+                          >
+                            {submittingQuestionId === targetId ? (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                <span>Submitting...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Send className="w-3.5 h-3.5" />
+                                <span>Submit Answer</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  };
+
+                  return events.map((ev) => {
                     const type = ev.eventType || 'response';
+
+                    if (type === 'system') {
+                      return (
+                        <div key={ev.id} className="flex justify-start">
+                          <div className="max-w-2xl bg-slate-900/90 border border-slate-700/60 rounded-xl px-4 py-3 text-slate-200 shadow-md">
+                            <div className="flex items-center justify-between gap-4 text-[11px] font-mono text-sky-400 mb-1.5 pb-1 border-b border-slate-800">
+                              <div className="flex items-center gap-1.5">
+                                <Terminal className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                                <span className="font-semibold uppercase tracking-wider">Mesh System</span>
+                              </div>
+                              <span className="text-slate-500">{new Date(ev.createdAt).toLocaleTimeString()}</span>
+                            </div>
+                            <div className="text-xs text-slate-300 font-mono leading-relaxed whitespace-pre-wrap">
+                              {ev.content}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
 
                     if (type === 'prompt') {
                       return (
@@ -1484,6 +2142,30 @@ export default function App() {
                     }
 
                     if (type === 'tool_call') {
+                      if (ev.toolName === 'ask_question') {
+                        let parsedQuestions: AskQuestionItem[] = [];
+                        if (ev.toolArgsJson) {
+                          try {
+                            const raw = JSON.parse(ev.toolArgsJson);
+                            if (Array.isArray(raw.questions)) {
+                              parsedQuestions = raw.questions;
+                            } else if (typeof raw.questions === 'string') {
+                              try {
+                                parsedQuestions = JSON.parse(raw.questions);
+                              } catch {}
+                            } else if (raw.question) {
+                              parsedQuestions = [{
+                                question: raw.question,
+                                options: Array.isArray(raw.options) ? raw.options : [],
+                                is_multi_select: !!raw.is_multi_select
+                              }];
+                            }
+                          } catch {}
+                        }
+
+                        return renderQuestionCard(ev.id, ev.id, ev.createdAt, parsedQuestions);
+                      }
+
                       return (
                         <details
                           key={ev.id}
@@ -1516,6 +2198,11 @@ export default function App() {
                     }
 
                     if (type === 'tool_result') {
+                      if (ev.toolName === 'ask_question') {
+                        // Suppress duplicate tool_result; already rendered in Question card
+                        return null;
+                      }
+
                       return (
                         <details
                           key={ev.id}
@@ -1559,38 +2246,53 @@ export default function App() {
                       } catch {}
                     }
 
+                    const textQuestions = parseTextQuestions(ev.content);
+                    const hasFollowupToolCall = events.some(
+                      (e) =>
+                        e.eventType === 'tool_call' &&
+                        e.toolName === 'ask_question' &&
+                        new Date(e.createdAt).getTime() >= new Date(ev.createdAt).getTime()
+                    );
+
+                    const cleanedContent = ev.content
+                      .replace(/\(?Note:?\s*I can't see your replies in this non-interactive session\.?.*?(\)|$)/gi, '')
+                      .trim();
+
                     return (
-                      <div
-                        key={ev.id}
-                        className="bg-slate-900/90 border border-slate-800 rounded-2xl rounded-tl-sm px-5 py-4 text-slate-100 shadow-lg"
-                      >
-                        <div className="flex items-center justify-between text-xs font-mono text-emerald-400 mb-2">
-                          <div className="flex items-center gap-2">
-                            <CheckCircle2 className="w-4 h-4" />
-                            <span className="font-bold">@{ev.senderAgentId}</span>
-                          </div>
-                          <div className="flex items-center gap-2.5">
-                            {usage && (
-                              <span
-                                className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/25"
-                                title={`In: ${usage.inputTokens || 0} | Out: ${usage.outputTokens || 0} | Think: ${usage.thinkingTokens || 0}`}
-                              >
-                                ⚡ {(usage.totalTokens || ((usage.inputTokens || 0) + (usage.outputTokens || 0))).toLocaleString()} tokens
-                                {usage.durationSeconds ? ` (${usage.durationSeconds.toFixed(1)}s)` : ''}
+                      <div key={ev.id} className="space-y-3">
+                        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl rounded-tl-sm px-5 py-4 text-slate-100 shadow-lg">
+                          <div className="flex items-center justify-between text-xs font-mono text-emerald-400 mb-2">
+                            <div className="flex items-center gap-2">
+                              <CheckCircle2 className="w-4 h-4" />
+                              <span className="font-bold">@{ev.senderAgentId}</span>
+                            </div>
+                            <div className="flex items-center gap-2.5">
+                              {usage && (
+                                <span
+                                  className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/25"
+                                  title={`In: ${usage.inputTokens || 0} | Out: ${usage.outputTokens || 0} | Think: ${usage.thinkingTokens || 0}`}
+                                >
+                                  ⚡ {(usage.totalTokens || ((usage.inputTokens || 0) + (usage.outputTokens || 0))).toLocaleString()} tokens
+                                  {usage.durationSeconds ? ` (${usage.durationSeconds.toFixed(1)}s)` : ''}
+                                </span>
+                              )}
+                              <span className="text-slate-500">
+                                {new Date(ev.createdAt).toLocaleTimeString()}
                               </span>
-                            )}
-                            <span className="text-slate-500">
-                              {new Date(ev.createdAt).toLocaleTimeString()}
-                            </span>
+                            </div>
+                          </div>
+                          <div className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200">
+                            {cleanedContent || ev.content}
                           </div>
                         </div>
-                        <div className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200">
-                          {ev.content}
-                        </div>
+
+                        {textQuestions.length > 0 && !hasFollowupToolCall && (
+                          renderQuestionCard(`text-q-${ev.id}`, ev.id, ev.createdAt, textQuestions)
+                        )}
                       </div>
                     );
-                  })
-                )}
+                  });
+                })()}
 
                 {selectedSession.status === 'thinking' && (
                   selectedAgent?.status === 'offline' ? (
@@ -1620,7 +2322,7 @@ export default function App() {
               {/* Bottom Prompt Bar */}
               <form
                 onSubmit={handleSendPrompt}
-                className="p-4 border-t border-slate-800/80 bg-slate-900/50 shrink-0 space-y-2.5"
+                className="p-4 border-t border-slate-800/80 bg-slate-900/50 shrink-0 space-y-2.5 relative z-20"
               >
                 {/* Active Command Pill */}
                 {activeCommand && (
@@ -1689,37 +2391,59 @@ export default function App() {
 
                 {/* Input & Control Bar */}
                 <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    placeholder={
-                      selectedSession.status === 'thinking'
-                        ? `Add instruction to queue for ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'}...`
-                        : `Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'}...`
-                    }
-                    value={promptInput}
-                    onChange={(e) => setPromptInput(e.target.value)}
-                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
-                  />
+                  <div className="relative flex-1">
+                    {/* Slash Command Autocomplete Palette */}
+                    <SlashCommandPalette
+                      query={promptInput}
+                      isOpen={slashPaletteOpen}
+                      highlightedIndex={slashPaletteIndex}
+                      onSelect={handleSelectSlashCommand}
+                      onClose={() => setSlashPaletteOpen(false)}
+                    />
 
-                  {/* Stop Button: beside the input bar, enabled strictly when thinking */}
-                  <button
-                    type="button"
-                    onClick={handleStopSession}
-                    disabled={selectedSession.status !== 'thinking' || isActionPending}
-                    title={
-                      selectedSession.status === 'thinking'
-                        ? 'Stop model execution (Interrupt)'
-                        : 'Model is idle'
-                    }
-                    className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition ${
-                      selectedSession.status === 'thinking'
-                        ? 'bg-rose-600/90 hover:bg-rose-500 text-white shadow-lg shadow-rose-950/40 cursor-pointer animate-pulse'
-                        : 'bg-slate-800/30 text-slate-600 border border-slate-800/50 cursor-not-allowed opacity-50'
-                    }`}
-                  >
-                    <Square className="w-3.5 h-3.5 fill-current" />
-                    <span>Stop</span>
-                  </button>
+                    <input
+                      type="text"
+                      placeholder={
+                        selectedSession.status === 'thinking'
+                          ? `Add instruction to queue for ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
+                          : `Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
+                      }
+                      value={promptInput}
+                      onChange={(e) => handlePromptChange(e.target.value)}
+                      onFocus={() => {
+                        if (promptInput.startsWith('/') || promptInput.startsWith('\\')) {
+                          setSlashPaletteOpen(true);
+                        }
+                      }}
+                      onKeyDown={handlePromptKeyDown}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                    />
+                  </div>
+
+                  {/* Stop Button: beside the input bar, enabled when thinking or waiting_for_input */}
+                  {(() => {
+                    const isStoppable = selectedSession.status === 'thinking' || selectedSession.status === 'waiting_for_input';
+                    return (
+                      <button
+                        type="button"
+                        onClick={handleStopSession}
+                        disabled={!isStoppable || isActionPending}
+                        title={
+                          isStoppable
+                            ? 'Stop model execution (Interrupt)'
+                            : 'Model is idle'
+                        }
+                        className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition ${
+                          isStoppable
+                            ? 'bg-rose-600/90 hover:bg-rose-500 text-white shadow-lg shadow-rose-950/40 cursor-pointer animate-pulse'
+                            : 'bg-slate-800/30 text-slate-600 border border-slate-800/50 cursor-not-allowed opacity-50'
+                        }`}
+                      >
+                        <Square className="w-3.5 h-3.5 fill-current" />
+                        <span>Stop</span>
+                      </button>
+                    );
+                  })()}
 
                   {/* Dynamic Send / Queue Split Button */}
                   {selectedSession.status === 'thinking' ? (
@@ -1782,7 +2506,34 @@ export default function App() {
                   </span>
                 </div>
               </form>
-            </>
+            </div>
+
+            {/* Resizable Split Divider */}
+            {showArtifactsPanel && (
+              <div
+                onMouseDown={() => setIsResizingArtifacts(true)}
+                className="w-1.5 hover:w-2 bg-slate-800 hover:bg-indigo-500 transition-colors cursor-col-resize select-none shrink-0"
+                title="Drag to resize artifacts panel"
+              />
+            )}
+
+            {/* Right: Resizable Artifacts Split Panel */}
+            {showArtifactsPanel && (
+              <div
+                style={{ width: `${artifactPanelWidth}px` }}
+                className="shrink-0 flex flex-col min-h-0 bg-slate-950 border-l border-slate-800 overflow-hidden"
+              >
+                <ArtifactViewer
+                  artifacts={artifacts}
+                  selectedArtifactId={selectedArtifactId}
+                  onSelectArtifact={(id) => setSelectedArtifactId(id)}
+                  onClose={() => setShowArtifactsPanel(false)}
+                  onRefresh={() => selectedSessionId && fetchSessionArtifacts(selectedSessionId)}
+                />
+              </div>
+            )}
+          </div>
+        </>
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
               <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-sky-400">

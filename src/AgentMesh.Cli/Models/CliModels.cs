@@ -49,6 +49,9 @@ public class PromptReceivedEvent
 
     [JsonPropertyName("mode")]
     public string? Mode { get; set; }
+
+    [JsonPropertyName("createdAt")]
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 public class TrajectoryEventPayload
@@ -59,6 +62,31 @@ public class TrajectoryEventPayload
     public string? ToolArgsJson { get; set; }
     public string? ToolResultJson { get; set; }
     public string? StructuredPayloadJson { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public class StopExecutionEvent
+{
+    [JsonPropertyName("sessionId")]
+    public Guid? SessionId { get; set; }
+
+    [JsonPropertyName("agentId")]
+    public string? AgentId { get; set; }
+
+    [JsonPropertyName("reason")]
+    public string? Reason { get; set; }
+}
+
+public class StopCommandEvent
+{
+    [JsonPropertyName("sessionId")]
+    public Guid? SessionId { get; set; }
+
+    [JsonPropertyName("commandId")]
+    public string? CommandId { get; set; }
+
+    [JsonPropertyName("agentId")]
+    public string? AgentId { get; set; }
 }
 
 public enum RunnerConnectionState

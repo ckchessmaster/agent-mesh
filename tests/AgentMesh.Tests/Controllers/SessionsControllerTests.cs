@@ -381,5 +381,321 @@ public class SessionsControllerTests
         // New prompt message created in session
         db.SessionMessages.Should().Contain(m => m.Content == "Next queued task" && m.EventType == "prompt");
     }
+
+    [Fact]
+    public async Task PostTrajectory_AskQuestion_SetsStatusToWaitingForInput()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Interactive Session",
+            Status = "thinking",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act: agent emits ask_question tool_call
+        var req = new PostMessageRequest(
+            "Asking user for confirmation",
+            EventType: "tool_call",
+            ToolName: "ask_question",
+            ToolArgsJson: "{\"questions\":[{\"question\":\"Confirm deploy?\",\"options\":[\"Yes\",\"No\"]}]}",
+            SenderAgentId: "agy"
+        );
+        var result = await controller.PostMessage(session.Id, req);
+
+        // Assert
+        result.Should().BeOfType<CreatedAtActionResult>();
+        session.Status.Should().Be("waiting_for_input");
+    }
+
+    [Fact]
+    public async Task SubmitAnswer_PersistsToolResultAndPrompt_AndDispatchesPromptReceived()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Interactive Session",
+            Status = "waiting_for_input",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+
+        var toolCallMsg = new SessionMessage
+        {
+            SessionId = session.Id,
+            SenderAgentId = "agy",
+            EventType = "tool_call",
+            ToolName = "ask_question",
+            Content = "Which database?",
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.SessionMessages.Add(toolCallMsg);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var req = new SubmitAnswerRequest(
+            ToolCallId: toolCallMsg.Id,
+            Answers: new List<QuestionAnswerDto>
+            {
+                new(
+                    QuestionIndex: 0,
+                    Question: "Which database?",
+                    SelectedOptions: new List<string> { "PostgreSQL" },
+                    CustomText: null
+                )
+            }
+        );
+        var result = await controller.SubmitAnswer(session.Id, req);
+
+        // Assert
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        session.Status.Should().Be("thinking");
+
+        // Tool result message created
+        db.SessionMessages.Should().Contain(m =>
+            m.EventType == "tool_result" &&
+            m.ToolName == "ask_question" &&
+            m.Content.Contains("PostgreSQL"));
+
+        // Prompt message created
+        db.SessionMessages.Should().Contain(m =>
+            m.EventType == "prompt" &&
+            m.Content.Contains("PostgreSQL"));
+
+        // PromptReceived SignalR broadcast to agent-agy
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("PromptReceived", It.IsAny<object[]>(), default),
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task StopSession_RecordsStoppedAtInMetadata_AndDropsSubsequentAgentEvents()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Active Session",
+            Status = "thinking",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act 1: Stop session
+        var stopResult = await controller.StopSession(session.Id);
+        stopResult.Should().BeOfType<OkObjectResult>();
+
+        session.Status.Should().Be("active");
+        var stoppedAt = SessionsController.ExtractStoppedAt(session.MetadataJson);
+        stoppedAt.Should().NotBeNull();
+
+        // Act 2: Trailing agent event arrives after stop
+        var trailingEvent = new PostMessageRequest("Late model thought", SenderAgentId: "agy", EventType: "thought");
+        var dropResult = await controller.PostMessage(session.Id, trailingEvent);
+        var dropOk = dropResult.Should().BeOfType<OkObjectResult>().Subject;
+        dropOk.Value!.ToString().Should().Contain("dropped_due_to_stop");
+
+        // DB should NOT have recorded the trailing thought
+        db.SessionMessages.Should().NotContain(m => m.Content == "Late model thought");
+
+        // Act 3: Operator sends new prompt - should clear stoppedAt and be accepted
+        var newPrompt = new PostMessageRequest("New prompt from operator", SenderAgentId: "operator", TargetAgentId: "agy", EventType: "prompt");
+        var promptResult = await controller.PostMessage(session.Id, newPrompt);
+        promptResult.Should().BeOfType<CreatedAtActionResult>();
+
+        var clearedStoppedAt = SessionsController.ExtractStoppedAt(session.MetadataJson);
+        clearedStoppedAt.Should().BeNull();
+        db.SessionMessages.Should().Contain(m => m.Content == "New prompt from operator");
+    }
+
+    [Fact]
+    public async Task SyncArtifact_PersistsArtifact_AndCanBeRetrieved()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Title = "Artifact Test Session",
+            Status = "active",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act 1: Sync a new markdown artifact
+        var syncReq = new SyncArtifactRequest(
+            Name: "architecture_plan.md",
+            Content: "# Architecture Plan\n\n```mermaid\ngraph TD\nA-->B\n```",
+            Summary: "System architecture and flow diagram",
+            ContentType: "text/markdown"
+        );
+        var syncResult = await controller.SyncArtifact(session.Id, syncReq);
+
+        // Assert 1: Sync successful and persisted
+        var syncOk = syncResult.Should().BeOfType<OkObjectResult>().Subject;
+        var artifactDto = syncOk.Value.Should().BeOfType<SessionArtifactDto>().Subject;
+        artifactDto.Name.Should().Be("architecture_plan.md");
+        artifactDto.Summary.Should().Be("System architecture and flow diagram");
+        artifactDto.Content.Should().Contain("# Architecture Plan");
+
+        // Act 2: List artifacts for session
+        var listResult = await controller.GetArtifacts(session.Id);
+        var listOk = listResult.Should().BeOfType<OkObjectResult>().Subject;
+        var artifacts = listOk.Value.Should().BeAssignableTo<IEnumerable<SessionArtifactDto>>().Subject.ToList();
+        artifacts.Should().ContainSingle(a => a.Name == "architecture_plan.md");
+
+        // Act 3: Get specific artifact by name
+        var getResult = await controller.GetArtifact(session.Id, "architecture_plan.md");
+        var getOk = getResult.Should().BeOfType<OkObjectResult>().Subject;
+        var fetchedDto = getOk.Value.Should().BeOfType<SessionArtifactDto>().Subject;
+        fetchedDto.Content.Should().Contain("graph TD");
+    }
+
+    [Fact]
+    public async Task PostMessage_MeshEffortNoArgs_InterceptedAsSystemCommand_WithoutForwardingToAgent()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Mesh Command Test",
+            Status = "active",
+            CreatorAgentId = "agy",
+            MetadataJson = SessionsController.MergeSessionMetadata(null, null, "gemini-3.8-flash", "medium", "auto")
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act: User submits "/mesh effort"
+        var req = new PostMessageRequest(
+            Content: "/mesh effort",
+            SenderAgentId: "operator",
+            EventType: "prompt"
+        );
+        var result = await controller.PostMessage(session.Id, req);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+
+        // System message persisted
+        var sysMsg = db.SessionMessages.FirstOrDefault(m => m.SessionId == session.Id && m.EventType == "system");
+        sysMsg.Should().NotBeNull();
+        sysMsg!.Content.Should().Contain("Reasoning Effort Configuration");
+        sysMsg.Content.Should().Contain("medium");
+
+        // Should NOT have created a prompt message
+        db.SessionMessages.Should().NotContain(m => m.EventType == "prompt");
+
+        // Should NOT have sent PromptReceived
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("PromptReceived", It.IsAny<object[]>(), default),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task PostMessage_BackslashMeshEffortWithArg_UpdatesEffort_AndReturnsConfirmation()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Mesh Effort Test",
+            Status = "active",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act: User submits "\mesh effort max"
+        var req = new PostMessageRequest(
+            Content: "\\mesh effort max",
+            SenderAgentId: "operator",
+            EventType: "prompt"
+        );
+        var result = await controller.PostMessage(session.Id, req);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+
+        var (_, _, effort, _, _) = SessionsController.ExtractSessionSettings(session.MetadataJson);
+        effort.Should().Be("max");
+
+        var sysMsg = db.SessionMessages.FirstOrDefault(m => m.SessionId == session.Id && m.EventType == "system");
+        sysMsg.Should().NotBeNull();
+        sysMsg!.Content.Should().Contain("max");
+
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("PromptReceived", It.IsAny<object[]>(), default),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task StopSession_LaggingTurnEventsDropEvenAfterNewPromptTurnBegins()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Lagging Event Test",
+            Status = "thinking",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Step 1: Stop session at T_stop
+        var stopTime = DateTimeOffset.UtcNow;
+        await controller.StopSession(session.Id);
+
+        // Step 2: New prompt arrives shortly after stop
+        var promptReq = new PostMessageRequest(
+            Content: "New task for model",
+            SenderAgentId: "operator",
+            EventType: "prompt"
+        );
+        var promptResult = await controller.PostMessage(session.Id, promptReq);
+        promptResult.Should().BeOfType<CreatedAtActionResult>();
+        session.Status.Should().Be("thinking");
+
+        // Step 3: A lagging event from the aborted turn arrives (with creation timestamp from before the stop)
+        var laggingThought = new PostMessageRequest(
+            Content: "Lagging model thought from aborted turn",
+            SenderAgentId: "agy",
+            EventType: "thought",
+            CreatedAt: stopTime.AddMilliseconds(-100)
+        );
+        var lagResult = await controller.PostMessage(session.Id, laggingThought);
+        var lagOk = lagResult.Should().BeOfType<OkObjectResult>().Subject;
+        lagOk.Value!.ToString().Should().Contain("dropped_due_to_stop");
+
+        // DB should NOT have recorded the lagging thought
+        db.SessionMessages.Should().NotContain(m => m.Content == "Lagging model thought from aborted turn");
+    }
 }
+
 

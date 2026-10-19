@@ -191,4 +191,35 @@ export interface QueuedPromptItem {
   workingDirectory?: string | null;
 }
 
+export interface AskQuestionItem {
+  question: string;
+  options: string[];
+  is_multi_select?: boolean;
+}
+
+export interface QuestionAnswerPayload {
+  questionIndex: number;
+  question: string;
+  selectedOptions: string[];
+  customText?: string;
+}
+
+export interface SubmitAnswerRequest {
+  toolCallId?: string | null;
+  answers: QuestionAnswerPayload[];
+}
+
+export interface SessionArtifact {
+  id: string;
+  sessionId: string;
+  name: string;
+  summary?: string;
+  contentType: string;
+  sizeBytes: number;
+  createdAt: string;
+  updatedAt: string;
+  content?: string;
+}
+
+
 

@@ -278,7 +278,8 @@ public class AgentsController(
                     model = model,
                     effort = effort,
                     mode = mode,
-                    tier = tier
+                    tier = tier,
+                    createdAt = promptMsg.CreatedAt
                 });
             }
         }

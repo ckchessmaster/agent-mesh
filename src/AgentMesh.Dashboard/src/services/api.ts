@@ -5,7 +5,9 @@ import type {
   FilesystemBrowseResponse,
   QueuedPromptItem,
   SessionMessage,
+  SessionArtifact,
   StagedJob,
+  SubmitAnswerRequest,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from '../types';
@@ -311,6 +313,44 @@ export const api = {
     return res.json();
   },
 
+
+  async submitQuestionAnswer(
+    sessionId: string,
+    req: SubmitAnswerRequest
+  ): Promise<{ toolResult: SessionMessage; prompt: SessionMessage; session: AgentSession }> {
+    const res = await fetch(`/api/sessions/${sessionId}/answer`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to submit answer: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getSessionArtifacts(sessionId: string): Promise<SessionArtifact[]> {
+    const res = await fetch(`/api/sessions/${sessionId}/artifacts`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load artifacts: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getSessionArtifact(sessionId: string, artifactId: string): Promise<SessionArtifact> {
+    const res = await fetch(`/api/sessions/${sessionId}/artifacts/${encodeURIComponent(artifactId)}`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load artifact details: ${res.statusText}`);
+    return res.json();
+  },
+
+  async syncSessionArtifact(
+    sessionId: string,
+    req: { name: string; content: string; summary?: string; contentType?: string }
+  ): Promise<SessionArtifact> {
+    const res = await fetch(`/api/sessions/${sessionId}/artifacts`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to sync artifact: ${res.statusText}`);
+    return res.json();
+  },
 
   async resetMesh(): Promise<{ status: string; message: string }> {
     const res = await fetch('/api/dev/reset-mesh', {

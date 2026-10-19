@@ -92,7 +92,11 @@ vi.mock('../services/api', () => ({
     stopCommand: vi.fn().mockResolvedValue({ status: 'stopped', commandId: 'c1' }),
     enqueuePrompt: vi.fn().mockResolvedValue({ session: {}, queue: [], dispatched: false }),
     dequeuePrompt: vi.fn().mockResolvedValue([]),
-    sendQueuedPromptNow: vi.fn().mockResolvedValue({ session: {}, queue: [], dispatched: true })
+    sendQueuedPromptNow: vi.fn().mockResolvedValue({ session: {}, queue: [], dispatched: true }),
+    submitQuestionAnswer: vi.fn().mockResolvedValue({ toolResult: {}, prompt: {}, session: {} }),
+    getSessionArtifacts: vi.fn().mockResolvedValue([]),
+    getSessionArtifact: vi.fn().mockResolvedValue({ id: 'art-1', name: 'plan.md', content: '# Plan' }),
+    syncSessionArtifact: vi.fn()
   }
 }));
 
@@ -880,6 +884,300 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Kill Command/i }));
     expect(api.stopCommand).toHaveBeenCalledWith('session-cmd-1', 'msg-cmd-1');
+  });
+
+  it('renders interactive question card for ask_question tool call and allows submitting answers', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-qa',
+      name: 'Agy QA Agent',
+      status: 'online',
+      runtimeType: 1,
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-qa-1',
+      title: 'Database Setup Discussion',
+      status: 'waiting_for_input',
+      creatorAgentId: 'agy-qa',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const mockQuestionCall: SessionMessage = {
+      id: 'msg-question-1',
+      sessionId: 'session-qa-1',
+      senderAgentId: 'agy-qa',
+      eventType: 'tool_call',
+      toolName: 'ask_question',
+      content: 'Which database would you prefer for the service?',
+      toolArgsJson: JSON.stringify({
+        questions: [
+          {
+            question: 'Which database would you prefer?',
+            options: ['PostgreSQL', 'SQLite', 'In-Memory'],
+            is_multi_select: false
+          }
+        ]
+      }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([mockQuestionCall]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Database Setup Discussion').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Database Setup Discussion')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Agent Question — Human Input Required/i)).toBeInTheDocument();
+      expect(screen.getByText('Which database would you prefer?')).toBeInTheDocument();
+      expect(screen.getByText('PostgreSQL')).toBeInTheDocument();
+      expect(screen.getByText('SQLite')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Submit Answer/i })).toBeInTheDocument();
+    });
+
+    // Select PostgreSQL option
+    fireEvent.click(screen.getByText('PostgreSQL'));
+
+    // Submit Answer
+    fireEvent.click(screen.getByRole('button', { name: /Submit Answer/i }));
+
+    expect(api.submitQuestionAnswer).toHaveBeenCalledWith('session-qa-1', {
+      toolCallId: 'msg-question-1',
+      answers: [
+        {
+          questionIndex: 0,
+          question: 'Which database would you prefer?',
+          selectedOptions: ['PostgreSQL'],
+          customText: ''
+        }
+      ]
+    });
+  });
+
+  it('renders interactive question card for agent text response containing questions (e.g. Copilot)', async () => {
+    const mockAgent: Agent = {
+      id: 'copilot',
+      name: 'GitHub Copilot',
+      status: 'online',
+      runtimeType: 'CliCopilot',
+      trustTier: 2,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-copilot-dinner',
+      title: 'Dinner Planning',
+      status: 'waiting_for_input',
+      creatorAgentId: 'copilot',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const mockResponseWithQuestions: SessionMessage = {
+      id: 'msg-dinner-1',
+      sessionId: 'session-copilot-dinner',
+      senderAgentId: 'copilot',
+      eventType: 'response',
+      content: `I can help you decide! To narrow it down:
+1. Cuisine type (Italian, Mexican, Asian, etc.)?
+2. Dietary preferences or restrictions (vegetarian, vegan, gluten-free, etc.)?
+3. Cooking at home or dining out / takeout?
+4. Fast & easy vs. elaborate?
+Let me know what sounds good, or I can suggest a few quick ideas right now!
+(Note: I can't see your replies in this non-interactive session. Run me interactively in your terminal to continue the conversation.)`,
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([mockResponseWithQuestions]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Dinner Planning').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Dinner Planning')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText(/I can help you decide/i)).toBeInTheDocument();
+      expect(screen.getByText(/Agent Question — Human Input Required/i)).toBeInTheDocument();
+      expect(screen.getByText('Italian')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Submit Answer/i })).toBeInTheDocument();
+    });
+
+    // Select Italian
+    fireEvent.click(screen.getByText('Italian'));
+
+    // Submit Answer
+    fireEvent.click(screen.getByRole('button', { name: /Submit Answer/i }));
+
+    expect(api.submitQuestionAnswer).toHaveBeenCalledWith('session-copilot-dinner', {
+      toolCallId: 'msg-dinner-1',
+      answers: expect.arrayContaining([
+        expect.objectContaining({
+          questionIndex: 0,
+          selectedOptions: ['Italian']
+        })
+      ])
+    });
+  });
+
+  it('renders slash command autocomplete palette when typing / and executes /mesh commands', async () => {
+    const mockAgent: Agent = {
+      id: 'agy',
+      name: 'Antigravity Lead',
+      role: 'Codebase Engineer',
+      status: 'online',
+      runtimeType: 'agy',
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-slash-1',
+      title: 'Slash Command Test',
+      status: 'active',
+      creatorAgentId: 'agy',
+      metadataJson: JSON.stringify({ model: 'gemini-4-argon' }),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Slash Command Test').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Slash Command Test')[0]);
+
+    const input = screen.getByPlaceholderText(/type \/ for commands/i);
+
+    // Type "/" to trigger palette
+    fireEvent.change(input, { target: { value: '/' } });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('slash-command-palette')).toBeInTheDocument();
+      expect(screen.getByText('/mesh stop')).toBeInTheDocument();
+      expect(screen.getByText('/plan')).toBeInTheDocument();
+      expect(screen.getByText('/grill-me')).toBeInTheDocument();
+    });
+
+    // Execute /mesh mode plan
+    fireEvent.change(input, { target: { value: '/mesh mode plan' } });
+    fireEvent.submit(input.closest('form')!);
+
+    await waitFor(() => {
+      expect(api.updateSessionControls).toHaveBeenCalledWith('session-slash-1', { mode: 'plan' });
+    });
+
+    // Execute \mesh effort (no args) -> should intercept and display reasoning effort card without forwarding as prompt
+    fireEvent.change(input, { target: { value: '\\mesh effort' } });
+    fireEvent.submit(input.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Reasoning Effort Configuration/i)).toBeInTheDocument();
+      // Verify it was NOT posted as a prompt to the agent runner
+      expect(api.postSessionMessage).not.toHaveBeenCalledWith(
+        'session-slash-1',
+        '\\mesh effort',
+        expect.anything(),
+        expect.anything(),
+        'prompt'
+      );
+    });
+
+    // Execute /mesh effort high -> updates controls
+    fireEvent.change(input, { target: { value: '/mesh effort high' } });
+    fireEvent.submit(input.closest('form')!);
+
+    await waitFor(() => {
+      expect(api.updateSessionControls).toHaveBeenCalledWith('session-slash-1', { effort: 'high' });
+    });
+  });
+
+  it('toggles resizable artifacts split panel and renders markdown and mermaid diagram', async () => {
+    const mockAgent: Agent = {
+      id: 'agy',
+      name: 'Antigravity Lead',
+      role: 'Codebase Engineer',
+      status: 'online',
+      runtimeType: 'agy',
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-art-1',
+      title: 'Artifact Session',
+      status: 'active',
+      creatorAgentId: 'agy',
+      metadataJson: '{}',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const mockArtifact = {
+      id: 'art-1',
+      sessionId: 'session-art-1',
+      name: 'architecture_plan.md',
+      summary: 'Architecture specification with Mermaid flow',
+      contentType: 'text/markdown',
+      sizeBytes: 1024,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      content: '# Architecture Specification\n\n```mermaid\ngraph TD\nClient-->API\n```\n\n- Step 1: Initialize\n- Step 2: Connect'
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+    vi.mocked(api.getSessionArtifacts).mockResolvedValue([mockArtifact]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Artifact Session').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Artifact Session')[0]);
+
+    // Find and click Artifacts button in header
+    const artifactsButton = await screen.findByRole('button', { name: /Artifacts/i });
+    fireEvent.click(artifactsButton);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('artifact-viewer')).toBeInTheDocument();
+      expect(screen.getByText('architecture_plan.md')).toBeInTheDocument();
+      expect(screen.getByText('Architecture specification with Mermaid flow')).toBeInTheDocument();
+      expect(screen.getByText(/Mermaid Architecture Diagram/i)).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: /Architecture Specification/i })).toBeInTheDocument();
+    });
+
+    // Toggle Raw view
+    const rawButton = screen.getByRole('button', { name: /Raw/i });
+    fireEvent.click(rawButton);
+
+    await waitFor(() => {
+      expect(screen.getByText(/# Architecture Specification/i)).toBeInTheDocument();
+    });
   });
 });
 

@@ -220,4 +220,58 @@ public class AgentMeshCliTests
         ev.Effort.Should().Be("max");
         ev.Mode.Should().Be("auto");
     }
+
+    [Fact]
+    public void AgyAdapter_GetMaxTranscriptStep_CalculatesHighestStepIndex()
+    {
+        var tempFile = Path.Combine(Path.GetTempPath(), $"transcript-test-{Guid.NewGuid()}.jsonl");
+        try
+        {
+            File.WriteAllLines(tempFile, new[]
+            {
+                "{\"step_index\": 0, \"type\": \"USER_INPUT\"}",
+                "{\"step_index\": 5, \"type\": \"PLANNER_RESPONSE\"}",
+                "{\"step_index\": 12, \"type\": \"PLANNER_RESPONSE\"}"
+            });
+
+            var max = AgyAdapter.GetMaxTranscriptStep(tempFile);
+            max.Should().Be(12);
+        }
+        finally
+        {
+            if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public void AgyAdapter_CheckForAskQuestionToolCall_DetectsInteractiveQuestion()
+    {
+        var tempFile = Path.Combine(Path.GetTempPath(), $"transcript-test-{Guid.NewGuid()}.jsonl");
+        try
+        {
+            var line1 = "{\"step_index\": 0, \"type\": \"USER_INPUT\"}";
+            var line2 = """
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "ask_question", "args": {"questions": "[{\"question\":\"Which db?\",\"options\":[\"Postgres\",\"SQLite\"],\"is_multi_select\":false}]", "toolSummary": "Database choice"}}]}
+            """;
+            File.WriteAllLines(tempFile, new[] { line1, line2 });
+
+            var lastStep = 0;
+            var payload = AgyAdapter.CheckForAskQuestionToolCall(tempFile, ref lastStep);
+
+            payload.Should().NotBeNull();
+            payload!.EventType.Should().Be("tool_call");
+            payload.ToolName.Should().Be("ask_question");
+            payload.Content.Should().Be("Database choice");
+            payload.ToolArgsJson.Should().Contain("Which db?");
+            lastStep.Should().Be(1);
+
+            // Re-checking should not re-detect the same step
+            var secondCheck = AgyAdapter.CheckForAskQuestionToolCall(tempFile, ref lastStep);
+            secondCheck.Should().BeNull();
+        }
+        finally
+        {
+            if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
 }
