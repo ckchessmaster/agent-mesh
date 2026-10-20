@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import {
   GitBranch,
   CheckCircle2,
@@ -11,11 +11,109 @@ import {
   User,
   ChevronRight,
   Check,
-  Briefcase
+  Briefcase,
+  Paperclip,
+  FileText,
+  Image as ImageIcon,
+  X,
+  ZoomIn,
+  Download,
+  AlertCircle
 } from 'lucide-react';
-import type { JobMessage, JobTask, Persona, Project, ProjectJob } from '../types';
+import type { JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
 import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
+import { api } from '../services/api';
+
+const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+const DEFAULT_ATTACHMENT_PROMPT = 'Please review the attached file(s).';
+
+function formatAttachmentSize(bytes?: number): string {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isImageAttachment(contentType?: string, fileName?: string): boolean {
+  const ct = (contentType || '').toLowerCase();
+  const name = (fileName || '').toLowerCase();
+  return ct.startsWith('image/') || /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)$/.test(name);
+}
+
+export function extractJobMessageAttachments(msg: JobMessage): SessionAttachment[] {
+  if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+    return msg.attachments;
+  }
+  if (!msg.structuredPayloadJson) return [];
+  try {
+    const parsed = JSON.parse(msg.structuredPayloadJson);
+    const rawList = Array.isArray(parsed?.attachments)
+      ? parsed.attachments
+      : Array.isArray(parsed?.Attachments)
+      ? parsed.Attachments
+      : null;
+
+    if (Array.isArray(rawList)) {
+      return rawList.map((item: any) => {
+        const id = item.id || item.Id || '';
+        const fileName = item.fileName || item.FileName || item.name || item.Name || '';
+        const contentType = item.contentType || item.ContentType || '';
+        const sizeBytes = typeof item.sizeBytes === 'number'
+          ? item.sizeBytes
+          : typeof item.SizeBytes === 'number'
+          ? item.SizeBytes
+          : (typeof item.size === 'number' ? item.size : 0);
+        const s3Key = item.s3Key || item.S3Key || '';
+        const targetId = id || fileName;
+        const downloadUrl = item.downloadUrl || item.DownloadUrl || (targetId ? `/api/project-jobs/${encodeURIComponent(msg.jobId)}/attachments/${encodeURIComponent(targetId)}/content` : '');
+        const createdAt = item.createdAt || item.CreatedAt || msg.createdAt;
+
+        return {
+          id,
+          sessionId: msg.jobId,
+          fileName,
+          contentType,
+          sizeBytes,
+          s3Key,
+          downloadUrl,
+          createdAt
+        };
+      });
+    }
+  } catch {}
+  return [];
+}
+
+function extractClipboardFiles(e: React.ClipboardEvent): File[] {
+  const files: File[] = [];
+  if (e.clipboardData?.files && e.clipboardData.files.length > 0) {
+    return Array.from(e.clipboardData.files);
+  }
+  if (e.clipboardData?.items) {
+    for (let i = 0; i < e.clipboardData.items.length; i++) {
+      const item = e.clipboardData.items[i];
+      if (item.kind === 'file') {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+  }
+  return files;
+}
+
+export interface StagedJobAttachmentItem {
+  localId: string;
+  file: File;
+  name: string;
+  sizeBytes: number;
+  contentType: string;
+  previewUrl?: string;
+  uploading: boolean;
+  error?: string;
+  uploaded?: SessionAttachment;
+}
 
 export function getActiveMentionQuery(
   text: string,
@@ -46,12 +144,14 @@ interface JobCockpitProps {
   tasks: JobTask[];
   messages: JobMessage[];
   personas?: Persona[];
-  onSendMessage: (content: string) => Promise<void>;
+  onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
   onAddTask: (title: string) => Promise<void>;
   onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
   onDeleteTask: (taskId: string) => Promise<void>;
   onCompleteJob: (resultSummary?: string) => Promise<void>;
   onSelectTurnSession?: (sessionId: string) => void;
+  onOpenLightbox?: (item: { url: string; fileName: string; sizeBytes?: number }) => void;
+  onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
 }
 
 export const JobCockpit: React.FC<JobCockpitProps> = ({
@@ -65,7 +165,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onToggleTask,
   onDeleteTask,
   onCompleteJob,
-  onSelectTurnSession
+  onSelectTurnSession,
+  onOpenLightbox,
+  onUploadAttachments
 }) => {
   const [prompt, setPrompt] = useState('');
   const [newTaskTitle, setNewTaskTitle] = useState('');
@@ -74,6 +176,18 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [resultSummary, setResultSummary] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
+
+  // Attachment & Drag-Drop State
+  const [stagedAttachments, setStagedAttachments] = useState<StagedJobAttachmentItem[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [internalLightbox, setInternalLightbox] = useState<{
+    url: string;
+    fileName: string;
+    sizeBytes?: number;
+  } | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Team Member Autocomplete Palette State
   const [mentionState, setMentionState] = useState<{
@@ -138,6 +252,117 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [messages]);
+
+  const handleOpenLightbox = useCallback(
+    (item: { url: string; fileName: string; sizeBytes?: number }) => {
+      if (onOpenLightbox) {
+        onOpenLightbox(item);
+      } else {
+        setInternalLightbox(item);
+      }
+    },
+    [onOpenLightbox]
+  );
+
+  const stageFiles = useCallback(
+    async (rawFiles: FileList | File[]) => {
+      const incoming = Array.from(rawFiles || []);
+      if (incoming.length === 0) return;
+
+      setAttachmentError(null);
+
+      if (stagedAttachments.length + incoming.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+        setAttachmentError(`Maximum of ${MAX_ATTACHMENTS_PER_MESSAGE} files can be attached per message.`);
+        return;
+      }
+
+      for (const f of incoming) {
+        if (f.size > MAX_ATTACHMENT_SIZE_BYTES) {
+          setAttachmentError(`File "${f.name}" exceeds the 25 MB maximum file size limit.`);
+          return;
+        }
+      }
+
+      const newItems: StagedJobAttachmentItem[] = incoming.map((file, idx) => {
+        const safeName = file.name || `attachment-${Date.now()}-${idx}.bin`;
+        let previewUrl: string | undefined;
+        if (isImageAttachment(file.type, safeName) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+          try {
+            previewUrl = URL.createObjectURL(file);
+          } catch {}
+        }
+
+        return {
+          localId: `local-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
+          file,
+          name: safeName,
+          sizeBytes: file.size,
+          contentType: file.type || 'application/octet-stream',
+          previewUrl,
+          uploading: true
+        };
+      });
+
+      setStagedAttachments((prev) => [...prev, ...newItems]);
+
+      try {
+        let uploadedDtos: SessionAttachment[];
+        if (typeof onUploadAttachments === 'function') {
+          uploadedDtos = await onUploadAttachments(incoming);
+        } else {
+          uploadedDtos = await api.uploadJobAttachments(job.id, incoming);
+        }
+
+        setStagedAttachments((prev) =>
+          prev.map((item) => {
+            const matched = newItems.find((n) => n.localId === item.localId);
+            if (!matched) return item;
+
+            const idx = newItems.indexOf(matched);
+            const dto = uploadedDtos[idx] || uploadedDtos.find((d) => d.fileName === item.name);
+            return {
+              ...item,
+              uploading: false,
+              uploaded: dto
+            };
+          })
+        );
+      } catch (err: any) {
+        const errMsg = err?.message || 'Failed to upload attachments';
+        setAttachmentError(errMsg);
+        setStagedAttachments((prev) =>
+          prev.map((item) => {
+            const isOneOfThese = newItems.some((n) => n.localId === item.localId);
+            return isOneOfThese ? { ...item, uploading: false, error: errMsg } : item;
+          })
+        );
+      }
+    },
+    [stagedAttachments.length, onUploadAttachments, job.id]
+  );
+
+  const removeStagedAttachment = (localId: string) => {
+    setStagedAttachments((prev) => {
+      const match = prev.find((a) => a.localId === localId);
+      if (match?.previewUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        try {
+          URL.revokeObjectURL(match.previewUrl);
+        } catch {}
+      }
+      return prev.filter((a) => a.localId !== localId);
+    });
+  };
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      const files = extractClipboardFiles(e);
+      if (files.length > 0) {
+        e.preventDefault();
+        void stageFiles(files);
+      }
+    },
+    [stageFiles]
+  );
 
   const checkMentionTrigger = (text: string, cursorPos: number) => {
     const mentionInfo = getActiveMentionQuery(text, cursorPos);
@@ -234,18 +459,48 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     // Normal Enter without Shift to send message
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      void handleSend();
     }
   };
 
+  const readyStagedAttachments = useMemo(
+    () => stagedAttachments.filter((a) => !a.uploading && !a.error),
+    [stagedAttachments]
+  );
+
+  const hasPendingUploads = stagedAttachments.some((a) => a.uploading);
+  const isCompleted = job.status === ProjectJobStatus.Completed;
+  const canSend = Boolean(prompt.trim() || readyStagedAttachments.length > 0) && !hasPendingUploads && !isSending && !isCompleted;
+
   const handleSend = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!prompt.trim() || isSending) return;
+    if (!canSend) return;
+
     const text = prompt.trim();
+    const attachmentsToSend: SessionAttachment[] = readyStagedAttachments.map(
+      (item) =>
+        item.uploaded || {
+          id: item.localId,
+          sessionId: job.id,
+          fileName: item.name,
+          contentType: item.contentType,
+          sizeBytes: item.sizeBytes,
+          s3Key: `jobs/${job.id}/attachments/${item.localId}/${item.name}`,
+          downloadUrl: item.previewUrl || `/api/project-jobs/${encodeURIComponent(job.id)}/attachments/${encodeURIComponent(item.localId)}/content`,
+          createdAt: new Date().toISOString()
+        }
+    );
+    const effectiveText = text || (attachmentsToSend.length > 0 ? DEFAULT_ATTACHMENT_PROMPT : '');
+
     setPrompt('');
+    setStagedAttachments([]);
+    setAttachmentError(null);
     setIsSending(true);
+
     try {
-      await onSendMessage(text);
+      await onSendMessage(effectiveText, attachmentsToSend.length > 0 ? attachmentsToSend : undefined);
+    } catch (err: any) {
+      setAttachmentError(err?.message || 'Failed to send message');
     } finally {
       setIsSending(false);
     }
@@ -290,10 +545,38 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   );
   const completedCount = uniqueTasks.filter((t) => t.isCompleted).length;
   const progressPercent = uniqueTasks.length > 0 ? Math.round((completedCount / uniqueTasks.length) * 100) : 0;
-  const isCompleted = job.status === ProjectJobStatus.Completed;
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-slate-950 overflow-hidden">
+    <div
+      className="flex-1 flex flex-col h-full bg-slate-950 overflow-hidden relative"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setIsDragging(true);
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault();
+        setIsDragging(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setIsDragging(false);
+        if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+          void stageFiles(e.dataTransfer.files);
+        }
+      }}
+    >
+      {/* Drag & Drop Overlay */}
+      {isDragging && (
+        <div
+          className="absolute inset-3 z-40 rounded-2xl bg-sky-950/90 border-2 border-dashed border-sky-400 flex flex-col items-center justify-center text-sky-200 pointer-events-none"
+          data-testid="job-dropzone-overlay"
+        >
+          <Paperclip className="w-10 h-10 mb-2 text-sky-400 animate-bounce" />
+          <span className="text-sm font-semibold">Drop images or files to attach to this job</span>
+          <span className="text-xs text-sky-300/80 mt-1">Up to 10 files (max 25 MB each)</span>
+        </div>
+      )}
+
       {/* Header Bar */}
       <div className="px-6 py-4 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-sm flex items-center justify-between gap-4 shrink-0">
         <div className="flex items-center gap-3 min-w-0">
@@ -464,12 +747,14 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             <Bot className="w-12 h-12 stroke-[1.2] text-slate-600 mb-3" />
             <h3 className="text-sm font-semibold text-slate-300">Job Collaboration Channel Ready</h3>
             <p className="text-xs text-slate-500 max-w-sm mt-1">
-              Give instructions or assign tasks to your team. Use <code className="text-sky-400 font-mono">@persona</code> to tag specific personas.
+              Give instructions, attach files, or assign tasks to your team. Use <code className="text-sky-400 font-mono">@persona</code> to tag specific personas.
             </p>
           </div>
         ) : (
           messages.map((msg) => {
             const isUser = msg.senderType === 'user';
+            const msgAttachments = extractJobMessageAttachments(msg);
+
             return (
               <div
                 key={msg.id}
@@ -510,6 +795,68 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     {msg.content}
                   </div>
 
+                  {/* Message Attachments Rendering */}
+                  {msgAttachments.length > 0 && (
+                    <div
+                      className={`flex flex-wrap gap-2 pt-1 ${isUser ? 'justify-end' : 'justify-start'}`}
+                      data-testid={`job-message-attachments-${msg.id}`}
+                    >
+                      {msgAttachments.map((att) => {
+                        const isImg = isImageAttachment(att.contentType, att.fileName);
+                        const targetId = att.id || att.fileName;
+                        const streamUrl = att.downloadUrl || (targetId ? `/api/project-jobs/${encodeURIComponent(msg.jobId)}/attachments/${encodeURIComponent(targetId)}/content` : '');
+
+                        if (isImg && streamUrl) {
+                          return (
+                            <button
+                              key={att.id || att.fileName}
+                              type="button"
+                              onClick={() =>
+                                handleOpenLightbox({
+                                  url: streamUrl,
+                                  fileName: att.fileName || 'attachment.png',
+                                  sizeBytes: att.sizeBytes
+                                })
+                              }
+                              aria-label={`Zoom image ${att.fileName || 'image'}`}
+                              className="group relative rounded-xl overflow-hidden border border-sky-500/40 bg-slate-950/80 hover:border-sky-300 transition cursor-pointer"
+                            >
+                              <img
+                                src={streamUrl}
+                                alt={att.fileName || 'attachment image'}
+                                className="max-h-36 max-w-[200px] object-cover block"
+                              />
+                              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-1 text-xs font-semibold text-white">
+                                <ZoomIn className="w-4 h-4 text-sky-300" />
+                                <span>Zoom</span>
+                              </div>
+                            </button>
+                          );
+                        }
+
+                        return (
+                          <a
+                            key={att.id || att.fileName}
+                            href={streamUrl ? `${streamUrl}${streamUrl.includes('?') ? '&' : '?'}download=true` : '#'}
+                            download={att.fileName || 'attachment'}
+                            className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-slate-950/80 hover:bg-slate-900 border border-sky-500/30 hover:border-sky-400 text-xs text-slate-200 transition"
+                          >
+                            <FileText className="w-4 h-4 text-sky-400 shrink-0" />
+                            <div className="min-w-0 text-left">
+                              <div className="font-mono text-xs text-white truncate max-w-[160px]">
+                                {att.fileName || 'Attachment'}
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                {formatAttachmentSize(att.sizeBytes)}
+                              </div>
+                            </div>
+                            <Download className="w-3.5 h-3.5 text-sky-400 shrink-0 ml-1" />
+                          </a>
+                        );
+                      })}
+                    </div>
+                  )}
+
                   {/* Two-Tier Turn Execution Button */}
                   {msg.turnSessionId && (
                     <div className={isUser ? 'text-right' : 'text-left'}>
@@ -534,6 +881,72 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
       {/* Prompt Composer & Mention Bar */}
       <div className="p-4 border-t border-slate-800/80 bg-slate-900/80 backdrop-blur-sm shrink-0">
+        {/* Attachment Error Banner */}
+        {attachmentError && (
+          <div className="mb-2.5 px-3 py-2 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>{attachmentError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAttachmentError(null)}
+              className="text-rose-400 hover:text-rose-200 text-xs font-semibold cursor-pointer"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {/* Staged Attachments Preview Bar */}
+        {stagedAttachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2.5" data-testid="job-staged-attachments">
+            {stagedAttachments.map((att) => {
+              const isImg = isImageAttachment(att.contentType, att.name);
+              return (
+                <div
+                  key={att.localId}
+                  className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-950 border text-xs text-slate-200 max-w-xs ${
+                    att.error ? 'border-rose-500/50 bg-rose-950/20' : 'border-slate-800'
+                  }`}
+                >
+                  {isImg && att.previewUrl ? (
+                    <img
+                      src={att.previewUrl}
+                      alt={att.name}
+                      className="w-7 h-7 object-cover rounded shrink-0 border border-slate-700"
+                    />
+                  ) : isImg ? (
+                    <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                  ) : (
+                    <FileText className="w-4 h-4 text-slate-400 shrink-0" />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-mono text-[11px] text-white max-w-[130px]">{att.name}</div>
+                    <div className="text-[10px] text-slate-400">
+                      {att.uploading ? (
+                        <span className="text-sky-400 animate-pulse">Uploading...</span>
+                      ) : att.error ? (
+                        <span className="text-rose-400">{att.error}</span>
+                      ) : (
+                        formatAttachmentSize(att.sizeBytes)
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => removeStagedAttachment(att.localId)}
+                    aria-label={`Remove attachment ${att.name}`}
+                    className="p-0.5 rounded hover:bg-slate-800 text-slate-400 hover:text-rose-400 transition cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {/* Quick Mention Chips */}
         {project.assignedPersonas && project.assignedPersonas.length > 0 && (
           <div className="flex items-center gap-1.5 mb-2.5 overflow-x-auto pb-1 text-xs">
@@ -552,6 +965,34 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         )}
 
         <form onSubmit={handleSend} className="relative flex items-center gap-2">
+          {/* Hidden File Input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            data-testid="job-file-input"
+            onChange={(e) => {
+              if (e.target.files && e.target.files.length > 0) {
+                void stageFiles(e.target.files);
+                e.target.value = '';
+              }
+            }}
+          />
+
+          {/* Paperclip Attach Button */}
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            title="Attach files (Images, PDFs, Code, Logs, ZIP — max 25 MB)"
+            aria-label="Attach files"
+            data-testid="job-attach-btn"
+            disabled={isCompleted || isSending}
+            className="p-3 bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-sky-300 disabled:opacity-40 rounded-xl transition cursor-pointer shrink-0 shadow-md flex items-center justify-center self-stretch"
+          >
+            <Paperclip className="w-4 h-4" />
+          </button>
+
           <div className="relative flex-1">
             <TeamMentionPalette
               members={teamMembers}
@@ -570,6 +1011,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               onKeyUp={handleCursorActivity}
               onClick={handleCursorActivity}
               onKeyDown={handlePromptKeyDown}
+              onPaste={handlePaste}
               placeholder="Type your message, tasks, or delegate with @persona (Press Enter to send)..."
               disabled={isCompleted || isSending}
               className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition resize-none disabled:opacity-50"
@@ -577,7 +1019,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           </div>
           <button
             type="submit"
-            disabled={!prompt.trim() || isSending || isCompleted}
+            disabled={!canSend}
             className="p-3 bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 rounded-xl transition cursor-pointer shrink-0 shadow-md flex items-center justify-center self-stretch"
             title="Send Message"
           >
@@ -585,6 +1027,63 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           </button>
         </form>
       </div>
+
+      {/* Internal Fullscreen Image Lightbox Modal fallback */}
+      {internalLightbox && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Image preview: ${internalLightbox.fileName}`}
+          data-testid="job-attachment-lightbox"
+          onClick={() => setInternalLightbox(null)}
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-6"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="max-w-5xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+          >
+            <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
+              <div className="flex items-center gap-2 min-w-0">
+                <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                <span className="font-mono text-xs font-semibold text-white truncate">
+                  {internalLightbox.fileName}
+                </span>
+                {internalLightbox.sizeBytes ? (
+                  <span className="text-[11px] font-mono text-slate-400">
+                    ({formatAttachmentSize(internalLightbox.sizeBytes)})
+                  </span>
+                ) : null}
+              </div>
+              <div className="flex items-center gap-2">
+                <a
+                  href={`${internalLightbox.url}${internalLightbox.url.includes('?') ? '&' : '?'}download=true`}
+                  download={internalLightbox.fileName}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition"
+                >
+                  <Download className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Download</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setInternalLightbox(null)}
+                  aria-label="Close image preview"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 p-6 bg-slate-950 flex items-center justify-center overflow-auto">
+              <img
+                src={internalLightbox.url}
+                alt={internalLightbox.fileName}
+                className="max-h-[75vh] max-w-full object-contain rounded-lg shadow-xl"
+                data-testid="job-lightbox-image"
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

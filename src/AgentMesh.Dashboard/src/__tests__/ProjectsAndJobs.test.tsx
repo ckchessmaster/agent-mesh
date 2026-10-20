@@ -32,6 +32,7 @@ vi.mock('../services/api', () => ({
     deleteJobTask: vi.fn(),
     getJobMessages: vi.fn(),
     postJobMessage: vi.fn(),
+    uploadJobAttachments: vi.fn(),
     completeJob: vi.fn()
   }
 }));
@@ -522,6 +523,75 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Deploy to staging')).toHaveLength(1);
+    });
+  });
+
+  it('allows attaching files in job cockpit, stages them, sends attachments to postJobMessage, and renders attachments in job messages', async () => {
+    const uploadedAtt = {
+      id: 'att-job-99',
+      sessionId: 'job-101',
+      fileName: 'spec.pdf',
+      contentType: 'application/pdf',
+      sizeBytes: 4096,
+      s3Key: 'jobs/job-101/attachments/att-job-99/spec.pdf',
+      downloadUrl: '/api/project-jobs/job-101/attachments/att-job-99/content',
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.uploadJobAttachments).mockResolvedValue([uploadedAtt]);
+
+    const createdJobMsg: JobMessage = {
+      id: 'msg-job-created-1',
+      jobId: 'job-101',
+      senderType: 'user',
+      content: 'Please review the attached file(s).',
+      mentions: [],
+      structuredPayloadJson: JSON.stringify({
+        attachments: [uploadedAtt]
+      }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.postJobMessage).mockResolvedValue(createdJobMsg);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('job-attach-btn')).toBeInTheDocument();
+    });
+
+    const fileInput = screen.getByTestId('job-file-input');
+    const pdfFile = new File(['pdf-data'], 'spec.pdf', { type: 'application/pdf' });
+    fireEvent.change(fileInput, { target: { files: [pdfFile] } });
+
+    await waitFor(() => {
+      expect(api.uploadJobAttachments).toHaveBeenCalledWith('job-101', [pdfFile]);
+      expect(screen.getByTestId('job-staged-attachments')).toBeInTheDocument();
+      expect(screen.getByText('spec.pdf')).toBeInTheDocument();
+    });
+
+    const sendBtn = screen.getByRole('button', { name: /Send Message/i });
+    expect(sendBtn).not.toBeDisabled();
+
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
+        content: 'Please review the attached file(s).',
+        senderType: 'user',
+        attachments: [uploadedAtt]
+      });
+    });
+
+    // The message with attachment is rendered in the message feed
+    await waitFor(() => {
+      expect(screen.getByTestId('job-message-attachments-msg-job-created-1')).toBeInTheDocument();
+      expect(screen.getByText('spec.pdf')).toBeInTheDocument();
     });
   });
 });

@@ -297,6 +297,7 @@ export interface JobMessage {
   mentions: string[];
   turnSessionId?: string | null;
   structuredPayloadJson?: string | null;
+  attachments?: SessionAttachment[] | null;
   createdAt: string;
 }
 

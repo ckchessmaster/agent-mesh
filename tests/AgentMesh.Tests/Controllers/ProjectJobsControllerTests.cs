@@ -1,10 +1,13 @@
 using AgentMesh.Api.Controllers;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Moq;
 using Xunit;
 
 namespace AgentMesh.Tests.Controllers;
@@ -172,5 +175,172 @@ public class ProjectJobsControllerTests
         var inDb = await db.ProjectJobs.FindAsync(job.Id);
         inDb!.Status.Should().Be(ProjectJobStatus.Completed);
         inDb.ResultSummary.Should().Be("Everything is done and tests pass.");
+    }
+
+    [Fact]
+    public async Task UploadJobAttachments_SavesFileAndReturnsDto()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "test-proj", Name = "Test Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "test-proj",
+            Title = "Attachment Job"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var mockStorage = new Mock<IStorageService>();
+        mockStorage
+            .Setup(s => s.UploadStreamAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string key, Stream _, string _, CancellationToken _) => $"s3://agent-mesh-artifacts/{key}");
+
+        var controller = new ProjectJobsController(db, storageService: mockStorage.Object);
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext()
+        };
+
+        var pngBytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        var pngStream = new MemoryStream(pngBytes);
+        var formFile = new FormFile(pngStream, 0, pngBytes.Length, "files", "spec-diagram.png")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "image/png"
+        };
+        var formFiles = new FormFileCollection { formFile };
+
+        var uploadResult = await controller.UploadJobAttachments(job.Id, formFiles);
+        var ok = uploadResult.Should().BeOfType<OkObjectResult>().Subject;
+        var list = ok.Value.Should().BeAssignableTo<List<JobAttachmentDto>>().Subject;
+
+        list.Should().HaveCount(1);
+        var att = list[0];
+        att.JobId.Should().Be(job.Id);
+        att.FileName.Should().Be("spec-diagram.png");
+        att.ContentType.Should().Be("image/png");
+        att.SizeBytes.Should().Be(pngBytes.Length);
+        att.DownloadUrl.Should().Be($"/api/project-jobs/{job.Id}/attachments/{att.Id}/content");
+
+        // Verify storage upload was attempted
+        mockStorage.Verify(
+            s => s.UploadStreamAsync(
+                It.Is<string>(k => k.EndsWith("spec-diagram.png")),
+                It.IsAny<Stream>(),
+                "image/png",
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Verify GetAttachmentContent can stream it back
+        var contentResult = await controller.GetAttachmentContent(job.Id, att.Id, download: false);
+        var fileStreamResult = contentResult.Should().BeOfType<FileStreamResult>().Subject;
+        fileStreamResult.ContentType.Should().Be("image/png");
+    }
+
+    [Fact]
+    public async Task UploadJobAttachments_DisallowedExtension_ReturnsBadRequest()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "test-proj", Name = "Test Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "test-proj",
+            Title = "Attachment Job"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext()
+        };
+
+        var exeBytes = new byte[] { 0x4D, 0x5A };
+        var exeStream = new MemoryStream(exeBytes);
+        var formFile = new FormFile(exeStream, 0, exeBytes.Length, "files", "malicious.exe")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "application/x-msdownload"
+        };
+        var formFiles = new FormFileCollection { formFile };
+
+        var uploadResult = await controller.UploadJobAttachments(job.Id, formFiles);
+        uploadResult.Should().BeOfType<BadRequestObjectResult>();
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WithAttachments_AttachesPayloadAndPropagatesToTurnSession()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var driver = new Agent { Id = "agy", Name = "Antigravity", RuntimeType = RuntimeType.CliAgy, TrustTier = TrustTier.SeniorManager };
+        var persona = new Persona { Id = "astra", Name = "Astra", Role = "Tech Lead", DriverId = "agy", PersonaPrompt = "You are Astra." };
+        var project = new Project
+        {
+            Id = "proj-mesh",
+            Name = "Mesh Project",
+            WorkspaceType = WorkspaceType.Git,
+            ProjectInstructions = "Guidelines"
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-mesh",
+            Title = "Attachment Turn Test",
+            GitBranchName = "mesh/job-attach"
+        };
+        db.Agents.Add(driver);
+        db.Personas.Add(persona);
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = "proj-mesh", PersonaId = "astra" });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        var attachment = new JobAttachmentDto(
+            Id: "att-12345",
+            JobId: job.Id,
+            FileName: "architecture.pdf",
+            ContentType: "application/pdf",
+            SizeBytes: 1024,
+            S3Key: $"jobs/{job.Id}/attachments/att-12345/architecture.pdf",
+            DownloadUrl: $"/api/project-jobs/{job.Id}/attachments/att-12345/content",
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        var msgReq = new PostJobMessageRequest(
+            Content: "@astra please inspect the design document",
+            Attachments: new List<JobAttachmentDto> { attachment }
+        );
+
+        var result = await controller.PostJobMessage(job.Id, msgReq);
+        var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+        var msgDto = ok.Value.Should().BeOfType<JobMessageDto>().Subject;
+
+        msgDto.Content.Should().Be("@astra please inspect the design document");
+        msgDto.Mentions.Should().Contain("astra");
+        msgDto.TurnSessionId.Should().NotBeNull();
+        msgDto.Attachments.Should().NotBeNull();
+        msgDto.Attachments.Should().HaveCount(1);
+        msgDto.Attachments![0].FileName.Should().Be("architecture.pdf");
+        msgDto.StructuredPayloadJson.Should().Contain("architecture.pdf");
+
+        // Verify turn session metadata contains attachments
+        var turnSession = await db.AgentSessions.FindAsync(msgDto.TurnSessionId);
+        turnSession.Should().NotBeNull();
+        turnSession!.MetadataJson.Should().Contain("architecture.pdf");
+
+        // Verify session message prompt also has structured payload with attachments
+        var promptMsg = await db.SessionMessages.FirstOrDefaultAsync(m => m.SessionId == turnSession.Id && m.EventType == "prompt");
+        promptMsg.Should().NotBeNull();
+        promptMsg!.StructuredPayloadJson.Should().Contain("architecture.pdf");
     }
 }

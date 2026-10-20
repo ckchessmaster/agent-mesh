@@ -2084,6 +2084,41 @@ public class SessionsController(
             }
         }
 
+        if (attachment == null && !string.IsNullOrWhiteSpace(session.MetadataJson))
+        {
+            try
+            {
+                using var metaDoc = JsonDocument.Parse(session.MetadataJson);
+                if (metaDoc.RootElement.TryGetProperty("jobId", out var jProp) &&
+                    Guid.TryParse(jProp.GetString(), out var jobId))
+                {
+                    var jobAttachDir = ProjectJobsController.GetAttachmentDirectory(jobId);
+                    if (Directory.Exists(jobAttachDir))
+                    {
+                        var matchingJobFile = Directory.GetFiles(jobAttachDir, $"{attachmentId}_*").FirstOrDefault()
+                            ?? Directory.GetFiles(jobAttachDir, $"*{attachmentId}*").FirstOrDefault();
+                        if (matchingJobFile != null)
+                        {
+                            var fn = Path.GetFileName(matchingJobFile);
+                            var underscoreIdx = fn.IndexOf('_');
+                            var safeFn = underscoreIdx >= 0 ? fn[(underscoreIdx + 1)..] : fn;
+                            attachment = new SessionAttachmentDto(
+                                Id: attachmentId,
+                                SessionId: id,
+                                FileName: safeFn,
+                                ContentType: GuessContentTypeFromExtension(safeFn),
+                                SizeBytes: new FileInfo(matchingJobFile).Length,
+                                S3Key: $"jobs/{jobId}/attachments/{attachmentId}/{safeFn}",
+                                DownloadUrl: $"/api/sessions/{id}/attachments/{attachmentId}/content",
+                                CreatedAt: DateTimeOffset.UtcNow
+                            );
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
         if (attachment == null)
         {
             return NotFound(new { error = $"Attachment '{attachmentId}' not found in session '{id}'." });

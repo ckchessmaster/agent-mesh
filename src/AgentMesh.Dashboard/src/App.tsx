@@ -617,9 +617,13 @@ export default function App() {
     }
   };
 
-  const handleSendJobMessage = async (content: string) => {
+  const handleSendJobMessage = async (content: string, attachments?: SessionAttachment[]) => {
     if (!selectedJobId) return;
-    const msg = await api.postJobMessage(selectedJobId, { content, senderType: 'user' });
+    const msg = await api.postJobMessage(selectedJobId, {
+      content,
+      senderType: 'user',
+      attachments
+    });
     setJobMessages((prev) => {
       if (prev.some((m) => m.id === msg.id)) return prev;
       return [...prev, msg];
@@ -2791,6 +2795,7 @@ export default function App() {
                     onToggleTask={handleToggleTask}
                     onDeleteTask={handleDeleteTask}
                     onCompleteJob={handleCompleteJob}
+                    onOpenLightbox={setLightboxAttachment}
                     onSelectTurnSession={(sessionId) => {
                       setSelectedSessionId(sessionId);
                       setActiveTab('personas');

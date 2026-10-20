@@ -1,8 +1,7 @@
-import React from 'react';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { JobCockpit, getActiveMentionQuery } from '../JobCockpit';
-import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage } from '../../types';
+import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment } from '../../types';
 
 describe('getActiveMentionQuery helper', () => {
   it('detects mention query at beginning of string', () => {
@@ -158,5 +157,259 @@ describe('JobCockpit - Team Member Mention Autocomplete', () => {
 
     expect(screen.queryByTestId('team-mention-palette')).not.toBeInTheDocument();
     expect((textarea as HTMLTextAreaElement).value).toBe('@ast');
+  });
+});
+
+describe('JobCockpit - Attachment Support', () => {
+  const mockProject: Project = {
+    id: 'agent-mesh',
+    name: 'Agent Mesh',
+    description: '',
+    workspaceType: 0,
+    gitBaseBranch: 'main',
+    projectInstructions: '',
+    defaultLeadPersonaId: 'agy-astra',
+    defaultLeadPersonaName: 'Astra',
+    assignedPersonas: [
+      { id: 'agy-astra', name: 'Astra', role: 'Tech Lead', driverId: 'agy' }
+    ],
+    jobCount: 1,
+    activeJobCount: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const mockJob: ProjectJob = {
+    id: 'job-attach-1',
+    projectId: 'agent-mesh',
+    projectName: 'Agent Mesh',
+    title: 'Attachment Interface Test',
+    description: '',
+    status: ProjectJobStatus.Active,
+    gitBranchName: 'mesh/job-attach-1',
+    tasks: [],
+    messageCount: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const mockProps = {
+    project: mockProject,
+    job: mockJob,
+    tasks: [] as JobTask[],
+    messages: [] as JobMessage[],
+    onSendMessage: vi.fn(),
+    onAddTask: vi.fn(),
+    onToggleTask: vi.fn(),
+    onDeleteTask: vi.fn(),
+    onCompleteJob: vi.fn()
+  };
+
+  it('renders paperclip attach button and hidden file input', () => {
+    render(<JobCockpit {...mockProps} />);
+
+    expect(screen.getByTestId('job-attach-btn')).toBeInTheDocument();
+    expect(screen.getByTestId('job-file-input')).toBeInTheDocument();
+  });
+
+  it('stages attachments via file input, enables sending without prompt text, and dispatches attachments', async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const mockUploaded: SessionAttachment[] = [
+      {
+        id: 'att-mock-1',
+        sessionId: 'job-attach-1',
+        fileName: 'architecture.png',
+        contentType: 'image/png',
+        sizeBytes: 1024,
+        s3Key: 'jobs/job-attach-1/attachments/att-mock-1/architecture.png',
+        downloadUrl: '/api/project-jobs/job-attach-1/attachments/att-mock-1/content',
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const onUpload = vi.fn().mockResolvedValue(mockUploaded);
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        onSendMessage={onSend}
+        onUploadAttachments={onUpload}
+      />
+    );
+
+    const fileInput = screen.getByTestId('job-file-input');
+    const sendBtn = screen.getByRole('button', { name: /Send Message/i });
+
+    // Send button disabled initially because text is empty
+    expect(sendBtn).toBeDisabled();
+
+    // Select file
+    const file = new File(['png-data'], 'architecture.png', { type: 'image/png' });
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    await waitFor(() => {
+      expect(onUpload).toHaveBeenCalledWith([file]);
+      expect(screen.getByTestId('job-staged-attachments')).toBeInTheDocument();
+      expect(screen.getByText('architecture.png')).toBeInTheDocument();
+    });
+
+    // Send button is enabled even though prompt text is blank
+    await waitFor(() => {
+      expect(sendBtn).not.toBeDisabled();
+    });
+
+    // Send the message
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        'Please review the attached file(s).',
+        mockUploaded
+      );
+    });
+
+    // Staged attachments cleared after sending
+    await waitFor(() => {
+      expect(screen.queryByTestId('job-staged-attachments')).not.toBeInTheDocument();
+    });
+  });
+
+  it('renders image thumbnails with zoom lightbox and file pills in message bubbles', async () => {
+    const mockMessages: JobMessage[] = [
+      {
+        id: 'msg-with-attach',
+        jobId: 'job-attach-1',
+        senderType: 'user',
+        content: 'Check this diagram',
+        mentions: [],
+        structuredPayloadJson: JSON.stringify({
+          attachments: [
+            {
+              id: 'att-img',
+              sessionId: 'job-attach-1',
+              fileName: 'flowchart.png',
+              contentType: 'image/png',
+              sizeBytes: 2048,
+              downloadUrl: '/api/project-jobs/job-attach-1/attachments/att-img/content',
+              createdAt: new Date().toISOString()
+            },
+            {
+              id: 'att-doc',
+              sessionId: 'job-attach-1',
+              fileName: 'notes.txt',
+              contentType: 'text/plain',
+              sizeBytes: 512,
+              downloadUrl: '/api/project-jobs/job-attach-1/attachments/att-doc/content',
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }),
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    const onLightbox = vi.fn();
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={mockMessages}
+        onOpenLightbox={onLightbox}
+      />
+    );
+
+    // Both attachments rendered
+    const attachmentsContainer = screen.getByTestId('job-message-attachments-msg-with-attach');
+    expect(attachmentsContainer).toBeInTheDocument();
+
+    // Image zoom button rendered
+    const zoomBtn = screen.getByRole('button', { name: /Zoom image flowchart.png/i });
+    expect(zoomBtn).toBeInTheDocument();
+
+    // File download link rendered
+    const fileLink = screen.getByText('notes.txt');
+    expect(fileLink).toBeInTheDocument();
+
+    // Click zoom opens lightbox
+    fireEvent.click(zoomBtn);
+    expect(onLightbox).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fileName: 'flowchart.png',
+        url: '/api/project-jobs/job-attach-1/attachments/att-img/content'
+      })
+    );
+  });
+
+  it('handles clipboard paste of files into the textarea', async () => {
+    const onUpload = vi.fn().mockResolvedValue([
+      {
+        id: 'att-pasted-1',
+        sessionId: 'job-attach-1',
+        fileName: 'screenshot.png',
+        contentType: 'image/png',
+        sizeBytes: 4096,
+        s3Key: '',
+        downloadUrl: '/api/project-jobs/job-attach-1/attachments/att-pasted-1/content',
+        createdAt: new Date().toISOString()
+      }
+    ]);
+
+    render(<JobCockpit {...mockProps} onUploadAttachments={onUpload} />);
+
+    const textarea = screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i);
+
+    const pastedFile = new File(['clip-data'], 'screenshot.png', { type: 'image/png' });
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        files: [pastedFile],
+        items: []
+      }
+    });
+
+    await waitFor(() => {
+      expect(onUpload).toHaveBeenCalledWith([pastedFile]);
+      expect(screen.getByTestId('job-staged-attachments')).toBeInTheDocument();
+      expect(screen.getByText('screenshot.png')).toBeInTheDocument();
+    });
+  });
+
+  it('shows dropzone overlay on dragOver and stages dropped files', async () => {
+    const onUpload = vi.fn().mockResolvedValue([
+      {
+        id: 'att-dropped-1',
+        sessionId: 'job-attach-1',
+        fileName: 'data.csv',
+        contentType: 'text/csv',
+        sizeBytes: 100,
+        s3Key: '',
+        downloadUrl: '/api/project-jobs/job-attach-1/attachments/att-dropped-1/content',
+        createdAt: new Date().toISOString()
+      }
+    ]);
+
+    render(<JobCockpit {...mockProps} onUploadAttachments={onUpload} />);
+
+    const container = screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i).closest('.flex-1.flex.flex-col')!;
+
+    // Drag over shows overlay
+    fireEvent.dragOver(container);
+    expect(screen.getByTestId('job-dropzone-overlay')).toBeInTheDocument();
+
+    // Drop stages file
+    const droppedFile = new File(['csv-data'], 'data.csv', { type: 'text/csv' });
+    fireEvent.drop(container, {
+      dataTransfer: {
+        files: [droppedFile]
+      }
+    });
+
+    // Overlay removed
+    expect(screen.queryByTestId('job-dropzone-overlay')).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(onUpload).toHaveBeenCalledWith([droppedFile]);
+      expect(screen.getByTestId('job-staged-attachments')).toBeInTheDocument();
+      expect(screen.getByText('data.csv')).toBeInTheDocument();
+    });
   });
 });
