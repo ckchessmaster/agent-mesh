@@ -87,8 +87,8 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) {
-      setError('Project Name is required.');
+    if (!name.trim() || isSaving) {
+      if (!name.trim()) setError('Project Name is required.');
       return;
     }
     setIsSaving(true);

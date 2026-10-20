@@ -52,9 +52,14 @@ vi.mock('../auth/AuthProvider', () => ({
   }))
 }));
 
+const signalRHandlers: Record<string, Function> = {};
 const mockSignalRConnection = {
-  on: vi.fn(),
-  off: vi.fn(),
+  on: vi.fn((event: string, cb: Function) => {
+    signalRHandlers[event] = cb;
+  }),
+  off: vi.fn((event: string) => {
+    delete signalRHandlers[event];
+  }),
   invoke: vi.fn().mockResolvedValue(undefined)
 };
 
@@ -342,6 +347,121 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       expect(api.completeJob).toHaveBeenCalledWith('job-101', {
         resultSummary: 'OAuth verified across all providers'
       });
+    });
+  });
+
+  it('does not create duplicate project rows when creating a project even if SignalR arrives concurrently', async () => {
+    const newProject: Project = {
+      id: 'mesh-billing',
+      name: 'Mesh Billing Subsystem',
+      description: 'Stripe webhook handling',
+      workspaceType: WorkspaceType.Git,
+      gitBaseBranch: 'main',
+      projectInstructions: '',
+      assignedPersonas: [],
+      jobCount: 0,
+      activeJobCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.createProject).mockImplementation(async () => {
+      if (signalRHandlers['ProjectCreated']) {
+        signalRHandlers['ProjectCreated'](newProject);
+      }
+      return newProject;
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('New Project')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('New Project'));
+
+    const nameInput = screen.getByPlaceholderText('e.g. AgentMesh Core');
+    fireEvent.change(nameInput, { target: { value: 'Mesh Billing Subsystem' } });
+    fireEvent.submit(nameInput.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Mesh Billing Subsystem')).toHaveLength(1);
+    });
+  });
+
+  it('does not create duplicate job rows when creating a job even if SignalR arrives concurrently', async () => {
+    const newJob: ProjectJob = {
+      id: 'job-102',
+      projectId: 'mesh-core',
+      projectName: 'Mesh Core System',
+      title: 'Setup Redis Distributed Lock',
+      description: '',
+      status: ProjectJobStatus.Active,
+      gitBranchName: 'mesh/job-redis-lock',
+      tasks: [],
+      messageCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.createProjectJob).mockImplementation(async () => {
+      if (signalRHandlers['JobCreated']) {
+        signalRHandlers['JobCreated'](newJob);
+      }
+      return newJob;
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Create new Job in this project')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTitle('Create new Job in this project'));
+
+    const jobTitleInput = screen.getByPlaceholderText('e.g. Implement OAuth2 flow with Google & GitHub');
+    fireEvent.change(jobTitleInput, { target: { value: 'Setup Redis Distributed Lock' } });
+    fireEvent.submit(jobTitleInput.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Setup Redis Distributed Lock')).toHaveLength(1);
+    });
+  });
+
+  it('does not create duplicate task items in checklist when adding a task even if SignalR arrives concurrently', async () => {
+    const newTask: JobTask = {
+      id: 'task-3',
+      title: 'Deploy to staging',
+      isCompleted: false
+    };
+
+    vi.mocked(api.addJobTask).mockImplementation(async () => {
+      if (signalRHandlers['JobTaskUpdated']) {
+        signalRHandlers['JobTaskUpdated']({
+          jobId: 'job-101',
+          tasks: [...mockTasks, newTask]
+        });
+      }
+      return newTask;
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+    });
+
+    const addTaskInput = screen.getByPlaceholderText('+ Add task...');
+    fireEvent.change(addTaskInput, { target: { value: 'Deploy to staging' } });
+    fireEvent.submit(addTaskInput.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Deploy to staging')).toHaveLength(1);
     });
   });
 });

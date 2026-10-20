@@ -573,7 +573,7 @@ export default function App() {
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
     } else {
       const created = await api.createProject(req);
-      setProjects((prev) => [created, ...prev]);
+      setProjects((prev) => (prev.some((p) => p.id === created.id) ? prev : [created, ...prev]));
       setSelectedProjectId(created.id);
       fetchJobsForProject(created.id);
     }
@@ -593,7 +593,10 @@ export default function App() {
     const created = await api.createProjectJob(jobModalProject.id, req);
     setJobsByProject((prev) => ({
       ...prev,
-      [jobModalProject.id]: [created, ...(prev[jobModalProject.id] || [])]
+      [jobModalProject.id]: [
+        created,
+        ...(prev[jobModalProject.id] || []).filter((j) => j.id !== created.id)
+      ]
     }));
     handleSelectJob(jobModalProject.id, created.id);
   };
@@ -626,7 +629,7 @@ export default function App() {
   const handleAddTask = async (title: string) => {
     if (!selectedJobId) return;
     const task = await api.addJobTask(selectedJobId, { title });
-    setJobTasks((prev) => [...prev, task]);
+    setJobTasks((prev) => (prev.some((t) => t.id === task.id) ? prev : [...prev, task]));
   };
 
   const handleToggleTask = async (taskId: string, isCompleted: boolean) => {
@@ -832,8 +835,22 @@ export default function App() {
 
     const handleJobTaskUpdated = (data: { jobId: string; tasks: JobTask[] }) => {
       if (data.jobId === selectedJobId) {
-        setJobTasks(data.tasks);
+        const unique = (data.tasks || []).filter(
+          (t, idx, self) => idx === self.findIndex((x) => x.id === t.id)
+        );
+        setJobTasks(unique);
       }
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          if (next[pId]?.some((j) => j.id === data.jobId)) {
+            next[pId] = next[pId].map((j) =>
+              j.id === data.jobId ? { ...j, tasks: data.tasks } : j
+            );
+          }
+        }
+        return next;
+      });
     };
 
     const handleJobCreated = (job: ProjectJob) => {

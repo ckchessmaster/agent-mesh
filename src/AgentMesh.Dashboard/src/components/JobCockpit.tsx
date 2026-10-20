@@ -105,8 +105,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
-  const completedCount = tasks.filter((t) => t.isCompleted).length;
-  const progressPercent = tasks.length > 0 ? Math.round((completedCount / tasks.length) * 100) : 0;
+  const uniqueTasks = tasks.filter(
+    (t, index, self) => index === self.findIndex((item) => item.id === t.id)
+  );
+  const completedCount = uniqueTasks.filter((t) => t.isCompleted).length;
+  const progressPercent = uniqueTasks.length > 0 ? Math.round((completedCount / uniqueTasks.length) * 100) : 0;
   const isCompleted = job.status === ProjectJobStatus.Completed;
 
   return (
@@ -207,7 +210,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           <div className="flex items-center gap-2">
             <span className="text-xs font-semibold text-slate-300">Tasks Checklist</span>
             <span className="text-[11px] font-mono text-slate-400">
-              ({completedCount}/{tasks.length} completed)
+              ({completedCount}/{uniqueTasks.length} completed)
             </span>
           </div>
           <div className="w-40 h-1.5 bg-slate-800 rounded-full overflow-hidden">
@@ -220,7 +223,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
         {/* Task Items */}
         <div className="flex flex-wrap items-center gap-2">
-          {tasks.map((task) => (
+          {uniqueTasks.map((task) => (
             <div
               key={task.id}
               className={`flex items-center gap-2 px-2.5 py-1 rounded-lg border text-xs transition ${

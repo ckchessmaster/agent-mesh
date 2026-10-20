@@ -47,6 +47,10 @@ export const ProjectList: React.FC<ProjectListProps> = ({
     );
   };
 
+  const uniqueProjects = projects.filter(
+    (p, index, self) => index === self.findIndex((item) => item.id === p.id)
+  );
+
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -66,15 +70,18 @@ export const ProjectList: React.FC<ProjectListProps> = ({
 
       {/* Projects List */}
       <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
-        {projects.length === 0 ? (
+        {uniqueProjects.length === 0 ? (
           <div className="p-4 text-center text-slate-500 text-xs">
             No projects yet. Create your first project to collaborate with Personas.
           </div>
         ) : (
-          projects.map((project) => {
+          uniqueProjects.map((project) => {
             const isSelected = selectedProjectId === project.id;
             const isExpanded = expandedProjectIds.includes(project.id) || isSelected;
-            const jobs = jobsByProject[project.id] || [];
+            const rawJobs = jobsByProject[project.id] || [];
+            const jobs = rawJobs.filter(
+              (j, index, self) => index === self.findIndex((item) => item.id === j.id)
+            );
 
             return (
               <div
