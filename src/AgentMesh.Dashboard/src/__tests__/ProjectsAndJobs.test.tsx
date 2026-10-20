@@ -594,4 +594,42 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       expect(screen.getByText('spec.pdf')).toBeInTheDocument();
     });
   });
+
+  it('allows editing project details and team members from project list and updates project', async () => {
+    const updatedProj = {
+      ...mockProject,
+      name: 'Mesh Core System (Updated)',
+      description: 'Updated description'
+    };
+    vi.mocked(api.updateProject).mockResolvedValue(updatedProj);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('edit-project-btn-mesh-core')).toBeInTheDocument();
+    });
+
+    // Click edit button on project in sidebar
+    fireEvent.click(screen.getByTestId('edit-project-btn-mesh-core'));
+
+    // Modal opens in edit mode
+    await waitFor(() => {
+      expect(screen.getByText('Edit Project')).toBeInTheDocument();
+    });
+
+    const nameInput = screen.getByDisplayValue('Mesh Core System');
+    fireEvent.change(nameInput, { target: { value: 'Mesh Core System (Updated)' } });
+
+    const saveBtn = screen.getByRole('button', { name: /Update Project/i });
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => {
+      expect(api.updateProject).toHaveBeenCalledWith(
+        'mesh-core',
+        expect.objectContaining({
+          name: 'Mesh Core System (Updated)'
+        })
+      );
+    });
+  });
 });

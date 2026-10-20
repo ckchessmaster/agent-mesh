@@ -349,6 +349,7 @@ export default function App() {
     }
   });
   const [isScrolledUp, setIsScrolledUp] = useState(false);
+  const userScrolledUpRef = useRef(false);
 
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const timelineContainerRef = useRef<HTMLDivElement | null>(null);
@@ -363,14 +364,8 @@ export default function App() {
         localStorage.setItem('agentmesh_autoscroll_enabled', String(next));
       } catch {}
       if (next && timelineContainerRef.current) {
-        if (typeof timelineContainerRef.current.scrollTo === 'function') {
-          timelineContainerRef.current.scrollTo({
-            top: timelineContainerRef.current.scrollHeight,
-            behavior: 'smooth'
-          });
-        } else {
-          timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
-        }
+        userScrolledUpRef.current = false;
+        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
         setIsScrolledUp(false);
       }
       return next;
@@ -378,15 +373,9 @@ export default function App() {
   };
 
   const handleScrollToBottom = () => {
+    userScrolledUpRef.current = false;
     if (timelineContainerRef.current) {
-      if (typeof timelineContainerRef.current.scrollTo === 'function') {
-        timelineContainerRef.current.scrollTo({
-          top: timelineContainerRef.current.scrollHeight,
-          behavior: 'smooth'
-        });
-      } else {
-        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
-      }
+      timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
     }
     setIsScrolledUp(false);
   };
@@ -394,8 +383,14 @@ export default function App() {
   const handleTimelineScroll = () => {
     if (!timelineContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = timelineContainerRef.current;
-    const isNearBottom = scrollHeight - (scrollTop + clientHeight) < 150;
-    setIsScrolledUp(!isNearBottom);
+    const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
+    if (distanceFromBottom < 80) {
+      userScrolledUpRef.current = false;
+      setIsScrolledUp(false);
+    } else if (distanceFromBottom > 200) {
+      userScrolledUpRef.current = true;
+      setIsScrolledUp(true);
+    }
   };
 
   const handleOpenUsageModal = async (agent: Agent) => {
@@ -943,6 +938,7 @@ export default function App() {
   useEffect(() => {
     if (isSessionSwitchingRef.current) {
       isSessionSwitchingRef.current = false;
+      userScrolledUpRef.current = false;
       if (timelineContainerRef.current) {
         timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
       }
@@ -950,16 +946,15 @@ export default function App() {
       return;
     }
 
-    if (!autoScrollEnabled) {
+    if (!autoScrollEnabled || userScrolledUpRef.current) {
       return;
     }
 
     if (timelineContainerRef.current) {
-      const { scrollTop, scrollHeight, clientHeight } = timelineContainerRef.current;
-      const isNearBottom = scrollHeight - (scrollTop + clientHeight) < 150;
-      if (isNearBottom && typeof timelineEndRef.current?.scrollIntoView === 'function') {
-        timelineEndRef.current.scrollIntoView({ behavior: 'smooth' });
-      }
+      timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
+      setIsScrolledUp(false);
+    } else if (typeof timelineEndRef.current?.scrollIntoView === 'function') {
+      timelineEndRef.current.scrollIntoView({ behavior: 'auto' });
     }
   }, [events, autoScrollEnabled]);
 
@@ -2188,6 +2183,10 @@ export default function App() {
                 setJobModalProject(proj);
                 setShowJobModal(true);
               }}
+              onEditProject={(proj) => {
+                setEditingProject(proj);
+                setShowProjectModal(true);
+              }}
               onDeleteProject={handleDeleteProject}
               onDeleteJob={handleDeleteJob}
             />
@@ -2796,6 +2795,10 @@ export default function App() {
                     onDeleteTask={handleDeleteTask}
                     onCompleteJob={handleCompleteJob}
                     onOpenLightbox={setLightboxAttachment}
+                    onEditProject={() => {
+                      setEditingProject(activeProj);
+                      setShowProjectModal(true);
+                    }}
                     onSelectTurnSession={(sessionId) => {
                       setSelectedSessionId(sessionId);
                       setActiveTab('personas');

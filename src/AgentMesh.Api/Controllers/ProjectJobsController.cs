@@ -646,6 +646,8 @@ public class ProjectJobsController(
             CreatedAt = DateTimeOffset.UtcNow
         };
 
+        JobMessage? ackMsg = null;
+
         // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn!
         if (targetPersonaId != null && req.TurnSessionId == null)
         {
@@ -788,6 +790,23 @@ public class ProjectJobsController(
                     await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", promptPayload);
                     await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
                 }
+
+                if (req.SenderType == "user")
+                {
+                    ackMsg = new JobMessage
+                    {
+                        Id = Guid.NewGuid(),
+                        JobId = id,
+                        SenderType = "persona",
+                        SenderId = persona.Id,
+                        SenderName = persona.Name,
+                        Content = "I'm on it — starting work on this now.",
+                        MentionsJson = JsonSerializer.Serialize(new List<string>(), JsonOpts),
+                        TurnSessionId = turnSession.Id,
+                        CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(2)
+                    };
+                    db.JobMessages.Add(ackMsg);
+                }
             }
         }
 
@@ -800,6 +819,11 @@ public class ProjectJobsController(
         if (hubContext != null)
         {
             await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
+            if (ackMsg != null)
+            {
+                var ackDto = ToMessageDto(ackMsg);
+                await hubContext.Clients.All.SendAsync("JobMessageAdded", ackDto);
+            }
         }
 
         return Ok(msgDto);

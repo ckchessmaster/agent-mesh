@@ -10,6 +10,10 @@ import {
   Bot,
   User,
   ChevronRight,
+  ChevronDown,
+  Settings,
+  ArrowDown,
+  ListTodo,
   Check,
   Briefcase,
   Paperclip,
@@ -152,6 +156,7 @@ interface JobCockpitProps {
   onSelectTurnSession?: (sessionId: string) => void;
   onOpenLightbox?: (item: { url: string; fileName: string; sizeBytes?: number }) => void;
   onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
+  onEditProject?: () => void;
 }
 
 export const JobCockpit: React.FC<JobCockpitProps> = ({
@@ -167,7 +172,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onCompleteJob,
   onSelectTurnSession,
   onOpenLightbox,
-  onUploadAttachments
+  onUploadAttachments,
+  onEditProject
 }) => {
   const [prompt, setPrompt] = useState('');
   const [newTaskTitle, setNewTaskTitle] = useState('');
@@ -176,6 +182,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [resultSummary, setResultSummary] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
+
+  // Task checklist presentation state
+  const [isTasksExpanded, setIsTasksExpanded] = useState(true);
+  const [taskFilter, setTaskFilter] = useState<'all' | 'pending' | 'completed'>('all');
 
   // Attachment & Drag-Drop State
   const [stagedAttachments, setStagedAttachments] = useState<StagedJobAttachmentItem[]>([]);
@@ -202,7 +212,109 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [mentionHighlightedIndex, setMentionHighlightedIndex] = useState(0);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const userScrolledUpRef = useRef(false);
+  const [isScrolledUp, setIsScrolledUp] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-scroll management: track user manual scrolling vs automatic tracking
+  const handleMessagesScroll = () => {
+    if (!messagesContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
+    const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
+    if (distanceFromBottom < 80) {
+      userScrolledUpRef.current = false;
+      setIsScrolledUp(false);
+    } else if (distanceFromBottom > 200) {
+      userScrolledUpRef.current = true;
+      setIsScrolledUp(true);
+    }
+  };
+
+  const scrollToBottom = (instant = false) => {
+    userScrolledUpRef.current = false;
+    setIsScrolledUp(false);
+    if (messagesContainerRef.current) {
+      if (instant) {
+        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+      } else if (typeof messagesContainerRef.current.scrollTo === 'function') {
+        messagesContainerRef.current.scrollTo({
+          top: messagesContainerRef.current.scrollHeight,
+          behavior: 'smooth'
+        });
+      } else {
+        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+      }
+    } else if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
+      messagesEndRef.current.scrollIntoView({ behavior: instant ? 'auto' : 'smooth' });
+    }
+  };
+
+  // Immediate feedback / active turn detection
+  const activeTurnInfo = useMemo(() => {
+    if (isSending) {
+      return {
+        isActive: true,
+        personaName: 'Team',
+        turnSessionId: undefined,
+        statusText: 'Sending message and initiating turn...'
+      };
+    }
+    if (messages.length === 0) return null;
+    const lastMsg = messages[messages.length - 1];
+
+    if (lastMsg.senderType === 'user' && lastMsg.turnSessionId) {
+      const mention = lastMsg.mentions?.[0];
+      const personaObj =
+        personas.find((p) => p.id === mention) ||
+        project.assignedPersonas?.find((p) => p.id === mention);
+      return {
+        isActive: true,
+        personaName: personaObj?.name || mention || 'Persona',
+        turnSessionId: lastMsg.turnSessionId,
+        statusText: 'is actively working on this task...'
+      };
+    }
+
+    if (
+      lastMsg.senderType === 'persona' &&
+      lastMsg.turnSessionId &&
+      (lastMsg.content.includes("I'm on it") || lastMsg.content.includes('starting work'))
+    ) {
+      return {
+        isActive: true,
+        personaName: lastMsg.senderName || 'Persona',
+        turnSessionId: lastMsg.turnSessionId,
+        statusText: 'is actively working on this task...'
+      };
+    }
+
+    return null;
+  }, [messages, isSending, personas, project.assignedPersonas]);
+
+  // Filtered task items for the structured checklist
+  const uniqueTasks = useMemo(() => {
+    return tasks.filter(
+      (t, index, self) => index === self.findIndex((item) => item.id === t.id)
+    );
+  }, [tasks]);
+
+  const filteredTasks = useMemo(() => {
+    if (taskFilter === 'pending') return uniqueTasks.filter((t) => !t.isCompleted);
+    if (taskFilter === 'completed') return uniqueTasks.filter((t) => t.isCompleted);
+    return uniqueTasks;
+  }, [uniqueTasks, taskFilter]);
+
+  // Keep pinned to bottom when messages arrive, unless user has deliberately scrolled up
+  useEffect(() => {
+    if (userScrolledUpRef.current) return;
+    if (messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+      setIsScrolledUp(false);
+    } else if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
+      messagesEndRef.current.scrollIntoView({ behavior: 'auto' });
+    }
+  }, [messages, activeTurnInfo]);
 
   // Team members list: priority given to project's assigned personas, fallback to all personas
   const teamMembers: MentionableMember[] = useMemo(() => {
@@ -246,12 +358,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       );
     });
   }, [teamMembers, mentionState.query]);
-
-  useEffect(() => {
-    if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [messages]);
 
   const handleOpenLightbox = useCallback(
     (item: { url: string; fileName: string; sizeBytes?: number }) => {
@@ -540,9 +646,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
-  const uniqueTasks = tasks.filter(
-    (t, index, self) => index === self.findIndex((item) => item.id === t.id)
-  );
   const completedCount = uniqueTasks.filter((t) => t.isCompleted).length;
   const progressPercent = uniqueTasks.length > 0 ? Math.round((completedCount / uniqueTasks.length) * 100) : 0;
 
@@ -612,8 +715,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
         {/* Assigned Personas & Actions */}
         <div className="flex items-center gap-3 shrink-0">
-          <div className="hidden lg:flex items-center gap-1 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl">
-            <span className="text-[11px] font-semibold text-slate-400 mr-1.5">Team:</span>
+          <div className="hidden lg:flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl">
+            <span className="text-[11px] font-semibold text-slate-400 mr-1">Team:</span>
             {project.assignedPersonas?.map((p) => (
               <span
                 key={p.id}
@@ -623,6 +726,17 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 @{p.id}
               </span>
             ))}
+            {onEditProject && (
+              <button
+                type="button"
+                onClick={onEditProject}
+                title="Edit Project Details & Team Members"
+                className="ml-1 p-1 rounded-md text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition cursor-pointer"
+                data-testid="cockpit-edit-project-btn"
+              >
+                <Settings className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
 
           {!isCompleted && (
@@ -667,81 +781,182 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         </div>
       </div>
 
-      {/* Task Checklist Bar */}
-      <div className="px-6 py-3 border-b border-slate-800/60 bg-slate-900/40">
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold text-slate-300">Tasks Checklist</span>
-            <span className="text-[11px] font-mono text-slate-400">
-              ({completedCount}/{uniqueTasks.length} completed)
+      {/* Redesigned Task Checklist */}
+      <div className="px-6 py-3 border-b border-slate-800/60 bg-slate-900/50">
+        {/* Task Header & Progress Bar */}
+        <div className="flex items-center justify-between gap-4 mb-2">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <button
+              type="button"
+              onClick={() => setIsTasksExpanded((prev) => !prev)}
+              className="text-slate-400 hover:text-slate-200 p-0.5 rounded transition flex items-center gap-1.5 cursor-pointer"
+              title={isTasksExpanded ? 'Collapse task list' : 'Expand task list'}
+              data-testid="toggle-tasks-btn"
+            >
+              {isTasksExpanded ? (
+                <ChevronDown className="w-4 h-4 text-slate-400" />
+              ) : (
+                <ChevronRight className="w-4 h-4 text-slate-400" />
+              )}
+              <ListTodo className="w-4 h-4 text-sky-400 shrink-0" />
+              <span className="text-xs font-semibold text-slate-200">Tasks & Objectives</span>
+            </button>
+            <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
+              ({completedCount}/{uniqueTasks.length} completed • {progressPercent}%)
             </span>
           </div>
-          <div className="w-40 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-emerald-500 transition-all duration-300 rounded-full"
-              style={{ width: `${progressPercent}%` }}
-            />
+
+          <div className="flex items-center gap-3 shrink-0">
+            {isTasksExpanded && (
+              <div className="flex items-center bg-slate-950/80 border border-slate-800 rounded-lg p-0.5 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => setTaskFilter('all')}
+                  className={`px-2 py-0.5 rounded-md transition ${
+                    taskFilter === 'all'
+                      ? 'bg-slate-800 text-sky-300 font-semibold shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  All ({uniqueTasks.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTaskFilter('pending')}
+                  className={`px-2 py-0.5 rounded-md transition ${
+                    taskFilter === 'pending'
+                      ? 'bg-slate-800 text-sky-300 font-semibold shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Pending ({uniqueTasks.length - completedCount})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTaskFilter('completed')}
+                  className={`px-2 py-0.5 rounded-md transition ${
+                    taskFilter === 'completed'
+                      ? 'bg-slate-800 text-sky-300 font-semibold shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Done ({completedCount})
+                </button>
+              </div>
+            )}
+            <div className="w-32 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
+              <div
+                className="h-full bg-emerald-500 transition-all duration-300 rounded-full"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
           </div>
         </div>
 
-        {/* Task Items */}
-        <div className="flex flex-wrap items-center gap-2">
-          {uniqueTasks.map((task) => (
-            <div
-              key={task.id}
-              className={`flex items-center gap-2 px-2.5 py-1 rounded-lg border text-xs transition ${
-                task.isCompleted
-                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300 line-through'
-                  : 'bg-slate-950/80 border-slate-800 text-slate-200'
-              }`}
-            >
-              <button
-                type="button"
-                onClick={() => onToggleTask(task.id, !task.isCompleted)}
-                className="cursor-pointer"
-              >
-                {task.isCompleted ? (
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                ) : (
-                  <Circle className="w-3.5 h-3.5 text-slate-500 hover:text-slate-300" />
-                )}
-              </button>
-              <span>{task.title}</span>
-              <button
-                type="button"
-                onClick={() => onDeleteTask(task.id)}
-                className="text-slate-600 hover:text-red-400 transition ml-1"
-                title="Delete task"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
-            </div>
-          ))}
+        {/* Expandable Task Content */}
+        {isTasksExpanded && (
+          <div className="space-y-2 mt-2">
+            {/* Task Item Rows */}
+            {filteredTasks.length === 0 ? (
+              <div className="py-3 px-4 rounded-xl bg-slate-950/40 border border-slate-800/60 text-center text-xs text-slate-500">
+                {uniqueTasks.length === 0
+                  ? 'No tasks yet. Add an objective below to track deliverables for this job.'
+                  : `No ${taskFilter} tasks found.`}
+              </div>
+            ) : (
+              <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1" data-testid="job-tasks-list">
+                {filteredTasks.map((task, idx) => (
+                  <div
+                    key={task.id}
+                    className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-xs transition group ${
+                      task.isCompleted
+                        ? 'bg-emerald-950/15 border-emerald-500/25 text-emerald-300/80'
+                        : 'bg-slate-950/70 border-slate-800 text-slate-200 hover:border-slate-700/80 shadow-sm'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => onToggleTask(task.id, !task.isCompleted)}
+                        className="cursor-pointer text-slate-400 hover:text-sky-400 transition shrink-0 p-0.5"
+                        title={task.isCompleted ? 'Mark as incomplete' : 'Mark as complete'}
+                        data-testid={`toggle-task-${task.id}`}
+                      >
+                        {task.isCompleted ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                        ) : (
+                          <Circle className="w-4 h-4 text-slate-500 hover:text-sky-400" />
+                        )}
+                      </button>
+                      <span className="font-mono text-[10px] text-slate-500 shrink-0">
+                        #{idx + 1}
+                      </span>
+                      <span
+                        className={`min-w-0 break-words leading-relaxed ${
+                          task.isCompleted
+                            ? 'line-through text-slate-400'
+                            : 'text-slate-100 font-medium'
+                        }`}
+                      >
+                        {task.title}
+                      </span>
+                    </div>
 
-          {/* Add Task Form */}
-          <form onSubmit={handleAddTaskSubmit} className="flex items-center gap-1.5">
-            <input
-              type="text"
-              value={newTaskTitle}
-              onChange={(e) => setNewTaskTitle(e.target.value)}
-              placeholder="+ Add task..."
-              className="bg-slate-950/90 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500 w-36 focus:w-56 transition-all"
-            />
-            {newTaskTitle.trim() && (
+                    <div className="flex items-center gap-2 shrink-0">
+                      {task.isCompleted ? (
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                          Completed
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
+                          Active
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onDeleteTask(task.id)}
+                        className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer"
+                        title="Delete task"
+                        data-testid={`delete-task-${task.id}`}
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Clean Inline Add Task Form */}
+            <form onSubmit={handleAddTaskSubmit} className="flex items-center gap-2 pt-1">
+              <input
+                type="text"
+                value={newTaskTitle}
+                onChange={(e) => setNewTaskTitle(e.target.value)}
+                placeholder="+ Add task..."
+                className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition shadow-inner"
+                data-testid="new-task-input"
+              />
               <button
                 type="submit"
-                disabled={isAddingTask}
-                className="p-1 rounded-lg bg-sky-500 text-slate-950 hover:bg-sky-400 transition"
+                disabled={!newTaskTitle.trim() || isAddingTask}
+                className="px-3.5 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer shadow-sm"
               >
                 <Plus className="w-3.5 h-3.5" />
+                <span>Add Task</span>
               </button>
-            )}
-          </form>
-        </div>
+            </form>
+          </div>
+        )}
       </div>
 
       {/* Live Chat Message Feed */}
-      <div className="flex-1 overflow-y-auto p-6 space-y-4">
+      <div
+        ref={messagesContainerRef}
+        onScroll={handleMessagesScroll}
+        data-testid="job-messages-container"
+        className="flex-1 overflow-y-auto p-6 space-y-4 relative"
+      >
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-500">
             <Bot className="w-12 h-12 stroke-[1.2] text-slate-600 mb-3" />
@@ -876,8 +1091,61 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             );
           })
         )}
+
+        {/* Active Turn Real-Time Feedback Card */}
+        {activeTurnInfo?.isActive && (
+          <div
+            className="flex items-center justify-between gap-3 p-3.5 rounded-2xl bg-sky-950/40 border border-sky-500/40 text-xs shadow-lg backdrop-blur-sm"
+            data-testid="job-active-turn-indicator"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="relative flex items-center justify-center w-8 h-8 rounded-xl bg-sky-500/20 text-sky-400 border border-sky-500/30 shrink-0">
+                <Bot className="w-4 h-4 animate-pulse" />
+                <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-sky-400 animate-ping" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-slate-100 truncate">
+                    {activeTurnInfo.personaName} {activeTurnInfo.statusText}
+                  </span>
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30 shrink-0 animate-pulse">
+                    Working
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-0.5 truncate">
+                  Executing workspace commands, tests, and active persona logic.
+                </p>
+              </div>
+            </div>
+            {activeTurnInfo.turnSessionId && (
+              <button
+                type="button"
+                onClick={() => onSelectTurnSession?.(activeTurnInfo.turnSessionId!)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 hover:text-white border border-sky-500/40 text-xs font-semibold transition cursor-pointer shrink-0 shadow-sm"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                <span>View Trajectory</span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        )}
+
         <div ref={messagesEndRef} />
       </div>
+
+      {/* Floating Scroll-to-Bottom Pill when user scrolls up */}
+      {isScrolledUp && (
+        <button
+          type="button"
+          onClick={() => scrollToBottom(true)}
+          className="absolute bottom-24 right-8 z-30 px-3.5 py-2 rounded-full bg-slate-900/95 hover:bg-slate-800 text-sky-400 hover:text-sky-300 border border-slate-700 shadow-2xl flex items-center gap-2 text-xs font-semibold backdrop-blur transition cursor-pointer"
+          data-testid="job-scroll-to-bottom-btn"
+        >
+          <ArrowDown className="w-3.5 h-3.5 animate-bounce" />
+          <span>New messages below</span>
+        </button>
+      )}
 
       {/* Prompt Composer & Mention Bar */}
       <div className="p-4 border-t border-slate-800/80 bg-slate-900/80 backdrop-blur-sm shrink-0">

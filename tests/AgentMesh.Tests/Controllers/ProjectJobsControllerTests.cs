@@ -145,6 +145,13 @@ public class ProjectJobsControllerTests
         promptMsg.Should().NotBeNull();
         promptMsg!.Content.Should().Contain("[Project Context: Project \"Chat Project\"");
         promptMsg.Content.Should().Contain("please refactor the database schema");
+
+        // Verify that immediate acknowledgment response from persona was posted
+        var ackMsg = await db.JobMessages.FirstOrDefaultAsync(m => m.JobId == job.Id && m.SenderType == "persona" && m.TurnSessionId == turnSession.Id);
+        ackMsg.Should().NotBeNull();
+        ackMsg!.SenderId.Should().Be("astra");
+        ackMsg.SenderName.Should().Be("Astra");
+        ackMsg.Content.Should().Be("I'm on it — starting work on this now.");
     }
 
     [Fact]

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   FolderGit2,
   Plus,
+  Pencil,
   ChevronDown,
   ChevronRight,
   Trash2,
@@ -20,6 +21,7 @@ interface ProjectListProps {
   onSelectJob: (projectId: string, jobId: string) => void;
   onOpenNewProjectModal: () => void;
   onOpenNewJobModal: (project: Project) => void;
+  onEditProject?: (project: Project) => void;
   onDeleteProject: (projectId: string) => Promise<void>;
   onDeleteJob: (jobId: string) => Promise<void>;
 }
@@ -33,6 +35,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   onSelectJob,
   onOpenNewProjectModal,
   onOpenNewJobModal,
+  onEditProject,
   onDeleteProject,
   onDeleteJob
 }) => {
@@ -128,6 +131,21 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                   </div>
 
                   <div className="flex items-center gap-1 shrink-0">
+                    {onEditProject && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onEditProject(project);
+                        }}
+                        title="Edit project details and team members"
+                        className="p-1 rounded-md text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition"
+                        data-testid={`edit-project-btn-${project.id}`}
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onClick={(e) => {

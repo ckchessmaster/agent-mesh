@@ -412,4 +412,94 @@ describe('JobCockpit - Attachment Support', () => {
       expect(screen.getByText('data.csv')).toBeInTheDocument();
     });
   });
+
+  it('renders active turn feedback indicator when an active persona turn is in progress', () => {
+    const activeMessages: JobMessage[] = [
+      {
+        id: 'msg-u1',
+        jobId: 'job-101',
+        senderType: 'user',
+        content: '@astra please start the implementation',
+        mentions: ['astra'],
+        turnSessionId: 'sess-active-turn',
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: 'msg-ack',
+        jobId: 'job-101',
+        senderType: 'persona',
+        senderId: 'astra',
+        senderName: 'Astra',
+        content: "I'm on it — starting work on this now.",
+        mentions: [],
+        turnSessionId: 'sess-active-turn',
+        createdAt: new Date().toISOString()
+      }
+    ];
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={activeMessages}
+      />
+    );
+
+    // Active working indicator is rendered
+    expect(screen.getByTestId('job-active-turn-indicator')).toBeInTheDocument();
+    expect(screen.getByText(/Astra is actively working on this task.../i)).toBeInTheDocument();
+    expect(screen.getByText('View Trajectory')).toBeInTheDocument();
+  });
+
+  it('renders structured collapsible task checklist, allows expanding/collapsing and filtering', async () => {
+    const mockTasksList: JobTask[] = [
+      { id: 't-1', jobId: 'job-101', title: 'Task Alpha', isCompleted: true },
+      { id: 't-2', jobId: 'job-101', title: 'Task Beta', isCompleted: false },
+      { id: 't-3', jobId: 'job-101', title: 'Task Gamma', isCompleted: false }
+    ];
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        tasks={mockTasksList}
+      />
+    );
+
+    // Header counter and percentage
+    expect(screen.getByText(/1\/3 completed/i)).toBeInTheDocument();
+    expect(screen.getByTestId('job-tasks-list')).toBeInTheDocument();
+
+    // Verify task rows & indices
+    expect(screen.getByText('#1')).toBeInTheDocument();
+    expect(screen.getByText('Task Alpha')).toBeInTheDocument();
+    expect(screen.getByText('Task Beta')).toBeInTheDocument();
+
+    // Filter to only Completed
+    const doneFilterBtn = screen.getByRole('button', { name: /^Done/i });
+    fireEvent.click(doneFilterBtn);
+
+    expect(screen.getByText('Task Alpha')).toBeInTheDocument();
+    expect(screen.queryByText('Task Beta')).not.toBeInTheDocument();
+
+    // Toggle collapse
+    const toggleCollapseBtn = screen.getByTestId('toggle-tasks-btn');
+    fireEvent.click(toggleCollapseBtn);
+
+    expect(screen.queryByTestId('job-tasks-list')).not.toBeInTheDocument();
+  });
+
+  it('renders edit project button and triggers onEditProject callback', () => {
+    const onEditProject = vi.fn();
+    render(
+      <JobCockpit
+        {...mockProps}
+        onEditProject={onEditProject}
+      />
+    );
+
+    const editBtn = screen.getByTestId('cockpit-edit-project-btn');
+    expect(editBtn).toBeInTheDocument();
+    fireEvent.click(editBtn);
+
+    expect(onEditProject).toHaveBeenCalledTimes(1);
+  });
 });
