@@ -116,13 +116,17 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var personaName = GetJsonPropString(elem, "personaName");
                 var personaRole = GetJsonPropString(elem, "personaRole");
                 var personaPrompt = GetJsonPropString(elem, "personaPrompt");
+                var jobId = GetJsonPropString(elem, "jobId");
+                var projectId = GetJsonPropString(elem, "projectId");
+                var gitBranch = GetJsonPropString(elem, "gitBranch");
+                var workspaceType = GetJsonPropString(elem, "workspaceType");
                 var attachments = ExtractJsonAttachments(elem);
 
                 await HandlePromptAsync(new PromptReceivedEvent
                 {
                     SessionId = sessionId,
                     MessageId = messageId,
-                    AgentId = _preset.Id,
+                    AgentId = _preset.Id ?? string.Empty,
                     DriverId = _preset.Id,
                     PersonaId = personaId,
                     PersonaName = personaName,
@@ -135,6 +139,10 @@ public class AgentRunnerInstance : IAsyncDisposable
                     Effort = effort,
                     Mode = mode,
                     Tier = tier,
+                    JobId = jobId,
+                    ProjectId = projectId,
+                    GitBranch = gitBranch,
+                    WorkspaceType = workspaceType,
                     Attachments = attachments,
                     CreatedAt = DateTimeOffset.UtcNow
                 }, _cts.Token);
@@ -338,6 +346,14 @@ public class AgentRunnerInstance : IAsyncDisposable
 
             _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender} (model: {ev.Model ?? "default"}, effort: {ev.Effort ?? "default"}): {ev.Prompt} (cwd: {effectiveWorkDir})");
 
+            if (!string.IsNullOrWhiteSpace(ev.GitBranch))
+            {
+                await GitWorkspaceManager.PrepareJobBranchAsync(
+                    effectiveWorkDir,
+                    ev.GitBranch,
+                    msg => _onLog(_preset.Id, $"[git] {msg}"));
+            }
+
             var adapter = AgentAdapterFactory.Create(_preset);
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>
             {
@@ -370,6 +386,17 @@ public class AgentRunnerInstance : IAsyncDisposable
                     trajectoryEv,
                     turnToken);
             }, turnToken);
+
+            if (!string.IsNullOrWhiteSpace(ev.GitBranch))
+            {
+                await GitWorkspaceManager.CommitTurnChangesAsync(
+                    effectiveWorkDir,
+                    ev.GitBranch,
+                    ev.PersonaId ?? _preset.Id,
+                    ev.PersonaName ?? _preset.Name,
+                    ev.Prompt,
+                    msg => _onLog(_preset.Id, $"[git] {msg}"));
+            }
 
             var convId = AgyAdapter.GetSessionConversationId(ev.SessionId);
             if (!string.IsNullOrWhiteSpace(convId))

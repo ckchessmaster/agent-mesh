@@ -41,7 +41,8 @@ import {
   Image as ImageIcon,
   File as FileIcon,
   Download,
-  ZoomIn
+  ZoomIn,
+  FolderGit2
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -52,7 +53,11 @@ import type {
   AgentUsageResponse,
   AskQuestionItem,
   FilesystemBrowseResponse,
+  JobMessage,
+  JobTask,
   Persona,
+  Project,
+  ProjectJob,
   QueuedPromptItem,
   QuestionAnswerPayload,
   SessionAttachment,
@@ -63,6 +68,10 @@ import type {
 } from './types';
 import { SlashCommandPalette, SLASH_COMMANDS, type SlashCommandItem } from './components/SlashCommandPalette';
 import { ArtifactViewer } from './components/ArtifactViewer';
+import { ProjectModal } from './components/ProjectModal';
+import { NewJobModal } from './components/NewJobModal';
+import { JobCockpit } from './components/JobCockpit';
+import { ProjectList } from './components/ProjectList';
 
 interface StagedAttachmentItem {
   localId: string;
@@ -97,8 +106,38 @@ function extractMessageAttachments(ev: SessionMessage): SessionAttachment[] {
   if (!ev.structuredPayloadJson) return [];
   try {
     const parsed = JSON.parse(ev.structuredPayloadJson);
-    if (Array.isArray(parsed?.attachments)) {
-      return parsed.attachments as SessionAttachment[];
+    const rawList = Array.isArray(parsed?.attachments)
+      ? parsed.attachments
+      : Array.isArray(parsed?.Attachments)
+      ? parsed.Attachments
+      : null;
+
+    if (Array.isArray(rawList)) {
+      return rawList.map((item: any) => {
+        const id = item.id || item.Id || '';
+        const fileName = item.fileName || item.FileName || item.name || item.Name || '';
+        const contentType = item.contentType || item.ContentType || '';
+        const sizeBytes = typeof item.sizeBytes === 'number'
+          ? item.sizeBytes
+          : typeof item.SizeBytes === 'number'
+          ? item.SizeBytes
+          : (typeof item.size === 'number' ? item.size : 0);
+        const s3Key = item.s3Key || item.S3Key || '';
+        const targetId = id || fileName;
+        const downloadUrl = item.downloadUrl || item.DownloadUrl || (targetId ? `/api/sessions/${ev.sessionId}/attachments/${encodeURIComponent(targetId)}/content` : '');
+        const createdAt = item.createdAt || item.CreatedAt || ev.createdAt;
+
+        return {
+          id,
+          sessionId: item.sessionId || item.SessionId || ev.sessionId,
+          fileName,
+          contentType,
+          sizeBytes,
+          s3Key,
+          downloadUrl,
+          createdAt
+        };
+      });
     }
   } catch {
     // Ignore malformed JSON
@@ -193,12 +232,24 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [sessions, setSessions] = useState<AgentSession[]>([]);
-  const [activeTab, setActiveTab] = useState<'personas' | 'drivers'>('personas');
+  const [activeTab, setActiveTab] = useState<'projects' | 'personas' | 'drivers'>('personas');
   const [hasUserSwitchedTab, setHasUserSwitchedTab] = useState(false);
   const [selectedPersonaId, setSelectedPersonaId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [events, setEvents] = useState<SessionMessage[]>([]);
+
+  // Projects & Jobs state
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [jobsByProject, setJobsByProject] = useState<Record<string, ProjectJob[]>>({});
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [jobMessages, setJobMessages] = useState<JobMessage[]>([]);
+  const [jobTasks, setJobTasks] = useState<JobTask[]>([]);
+  const [showProjectModal, setShowProjectModal] = useState(false);
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
+  const [showJobModal, setShowJobModal] = useState(false);
+  const [jobModalProject, setJobModalProject] = useState<Project | null>(null);
 
   // Create / Edit Persona Modal state
   const [showPersonaModal, setShowPersonaModal] = useState(false);
@@ -375,17 +426,19 @@ export default function App() {
 
   const fetchAllData = useCallback(async () => {
     try {
-      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes] = await Promise.all([
+      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes] = await Promise.all([
         api.getStatus(),
         api.getAgents(),
         api.getPersonas ? api.getPersonas().catch(() => []) : Promise.resolve([]),
         api.getSessions('all'),
-        api.getCapabilities().catch(() => null)
+        api.getCapabilities().catch(() => null),
+        api.getProjects ? api.getProjects().catch(() => []) : Promise.resolve([])
       ]);
       setStatusData(statusRes);
       setAgents(agentsRes);
       setPersonas(personasRes);
       setSessions(sessionsRes);
+      setProjects(projectsRes || []);
       if (capsRes) {
         setCapabilities(capsRes);
       }
@@ -393,11 +446,23 @@ export default function App() {
 
       // If no personas exist but drivers exist and user hasn't manually switched tab, show Drivers tab
       if (!hasUserSwitchedTab) {
-        if (personasRes.length > 0) {
+        if (projectsRes && projectsRes.length > 0) {
+          setActiveTab('projects');
+        } else if (personasRes.length > 0) {
           setActiveTab('personas');
         } else if (agentsRes.length > 0) {
           setActiveTab('drivers');
         }
+      }
+
+      // Auto-select first project if none selected
+      if (projectsRes && projectsRes.length > 0) {
+        setSelectedProjectId((prevProj) => {
+          if (prevProj && projectsRes.some((p) => p.id === prevProj)) {
+            return prevProj;
+          }
+          return projectsRes[0]?.id || null;
+        });
       }
 
       // Fetch usage stats & quotas in parallel for all agents
@@ -453,6 +518,140 @@ export default function App() {
       console.error('Failed to load session events:', err);
     }
   }, []);
+
+  const fetchJobsForProject = useCallback(async (projectId: string) => {
+    try {
+      const jobs = await api.getProjectJobs(projectId);
+      setJobsByProject((prev) => ({ ...prev, [projectId]: jobs }));
+      return jobs;
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const handleSelectProject = (projectId: string) => {
+    setSelectedProjectId(projectId);
+  };
+
+  const handleSelectJob = (projectId: string, jobId: string) => {
+    setSelectedProjectId(projectId);
+    setSelectedJobId(jobId);
+  };
+
+  useEffect(() => {
+    if (selectedProjectId) {
+      fetchJobsForProject(selectedProjectId).then((jobs) => {
+        if (jobs && jobs.length > 0) {
+          setSelectedJobId((cur) => (cur && jobs.some((j) => j.id === cur) ? cur : jobs[0].id));
+        } else {
+          setSelectedJobId(null);
+        }
+      });
+    }
+  }, [selectedProjectId, fetchJobsForProject]);
+
+  useEffect(() => {
+    if (selectedJobId) {
+      Promise.all([
+        api.getJobMessages(selectedJobId),
+        api.getJobTasks(selectedJobId)
+      ]).then(([msgs, tasks]) => {
+        setJobMessages(msgs);
+        setJobTasks(tasks);
+      }).catch((err) => {
+        console.error('Failed to load job details:', err);
+      });
+    } else {
+      setJobMessages([]);
+      setJobTasks([]);
+    }
+  }, [selectedJobId]);
+
+  const handleSaveProject = async (req: any) => {
+    if (editingProject) {
+      const updated = await api.updateProject(editingProject.id, req);
+      setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+    } else {
+      const created = await api.createProject(req);
+      setProjects((prev) => [created, ...prev]);
+      setSelectedProjectId(created.id);
+      fetchJobsForProject(created.id);
+    }
+  };
+
+  const handleDeleteProject = async (projectId: string) => {
+    await api.deleteProject(projectId);
+    setProjects((prev) => prev.filter((p) => p.id !== projectId));
+    if (selectedProjectId === projectId) {
+      setSelectedProjectId(null);
+      setSelectedJobId(null);
+    }
+  };
+
+  const handleCreateJob = async (req: any) => {
+    if (!jobModalProject) return;
+    const created = await api.createProjectJob(jobModalProject.id, req);
+    setJobsByProject((prev) => ({
+      ...prev,
+      [jobModalProject.id]: [created, ...(prev[jobModalProject.id] || [])]
+    }));
+    handleSelectJob(jobModalProject.id, created.id);
+  };
+
+  const handleDeleteJob = async (jobId: string) => {
+    await api.deleteProjectJob(jobId);
+    setJobsByProject((prev) => {
+      const next = { ...prev };
+      for (const pId of Object.keys(next)) {
+        next[pId] = next[pId].filter((j) => j.id !== jobId);
+      }
+      return next;
+    });
+    if (selectedJobId === jobId) {
+      setSelectedJobId(null);
+      setJobMessages([]);
+      setJobTasks([]);
+    }
+  };
+
+  const handleSendJobMessage = async (content: string) => {
+    if (!selectedJobId) return;
+    const msg = await api.postJobMessage(selectedJobId, { content, senderType: 'user' });
+    setJobMessages((prev) => {
+      if (prev.some((m) => m.id === msg.id)) return prev;
+      return [...prev, msg];
+    });
+  };
+
+  const handleAddTask = async (title: string) => {
+    if (!selectedJobId) return;
+    const task = await api.addJobTask(selectedJobId, { title });
+    setJobTasks((prev) => [...prev, task]);
+  };
+
+  const handleToggleTask = async (taskId: string, isCompleted: boolean) => {
+    if (!selectedJobId) return;
+    const updated = await api.updateJobTask(selectedJobId, taskId, { isCompleted });
+    setJobTasks((prev) => prev.map((t) => (t.id === taskId ? updated : t)));
+  };
+
+  const handleDeleteTask = async (taskId: string) => {
+    if (!selectedJobId) return;
+    await api.deleteJobTask(selectedJobId, taskId);
+    setJobTasks((prev) => prev.filter((t) => t.id !== taskId));
+  };
+
+  const handleCompleteJob = async (resultSummary?: string) => {
+    if (!selectedJobId) return;
+    const updated = await api.completeJob(selectedJobId, { resultSummary });
+    setJobsByProject((prev) => {
+      const next = { ...prev };
+      for (const pId of Object.keys(next)) {
+        next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+      }
+      return next;
+    });
+  };
 
   const fetchSessionArtifacts = useCallback(async (sessionId: string) => {
     try {
@@ -621,6 +820,57 @@ export default function App() {
       }
     };
 
+    const handleJobMessageAdded = (msg: JobMessage) => {
+      setJobMessages((prev) => {
+        if (msg.jobId === selectedJobId) {
+          if (prev.some((m) => m.id === msg.id)) return prev;
+          return [...prev, msg];
+        }
+        return prev;
+      });
+    };
+
+    const handleJobTaskUpdated = (data: { jobId: string; tasks: JobTask[] }) => {
+      if (data.jobId === selectedJobId) {
+        setJobTasks(data.tasks);
+      }
+    };
+
+    const handleJobCreated = (job: ProjectJob) => {
+      setJobsByProject((prev) => ({
+        ...prev,
+        [job.projectId]: [job, ...(prev[job.projectId] || []).filter((j) => j.id !== job.id)]
+      }));
+    };
+
+    const handleJobUpdated = (job: ProjectJob) => {
+      setJobsByProject((prev) => ({
+        ...prev,
+        [job.projectId]: (prev[job.projectId] || []).map((j) => (j.id === job.id ? job : j))
+      }));
+    };
+
+    const handleJobDeleted = (data: { id: string; projectId: string }) => {
+      setJobsByProject((prev) => ({
+        ...prev,
+        [data.projectId]: (prev[data.projectId] || []).filter((j) => j.id !== data.id)
+      }));
+      setSelectedJobId((cur) => (cur === data.id ? null : cur));
+    };
+
+    const handleProjectCreated = (proj: Project) => {
+      setProjects((prev) => [proj, ...prev.filter((p) => p.id !== proj.id)]);
+    };
+
+    const handleProjectUpdated = (proj: Project) => {
+      setProjects((prev) => prev.map((p) => (p.id === proj.id ? proj : p)));
+    };
+
+    const handleProjectDeleted = (data: { id: string }) => {
+      setProjects((prev) => prev.filter((p) => p.id !== data.id));
+      setSelectedProjectId((cur) => (cur === data.id ? null : cur));
+    };
+
     connection.on('ReceiveMessage', handleReceiveMessage);
     connection.on('SessionCreated', handleSessionCreated);
     connection.on('SessionDeleted', handleSessionDeleted);
@@ -634,6 +884,14 @@ export default function App() {
     connection.on('PersonaUpdated', handleSessionUpdated);
     connection.on('PersonaDeleted', handleSessionUpdated);
     connection.on('MeshReset', handleMeshReset);
+    connection.on('JobMessageAdded', handleJobMessageAdded);
+    connection.on('JobTaskUpdated', handleJobTaskUpdated);
+    connection.on('JobCreated', handleJobCreated);
+    connection.on('JobUpdated', handleJobUpdated);
+    connection.on('JobDeleted', handleJobDeleted);
+    connection.on('ProjectCreated', handleProjectCreated);
+    connection.on('ProjectUpdated', handleProjectUpdated);
+    connection.on('ProjectDeleted', handleProjectDeleted);
 
     return () => {
       connection.off('ReceiveMessage', handleReceiveMessage);
@@ -649,6 +907,14 @@ export default function App() {
       connection.off('PersonaUpdated', handleSessionUpdated);
       connection.off('PersonaDeleted', handleSessionUpdated);
       connection.off('MeshReset', handleMeshReset);
+      connection.off('JobMessageAdded', handleJobMessageAdded);
+      connection.off('JobTaskUpdated', handleJobTaskUpdated);
+      connection.off('JobCreated', handleJobCreated);
+      connection.off('JobUpdated', handleJobUpdated);
+      connection.off('JobDeleted', handleJobDeleted);
+      connection.off('ProjectCreated', handleProjectCreated);
+      connection.off('ProjectUpdated', handleProjectUpdated);
+      connection.off('ProjectDeleted', handleProjectDeleted);
     };
   }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents, fetchSessionArtifacts]);
 
@@ -729,7 +995,7 @@ export default function App() {
     : agents.find((a) => a.id === (selectedSession?.driverId || selectedSession?.creatorAgentId || selectedAgentId)) || null;
 
   const getRuntimeCapsForDriver = useCallback((driverIdOrAgent?: string | Agent | null) => {
-    if (!capabilities) return null;
+    if (!capabilities || !capabilities.agentRuntimes) return null;
     if (!driverIdOrAgent) return capabilities.agentRuntimes['agy'] || null;
 
     const idLower = (typeof driverIdOrAgent === 'string' ? driverIdOrAgent : driverIdOrAgent.id).toLowerCase();
@@ -1663,11 +1929,38 @@ export default function App() {
   }, [selectedSession?.metadataJson]);
 
   useEffect(() => {
-    const q = Array.isArray(selectedSessionMetadata?.promptQueue)
-      ? (selectedSessionMetadata.promptQueue as QueuedPromptItem[])
+    const rawQueue = selectedSessionMetadata?.promptQueue || (selectedSessionMetadata as any)?.PromptQueue;
+    const q = Array.isArray(rawQueue)
+      ? (rawQueue as any[]).map((item: any) => ({
+          id: item.id || item.Id || '',
+          prompt: item.prompt || item.Prompt || '',
+          sender: item.sender || item.Sender || '',
+          createdAt: item.createdAt || item.CreatedAt || '',
+          model: item.model || item.Model || null,
+          effort: item.effort || item.Effort || null,
+          tier: item.tier || item.Tier || null,
+          mode: item.mode || item.Mode || null,
+          workingDirectory: item.workingDirectory || item.WorkingDirectory || null,
+          attachments: Array.isArray(item.attachments || item.Attachments)
+            ? (item.attachments || item.Attachments).map((att: any) => ({
+                id: att.id || att.Id || '',
+                sessionId: att.sessionId || att.SessionId || selectedSessionId,
+                fileName: att.fileName || att.FileName || att.name || att.Name || '',
+                contentType: att.contentType || att.ContentType || '',
+                sizeBytes: typeof att.sizeBytes === 'number'
+                  ? att.sizeBytes
+                  : typeof att.SizeBytes === 'number'
+                  ? att.SizeBytes
+                  : 0,
+                s3Key: att.s3Key || att.S3Key || '',
+                downloadUrl: att.downloadUrl || att.DownloadUrl || (att.id || att.Id ? `/api/sessions/${selectedSessionId}/attachments/${encodeURIComponent(att.id || att.Id)}/content` : ''),
+                createdAt: att.createdAt || att.CreatedAt || ''
+              }))
+            : null
+        }))
       : [];
     setActiveQueue(q);
-  }, [selectedSessionMetadata?.promptQueue]);
+  }, [selectedSessionMetadata?.promptQueue, (selectedSessionMetadata as any)?.PromptQueue, selectedSessionId]);
 
   const activeCommand = useMemo(() => {
     if (selectedSession?.status !== 'thinking') return null;
@@ -1743,8 +2036,27 @@ export default function App() {
             )}
           </div>
 
-          {/* Top-level Navigation Tabs: Personas & Sessions vs Drivers & Infrastructure */}
+          {/* Top-level Navigation Tabs: Projects vs Personas vs Drivers */}
           <div className="flex items-center gap-1 ml-4 bg-slate-950/80 border border-slate-800 rounded-xl p-1">
+            <button
+              type="button"
+              onClick={() => {
+                setHasUserSwitchedTab(true);
+                setActiveTab('projects');
+              }}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                activeTab === 'projects'
+                  ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
+              }`}
+            >
+              <FolderGit2 className="w-3.5 h-3.5" />
+              <span>Projects & Jobs</span>
+              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                {projects.length}
+              </span>
+            </button>
+
             <button
               type="button"
               onClick={() => {
@@ -1837,9 +2149,28 @@ export default function App() {
 
       {/* Main Split View */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Sidebar: Personas or Drivers & Their Sessions */}
+        {/* Left Sidebar: Projects, Personas or Drivers & Their Sessions */}
         <aside className="w-80 border-r border-slate-800/80 bg-slate-900/40 flex flex-col shrink-0">
-          {activeTab === 'personas' ? (
+          {activeTab === 'projects' ? (
+            <ProjectList
+              projects={projects}
+              selectedProjectId={selectedProjectId}
+              selectedJobId={selectedJobId}
+              jobsByProject={jobsByProject}
+              onSelectProject={handleSelectProject}
+              onSelectJob={handleSelectJob}
+              onOpenNewProjectModal={() => {
+                setEditingProject(null);
+                setShowProjectModal(true);
+              }}
+              onOpenNewJobModal={(proj) => {
+                setJobModalProject(proj);
+                setShowJobModal(true);
+              }}
+              onDeleteProject={handleDeleteProject}
+              onDeleteJob={handleDeleteJob}
+            />
+          ) : activeTab === 'personas' ? (
             <>
               <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
                 <div className="flex items-center gap-2">
@@ -2423,7 +2754,73 @@ export default function App() {
 
         {/* Right Main Panel: Active Session Trajectory or New Session Composer */}
         <main className="flex-1 flex flex-col bg-slate-950 overflow-hidden">
-          {isCreatingSession && (selectedAgent || activeCreationPersona) ? (
+          {activeTab === 'projects' ? (
+            (() => {
+              const activeProj = projects.find((p) => p.id === selectedProjectId) || projects[0] || null;
+              const activeJ = selectedJobId
+                ? (jobsByProject[activeProj?.id || ''] || []).find((j) => j.id === selectedJobId) || null
+                : null;
+
+              if (activeProj && activeJ) {
+                return (
+                  <JobCockpit
+                    project={activeProj}
+                    job={activeJ}
+                    tasks={jobTasks}
+                    messages={jobMessages}
+                    onSendMessage={handleSendJobMessage}
+                    onAddTask={handleAddTask}
+                    onToggleTask={handleToggleTask}
+                    onDeleteTask={handleDeleteTask}
+                    onCompleteJob={handleCompleteJob}
+                    onSelectTurnSession={(sessionId) => {
+                      setSelectedSessionId(sessionId);
+                      setActiveTab('personas');
+                    }}
+                  />
+                );
+              }
+
+              return (
+                <div className="flex-1 flex flex-col items-center justify-center text-center p-8 text-slate-500">
+                  <FolderGit2 className="w-12 h-12 stroke-[1.2] text-slate-600 mb-3" />
+                  <h3 className="text-sm font-semibold text-slate-300">
+                    {activeProj ? `Project: ${activeProj.name}` : 'No Project Selected'}
+                  </h3>
+                  <p className="text-xs text-slate-500 max-w-sm mt-1">
+                    {activeProj
+                      ? 'Select a Job from the sidebar or click + to start a collaborative task.'
+                      : 'Select or create a project to collaborate with Personas.'}
+                  </p>
+                  {activeProj ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setJobModalProject(activeProj);
+                        setShowJobModal(true);
+                      }}
+                      className="mt-4 px-4 py-2 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>Start New Job</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingProject(null);
+                        setShowProjectModal(true);
+                      }}
+                      className="mt-4 px-4 py-2 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>Create Project</span>
+                    </button>
+                  )}
+                </div>
+              );
+            })()
+          ) : isCreatingSession && (selectedAgent || activeCreationPersona) ? (
             <div className="flex-1 flex items-center justify-center p-6">
               <form
                 onSubmit={handleCreateSession}
@@ -3372,8 +3769,9 @@ export default function App() {
                               <div className="flex flex-wrap gap-2 pt-1" data-testid={`message-attachments-${ev.id}`}>
                                 {msgAttachments.map((att) => {
                                   const isImg = isImageAttachment(att.contentType, att.fileName);
-                                  const streamUrl = att.downloadUrl || `/api/sessions/${ev.sessionId}/attachments/${encodeURIComponent(att.id)}/content`;
-                                  if (isImg) {
+                                  const targetId = att.id || att.fileName;
+                                  const streamUrl = att.downloadUrl || (targetId ? `/api/sessions/${ev.sessionId}/attachments/${encodeURIComponent(targetId)}/content` : '');
+                                  if (isImg && streamUrl) {
                                     return (
                                       <button
                                         key={att.id || att.fileName}
@@ -3381,16 +3779,16 @@ export default function App() {
                                         onClick={() =>
                                           setLightboxAttachment({
                                             url: streamUrl,
-                                            fileName: att.fileName,
+                                            fileName: att.fileName || 'attachment.png',
                                             sizeBytes: att.sizeBytes
                                           })
                                         }
-                                        aria-label={`Zoom image ${att.fileName}`}
+                                        aria-label={`Zoom image ${att.fileName || 'image'}`}
                                         className="group relative rounded-xl overflow-hidden border border-sky-500/40 bg-slate-950/80 hover:border-sky-300 transition cursor-pointer"
                                       >
                                         <img
                                           src={streamUrl}
-                                          alt={att.fileName}
+                                          alt={att.fileName || 'attachment image'}
                                           className="max-h-40 max-w-[220px] object-cover block"
                                         />
                                         <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-1 text-xs font-semibold text-white">
@@ -3403,13 +3801,13 @@ export default function App() {
                                   return (
                                     <a
                                       key={att.id || att.fileName}
-                                      href={`${streamUrl}${streamUrl.includes('?') ? '&' : '?'}download=true`}
-                                      download={att.fileName}
+                                      href={streamUrl ? `${streamUrl}${streamUrl.includes('?') ? '&' : '?'}download=true` : '#'}
+                                      download={att.fileName || 'attachment'}
                                       className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-slate-950/80 hover:bg-slate-900 border border-sky-500/30 hover:border-sky-400 text-xs text-slate-200 transition"
                                     >
                                       <FileIcon className="w-4 h-4 text-sky-400 shrink-0" />
                                       <div className="min-w-0">
-                                        <div className="font-mono text-xs text-white truncate max-w-[180px]">{att.fileName}</div>
+                                        <div className="font-mono text-xs text-white truncate max-w-[180px]">{att.fileName || 'Attachment'}</div>
                                         <div className="text-[10px] text-slate-400">{formatAttachmentSize(att.sizeBytes)}</div>
                                       </div>
                                       <Download className="w-3.5 h-3.5 text-sky-400 shrink-0 ml-1" />
@@ -4773,6 +5171,24 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+      {showProjectModal && (
+        <ProjectModal
+          isOpen={showProjectModal}
+          onClose={() => setShowProjectModal(false)}
+          onSave={handleSaveProject}
+          editingProject={editingProject}
+          availablePersonas={personas}
+        />
+      )}
+
+      {showJobModal && jobModalProject && (
+        <NewJobModal
+          isOpen={showJobModal}
+          onClose={() => setShowJobModal(false)}
+          project={jobModalProject}
+          onCreate={handleCreateJob}
+        />
       )}
     </div>
   );

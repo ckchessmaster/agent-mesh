@@ -1,6 +1,10 @@
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
@@ -20,6 +24,12 @@ public class SessionsController(
     IHubContext<AgentMeshHub> hubContext,
     IStorageService? storageService = null) : ControllerBase
 {
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true
+    };
+
     public const long MaxAttachmentSizeBytes = 25 * 1024 * 1024; // 25 MB per file
     public const int MaxAttachmentsPerMessage = 10;
     public const string DefaultAttachmentPrompt = "Please review the attached file(s).";
@@ -464,13 +474,11 @@ public class SessionsController(
         if (string.IsNullOrWhiteSpace(metadataJson)) return new();
         try
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
-            if (doc.RootElement.TryGetProperty("promptQueue", out var qElem) && qElem.ValueKind == System.Text.Json.JsonValueKind.Array)
+            using var doc = JsonDocument.Parse(metadataJson);
+            if ((doc.RootElement.TryGetProperty("promptQueue", out var qElem) || doc.RootElement.TryGetProperty("PromptQueue", out qElem)) &&
+                qElem.ValueKind == JsonValueKind.Array)
             {
-                return System.Text.Json.JsonSerializer.Deserialize<List<QueuedPromptDto>>(qElem.GetRawText(), new System.Text.Json.JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                }) ?? new();
+                return JsonSerializer.Deserialize<List<QueuedPromptDto>>(qElem.GetRawText(), JsonOptions) ?? new();
             }
         }
         catch { }
@@ -484,14 +492,14 @@ public class SessionsController(
             var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             if (!string.IsNullOrWhiteSpace(metadataJson))
             {
-                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson);
+                var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson, JsonOptions);
                 if (parsed != null)
                 {
                     foreach (var (k, v) in parsed) dict[k] = v;
                 }
             }
             dict["promptQueue"] = queue;
-            return System.Text.Json.JsonSerializer.Serialize(dict);
+            return JsonSerializer.Serialize(dict, JsonOptions);
         }
         catch
         {
@@ -504,13 +512,11 @@ public class SessionsController(
         if (string.IsNullOrWhiteSpace(metadataJson)) return new();
         try
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
-            if (doc.RootElement.TryGetProperty("artifacts", out var aElem) && aElem.ValueKind == System.Text.Json.JsonValueKind.Array)
+            using var doc = JsonDocument.Parse(metadataJson);
+            if ((doc.RootElement.TryGetProperty("artifacts", out var aElem) || doc.RootElement.TryGetProperty("Artifacts", out aElem)) &&
+                aElem.ValueKind == JsonValueKind.Array)
             {
-                return System.Text.Json.JsonSerializer.Deserialize<List<SessionArtifactDto>>(aElem.GetRawText(), new System.Text.Json.JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                }) ?? new();
+                return JsonSerializer.Deserialize<List<SessionArtifactDto>>(aElem.GetRawText(), JsonOptions) ?? new();
             }
         }
         catch { }
@@ -524,14 +530,14 @@ public class SessionsController(
             var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             if (!string.IsNullOrWhiteSpace(metadataJson))
             {
-                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson);
+                var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson, JsonOptions);
                 if (parsed != null)
                 {
                     foreach (var (k, v) in parsed) dict[k] = v;
                 }
             }
             dict["artifacts"] = artifacts;
-            return System.Text.Json.JsonSerializer.Serialize(dict);
+            return JsonSerializer.Serialize(dict, JsonOptions);
         }
         catch
         {
@@ -558,13 +564,11 @@ public class SessionsController(
         if (string.IsNullOrWhiteSpace(metadataJson)) return new();
         try
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
-            if (doc.RootElement.TryGetProperty("attachments", out var aElem) && aElem.ValueKind == System.Text.Json.JsonValueKind.Array)
+            using var doc = JsonDocument.Parse(metadataJson);
+            if ((doc.RootElement.TryGetProperty("attachments", out var aElem) || doc.RootElement.TryGetProperty("Attachments", out aElem)) &&
+                aElem.ValueKind == JsonValueKind.Array)
             {
-                return System.Text.Json.JsonSerializer.Deserialize<List<SessionAttachmentDto>>(aElem.GetRawText(), new System.Text.Json.JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                }) ?? new();
+                return JsonSerializer.Deserialize<List<SessionAttachmentDto>>(aElem.GetRawText(), JsonOptions) ?? new();
             }
         }
         catch { }
@@ -578,14 +582,14 @@ public class SessionsController(
             var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             if (!string.IsNullOrWhiteSpace(metadataJson))
             {
-                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson);
+                var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson, JsonOptions);
                 if (parsed != null)
                 {
                     foreach (var (k, v) in parsed) dict[k] = v;
                 }
             }
             dict["attachments"] = attachments;
-            return System.Text.Json.JsonSerializer.Serialize(dict);
+            return JsonSerializer.Serialize(dict, JsonOptions);
         }
         catch
         {
@@ -605,18 +609,18 @@ public class SessionsController(
             var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             if (!string.IsNullOrWhiteSpace(existingStructuredJson))
             {
-                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(existingStructuredJson);
+                var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(existingStructuredJson, JsonOptions);
                 if (parsed != null)
                 {
                     foreach (var (k, v) in parsed) dict[k] = v;
                 }
             }
             dict["attachments"] = attachments;
-            return System.Text.Json.JsonSerializer.Serialize(dict);
+            return JsonSerializer.Serialize(dict, JsonOptions);
         }
         catch
         {
-            return System.Text.Json.JsonSerializer.Serialize(new { attachments });
+            return JsonSerializer.Serialize(new { attachments }, JsonOptions);
         }
     }
 
@@ -632,13 +636,11 @@ public class SessionsController(
         }
         try
         {
-            using var doc = System.Text.Json.JsonDocument.Parse(structuredPayloadJson);
-            if (doc.RootElement.TryGetProperty("attachments", out var aElem) && aElem.ValueKind == System.Text.Json.JsonValueKind.Array)
+            using var doc = JsonDocument.Parse(structuredPayloadJson);
+            if ((doc.RootElement.TryGetProperty("attachments", out var aElem) || doc.RootElement.TryGetProperty("Attachments", out aElem)) &&
+                aElem.ValueKind == JsonValueKind.Array)
             {
-                return System.Text.Json.JsonSerializer.Deserialize<List<SessionAttachmentDto>>(aElem.GetRawText(), new System.Text.Json.JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                }) ?? new();
+                return JsonSerializer.Deserialize<List<SessionAttachmentDto>>(aElem.GetRawText(), JsonOptions) ?? new();
             }
         }
         catch { }
@@ -1243,6 +1245,8 @@ public class SessionsController(
         }
         else if (eventType == "response" && wasThinking)
         {
+            await CheckAndForwardJobTurnResponseAsync(session, message);
+
             // Auto-advance queued prompts sequentially if any are pending
             var queue = ExtractPromptQueue(session.MetadataJson);
             if (queue.Count > 0)
@@ -2028,6 +2032,60 @@ public class SessionsController(
 
         if (attachment == null)
         {
+            // Fallback: look into messages of this session
+            var recentMessages = await db.SessionMessages
+                .Where(m => m.SessionId == id && m.StructuredPayloadJson != null)
+                .OrderByDescending(m => m.CreatedAt)
+                .Take(25)
+                .ToListAsync();
+
+            foreach (var m in recentMessages)
+            {
+                var msgAttachments = ExtractAttachmentsFromPayload(m.StructuredPayloadJson);
+                var matched = msgAttachments.FirstOrDefault(a =>
+                    string.Equals(a.Id, attachmentId, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(a.FileName, attachmentId, StringComparison.OrdinalIgnoreCase));
+                if (matched != null)
+                {
+                    attachment = matched;
+                    break;
+                }
+            }
+        }
+
+        if (attachment == null && (string.Equals(attachmentId, "undefined", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(attachmentId)))
+        {
+            attachment = attachments.LastOrDefault();
+        }
+
+        if (attachment == null)
+        {
+            var localAttachDir = GetAttachmentDirectory(id);
+            if (Directory.Exists(localAttachDir))
+            {
+                var matchingFile = Directory.GetFiles(localAttachDir, $"{attachmentId}_*").FirstOrDefault()
+                    ?? Directory.GetFiles(localAttachDir, $"*{attachmentId}*").FirstOrDefault();
+                if (matchingFile != null)
+                {
+                    var fn = Path.GetFileName(matchingFile);
+                    var underscoreIdx = fn.IndexOf('_');
+                    var safeFn = underscoreIdx >= 0 ? fn[(underscoreIdx + 1)..] : fn;
+                    attachment = new SessionAttachmentDto(
+                        Id: attachmentId,
+                        SessionId: id,
+                        FileName: safeFn,
+                        ContentType: GuessContentTypeFromExtension(safeFn),
+                        SizeBytes: new FileInfo(matchingFile).Length,
+                        S3Key: $"sessions/{id}/attachments/{attachmentId}/{safeFn}",
+                        DownloadUrl: $"/api/sessions/{id}/attachments/{attachmentId}/content",
+                        CreatedAt: DateTimeOffset.UtcNow
+                    );
+                }
+            }
+        }
+
+        if (attachment == null)
+        {
             return NotFound(new { error = $"Attachment '{attachmentId}' not found in session '{id}'." });
         }
 
@@ -2050,7 +2108,16 @@ public class SessionsController(
             var localFilePath = Path.Combine(localAttachDir, $"{attachment.Id}_{attachment.FileName}");
             if (!System.IO.File.Exists(localFilePath))
             {
-                return NotFound(new { error = $"Attachment content for '{attachment.FileName}' was not found." });
+                var candidate = Directory.GetFiles(localAttachDir, $"{attachment.Id}_*").FirstOrDefault()
+                    ?? Directory.GetFiles(localAttachDir, $"*{attachment.FileName}*").FirstOrDefault();
+                if (candidate != null && System.IO.File.Exists(candidate))
+                {
+                    localFilePath = candidate;
+                }
+                else
+                {
+                    return NotFound(new { error = $"Attachment content for '{attachment.FileName}' was not found." });
+                }
             }
 
             contentStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
@@ -2358,6 +2425,189 @@ public class SessionsController(
         m.ToolArgsJson,
         m.ToolResultJson
     );
+
+    private async Task CheckAndForwardJobTurnResponseAsync(AgentSession session, SessionMessage responseMessage)
+    {
+        if (string.IsNullOrWhiteSpace(session.MetadataJson)) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(session.MetadataJson);
+            if (!doc.RootElement.TryGetProperty("jobId", out var jElem)) return;
+            var jobIdStr = jElem.GetString();
+            if (string.IsNullOrWhiteSpace(jobIdStr) || !Guid.TryParse(jobIdStr, out var jobId)) return;
+
+            var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
+            if (job == null) return;
+
+            var alreadyPosted = await db.JobMessages.AnyAsync(m => m.JobId == jobId && m.TurnSessionId == session.Id && m.Content == responseMessage.Content);
+            if (alreadyPosted) return;
+
+            var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
+
+            var matches = Regex.Matches(responseMessage.Content, @"@([a-zA-Z0-9_\-]+)");
+            var mentions = matches.Select(m => m.Groups[1].Value.ToLowerInvariant()).Distinct().ToList();
+
+            var jobMsg = new JobMessage
+            {
+                Id = Guid.NewGuid(),
+                JobId = jobId,
+                SenderType = "persona",
+                SenderId = pId ?? session.PersonaId,
+                SenderName = pName ?? session.PersonaId,
+                Content = responseMessage.Content,
+                MentionsJson = JsonSerializer.Serialize(mentions, JsonOptions),
+                TurnSessionId = session.Id,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+
+            db.JobMessages.Add(jobMsg);
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+
+            var msgDto = new JobMessageDto(
+                jobMsg.Id,
+                jobMsg.JobId,
+                jobMsg.SenderType,
+                jobMsg.SenderId,
+                jobMsg.SenderName,
+                jobMsg.Content,
+                mentions,
+                jobMsg.TurnSessionId,
+                jobMsg.StructuredPayloadJson,
+                jobMsg.CreatedAt
+            );
+
+            await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
+
+            // Autonomous Handoff Check (Loop Guard: max 5 consecutive persona hops)
+            var recentMessages = await db.JobMessages
+                .AsNoTracking()
+                .Where(m => m.JobId == jobId)
+                .OrderByDescending(m => m.CreatedAt)
+                .Take(10)
+                .ToListAsync();
+
+            var consecutivePersonaCount = recentMessages.TakeWhile(m => m.SenderType == "persona").Count();
+            if (consecutivePersonaCount < 5)
+            {
+                var assignedPersonaIds = await db.ProjectPersonas
+                    .AsNoTracking()
+                    .Where(pp => pp.ProjectId == job.ProjectId)
+                    .Select(pp => pp.PersonaId)
+                    .ToListAsync();
+
+                var nextPersonaId = mentions.FirstOrDefault(m => assignedPersonaIds.Contains(m) && !string.Equals(m, pId, StringComparison.OrdinalIgnoreCase));
+                if (nextPersonaId != null)
+                {
+                    var nextPersona = await db.Personas.FirstOrDefaultAsync(p => p.Id == nextPersonaId);
+                    var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+                    if (nextPersona != null && project != null)
+                    {
+                        var driverId = nextPersona.DriverId.Trim().ToLowerInvariant();
+                        var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
+                        if (driver == null)
+                        {
+                            driver = new Agent
+                            {
+                                Id = driverId,
+                                Name = $"Driver {driverId}",
+                                RuntimeType = RuntimeType.CliAgy,
+                                TrustTier = TrustTier.SeniorManager
+                            };
+                            db.Agents.Add(driver);
+                        }
+
+                        var turnMetadata = new Dictionary<string, object?>
+                        {
+                            ["jobId"] = job.Id.ToString(),
+                            ["projectId"] = project.Id,
+                            ["projectName"] = project.Name,
+                            ["workspaceType"] = project.WorkspaceType.ToString(),
+                            ["gitBranch"] = job.GitBranchName,
+                            ["gitUrl"] = project.GitRepositoryUrl,
+                            ["gitBaseBranch"] = project.GitBaseBranch,
+                            ["s3ArchiveKey"] = job.S3ArchiveKey,
+                            ["projectInstructions"] = project.ProjectInstructions,
+                            ["personaId"] = nextPersona.Id,
+                            ["personaName"] = nextPersona.Name,
+                            ["personaRole"] = nextPersona.Role,
+                            ["personaPrompt"] = nextPersona.PersonaPrompt,
+                            ["workingDirectory"] = nextPersona.DefaultWorkingDirectory,
+                            ["model"] = nextPersona.DefaultModel,
+                            ["effort"] = nextPersona.DefaultEffort,
+                            ["mode"] = nextPersona.DefaultMode,
+                            ["tier"] = nextPersona.DefaultTier
+                        };
+
+                        var nextTurnSession = new AgentSession
+                        {
+                            Id = Guid.NewGuid(),
+                            Title = $"Job Turn: {job.Title} (@{nextPersona.Name})",
+                            Status = "thinking",
+                            MetadataJson = JsonSerializer.Serialize(turnMetadata, JsonOptions),
+                            PersonaId = nextPersona.Id,
+                            DriverId = driverId,
+                            CreatorAgentId = driverId,
+                            CreatedAt = DateTimeOffset.UtcNow,
+                            UpdatedAt = DateTimeOffset.UtcNow
+                        };
+                        db.AgentSessions.Add(nextTurnSession);
+
+                        var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
+                                                (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
+                                                $"[Job Context: {job.Title} - {job.Description}]\n" +
+                                                $"[Previous Handoff from @{pName ?? pId}]:\n{responseMessage.Content}";
+
+                        var promptMsg = new SessionMessage
+                        {
+                            SessionId = nextTurnSession.Id,
+                            SenderAgentId = pId ?? "agent",
+                            TargetAgentId = driverId,
+                            EventType = "prompt",
+                            Content = promptWithContext,
+                            CreatedAt = DateTimeOffset.UtcNow
+                        };
+                        db.SessionMessages.Add(promptMsg);
+
+                        if (AgentMeshHub.IsAgentConnected(driverId))
+                        {
+                            driver.Status = "busy";
+                            driver.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                        }
+
+                        await db.SaveChangesAsync();
+
+                        var promptPayload = new
+                        {
+                            sessionId = nextTurnSession.Id,
+                            messageId = promptMsg.Id,
+                            agentId = driverId,
+                            driverId = driverId,
+                            personaId = nextPersona.Id,
+                            personaName = nextPersona.Name,
+                            personaRole = nextPersona.Role,
+                            personaPrompt = nextPersona.PersonaPrompt,
+                            prompt = promptMsg.Content,
+                            sender = promptMsg.SenderAgentId,
+                            workingDirectory = nextPersona.DefaultWorkingDirectory,
+                            model = nextPersona.DefaultModel,
+                            effort = nextPersona.DefaultEffort,
+                            mode = nextPersona.DefaultMode,
+                            tier = nextPersona.DefaultTier,
+                            jobId = job.Id,
+                            projectId = project.Id,
+                            gitBranch = job.GitBranchName,
+                            createdAt = promptMsg.CreatedAt
+                        };
+
+                        await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", promptPayload);
+                        await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                    }
+                }
+            }
+        }
+        catch { }
+    }
 }
 
 public record CreateSessionRequest(
@@ -2446,16 +2696,16 @@ public record SessionMessageDto(
 );
 
 public record QueuedPromptDto(
-    string Id,
-    string Prompt,
-    string Sender,
-    DateTimeOffset CreatedAt,
-    string? Model = null,
-    string? Effort = null,
-    string? Tier = null,
-    string? Mode = null,
-    string? WorkingDirectory = null,
-    List<SessionAttachmentDto>? Attachments = null
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("prompt")] string Prompt,
+    [property: JsonPropertyName("sender")] string Sender,
+    [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("model")] string? Model = null,
+    [property: JsonPropertyName("effort")] string? Effort = null,
+    [property: JsonPropertyName("tier")] string? Tier = null,
+    [property: JsonPropertyName("mode")] string? Mode = null,
+    [property: JsonPropertyName("workingDirectory")] string? WorkingDirectory = null,
+    [property: JsonPropertyName("attachments")] List<SessionAttachmentDto>? Attachments = null
 );
 
 public record EnqueuePromptRequest(
@@ -2483,17 +2733,17 @@ public record SubmitAnswerRequest(
 );
 
 public record SessionArtifactDto(
-    string Id,
-    Guid SessionId,
-    string Name,
-    string? Summary,
-    string ContentType,
-    long SizeBytes,
-    DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt,
-    string? Content = null,
-    string? S3Key = null,
-    string? DownloadUrl = null
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("sessionId")] Guid SessionId,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("summary")] string? Summary,
+    [property: JsonPropertyName("contentType")] string ContentType,
+    [property: JsonPropertyName("sizeBytes")] long SizeBytes,
+    [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("updatedAt")] DateTimeOffset UpdatedAt,
+    [property: JsonPropertyName("content")] string? Content = null,
+    [property: JsonPropertyName("s3Key")] string? S3Key = null,
+    [property: JsonPropertyName("downloadUrl")] string? DownloadUrl = null
 );
 
 public record SyncArtifactRequest(
@@ -2505,14 +2755,14 @@ public record SyncArtifactRequest(
 );
 
 public record SessionAttachmentDto(
-    string Id,
-    Guid SessionId,
-    string FileName,
-    string ContentType,
-    long SizeBytes,
-    string S3Key,
-    string DownloadUrl,
-    DateTimeOffset CreatedAt
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("sessionId")] Guid SessionId,
+    [property: JsonPropertyName("fileName")] string FileName,
+    [property: JsonPropertyName("contentType")] string ContentType,
+    [property: JsonPropertyName("sizeBytes")] long SizeBytes,
+    [property: JsonPropertyName("s3Key")] string S3Key,
+    [property: JsonPropertyName("downloadUrl")] string DownloadUrl,
+    [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt
 );
 
 

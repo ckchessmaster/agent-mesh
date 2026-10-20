@@ -11,6 +11,10 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     public DbSet<AgentSession> AgentSessions => Set<AgentSession>();
     public DbSet<SessionMessage> SessionMessages => Set<SessionMessage>();
     public DbSet<AgentJob> AgentJobs => Set<AgentJob>();
+    public DbSet<Project> Projects => Set<Project>();
+    public DbSet<ProjectPersona> ProjectPersonas => Set<ProjectPersona>();
+    public DbSet<ProjectJob> ProjectJobs => Set<ProjectJob>();
+    public DbSet<JobMessage> JobMessages => Set<JobMessage>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {

@@ -875,11 +875,14 @@ public class SessionsControllerTests
             Attachments: new List<SessionAttachmentDto> { attachment }
         ));
 
-        // Assert 1: Default prompt supplied & attachment persisted in StructuredPayloadJson
+        // Assert 1: Default prompt supplied & attachment persisted in StructuredPayloadJson with camelCase properties
         var created = postResult.Should().BeOfType<CreatedAtActionResult>().Subject;
         var msgDto = created.Value.Should().BeOfType<SessionMessageDto>().Subject;
         msgDto.Content.Should().Be(SessionsController.DefaultAttachmentPrompt);
         msgDto.StructuredPayloadJson.Should().Contain("screenshot.png");
+        msgDto.StructuredPayloadJson.Should().Contain("\"fileName\":\"screenshot.png\"");
+        msgDto.StructuredPayloadJson.Should().Contain("\"id\":\"att123\"");
+        msgDto.StructuredPayloadJson.Should().Contain("\"downloadUrl\":");
 
         // Act 2: Session is now 'thinking'; EnqueuePrompt with empty Prompt and an attachment queues item
         var queueResult = await controller.EnqueuePrompt(session.Id, new EnqueuePromptRequest(

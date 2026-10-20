@@ -160,6 +160,7 @@ public class MeshClient
 
                 string? workDir = null, model = null, effort = null, mode = null;
                 string? personaId = null, personaName = null, personaRole = null, personaPrompt = null;
+                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null;
                 if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
                 {
                     personaId = topPid.GetString();
@@ -182,6 +183,10 @@ public class MeshClient
                         if (mRoot.TryGetProperty("personaName", out var pn)) personaName ??= pn.GetString();
                         if (mRoot.TryGetProperty("personaRole", out var pr)) personaRole = pr.GetString();
                         if (mRoot.TryGetProperty("personaPrompt", out var pp)) personaPrompt = pp.GetString();
+                        if (mRoot.TryGetProperty("jobId", out var jid)) jobId = jid.GetString();
+                        if (mRoot.TryGetProperty("projectId", out var projid)) projectId = projid.GetString();
+                        if (mRoot.TryGetProperty("gitBranch", out var gb)) gitBranch = gb.GetString();
+                        if (mRoot.TryGetProperty("workspaceType", out var wt)) workspaceType = wt.GetString();
                     }
                     catch { }
                 }
@@ -244,6 +249,10 @@ public class MeshClient
                         Model = model,
                         Effort = effort,
                         Mode = mode,
+                        JobId = jobId,
+                        ProjectId = projectId,
+                        GitBranch = gitBranch,
+                        WorkspaceType = workspaceType,
                         Attachments = attachments,
                         CreatedAt = createdAt
                     });

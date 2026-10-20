@@ -274,4 +274,125 @@ public class AgentMeshCliTests
             if (File.Exists(tempFile)) File.Delete(tempFile);
         }
     }
+
+    [Fact]
+    public async Task GitWorkspaceManager_DetectsRepo_PreparesBranch_AndCommitsChanges()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"agentmesh-git-{Guid.NewGuid()}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // Initially not a git repo
+            var isGitBefore = await GitWorkspaceManager.IsGitRepositoryAsync(tempDir);
+            isGitBefore.Should().BeFalse();
+
+            // Initialize git repo
+            using var initProc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "init -b main",
+                WorkingDirectory = tempDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            })!;
+            await initProc.WaitForExitAsync();
+
+            // Set git user config locally for the test repo
+            using var configName = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "config user.name \"Test Runner\"",
+                WorkingDirectory = tempDir,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            })!;
+            await configName.WaitForExitAsync();
+
+            using var configEmail = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "config user.email \"runner@test.local\"",
+                WorkingDirectory = tempDir,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            })!;
+            await configEmail.WaitForExitAsync();
+
+            // Create initial commit on main
+            File.WriteAllText(Path.Combine(tempDir, "README.md"), "# Test Repo");
+            using var addProc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "add -A",
+                WorkingDirectory = tempDir,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            })!;
+            await addProc.WaitForExitAsync();
+
+            using var commitProc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "commit -m \"initial commit\"",
+                WorkingDirectory = tempDir,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            })!;
+            await commitProc.WaitForExitAsync();
+
+            // Now detected as git repo
+            var isGitAfter = await GitWorkspaceManager.IsGitRepositoryAsync(tempDir);
+            isGitAfter.Should().BeTrue();
+
+            // Prepare job branch
+            var logs = new List<string>();
+            await GitWorkspaceManager.PrepareJobBranchAsync(tempDir, "mesh/job-auth-oauth", msg => logs.Add(msg));
+
+            // Verify branch switched
+            using var branchProc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "branch --show-current",
+                WorkingDirectory = tempDir,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            })!;
+            var currentBranch = (await branchProc.StandardOutput.ReadToEndAsync()).Trim();
+            await branchProc.WaitForExitAsync();
+            currentBranch.Should().Be("mesh/job-auth-oauth");
+
+            // Make a file change during persona turn
+            File.WriteAllText(Path.Combine(tempDir, "auth.ts"), "export const auth = () => true;");
+
+            // Commit turn changes
+            await GitWorkspaceManager.CommitTurnChangesAsync(
+                tempDir,
+                "mesh/job-auth-oauth",
+                "astra",
+                "Astra",
+                "Implement OAuth handlers for authentication",
+                msg => logs.Add(msg));
+
+            // Verify git log
+            using var logProc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "log -1 --pretty=format:\"%an <%ae> - %s\"",
+                WorkingDirectory = tempDir,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            })!;
+            var lastCommit = (await logProc.StandardOutput.ReadToEndAsync()).Trim();
+            await logProc.WaitForExitAsync();
+
+            lastCommit.Should().Contain("Astra <astra-bot@agentmesh.local>");
+            lastCommit.Should().Contain("feat(job): turn by @astra");
+            lastCommit.Should().Contain("Implement OAuth handlers");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
 }

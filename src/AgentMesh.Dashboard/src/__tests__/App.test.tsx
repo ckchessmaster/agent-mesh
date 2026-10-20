@@ -1672,6 +1672,75 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
       expect(screen.queryByTestId('attachment-lightbox')).not.toBeInTheDocument();
     });
   });
+
+  it('correctly parses and renders attachments serialized with PascalCase or missing downloadUrl without producing undefined in URL or 0 B', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-core',
+      name: 'AgentMesh Core',
+      status: 'online',
+      runtimeType: 'CliAntigravity',
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-pascal-att',
+      title: 'Pascal Case Attachment Session',
+      status: 'active',
+      creatorAgentId: 'agy-core',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const pascalMessage: SessionMessage = {
+      id: 'msg-pascal-1',
+      sessionId: 'session-pascal-att',
+      senderAgentId: 'admin',
+      eventType: 'prompt',
+      content: 'give me a 1 sentence overview',
+      structuredPayloadJson: JSON.stringify({
+        attachments: [
+          {
+            Id: 'att-doc-999',
+            SessionId: 'session-pascal-att',
+            FileName: 'financial-report.pdf',
+            ContentType: 'application/pdf',
+            SizeBytes: 1048576,
+            S3Key: 'sessions/session-pascal-att/attachments/att-doc-999/financial-report.pdf',
+            DownloadUrl: '/api/sessions/session-pascal-att/attachments/att-doc-999/content',
+            CreatedAt: new Date().toISOString()
+          }
+        ]
+      }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([pascalMessage]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Pascal Case Attachment Session').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Pascal Case Attachment Session')[0]);
+
+    await waitFor(() => {
+      // Filename should be rendered
+      expect(screen.getByText('financial-report.pdf')).toBeInTheDocument();
+      // Size should be formatted (1.0 MB, NOT 0 B)
+      expect(screen.getByText('1.0 MB')).toBeInTheDocument();
+    });
+
+    // Download link must NOT contain 'undefined'
+    const downloadLink = screen.getByRole('link', { name: /financial-report\.pdf/i });
+    expect(downloadLink).toBeInTheDocument();
+    expect(downloadLink).toHaveAttribute('href', expect.stringContaining('/api/sessions/session-pascal-att/attachments/att-doc-999/content'));
+    expect(downloadLink.getAttribute('href')).not.toContain('undefined');
+  });
 });
 
 

@@ -26,4 +26,7 @@ public class Persona
 
     [JsonIgnore]
     public ICollection<AgentSession> Sessions { get; set; } = new List<AgentSession>();
+
+    [JsonIgnore]
+    public ICollection<ProjectPersona> ProjectPersonas { get; set; } = new List<ProjectPersona>();
 }

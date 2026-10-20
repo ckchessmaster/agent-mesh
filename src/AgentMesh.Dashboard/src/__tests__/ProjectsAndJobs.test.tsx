@@ -1,0 +1,347 @@
+// @vitest-environment jsdom
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import App from '../App';
+import { api } from '../services/api';
+import type { Persona, Project, ProjectJob, JobTask, JobMessage } from '../types';
+import { WorkspaceType, ProjectJobStatus } from '../types';
+
+vi.mock('../services/api', () => ({
+  api: {
+    getStatus: vi.fn(),
+    getAgents: vi.fn(),
+    getPersonas: vi.fn(),
+    getSessions: vi.fn(),
+    getSessionMessages: vi.fn(),
+    getSessionArtifacts: vi.fn(),
+    getCapabilities: vi.fn(),
+    getAgentUsage: vi.fn(),
+    getProjects: vi.fn(),
+    getProject: vi.fn(),
+    createProject: vi.fn(),
+    updateProject: vi.fn(),
+    deleteProject: vi.fn(),
+    getProjectJobs: vi.fn(),
+    getProjectJob: vi.fn(),
+    createProjectJob: vi.fn(),
+    updateProjectJob: vi.fn(),
+    deleteProjectJob: vi.fn(),
+    getJobTasks: vi.fn(),
+    addJobTask: vi.fn(),
+    updateJobTask: vi.fn(),
+    deleteJobTask: vi.fn(),
+    getJobMessages: vi.fn(),
+    postJobMessage: vi.fn(),
+    completeJob: vi.fn()
+  }
+}));
+
+vi.mock('../auth/AuthProvider', () => ({
+  useAuth: vi.fn(() => ({
+    isAuthenticated: true,
+    isLoading: false,
+    user: {
+      profile: {
+        email: 'admin',
+        name: 'admin'
+      },
+      access_token: 'mock-jwt-token'
+    },
+    signinRedirect: vi.fn(),
+    signoutRedirect: vi.fn()
+  }))
+}));
+
+const mockSignalRConnection = {
+  on: vi.fn(),
+  off: vi.fn(),
+  invoke: vi.fn().mockResolvedValue(undefined)
+};
+
+vi.mock('../hooks/useSignalR', () => ({
+  useSignalR: () => ({
+    connection: mockSignalRConnection,
+    connected: true
+  })
+}));
+
+describe('Projects & Multi-Persona Jobs Workflow', () => {
+  const mockAstraPersona: Persona = {
+    id: 'astra',
+    name: 'Astra',
+    role: 'Tech Lead',
+    personaPrompt: 'You are Astra, Engineering Tech Lead.',
+    driverId: 'agy',
+    trustTier: 2,
+    createdAt: new Date().toISOString()
+  };
+
+  const mockQaPersona: Persona = {
+    id: 'qa-tester',
+    name: 'QA Tester',
+    role: 'Quality Engineer',
+    personaPrompt: 'You are QA Tester.',
+    driverId: 'agy',
+    trustTier: 1,
+    createdAt: new Date().toISOString()
+  };
+
+  const mockProject: Project = {
+    id: 'mesh-core',
+    name: 'Mesh Core System',
+    description: 'Autonomous multi-agent platform',
+    workspaceType: WorkspaceType.Git,
+    gitRepositoryUrl: 'https://github.com/example/mesh.git',
+    gitBaseBranch: 'main',
+    projectInstructions: 'Maintain clean architecture and tests.',
+    defaultLeadPersonaId: 'astra',
+    defaultLeadPersonaName: 'Astra',
+    assignedPersonas: [
+      { id: 'astra', name: 'Astra', role: 'Tech Lead', driverId: 'agy' },
+      { id: 'qa-tester', name: 'QA Tester', role: 'Quality Engineer', driverId: 'agy' }
+    ],
+    jobCount: 1,
+    activeJobCount: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const mockTasks: JobTask[] = [
+    { id: 'task-1', title: 'Implement OAuth endpoints', isCompleted: true, completedAt: new Date().toISOString() },
+    { id: 'task-2', title: 'Write integration test coverage', isCompleted: false }
+  ];
+
+  const mockJob: ProjectJob = {
+    id: 'job-101',
+    projectId: 'mesh-core',
+    projectName: 'Mesh Core System',
+    title: 'Implement OAuth Provider',
+    description: 'Add Google & GitHub OAuth handlers',
+    status: ProjectJobStatus.Active,
+    gitBranchName: 'mesh/job-auth-oauth',
+    tasks: mockTasks,
+    messageCount: 2,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const mockMessages: JobMessage[] = [
+    {
+      id: 'm-1',
+      jobId: 'job-101',
+      senderType: 'user',
+      content: '@astra please implement the OAuth endpoints',
+      mentions: ['astra'],
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: 'm-2',
+      jobId: 'job-101',
+      senderType: 'persona',
+      senderId: 'astra',
+      senderName: 'Astra',
+      content: 'I have finished the OAuth controller. @qa-tester please test token exchange edge cases.',
+      mentions: ['qa-tester'],
+      turnSessionId: 'sess-turn-456',
+      createdAt: new Date().toISOString()
+    }
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getStatus).mockResolvedValue({
+      status: 'Healthy',
+      timestamp: new Date().toISOString(),
+      environment: 'Development',
+      services: {
+        api: { status: 'Healthy', latencyMs: 2, description: 'ASP.NET Core 10 Web API' }
+      }
+    });
+    vi.mocked(api.getAgents).mockResolvedValue([]);
+    vi.mocked(api.getPersonas).mockResolvedValue([mockAstraPersona, mockQaPersona]);
+    vi.mocked(api.getSessions).mockResolvedValue([]);
+    vi.mocked(api.getCapabilities).mockResolvedValue({
+      workspace: {
+        defaultSandboxPath: '~/.agentmesh/workspaces/<session-id>',
+        currentDirectory: '/workspace/agent-mesh',
+        userHome: '/home/testuser',
+        bookmarks: [
+          { label: 'Default Sandbox', path: '', description: 'Sandbox' },
+          { label: 'Current Project', path: '/workspace/agent-mesh', description: 'Project' },
+          { label: 'User Home', path: '/home/testuser', description: 'Home' }
+        ]
+      },
+      agentRuntimes: {
+        agy: {
+          adapter: 'agy',
+          name: 'Antigravity CLI (agy)',
+          modes: [
+            { id: 'auto', label: 'Auto (Autonomous)', description: 'Auto execution' },
+            { id: 'plan', label: 'Plan Only', description: 'Plan only' }
+          ],
+          models: [
+            { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] }
+          ]
+        }
+      }
+    } as any);
+    vi.mocked(api.getProjects).mockResolvedValue([mockProject]);
+    vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob]);
+    vi.mocked(api.getJobTasks).mockResolvedValue(mockTasks);
+    vi.mocked(api.getJobMessages).mockResolvedValue(mockMessages);
+  });
+
+  it('renders Projects & Jobs tab and auto-selects project and job into the Job Cockpit', async () => {
+    render(<App />);
+
+    // Top tab button exists and indicates projects count
+    await waitFor(() => {
+      expect(screen.getByText('Projects & Jobs')).toBeInTheDocument();
+    });
+
+    // Project name in sidebar
+    await waitFor(() => {
+      expect(screen.getAllByText('Mesh Core System').length).toBeGreaterThan(0);
+    });
+
+    // Clicking the job in the sidebar opens JobCockpit
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    // Job Cockpit header displays branch and project details
+    await waitFor(() => {
+      expect(screen.getByText('mesh/job-auth-oauth')).toBeInTheDocument();
+      expect(screen.getByText('Active Job')).toBeInTheDocument();
+      expect(screen.getByText('Complete & Merge Job')).toBeInTheDocument();
+    });
+
+    // Task checklist bar displays progress (1/2 completed)
+    expect(screen.getByText(/1\/2 completed/i)).toBeInTheDocument();
+    expect(screen.getByText('Implement OAuth endpoints')).toBeInTheDocument();
+    expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+
+    // Messages render in chat feed with persona badges and two-tier trajectory button
+    expect(screen.getByText('@astra please implement the OAuth endpoints')).toBeInTheDocument();
+    expect(screen.getByText(/I have finished the OAuth controller/)).toBeInTheDocument();
+    expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
+
+    // Quick mention chips are visible
+    expect(screen.getAllByText('@astra').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('@qa-tester').length).toBeGreaterThan(0);
+  });
+
+  it('allows clicking quick mention chip to insert persona mention into prompt input and sending message', async () => {
+    vi.mocked(api.postJobMessage).mockResolvedValue({
+      id: 'm-3',
+      jobId: 'job-101',
+      senderType: 'user',
+      content: '@qa-tester please verify token expiration',
+      mentions: ['qa-tester'],
+      createdAt: new Date().toISOString()
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('@qa-tester').length).toBeGreaterThan(0);
+    });
+
+    // Click mention chip (the button element)
+    const mentionButtons = screen.getAllByRole('button', { name: /@qa-tester/i });
+    fireEvent.click(mentionButtons[0]);
+
+    const textarea = screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i);
+    expect((textarea as HTMLTextAreaElement).value).toContain('@qa-tester ');
+
+    // Type the rest of the message
+    fireEvent.change(textarea, { target: { value: '@qa-tester please verify token expiration' } });
+
+    // Submit message
+    const sendBtn = screen.getByTitle('Send Message');
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
+        content: '@qa-tester please verify token expiration',
+        senderType: 'user'
+      });
+    });
+  });
+
+  it('allows toggling task checklist items and adding a new task', async () => {
+    vi.mocked(api.updateJobTask).mockResolvedValue({
+      id: 'task-2',
+      title: 'Write integration test coverage',
+      isCompleted: true,
+      completedAt: new Date().toISOString()
+    });
+
+    vi.mocked(api.addJobTask).mockResolvedValue({
+      id: 'task-3',
+      title: 'Deploy to staging',
+      isCompleted: false
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+    });
+
+    // Add new task
+    const addTaskInput = screen.getByPlaceholderText('+ Add task...');
+    fireEvent.change(addTaskInput, { target: { value: 'Deploy to staging' } });
+    fireEvent.submit(addTaskInput.closest('form')!);
+
+    await waitFor(() => {
+      expect(api.addJobTask).toHaveBeenCalledWith('job-101', { title: 'Deploy to staging' });
+    });
+  });
+
+  it('supports completing and merging a job with result summary', async () => {
+    vi.mocked(api.completeJob).mockResolvedValue({
+      ...mockJob,
+      status: ProjectJobStatus.Completed,
+      resultSummary: 'OAuth verified across all providers'
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Complete & Merge Job')).toBeInTheDocument();
+    });
+
+    // Click Complete & Merge Job to open confirmation
+    fireEvent.click(screen.getByText('Complete & Merge Job'));
+
+    expect(screen.getByPlaceholderText('Summary of deliverables...')).toBeInTheDocument();
+    const summaryInput = screen.getByPlaceholderText('Summary of deliverables...');
+    fireEvent.change(summaryInput, { target: { value: 'OAuth verified across all providers' } });
+
+    // Confirm merge
+    fireEvent.click(screen.getByText('Confirm & Merge'));
+
+    await waitFor(() => {
+      expect(api.completeJob).toHaveBeenCalledWith('job-101', {
+        resultSummary: 'OAuth verified across all providers'
+      });
+    });
+  });
+});

@@ -224,6 +224,82 @@ export interface SessionAttachment {
   createdAt: string;
 }
 
+export const WorkspaceType = {
+  Git: 0,
+  S3Archive: 1
+} as const;
+export type WorkspaceType = (typeof WorkspaceType)[keyof typeof WorkspaceType];
+
+export const ProjectJobStatus = {
+  Active: 0,
+  Completed: 1,
+  Archived: 2
+} as const;
+export type ProjectJobStatus = (typeof ProjectJobStatus)[keyof typeof ProjectJobStatus];
+
+export interface ProjectPersonaSummary {
+  id: string;
+  name: string;
+  role: string;
+  driverId: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  description: string;
+  workspaceType: WorkspaceType | number;
+  gitRepositoryUrl?: string | null;
+  gitBaseBranch: string;
+  s3BucketName?: string | null;
+  s3PrefixKey?: string | null;
+  projectInstructions: string;
+  defaultLeadPersonaId?: string | null;
+  defaultLeadPersonaName?: string | null;
+  assignedPersonas: ProjectPersonaSummary[];
+  jobCount: number;
+  activeJobCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface JobTask {
+  id: string;
+  title: string;
+  isCompleted: boolean;
+  assignedPersonaId?: string | null;
+  completedAt?: string | null;
+}
+
+export interface ProjectJob {
+  id: string;
+  projectId: string;
+  projectName?: string | null;
+  title: string;
+  description: string;
+  status: ProjectJobStatus | number;
+  gitBranchName: string;
+  s3ArchiveKey?: string | null;
+  tasks: JobTask[];
+  resultSummary?: string | null;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface JobMessage {
+  id: string;
+  jobId: string;
+  senderType: 'user' | 'persona' | string;
+  senderId?: string | null;
+  senderName?: string | null;
+  content: string;
+  mentions: string[];
+  turnSessionId?: string | null;
+  structuredPayloadJson?: string | null;
+  createdAt: string;
+}
+
 export interface QueuedPromptItem {
   id: string;
   prompt: string;

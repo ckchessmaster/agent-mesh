@@ -68,6 +68,18 @@ public class PromptReceivedEvent
     [JsonPropertyName("tier")]
     public string? Tier { get; set; }
 
+    [JsonPropertyName("jobId")]
+    public string? JobId { get; set; }
+
+    [JsonPropertyName("projectId")]
+    public string? ProjectId { get; set; }
+
+    [JsonPropertyName("gitBranch")]
+    public string? GitBranch { get; set; }
+
+    [JsonPropertyName("workspaceType")]
+    public string? WorkspaceType { get; set; }
+
     [JsonPropertyName("attachments")]
     public List<AttachmentItem>? Attachments { get; set; }
 

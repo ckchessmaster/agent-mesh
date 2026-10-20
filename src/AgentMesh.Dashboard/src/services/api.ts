@@ -3,7 +3,12 @@ import type {
   AgentSession,
   AgentUsageResponse,
   FilesystemBrowseResponse,
+  JobMessage,
+  JobTask,
   Persona,
+  Project,
+  ProjectJob,
+  ProjectPersonaSummary,
   QueuedPromptItem,
   SessionAttachment,
   SessionMessage,
@@ -371,7 +376,26 @@ export const api = {
       }
       throw new Error(`Failed to upload attachments: ${errMsg}`);
     }
-    return res.json();
+    const raw = await res.json();
+    return (Array.isArray(raw) ? raw : []).map((item: any) => {
+      const id = item.id || item.Id || '';
+      const fileName = item.fileName || item.FileName || item.name || item.Name || '';
+      const targetId = id || fileName;
+      return {
+        id,
+        sessionId: item.sessionId || item.SessionId || sessionId,
+        fileName,
+        contentType: item.contentType || item.ContentType || 'application/octet-stream',
+        sizeBytes: typeof item.sizeBytes === 'number'
+          ? item.sizeBytes
+          : typeof item.SizeBytes === 'number'
+          ? item.SizeBytes
+          : 0,
+        s3Key: item.s3Key || item.S3Key || '',
+        downloadUrl: item.downloadUrl || item.DownloadUrl || (targetId ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(targetId)}/content` : ''),
+        createdAt: item.createdAt || item.CreatedAt || new Date().toISOString()
+      };
+    });
   },
 
   async postSessionMessage(
@@ -504,6 +528,208 @@ export const api = {
       headers: getHeaders()
     });
     if (!res.ok) throw new Error(`Failed to reset mesh data: ${res.statusText}`);
+    return res.json();
+  },
+
+  // Projects API
+  async getProjects(): Promise<Project[]> {
+    const res = await fetch('/api/projects', { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load projects: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getProject(id: string): Promise<Project> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load project: ${res.statusText}`);
+    return res.json();
+  },
+
+  async createProject(req: {
+    name: string;
+    id?: string;
+    description?: string;
+    workspaceType?: number;
+    gitRepositoryUrl?: string;
+    gitBaseBranch?: string;
+    s3BucketName?: string;
+    s3PrefixKey?: string;
+    projectInstructions?: string;
+    defaultLeadPersonaId?: string;
+    allowedPersonaIds?: string[];
+  }): Promise<Project> {
+    const res = await fetch('/api/projects', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to create project: ${res.statusText}`);
+    return res.json();
+  },
+
+  async updateProject(id: string, req: {
+    name?: string;
+    description?: string;
+    workspaceType?: number;
+    gitRepositoryUrl?: string;
+    gitBaseBranch?: string;
+    s3BucketName?: string;
+    s3PrefixKey?: string;
+    projectInstructions?: string;
+    defaultLeadPersonaId?: string;
+    allowedPersonaIds?: string[];
+  }): Promise<Project> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to update project: ${res.statusText}`);
+    return res.json();
+  },
+
+  async deleteProject(id: string): Promise<{ status: string; id: string; deletedJobsCount: number }> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to delete project: ${res.statusText}`);
+    return res.json();
+  },
+
+  async assignProjectPersona(projectId: string, personaId: string): Promise<ProjectPersonaSummary> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/personas`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ personaId })
+    });
+    if (!res.ok) throw new Error(`Failed to assign persona: ${res.statusText}`);
+    return res.json();
+  },
+
+  async removeProjectPersona(projectId: string, personaId: string): Promise<{ status: string }> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/personas/${encodeURIComponent(personaId)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to remove persona: ${res.statusText}`);
+    return res.json();
+  },
+
+  // Project Jobs API
+  async getProjectJobs(projectId: string): Promise<ProjectJob[]> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load project jobs: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getProjectJob(id: string): Promise<ProjectJob> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load job: ${res.statusText}`);
+    return res.json();
+  },
+
+  async createProjectJob(projectId: string, req: {
+    title: string;
+    description?: string;
+    gitBranchName?: string;
+    initialTasks?: string[];
+  }): Promise<ProjectJob> {
+    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to create job: ${res.statusText}`);
+    return res.json();
+  },
+
+  async updateProjectJob(id: string, req: {
+    title?: string;
+    description?: string;
+    status?: number;
+    resultSummary?: string;
+  }): Promise<ProjectJob> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to update job: ${res.statusText}`);
+    return res.json();
+  },
+
+  async deleteProjectJob(id: string): Promise<{ status: string; id: string; projectId: string }> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to delete job: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getJobTasks(id: string): Promise<JobTask[]> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load job tasks: ${res.statusText}`);
+    return res.json();
+  },
+
+  async addJobTask(id: string, req: { title: string; assignedPersonaId?: string }): Promise<JobTask> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to add task: ${res.statusText}`);
+    return res.json();
+  },
+
+  async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; assignedPersonaId?: string }): Promise<JobTask> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to update task: ${res.statusText}`);
+    return res.json();
+  },
+
+  async deleteJobTask(id: string, taskId: string): Promise<{ status: string; taskId: string }> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to delete task: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getJobMessages(id: string): Promise<JobMessage[]> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load job messages: ${res.statusText}`);
+    return res.json();
+  },
+
+  async postJobMessage(id: string, req: {
+    content: string;
+    senderType?: string;
+    senderId?: string;
+    senderName?: string;
+  }): Promise<JobMessage> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to post job message: ${res.statusText}`);
+    return res.json();
+  },
+
+  async completeJob(id: string, req?: { resultSummary?: string }): Promise<ProjectJob> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/complete`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req || {})
+    });
+    if (!res.ok) throw new Error(`Failed to complete job: ${res.statusText}`);
     return res.json();
   }
 };
