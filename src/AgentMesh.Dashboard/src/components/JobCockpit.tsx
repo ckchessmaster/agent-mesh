@@ -22,9 +22,10 @@ import {
   X,
   ZoomIn,
   Download,
-  AlertCircle
+  AlertCircle,
+  Square
 } from 'lucide-react';
-import type { JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
+import type { AgentSession, JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
 import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
 import { api } from '../services/api';
@@ -157,6 +158,8 @@ interface JobCockpitProps {
   onOpenLightbox?: (item: { url: string; fileName: string; sizeBytes?: number }) => void;
   onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
   onEditProject?: () => void;
+  onStopTurn?: (sessionId: string) => Promise<void>;
+  sessions?: AgentSession[];
 }
 
 export const JobCockpit: React.FC<JobCockpitProps> = ({
@@ -165,6 +168,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   tasks,
   messages,
   personas = [],
+  sessions = [],
   onSendMessage,
   onAddTask,
   onToggleTask,
@@ -173,7 +177,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onSelectTurnSession,
   onOpenLightbox,
   onUploadAttachments,
-  onEditProject
+  onEditProject,
+  onStopTurn
 }) => {
   const [prompt, setPrompt] = useState('');
   const [newTaskTitle, setNewTaskTitle] = useState('');
@@ -263,6 +268,13 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     if (messages.length === 0) return null;
     const lastMsg = messages[messages.length - 1];
 
+    if (lastMsg.turnSessionId && sessions.length > 0) {
+      const turnSession = sessions.find((s) => s.id === lastMsg.turnSessionId);
+      if (turnSession && turnSession.status !== 'thinking' && turnSession.status !== 'waiting_for_input') {
+        return null;
+      }
+    }
+
     if (lastMsg.senderType === 'user' && lastMsg.turnSessionId) {
       const mention = lastMsg.mentions?.[0];
       const personaObj =
@@ -290,7 +302,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
 
     return null;
-  }, [messages, isSending, personas, project.assignedPersonas]);
+  }, [messages, isSending, personas, project.assignedPersonas, sessions]);
 
   // Filtered task items for the structured checklist
   const uniqueTasks = useMemo(() => {
@@ -1118,15 +1130,29 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               </div>
             </div>
             {activeTurnInfo.turnSessionId && (
-              <button
-                type="button"
-                onClick={() => onSelectTurnSession?.(activeTurnInfo.turnSessionId!)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 hover:text-white border border-sky-500/40 text-xs font-semibold transition cursor-pointer shrink-0 shadow-sm"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-sky-400" />
-                <span>View Trajectory</span>
-                <ChevronRight className="w-3.5 h-3.5" />
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                {onStopTurn && (
+                  <button
+                    type="button"
+                    onClick={() => onStopTurn(activeTurnInfo.turnSessionId!)}
+                    title="Stop active turn execution"
+                    data-testid="job-stop-turn-btn"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white border border-rose-500/40 text-xs font-semibold transition cursor-pointer shrink-0 shadow-sm animate-pulse"
+                  >
+                    <Square className="w-3.5 h-3.5 fill-current" />
+                    <span>Stop</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onSelectTurnSession?.(activeTurnInfo.turnSessionId!)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 hover:text-white border border-sky-500/40 text-xs font-semibold transition cursor-pointer shrink-0 shadow-sm"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                  <span>View Trajectory</span>
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
             )}
           </div>
         )}

@@ -1317,6 +1317,11 @@ public class SessionsController(
                     await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
                 }
             }
+            else
+            {
+                // Queue is empty: session completed turn and returned to active/idle. Notify all clients to clear thinking/stop button state!
+                await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+            }
         }
 
         return CreatedAtAction(nameof(GetMessages), new { id }, messageDto);

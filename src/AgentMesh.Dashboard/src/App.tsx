@@ -735,7 +735,14 @@ export default function App() {
             ? {
                 ...s,
                 messageCount: (s.messageCount || 0) + 1,
-                status: (msg.eventType === 'prompt' || msg.eventType === 'thought' || msg.eventType === 'tool_call') ? 'thinking' : s.status,
+                status:
+                  msg.eventType === 'tool_call' && (msg.toolName === 'ask_question' || msg.toolName === 'ask_user')
+                    ? 'waiting_for_input'
+                    : (msg.eventType === 'prompt' || msg.eventType === 'thought' || msg.eventType === 'tool_call')
+                    ? 'thinking'
+                    : msg.eventType === 'response'
+                    ? (s.status === 'waiting_for_input' ? 'waiting_for_input' : 'active')
+                    : s.status,
                 updatedAt: msg.createdAt || new Date().toISOString()
               }
             : s
@@ -777,7 +784,12 @@ export default function App() {
       });
     };
 
-    const handleSessionUpdated = () => {
+    const handleSessionUpdated = (updatedSession?: AgentSession) => {
+      if (updatedSession?.id) {
+        setSessions((prev) =>
+          prev.map((s) => (s.id === updatedSession.id ? { ...s, ...updatedSession } : s))
+        );
+      }
       fetchAllData();
       if (selectedSessionId) {
         fetchSessionArtifacts(selectedSessionId);
@@ -1806,13 +1818,16 @@ export default function App() {
     }
   };
 
-  const handleStopSession = async () => {
-    if (!selectedSessionId) return;
+  const handleStopSession = async (sessionId?: string | React.MouseEvent) => {
+    const targetSessionId = typeof sessionId === 'string' && sessionId ? sessionId : selectedSessionId;
+    if (!targetSessionId) return;
     setIsActionPending(true);
     try {
-      await api.stopSession(selectedSessionId);
+      await api.stopSession(targetSessionId);
       await fetchAllData();
-      await fetchSessionEvents(selectedSessionId);
+      if (selectedSessionId) {
+        await fetchSessionEvents(selectedSessionId);
+      }
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Failed to stop model');
     } finally {
@@ -2789,12 +2804,14 @@ export default function App() {
                     tasks={jobTasks}
                     messages={jobMessages}
                     personas={personas}
+                    sessions={sessions}
                     onSendMessage={handleSendJobMessage}
                     onAddTask={handleAddTask}
                     onToggleTask={handleToggleTask}
                     onDeleteTask={handleDeleteTask}
                     onCompleteJob={handleCompleteJob}
                     onOpenLightbox={setLightboxAttachment}
+                    onStopTurn={handleStopSession}
                     onEditProject={() => {
                       setEditingProject(activeProj);
                       setShowProjectModal(true);

@@ -406,7 +406,8 @@ public class ProjectJobsController(
     }
 
     [HttpPost("api/project-jobs/{id}/attachments")]
-    public async Task<IActionResult> UploadJobAttachments(Guid id, IFormFileCollection? files = null)
+    [RequestSizeLimit(262_144_000)]
+    public async Task<IActionResult> UploadJobAttachments(Guid id, [FromForm] IFormFileCollection? files = null)
     {
         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
         if (job == null)

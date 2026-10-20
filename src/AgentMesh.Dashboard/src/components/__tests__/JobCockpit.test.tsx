@@ -452,9 +452,9 @@ describe('JobCockpit - Attachment Support', () => {
 
   it('renders structured collapsible task checklist, allows expanding/collapsing and filtering', async () => {
     const mockTasksList: JobTask[] = [
-      { id: 't-1', jobId: 'job-101', title: 'Task Alpha', isCompleted: true },
-      { id: 't-2', jobId: 'job-101', title: 'Task Beta', isCompleted: false },
-      { id: 't-3', jobId: 'job-101', title: 'Task Gamma', isCompleted: false }
+      { id: 't-1', title: 'Task Alpha', isCompleted: true },
+      { id: 't-2', title: 'Task Beta', isCompleted: false },
+      { id: 't-3', title: 'Task Gamma', isCompleted: false }
     ];
 
     render(
@@ -501,5 +501,73 @@ describe('JobCockpit - Attachment Support', () => {
     fireEvent.click(editBtn);
 
     expect(onEditProject).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders stop button in active turn feedback card and invokes onStopTurn with turnSessionId', () => {
+    const onStopTurn = vi.fn();
+    const activeMessages: JobMessage[] = [
+      {
+        id: 'msg-1',
+        jobId: 'job-1',
+        senderType: 'user',
+        senderId: 'user-1',
+        senderName: 'User',
+        content: '@persona-1 please write tests',
+        mentions: ['persona-1'],
+        turnSessionId: 'session-turn-999',
+        createdAt: '2026-10-20T10:00:00Z'
+      }
+    ];
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={activeMessages}
+        onStopTurn={onStopTurn}
+      />
+    );
+
+    const stopBtn = screen.getByTestId('job-stop-turn-btn');
+    expect(stopBtn).toBeInTheDocument();
+    fireEvent.click(stopBtn);
+
+    expect(onStopTurn).toHaveBeenCalledWith('session-turn-999');
+  });
+
+  it('hides active turn feedback card when sessions list indicates turn session is idle or completed', () => {
+    const activeMessages: JobMessage[] = [
+      {
+        id: 'msg-1',
+        jobId: 'job-1',
+        senderType: 'user',
+        senderId: 'user-1',
+        senderName: 'User',
+        content: '@persona-1 please write tests',
+        mentions: ['persona-1'],
+        turnSessionId: 'session-turn-999',
+        createdAt: '2026-10-20T10:00:00Z'
+      }
+    ];
+
+    // Session is active (not thinking)
+    const sessions = [
+      {
+        id: 'session-turn-999',
+        title: 'Job Turn',
+        status: 'active',
+        createdAt: '2026-10-20T10:00:00Z',
+        updatedAt: '2026-10-20T10:01:00Z'
+      }
+    ];
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={activeMessages}
+        sessions={sessions as any}
+      />
+    );
+
+    expect(screen.queryByTestId('job-active-turn-indicator')).not.toBeInTheDocument();
   });
 });
