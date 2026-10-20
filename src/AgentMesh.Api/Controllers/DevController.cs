@@ -24,6 +24,9 @@ public class DevController(AgentMeshDbContext db, IHubContext<AgentMeshHub> hubC
         var sessions = await db.AgentSessions.ToListAsync();
         db.AgentSessions.RemoveRange(sessions);
 
+        var personas = await db.Personas.ToListAsync();
+        db.Personas.RemoveRange(personas);
+
         var agents = await db.Agents.ToListAsync();
         db.Agents.RemoveRange(agents);
 

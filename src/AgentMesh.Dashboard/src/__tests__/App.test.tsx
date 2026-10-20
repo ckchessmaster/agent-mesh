@@ -5,6 +5,7 @@ import { api } from '../services/api';
 import type {
   Agent,
   AgentSession,
+  Persona,
   SessionMessage,
   SystemCapabilitiesResponse,
   SystemStatusResponse
@@ -48,6 +49,13 @@ vi.mock('../services/api', () => ({
       ]
     }),
     getAgents: vi.fn().mockResolvedValue([]),
+    getPersonas: vi.fn().mockResolvedValue([]),
+    createPersona: vi.fn(),
+    updatePersona: vi.fn(),
+    deletePersona: vi.fn(),
+    createPersonaSession: vi.fn(),
+    deleteSession: vi.fn(),
+    uploadSessionAttachments: vi.fn(),
     getAgentUsage: vi.fn().mockResolvedValue({
       agentId: 'agy-core',
       agentName: 'Agy Lead Architect',
@@ -166,6 +174,7 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       ]
     });
     vi.mocked(api.getAgents).mockResolvedValue([]);
+    vi.mocked(api.getPersonas).mockResolvedValue([]);
     vi.mocked(api.getSessions).mockResolvedValue([]);
     vi.mocked(api.getSessionMessages).mockResolvedValue([]);
   });
@@ -1177,6 +1186,490 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
 
     await waitFor(() => {
       expect(screen.getByText(/# Architecture Specification/i)).toBeInTheDocument();
+    });
+  });
+
+  it('supports creating a Persona, launching a session with Persona default model, and viewing sessions at both Persona and Driver levels', async () => {
+    const mockDriver: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      role: 'Autonomous Codebase Driver',
+      status: 'online',
+      runtimeType: 'CliAgy',
+      trustTier: 3,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockPersona: Persona = {
+      id: 'sec-auditor',
+      name: 'Security Auditor',
+      role: 'Principal AppSec Architect',
+      personaPrompt: 'Review all authentication and token flows.',
+      driverId: 'agy',
+      driverName: 'Antigravity CLI',
+      driverStatus: 'online',
+      defaultModel: 'gemini-4-argon',
+      defaultEffort: 'high',
+      defaultMode: 'plan',
+      trustTier: 3,
+      sessionCount: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockPersonaSession: AgentSession = {
+      id: 'sess-persona-1',
+      title: 'Audit OIDC Handshake',
+      status: 'active',
+      personaId: 'sec-auditor',
+      personaName: 'Security Auditor',
+      driverId: 'agy',
+      driverName: 'Antigravity CLI',
+      creatorAgentId: 'agy',
+      metadataJson: JSON.stringify({
+        personaId: 'sec-auditor',
+        personaName: 'Security Auditor',
+        model: 'gemini-4-argon',
+        effort: 'high',
+        mode: 'plan'
+      }),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockDriver]);
+    vi.mocked(api.getPersonas).mockResolvedValue([mockPersona]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockPersonaSession]);
+    vi.mocked(api.createPersonaSession).mockResolvedValue({
+      id: 'sess-persona-2',
+      title: 'Review JWT Scopes',
+      status: 'active',
+      personaId: 'sec-auditor',
+      driverId: 'agy',
+      creatorAgentId: 'agy',
+      metadataJson: '{}',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+
+    render(<App />);
+
+    // 1. Verify Personas & Sessions tab renders Persona card and its session
+    await waitFor(() => {
+      expect(screen.getByText('Security Auditor')).toBeInTheDocument();
+      expect(screen.getAllByText('Audit OIDC Handshake').length).toBeGreaterThan(0);
+    });
+
+    // Verify Active Session Header displays both Persona and Driver
+    expect(screen.getAllByText('@sec-auditor').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('@agy').length).toBeGreaterThan(0);
+
+    // 2. Click "+" on Persona to start a new session and verify Persona's default model/effort/mode are pre-selected
+    const newPersonaSessionBtn = screen.getByTitle('New Session with Security Auditor');
+    fireEvent.click(newPersonaSessionBtn);
+
+    expect(screen.getByText('Start New Session with Security Auditor')).toBeInTheDocument();
+    const selects = screen.getAllByRole('combobox');
+    expect((selects[0] as HTMLSelectElement).value).toBe('gemini-4-argon');
+    expect((selects[1] as HTMLSelectElement).value).toBe('high');
+    expect((selects[2] as HTMLSelectElement).value).toBe('plan');
+
+    // Can also access any other model on the Driver (e.g. gpt-oss-120b)
+    expect(screen.getByRole('option', { name: 'GPT-OSS 120b' })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText(/Refactor authentication middleware/i), {
+      target: { value: 'Review JWT Scopes' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Launch Session/i }));
+
+    await waitFor(() => {
+      expect(api.createPersonaSession).toHaveBeenCalledWith(
+        'sec-auditor',
+        'Review JWT Scopes',
+        undefined,
+        expect.objectContaining({
+          model: 'gemini-4-argon',
+          effort: 'high',
+          mode: 'plan'
+        })
+      );
+    });
+
+    // 3. Switch to "Drivers & Infrastructure" tab and verify the Driver shows associated Persona badge and session
+    fireEvent.click(screen.getByRole('button', { name: /Drivers & Infrastructure/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Antigravity CLI')).toBeInTheDocument();
+      expect(screen.getAllByText('Audit OIDC Handshake').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('@sec-auditor').length).toBeGreaterThan(0);
+    });
+  });
+
+  it('enforces mutual exclusivity between option pills and write-in input for single-select questions', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-qa',
+      name: 'Agy QA Agent',
+      status: 'online',
+      runtimeType: 1,
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-qa-mut',
+      title: 'Mutual Exclusivity Test',
+      status: 'waiting_for_input',
+      creatorAgentId: 'agy-qa',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const mockQuestionCall: SessionMessage = {
+      id: 'msg-question-mut',
+      sessionId: 'session-qa-mut',
+      senderAgentId: 'agy-qa',
+      eventType: 'tool_call',
+      toolName: 'ask_question',
+      content: 'Choose one storage provider:',
+      toolArgsJson: JSON.stringify({
+        questions: [
+          {
+            question: 'Choose one storage provider:',
+            options: ['S3', 'GCS', 'Azure Blob'],
+            is_multi_select: false
+          }
+        ]
+      }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([mockQuestionCall]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Mutual Exclusivity Test').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Mutual Exclusivity Test')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('S3')).toBeInTheDocument();
+      expect(screen.getByPlaceholderText(/Or type a custom write-in response.../i)).toBeInTheDocument();
+    });
+
+    const writeInInput = screen.getByPlaceholderText(/Or type a custom write-in response.../i) as HTMLInputElement;
+
+    // 1. Select 'S3' option pill
+    fireEvent.click(screen.getByText('S3'));
+
+    // 2. Change mind and type a write-in: 'MinIO'
+    fireEvent.change(writeInInput, { target: { value: 'MinIO' } });
+
+    // Submit Answer
+    fireEvent.click(screen.getByRole('button', { name: /Submit Answer/i }));
+
+    expect(api.submitQuestionAnswer).toHaveBeenCalledWith('session-qa-mut', {
+      toolCallId: 'msg-question-mut',
+      answers: [
+        {
+          questionIndex: 0,
+          question: 'Choose one storage provider:',
+          selectedOptions: [],
+          customText: 'MinIO'
+        }
+      ]
+    });
+  });
+
+  it('supports deleting a session from sidebar with inline confirmation', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-del',
+      name: 'Agy Delete Agent',
+      status: 'online',
+      runtimeType: 1,
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockPersona: Persona = {
+      id: 'del-persona',
+      name: 'Delete Test Persona',
+      role: 'Engineer',
+      personaPrompt: 'Delete test prompt',
+      trustTier: 1,
+      driverId: 'agy-del',
+      driverName: 'Agy Delete Agent',
+      driverStatus: 'online',
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession1: AgentSession = {
+      id: 'session-del-1',
+      title: 'Session to Remove',
+      status: 'active',
+      creatorAgentId: 'agy-del',
+      driverId: 'agy-del',
+      personaId: 'del-persona',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date(Date.now() - 1000).toISOString(),
+      updatedAt: new Date(Date.now() - 1000).toISOString()
+    };
+
+    const mockSession2: AgentSession = {
+      id: 'session-del-2',
+      title: 'Session Sibling',
+      status: 'active',
+      creatorAgentId: 'agy-del',
+      driverId: 'agy-del',
+      personaId: 'del-persona',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getPersonas).mockResolvedValue([mockPersona]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession1, mockSession2]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+    vi.mocked(api.deleteSession).mockResolvedValue({ status: 'deleted', id: 'session-del-1' });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Delete Test Persona')).toBeInTheDocument();
+      expect(screen.getByTitle('Delete session Session to Remove')).toBeInTheDocument();
+    });
+
+    // Find delete button for Session to Remove
+    const deleteBtn = screen.getByTitle('Delete session Session to Remove');
+    fireEvent.click(deleteBtn);
+
+    // Verify confirmation banner appears
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Confirm Delete/i })).toBeInTheDocument();
+    });
+
+    // Confirm deletion
+    fireEvent.click(screen.getByRole('button', { name: /Confirm Delete/i }));
+
+    await waitFor(() => {
+      expect(api.deleteSession).toHaveBeenCalledWith('session-del-1');
+      expect(screen.queryByTitle('Delete session Session to Remove')).not.toBeInTheDocument();
+    });
+  });
+
+  it('does not trigger question card on bullet lists with markdown links and embedded question marks in completed turns', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-core',
+      name: 'AgentMesh Core',
+      status: 'online',
+      runtimeType: 'CliAntigravity',
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-summary-1',
+      title: 'Implementation Summary',
+      status: 'completed',
+      creatorAgentId: 'agy-core',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const mockSummaryResponse: SessionMessage = {
+      id: 'msg-summary-1',
+      sessionId: 'session-summary-1',
+      senderAgentId: 'agy-core',
+      eventType: 'response',
+      content: `All features and bug fixes have been implemented:
+* **Sidebar UI**: Added hover trash icons to every session row in both Personas and Drivers tabs in [App.tsx](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Dashboard/src/App.tsx). Clicking shows an inline confirmation banner ('Delete {title}? [Cancel] [Confirm Delete]').
+* **Verification**: All tests passed with zero errors.`,
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([mockSummaryResponse]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implementation Summary').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Implementation Summary')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText(/All features and bug fixes have been implemented/i)).toBeInTheDocument();
+    });
+
+    // Verify false positive question card is NOT rendered
+    expect(screen.queryByText(/Agent Question — Human Input Required/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('file:')).not.toBeInTheDocument();
+    expect(screen.queryByText('App.tsx')).not.toBeInTheDocument();
+  });
+
+  it('toggles auto-scroll on and off, updates localStorage, and toggles button label', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-core',
+      name: 'AgentMesh Core',
+      status: 'online',
+      runtimeType: 'CliAntigravity',
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-scroll-1',
+      title: 'Auto Scroll Test Session',
+      status: 'completed',
+      creatorAgentId: 'agy-core',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Auto Scroll Test Session').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Auto Scroll Test Session')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Toggle Auto-scroll/i })).toBeInTheDocument();
+    });
+
+    const toggleBtn = screen.getByRole('button', { name: /Toggle Auto-scroll/i });
+    expect(toggleBtn).toHaveTextContent('Auto-scroll: On');
+
+    // Click to turn OFF
+    fireEvent.click(toggleBtn);
+    expect(toggleBtn).toHaveTextContent('Auto-scroll: Off');
+    expect(localStorage.getItem('agentmesh_autoscroll_enabled')).toBe('false');
+
+    // Click to turn back ON
+    fireEvent.click(toggleBtn);
+    expect(toggleBtn).toHaveTextContent('Auto-scroll: On');
+    expect(localStorage.getItem('agentmesh_autoscroll_enabled')).toBe('true');
+  });
+
+  it('stages attachments via file picker or clipboard paste, enables sending attachment-only prompts, and opens image lightbox from timeline', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-core',
+      name: 'AgentMesh Core',
+      status: 'online',
+      runtimeType: 'CliAntigravity',
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-attach-1',
+      title: 'Multimodal Attachment Session',
+      status: 'active',
+      creatorAgentId: 'agy-core',
+      metadataJson: JSON.stringify({}),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const uploadedAttachment = {
+      id: 'att-img-1',
+      sessionId: 'session-attach-1',
+      fileName: 'ui-mockup.png',
+      contentType: 'image/png',
+      sizeBytes: 2048,
+      s3Key: 'sessions/session-attach-1/attachments/att-img-1/ui-mockup.png',
+      downloadUrl: '/api/sessions/session-attach-1/attachments/att-img-1/content',
+      createdAt: new Date().toISOString()
+    };
+
+    const mockCreatedMessage: SessionMessage = {
+      id: 'msg-with-att-1',
+      sessionId: 'session-attach-1',
+      senderAgentId: 'admin',
+      eventType: 'prompt',
+      content: 'Please review the attached file(s).',
+      structuredPayloadJson: JSON.stringify({
+        attachments: [uploadedAttachment]
+      }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+    vi.mocked(api.uploadSessionAttachments).mockResolvedValue([uploadedAttachment]);
+    vi.mocked(api.postSessionMessage).mockResolvedValue(mockCreatedMessage);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Multimodal Attachment Session').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Multimodal Attachment Session')[0]);
+
+    const fileInput = await screen.findByTestId('chat-file-input');
+    const sendBtn = screen.getByRole('button', { name: /^Send$/i });
+    expect(sendBtn).toBeDisabled();
+
+    // Stage an image file via the file input
+    const testFile = new File(['fake-png-bytes'], 'ui-mockup.png', { type: 'image/png' });
+    fireEvent.change(fileInput, { target: { files: [testFile] } });
+
+    await waitFor(() => {
+      expect(api.uploadSessionAttachments).toHaveBeenCalledWith('session-attach-1', [testFile]);
+      expect(screen.getByTestId('chat-staged-attachments')).toBeInTheDocument();
+      expect(screen.getByText('ui-mockup.png')).toBeInTheDocument();
+    });
+
+    // Send button is now enabled even though text input is empty
+    await waitFor(() => {
+      expect(sendBtn).not.toBeDisabled();
+    });
+
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(api.postSessionMessage).toHaveBeenCalledWith(
+        'session-attach-1',
+        'Please review the attached file(s).',
+        'agy-core',
+        expect.any(String),
+        'prompt',
+        [uploadedAttachment]
+      );
+    });
+
+    // Inline image thumbnail is rendered in the message timeline
+    const zoomBtn = await screen.findByRole('button', { name: /Zoom image ui-mockup.png/i });
+    expect(zoomBtn).toBeInTheDocument();
+
+    // Clicking the inline thumbnail opens the Fullscreen Image Lightbox modal
+    fireEvent.click(zoomBtn);
+    const lightbox = await screen.findByTestId('attachment-lightbox');
+    expect(lightbox).toBeInTheDocument();
+    expect(screen.getByTestId('lightbox-image')).toHaveAttribute(
+      'src',
+      '/api/sessions/session-attach-1/attachments/att-img-1/content'
+    );
+
+    // Close the lightbox
+    fireEvent.click(screen.getByRole('button', { name: /Close image preview/i }));
+    await waitFor(() => {
+      expect(screen.queryByTestId('attachment-lightbox')).not.toBeInTheDocument();
     });
   });
 });

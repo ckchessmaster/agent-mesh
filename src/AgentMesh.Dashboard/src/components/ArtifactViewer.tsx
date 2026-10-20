@@ -44,8 +44,36 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
     }
   };
 
+  const getArtifactStreamUrl = (artifact: SessionArtifact, download = false) => {
+    const base = artifact.downloadUrl || `/api/sessions/${artifact.sessionId}/artifacts/${encodeURIComponent(artifact.id)}/content`;
+    return download ? `${base}${base.includes('?') ? '&' : '?'}download=true` : base;
+  };
+
+  const isImageArtifact = (artifact?: SessionArtifact | null) => {
+    if (!artifact) return false;
+    const ct = (artifact.contentType || '').toLowerCase();
+    const name = (artifact.name || '').toLowerCase();
+    return ct.startsWith('image/') || /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)$/.test(name);
+  };
+
+  const isPdfArtifact = (artifact?: SessionArtifact | null) => {
+    if (!artifact) return false;
+    const ct = (artifact.contentType || '').toLowerCase();
+    const name = (artifact.name || '').toLowerCase();
+    return ct === 'application/pdf' || name.endsWith('.pdf');
+  };
+
   const handleDownloadFile = () => {
     if (!activeArtifact) return;
+    if ((isImageArtifact(activeArtifact) || isPdfArtifact(activeArtifact)) && !activeArtifact.content) {
+      const a = document.createElement('a');
+      a.href = getArtifactStreamUrl(activeArtifact, true);
+      a.download = activeArtifact.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      return;
+    }
     const content = activeArtifact.content || '';
     const blob = new Blob([content], { type: activeArtifact.contentType || 'text/markdown' });
     const url = URL.createObjectURL(blob);
@@ -348,9 +376,27 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
           {/* Artifact Content Area */}
           <div className="flex-1 overflow-y-auto p-4 min-h-0">
             {activeArtifact ? (
-              viewMode === 'raw' ? (
+              isImageArtifact(activeArtifact) && viewMode === 'rendered' ? (
+                <div className="flex flex-col items-center justify-center p-4 bg-slate-900/60 rounded-xl border border-slate-800/80">
+                  <img
+                    src={getArtifactStreamUrl(activeArtifact)}
+                    alt={activeArtifact.name}
+                    className="max-w-full max-h-[70vh] rounded-lg object-contain shadow-lg"
+                    data-testid="artifact-image-preview"
+                  />
+                </div>
+              ) : isPdfArtifact(activeArtifact) && viewMode === 'rendered' ? (
+                <div className="w-full h-[70vh] bg-slate-900/60 rounded-xl border border-slate-800/80 overflow-hidden">
+                  <iframe
+                    src={getArtifactStreamUrl(activeArtifact)}
+                    title={activeArtifact.name}
+                    className="w-full h-full border-0"
+                    data-testid="artifact-pdf-preview"
+                  />
+                </div>
+              ) : viewMode === 'raw' ? (
                 <pre className="font-mono text-xs text-slate-200 bg-slate-900/60 p-4 rounded-xl border border-slate-800/80 overflow-x-auto whitespace-pre-wrap leading-relaxed">
-                  {activeArtifact.content || '(empty artifact content)'}
+                  {activeArtifact.content || '(binary artifact — switch to View or Download)'}
                 </pre>
               ) : (
                 <div className="prose prose-invert max-w-none text-xs">

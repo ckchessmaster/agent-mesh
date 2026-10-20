@@ -17,6 +17,7 @@ namespace AgentMesh.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Route("api/drivers")]
 [Authorize]
 public class AgentsController(
     AgentMeshDbContext db,
@@ -100,8 +101,9 @@ public class AgentsController(
             existing.UpdatedAt = DateTimeOffset.UtcNow;
 
             await db.SaveChangesAsync();
-            var sessionCount = await db.AgentSessions.CountAsync(s => s.CreatorAgentId == normalizedId);
-            var updatedDto = ToDto(existing, sessionCount);
+            var sessionCount = await db.AgentSessions.CountAsync(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId);
+            var personas = await GetDriverPersonasSummaryAsync(normalizedId);
+            var updatedDto = ToDto(existing, sessionCount, personas);
 
             if (hubContext != null)
             {
@@ -131,8 +133,9 @@ public class AgentsController(
             return NotFound(new { error = $"Agent '{agentId}' not found." });
         }
 
-        var sessionCount = await db.AgentSessions.CountAsync(s => s.CreatorAgentId == agent.Id);
-        return Ok(ToDto(agent, sessionCount));
+        var sessionCount = await db.AgentSessions.CountAsync(s => s.DriverId == agent.Id || s.CreatorAgentId == agent.Id);
+        var personas = await GetDriverPersonasSummaryAsync(agent.Id);
+        return Ok(ToDto(agent, sessionCount, personas));
     }
 
     [HttpGet]
@@ -146,13 +149,28 @@ public class AgentsController(
 
         var sessionCounts = await db.AgentSessions
             .AsNoTracking()
-            .Where(s => s.CreatorAgentId != null)
-            .GroupBy(s => s.CreatorAgentId!)
+            .Where(s => s.CreatorAgentId != null || s.DriverId != null)
+            .GroupBy(s => s.DriverId ?? s.CreatorAgentId!)
             .Select(g => new { AgentId = g.Key, Count = g.Count() })
-            .ToDictionaryAsync(x => x.AgentId, x => x.Count);
+            .ToDictionaryAsync(x => x.AgentId, x => x.Count, StringComparer.OrdinalIgnoreCase);
+
+        var allPersonas = await db.Personas
+            .AsNoTracking()
+            .OrderBy(p => p.Name)
+            .ToListAsync();
+
+        var personasByDriver = allPersonas
+            .GroupBy(p => p.DriverId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(p => new DriverPersonaSummaryDto(p.Id, p.Name, p.Role, p.DefaultModel)).ToList(),
+                StringComparer.OrdinalIgnoreCase);
 
         var dtos = agents
-            .Select(a => ToDto(a, sessionCounts.GetValueOrDefault(a.Id, 0)))
+            .Select(a => ToDto(
+                a,
+                sessionCounts.GetValueOrDefault(a.Id, 0),
+                personasByDriver.GetValueOrDefault(a.Id, new List<DriverPersonaSummaryDto>())))
             .ToList();
 
         return Ok(dtos);
@@ -172,8 +190,40 @@ public class AgentsController(
             return NotFound(new { error = $"Agent '{id}' not found." });
         }
 
-        var sessionCount = await db.AgentSessions.CountAsync(s => s.CreatorAgentId == normalizedId);
-        return Ok(ToDto(agent, sessionCount));
+        var sessionCount = await db.AgentSessions.CountAsync(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId);
+        var personas = await GetDriverPersonasSummaryAsync(normalizedId);
+        return Ok(ToDto(agent, sessionCount, personas));
+    }
+
+    [HttpGet("{id}/personas")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetDriverPersonas(string id)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId);
+        if (driver == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        var personas = await db.Personas
+            .AsNoTracking()
+            .Where(p => p.DriverId == normalizedId)
+            .OrderBy(p => p.Name)
+            .ToListAsync();
+
+        var sessionCounts = await db.AgentSessions
+            .AsNoTracking()
+            .Where(s => s.PersonaId != null)
+            .GroupBy(s => s.PersonaId!)
+            .Select(g => new { PersonaId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.PersonaId, x => x.Count, StringComparer.OrdinalIgnoreCase);
+
+        var dtos = personas
+            .Select(p => PersonasController.ToDto(p, driver, sessionCounts.GetValueOrDefault(p.Id, 0)))
+            .ToList();
+
+        return Ok(dtos);
     }
 
     [HttpGet("{id}/sessions")]
@@ -181,21 +231,48 @@ public class AgentsController(
     public async Task<IActionResult> GetAgentSessions(string id)
     {
         var normalizedId = id.Trim().ToLowerInvariant();
-        var sessions = await db.AgentSessions
+        var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId);
+        var personas = await db.Personas
             .AsNoTracking()
-            .Where(s => s.CreatorAgentId == normalizedId)
+            .ToDictionaryAsync(p => p.Id, p => p.Name, StringComparer.OrdinalIgnoreCase);
+
+        var rawSessions = await db.AgentSessions
+            .AsNoTracking()
+            .Where(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId)
             .OrderByDescending(s => s.UpdatedAt)
-            .Select(s => new SessionSummaryDto(
+            .Select(s => new
+            {
                 s.Id,
                 s.Title,
                 s.Status,
                 s.MetadataJson,
                 s.CreatorAgentId,
-                s.Messages.Count,
+                s.DriverId,
+                s.PersonaId,
+                MessageCount = s.Messages.Count,
                 s.CreatedAt,
                 s.UpdatedAt
-            ))
+            })
             .ToListAsync();
+
+        var sessions = rawSessions.Select(s =>
+        {
+            var dId = s.DriverId ?? s.CreatorAgentId;
+            return new SessionSummaryDto(
+                s.Id,
+                s.Title,
+                s.Status,
+                s.MetadataJson,
+                dId,
+                s.MessageCount,
+                s.CreatedAt,
+                s.UpdatedAt,
+                DriverId: dId,
+                DriverName: driver?.Name ?? dId,
+                PersonaId: s.PersonaId,
+                PersonaName: s.PersonaId != null ? personas.GetValueOrDefault(s.PersonaId, s.PersonaId) : null
+            );
+        }).ToList();
 
         return Ok(sessions);
     }
@@ -215,13 +292,40 @@ public class AgentsController(
             return BadRequest(new { error = "Session Title is required." });
         }
 
-        var hasInitialPrompt = !string.IsNullOrWhiteSpace(req.InitialPrompt);
-        var initialMetadata = SessionsController.MergeSessionMetadata(req.MetadataJson, req.WorkingDirectory, req.Model, req.Effort, req.Mode, req.Tier);
+        Persona? persona = null;
+        if (!string.IsNullOrWhiteSpace(req.PersonaId))
+        {
+            var normPersonaId = req.PersonaId.Trim().ToLowerInvariant();
+            persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == normPersonaId);
+        }
+
+        var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : persona?.DefaultWorkingDirectory;
+        var effectiveModel = !string.IsNullOrWhiteSpace(req.Model) ? req.Model : persona?.DefaultModel;
+        var effectiveEffort = req.Effort != null ? req.Effort : persona?.DefaultEffort;
+        var effectiveMode = !string.IsNullOrWhiteSpace(req.Mode) ? req.Mode : persona?.DefaultMode;
+        var effectiveTier = !string.IsNullOrWhiteSpace(req.Tier) ? req.Tier : persona?.DefaultTier;
+
+        var hasAttachments = req.Attachments is { Count: > 0 };
+        var hasInitialPrompt = !string.IsNullOrWhiteSpace(req.InitialPrompt) || hasAttachments;
+        var initialMetadata = SessionsController.MergeSessionMetadata(
+            req.MetadataJson,
+            effectiveWorkDir,
+            effectiveModel,
+            effectiveEffort,
+            effectiveMode,
+            effectiveTier,
+            persona?.Id,
+            persona?.Name,
+            persona?.Role,
+            persona?.PersonaPrompt);
+
         var session = new AgentSession
         {
             Title = req.Title.Trim(),
             Status = hasInitialPrompt ? "thinking" : "active",
             MetadataJson = initialMetadata,
+            PersonaId = persona?.Id,
+            DriverId = normalizedId,
             CreatorAgentId = normalizedId,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
@@ -232,13 +336,17 @@ public class AgentsController(
         SessionMessage? promptMsg = null;
         if (hasInitialPrompt)
         {
+            var effectivePrompt = !string.IsNullOrWhiteSpace(req.InitialPrompt)
+                ? req.InitialPrompt.Trim()
+                : SessionsController.DefaultAttachmentPrompt;
             promptMsg = new SessionMessage
             {
                 SessionId = session.Id,
                 SenderAgentId = "operator",
                 TargetAgentId = normalizedId,
                 EventType = "prompt",
-                Content = req.InitialPrompt!.Trim(),
+                Content = effectivePrompt,
+                StructuredPayloadJson = SessionsController.MergeAttachmentsIntoStructuredPayload(null, req.Attachments),
                 CreatedAt = DateTimeOffset.UtcNow
             };
             db.SessionMessages.Add(promptMsg);
@@ -258,10 +366,14 @@ public class AgentsController(
                 session.Title,
                 session.Status,
                 session.MetadataJson,
-                session.CreatorAgentId,
+                session.DriverId,
                 hasInitialPrompt ? 1 : 0,
                 session.CreatedAt,
-                session.UpdatedAt
+                session.UpdatedAt,
+                DriverId: session.DriverId,
+                DriverName: agent.Name,
+                PersonaId: persona?.Id,
+                PersonaName: persona?.Name
             ));
 
             if (promptMsg != null)
@@ -272,6 +384,11 @@ public class AgentsController(
                     sessionId = session.Id,
                     messageId = promptMsg.Id,
                     agentId = normalizedId,
+                    driverId = normalizedId,
+                    personaId = persona?.Id,
+                    personaName = persona?.Name,
+                    personaRole = persona?.Role,
+                    personaPrompt = persona?.PersonaPrompt,
                     prompt = promptMsg.Content,
                     sender = promptMsg.SenderAgentId,
                     workingDirectory = workDir,
@@ -279,6 +396,7 @@ public class AgentsController(
                     effort = effort,
                     mode = mode,
                     tier = tier,
+                    attachments = req.Attachments,
                     createdAt = promptMsg.CreatedAt
                 });
             }
@@ -287,9 +405,19 @@ public class AgentsController(
         return CreatedAtAction("GetSession", "Sessions", new { id = session.Id }, session);
     }
 
+    private async Task<List<DriverPersonaSummaryDto>> GetDriverPersonasSummaryAsync(string driverId)
+    {
+        return await db.Personas
+            .AsNoTracking()
+            .Where(p => p.DriverId == driverId)
+            .OrderBy(p => p.Name)
+            .Select(p => new DriverPersonaSummaryDto(p.Id, p.Name, p.Role, p.DefaultModel))
+            .ToListAsync();
+    }
+
     [HttpGet("{id}/usage")]
     [AllowAnonymous]
-    public async Task<IActionResult> GetAgentUsage(string id)
+    public async Task<IActionResult> GetAgentUsage(string id, [FromQuery] bool refresh = false)
     {
         var normalizedId = id.Trim().ToLowerInvariant();
         var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId);
@@ -299,7 +427,7 @@ public class AgentsController(
         }
 
         var sessions = await db.AgentSessions
-            .Where(s => s.CreatorAgentId == normalizedId)
+            .Where(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId)
             .ToListAsync();
 
         long totalInputTokens = 0;
@@ -331,7 +459,7 @@ public class AgentsController(
             totalTokens = totalInputTokens + totalOutputTokens;
         }
 
-        var providerQuota = await GetAgentProviderQuotaAsync(agent);
+        var providerQuota = await GetAgentProviderQuotaAsync(agent, refresh);
 
         return Ok(new AgentUsageResponse(
             AgentId: normalizedId,
@@ -350,7 +478,7 @@ public class AgentsController(
 
     private static readonly ConcurrentDictionary<string, (DateTimeOffset CachedAt, ProviderQuotaDto Quota)> QuotaCache = new();
 
-    private static async Task<ProviderQuotaDto?> GetAgentProviderQuotaAsync(Agent agent)
+    private static async Task<ProviderQuotaDto?> GetAgentProviderQuotaAsync(Agent agent, bool refresh = false)
     {
         var id = agent.Id.ToLowerInvariant();
         var isAgy = id == "agy" || id.Contains("agy") || id.Contains("antigravity");
@@ -358,7 +486,8 @@ public class AgentsController(
 
         if (isAgy)
         {
-            if (QuotaCache.TryGetValue("agy", out var cached) &&
+            if (!refresh &&
+                QuotaCache.TryGetValue("agy", out var cached) &&
                 DateTimeOffset.UtcNow - cached.CachedAt < TimeSpan.FromSeconds(60))
             {
                 return cached.Quota;
@@ -384,7 +513,9 @@ public class AgentsController(
 
                     proc.Start();
                     var outputTask = proc.StandardOutput.ReadToEndAsync();
-                    if (await Task.WhenAny(proc.WaitForExitAsync(), Task.Delay(5000)) == proc.WaitForExitAsync())
+                    var errorTask = proc.StandardError.ReadToEndAsync();
+                    var exitTask = proc.WaitForExitAsync();
+                    if (await Task.WhenAny(exitTask, Task.Delay(8000)) == exitTask)
                     {
                         var stdOut = await outputTask;
                         if (!string.IsNullOrWhiteSpace(stdOut))
@@ -424,7 +555,7 @@ public class AgentsController(
                     }),
                     new("Gemini 4 Argon", "Argon Weekly Allowance", new List<QuotaBucketDto>
                     {
-                        new("argon-weekly", "Argon Weekly Limit", "Dedicated Argon capacity", "weekly", 0.59, DateTimeOffset.UtcNow.AddDays(6).ToString("u"))
+                        new("gemini-argon-wtu-weekly", "Gemini 4 Argon Weekly Limit", "Dedicated Argon capacity", "weekly", 0.20, DateTimeOffset.UtcNow.AddDays(6).ToString("u"))
                     })
                 }
             );
@@ -484,7 +615,7 @@ public class AgentsController(
                         var bFrac = b.TryGetProperty("remaining_fraction", out var bf) ? bf.GetDouble() : 1.0;
                         var bReset = b.TryGetProperty("reset_time", out var br) ? br.GetString() : null;
 
-                        if (primaryRemaining == null || bFrac < primaryRemaining)
+                        if (bId == "gemini-weekly" || (primaryRemaining == null && bWindow == "weekly"))
                         {
                             primaryRemaining = bFrac;
                         }
@@ -494,6 +625,11 @@ public class AgentsController(
                 }
 
                 groups.Add(new QuotaGroupDto(gName, gDesc, buckets));
+            }
+
+            if (primaryRemaining == null && groups.Count > 0 && groups[0].Buckets.Count > 0)
+            {
+                primaryRemaining = groups[0].Buckets[0].RemainingFraction;
             }
 
             return new ProviderQuotaDto(
@@ -546,7 +682,7 @@ public class AgentsController(
         return null;
     }
 
-    private static AgentDto ToDto(Agent a, int sessionCount) => new(
+    private static AgentDto ToDto(Agent a, int sessionCount, List<DriverPersonaSummaryDto>? personas = null) => new(
         a.Id,
         a.Name,
         a.RuntimeType.ToString(),
@@ -557,9 +693,17 @@ public class AgentsController(
         a.Status,
         a.CapabilitiesJson,
         a.LastHeartbeatAt,
-        sessionCount
+        sessionCount,
+        personas ?? new List<DriverPersonaSummaryDto>()
     );
 }
+
+public record DriverPersonaSummaryDto(
+    string Id,
+    string Name,
+    string Role,
+    string? DefaultModel
+);
 
 public record RegisterAgentRequest(
     string Id,
@@ -581,7 +725,9 @@ public record CreateAgentSessionRequest(
     string? Model = null,
     string? Effort = null,
     string? Mode = null,
-    string? Tier = null
+    string? Tier = null,
+    string? PersonaId = null,
+    List<SessionAttachmentDto>? Attachments = null
 );
 
 public record AgentDto(
@@ -595,7 +741,8 @@ public record AgentDto(
     string Status = "online",
     string CapabilitiesJson = "[]",
     DateTimeOffset? LastHeartbeatAt = null,
-    int SessionCount = 0
+    int SessionCount = 0,
+    List<DriverPersonaSummaryDto>? Personas = null
 );
 
 public record QuotaBucketDto(

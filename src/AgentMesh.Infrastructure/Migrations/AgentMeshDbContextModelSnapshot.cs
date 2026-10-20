@@ -232,12 +232,22 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("creator_agent_id");
 
+                    b.Property<string>("DriverId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("driver_id");
+
                     b.Property<string>("MetadataJson")
                         .IsRequired()
                         .ValueGeneratedOnAdd()
                         .HasColumnType("jsonb")
                         .HasDefaultValue("{}")
                         .HasColumnName("metadata");
+
+                    b.Property<string>("PersonaId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("persona_id");
 
                     b.Property<string>("Status")
                         .IsRequired()
@@ -265,7 +275,97 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.HasIndex("CreatorAgentId")
                         .HasDatabaseName("ix_agent_sessions_creator_agent_id");
 
+                    b.HasIndex("DriverId")
+                        .HasDatabaseName("ix_agent_sessions_driver_id");
+
+                    b.HasIndex("PersonaId")
+                        .HasDatabaseName("ix_agent_sessions_persona_id");
+
                     b.ToTable("agent_sessions", (string)null);
+                });
+
+            modelBuilder.Entity("AgentMesh.Core.Models.Persona", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("id");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("DefaultEffort")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("default_effort");
+
+                    b.Property<string>("DefaultMode")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("default_mode");
+
+                    b.Property<string>("DefaultModel")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("default_model");
+
+                    b.Property<string>("DefaultTier")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("default_tier");
+
+                    b.Property<string>("DefaultWorkingDirectory")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("default_working_directory");
+
+                    b.Property<string>("DriverId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("driver_id");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("name");
+
+                    b.Property<string>("PersonaPrompt")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("persona_prompt");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasDefaultValue("Autonomous Persona")
+                        .HasColumnName("role");
+
+                    b.Property<int>("TrustTier")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(1)
+                        .HasColumnName("trust_tier");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.HasKey("Id")
+                        .HasName("pk_personas");
+
+                    b.HasIndex("DriverId")
+                        .HasDatabaseName("ix_personas_driver_id");
+
+                    b.ToTable("personas", (string)null);
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.SessionMessage", b =>
@@ -342,7 +442,7 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasForeignKey("RequestedByAgentId")
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired()
-                        .HasConstraintName("fk_agent_jobs_agents_requested_by_agent_id");
+                        .HasConstraintName("fk_agent_jobs_agent_requested_by_agent_id");
 
                     b.HasOne("AgentMesh.Core.Models.AgentSession", "Session")
                         .WithMany("Jobs")

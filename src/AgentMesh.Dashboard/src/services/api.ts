@@ -3,7 +3,9 @@ import type {
   AgentSession,
   AgentUsageResponse,
   FilesystemBrowseResponse,
+  Persona,
   QueuedPromptItem,
+  SessionAttachment,
   SessionMessage,
   SessionArtifact,
   StagedJob,
@@ -18,21 +20,24 @@ export const setAuthTokenProvider = (provider: (() => string | null) | null) => 
   tokenProvider = provider;
 };
 
-const getHeaders = (): Record<string, string> => {
+const getAuthHeadersOnly = (): Record<string, string> => {
   const token = tokenProvider?.();
   if (token) {
     return {
-      'Content-Type': 'application/json',
       'Authorization': `Bearer ${token}`
     };
   }
 
   return {
-    'Content-Type': 'application/json',
     'Authorization': 'Bearer mesh-default-secret-key',
     'X-Agent-Id': 'agy-core'
   };
 };
+
+const getHeaders = (): Record<string, string> => ({
+  'Content-Type': 'application/json',
+  ...getAuthHeadersOnly()
+});
 
 export interface SessionControlOptions {
   workingDirectory?: string;
@@ -40,6 +45,7 @@ export interface SessionControlOptions {
   effort?: string;
   mode?: string;
   tier?: string;
+  attachments?: SessionAttachment[];
 }
 
 export const api = {
@@ -68,8 +74,113 @@ export const api = {
     return res.json();
   },
 
-  async getAgentUsage(agentId: string): Promise<AgentUsageResponse> {
-    const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/usage`, { headers: getHeaders() });
+  async getDrivers(): Promise<Agent[]> {
+    const res = await fetch('/api/drivers', { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load drivers: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getPersonas(driverId?: string): Promise<Persona[]> {
+    const query = driverId ? `?driverId=${encodeURIComponent(driverId)}` : '';
+    const res = await fetch(`/api/personas${query}`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load personas: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getPersona(id: string): Promise<Persona> {
+    const res = await fetch(`/api/personas/${encodeURIComponent(id)}`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load persona: ${res.statusText}`);
+    return res.json();
+  },
+
+  async createPersona(req: {
+    id?: string;
+    name: string;
+    driverId: string;
+    role?: string;
+    personaPrompt?: string;
+    defaultModel?: string;
+    defaultEffort?: string;
+    defaultMode?: string;
+    defaultTier?: string;
+    defaultWorkingDirectory?: string;
+    trustTier?: number;
+  }): Promise<Persona> {
+    const res = await fetch('/api/personas', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to create persona: ${res.statusText}`);
+    return res.json();
+  },
+
+  async updatePersona(
+    id: string,
+    req: {
+      name?: string;
+      role?: string;
+      personaPrompt?: string;
+      driverId?: string;
+      defaultModel?: string;
+      defaultEffort?: string;
+      defaultMode?: string;
+      defaultTier?: string;
+      defaultWorkingDirectory?: string;
+      trustTier?: number;
+    }
+  ): Promise<Persona> {
+    const res = await fetch(`/api/personas/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to update persona: ${res.statusText}`);
+    return res.json();
+  },
+
+  async deletePersona(id: string): Promise<{ status: string; id: string; deletedSessionsCount: number }> {
+    const res = await fetch(`/api/personas/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to delete persona: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getPersonaSessions(personaId: string): Promise<AgentSession[]> {
+    const res = await fetch(`/api/personas/${encodeURIComponent(personaId)}/sessions`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load persona sessions: ${res.statusText}`);
+    return res.json();
+  },
+
+  async createPersonaSession(
+    personaId: string,
+    title: string,
+    initialPrompt?: string,
+    options?: SessionControlOptions
+  ): Promise<AgentSession> {
+    const res = await fetch(`/api/personas/${encodeURIComponent(personaId)}/sessions`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({
+        title,
+        initialPrompt,
+        workingDirectory: options?.workingDirectory,
+        model: options?.model,
+        effort: options?.effort,
+        mode: options?.mode,
+        tier: options?.tier,
+        attachments: options?.attachments
+      })
+    });
+    if (!res.ok) throw new Error(`Failed to create persona session: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getAgentUsage(agentId: string, refresh = false): Promise<AgentUsageResponse> {
+    const url = `/api/agents/${encodeURIComponent(agentId)}/usage${refresh ? '?refresh=true' : ''}`;
+    const res = await fetch(url, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load agent usage: ${res.statusText}`);
     return res.json();
   },
@@ -157,7 +268,8 @@ export const api = {
         model: options?.model,
         effort: options?.effort,
         mode: options?.mode,
-        tier: options?.tier
+        tier: options?.tier,
+        attachments: options?.attachments
       })
     });
     if (!res.ok) throw new Error(`Failed to create agent session: ${res.statusText}`);
@@ -167,6 +279,15 @@ export const api = {
   async getSession(id: string): Promise<AgentSession> {
     const res = await fetch(`/api/sessions/${id}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load session details: ${res.statusText}`);
+    return res.json();
+  },
+
+  async deleteSession(id: string): Promise<{ status: string; id: string; personaId?: string; driverId?: string }> {
+    const res = await fetch(`/api/sessions/${id}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to delete session: ${res.statusText}`);
     return res.json();
   },
 
@@ -189,7 +310,8 @@ export const api = {
         model: options?.model,
         effort: options?.effort,
         mode: options?.mode,
-        tier: options?.tier
+        tier: options?.tier,
+        attachments: options?.attachments
       })
     });
     if (!res.ok) throw new Error(`Failed to create session: ${res.statusText}`);
@@ -231,12 +353,34 @@ export const api = {
     return res.json();
   },
 
+  async uploadSessionAttachments(sessionId: string, files: File[]): Promise<SessionAttachment[]> {
+    const formData = new FormData();
+    files.forEach((f) => formData.append('files', f, f.name));
+    const res = await fetch(`/api/sessions/${sessionId}/attachments`, {
+      method: 'POST',
+      headers: getAuthHeadersOnly(),
+      body: formData
+    });
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errBody = await res.json();
+        if (errBody?.error) errMsg = errBody.error;
+      } catch {
+        // Ignore JSON parse error
+      }
+      throw new Error(`Failed to upload attachments: ${errMsg}`);
+    }
+    return res.json();
+  },
+
   async postSessionMessage(
     sessionId: string,
     content: string,
     targetAgentId?: string,
     senderAgentId = 'operator',
-    eventType = 'prompt'
+    eventType = 'prompt',
+    attachments?: SessionAttachment[]
   ): Promise<SessionMessage> {
     const res = await fetch(`/api/sessions/${sessionId}/events`, {
       method: 'POST',
@@ -245,7 +389,8 @@ export const api = {
         content,
         targetAgentId,
         senderAgentId,
-        eventType
+        eventType,
+        attachments
       })
     });
     if (!res.ok) throw new Error(`Failed to post session event: ${res.statusText}`);
@@ -281,6 +426,7 @@ export const api = {
       tier?: string;
       mode?: string;
       workingDirectory?: string;
+      attachments?: SessionAttachment[];
     }
   ): Promise<{ session: AgentSession; queue: QueuedPromptItem[]; dispatched: boolean }> {
     const res = await fetch(`/api/sessions/${sessionId}/queue`, {

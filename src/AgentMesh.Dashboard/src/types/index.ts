@@ -1,3 +1,29 @@
+export interface DriverPersonaSummary {
+  id: string;
+  name: string;
+  role: string;
+  defaultModel?: string | null;
+}
+
+export interface Persona {
+  id: string;
+  name: string;
+  role: string;
+  personaPrompt: string;
+  driverId: string;
+  driverName?: string;
+  driverStatus?: 'online' | 'busy' | 'offline' | string;
+  defaultModel?: string | null;
+  defaultEffort?: string | null;
+  defaultMode?: string | null;
+  defaultTier?: string | null;
+  defaultWorkingDirectory?: string | null;
+  trustTier: number;
+  sessionCount?: number;
+  createdAt: string;
+  updatedAt?: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -10,9 +36,12 @@ export interface Agent {
   capabilitiesJson?: string;
   lastHeartbeatAt?: string;
   sessionCount?: number;
+  personas?: DriverPersonaSummary[];
   createdAt: string;
   updatedAt?: string;
 }
+
+export type Driver = Agent;
 
 export interface StagedJob {
   id: string;
@@ -41,6 +70,11 @@ export interface AgentSession {
   metadataJson: string;
   creatorAgentId?: string | null;
   creatorAgentName?: string | null;
+  driverId?: string | null;
+  driverName?: string | null;
+  personaId?: string | null;
+  personaName?: string | null;
+  personaRole?: string | null;
   messageCount?: number;
   createdAt: string;
   updatedAt: string;
@@ -179,6 +213,17 @@ export interface AgentUsageResponse {
   providerQuota?: ProviderQuotaInfo | null;
 }
 
+export interface SessionAttachment {
+  id: string;
+  sessionId: string;
+  fileName: string;
+  contentType: string;
+  sizeBytes: number;
+  s3Key: string;
+  downloadUrl: string;
+  createdAt: string;
+}
+
 export interface QueuedPromptItem {
   id: string;
   prompt: string;
@@ -189,6 +234,7 @@ export interface QueuedPromptItem {
   tier?: string | null;
   mode?: string | null;
   workingDirectory?: string | null;
+  attachments?: SessionAttachment[] | null;
 }
 
 export interface AskQuestionItem {
@@ -219,6 +265,8 @@ export interface SessionArtifact {
   createdAt: string;
   updatedAt: string;
   content?: string;
+  s3Key?: string | null;
+  downloadUrl?: string | null;
 }
 
 

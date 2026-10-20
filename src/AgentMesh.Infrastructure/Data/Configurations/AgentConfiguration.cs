@@ -68,5 +68,6 @@ public class AgentConfiguration : IEntityTypeConfiguration<Agent>
             .IsRequired();
 
         builder.Ignore(a => a.SentMessages);
+        builder.Ignore(a => a.Personas);
     }
 }

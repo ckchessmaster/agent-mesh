@@ -696,6 +696,270 @@ public class SessionsControllerTests
         // DB should NOT have recorded the lagging thought
         db.SessionMessages.Should().NotContain(m => m.Content == "Lagging model thought from aborted turn");
     }
+
+    [Fact]
+    public async Task DeleteSession_ExistingSession_RemovesFromDatabase_AndBroadcastsSessionDeleted()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Session to Delete",
+            DriverId = "agy",
+            PersonaId = "astra"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var result = await controller.DeleteSession(session.Id);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+        db.AgentSessions.Should().NotContain(s => s.Id == session.Id);
+
+        _mockClients.Verify(c => c.All, Times.AtLeastOnce);
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("SessionDeleted", It.Is<object[]>(args => args.Length == 1), default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task DeleteSession_NonExistentSession_ReturnsNotFound()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var result = await controller.DeleteSession(Guid.NewGuid());
+
+        // Assert
+        result.Should().BeOfType<NotFoundObjectResult>();
+    }
+
+    [Fact]
+    public async Task UploadAttachments_ValidImageAndMarkdown_UploadsToS3_PersistsMetadata_AndStreamsContent()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Attachment Upload Test",
+            Status = "active",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var mockStorage = new Mock<AgentMesh.Core.Services.IStorageService>();
+        mockStorage
+            .Setup(s => s.UploadStreamAsync(It.IsAny<string>(), It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string key, Stream _, string _, CancellationToken _) => $"s3://agent-mesh-artifacts/{key}");
+
+        var controller = new SessionsController(db, _mockHubContext.Object, mockStorage.Object);
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext()
+        };
+
+        var pngBytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        var pngStream = new MemoryStream(pngBytes);
+        var formFile = new FormFile(pngStream, 0, pngBytes.Length, "files", "architecture.png")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "image/png"
+        };
+        var formFiles = new FormFileCollection { formFile };
+
+        // Act: Upload attachment
+        var uploadResult = await controller.UploadAttachments(session.Id, formFiles);
+
+        // Assert: Upload succeeded & S3 UploadStreamAsync called
+        var okResult = uploadResult.Should().BeOfType<OkObjectResult>().Subject;
+        var uploadedList = okResult.Value.Should().BeAssignableTo<List<SessionAttachmentDto>>().Subject;
+        uploadedList.Should().HaveCount(1);
+        var att = uploadedList[0];
+        att.FileName.Should().Be("architecture.png");
+        att.ContentType.Should().Be("image/png");
+        att.SizeBytes.Should().Be(pngBytes.Length);
+        att.S3Key.Should().StartWith($"sessions/{session.Id}/attachments/{att.Id}/architecture.png");
+        att.DownloadUrl.Should().Be($"/api/sessions/{session.Id}/attachments/{att.Id}/content");
+
+        mockStorage.Verify(
+            s => s.UploadStreamAsync(
+                It.Is<string>(k => k.EndsWith("/architecture.png")),
+                It.IsAny<Stream>(),
+                "image/png",
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Act: Stream content back via GetAttachmentContent (using S3 stream)
+        mockStorage
+            .Setup(s => s.DownloadStreamAsync(att.S3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(pngBytes));
+
+        var contentResult = await controller.GetAttachmentContent(session.Id, att.Id, download: false);
+        var fileResult = contentResult.Should().BeOfType<FileStreamResult>().Subject;
+        fileResult.ContentType.Should().Be("image/png");
+        controller.Response.Headers.ContentDisposition.ToString().Should().StartWith("inline;");
+    }
+
+    [Fact]
+    public async Task UploadAttachments_DisallowedExtension_ReturnsBadRequest()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Invalid Attachment Test",
+            Status = "active",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+        var badBytes = new byte[] { 0x4D, 0x5A, 0x90, 0x00 };
+        var formFile = new FormFile(new MemoryStream(badBytes), 0, badBytes.Length, "files", "malware.exe")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "application/x-msdownload"
+        };
+        var formFiles = new FormFileCollection { formFile };
+
+        // Act
+        var result = await controller.UploadAttachments(session.Id, formFiles);
+
+        // Assert
+        result.Should().BeOfType<BadRequestObjectResult>();
+    }
+
+    [Fact]
+    public async Task PostMessage_And_EnqueuePrompt_WithAttachmentsAndEmptyText_UsesDefaultDirectiveAndPersistsAttachments()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Attachment-Only Prompt Test",
+            Status = "active",
+            CreatorAgentId = "agy"
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+        var attachment = new SessionAttachmentDto(
+            Id: "att123",
+            SessionId: session.Id,
+            FileName: "screenshot.png",
+            ContentType: "image/png",
+            SizeBytes: 1024,
+            S3Key: $"sessions/{session.Id}/attachments/att123/screenshot.png",
+            DownloadUrl: $"/api/sessions/{session.Id}/attachments/att123/content",
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        // Act 1: PostMessage with empty Content but non-empty Attachments
+        var postResult = await controller.PostMessage(session.Id, new PostMessageRequest(
+            Content: "",
+            SenderAgentId: "operator",
+            EventType: "prompt",
+            Attachments: new List<SessionAttachmentDto> { attachment }
+        ));
+
+        // Assert 1: Default prompt supplied & attachment persisted in StructuredPayloadJson
+        var created = postResult.Should().BeOfType<CreatedAtActionResult>().Subject;
+        var msgDto = created.Value.Should().BeOfType<SessionMessageDto>().Subject;
+        msgDto.Content.Should().Be(SessionsController.DefaultAttachmentPrompt);
+        msgDto.StructuredPayloadJson.Should().Contain("screenshot.png");
+
+        // Act 2: Session is now 'thinking'; EnqueuePrompt with empty Prompt and an attachment queues item
+        var queueResult = await controller.EnqueuePrompt(session.Id, new EnqueuePromptRequest(
+            Prompt: "   ",
+            SenderAgentId: "operator",
+            SendNow: false,
+            Attachments: new List<SessionAttachmentDto> { attachment }
+        ));
+        queueResult.Should().BeOfType<OkObjectResult>();
+        var queue = SessionsController.ExtractPromptQueue(session.MetadataJson);
+        queue.Should().HaveCount(1);
+        queue[0].Prompt.Should().Be(SessionsController.DefaultAttachmentPrompt);
+        queue[0].Attachments.Should().NotBeNull();
+        queue[0].Attachments!.Should().ContainSingle(a => a.FileName == "screenshot.png");
+    }
+
+    [Fact]
+    public async Task RunnerStaging_And_PromptInjection_StagesFileIntoWorkspaceAndFormatsBlock()
+    {
+        // Arrange
+        var tempWorkDir = Path.Combine(Path.GetTempPath(), $"agentmesh-test-ws-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempWorkDir);
+        try
+        {
+            var sessionId = Guid.NewGuid();
+            var promptEv = new AgentMesh.Cli.Models.PromptReceivedEvent
+            {
+                SessionId = sessionId,
+                MessageId = Guid.NewGuid(),
+                AgentId = "agy",
+                Prompt = "Inspect this diagram",
+                WorkingDirectory = tempWorkDir,
+                Attachments = new List<AgentMesh.Cli.Models.AttachmentItem>
+                {
+                    new()
+                    {
+                        Id = "att999",
+                        SessionId = sessionId,
+                        FileName = "diagram.png",
+                        ContentType = "image/png",
+                        SizeBytes = 64
+                    }
+                }
+            };
+
+            var mockMeshClient = new Mock<AgentMesh.Cli.Services.MeshClient>(new AgentMesh.Cli.Models.CliConfig(), new AgentMesh.Cli.Services.ConfigStore(), null);
+            mockMeshClient
+                .Setup(m => m.DownloadSessionAttachmentAsync(sessionId, "att999", It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((Guid _, string _, string destPath, CancellationToken _) =>
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                    File.WriteAllBytes(destPath, new byte[] { 1, 2, 3, 4 });
+                    return true;
+                });
+
+            // Act
+            var stagedPaths = await AgentMesh.Cli.Services.AgentRunnerInstance.StagePromptAttachmentsAsync(
+                promptEv,
+                tempWorkDir,
+                mockMeshClient.Object);
+
+            // Assert
+            stagedPaths.Should().HaveCount(1);
+            stagedPaths[0].Should().EndWith(Path.Combine(".agentmesh", "attachments", "att999_diagram.png"));
+            File.Exists(stagedPaths[0]).Should().BeTrue();
+            promptEv.Attachments[0].LocalFilePath.Should().Be(stagedPaths[0]);
+
+            var formattedBlock = AgentMesh.Cli.Adapters.AgentAdapterFactory.FormatAttachedFilesBlock(promptEv.Attachments);
+            formattedBlock.Should().Contain("[Attached Files in Workspace]");
+            formattedBlock.Should().Contain("diagram.png (image/png, 64 bytes)");
+            formattedBlock.Should().Contain(stagedPaths[0]);
+        }
+        finally
+        {
+            if (Directory.Exists(tempWorkDir))
+            {
+                Directory.Delete(tempWorkDir, recursive: true);
+            }
+        }
+    }
 }
 
 

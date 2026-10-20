@@ -6,6 +6,8 @@ namespace AgentMesh.Infrastructure.Data;
 public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : DbContext(options)
 {
     public DbSet<Agent> Agents => Set<Agent>();
+    public DbSet<Agent> Drivers => Set<Agent>();
+    public DbSet<Persona> Personas => Set<Persona>();
     public DbSet<AgentSession> AgentSessions => Set<AgentSession>();
     public DbSet<SessionMessage> SessionMessages => Set<SessionMessage>();
     public DbSet<AgentJob> AgentJobs => Set<AgentJob>();

@@ -263,16 +263,76 @@ public static class AgentAdapterFactory
 
     public record ExtractedQuestion(string Question, List<string> Options, bool IsMultiSelect);
 
-    public static string BuildAgentMeshPromptEnvelope(string userPrompt, string agentId, string? mode)
+    public static string FormatAttachedFilesBlock(List<AttachmentItem>? attachments)
+    {
+        if (attachments == null || attachments.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine("[Attached Files in Workspace]");
+        sb.AppendLine("The user attached the following file(s) to this message. They have been staged into the workspace so you can inspect them directly using your file/image reader tool (e.g. `read_file`):");
+        foreach (var att in attachments)
+        {
+            var path = !string.IsNullOrWhiteSpace(att.LocalFilePath)
+                ? att.LocalFilePath
+                : Path.Combine(".agentmesh", "attachments", $"{att.Id}_{att.FileName}");
+            sb.AppendLine($"- {att.FileName} ({att.ContentType}, {att.SizeBytes} bytes): {path}");
+        }
+        sb.AppendLine();
+        return sb.ToString();
+    }
+
+    public static string BuildAgentMeshPromptEnvelope(
+        string userPrompt,
+        string agentId,
+        string? mode,
+        string? personaId = null,
+        string? personaName = null,
+        string? personaRole = null,
+        string? personaPrompt = null,
+        Guid? sessionId = null,
+        List<AttachmentItem>? attachments = null)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"[AgentMesh System Context: You are running as agent @{agentId} connected to the interactive AgentMesh Cockpit.]");
+        if (!string.IsNullOrWhiteSpace(personaId) || !string.IsNullOrWhiteSpace(personaName))
+        {
+            var pDisplay = !string.IsNullOrWhiteSpace(personaName) ? personaName : personaId;
+            var roleClause = !string.IsNullOrWhiteSpace(personaRole) ? $", Role: {personaRole}" : "";
+            sb.AppendLine($"[AgentMesh System Context: You are running on driver @{agentId} as Persona \"{pDisplay}\" (@{personaId ?? agentId}{roleClause}) connected to the interactive AgentMesh Cockpit.]");
+        }
+        else
+        {
+            sb.AppendLine($"[AgentMesh System Context: You are running as driver @{agentId} connected to the interactive AgentMesh Cockpit.]");
+        }
+
+        if (sessionId.HasValue)
+        {
+            sb.AppendLine($"[Active Session ID: {sessionId.Value}]");
+        }
+
+        if (!string.IsNullOrWhiteSpace(personaId))
+        {
+            sb.AppendLine($"[Session History Tooling: You can inspect past sessions for this persona anytime using the MCP tool 'get_persona_sessions' with personaId='{personaId}', or 'get_session' to inspect previous session transcripts and artifacts.]");
+        }
+
+        if (!string.IsNullOrWhiteSpace(personaPrompt))
+        {
+            sb.AppendLine($"[Persona System Instructions: {personaPrompt.Trim()}]");
+        }
+
         if (!string.IsNullOrWhiteSpace(mode))
         {
             sb.AppendLine($"[Execution Mode: {mode}]");
         }
         sb.AppendLine("[Interactive Human-in-the-Loop Instructions: You are running in an interactive session. If the user asks you to ask them questions, or if you need clarifications or decisions before proceeding, ask your questions directly. Format questions as a numbered list (e.g. 1. Question? 2. Question?), or output a ```ask_question JSON block with questions array. Do NOT state that this is a non-interactive session or that you cannot see replies. The user will be presented with interactive UI cards to answer your questions and will send their responses in the next turn.]");
         sb.AppendLine();
+        var attachedBlock = FormatAttachedFilesBlock(attachments);
+        if (!string.IsNullOrWhiteSpace(attachedBlock))
+        {
+            sb.Append(attachedBlock);
+        }
         sb.AppendLine(userPrompt);
         return sb.ToString();
     }
@@ -374,6 +434,11 @@ public class AgyAdapter : IAgentAdapter
         return SessionConversations.TryGetValue(sessionId, out var convId) ? convId : null;
     }
 
+    private static readonly HashSet<string> SupportedBrainArtifactExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".md", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".pdf"
+    };
+
     public static async Task SyncBrainArtifactsAsync(Guid sessionId, string convId, MeshClient? client, CancellationToken ct = default)
     {
         if (client == null || string.IsNullOrWhiteSpace(convId)) return;
@@ -382,15 +447,16 @@ public class AgyAdapter : IAgentAdapter
             var brainDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "antigravity-cli", "brain", convId);
             if (!Directory.Exists(brainDir)) return;
 
-            var mdFiles = Directory.GetFiles(brainDir, "*.md", SearchOption.TopDirectoryOnly);
-            foreach (var mdFile in mdFiles)
+            var files = Directory.GetFiles(brainDir, "*", SearchOption.TopDirectoryOnly);
+            foreach (var file in files)
             {
-                var fInfo = new FileInfo(mdFile);
-                if (fInfo.Name.StartsWith('.')) continue;
+                var fInfo = new FileInfo(file);
+                if (fInfo.Name.StartsWith('.') || fInfo.Name.EndsWith(".metadata.json", StringComparison.OrdinalIgnoreCase)) continue;
+                var ext = fInfo.Extension.ToLowerInvariant();
+                if (!SupportedBrainArtifactExtensions.Contains(ext)) continue;
 
-                var content = await File.ReadAllTextAsync(mdFile, ct);
                 string? summary = null;
-                var metaFile = mdFile + ".metadata.json";
+                var metaFile = file + ".metadata.json";
                 if (File.Exists(metaFile))
                 {
                     try
@@ -404,7 +470,29 @@ public class AgyAdapter : IAgentAdapter
                     catch { }
                 }
 
-                await client.SyncSessionArtifactAsync(sessionId, fInfo.Name, content, summary, "text/markdown", ct);
+                var contentType = ext switch
+                {
+                    ".md" => "text/markdown",
+                    ".png" => "image/png",
+                    ".jpg" or ".jpeg" => "image/jpeg",
+                    ".webp" => "image/webp",
+                    ".gif" => "image/gif",
+                    ".svg" => "image/svg+xml",
+                    ".pdf" => "application/pdf",
+                    _ => "application/octet-stream"
+                };
+
+                if (ext is ".md" or ".svg")
+                {
+                    var content = await File.ReadAllTextAsync(file, ct);
+                    await client.SyncSessionArtifactAsync(sessionId, fInfo.Name, content, summary, contentType, ct);
+                }
+                else
+                {
+                    var bytes = await File.ReadAllBytesAsync(file, ct);
+                    var base64 = Convert.ToBase64String(bytes);
+                    await client.SyncSessionArtifactAsync(sessionId, fInfo.Name, string.Empty, summary, contentType, ct, base64);
+                }
             }
         }
         catch { }
@@ -602,8 +690,37 @@ public class AgyAdapter : IAgentAdapter
             psi.ArgumentList.Add(promptEvent.Mode.Trim());
         }
 
+        var attachedBlock = AgentAdapterFactory.FormatAttachedFilesBlock(promptEvent.Attachments);
+        var agyPromptText = string.IsNullOrWhiteSpace(attachedBlock)
+            ? promptEvent.Prompt
+            : $"{attachedBlock}{promptEvent.Prompt}";
+        if (string.IsNullOrWhiteSpace(activeConvId) &&
+            (!string.IsNullOrWhiteSpace(promptEvent.PersonaPrompt) || !string.IsNullOrWhiteSpace(promptEvent.PersonaName)))
+        {
+            var sb = new StringBuilder();
+            var pDisplay = !string.IsNullOrWhiteSpace(promptEvent.PersonaName) ? promptEvent.PersonaName : promptEvent.PersonaId;
+            var rolePart = !string.IsNullOrWhiteSpace(promptEvent.PersonaRole) ? $" ({promptEvent.PersonaRole})" : "";
+            sb.AppendLine($"[Persona Context: You are acting as \"{pDisplay}\"{rolePart} on driver @{preset.Id}.]");
+            sb.AppendLine($"[Active Session ID: {promptEvent.SessionId}]");
+            if (!string.IsNullOrWhiteSpace(promptEvent.PersonaId))
+            {
+                sb.AppendLine($"[Session History Tooling: You can inspect past sessions for this persona anytime using the MCP tool 'get_persona_sessions' with personaId='{promptEvent.PersonaId}', or 'get_session' to inspect previous session transcripts and artifacts.]");
+            }
+            if (!string.IsNullOrWhiteSpace(promptEvent.PersonaPrompt))
+            {
+                sb.AppendLine($"[Persona Instructions: {promptEvent.PersonaPrompt.Trim()}]");
+            }
+            sb.AppendLine();
+            if (!string.IsNullOrWhiteSpace(attachedBlock))
+            {
+                sb.Append(attachedBlock);
+            }
+            sb.Append(promptEvent.Prompt);
+            agyPromptText = sb.ToString();
+        }
+
         psi.ArgumentList.Add("-p");
-        psi.ArgumentList.Add(promptEvent.Prompt);
+        psi.ArgumentList.Add(agyPromptText);
         psi.ArgumentList.Add("--output-format");
         psi.ArgumentList.Add("stream-json");
         psi.ArgumentList.Add("--dangerously-skip-permissions");
@@ -975,7 +1092,16 @@ public class ClaudeAdapter : IAgentAdapter
                 Content = $"[Claude Code @{preset.Id}] Executing prompt via {claudePath}..."
             });
 
-            var promptEnvelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(promptEvent.Prompt, preset.Id, promptEvent.Mode);
+            var promptEnvelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(
+                promptEvent.Prompt,
+                preset.Id,
+                promptEvent.Mode,
+                promptEvent.PersonaId,
+                promptEvent.PersonaName,
+                promptEvent.PersonaRole,
+                promptEvent.PersonaPrompt,
+                promptEvent.SessionId,
+                promptEvent.Attachments);
             var escapedPrompt = promptEnvelope.Replace("\"", "\\\"");
             var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\" -p \"{escapedPrompt}\"", cwd, ct);
             ct.ThrowIfCancellationRequested();
@@ -1104,7 +1230,16 @@ public class CopilotAdapter : IAgentAdapter
                 }
             }
 
-            var promptEnvelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(promptEvent.Prompt, preset.Id, promptEvent.Mode);
+            var promptEnvelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(
+                promptEvent.Prompt,
+                preset.Id,
+                promptEvent.Mode,
+                promptEvent.PersonaId,
+                promptEvent.PersonaName,
+                promptEvent.PersonaRole,
+                promptEvent.PersonaPrompt,
+                promptEvent.SessionId,
+                promptEvent.Attachments);
 
             psi.ArgumentList.Add("-p");
             psi.ArgumentList.Add(promptEnvelope);

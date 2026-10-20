@@ -112,12 +112,22 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var effort = GetJsonPropString(elem, "effort");
                 var mode = GetJsonPropString(elem, "mode");
                 var tier = GetJsonPropString(elem, "tier");
+                var personaId = GetJsonPropString(elem, "personaId");
+                var personaName = GetJsonPropString(elem, "personaName");
+                var personaRole = GetJsonPropString(elem, "personaRole");
+                var personaPrompt = GetJsonPropString(elem, "personaPrompt");
+                var attachments = ExtractJsonAttachments(elem);
 
                 await HandlePromptAsync(new PromptReceivedEvent
                 {
                     SessionId = sessionId,
                     MessageId = messageId,
                     AgentId = _preset.Id,
+                    DriverId = _preset.Id,
+                    PersonaId = personaId,
+                    PersonaName = personaName,
+                    PersonaRole = personaRole,
+                    PersonaPrompt = personaPrompt,
                     Prompt = prompt,
                     Sender = sender,
                     WorkingDirectory = workDir,
@@ -125,6 +135,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                     Effort = effort,
                     Mode = mode,
                     Tier = tier,
+                    Attachments = attachments,
                     CreatedAt = DateTimeOffset.UtcNow
                 }, _cts.Token);
             }
@@ -320,6 +331,11 @@ public class AgentRunnerInstance : IAsyncDisposable
 
             ev.WorkingDirectory = effectiveWorkDir;
 
+            if (ev.Attachments is { Count: > 0 })
+            {
+                await StagePromptAttachmentsAsync(ev, effectiveWorkDir, _meshClient, (msg) => _onLog(_preset.Id, msg), turnToken);
+            }
+
             _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender} (model: {ev.Model ?? "default"}, effort: {ev.Effort ?? "default"}): {ev.Prompt} (cwd: {effectiveWorkDir})");
 
             var adapter = AgentAdapterFactory.Create(_preset);
@@ -445,6 +461,110 @@ public class AgentRunnerInstance : IAsyncDisposable
     {
         await StopAsync();
         _cts.Dispose();
+    }
+
+    public static List<AttachmentItem>? ExtractJsonAttachments(JsonElement elem)
+    {
+        foreach (var prop in elem.EnumerateObject())
+        {
+            if (string.Equals(prop.Name, "attachments", StringComparison.OrdinalIgnoreCase) &&
+                prop.Value.ValueKind == JsonValueKind.Array)
+            {
+                try
+                {
+                    return JsonSerializer.Deserialize<List<AttachmentItem>>(prop.Value.GetRawText(), new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    public static async Task<List<string>> StagePromptAttachmentsAsync(
+        PromptReceivedEvent ev,
+        string effectiveWorkDir,
+        MeshClient meshClient,
+        Action<string>? onLog = null,
+        CancellationToken ct = default)
+    {
+        var stagedPaths = new List<string>();
+        if (ev.Attachments == null || ev.Attachments.Count == 0)
+        {
+            return stagedPaths;
+        }
+
+        var attachDir = Path.Combine(effectiveWorkDir, ".agentmesh", "attachments");
+        try
+        {
+            Directory.CreateDirectory(attachDir);
+        }
+        catch (Exception ex)
+        {
+            onLog?.Invoke($"Warning: Could not create attachment directory '{attachDir}': {ex.Message}");
+            return stagedPaths;
+        }
+
+        foreach (var att in ev.Attachments)
+        {
+            if (string.IsNullOrWhiteSpace(att.Id) && string.IsNullOrWhiteSpace(att.FileName))
+            {
+                continue;
+            }
+
+            var safeName = Path.GetFileName(string.IsNullOrWhiteSpace(att.FileName) ? "attachment.bin" : att.FileName.Trim());
+            var prefix = string.IsNullOrWhiteSpace(att.Id) ? Guid.NewGuid().ToString("N")[..8] : att.Id;
+            var targetPath = Path.Combine(attachDir, $"{prefix}_{safeName}");
+
+            var downloaded = false;
+            if (File.Exists(targetPath))
+            {
+                downloaded = true;
+            }
+            else if (!string.IsNullOrWhiteSpace(att.Id))
+            {
+                downloaded = await meshClient.DownloadSessionAttachmentAsync(ev.SessionId, att.Id, targetPath, ct);
+            }
+
+            if (!downloaded)
+            {
+                // Local disk fallback when running on same machine as API
+                var localFallbackPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".agentmesh",
+                    "artifacts",
+                    ev.SessionId.ToString(),
+                    "attachments",
+                    $"{att.Id}_{safeName}");
+                if (File.Exists(localFallbackPath))
+                {
+                    try
+                    {
+                        File.Copy(localFallbackPath, targetPath, overwrite: true);
+                        downloaded = true;
+                    }
+                    catch { }
+                }
+            }
+
+            if (downloaded)
+            {
+                att.LocalFilePath = targetPath;
+                stagedPaths.Add(targetPath);
+                onLog?.Invoke($"📎 Staged attachment '{safeName}' -> {targetPath}");
+            }
+            else
+            {
+                onLog?.Invoke($"Warning: Could not download attachment '{safeName}' ({att.Id}) for session {ev.SessionId.ToString()[..8]}");
+            }
+        }
+
+        return stagedPaths;
     }
 
     private static string Truncate(string input, int maxLen)

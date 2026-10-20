@@ -21,6 +21,11 @@ public class SessionTools(
     IHttpContextAccessor? httpContextAccessor = null,
     IHubContext<AgentMeshHub>? hubContext = null)
 {
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
     private string? GetAuthenticatedAgentId()
     {
         var user = httpContextAccessor?.HttpContext?.User;
@@ -38,7 +43,7 @@ public class SessionTools(
         {
             error = "Unauthorized",
             message = "Missing or invalid API token. Please register via 'register_agent' and provide 'Authorization: Bearer <token>' in your MCP client headers."
-        }, new JsonSerializerOptions { WriteIndented = true });
+        }, JsonOptions);
 
     [McpServerTool(Name = "register_agent")]
     [Description("Registers a new autonomous AI agent (such as agy) into AgentMesh and generates a Bearer API token.")]
@@ -69,7 +74,7 @@ public class SessionTools(
                 runtimeType = existing.RuntimeType.ToString(),
                 trustTier = existing.TrustTier.ToString(),
                 message = $"Agent '{normalizedId}' is already registered and marked online."
-            }, new JsonSerializerOptions { WriteIndented = true });
+            }, JsonOptions);
         }
 
         if (!Enum.TryParse<RuntimeType>(runtimeType, true, out var parsedRuntime))
@@ -110,7 +115,7 @@ public class SessionTools(
             runtimeType = agent.RuntimeType.ToString(),
             token = rawToken,
             instructions = "Set 'Authorization: Bearer <token>' in your MCP client headers for all future tool calls."
-        }, new JsonSerializerOptions { WriteIndented = true });
+        }, JsonOptions);
     }
 
     [McpServerTool(Name = "create_session")]
@@ -166,13 +171,15 @@ public class SessionTools(
             title = session.Title,
             creatorAgentId = session.CreatorAgentId,
             createdAt = session.CreatedAt
-        }, new JsonSerializerOptions { WriteIndented = true });
+        }, JsonOptions);
     }
 
     [McpServerTool(Name = "list_sessions")]
     [Description("Lists active and past sessions, ordered by most recently updated.")]
     public async Task<string> ListSessions(
         [Description("Optional filter: 'active', 'completed', or 'all' (default is 'active')")] string? status = "active",
+        [Description("Optional persona ID to filter sessions")] string? personaId = null,
+        [Description("Optional driver or creator agent ID to filter sessions")] string? driverId = null,
         CancellationToken ct = default)
     {
         var query = db.AgentSessions.AsNoTracking().AsQueryable();
@@ -180,6 +187,18 @@ public class SessionTools(
         if (!string.IsNullOrWhiteSpace(status) && status.ToLower() != "all")
         {
             query = query.Where(s => s.Status.ToLower() == status.Trim().ToLower());
+        }
+
+        if (!string.IsNullOrWhiteSpace(personaId))
+        {
+            var normPersona = personaId.Trim().ToLowerInvariant();
+            query = query.Where(s => s.PersonaId == normPersona);
+        }
+
+        if (!string.IsNullOrWhiteSpace(driverId))
+        {
+            var normDriver = driverId.Trim().ToLowerInvariant();
+            query = query.Where(s => s.DriverId == normDriver || s.CreatorAgentId == normDriver);
         }
 
         var sessions = await query
@@ -191,17 +210,92 @@ public class SessionTools(
                 s.Title,
                 s.Status,
                 s.CreatorAgentId,
+                s.DriverId,
+                s.PersonaId,
+                s.MetadataJson,
                 MessageCount = s.Messages.Count,
                 s.CreatedAt,
                 s.UpdatedAt
             })
             .ToListAsync(ct);
 
-        return JsonSerializer.Serialize(sessions, new JsonSerializerOptions { WriteIndented = true });
+        var result = sessions.Select(s =>
+        {
+            var artifacts = SessionsController.ExtractArtifacts(s.MetadataJson);
+            return new
+            {
+                s.Id,
+                s.Title,
+                s.Status,
+                s.CreatorAgentId,
+                s.DriverId,
+                s.PersonaId,
+                s.MessageCount,
+                ArtifactCount = artifacts.Count,
+                s.CreatedAt,
+                s.UpdatedAt
+            };
+        }).ToList();
+
+        return JsonSerializer.Serialize(result, JsonOptions);
+    }
+
+    [McpServerTool(Name = "get_persona_sessions")]
+    [Description("Lists sessions created for or by a specific persona, including session IDs, titles, status, message count, artifact count, and timestamps so past work and decisions can be referenced.")]
+    public async Task<string> GetPersonaSessions(
+        [Description("The persona ID, e.g. 'system-architect', 'astra', etc.")] string personaId,
+        [Description("Optional filter: 'active', 'completed', or 'all' (default is 'all')")] string? status = "all",
+        CancellationToken ct = default)
+    {
+        var normalizedPersonaId = personaId.Trim().ToLowerInvariant();
+        var query = db.AgentSessions.AsNoTracking()
+            .Where(s => s.PersonaId == normalizedPersonaId);
+
+        if (!string.IsNullOrWhiteSpace(status) && status.ToLower() != "all")
+        {
+            query = query.Where(s => s.Status.ToLower() == status.Trim().ToLower());
+        }
+
+        var sessions = await query
+            .OrderByDescending(s => s.CreatedAt)
+            .Take(50)
+            .Select(s => new
+            {
+                s.Id,
+                s.Title,
+                s.Status,
+                s.PersonaId,
+                s.DriverId,
+                s.MetadataJson,
+                MessageCount = s.Messages.Count,
+                s.CreatedAt,
+                s.UpdatedAt
+            })
+            .ToListAsync(ct);
+
+        var result = sessions.Select(s =>
+        {
+            var artifacts = SessionsController.ExtractArtifacts(s.MetadataJson);
+            return new
+            {
+                s.Id,
+                s.Title,
+                s.Status,
+                s.PersonaId,
+                s.DriverId,
+                s.MessageCount,
+                ArtifactCount = artifacts.Count,
+                Artifacts = artifacts.Select(a => new { a.Id, a.Name, a.ContentType, a.Summary }).ToList(),
+                s.CreatedAt,
+                s.UpdatedAt
+            };
+        }).ToList();
+
+        return JsonSerializer.Serialize(result, JsonOptions);
     }
 
     [McpServerTool(Name = "get_session")]
-    [Description("Retrieves details of a specific session including full trajectory history.")]
+    [Description("Retrieves details of a specific session including full trajectory history and artifacts.")]
     public async Task<string> GetSession(
         [Description("The GUID string of the session to retrieve")] string sessionId,
         CancellationToken ct = default)
@@ -222,14 +316,17 @@ public class SessionTools(
         }
 
         string? creatorAgentName = null;
-        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        var effectiveDriverId = session.DriverId ?? session.CreatorAgentId;
+        if (!string.IsNullOrWhiteSpace(effectiveDriverId))
         {
             creatorAgentName = await db.Agents
                 .AsNoTracking()
-                .Where(a => a.Id == session.CreatorAgentId)
+                .Where(a => a.Id == effectiveDriverId)
                 .Select(a => a.Name)
                 .FirstOrDefaultAsync(ct);
         }
+
+        var artifacts = SessionsController.ExtractArtifacts(session.MetadataJson);
 
         var result = new
         {
@@ -238,7 +335,10 @@ public class SessionTools(
             session.Status,
             session.MetadataJson,
             session.CreatorAgentId,
+            session.DriverId,
+            session.PersonaId,
             CreatorAgentName = creatorAgentName,
+            Artifacts = artifacts,
             session.CreatedAt,
             session.UpdatedAt,
             Messages = session.Messages.Select(m => new
@@ -256,7 +356,7 @@ public class SessionTools(
             })
         };
 
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return JsonSerializer.Serialize(result, JsonOptions);
     }
 
     [McpServerTool(Name = "append_thought")]
@@ -367,7 +467,7 @@ public class SessionTools(
             eventType = message.EventType,
             senderAgentId = message.SenderAgentId,
             createdAt = message.CreatedAt
-        }, new JsonSerializerOptions { WriteIndented = true });
+        }, JsonOptions);
     }
 
     [McpServerTool(Name = "update_session_status")]
@@ -403,6 +503,6 @@ public class SessionTools(
             sessionId = session.Id,
             newStatus = session.Status,
             updatedAt = session.UpdatedAt
-        }, new JsonSerializerOptions { WriteIndented = true });
+        }, JsonOptions);
     }
 }

@@ -32,6 +32,21 @@ public class PromptReceivedEvent
     [JsonPropertyName("agentId")]
     public string AgentId { get; set; } = string.Empty;
 
+    [JsonPropertyName("driverId")]
+    public string? DriverId { get; set; }
+
+    [JsonPropertyName("personaId")]
+    public string? PersonaId { get; set; }
+
+    [JsonPropertyName("personaName")]
+    public string? PersonaName { get; set; }
+
+    [JsonPropertyName("personaRole")]
+    public string? PersonaRole { get; set; }
+
+    [JsonPropertyName("personaPrompt")]
+    public string? PersonaPrompt { get; set; }
+
     [JsonPropertyName("prompt")]
     public string Prompt { get; set; } = string.Empty;
 
@@ -53,8 +68,38 @@ public class PromptReceivedEvent
     [JsonPropertyName("tier")]
     public string? Tier { get; set; }
 
+    [JsonPropertyName("attachments")]
+    public List<AttachmentItem>? Attachments { get; set; }
+
     [JsonPropertyName("createdAt")]
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public class AttachmentItem
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonPropertyName("sessionId")]
+    public Guid SessionId { get; set; }
+
+    [JsonPropertyName("fileName")]
+    public string FileName { get; set; } = string.Empty;
+
+    [JsonPropertyName("contentType")]
+    public string ContentType { get; set; } = "application/octet-stream";
+
+    [JsonPropertyName("sizeBytes")]
+    public long SizeBytes { get; set; }
+
+    [JsonPropertyName("s3Key")]
+    public string? S3Key { get; set; }
+
+    [JsonPropertyName("downloadUrl")]
+    public string? DownloadUrl { get; set; }
+
+    [JsonIgnore]
+    public string? LocalFilePath { get; set; }
 }
 
 public class TrajectoryEventPayload

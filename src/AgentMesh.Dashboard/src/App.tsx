@@ -32,7 +32,16 @@ import {
   Square,
   ListPlus,
   HelpCircle,
-  FileText
+  FileText,
+  Users,
+  Edit3,
+  ArrowDown,
+  ArrowDownToLine,
+  Paperclip,
+  Image as ImageIcon,
+  File as FileIcon,
+  Download,
+  ZoomIn
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -43,8 +52,10 @@ import type {
   AgentUsageResponse,
   AskQuestionItem,
   FilesystemBrowseResponse,
+  Persona,
   QueuedPromptItem,
   QuestionAnswerPayload,
+  SessionAttachment,
   SessionMessage,
   SessionArtifact,
   SystemCapabilitiesResponse,
@@ -52,6 +63,48 @@ import type {
 } from './types';
 import { SlashCommandPalette, SLASH_COMMANDS, type SlashCommandItem } from './components/SlashCommandPalette';
 import { ArtifactViewer } from './components/ArtifactViewer';
+
+interface StagedAttachmentItem {
+  localId: string;
+  file: File;
+  name: string;
+  contentType: string;
+  sizeBytes: number;
+  previewUrl?: string;
+  uploading: boolean;
+  uploaded?: SessionAttachment;
+  error?: string;
+}
+
+const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+const DEFAULT_ATTACHMENT_PROMPT = 'Please review the attached file(s).';
+
+function formatAttachmentSize(bytes?: number): string {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isImageAttachment(contentType?: string, fileName?: string): boolean {
+  const ct = (contentType || '').toLowerCase();
+  const name = (fileName || '').toLowerCase();
+  return ct.startsWith('image/') || /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)$/.test(name);
+}
+
+function extractMessageAttachments(ev: SessionMessage): SessionAttachment[] {
+  if (!ev.structuredPayloadJson) return [];
+  try {
+    const parsed = JSON.parse(ev.structuredPayloadJson);
+    if (Array.isArray(parsed?.attachments)) {
+      return parsed.attachments as SessionAttachment[];
+    }
+  } catch {
+    // Ignore malformed JSON
+  }
+  return [];
+}
 
 function parseTextQuestions(content: string): AskQuestionItem[] {
   if (!content) return [];
@@ -64,44 +117,71 @@ function parseTextQuestions(content: string): AskQuestionItem[] {
   }
   const lines = content.split('\n');
   const items: AskQuestionItem[] = [];
-  for (const line of lines) {
-    const qMatch = line.match(/^\s*(?:\d+[\.\)]|[-*])\s+(.+?\?)/);
-    if (qMatch && qMatch[1].trim().length > 5) {
-      const fullQ = qMatch[1].trim();
-      const extractedOptions: string[] = [];
+  for (const rawLine of lines) {
+    // Strip markdown links [text](url) -> text, and inline code `code` -> code
+    const line = rawLine
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+      .trim();
 
-      // Check for parenthesized choices, e.g. (Italian, Mexican, Asian, etc.)
-      const parenMatch = fullQ.match(/\(([^)]+)\)/);
-      if (parenMatch) {
-        const rawChoices = parenMatch[1].split(/[,/]| or /i);
-        for (const choice of rawChoices) {
-          const trimmed = choice.trim().replace(/^etc\.?$/i, '').replace(/^e\.g\.?$/i, '').trim();
-          if (trimmed.length > 1 && trimmed.length < 35 && !extractedOptions.includes(trimmed)) {
+    // Line must start with list marker (e.g. "1.", "1)", "*", "-")
+    const listMatch = line.match(/^\s*(?:\d+[\.\)]|[-*])\s+(.+)$/);
+    if (!listMatch) continue;
+
+    const body = listMatch[1].trim();
+
+    // Must strictly end with a question mark (allowing trailing formatting or quotes)
+    if (!/\?\s*["'\)\]*_~]*$/.test(body)) continue;
+
+    // Reject bullet points that are key-value headers (e.g. "**API Endpoint**: ...?")
+    if (/^\*\*[^*]+?\*\*:\s*/.test(body)) continue;
+
+    const fullQ = body;
+    const extractedOptions: string[] = [];
+
+    // Check for parenthesized choices, e.g. (Italian, Mexican, Asian, etc.)
+    const parenMatch = fullQ.match(/\(([^)]+)\)/);
+    if (parenMatch) {
+      const rawChoices = parenMatch[1].split(/[,/]| or /i);
+      for (const choice of rawChoices) {
+        const trimmed = choice.trim().replace(/^etc\.?$/i, '').replace(/^e\.g\.?$/i, '').trim();
+        // Ignore if looks like a URL, file path, or option is too long
+        if (
+          trimmed.length > 1 &&
+          trimmed.length < 35 &&
+          !trimmed.includes('://') &&
+          !trimmed.includes('/') &&
+          !extractedOptions.includes(trimmed)
+        ) {
+          extractedOptions.push(trimmed);
+        }
+      }
+    }
+
+    // If no paren choices, check for "A or B" pattern
+    if (extractedOptions.length === 0 && fullQ.includes(' or ')) {
+      const cleanedQ = fullQ.replace(/\?["'\)\]*_~]*$/, '');
+      const orParts = cleanedQ.split(/\s+or\s+/i);
+      if (orParts.length >= 2 && orParts.length <= 4) {
+        for (const part of orParts) {
+          const trimmed = part.trim();
+          if (
+            trimmed.length > 2 &&
+            trimmed.length < 35 &&
+            !trimmed.includes('://') &&
+            !extractedOptions.includes(trimmed)
+          ) {
             extractedOptions.push(trimmed);
           }
         }
       }
-
-      // If no paren choices, check for "A or B" pattern
-      if (extractedOptions.length === 0 && fullQ.includes(' or ')) {
-        const cleanedQ = fullQ.replace(/\?$/, '');
-        const orParts = cleanedQ.split(/\s+or\s+/i);
-        if (orParts.length >= 2 && orParts.length <= 4) {
-          for (const part of orParts) {
-            const trimmed = part.trim();
-            if (trimmed.length > 2 && trimmed.length < 35 && !extractedOptions.includes(trimmed)) {
-              extractedOptions.push(trimmed);
-            }
-          }
-        }
-      }
-
-      items.push({
-        question: fullQ,
-        options: extractedOptions,
-        is_multi_select: false
-      });
     }
+
+    items.push({
+      question: fullQ,
+      options: extractedOptions,
+      is_multi_select: false
+    });
   }
   return items;
 }
@@ -111,10 +191,30 @@ export default function App() {
   const userEmail = auth?.user?.profile?.email || auth?.user?.profile?.name || 'admin';
 
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [personas, setPersonas] = useState<Persona[]>([]);
   const [sessions, setSessions] = useState<AgentSession[]>([]);
+  const [activeTab, setActiveTab] = useState<'personas' | 'drivers'>('personas');
+  const [hasUserSwitchedTab, setHasUserSwitchedTab] = useState(false);
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [events, setEvents] = useState<SessionMessage[]>([]);
+
+  // Create / Edit Persona Modal state
+  const [showPersonaModal, setShowPersonaModal] = useState(false);
+  const [editingPersona, setEditingPersona] = useState<Persona | null>(null);
+  const [personaIdInput, setPersonaIdInput] = useState('');
+  const [personaNameInput, setPersonaNameInput] = useState('');
+  const [personaRoleInput, setPersonaRoleInput] = useState('Codebase Engineer');
+  const [personaPromptInput, setPersonaPromptInput] = useState('');
+  const [personaDriverInput, setPersonaDriverInput] = useState('agy');
+  const [personaDefaultModel, setPersonaDefaultModel] = useState('');
+  const [personaDefaultEffort, setPersonaDefaultEffort] = useState('');
+  const [personaDefaultMode, setPersonaDefaultMode] = useState('');
+  const [personaDefaultTier, setPersonaDefaultTier] = useState('');
+  const [personaDefaultWorkDir, setPersonaDefaultWorkDir] = useState('');
+  const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
 
   const [statusData, setStatusData] = useState<SystemStatusResponse | null>(null);
   const [capabilities, setCapabilities] = useState<SystemCapabilitiesResponse | null>(null);
@@ -143,6 +243,7 @@ export default function App() {
   const [agentUsages, setAgentUsages] = useState<Record<string, AgentUsageResponse>>({});
   const [selectedUsageAgent, setSelectedUsageAgent] = useState<Agent | null>(null);
   const [showUsageModal, setShowUsageModal] = useState(false);
+  const [isRefreshingUsage, setIsRefreshingUsage] = useState(false);
 
   // Active session inline control edit popover state
   const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | null>(null);
@@ -174,24 +275,130 @@ export default function App() {
   const [slashPaletteOpen, setSlashPaletteOpen] = useState(false);
   const [slashPaletteIndex, setSlashPaletteIndex] = useState(0);
 
+  // Session Chat & New Session Attachments + Fullscreen Lightbox state
+  const [stagedAttachments, setStagedAttachments] = useState<StagedAttachmentItem[]>([]);
+  const [newSessionAttachments, setNewSessionAttachments] = useState<StagedAttachmentItem[]>([]);
+  const [isDraggingChat, setIsDraggingChat] = useState(false);
+  const [isDraggingNewSession, setIsDraggingNewSession] = useState(false);
+  const [lightboxAttachment, setLightboxAttachment] = useState<{
+    url: string;
+    fileName: string;
+    sizeBytes?: number;
+  } | null>(null);
+  const chatFileInputRef = useRef<HTMLInputElement | null>(null);
+  const newSessionFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Auto-scroll toggle state (persisted in localStorage, default ON)
+  const [autoScrollEnabled, setAutoScrollEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('agentmesh_autoscroll_enabled');
+      return saved !== null ? saved === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+  const [isScrolledUp, setIsScrolledUp] = useState(false);
+
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const timelineContainerRef = useRef<HTMLDivElement | null>(null);
+  const isSessionSwitchingRef = useRef(false);
+  const prevSelectedSessionIdRef = useRef<string | null>(null);
   const { connection, connected: signalRConnected } = useSignalR('/hubs/agent-mesh');
+
+  const handleToggleAutoScroll = () => {
+    setAutoScrollEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('agentmesh_autoscroll_enabled', String(next));
+      } catch {}
+      if (next && timelineContainerRef.current) {
+        if (typeof timelineContainerRef.current.scrollTo === 'function') {
+          timelineContainerRef.current.scrollTo({
+            top: timelineContainerRef.current.scrollHeight,
+            behavior: 'smooth'
+          });
+        } else {
+          timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
+        }
+        setIsScrolledUp(false);
+      }
+      return next;
+    });
+  };
+
+  const handleScrollToBottom = () => {
+    if (timelineContainerRef.current) {
+      if (typeof timelineContainerRef.current.scrollTo === 'function') {
+        timelineContainerRef.current.scrollTo({
+          top: timelineContainerRef.current.scrollHeight,
+          behavior: 'smooth'
+        });
+      } else {
+        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
+      }
+    }
+    setIsScrolledUp(false);
+  };
+
+  const handleTimelineScroll = () => {
+    if (!timelineContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = timelineContainerRef.current;
+    const isNearBottom = scrollHeight - (scrollTop + clientHeight) < 150;
+    setIsScrolledUp(!isNearBottom);
+  };
+
+  const handleOpenUsageModal = async (agent: Agent) => {
+    setSelectedUsageAgent(agent);
+    setShowUsageModal(true);
+    setIsRefreshingUsage(true);
+    try {
+      const u = await api.getAgentUsage(agent.id, true);
+      setAgentUsages((prev) => ({ ...prev, [agent.id]: u }));
+    } catch (err) {
+      console.error('Failed to load fresh agent usage:', err);
+    } finally {
+      setIsRefreshingUsage(false);
+    }
+  };
+
+  const handleRefreshUsage = async (agentId: string) => {
+    setIsRefreshingUsage(true);
+    try {
+      const u = await api.getAgentUsage(agentId, true);
+      setAgentUsages((prev) => ({ ...prev, [agentId]: u }));
+    } catch (err) {
+      console.error('Failed to refresh agent usage:', err);
+    } finally {
+      setIsRefreshingUsage(false);
+    }
+  };
 
   const fetchAllData = useCallback(async () => {
     try {
-      const [statusRes, agentsRes, sessionsRes, capsRes] = await Promise.all([
+      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes] = await Promise.all([
         api.getStatus(),
         api.getAgents(),
+        api.getPersonas ? api.getPersonas().catch(() => []) : Promise.resolve([]),
         api.getSessions('all'),
         api.getCapabilities().catch(() => null)
       ]);
       setStatusData(statusRes);
       setAgents(agentsRes);
+      setPersonas(personasRes);
       setSessions(sessionsRes);
       if (capsRes) {
         setCapabilities(capsRes);
       }
       setApiError(null);
+
+      // If no personas exist but drivers exist and user hasn't manually switched tab, show Drivers tab
+      if (!hasUserSwitchedTab) {
+        if (personasRes.length > 0) {
+          setActiveTab('personas');
+        } else if (agentsRes.length > 0) {
+          setActiveTab('drivers');
+        }
+      }
 
       // Fetch usage stats & quotas in parallel for all agents
       const usages: Record<string, AgentUsageResponse> = {};
@@ -207,7 +414,14 @@ export default function App() {
       );
       setAgentUsages(usages);
 
-      // Auto-select first agent & session if none selected
+      // Auto-select first persona, agent & session if none selected
+      setSelectedPersonaId((prevPersona) => {
+        if (prevPersona && personasRes.some((p) => p.id === prevPersona)) {
+          return prevPersona;
+        }
+        return personasRes[0]?.id || null;
+      });
+
       setSelectedAgentId((prevAgent) => {
         const nextAgent = prevAgent && agentsRes.some((a) => a.id === prevAgent)
           ? prevAgent
@@ -219,6 +433,9 @@ export default function App() {
         if (prevSession && sessionsRes.some((s) => s.id === prevSession)) {
           return prevSession;
         }
+        if (prevSession) {
+          return prevSession;
+        }
         return sessionsRes[0]?.id || null;
       });
     } catch (err) {
@@ -226,7 +443,7 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [hasUserSwitchedTab]);
 
   const fetchSessionEvents = useCallback(async (sessionId: string) => {
     try {
@@ -254,13 +471,22 @@ export default function App() {
   }, [fetchAllData]);
 
   useEffect(() => {
+    isSessionSwitchingRef.current = true;
     if (selectedSessionId) {
+      if (prevSelectedSessionIdRef.current && prevSelectedSessionIdRef.current !== selectedSessionId && connection && signalRConnected) {
+        connection.invoke('LeaveSession', prevSelectedSessionIdRef.current).catch(() => {});
+      }
+      prevSelectedSessionIdRef.current = selectedSessionId;
       fetchSessionEvents(selectedSessionId);
       fetchSessionArtifacts(selectedSessionId);
       if (connection && signalRConnected) {
         connection.invoke('JoinSession', selectedSessionId).catch(() => {});
       }
     } else {
+      if (prevSelectedSessionIdRef.current && connection && signalRConnected) {
+        connection.invoke('LeaveSession', prevSelectedSessionIdRef.current).catch(() => {});
+      }
+      prevSelectedSessionIdRef.current = null;
       setEvents([]);
       setArtifacts([]);
       setSelectedArtifactId(null);
@@ -302,15 +528,52 @@ export default function App() {
           return [...prev, msg];
         });
       }
-      fetchAllData();
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === msg.sessionId
+            ? {
+                ...s,
+                messageCount: (s.messageCount || 0) + 1,
+                status: (msg.eventType === 'prompt' || msg.eventType === 'thought' || msg.eventType === 'tool_call') ? 'thinking' : s.status,
+                updatedAt: msg.createdAt || new Date().toISOString()
+              }
+            : s
+        )
+      );
     };
 
     const handleSessionCreated = (session: AgentSession) => {
-      fetchAllData();
+      setSessions((prev) => {
+        if (prev.some((s) => s.id === session.id)) return prev;
+        return [session, ...prev];
+      });
       setSelectedSessionId(session.id);
-      if (session.creatorAgentId) {
-        setSelectedAgentId(session.creatorAgentId);
+      if (session.personaId) {
+        setSelectedPersonaId(session.personaId);
       }
+      if (session.driverId || session.creatorAgentId) {
+        setSelectedAgentId(session.driverId || session.creatorAgentId || null);
+      }
+    };
+
+    const handleSessionDeleted = (data: { id?: string; sessionId?: string; personaId?: string; driverId?: string }) => {
+      const deletedId = data.id || data.sessionId;
+      if (!deletedId) return;
+      setSessions((prev) => prev.filter((s) => s.id !== deletedId));
+      setSelectedSessionId((cur) => {
+        if (cur === deletedId) {
+          const siblings = sessions.filter((s) => s.id !== deletedId && (
+            (data.personaId && s.personaId === data.personaId) ||
+            (!data.personaId && (s.driverId === data.driverId || s.creatorAgentId === data.driverId))
+          ));
+          if (siblings.length > 0) {
+            return siblings[0].id;
+          }
+          setIsCreatingSession(true);
+          return null;
+        }
+        return cur;
+      });
     };
 
     const handleSessionUpdated = () => {
@@ -322,9 +585,11 @@ export default function App() {
 
     const handleMeshReset = () => {
       setAgents([]);
+      setPersonas([]);
       setSessions([]);
       setEvents([]);
       setArtifacts([]);
+      setSelectedPersonaId(null);
       setSelectedAgentId(null);
       setSelectedSessionId(null);
     };
@@ -358,41 +623,68 @@ export default function App() {
 
     connection.on('ReceiveMessage', handleReceiveMessage);
     connection.on('SessionCreated', handleSessionCreated);
+    connection.on('SessionDeleted', handleSessionDeleted);
     connection.on('SessionUpdated', handleSessionUpdated);
     connection.on('QueueUpdated', handleQueueUpdated);
     connection.on('ArtifactCreated', handleArtifactCreated);
     connection.on('ArtifactUpdated', handleArtifactUpdated);
     connection.on('AgentRegistered', handleSessionUpdated);
     connection.on('AgentUpdated', handleSessionUpdated);
+    connection.on('PersonaCreated', handleSessionUpdated);
+    connection.on('PersonaUpdated', handleSessionUpdated);
+    connection.on('PersonaDeleted', handleSessionUpdated);
     connection.on('MeshReset', handleMeshReset);
 
     return () => {
       connection.off('ReceiveMessage', handleReceiveMessage);
       connection.off('SessionCreated', handleSessionCreated);
+      connection.off('SessionDeleted', handleSessionDeleted);
       connection.off('SessionUpdated', handleSessionUpdated);
       connection.off('QueueUpdated', handleQueueUpdated);
       connection.off('ArtifactCreated', handleArtifactCreated);
       connection.off('ArtifactUpdated', handleArtifactUpdated);
       connection.off('AgentRegistered', handleSessionUpdated);
       connection.off('AgentUpdated', handleSessionUpdated);
+      connection.off('PersonaCreated', handleSessionUpdated);
+      connection.off('PersonaUpdated', handleSessionUpdated);
+      connection.off('PersonaDeleted', handleSessionUpdated);
       connection.off('MeshReset', handleMeshReset);
     };
   }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents, fetchSessionArtifacts]);
 
-  // Auto-scroll timeline when new events arrive
+  // Auto-scroll timeline when events change or session switches
   useEffect(() => {
-    if (typeof timelineEndRef.current?.scrollIntoView === 'function') {
-      timelineEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (isSessionSwitchingRef.current) {
+      isSessionSwitchingRef.current = false;
+      if (timelineContainerRef.current) {
+        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
+      }
+      setIsScrolledUp(false);
+      return;
     }
-  }, [events.length]);
+
+    if (!autoScrollEnabled) {
+      return;
+    }
+
+    if (timelineContainerRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = timelineContainerRef.current;
+      const isNearBottom = scrollHeight - (scrollTop + clientHeight) < 150;
+      if (isNearBottom && typeof timelineEndRef.current?.scrollIntoView === 'function') {
+        timelineEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      }
+    }
+  }, [events, autoScrollEnabled]);
 
   const handleResetMesh = async () => {
     setIsActionPending(true);
     try {
       await api.resetMesh();
       setAgents([]);
+      setPersonas([]);
       setSessions([]);
       setEvents([]);
+      setSelectedPersonaId(null);
       setSelectedAgentId(null);
       setSelectedSessionId(null);
       setIsCreatingSession(false);
@@ -423,28 +715,186 @@ export default function App() {
   }, [newSessionWorkDir, capabilities?.workspace?.currentDirectory, loadBrowseDirectory]);
 
   const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
+  const selectedPersona = personas.find((p) => p.id === (selectedSession?.personaId || selectedPersonaId)) ||
+    personas.find((p) => p.id === selectedPersonaId) ||
+    personas[0] ||
+    null;
+  const activeCreationPersona = personas.find((p) => p.id === selectedPersonaId) || personas[0] || null;
   const activeCreationAgent =
     agents.find((a) => a.id === selectedAgentId) || agents[0] || null;
   const selectedAgent = isCreatingSession
-    ? activeCreationAgent
-    : agents.find((a) => a.id === (selectedSession?.creatorAgentId || selectedAgentId)) || null;
+    ? (activeTab === 'personas' && activeCreationPersona
+        ? agents.find((a) => a.id === activeCreationPersona.driverId) || activeCreationAgent
+        : activeCreationAgent)
+    : agents.find((a) => a.id === (selectedSession?.driverId || selectedSession?.creatorAgentId || selectedAgentId)) || null;
 
-  const currentRuntimeCaps = useMemo(() => {
+  const getRuntimeCapsForDriver = useCallback((driverIdOrAgent?: string | Agent | null) => {
     if (!capabilities) return null;
-    const agent = isCreatingSession ? activeCreationAgent : selectedAgent;
-    if (!agent) return capabilities.agentRuntimes['agy'] || null;
+    if (!driverIdOrAgent) return capabilities.agentRuntimes['agy'] || null;
 
-    const idLower = agent.id.toLowerCase();
-    const nameLower = agent.name.toLowerCase();
+    const idLower = (typeof driverIdOrAgent === 'string' ? driverIdOrAgent : driverIdOrAgent.id).toLowerCase();
+    const nameLower = (typeof driverIdOrAgent === 'string' ? driverIdOrAgent : driverIdOrAgent.name).toLowerCase();
     let key = 'agy';
     if (idLower.includes('copilot') || nameLower.includes('copilot')) key = 'copilot';
     else if (idLower.includes('claude') || nameLower.includes('claude')) key = 'claude';
     else if (idLower.includes('agy') || idLower.includes('antigravity') || nameLower.includes('agy') || nameLower.includes('antigravity')) key = 'agy';
-    else if (capabilities.agentRuntimes[agent.id]) key = agent.id;
+    else if (capabilities.agentRuntimes[idLower]) key = idLower;
     else key = 'agy';
 
     return capabilities.agentRuntimes[key] || capabilities.agentRuntimes['agy'] || null;
-  }, [capabilities, isCreatingSession, activeCreationAgent, selectedAgent]);
+  }, [capabilities]);
+
+  const currentRuntimeCaps = useMemo(() => {
+    if (!capabilities) return null;
+    if (isCreatingSession && activeTab === 'personas' && activeCreationPersona) {
+      return getRuntimeCapsForDriver(activeCreationPersona.driverId);
+    }
+    const agent = isCreatingSession ? activeCreationAgent : selectedAgent;
+    if (!agent && selectedSession?.driverId) {
+      return getRuntimeCapsForDriver(selectedSession.driverId);
+    }
+    return getRuntimeCapsForDriver(agent);
+  }, [capabilities, isCreatingSession, activeTab, activeCreationPersona, activeCreationAgent, selectedAgent, selectedSession, getRuntimeCapsForDriver]);
+
+  const personaModalRuntimeCaps = useMemo(() => {
+    return getRuntimeCapsForDriver(personaDriverInput);
+  }, [getRuntimeCapsForDriver, personaDriverInput]);
+
+  const openCreatePersonaModal = useCallback((defaultDriverId?: string) => {
+    setEditingPersona(null);
+    setPersonaIdInput('');
+    setPersonaNameInput('');
+    setPersonaRoleInput('Codebase Engineer');
+    setPersonaPromptInput('');
+    setPersonaDriverInput(defaultDriverId || selectedAgentId || agents[0]?.id || 'agy');
+    setPersonaDefaultModel('');
+    setPersonaDefaultEffort('');
+    setPersonaDefaultMode('');
+    setPersonaDefaultTier('');
+    setPersonaDefaultWorkDir('');
+    setShowPersonaModal(true);
+  }, [selectedAgentId, agents]);
+
+  const openEditPersonaModal = useCallback((persona: Persona) => {
+    setEditingPersona(persona);
+    setPersonaIdInput(persona.id);
+    setPersonaNameInput(persona.name);
+    setPersonaRoleInput(persona.role || 'Codebase Engineer');
+    setPersonaPromptInput(persona.personaPrompt || '');
+    setPersonaDriverInput(persona.driverId || 'agy');
+    setPersonaDefaultModel(persona.defaultModel || '');
+    setPersonaDefaultEffort(persona.defaultEffort || '');
+    setPersonaDefaultMode(persona.defaultMode || '');
+    setPersonaDefaultTier(persona.defaultTier || '');
+    setPersonaDefaultWorkDir(persona.defaultWorkingDirectory || '');
+    setShowPersonaModal(true);
+  }, []);
+
+  const startNewSessionWithPersona = useCallback((persona: Persona) => {
+    setSelectedPersonaId(persona.id);
+    setSelectedAgentId(persona.driverId);
+    setNewSessionModel(persona.defaultModel || '');
+    setNewSessionEffort(persona.defaultEffort || '');
+    setNewSessionMode(persona.defaultMode || '');
+    setNewSessionTier(persona.defaultTier || '');
+    setNewSessionWorkDir(persona.defaultWorkingDirectory || '');
+    setIsCreatingSession(true);
+  }, []);
+
+  const handleSavePersona = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!personaNameInput.trim() || !personaDriverInput.trim()) return;
+
+    setIsActionPending(true);
+    try {
+      if (editingPersona) {
+        const updated = await api.updatePersona(editingPersona.id, {
+          name: personaNameInput.trim(),
+          role: personaRoleInput.trim() || 'Codebase Engineer',
+          personaPrompt: personaPromptInput.trim(),
+          driverId: personaDriverInput.trim().toLowerCase(),
+          defaultModel: personaDefaultModel || '',
+          defaultEffort: personaDefaultEffort || '',
+          defaultMode: personaDefaultMode || '',
+          defaultTier: personaDefaultTier || '',
+          defaultWorkingDirectory: personaDefaultWorkDir || ''
+        });
+        setShowPersonaModal(false);
+        await fetchAllData();
+        setSelectedPersonaId(updated.id);
+      } else {
+        const created = await api.createPersona({
+          id: personaIdInput.trim() || undefined,
+          name: personaNameInput.trim(),
+          role: personaRoleInput.trim() || 'Codebase Engineer',
+          personaPrompt: personaPromptInput.trim() || undefined,
+          driverId: personaDriverInput.trim().toLowerCase(),
+          defaultModel: personaDefaultModel || undefined,
+          defaultEffort: personaDefaultEffort || undefined,
+          defaultMode: personaDefaultMode || undefined,
+          defaultTier: personaDefaultTier || undefined,
+          defaultWorkingDirectory: personaDefaultWorkDir || undefined
+        });
+        setShowPersonaModal(false);
+        setHasUserSwitchedTab(true);
+        setActiveTab('personas');
+        await fetchAllData();
+        setSelectedPersonaId(created.id);
+      }
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to save persona');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const handleDeletePersona = async (personaId: string) => {
+    setIsActionPending(true);
+    try {
+      await api.deletePersona(personaId);
+      setDeletingPersonaId(null);
+      if (selectedPersonaId === personaId) {
+        setSelectedPersonaId(null);
+      }
+      await fetchAllData();
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to delete persona');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
+  const handleDeleteSession = async (sessionId: string) => {
+    setIsActionPending(true);
+    try {
+      await api.deleteSession(sessionId);
+      setDeletingSessionId(null);
+      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+
+      if (selectedSessionId === sessionId) {
+        const targetPersonaId = selectedPersona?.id || selectedPersonaId;
+        const targetDriverId = selectedAgent?.id || selectedAgentId;
+
+        const siblings = sessions.filter(
+          (s) =>
+            s.id !== sessionId &&
+            ((activeTab === 'personas' && targetPersonaId && (s.personaId === targetPersonaId || (!s.personaId && s.driverId === selectedPersona?.driverId))) ||
+             (activeTab === 'drivers' && targetDriverId && (s.driverId === targetDriverId || s.creatorAgentId === targetDriverId)))
+        );
+
+        if (siblings.length > 0) {
+          setSelectedSessionId(siblings[0].id);
+        } else {
+          setSelectedSessionId(null);
+          setIsCreatingSession(true);
+        }
+      }
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Failed to delete session');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
 
   const availableModels = useMemo(() => {
     return currentRuntimeCaps?.models || [];
@@ -487,25 +937,220 @@ export default function App() {
     }
   }, [availableModels, availableModes, availableTiers, newSessionModel, newSessionMode, newSessionTier]);
 
+  const createPreviewUrl = (file: File): string | undefined => {
+    if (isImageAttachment(file.type, file.name) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+      try {
+        return URL.createObjectURL(file);
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  };
+
+  const stageFilesForComposer = useCallback(
+    async (rawFiles: FileList | File[], target: 'chat' | 'newSession') => {
+      const incoming = Array.from(rawFiles || []);
+      if (incoming.length === 0) return;
+
+      const currentList = target === 'chat' ? stagedAttachments : newSessionAttachments;
+      if (currentList.length + incoming.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+        setApiError(`Maximum of ${MAX_ATTACHMENTS_PER_MESSAGE} files can be attached per message.`);
+        return;
+      }
+
+      for (const f of incoming) {
+        if (f.size > MAX_ATTACHMENT_SIZE_BYTES) {
+          setApiError(`File "${f.name}" exceeds the 25 MB maximum file size limit.`);
+          return;
+        }
+      }
+
+      const newItems: StagedAttachmentItem[] = incoming.map((file, idx) => {
+        const safeName = file.name || `clipboard-image-${Date.now()}-${idx}.png`;
+        return {
+          localId: `att-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+          file,
+          name: safeName,
+          contentType: file.type || 'application/octet-stream',
+          sizeBytes: file.size,
+          previewUrl: createPreviewUrl(file),
+          uploading: target === 'chat' && Boolean(selectedSessionId)
+        };
+      });
+
+      if (target === 'newSession') {
+        setNewSessionAttachments((prev) => [...prev, ...newItems]);
+        return;
+      }
+
+      setStagedAttachments((prev) => [...prev, ...newItems]);
+
+      if (selectedSessionId) {
+        try {
+          let uploadedDtos: SessionAttachment[];
+          if (typeof api.uploadSessionAttachments === 'function') {
+            uploadedDtos = await api.uploadSessionAttachments(
+              selectedSessionId,
+              newItems.map((i) => i.file)
+            );
+          } else {
+            uploadedDtos = newItems.map((item) => ({
+              id: item.localId,
+              sessionId: selectedSessionId,
+              fileName: item.name,
+              contentType: item.contentType,
+              sizeBytes: item.sizeBytes,
+              s3Key: `sessions/${selectedSessionId}/attachments/${item.localId}/${item.name}`,
+              downloadUrl: item.previewUrl || `/api/sessions/${selectedSessionId}/attachments/${item.localId}/content`,
+              createdAt: new Date().toISOString()
+            }));
+          }
+
+          setStagedAttachments((prev) =>
+            prev.map((existing) => {
+              const matchIdx = newItems.findIndex((n) => n.localId === existing.localId);
+              if (matchIdx === -1) return existing;
+              const dto = uploadedDtos[matchIdx] || {
+                id: existing.localId,
+                sessionId: selectedSessionId,
+                fileName: existing.name,
+                contentType: existing.contentType,
+                sizeBytes: existing.sizeBytes,
+                s3Key: `sessions/${selectedSessionId}/attachments/${existing.localId}/${existing.name}`,
+                downloadUrl: existing.previewUrl || `/api/sessions/${selectedSessionId}/attachments/${existing.localId}/content`,
+                createdAt: new Date().toISOString()
+              };
+              return {
+                ...existing,
+                uploading: false,
+                uploaded: dto
+              };
+            })
+          );
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : 'Failed to upload attachment';
+          setApiError(errMsg);
+          setStagedAttachments((prev) =>
+            prev.map((existing) =>
+              newItems.some((n) => n.localId === existing.localId)
+                ? { ...existing, uploading: false, error: errMsg }
+                : existing
+            )
+          );
+        }
+      }
+    },
+    [stagedAttachments, newSessionAttachments, selectedSessionId]
+  );
+
+  const handleRemoveStagedAttachment = useCallback((localId: string, target: 'chat' | 'newSession') => {
+    const updater = (prev: StagedAttachmentItem[]) => {
+      const removed = prev.find((item) => item.localId === localId);
+      if (removed?.previewUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        try {
+          URL.revokeObjectURL(removed.previewUrl);
+        } catch {}
+      }
+      return prev.filter((item) => item.localId !== localId);
+    };
+    if (target === 'chat') {
+      setStagedAttachments(updater);
+    } else {
+      setNewSessionAttachments(updater);
+    }
+  }, []);
+
+  const extractClipboardFiles = (e: React.ClipboardEvent): File[] => {
+    const files: File[] = [];
+    if (e.clipboardData?.files && e.clipboardData.files.length > 0) {
+      return Array.from(e.clipboardData.files);
+    }
+    if (e.clipboardData?.items) {
+      for (let i = 0; i < e.clipboardData.items.length; i++) {
+        const item = e.clipboardData.items[i];
+        if (item.kind === 'file') {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    return files;
+  };
+
+  const handleChatPaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      const files = extractClipboardFiles(e);
+      if (files.length > 0) {
+        e.preventDefault();
+        void stageFilesForComposer(files, 'chat');
+      }
+    },
+    [stageFilesForComposer]
+  );
+
+  const handleNewSessionPaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      const files = extractClipboardFiles(e);
+      if (files.length > 0) {
+        e.preventDefault();
+        void stageFilesForComposer(files, 'newSession');
+      }
+    },
+    [stageFilesForComposer]
+  );
+
   const handleCreateSession = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!newSessionTitle.trim()) return;
+
+    const targetPersona = activeTab === 'personas' ? (personas.find((p) => p.id === selectedPersonaId) || activeCreationPersona) : null;
     const targetAgent = selectedAgentId || activeCreationAgent?.id || agents[0]?.id;
-    if (!targetAgent || !newSessionTitle.trim()) return;
+    if (!targetPersona && !targetAgent) return;
+
+    const pendingNewFiles = newSessionAttachments.map((a) => a.file);
+    const hasInitialFiles = pendingNewFiles.length > 0;
+    const rawPrompt = newSessionPrompt.trim();
 
     setIsActionPending(true);
     try {
-      const created = await api.createAgentSession(
-        targetAgent,
-        newSessionTitle.trim(),
-        newSessionPrompt.trim() || undefined,
-        {
-          workingDirectory: newSessionWorkDir.trim() || undefined,
-          model: newSessionModel.trim() || undefined,
-          effort: newSessionEffort.trim() || undefined,
-          mode: newSessionMode.trim() || undefined,
-          tier: newSessionTier.trim() || undefined
+      const options = {
+        workingDirectory: newSessionWorkDir.trim() || undefined,
+        model: newSessionModel.trim() || undefined,
+        effort: newSessionEffort.trim() || undefined,
+        mode: newSessionMode.trim() || undefined,
+        tier: newSessionTier.trim() || undefined
+      };
+      const created = targetPersona && api.createPersonaSession
+        ? await api.createPersonaSession(
+            targetPersona.id,
+            newSessionTitle.trim(),
+            hasInitialFiles ? undefined : (rawPrompt || undefined),
+            options
+          )
+        : await api.createAgentSession(
+            targetAgent!,
+            newSessionTitle.trim(),
+            hasInitialFiles ? undefined : (rawPrompt || undefined),
+            options
+          );
+
+      if (hasInitialFiles) {
+        let uploadedDtos: SessionAttachment[] = [];
+        if (typeof api.uploadSessionAttachments === 'function') {
+          uploadedDtos = await api.uploadSessionAttachments(created.id, pendingNewFiles);
         }
-      );
+        const effectivePrompt = rawPrompt || DEFAULT_ATTACHMENT_PROMPT;
+        await api.postSessionMessage(
+          created.id,
+          effectivePrompt,
+          created.creatorAgentId || targetAgent || 'agy-core',
+          userEmail,
+          'prompt',
+          uploadedDtos
+        );
+      }
+
       setNewSessionTitle('');
       setNewSessionPrompt('');
       setNewSessionWorkDir('');
@@ -513,6 +1158,7 @@ export default function App() {
       setNewSessionEffort('');
       setNewSessionMode('');
       setNewSessionTier('');
+      setNewSessionAttachments([]);
       setIsCreatingSession(false);
       await fetchAllData();
       setSelectedSessionId(created.id);
@@ -757,17 +1403,40 @@ export default function App() {
     }
   };
 
+  const readyStagedAttachments = useMemo(
+    () => stagedAttachments.filter((a) => !a.uploading && !a.error),
+    [stagedAttachments]
+  );
+
+  const canSendPrompt = Boolean(promptInput.trim() || readyStagedAttachments.length > 0);
+
   const handleSendPrompt = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedSessionId || !promptInput.trim()) return;
+    if (!selectedSessionId || !canSendPrompt) return;
 
     const text = promptInput.trim();
+    const attachmentsToSend: SessionAttachment[] = readyStagedAttachments.map(
+      (item) =>
+        item.uploaded || {
+          id: item.localId,
+          sessionId: selectedSessionId,
+          fileName: item.name,
+          contentType: item.contentType,
+          sizeBytes: item.sizeBytes,
+          s3Key: `sessions/${selectedSessionId}/attachments/${item.localId}/${item.name}`,
+          downloadUrl: item.previewUrl || `/api/sessions/${selectedSessionId}/attachments/${item.localId}/content`,
+          createdAt: new Date().toISOString()
+        }
+    );
+    const effectiveText = text || (attachmentsToSend.length > 0 ? DEFAULT_ATTACHMENT_PROMPT : '');
+
     setPromptInput('');
+    setStagedAttachments([]);
     setSlashPaletteOpen(false);
     setShowSendNowDropdown(false);
 
-    if (text.startsWith('/mesh') || text.startsWith('\\mesh')) {
-      await handleExecuteMeshCommand(text);
+    if (effectiveText.startsWith('/mesh') || effectiveText.startsWith('\\mesh')) {
+      await handleExecuteMeshCommand(effectiveText);
       return;
     }
 
@@ -778,21 +1447,32 @@ export default function App() {
       if (isThinking) {
         // Model is busy: queue the message sequentially by default
         const res = await api.enqueuePrompt(selectedSessionId, {
-          prompt: text,
+          prompt: effectiveText,
           senderAgentId: userEmail,
-          sendNow: false
+          sendNow: false,
+          ...(attachmentsToSend.length > 0 ? { attachments: attachmentsToSend } : {})
         });
         setActiveQueue(res.queue || []);
         await fetchAllData();
       } else {
         // Model is idle: dispatch prompt immediately
-        const createdMsg = await api.postSessionMessage(
-          selectedSessionId,
-          text,
-          currentSession?.creatorAgentId || selectedAgentId || 'agy-core',
-          userEmail,
-          'prompt'
-        );
+        const createdMsg =
+          attachmentsToSend.length > 0
+            ? await api.postSessionMessage(
+                selectedSessionId,
+                effectiveText,
+                currentSession?.creatorAgentId || selectedAgentId || 'agy-core',
+                userEmail,
+                'prompt',
+                attachmentsToSend
+              )
+            : await api.postSessionMessage(
+                selectedSessionId,
+                effectiveText,
+                currentSession?.creatorAgentId || selectedAgentId || 'agy-core',
+                userEmail,
+                'prompt'
+              );
         setEvents((prev) => (prev.some((m) => m.id === createdMsg.id) ? prev : [...prev, createdMsg]));
         await fetchAllData();
       }
@@ -802,22 +1482,39 @@ export default function App() {
   };
 
   const handleSendPromptNow = async () => {
-    if (!selectedSessionId || !promptInput.trim()) return;
+    if (!selectedSessionId || !canSendPrompt) return;
 
     const text = promptInput.trim();
+    const attachmentsToSend: SessionAttachment[] = readyStagedAttachments.map(
+      (item) =>
+        item.uploaded || {
+          id: item.localId,
+          sessionId: selectedSessionId,
+          fileName: item.name,
+          contentType: item.contentType,
+          sizeBytes: item.sizeBytes,
+          s3Key: `sessions/${selectedSessionId}/attachments/${item.localId}/${item.name}`,
+          downloadUrl: item.previewUrl || `/api/sessions/${selectedSessionId}/attachments/${item.localId}/content`,
+          createdAt: new Date().toISOString()
+        }
+    );
+    const effectiveText = text || (attachmentsToSend.length > 0 ? DEFAULT_ATTACHMENT_PROMPT : '');
+
     setPromptInput('');
+    setStagedAttachments([]);
     setShowSendNowDropdown(false);
 
-    if (text.startsWith('/mesh') || text.startsWith('\\mesh')) {
-      await handleExecuteMeshCommand(text);
+    if (effectiveText.startsWith('/mesh') || effectiveText.startsWith('\\mesh')) {
+      await handleExecuteMeshCommand(effectiveText);
       return;
     }
 
     try {
       const res = await api.enqueuePrompt(selectedSessionId, {
-        prompt: text,
+        prompt: effectiveText,
         senderAgentId: userEmail,
-        sendNow: true
+        sendNow: true,
+        ...(attachmentsToSend.length > 0 ? { attachments: attachmentsToSend } : {})
       });
       setActiveQueue(res.queue || []);
       await fetchAllData();
@@ -882,12 +1579,32 @@ export default function App() {
     setSubmittingQuestionId(toolCallId);
     try {
       const curAnswers = questionAnswers[toolCallId] || { selectedOptions: {}, customTexts: {} };
-      const answers: QuestionAnswerPayload[] = parsedQuestions.map((q, idx) => ({
-        questionIndex: idx,
-        question: q.question,
-        selectedOptions: curAnswers.selectedOptions[idx] || [],
-        customText: curAnswers.customTexts[idx] || ''
-      }));
+      const answers: QuestionAnswerPayload[] = parsedQuestions.map((q, idx) => {
+        const selected = curAnswers.selectedOptions[idx] || [];
+        const custom = (curAnswers.customTexts[idx] || '').trim();
+        if (!q.is_multi_select) {
+          if (custom.length > 0) {
+            return {
+              questionIndex: idx,
+              question: q.question,
+              selectedOptions: [],
+              customText: custom
+            };
+          }
+          return {
+            questionIndex: idx,
+            question: q.question,
+            selectedOptions: selected.slice(0, 1),
+            customText: ''
+          };
+        }
+        return {
+          questionIndex: idx,
+          question: q.question,
+          selectedOptions: selected,
+          customText: custom
+        };
+      });
 
       await api.submitQuestionAnswer(selectedSessionId, {
         toolCallId,
@@ -1025,6 +1742,47 @@ export default function App() {
               </span>
             )}
           </div>
+
+          {/* Top-level Navigation Tabs: Personas & Sessions vs Drivers & Infrastructure */}
+          <div className="flex items-center gap-1 ml-4 bg-slate-950/80 border border-slate-800 rounded-xl p-1">
+            <button
+              type="button"
+              onClick={() => {
+                setHasUserSwitchedTab(true);
+                setActiveTab('personas');
+              }}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                activeTab === 'personas'
+                  ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
+              }`}
+            >
+              <Users className="w-3.5 h-3.5" />
+              <span>Personas & Sessions</span>
+              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                {personas.length}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setHasUserSwitchedTab(true);
+                setActiveTab('drivers');
+              }}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                activeTab === 'drivers'
+                  ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
+              }`}
+            >
+              <Cpu className="w-3.5 h-3.5" />
+              <span>Drivers & Infrastructure</span>
+              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                {agents.length}
+              </span>
+            </button>
+          </div>
         </div>
 
         {/* Developer Controls & Auth */}
@@ -1079,267 +1837,647 @@ export default function App() {
 
       {/* Main Split View */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Sidebar: Connected Agents & Their Sessions */}
+        {/* Left Sidebar: Personas or Drivers & Their Sessions */}
         <aside className="w-80 border-r border-slate-800/80 bg-slate-900/40 flex flex-col shrink-0">
-          <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Bot className="w-4 h-4 text-sky-400" />
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                Connected Agents ({agents.length})
-              </span>
-            </div>
-            <button
-              onClick={() => setShowRegisterModal((v) => !v)}
-              className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Add Agent</span>
-            </button>
-          </div>
-
-          {/* Inline Register Agent Drawer */}
-          {showRegisterModal && (
-            <form
-              onSubmit={handleRegisterAgent}
-              className="p-3.5 bg-slate-900/90 border-b border-slate-800 space-y-2.5 text-xs"
-            >
-              <div className="font-semibold text-slate-200">Register Live Agent</div>
-              <input
-                type="text"
-                placeholder="Agent ID (e.g. agy-cli)"
-                value={newAgentId}
-                onChange={(e) => setNewAgentId(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
-                required
-              />
-              <input
-                type="text"
-                placeholder="Display Name (e.g. Agy Local CLI)"
-                value={newAgentName}
-                onChange={(e) => setNewAgentName(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
-                required
-              />
-              <input
-                type="text"
-                placeholder="Role (e.g. Codebase Engineer)"
-                value={newAgentRole}
-                onChange={(e) => setNewAgentRole(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
-              />
-              <div className="flex justify-end gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => setShowRegisterModal(false)}
-                  className="px-2.5 py-1 rounded text-slate-400 hover:text-slate-200"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium"
-                >
-                  Register
-                </button>
-              </div>
-            </form>
-          )}
-
-          {/* Agent & Session List */}
-          <div className="flex-1 overflow-y-auto p-3 space-y-4">
-            {isLoading ? (
-              <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
-                <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
-                <span>Loading agents...</span>
-              </div>
-            ) : agents.length === 0 ? (
-              <div className="p-5 rounded-xl border border-dashed border-slate-800 bg-slate-900/30 text-center space-y-3 my-4">
-                <Bot className="w-8 h-8 text-slate-600 mx-auto" />
-                <div>
-                  <h3 className="text-xs font-semibold text-slate-300">No Agents Connected</h3>
-                  <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
-                    Connect an external CLI agent or register an agent to start a session.
-                  </p>
+          {activeTab === 'personas' ? (
+            <>
+              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Users className="w-4 h-4 text-sky-400" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                    Personas ({personas.length})
+                  </span>
                 </div>
                 <button
-                  onClick={() => setShowRegisterModal(true)}
-                  disabled={isActionPending}
-                  className="w-full py-2 px-3 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  type="button"
+                  onClick={() => openCreatePersonaModal()}
+                  className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Register Agent</span>
+                  <span>New Persona</span>
                 </button>
               </div>
-            ) : (
-              agents.map((agent) => {
-                const agentSessions = sessions.filter((s) => s.creatorAgentId === agent.id);
-                const isAgentSelected = selectedAgent?.id === agent.id;
-                const isOffline = agent.status === 'offline';
-                const isBusy =
-                  !isOffline &&
-                  (agent.status === 'busy' || agentSessions.some((s) => s.status === 'thinking'));
-                const usage = agentUsages[agent.id];
 
-                return (
-                  <div
-                    key={agent.id}
-                    className={`rounded-xl border transition ${
-                      isAgentSelected
-                        ? 'border-slate-700 bg-slate-900/80'
-                        : 'border-slate-800/70 bg-slate-900/30 hover:border-slate-800'
-                    }`}
-                  >
-                    {/* Agent Header */}
-                    <div
-                      onClick={() => {
-                        setSelectedAgentId(agent.id);
-                        if (agentSessions.length > 0 && !agentSessions.some((s) => s.id === selectedSessionId)) {
-                          setSelectedSessionId(agentSessions[0].id);
-                        }
-                      }}
-                      className="p-3 flex items-start justify-between cursor-pointer"
+              <div className="flex-1 overflow-y-auto p-3 space-y-4">
+                {isLoading ? (
+                  <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
+                    <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
+                    <span>Loading personas...</span>
+                  </div>
+                ) : personas.length === 0 ? (
+                  <div className="p-5 rounded-xl border border-dashed border-slate-800 bg-slate-900/30 text-center space-y-3 my-4">
+                    <Users className="w-8 h-8 text-sky-400/70 mx-auto" />
+                    <div>
+                      <h3 className="text-xs font-semibold text-slate-200">Create Your First Persona</h3>
+                      <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                        Personas define specialized roles, system instructions, a target Driver, and a default model for your sessions.
+                      </p>
+                      {agents.length === 0 && (
+                        <p className="text-[10px] text-slate-500 mt-1">
+                          No Agents Connected
+                        </p>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => openCreatePersonaModal()}
+                      disabled={isActionPending}
+                      className="w-full py-2 px-3 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
                     >
-                      <div className="flex items-start gap-2.5 min-w-0">
-                        <span
-                          className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${
-                            isOffline
-                              ? 'bg-slate-600'
-                              : isBusy
-                              ? 'bg-amber-400 animate-pulse'
-                              : 'bg-emerald-400'
-                          }`}
-                        />
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-xs font-bold text-white truncate">{agent.name}</span>
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Create Persona</span>
+                    </button>
+                  </div>
+                ) : (
+                  personas.map((persona) => {
+                    const personaSessions = sessions
+                      .filter((s) => s.personaId === persona.id)
+                      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+                    const isPersonaSelected = selectedPersona?.id === persona.id;
+                    const linkedDriver = agents.find((a) => a.id === persona.driverId);
+                    const driverStatus = linkedDriver?.status || persona.driverStatus || 'offline';
+                    const isDriverOffline = driverStatus === 'offline';
+                    const isDriverBusy =
+                      !isDriverOffline &&
+                      (driverStatus === 'busy' || personaSessions.some((s) => s.status === 'thinking'));
+
+                    return (
+                      <div
+                        key={persona.id}
+                        className={`rounded-xl border transition ${
+                          isPersonaSelected
+                            ? 'border-slate-700 bg-slate-900/80'
+                            : 'border-slate-800/70 bg-slate-900/30 hover:border-slate-800'
+                        }`}
+                      >
+                        {/* Persona Header */}
+                        <div
+                          onClick={() => {
+                            setSelectedPersonaId(persona.id);
+                            setSelectedAgentId(persona.driverId);
+                            if (personaSessions.length > 0 && !personaSessions.some((s) => s.id === selectedSessionId)) {
+                              setSelectedSessionId(personaSessions[0].id);
+                            }
+                          }}
+                          className="p-3 flex items-start justify-between cursor-pointer"
+                        >
+                          <div className="flex items-start gap-2.5 min-w-0">
                             <span
-                              className={`text-[9px] font-mono uppercase px-1.5 py-0.2 rounded ${
-                                isOffline
-                                  ? 'bg-slate-800 text-slate-400'
-                                  : isBusy
-                                  ? 'bg-amber-500/20 text-amber-300'
-                                  : 'bg-emerald-500/20 text-emerald-300'
+                              className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${
+                                isDriverOffline
+                                  ? 'bg-slate-600'
+                                  : isDriverBusy
+                                  ? 'bg-amber-400 animate-pulse'
+                                  : 'bg-emerald-400'
                               }`}
-                            >
-                              {isOffline ? 'offline' : isBusy ? 'busy' : 'online'}
-                            </span>
+                              title={`Driver @${persona.driverId} is ${driverStatus}`}
+                            />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-bold text-white truncate">{persona.name}</span>
+                              </div>
+                              <div className="text-[11px] font-mono text-slate-400 truncate">
+                                @{persona.id} · {persona.role}
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-950/80 border border-slate-800 text-[10px] font-mono text-sky-300">
+                                  <Cpu className="w-2.5 h-2.5 text-sky-400" />
+                                  <span>@{persona.driverId}</span>
+                                </span>
+                                {persona.defaultModel && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-950/40 border border-purple-500/30 text-[10px] font-mono text-purple-300 truncate max-w-[140px]">
+                                    <span>{persona.defaultModel}</span>
+                                  </span>
+                                )}
+                              </div>
+                            </div>
                           </div>
-                          <div className="text-[11px] font-mono text-slate-400 truncate">
-                            @{agent.id} · {agent.role || 'Agent'}
-                          </div>
-                          {usage && (
+
+                          <div className="flex items-center gap-1 shrink-0">
                             <button
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                setSelectedUsageAgent(agent);
-                                setShowUsageModal(true);
+                                openEditPersonaModal(persona);
                               }}
-                              className="mt-1.5 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-950/70 hover:bg-slate-800 text-[10px] font-mono text-slate-300 border border-slate-800 hover:border-slate-700 transition cursor-pointer max-w-full"
-                              title="Click to view full quota and lifetime token usage"
+                              className="p-1 rounded-md text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition cursor-pointer"
+                              title={`Edit ${persona.name}`}
                             >
-                              <span
-                                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                                  usage.providerQuota
-                                    ? usage.providerQuota.primaryRemainingFraction > 0.3
-                                      ? 'bg-emerald-400'
-                                      : 'bg-rose-400'
-                                    : 'bg-sky-400'
-                                }`}
-                              />
-                              <span className="truncate">
-                                {usage.providerQuota
-                                  ? `${Math.round(usage.providerQuota.primaryRemainingFraction * 100)}% quota`
-                                  : 'Quota'}
-                                {' · '}
-                                {usage.lifetimeTokens.totalTokens > 0
-                                  ? `${(usage.lifetimeTokens.totalTokens / 1000).toFixed(1)}k tokens`
-                                  : '0 tokens'}
-                              </span>
-                              <BarChart2 className="w-2.5 h-2.5 text-slate-500 hover:text-sky-400 ml-1 shrink-0" />
+                              <Edit3 className="w-3 h-3" />
                             </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDeletingPersonaId(persona.id);
+                              }}
+                              className="p-1 rounded-md text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition cursor-pointer"
+                              title={`Delete ${persona.name}`}
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                startNewSessionWithPersona(persona);
+                              }}
+                              className="p-1 rounded-md bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition shrink-0 cursor-pointer"
+                              title={`New Session with ${persona.name}`}
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Delete Confirmation Inline Banner */}
+                        {deletingPersonaId === persona.id && (
+                          <div className="mx-2 mb-2 p-2.5 rounded-lg bg-rose-950/60 border border-rose-500/40 text-[11px] text-rose-200 space-y-2">
+                            <p>
+                              Delete <strong>{persona.name}</strong> and its {personaSessions.length} session(s)?
+                            </p>
+                            <div className="flex justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setDeletingPersonaId(null)}
+                                className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeletePersona(persona.id)}
+                                className="px-2.5 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-semibold cursor-pointer"
+                              >
+                                Confirm Delete
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Persona's Sessions */}
+                        <div className="px-2 pb-2 space-y-1">
+                          {personaSessions.length === 0 ? (
+                            <div className="px-2 py-1.5 text-[11px] text-slate-500 italic">
+                              No sessions yet
+                            </div>
+                          ) : (
+                            personaSessions.map((session) => {
+                              const isSelected = session.id === selectedSessionId && !isCreatingSession;
+                              const isThinking = session.status === 'thinking';
+
+                              return (
+                                <div key={session.id} className="space-y-1">
+                                  <div
+                                    onClick={() => {
+                                      setSelectedPersonaId(persona.id);
+                                      setSelectedAgentId(session.driverId || session.creatorAgentId || persona.driverId);
+                                      setSelectedSessionId(session.id);
+                                      setIsCreatingSession(false);
+                                    }}
+                                    className={`group w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
+                                      isSelected
+                                        ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 font-medium'
+                                        : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200 border border-transparent'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                                      {session.status === 'waiting_for_input' ? (
+                                        <span className="w-2.5 h-2.5 rounded-full bg-amber-400 border border-amber-300 animate-ping shrink-0" title="Human input required" />
+                                      ) : isThinking ? (
+                                        <RefreshCw className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
+                                      ) : (
+                                        <MessageSquare className="w-3 h-3 text-slate-500 shrink-0" />
+                                      )}
+                                      <span className="truncate">{session.title}</span>
+                                    </div>
+
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setDeletingSessionId(session.id);
+                                        }}
+                                        className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition cursor-pointer"
+                                        title={`Delete session ${session.title}`}
+                                      >
+                                        <Trash2 className="w-3 h-3" />
+                                      </button>
+                                      <ChevronRight className="w-3 h-3 opacity-50 shrink-0 group-hover:opacity-100" />
+                                    </div>
+                                  </div>
+
+                                  {/* Delete Confirmation Inline Banner */}
+                                  {deletingSessionId === session.id && (
+                                    <div className="p-2 rounded-lg bg-rose-950/70 border border-rose-500/40 text-[11px] text-rose-200 space-y-1.5">
+                                      <p className="truncate">Delete <strong>{session.title}</strong>?</p>
+                                      <div className="flex justify-end gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setDeletingSessionId(null);
+                                          }}
+                                          className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleDeleteSession(session.id);
+                                          }}
+                                          className="px-2.5 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-semibold cursor-pointer"
+                                        >
+                                          Confirm Delete
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })
                           )}
                         </div>
                       </div>
+                    );
+                  })
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Bot className="w-4 h-4 text-sky-400" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                    Connected Drivers ({agents.length})
+                  </span>
+                </div>
+                <button
+                  onClick={() => setShowRegisterModal((v) => !v)}
+                  className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add Driver</span>
+                </button>
+              </div>
 
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelectedAgentId(agent.id);
-                          setIsCreatingSession(true);
-                        }}
-                        className="p-1 rounded-md bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition shrink-0 cursor-pointer"
-                        title={`New Session with ${agent.name}`}
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    {/* Agent's Sessions */}
-                    <div className="px-2 pb-2 space-y-1">
-                      {agentSessions.length === 0 ? (
-                        <div className="px-2 py-1.5 text-[11px] text-slate-500 italic">
-                          No sessions yet
-                        </div>
-                      ) : (
-                        agentSessions.map((session) => {
-                          const isSelected = session.id === selectedSessionId && !isCreatingSession;
-                          const isThinking = session.status === 'thinking';
-
-                          return (
-                            <button
-                              key={session.id}
-                              onClick={() => {
-                                setSelectedAgentId(agent.id);
-                                setSelectedSessionId(session.id);
-                                setIsCreatingSession(false);
-                              }}
-                              className={`w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
-                                isSelected
-                                  ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 font-medium'
-                                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200 border border-transparent'
-                              }`}
-                            >
-                              <div className="flex items-center gap-2 min-w-0">
-                                {session.status === 'waiting_for_input' ? (
-                                  <span className="w-2.5 h-2.5 rounded-full bg-amber-400 border border-amber-300 animate-ping shrink-0" title="Human input required" />
-                                ) : isThinking ? (
-                                  <RefreshCw className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
-                                ) : (
-                                  <MessageSquare className="w-3 h-3 text-slate-500 shrink-0" />
-                                )}
-                                <span className="truncate">{session.title}</span>
-                              </div>
-                              <ChevronRight className="w-3 h-3 opacity-50 shrink-0" />
-                            </button>
-                          );
-                        })
-                      )}
-                    </div>
+              {/* Inline Register Driver Drawer */}
+              {showRegisterModal && (
+                <form
+                  onSubmit={handleRegisterAgent}
+                  className="p-3.5 bg-slate-900/90 border-b border-slate-800 space-y-2.5 text-xs"
+                >
+                  <div className="font-semibold text-slate-200">Register Live Driver</div>
+                  <input
+                    type="text"
+                    placeholder="Driver ID (e.g. agy-cli)"
+                    value={newAgentId}
+                    onChange={(e) => setNewAgentId(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
+                    required
+                  />
+                  <input
+                    type="text"
+                    placeholder="Display Name (e.g. Agy Local CLI)"
+                    value={newAgentName}
+                    onChange={(e) => setNewAgentName(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
+                    required
+                  />
+                  <input
+                    type="text"
+                    placeholder="Role (e.g. Codebase Engineer)"
+                    value={newAgentRole}
+                    onChange={(e) => setNewAgentRole(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
+                  />
+                  <div className="flex justify-end gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowRegisterModal(false)}
+                      className="px-2.5 py-1 rounded text-slate-400 hover:text-slate-200"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium"
+                    >
+                      Register
+                    </button>
                   </div>
-                );
-              })
-            )}
-          </div>
+                </form>
+              )}
+
+              {/* Driver & Session List */}
+              <div className="flex-1 overflow-y-auto p-3 space-y-4">
+                {isLoading ? (
+                  <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
+                    <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
+                    <span>Loading drivers...</span>
+                  </div>
+                ) : agents.length === 0 ? (
+                  <div className="p-5 rounded-xl border border-dashed border-slate-800 bg-slate-900/30 text-center space-y-3 my-4">
+                    <Bot className="w-8 h-8 text-slate-600 mx-auto" />
+                    <div>
+                      <h3 className="text-xs font-semibold text-slate-300">No Agents Connected</h3>
+                      <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                        Connect an external CLI driver or register an agent to start a session.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setShowRegisterModal(true)}
+                      disabled={isActionPending}
+                      className="w-full py-2 px-3 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Register Agent</span>
+                    </button>
+                  </div>
+                ) : (
+                  agents.map((agent) => {
+                    const agentSessions = sessions
+                      .filter((s) => s.driverId === agent.id || s.creatorAgentId === agent.id)
+                      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+                    const driverPersonas = personas.filter((p) => p.driverId === agent.id);
+                    const isAgentSelected = selectedAgent?.id === agent.id;
+                    const isOffline = agent.status === 'offline';
+                    const isBusy =
+                      !isOffline &&
+                      (agent.status === 'busy' || agentSessions.some((s) => s.status === 'thinking'));
+                    const usage = agentUsages[agent.id];
+
+                    return (
+                      <div
+                        key={agent.id}
+                        className={`rounded-xl border transition ${
+                          isAgentSelected
+                            ? 'border-slate-700 bg-slate-900/80'
+                            : 'border-slate-800/70 bg-slate-900/30 hover:border-slate-800'
+                        }`}
+                      >
+                        {/* Driver Header */}
+                        <div
+                          onClick={() => {
+                            setSelectedAgentId(agent.id);
+                            if (agentSessions.length > 0 && !agentSessions.some((s) => s.id === selectedSessionId)) {
+                              setSelectedSessionId(agentSessions[0].id);
+                            }
+                          }}
+                          className="p-3 flex items-start justify-between cursor-pointer"
+                        >
+                          <div className="flex items-start gap-2.5 min-w-0">
+                            <span
+                              className={`w-2.5 h-2.5 rounded-full mt-1 shrink-0 ${
+                                isOffline
+                                  ? 'bg-slate-600'
+                                  : isBusy
+                                  ? 'bg-amber-400 animate-pulse'
+                                  : 'bg-emerald-400'
+                              }`}
+                            />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-bold text-white truncate">{agent.name}</span>
+                                <span
+                                  className={`text-[9px] font-mono uppercase px-1.5 py-0.2 rounded ${
+                                    isOffline
+                                      ? 'bg-slate-800 text-slate-400'
+                                      : isBusy
+                                      ? 'bg-amber-500/20 text-amber-300'
+                                      : 'bg-emerald-500/20 text-emerald-300'
+                                  }`}
+                                >
+                                  {isOffline ? 'offline' : isBusy ? 'busy' : 'online'}
+                                </span>
+                              </div>
+                              <div className="text-[11px] font-mono text-slate-400 truncate">
+                                @{agent.id} · {agent.role || 'Driver'}
+                              </div>
+                              {driverPersonas.length > 0 && (
+                                <div className="flex flex-wrap items-center gap-1 mt-1.5">
+                                  {driverPersonas.map((dp) => (
+                                    <span
+                                      key={dp.id}
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-950/50 border border-indigo-500/30 text-[10px] font-mono text-indigo-300"
+                                      title={`Persona: ${dp.name} (${dp.role})`}
+                                    >
+                                      <Users className="w-2.5 h-2.5 text-indigo-400" />
+                                      <span>@{dp.id}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {usage && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleOpenUsageModal(agent);
+                                  }}
+                                  className="mt-1.5 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-950/70 hover:bg-slate-800 text-[10px] font-mono text-slate-300 border border-slate-800 hover:border-slate-700 transition cursor-pointer max-w-full"
+                                  title="Click to view full quota and lifetime token usage"
+                                >
+                                  <span
+                                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                                      usage.providerQuota
+                                        ? usage.providerQuota.primaryRemainingFraction > 0.3
+                                          ? 'bg-emerald-400'
+                                          : 'bg-rose-400'
+                                        : 'bg-sky-400'
+                                    }`}
+                                  />
+                                  <span className="truncate">
+                                    {usage.providerQuota
+                                      ? `${Math.round(usage.providerQuota.primaryRemainingFraction * 100)}% quota`
+                                      : 'Quota'}
+                                    {' · '}
+                                    {usage.lifetimeTokens.totalTokens > 0
+                                      ? `${(usage.lifetimeTokens.totalTokens / 1000).toFixed(1)}k tokens`
+                                      : '0 tokens'}
+                                  </span>
+                                  <BarChart2 className="w-2.5 h-2.5 text-slate-500 hover:text-sky-400 ml-1 shrink-0" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedAgentId(agent.id);
+                              setIsCreatingSession(true);
+                            }}
+                            className="p-1 rounded-md bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition shrink-0 cursor-pointer"
+                            title={`New Session with ${agent.name}`}
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {/* Driver's Sessions (across all associated Personas) */}
+                        <div className="px-2 pb-2 space-y-1">
+                          {agentSessions.length === 0 ? (
+                            <div className="px-2 py-1.5 text-[11px] text-slate-500 italic">
+                              No sessions yet
+                            </div>
+                          ) : (
+                            agentSessions.map((session) => {
+                              const isSelected = session.id === selectedSessionId && !isCreatingSession;
+                              const isThinking = session.status === 'thinking';
+
+                              return (
+                                <div key={session.id} className="space-y-1">
+                                  <div
+                                    onClick={() => {
+                                      setSelectedAgentId(agent.id);
+                                      if (session.personaId) {
+                                        setSelectedPersonaId(session.personaId);
+                                      }
+                                      setSelectedSessionId(session.id);
+                                      setIsCreatingSession(false);
+                                    }}
+                                    className={`group w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
+                                      isSelected
+                                        ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 font-medium'
+                                        : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200 border border-transparent'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                                      {session.status === 'waiting_for_input' ? (
+                                        <span className="w-2.5 h-2.5 rounded-full bg-amber-400 border border-amber-300 animate-ping shrink-0" title="Human input required" />
+                                      ) : isThinking ? (
+                                        <RefreshCw className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
+                                      ) : (
+                                        <MessageSquare className="w-3 h-3 text-slate-500 shrink-0" />
+                                      )}
+                                      <span className="truncate">{session.title}</span>
+                                      {session.personaId && (
+                                        <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 shrink-0">
+                                          @{session.personaId}
+                                        </span>
+                                      )}
+                                    </div>
+
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setDeletingSessionId(session.id);
+                                        }}
+                                        className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition cursor-pointer"
+                                        title={`Delete session ${session.title}`}
+                                      >
+                                        <Trash2 className="w-3 h-3" />
+                                      </button>
+                                      <ChevronRight className="w-3 h-3 opacity-50 shrink-0 group-hover:opacity-100" />
+                                    </div>
+                                  </div>
+
+                                  {/* Delete Confirmation Inline Banner */}
+                                  {deletingSessionId === session.id && (
+                                    <div className="p-2 rounded-lg bg-rose-950/70 border border-rose-500/40 text-[11px] text-rose-200 space-y-1.5">
+                                      <p className="truncate">Delete <strong>{session.title}</strong>?</p>
+                                      <div className="flex justify-end gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setDeletingSessionId(null);
+                                          }}
+                                          className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleDeleteSession(session.id);
+                                          }}
+                                          className="px-2.5 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-semibold cursor-pointer"
+                                        >
+                                          Confirm Delete
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </>
+          )}
         </aside>
 
         {/* Right Main Panel: Active Session Trajectory or New Session Composer */}
         <main className="flex-1 flex flex-col bg-slate-950 overflow-hidden">
-          {isCreatingSession && selectedAgent ? (
+          {isCreatingSession && (selectedAgent || activeCreationPersona) ? (
             <div className="flex-1 flex items-center justify-center p-6">
               <form
                 onSubmit={handleCreateSession}
-                className="max-w-lg w-full bg-slate-900/70 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl"
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setIsDraggingNewSession(true);
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  setIsDraggingNewSession(false);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setIsDraggingNewSession(false);
+                  if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+                    void stageFilesForComposer(e.dataTransfer.files, 'newSession');
+                  }
+                }}
+                className={`max-w-lg w-full bg-slate-900/70 border rounded-2xl p-6 space-y-4 shadow-2xl relative transition ${
+                  isDraggingNewSession ? 'border-sky-400 ring-2 ring-sky-500/40' : 'border-slate-800'
+                }`}
               >
+                {isDraggingNewSession && (
+                  <div className="absolute inset-0 z-30 rounded-2xl bg-sky-950/80 border-2 border-dashed border-sky-400 flex flex-col items-center justify-center text-sky-200 pointer-events-none">
+                    <Paperclip className="w-8 h-8 mb-2 text-sky-400 animate-bounce" />
+                    <span className="text-sm font-semibold">Drop files to attach to New Session</span>
+                  </div>
+                )}
                 <div className="flex items-center gap-2.5">
                   <div className="w-9 h-9 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
-                    <Bot className="w-5 h-5" />
+                    {activeTab === 'personas' && activeCreationPersona ? (
+                      <Users className="w-5 h-5" />
+                    ) : (
+                      <Bot className="w-5 h-5" />
+                    )}
                   </div>
                   <div>
                     <h2 className="text-base font-bold text-white">
-                      Start New Session with {selectedAgent.name}
+                      Start New Session with{' '}
+                      {activeTab === 'personas' && activeCreationPersona
+                        ? activeCreationPersona.name
+                        : selectedAgent?.name || 'Agent'}
                     </h2>
-                    <p className="text-xs text-slate-400 font-mono">@{selectedAgent.id}</p>
+                    <div className="flex items-center gap-2 text-xs text-slate-400 font-mono">
+                      {activeTab === 'personas' && activeCreationPersona ? (
+                        <>
+                          <span>@{activeCreationPersona.id}</span>
+                          <span>·</span>
+                          <span className="text-sky-400">Driver: @{activeCreationPersona.driverId}</span>
+                        </>
+                      ) : (
+                        <span>@{selectedAgent?.id}</span>
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -1359,16 +2497,73 @@ export default function App() {
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="block text-xs font-semibold text-slate-300">
-                    Initial Prompt (Optional)
-                  </label>
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-semibold text-slate-300">
+                      Initial Prompt (Optional)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => newSessionFileInputRef.current?.click()}
+                      className="text-[11px] font-medium text-sky-400 hover:text-sky-300 flex items-center gap-1 cursor-pointer"
+                      aria-label="Attach files to new session"
+                    >
+                      <Paperclip className="w-3 h-3" />
+                      <span>Attach files</span>
+                    </button>
+                    <input
+                      ref={newSessionFileInputRef}
+                      type="file"
+                      multiple
+                      className="hidden"
+                      data-testid="new-session-file-input"
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files.length > 0) {
+                          void stageFilesForComposer(e.target.files, 'newSession');
+                          e.target.value = '';
+                        }
+                      }}
+                    />
+                  </div>
                   <textarea
                     rows={2}
-                    placeholder="Enter an initial instruction for the agent to begin reasoning..."
+                    placeholder="Enter an initial instruction for the agent to begin reasoning (or paste/drop images & files)..."
                     value={newSessionPrompt}
                     onChange={(e) => setNewSessionPrompt(e.target.value)}
+                    onPaste={handleNewSessionPaste}
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
                   />
+                  {newSessionAttachments.length > 0 && (
+                    <div className="flex flex-wrap gap-2 pt-1.5" data-testid="new-session-staged-attachments">
+                      {newSessionAttachments.map((att) => (
+                        <div
+                          key={att.localId}
+                          className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200 max-w-xs"
+                        >
+                          {att.previewUrl ? (
+                            <img
+                              src={att.previewUrl}
+                              alt={att.name}
+                              className="w-7 h-7 rounded object-cover border border-slate-700 shrink-0"
+                            />
+                          ) : (
+                            <FileIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-mono text-[11px] text-white">{att.name}</div>
+                            <div className="text-[10px] text-slate-400">{formatAttachmentSize(att.sizeBytes)}</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveStagedAttachment(att.localId, 'newSession')}
+                            aria-label={`Remove attachment ${att.name}`}
+                            className="p-0.5 rounded hover:bg-slate-800 text-slate-400 hover:text-rose-400 cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 {/* Session Controls: Working Directory & Model Parameters */}
@@ -1622,8 +2817,16 @@ export default function App() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-[11px]">
+                    {(selectedSession.personaId || selectedSessionMetadata?.personaId) && (
+                      <>
+                        <span className="text-slate-400">
+                          Persona: <strong className="text-indigo-300">@{selectedSession.personaId || selectedSessionMetadata?.personaId}</strong>
+                        </span>
+                        <span className="text-slate-600">·</span>
+                      </>
+                    )}
                     <span className="text-slate-400">
-                      Agent: <strong className="text-slate-200">@{selectedAgent?.id || selectedSession.creatorAgentId || 'agy'}</strong>
+                      Driver: <strong className="text-slate-200">@{selectedSession.driverId || selectedAgent?.id || selectedSession.creatorAgentId || 'agy'}</strong>
                     </span>
                     <span className="text-slate-600">·</span>
                     <span
@@ -1832,6 +3035,21 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    onClick={handleToggleAutoScroll}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer border ${
+                      autoScrollEnabled
+                        ? 'bg-sky-600/20 text-sky-200 border-sky-500/40 hover:bg-sky-600/30 shadow-sm'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-400 border-slate-700'
+                    }`}
+                    title={autoScrollEnabled ? 'Auto-scroll is ON (tracking new events)' : 'Auto-scroll is OFF'}
+                    aria-label={`Toggle Auto-scroll (currently ${autoScrollEnabled ? 'On' : 'Off'})`}
+                  >
+                    <ArrowDownToLine className={`w-3.5 h-3.5 ${autoScrollEnabled ? 'text-sky-400' : 'text-slate-400'}`} />
+                    <span>Auto-scroll: {autoScrollEnabled ? 'On' : 'Off'}</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => setShowArtifactsPanel((prev) => !prev)}
                     className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer border ${
                       showArtifactsPanel
@@ -1863,9 +3081,40 @@ export default function App() {
 
               {/* Split Body: Left Chat Stream + Right Artifacts Panel */}
               <div className="flex-1 flex min-h-0 overflow-hidden relative">
-                <div className="flex-1 flex flex-col min-w-0 min-h-0">
+                <div
+                  className="flex-1 flex flex-col min-w-0 min-h-0 relative"
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDraggingChat(true);
+                  }}
+                  onDragLeave={(e) => {
+                    e.preventDefault();
+                    setIsDraggingChat(false);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setIsDraggingChat(false);
+                    if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+                      void stageFilesForComposer(e.dataTransfer.files, 'chat');
+                    }
+                  }}
+                >
+                  {isDraggingChat && (
+                    <div
+                      className="absolute inset-3 z-40 rounded-2xl bg-sky-950/85 border-2 border-dashed border-sky-400 flex flex-col items-center justify-center text-sky-200 pointer-events-none"
+                      data-testid="chat-dropzone-overlay"
+                    >
+                      <Paperclip className="w-10 h-10 mb-2 text-sky-400 animate-bounce" />
+                      <span className="text-sm font-semibold">Drop images or files to attach to this session</span>
+                      <span className="text-xs text-sky-300/80 mt-1">Up to 10 files (max 25 MB each)</span>
+                    </div>
+                  )}
                   {/* Trajectory Events Stream */}
-                  <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                  <div
+                    ref={timelineContainerRef}
+                    onScroll={handleTimelineScroll}
+                    className="flex-1 overflow-y-auto p-6 space-y-4"
+                  >
                 {events.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 space-y-2">
                     <Activity className="w-8 h-8 text-slate-700" />
@@ -1985,21 +3234,23 @@ export default function App() {
                                               const cur = prev[targetId] || { selectedOptions: {}, customTexts: {} };
                                               const existing = cur.selectedOptions[idx] || [];
                                               let nextSelected: string[];
+                                              let nextCustom = cur.customTexts;
                                               if (q.is_multi_select) {
                                                 nextSelected = existing.includes(opt)
                                                   ? existing.filter((x) => x !== opt)
                                                   : [...existing, opt];
                                               } else {
                                                 nextSelected = existing.includes(opt) ? [] : [opt];
+                                                nextCustom = { ...cur.customTexts, [idx]: '' };
                                               }
                                               return {
                                                 ...prev,
                                                 [targetId]: {
-                                                  ...cur,
                                                   selectedOptions: {
                                                     ...cur.selectedOptions,
                                                     [idx]: nextSelected
-                                                  }
+                                                  },
+                                                  customTexts: nextCustom
                                                 }
                                               };
                                             });
@@ -2030,10 +3281,14 @@ export default function App() {
                                       const val = e.target.value;
                                       setQuestionAnswers((prev) => {
                                         const cur = prev[targetId] || { selectedOptions: {}, customTexts: {} };
+                                        const nextSelected = (!q.is_multi_select && val.trim().length > 0)
+                                          ? { ...cur.selectedOptions, [idx]: [] }
+                                          : cur.selectedOptions;
+
                                         return {
                                           ...prev,
                                           [targetId]: {
-                                            ...cur,
+                                            selectedOptions: nextSelected,
                                             customTexts: {
                                               ...cur.customTexts,
                                               [idx]: val
@@ -2102,14 +3357,67 @@ export default function App() {
                     }
 
                     if (type === 'prompt') {
+                      const msgAttachments = extractMessageAttachments(ev);
                       return (
                         <div key={ev.id} className="flex justify-end">
-                          <div className="max-w-2xl bg-sky-600/15 border border-sky-500/30 rounded-2xl rounded-tr-sm px-4 py-3 text-slate-100">
+                          <div className="max-w-2xl bg-sky-600/15 border border-sky-500/30 rounded-2xl rounded-tr-sm px-4 py-3 text-slate-100 space-y-2">
                             <div className="flex items-center justify-between gap-4 text-[11px] font-mono text-sky-400 mb-1">
                               <span>Prompt ({ev.senderAgentId})</span>
                               <span>{new Date(ev.createdAt).toLocaleTimeString()}</span>
                             </div>
-                            <p className="text-sm whitespace-pre-wrap leading-relaxed">{ev.content}</p>
+                            {ev.content && (
+                              <p className="text-sm whitespace-pre-wrap leading-relaxed">{ev.content}</p>
+                            )}
+                            {msgAttachments.length > 0 && (
+                              <div className="flex flex-wrap gap-2 pt-1" data-testid={`message-attachments-${ev.id}`}>
+                                {msgAttachments.map((att) => {
+                                  const isImg = isImageAttachment(att.contentType, att.fileName);
+                                  const streamUrl = att.downloadUrl || `/api/sessions/${ev.sessionId}/attachments/${encodeURIComponent(att.id)}/content`;
+                                  if (isImg) {
+                                    return (
+                                      <button
+                                        key={att.id || att.fileName}
+                                        type="button"
+                                        onClick={() =>
+                                          setLightboxAttachment({
+                                            url: streamUrl,
+                                            fileName: att.fileName,
+                                            sizeBytes: att.sizeBytes
+                                          })
+                                        }
+                                        aria-label={`Zoom image ${att.fileName}`}
+                                        className="group relative rounded-xl overflow-hidden border border-sky-500/40 bg-slate-950/80 hover:border-sky-300 transition cursor-pointer"
+                                      >
+                                        <img
+                                          src={streamUrl}
+                                          alt={att.fileName}
+                                          className="max-h-40 max-w-[220px] object-cover block"
+                                        />
+                                        <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-1 text-xs font-semibold text-white">
+                                          <ZoomIn className="w-4 h-4 text-sky-300" />
+                                          <span>Zoom</span>
+                                        </div>
+                                      </button>
+                                    );
+                                  }
+                                  return (
+                                    <a
+                                      key={att.id || att.fileName}
+                                      href={`${streamUrl}${streamUrl.includes('?') ? '&' : '?'}download=true`}
+                                      download={att.fileName}
+                                      className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-slate-950/80 hover:bg-slate-900 border border-sky-500/30 hover:border-sky-400 text-xs text-slate-200 transition"
+                                    >
+                                      <FileIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                                      <div className="min-w-0">
+                                        <div className="font-mono text-xs text-white truncate max-w-[180px]">{att.fileName}</div>
+                                        <div className="text-[10px] text-slate-400">{formatAttachmentSize(att.sizeBytes)}</div>
+                                      </div>
+                                      <Download className="w-3.5 h-3.5 text-sky-400 shrink-0 ml-1" />
+                                    </a>
+                                  );
+                                })}
+                              </div>
+                            )}
                           </div>
                         </div>
                       );
@@ -2257,6 +3565,15 @@ export default function App() {
                         e.toolName === 'ask_question' &&
                         new Date(e.createdAt).getTime() >= new Date(ev.createdAt).getTime()
                     );
+                    const isLatestEvent = events[events.length - 1]?.id === ev.id;
+                    const isWaitingOrExplicit =
+                      selectedSession?.status === 'waiting_for_input' ||
+                      /```(?:json:)?ask_question/i.test(ev.content);
+                    const shouldRenderTextQuestions =
+                      textQuestions.length > 0 &&
+                      !hasFollowupToolCall &&
+                      isLatestEvent &&
+                      isWaitingOrExplicit;
 
                     const cleanedContent = ev.content
                       .replace(/\(?Note:?\s*I can't see your replies in this non-interactive session\.?.*?(\)|$)/gi, '')
@@ -2299,7 +3616,7 @@ export default function App() {
                           </div>
                         </div>
 
-                        {textQuestions.length > 0 && !hasFollowupToolCall && (
+                        {shouldRenderTextQuestions && (
                           renderQuestionCard(`text-q-${ev.id}`, ev.id, ev.createdAt, textQuestions)
                         )}
                       </div>
@@ -2331,6 +3648,22 @@ export default function App() {
 
                 <div ref={timelineEndRef} />
               </div>
+
+              {/* Floating Jump to bottom button when scrolled up */}
+              {isScrolledUp && (
+                <div className="absolute bottom-24 right-6 z-30 pointer-events-auto">
+                  <button
+                    type="button"
+                    onClick={handleScrollToBottom}
+                    className="px-3.5 py-1.5 rounded-full text-xs font-semibold bg-sky-600 hover:bg-sky-500 text-white shadow-xl border border-sky-400/40 flex items-center gap-1.5 transition-all duration-150 cursor-pointer active:scale-95"
+                    title="Jump to latest message and resume following"
+                    aria-label="Jump to bottom"
+                  >
+                    <ArrowDown className="w-3.5 h-3.5 animate-bounce" />
+                    <span>Jump to bottom</span>
+                  </button>
+                </div>
+              )}
 
               {/* Bottom Prompt Bar */}
               <form
@@ -2376,6 +3709,15 @@ export default function App() {
                           <div className="flex items-center gap-2 min-w-0">
                             <span className="font-mono text-[10px] text-slate-400 shrink-0">#{idx + 1}</span>
                             <span className="truncate text-xs font-mono">{item.prompt}</span>
+                            {item.attachments && item.attachments.length > 0 && (
+                              <span
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 text-[10px] font-mono shrink-0"
+                                title={`${item.attachments.length} attached file(s)`}
+                              >
+                                <Paperclip className="w-2.5 h-2.5" />
+                                <span>{item.attachments.length}</span>
+                              </span>
+                            )}
                           </div>
                           <div className="flex items-center gap-1.5 shrink-0">
                             <button
@@ -2402,8 +3744,78 @@ export default function App() {
                   </div>
                 )}
 
+                {/* Pending Staged Attachments Strip */}
+                {stagedAttachments.length > 0 && (
+                  <div
+                    className="flex flex-wrap items-center gap-2 p-2.5 rounded-xl bg-slate-950/80 border border-slate-800"
+                    data-testid="chat-staged-attachments"
+                  >
+                    {stagedAttachments.map((att) => {
+                      const isImg = isImageAttachment(att.contentType, att.name);
+                      const thumbSrc = att.previewUrl || att.uploaded?.downloadUrl;
+                      return (
+                        <div
+                          key={att.localId}
+                          className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700/80 text-xs text-slate-200 max-w-xs"
+                        >
+                          {isImg && thumbSrc ? (
+                            <img
+                              src={thumbSrc}
+                              alt={att.name}
+                              className="w-8 h-8 rounded object-cover border border-slate-700 shrink-0"
+                            />
+                          ) : isImg ? (
+                            <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                          ) : (
+                            <FileIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-mono text-[11px] text-white">{att.name}</div>
+                            <div className="flex items-center gap-1.5 text-[10px] text-slate-400">
+                              <span>{formatAttachmentSize(att.sizeBytes)}</span>
+                              {att.uploading && <span className="text-amber-300 animate-pulse">Uploading...</span>}
+                              {att.error && <span className="text-rose-400">Failed</span>}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveStagedAttachment(att.localId, 'chat')}
+                            aria-label={`Remove attachment ${att.name}`}
+                            className="p-0.5 rounded hover:bg-slate-800 text-slate-400 hover:text-rose-400 transition cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
                 {/* Input & Control Bar */}
                 <div className="flex items-center gap-2">
+                  <input
+                    ref={chatFileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    data-testid="chat-file-input"
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files.length > 0) {
+                        void stageFilesForComposer(e.target.files, 'chat');
+                        e.target.value = '';
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => chatFileInputRef.current?.click()}
+                    title="Attach files (Images, PDFs, Code, Logs, ZIP — max 25 MB)"
+                    aria-label="Attach files"
+                    className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-sky-300 transition cursor-pointer shrink-0"
+                  >
+                    <Paperclip className="w-4 h-4" />
+                  </button>
+
                   <div className="relative flex-1">
                     {/* Slash Command Autocomplete Palette */}
                     <SlashCommandPalette
@@ -2423,6 +3835,7 @@ export default function App() {
                       }
                       value={promptInput}
                       onChange={(e) => handlePromptChange(e.target.value)}
+                      onPaste={handleChatPaste}
                       onFocus={() => {
                         if (promptInput.startsWith('/') || promptInput.startsWith('\\')) {
                           setSlashPaletteOpen(true);
@@ -2463,7 +3876,7 @@ export default function App() {
                     <div className="relative flex items-center">
                       <button
                         type="submit"
-                        disabled={!promptInput.trim()}
+                        disabled={!canSendPrompt}
                         title="Add prompt to sequential execution queue"
                         className="px-3.5 py-2.5 rounded-l-xl bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer"
                       >
@@ -2473,14 +3886,14 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => setShowSendNowDropdown((prev) => !prev)}
-                        disabled={!promptInput.trim()}
+                        disabled={!canSendPrompt}
                         title="More sending options"
                         className="px-2 py-2.5 rounded-r-xl bg-amber-700 hover:bg-amber-600 border-l border-amber-800 disabled:opacity-40 text-white transition cursor-pointer"
                       >
                         <ChevronDown className="w-3.5 h-3.5" />
                       </button>
 
-                      {showSendNowDropdown && promptInput.trim() && (
+                      {showSendNowDropdown && canSendPrompt && (
                         <div className="absolute right-0 bottom-full mb-2 w-56 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1.5 z-50 text-xs">
                           <button
                             type="button"
@@ -2501,7 +3914,7 @@ export default function App() {
                   ) : (
                     <button
                       type="submit"
-                      disabled={!promptInput.trim()}
+                      disabled={!canSendPrompt}
                       className="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-semibold text-xs flex items-center gap-1.5 transition cursor-pointer"
                     >
                       <Send className="w-3.5 h-3.5" />
@@ -2559,7 +3972,15 @@ export default function App() {
                 </p>
               </div>
               <div className="flex items-center gap-3">
-                {selectedAgent ? (
+                {activeTab === 'personas' && selectedPersona ? (
+                  <button
+                    onClick={() => startNewSessionWithPersona(selectedPersona)}
+                    className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>New Session with {selectedPersona.name}</span>
+                  </button>
+                ) : selectedAgent ? (
                   <button
                     onClick={() => setIsCreatingSession(true)}
                     className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
@@ -2568,13 +3989,22 @@ export default function App() {
                     <span>New Session with {selectedAgent.name}</span>
                   </button>
                 ) : (
-                  <button
-                    onClick={() => setShowRegisterModal(true)}
-                    className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Register Agent</span>
-                  </button>
+                  <>
+                    <button
+                      onClick={() => openCreatePersonaModal()}
+                      className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>Create Persona</span>
+                    </button>
+                    <button
+                      onClick={() => setShowRegisterModal(true)}
+                      className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>Register Agent</span>
+                    </button>
+                  </>
                 )}
               </div>
             </div>
@@ -2836,13 +4266,25 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowUsageModal(false)}
-                  className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={isRefreshingUsage}
+                    onClick={() => handleRefreshUsage(selectedUsageAgent.id)}
+                    className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer disabled:opacity-50"
+                    title="Refresh live provider quotas"
+                    aria-label="Refresh quota"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${isRefreshingUsage ? 'animate-spin text-sky-400' : ''}`} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowUsageModal(false)}
+                    className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
 
               {/* Modal Body */}
@@ -3028,6 +4470,310 @@ export default function App() {
           </div>
         );
       })()}
+
+      {/* Create / Edit Persona Modal */}
+      {showPersonaModal && (() => {
+        const driverModels = personaModalRuntimeCaps?.models || [];
+        const driverModes = personaModalRuntimeCaps?.modes || [];
+        const driverTiers = personaModalRuntimeCaps?.tiers || [];
+        const selectedModelObj = driverModels.find((m) => m.id === personaDefaultModel);
+        const driverEfforts = selectedModelObj?.efforts || [];
+
+        const driverOptions = Array.from(
+          new Map(
+            [
+              { id: 'agy', name: 'Antigravity CLI (agy)' },
+              { id: 'copilot', name: 'GitHub Copilot CLI (copilot)' },
+              { id: 'claude', name: 'Claude Code CLI (claude)' },
+              ...agents.map((a) => ({ id: a.id, name: `${a.name} (${a.id})` }))
+            ].map((item) => [item.id, item])
+          ).values()
+        );
+
+        return (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={editingPersona ? 'Edit Persona' : 'Create Persona'}
+            className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <form
+              onSubmit={handleSavePersona}
+              className="max-w-xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col max-h-[90vh] overflow-hidden"
+            >
+              {/* Header */}
+              <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+                    <Users className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-white">
+                      {editingPersona ? `Edit Persona: ${editingPersona.name}` : 'Create New Persona'}
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Configure specialized agent identity, target Driver, and default model
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowPersonaModal(false)}
+                  className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="flex-1 overflow-y-auto p-5 space-y-4 text-xs">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="block font-semibold text-slate-300">Persona Name</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Agy Security Reviewer"
+                      value={personaNameInput}
+                      onChange={(e) => setPersonaNameInput(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-sky-500"
+                      required
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block font-semibold text-slate-300">
+                      Handle / ID {editingPersona ? '(Fixed)' : '(Optional)'}
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. agy-sec-reviewer"
+                      value={personaIdInput}
+                      onChange={(e) => setPersonaIdInput(e.target.value)}
+                      disabled={!!editingPersona}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-sky-500 disabled:opacity-50"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="block font-semibold text-slate-300">Role Title</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Principal Security Architect"
+                      value={personaRoleInput}
+                      onChange={(e) => setPersonaRoleInput(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-sky-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block font-semibold text-slate-300">Execution Driver</label>
+                    <select
+                      aria-label="Execution Driver"
+                      value={personaDriverInput}
+                      onChange={(e) => {
+                        setPersonaDriverInput(e.target.value);
+                        setPersonaDefaultModel('');
+                        setPersonaDefaultEffort('');
+                      }}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                    >
+                      {driverOptions.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-semibold text-slate-300">
+                    System Instructions / Persona Prompt
+                  </label>
+                  <textarea
+                    rows={3}
+                    placeholder="Define specialized behavior, architectural constraints, or review criteria for this Persona..."
+                    value={personaPromptInput}
+                    onChange={(e) => setPersonaPromptInput(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-sky-500"
+                  />
+                </div>
+
+                {/* Default Model & Execution Preferences */}
+                <div className="pt-2 border-t border-slate-800 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-slate-300">
+                      Default Driver Model & Execution Settings
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      All Driver models remain accessible per session
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    <div className="space-y-1">
+                      <label className="block text-[11px] text-slate-400">Default Model</label>
+                      <select
+                        aria-label="Persona Default Model"
+                        value={personaDefaultModel}
+                        onChange={(e) => setPersonaDefaultModel(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                      >
+                        <option value="">Driver Default</option>
+                        {driverModels.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.name || m.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="block text-[11px] text-slate-400">Default Effort</label>
+                      <select
+                        aria-label="Persona Default Effort"
+                        value={personaDefaultEffort}
+                        onChange={(e) => setPersonaDefaultEffort(e.target.value)}
+                        disabled={driverEfforts.length === 0}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 disabled:opacity-40 cursor-pointer"
+                      >
+                        <option value="">Default Effort</option>
+                        {driverEfforts.map((eff) => (
+                          <option key={eff} value={eff}>
+                            {eff}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="block text-[11px] text-slate-400">Default Mode</label>
+                      <select
+                        aria-label="Persona Default Mode"
+                        value={personaDefaultMode}
+                        onChange={(e) => setPersonaDefaultMode(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                      >
+                        <option value="">Default Mode</option>
+                        {driverModes.map((mode) => (
+                          <option key={mode.id} value={mode.id}>
+                            {mode.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {driverTiers.length > 0 && (
+                    <div className="space-y-1">
+                      <label className="block text-[11px] text-slate-400">Default Optimization Tier</label>
+                      <select
+                        aria-label="Persona Default Tier"
+                        value={personaDefaultTier}
+                        onChange={(e) => setPersonaDefaultTier(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                      >
+                        <option value="">Default Tier</option>
+                        {driverTiers.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  <div className="space-y-1">
+                    <label className="block text-[11px] text-slate-400">Default Working Directory (Optional)</label>
+                    <input
+                      type="text"
+                      placeholder="Leave empty for isolated sandbox (~/.agentmesh/workspaces/<session-id>)"
+                      value={personaDefaultWorkDir}
+                      onChange={(e) => setPersonaDefaultWorkDir(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white font-mono focus:outline-none focus:border-sky-500"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="px-5 py-3 border-t border-slate-800 bg-slate-950 flex items-center justify-end gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowPersonaModal(false)}
+                  className="px-3.5 py-1.5 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isActionPending}
+                  className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-sky-600 hover:bg-sky-500 text-white transition cursor-pointer"
+                >
+                  {editingPersona ? 'Save Changes' : 'Create Persona'}
+                </button>
+              </div>
+            </form>
+          </div>
+        );
+      })()}
+
+      {/* Fullscreen Image Lightbox Modal */}
+      {lightboxAttachment && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Image preview: ${lightboxAttachment.fileName}`}
+          data-testid="attachment-lightbox"
+          onClick={() => setLightboxAttachment(null)}
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-6"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="max-w-5xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+          >
+            <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
+              <div className="flex items-center gap-2 min-w-0">
+                <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
+                <span className="font-mono text-xs font-semibold text-white truncate">
+                  {lightboxAttachment.fileName}
+                </span>
+                {lightboxAttachment.sizeBytes ? (
+                  <span className="text-[11px] font-mono text-slate-400">
+                    ({formatAttachmentSize(lightboxAttachment.sizeBytes)})
+                  </span>
+                ) : null}
+              </div>
+              <div className="flex items-center gap-2">
+                <a
+                  href={`${lightboxAttachment.url}${lightboxAttachment.url.includes('?') ? '&' : '?'}download=true`}
+                  download={lightboxAttachment.fileName}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition"
+                >
+                  <Download className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Download</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setLightboxAttachment(null)}
+                  aria-label="Close image preview"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 p-6 bg-slate-950 flex items-center justify-center overflow-auto">
+              <img
+                src={lightboxAttachment.url}
+                alt={lightboxAttachment.fileName}
+                className="max-h-[75vh] max-w-full object-contain rounded-lg shadow-xl"
+                data-testid="lightbox-image"
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -159,6 +159,15 @@ public class MeshClient
                     continue;
 
                 string? workDir = null, model = null, effort = null, mode = null;
+                string? personaId = null, personaName = null, personaRole = null, personaPrompt = null;
+                if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
+                {
+                    personaId = topPid.GetString();
+                }
+                if (sElem.TryGetProperty("personaName", out var topPname) && topPname.ValueKind == JsonValueKind.String)
+                {
+                    personaName = topPname.GetString();
+                }
                 if (sElem.TryGetProperty("metadataJson", out var metaProp) && !string.IsNullOrWhiteSpace(metaProp.GetString()))
                 {
                     try
@@ -169,6 +178,10 @@ public class MeshClient
                         if (mRoot.TryGetProperty("model", out var m)) model = m.GetString();
                         if (mRoot.TryGetProperty("effort", out var ef)) effort = ef.GetString();
                         if (mRoot.TryGetProperty("mode", out var md)) mode = md.GetString();
+                        if (mRoot.TryGetProperty("personaId", out var pid)) personaId ??= pid.GetString();
+                        if (mRoot.TryGetProperty("personaName", out var pn)) personaName ??= pn.GetString();
+                        if (mRoot.TryGetProperty("personaRole", out var pr)) personaRole = pr.GetString();
+                        if (mRoot.TryGetProperty("personaPrompt", out var pp)) personaPrompt = pp.GetString();
                     }
                     catch { }
                 }
@@ -195,17 +208,43 @@ public class MeshClient
                         ? dto
                         : DateTimeOffset.UtcNow;
 
+                    List<AttachmentItem>? attachments = null;
+                    if (lastEv.TryGetProperty("structuredPayloadJson", out var spProp) &&
+                        spProp.ValueKind == JsonValueKind.String &&
+                        !string.IsNullOrWhiteSpace(spProp.GetString()))
+                    {
+                        try
+                        {
+                            using var spDoc = JsonDocument.Parse(spProp.GetString()!);
+                            if (spDoc.RootElement.TryGetProperty("attachments", out var attElem) &&
+                                attElem.ValueKind == JsonValueKind.Array)
+                            {
+                                attachments = JsonSerializer.Deserialize<List<AttachmentItem>>(attElem.GetRawText(), new JsonSerializerOptions
+                                {
+                                    PropertyNameCaseInsensitive = true
+                                });
+                            }
+                        }
+                        catch { }
+                    }
+
                     pending.Add(new PromptReceivedEvent
                     {
                         SessionId = sessionId,
                         MessageId = msgId,
                         AgentId = agentId,
+                        DriverId = agentId,
+                        PersonaId = personaId,
+                        PersonaName = personaName,
+                        PersonaRole = personaRole,
+                        PersonaPrompt = personaPrompt,
                         Prompt = content,
                         Sender = sender,
                         WorkingDirectory = workDir,
                         Model = model,
                         Effort = effort,
                         Mode = mode,
+                        Attachments = attachments,
                         CreatedAt = createdAt
                     });
                 }
@@ -219,7 +258,36 @@ public class MeshClient
         return pending;
     }
 
-    public async Task<bool> SyncSessionArtifactAsync(Guid sessionId, string name, string content, string? summary = null, string? contentType = "text/markdown", CancellationToken ct = default)
+    public virtual async Task<bool> DownloadSessionAttachmentAsync(Guid sessionId, string attachmentId, string destinationFilePath, CancellationToken ct = default)
+    {
+        try
+        {
+            var token = _config.MasterToken;
+            using var req = CreateRequest(HttpMethod.Get, $"api/sessions/{sessionId}/attachments/{Uri.EscapeDataString(attachmentId)}/content", token);
+            using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!res.IsSuccessStatusCode)
+            {
+                return false;
+            }
+
+            var dir = Path.GetDirectoryName(destinationFilePath);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            await using var netStream = await res.Content.ReadAsStreamAsync(ct);
+            await using var fileStream = new FileStream(destinationFilePath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            await netStream.CopyToAsync(fileStream, ct);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public async Task<bool> SyncSessionArtifactAsync(Guid sessionId, string name, string content, string? summary = null, string? contentType = "text/markdown", CancellationToken ct = default, string? base64Content = null)
     {
         try
         {
@@ -230,7 +298,8 @@ public class MeshClient
                 name,
                 content,
                 summary,
-                contentType
+                contentType,
+                base64Content
             });
             using var res = await _http.SendAsync(req, ct);
             return res.IsSuccessStatusCode;

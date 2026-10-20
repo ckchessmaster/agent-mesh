@@ -2,8 +2,10 @@ using System.Security.Claims;
 using System.Text;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
@@ -15,11 +17,104 @@ namespace AgentMesh.Api.Controllers;
 [Authorize]
 public class SessionsController(
     AgentMeshDbContext db,
-    IHubContext<AgentMeshHub> hubContext) : ControllerBase
+    IHubContext<AgentMeshHub> hubContext,
+    IStorageService? storageService = null) : ControllerBase
 {
+    public const long MaxAttachmentSizeBytes = 25 * 1024 * 1024; // 25 MB per file
+    public const int MaxAttachmentsPerMessage = 10;
+    public const string DefaultAttachmentPrompt = "Please review the attached file(s).";
+
+    private static readonly HashSet<string> AllowedAttachmentExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // Images
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico",
+        // PDFs
+        ".pdf",
+        // Markdown / Text / Docs
+        ".md", ".markdown", ".txt", ".log", ".rst", ".adoc",
+        // Data & Config
+        ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".xml", ".ini", ".env", ".conf", ".config", ".properties",
+        // Source Code
+        ".cs", ".csproj", ".sln", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java", ".kt", ".swift",
+        ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".sh", ".bash", ".zsh", ".ps1", ".sql", ".graphql", ".gql", ".html", ".htm",
+        ".css", ".scss", ".less", ".vue", ".svelte", ".dockerfile", ".makefile", ".proto", ".tf", ".hcl", ".bicep", ".gradle",
+        // Archives
+        ".zip", ".tar", ".gz", ".tgz"
+    };
+
+    public static bool IsAllowedAttachment(string? fileName, string? contentType)
+        => IsAllowedAttachment(fileName, contentType, out _, out _);
+
+    public static bool IsAllowedAttachment(string? fileName, string? contentType, out string resolvedContentType, out string? errorReason)
+    {
+        resolvedContentType = string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType.Trim();
+        errorReason = null;
+
+        var ext = Path.GetExtension(fileName ?? string.Empty)?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(ext))
+        {
+            if (resolvedContentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+                resolvedContentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) ||
+                resolvedContentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase) ||
+                resolvedContentType.Equals("application/json", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            errorReason = $"File '{fileName}' is missing a supported file extension.";
+            return false;
+        }
+
+        if (!AllowedAttachmentExtensions.Contains(ext))
+        {
+            errorReason = $"File extension '{ext}' is not allowed. Supported types: images, PDFs, markdown/text, source code, JSON/CSV/YAML/logs, and ZIP.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(contentType) || resolvedContentType.Equals("application/octet-stream", StringComparison.OrdinalIgnoreCase))
+        {
+            resolvedContentType = GuessContentTypeFromExtension(ext);
+        }
+
+        return true;
+    }
+
+    public static string GuessContentTypeFromExtension(string fileNameOrExt)
+    {
+        var trimmed = (fileNameOrExt ?? string.Empty).Trim();
+        var ext = trimmed.StartsWith('.') ? trimmed : Path.GetExtension(trimmed);
+        return ext.ToLowerInvariant() switch
+        {
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            ".bmp" => "image/bmp",
+            ".ico" => "image/x-icon",
+            ".pdf" => "application/pdf",
+            ".md" or ".markdown" => "text/markdown",
+            ".txt" or ".log" or ".rst" or ".adoc" => "text/plain",
+            ".json" or ".jsonl" => "application/json",
+            ".csv" => "text/csv",
+            ".tsv" => "text/tab-separated-values",
+            ".yaml" or ".yml" => "application/yaml",
+            ".xml" => "application/xml",
+            ".html" or ".htm" => "text/html",
+            ".css" or ".scss" or ".less" => "text/css",
+            ".js" or ".jsx" or ".mjs" or ".cjs" or ".ts" or ".tsx" => "text/javascript",
+            ".zip" => "application/zip",
+            ".gz" or ".tgz" => "application/gzip",
+            ".tar" => "application/x-tar",
+            _ => "text/plain"
+        };
+    }
     [HttpGet]
     [AllowAnonymous]
-    public async Task<IActionResult> GetSessions([FromQuery] string? status = null, [FromQuery] string? creatorAgentId = null)
+    public async Task<IActionResult> GetSessions(
+        [FromQuery] string? status = null,
+        [FromQuery] string? creatorAgentId = null,
+        [FromQuery] string? driverId = null,
+        [FromQuery] string? personaId = null)
     {
         var query = db.AgentSessions.AsNoTracking().AsQueryable();
 
@@ -28,25 +123,63 @@ public class SessionsController(
             query = query.Where(s => s.Status.ToLower() == status.Trim().ToLower());
         }
 
-        if (!string.IsNullOrWhiteSpace(creatorAgentId))
+        var effectiveDriverId = !string.IsNullOrWhiteSpace(driverId) ? driverId : creatorAgentId;
+        if (!string.IsNullOrWhiteSpace(effectiveDriverId))
         {
-            query = query.Where(s => s.CreatorAgentId == creatorAgentId.Trim().ToLowerInvariant());
+            var normDriver = effectiveDriverId.Trim().ToLowerInvariant();
+            query = query.Where(s => s.DriverId == normDriver || s.CreatorAgentId == normDriver);
         }
 
-        var sessions = await query
+        if (!string.IsNullOrWhiteSpace(personaId))
+        {
+            var normPersona = personaId.Trim().ToLowerInvariant();
+            query = query.Where(s => s.PersonaId == normPersona);
+        }
+
+        var drivers = await db.Agents
+            .AsNoTracking()
+            .ToDictionaryAsync(a => a.Id, a => a.Name, StringComparer.OrdinalIgnoreCase);
+
+        var personas = await db.Personas
+            .AsNoTracking()
+            .ToDictionaryAsync(p => p.Id, p => p.Name, StringComparer.OrdinalIgnoreCase);
+
+        var rawSessions = await query
             .OrderByDescending(s => s.UpdatedAt)
             .Take(100)
-            .Select(s => new SessionSummaryDto(
+            .Select(s => new
+            {
                 s.Id,
                 s.Title,
                 s.Status,
                 s.MetadataJson,
                 s.CreatorAgentId,
-                s.Messages.Count,
+                s.DriverId,
+                s.PersonaId,
+                MessageCount = s.Messages.Count,
                 s.CreatedAt,
                 s.UpdatedAt
-            ))
+            })
             .ToListAsync();
+
+        var sessions = rawSessions.Select(s =>
+        {
+            var dId = s.DriverId ?? s.CreatorAgentId;
+            return new SessionSummaryDto(
+                s.Id,
+                s.Title,
+                s.Status,
+                s.MetadataJson,
+                dId,
+                s.MessageCount,
+                s.CreatedAt,
+                s.UpdatedAt,
+                DriverId: dId,
+                DriverName: dId != null ? drivers.GetValueOrDefault(dId, dId) : null,
+                PersonaId: s.PersonaId,
+                PersonaName: s.PersonaId != null ? personas.GetValueOrDefault(s.PersonaId, s.PersonaId) : null
+            );
+        }).ToList();
 
         return Ok(sessions);
     }
@@ -65,14 +198,26 @@ public class SessionsController(
             return NotFound(new { error = $"Session '{id}' not found." });
         }
 
+        var effectiveDriverId = session.DriverId ?? session.CreatorAgentId;
         string? creatorAgentName = null;
-        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        if (!string.IsNullOrWhiteSpace(effectiveDriverId))
         {
             creatorAgentName = await db.Agents
                 .AsNoTracking()
-                .Where(a => a.Id == session.CreatorAgentId)
+                .Where(a => a.Id == effectiveDriverId)
                 .Select(a => a.Name)
                 .FirstOrDefaultAsync();
+        }
+
+        string? personaName = null;
+        string? personaRole = null;
+        if (!string.IsNullOrWhiteSpace(session.PersonaId))
+        {
+            var persona = await db.Personas
+                .AsNoTracking()
+                .FirstOrDefaultAsync(p => p.Id == session.PersonaId);
+            personaName = persona?.Name;
+            personaRole = persona?.Role;
         }
 
         var dto = new SessionDetailDto(
@@ -80,14 +225,88 @@ public class SessionsController(
             session.Title,
             session.Status,
             session.MetadataJson,
-            session.CreatorAgentId,
+            effectiveDriverId,
             creatorAgentName,
             session.CreatedAt,
             session.UpdatedAt,
-            session.Messages.Select(ToMessageDto).ToList()
+            session.Messages.Select(ToMessageDto).ToList(),
+            DriverId: effectiveDriverId,
+            DriverName: creatorAgentName ?? effectiveDriverId,
+            PersonaId: session.PersonaId,
+            PersonaName: personaName,
+            PersonaRole: personaRole
         );
 
         return Ok(dto);
+    }
+
+    [HttpDelete("{id:guid}")]
+    public async Task<IActionResult> DeleteSession(Guid id)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var effectiveDriverId = session.DriverId ?? session.CreatorAgentId;
+        var personaId = session.PersonaId;
+
+        // 1. Halt any running execution
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("StopExecution", new
+            {
+                sessionId = session.Id,
+                agentId = effectiveDriverId
+            });
+            if (!string.IsNullOrWhiteSpace(effectiveDriverId))
+            {
+                await hubContext.Clients.Group($"agent-{effectiveDriverId}").SendAsync("StopExecution", new
+                {
+                    sessionId = session.Id,
+                    agentId = effectiveDriverId
+                });
+            }
+        }
+
+        // 2. Remove local disk artifacts if present
+        try
+        {
+            var basePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "artifacts", session.Id.ToString());
+            if (Directory.Exists(basePath))
+            {
+                Directory.Delete(basePath, true);
+            }
+        }
+        catch
+        {
+            // Ignore artifact folder deletion failures
+        }
+
+        // 3. Delete session from DB (cascades to messages and jobs)
+        db.AgentSessions.Remove(session);
+        await db.SaveChangesAsync();
+
+        // 4. Broadcast SessionDeleted event via SignalR
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("SessionDeleted", new
+            {
+                id = session.Id.ToString(),
+                sessionId = session.Id,
+                personaId,
+                driverId = effectiveDriverId
+            });
+        }
+
+        return Ok(new
+        {
+            status = "deleted",
+            id = session.Id,
+            personaId,
+            driverId = effectiveDriverId
+        });
     }
 
     public static string MergeSessionMetadata(
@@ -96,7 +315,11 @@ public class SessionsController(
         string? model,
         string? effort,
         string? mode,
-        string? tier = null)
+        string? tier = null,
+        string? personaId = null,
+        string? personaName = null,
+        string? personaRole = null,
+        string? personaPrompt = null)
     {
         var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrWhiteSpace(existingJson))
@@ -121,8 +344,46 @@ public class SessionsController(
         }
         if (!string.IsNullOrWhiteSpace(mode)) dict["mode"] = mode.Trim();
         if (!string.IsNullOrWhiteSpace(tier)) dict["tier"] = tier.Trim();
+        if (!string.IsNullOrWhiteSpace(personaId)) dict["personaId"] = personaId.Trim();
+        if (!string.IsNullOrWhiteSpace(personaName)) dict["personaName"] = personaName.Trim();
+        if (!string.IsNullOrWhiteSpace(personaRole)) dict["personaRole"] = personaRole.Trim();
+        if (!string.IsNullOrWhiteSpace(personaPrompt)) dict["personaPrompt"] = personaPrompt.Trim();
 
         return System.Text.Json.JsonSerializer.Serialize(dict);
+    }
+
+    public static (string? personaId, string? personaName, string? personaRole, string? personaPrompt) ExtractSessionPersona(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return (null, null, null, null);
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
+            var root = doc.RootElement;
+            var pId = root.TryGetProperty("personaId", out var pid) ? pid.GetString() : null;
+            var pName = root.TryGetProperty("personaName", out var pn) ? pn.GetString() : null;
+            var pRole = root.TryGetProperty("personaRole", out var pr) ? pr.GetString() : null;
+            var pPrompt = root.TryGetProperty("personaPrompt", out var pp) ? pp.GetString() : null;
+            return (pId, pName, pRole, pPrompt);
+        }
+        catch
+        {
+            return (null, null, null, null);
+        }
+    }
+
+    private async Task<(string? personaId, string? personaName, string? personaRole, string? personaPrompt)> ResolveSessionPersonaAsync(AgentSession session)
+    {
+        var (metaId, metaName, metaRole, metaPrompt) = ExtractSessionPersona(session.MetadataJson);
+        var pid = session.PersonaId ?? metaId;
+        if (!string.IsNullOrWhiteSpace(pid))
+        {
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == pid);
+            if (persona != null)
+            {
+                return (persona.Id, persona.Name, persona.Role, persona.PersonaPrompt);
+            }
+        }
+        return (pid, metaName, metaRole, metaPrompt);
     }
 
     public static (string? workingDirectory, string? model, string? effort, string? mode, string? tier) ExtractSessionSettings(string? metadataJson)
@@ -285,6 +546,118 @@ public class SessionsController(
         return basePath;
     }
 
+    public static string GetAttachmentDirectory(Guid sessionId)
+    {
+        var basePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "artifacts", sessionId.ToString(), "attachments");
+        Directory.CreateDirectory(basePath);
+        return basePath;
+    }
+
+    public static List<SessionAttachmentDto> ExtractAttachments(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return new();
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
+            if (doc.RootElement.TryGetProperty("attachments", out var aElem) && aElem.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                return System.Text.Json.JsonSerializer.Deserialize<List<SessionAttachmentDto>>(aElem.GetRawText(), new System.Text.Json.JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? new();
+            }
+        }
+        catch { }
+        return new();
+    }
+
+    public static string UpdateAttachmentsMetadata(string? metadataJson, List<SessionAttachmentDto> attachments)
+    {
+        try
+        {
+            var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(metadataJson))
+            {
+                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson);
+                if (parsed != null)
+                {
+                    foreach (var (k, v) in parsed) dict[k] = v;
+                }
+            }
+            dict["attachments"] = attachments;
+            return System.Text.Json.JsonSerializer.Serialize(dict);
+        }
+        catch
+        {
+            return metadataJson ?? "{}";
+        }
+    }
+
+    public static string? MergeAttachmentsIntoStructuredPayload(string? existingStructuredJson, List<SessionAttachmentDto>? attachments)
+    {
+        if (attachments == null || attachments.Count == 0)
+        {
+            return existingStructuredJson;
+        }
+
+        try
+        {
+            var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(existingStructuredJson))
+            {
+                var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(existingStructuredJson);
+                if (parsed != null)
+                {
+                    foreach (var (k, v) in parsed) dict[k] = v;
+                }
+            }
+            dict["attachments"] = attachments;
+            return System.Text.Json.JsonSerializer.Serialize(dict);
+        }
+        catch
+        {
+            return System.Text.Json.JsonSerializer.Serialize(new { attachments });
+        }
+    }
+
+    public static List<SessionAttachmentDto> ExtractAttachmentsFromPayload(string? structuredPayloadJson, List<SessionAttachmentDto>? directAttachments = null)
+    {
+        if (directAttachments is { Count: > 0 })
+        {
+            return directAttachments;
+        }
+        if (string.IsNullOrWhiteSpace(structuredPayloadJson))
+        {
+            return new();
+        }
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(structuredPayloadJson);
+            if (doc.RootElement.TryGetProperty("attachments", out var aElem) && aElem.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                return System.Text.Json.JsonSerializer.Deserialize<List<SessionAttachmentDto>>(aElem.GetRawText(), new System.Text.Json.JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? new();
+            }
+        }
+        catch { }
+        return new();
+    }
+
+    public static string SanitizeFileName(string? fileName)
+    {
+        var raw = Path.GetFileName(string.IsNullOrWhiteSpace(fileName) ? "attachment.txt" : fileName.Trim());
+        if (string.IsNullOrWhiteSpace(raw)) return "attachment.txt";
+        var invalid = Path.GetInvalidFileNameChars();
+        var sb = new StringBuilder(raw.Length);
+        foreach (var ch in raw)
+        {
+            sb.Append(invalid.Contains(ch) ? '_' : ch);
+        }
+        return sb.ToString();
+    }
+
     public static DateTimeOffset? ExtractStoppedAt(string? metadataJson)
     {
         if (string.IsNullOrWhiteSpace(metadataJson)) return null;
@@ -434,19 +807,55 @@ public class SessionsController(
             return BadRequest(new { error = "Session Title is required." });
         }
 
-        var callerAgentId = !string.IsNullOrWhiteSpace(req.CreatorAgentId)
-            ? req.CreatorAgentId.Trim().ToLowerInvariant()
-            : User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
-              ?? User?.FindFirst("AgentId")?.Value
-              ?? "agy";
+        Persona? persona = null;
+        if (!string.IsNullOrWhiteSpace(req.PersonaId))
+        {
+            var normPersonaId = req.PersonaId.Trim().ToLowerInvariant();
+            persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == normPersonaId);
+        }
 
-        var initialMetadata = MergeSessionMetadata(req.MetadataJson, req.WorkingDirectory, req.Model, req.Effort, req.Mode, req.Tier);
+        var callerAgentId = !string.IsNullOrWhiteSpace(req.DriverId)
+            ? req.DriverId.Trim().ToLowerInvariant()
+            : !string.IsNullOrWhiteSpace(req.CreatorAgentId)
+                ? req.CreatorAgentId.Trim().ToLowerInvariant()
+                : persona?.DriverId
+                  ?? User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                  ?? User?.FindFirst("AgentId")?.Value
+                  ?? "agy";
+
+        var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : persona?.DefaultWorkingDirectory;
+        var effectiveModel = !string.IsNullOrWhiteSpace(req.Model) ? req.Model : persona?.DefaultModel;
+        var effectiveEffort = req.Effort != null ? req.Effort : persona?.DefaultEffort;
+        var effectiveMode = !string.IsNullOrWhiteSpace(req.Mode) ? req.Mode : persona?.DefaultMode;
+        var effectiveTier = !string.IsNullOrWhiteSpace(req.Tier) ? req.Tier : persona?.DefaultTier;
+
+        var initialMetadata = MergeSessionMetadata(
+            req.MetadataJson,
+            effectiveWorkDir,
+            effectiveModel,
+            effectiveEffort,
+            effectiveMode,
+            effectiveTier,
+            persona?.Id ?? req.PersonaId,
+            persona?.Name,
+            persona?.Role,
+            persona?.PersonaPrompt);
+
+        var hasAttachments = req.Attachments is { Count: > 0 };
+        var hasInitialPrompt = !string.IsNullOrWhiteSpace(req.InitialMessage) || hasAttachments;
+
+        if (hasAttachments)
+        {
+            initialMetadata = UpdateAttachmentsMetadata(initialMetadata, req.Attachments!);
+        }
 
         var session = new AgentSession
         {
             Title = req.Title.Trim(),
-            Status = "active",
+            Status = hasInitialPrompt ? "thinking" : "active",
             MetadataJson = initialMetadata,
+            PersonaId = persona?.Id ?? req.PersonaId?.Trim().ToLowerInvariant(),
+            DriverId = callerAgentId,
             CreatorAgentId = callerAgentId,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
@@ -454,15 +863,21 @@ public class SessionsController(
 
         db.AgentSessions.Add(session);
 
-        if (!string.IsNullOrWhiteSpace(req.InitialMessage))
+        SessionMessage? initialMsg = null;
+        if (hasInitialPrompt)
         {
-            var initialMsg = new SessionMessage
+            var promptText = !string.IsNullOrWhiteSpace(req.InitialMessage)
+                ? req.InitialMessage.Trim()
+                : DefaultAttachmentPrompt;
+
+            initialMsg = new SessionMessage
             {
                 SessionId = session.Id,
                 SenderAgentId = "operator",
                 TargetAgentId = callerAgentId,
                 EventType = "prompt",
-                Content = req.InitialMessage.Trim(),
+                Content = promptText,
+                StructuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, req.Attachments),
                 CreatedAt = DateTimeOffset.UtcNow
             };
             db.SessionMessages.Add(initialMsg);
@@ -471,6 +886,35 @@ public class SessionsController(
         await db.SaveChangesAsync();
 
         await hubContext.Clients.All.SendAsync("SessionCreated", session);
+
+        if (initialMsg != null && !string.IsNullOrWhiteSpace(callerAgentId))
+        {
+            var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
+            var targetGroup = $"agent-{callerAgentId}";
+            var promptPayload = new
+            {
+                sessionId = session.Id,
+                messageId = initialMsg.Id,
+                agentId = callerAgentId,
+                driverId = callerAgentId,
+                personaId = personaId,
+                personaName = personaName,
+                personaRole = personaRole,
+                personaPrompt = personaPrompt,
+                prompt = initialMsg.Content,
+                sender = initialMsg.SenderAgentId,
+                workingDirectory = workDir,
+                model = model,
+                effort = effort,
+                mode = mode,
+                tier = tier,
+                attachments = req.Attachments,
+                createdAt = initialMsg.CreatedAt
+            };
+            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+        }
 
         return CreatedAtAction(nameof(GetSession), new { id = session.Id }, session);
     }
@@ -637,7 +1081,10 @@ public class SessionsController(
     [HttpPost("{id:guid}/events")]
     public async Task<IActionResult> PostMessage(Guid id, [FromBody] PostMessageRequest req)
     {
-        if (string.IsNullOrWhiteSpace(req.Content))
+        var messageAttachments = ExtractAttachmentsFromPayload(req.StructuredPayloadJson, req.Attachments);
+        var hasAttachments = messageAttachments.Count > 0;
+
+        if (string.IsNullOrWhiteSpace(req.Content) && !hasAttachments)
         {
             return BadRequest(new { error = "Message content is required." });
         }
@@ -658,12 +1105,16 @@ public class SessionsController(
             ? req.EventType.Trim().ToLowerInvariant()
             : "response";
 
+        var effectiveContent = !string.IsNullOrWhiteSpace(req.Content)
+            ? req.Content.Trim()
+            : DefaultAttachmentPrompt;
+
         if (eventType == "prompt")
         {
-            if (req.Content.StartsWith("/mesh", StringComparison.OrdinalIgnoreCase) ||
-                req.Content.StartsWith("\\mesh", StringComparison.OrdinalIgnoreCase))
+            if (effectiveContent.StartsWith("/mesh", StringComparison.OrdinalIgnoreCase) ||
+                effectiveContent.StartsWith("\\mesh", StringComparison.OrdinalIgnoreCase))
             {
-                return await HandleMeshCommandInternalAsync(session, req.Content);
+                return await HandleMeshCommandInternalAsync(session, effectiveContent);
             }
 
             session.MetadataJson = ClearStopMetadata(session.MetadataJson);
@@ -697,25 +1148,27 @@ public class SessionsController(
             }
         }
 
+        var mergedStructuredPayload = MergeAttachmentsIntoStructuredPayload(req.StructuredPayloadJson, messageAttachments);
+
         var message = new SessionMessage
         {
             SessionId = id,
             SenderAgentId = senderId,
             TargetAgentId = req.TargetAgentId ?? session.CreatorAgentId,
             EventType = eventType,
-            Content = req.Content.Trim(),
+            Content = effectiveContent,
             ToolName = req.ToolName,
             ToolArgsJson = req.ToolArgsJson,
             ToolResultJson = req.ToolResultJson,
-            StructuredPayloadJson = req.StructuredPayloadJson,
+            StructuredPayloadJson = mergedStructuredPayload,
             CreatedAt = DateTimeOffset.UtcNow
         };
 
         var wasThinking = session.Status == "thinking";
 
-        if (!string.IsNullOrWhiteSpace(req.StructuredPayloadJson))
+        if (!string.IsNullOrWhiteSpace(mergedStructuredPayload))
         {
-            session.MetadataJson = AccumulateUsageMetadata(session.MetadataJson, req.StructuredPayloadJson);
+            session.MetadataJson = AccumulateUsageMetadata(session.MetadataJson, mergedStructuredPayload);
         }
 
         db.SessionMessages.Add(message);
@@ -763,12 +1216,18 @@ public class SessionsController(
         if (eventType == "prompt" && !string.IsNullOrWhiteSpace(message.TargetAgentId))
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
             var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
             var promptPayload = new
             {
                 sessionId = id,
                 messageId = message.Id,
                 agentId = message.TargetAgentId.Trim().ToLowerInvariant(),
+                driverId = message.TargetAgentId.Trim().ToLowerInvariant(),
+                personaId = personaId,
+                personaName = personaName,
+                personaRole = personaRole,
+                personaPrompt = personaPrompt,
                 prompt = message.Content,
                 sender = message.SenderAgentId,
                 workingDirectory = workDir,
@@ -776,6 +1235,7 @@ public class SessionsController(
                 effort = effort,
                 mode = mode,
                 tier = tier,
+                attachments = messageAttachments.Count > 0 ? messageAttachments : null,
                 createdAt = message.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -797,7 +1257,8 @@ public class SessionsController(
                     SenderAgentId = nextPrompt.Sender,
                     TargetAgentId = session.CreatorAgentId,
                     EventType = "prompt",
-                    Content = nextPrompt.Prompt,
+                    Content = string.IsNullOrWhiteSpace(nextPrompt.Prompt) ? DefaultAttachmentPrompt : nextPrompt.Prompt,
+                    StructuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, nextPrompt.Attachments),
                     CreatedAt = DateTimeOffset.UtcNow
                 };
                 db.SessionMessages.Add(nextMsg);
@@ -824,6 +1285,7 @@ public class SessionsController(
                 await hubContext.Clients.All.SendAsync("SessionUpdated", session);
 
                 var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
                 if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
                 {
                     var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
@@ -832,6 +1294,11 @@ public class SessionsController(
                         sessionId = id,
                         messageId = nextMsg.Id,
                         agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                        driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                        personaId = personaId,
+                        personaName = personaName,
+                        personaRole = personaRole,
+                        personaPrompt = personaPrompt,
                         prompt = nextMsg.Content,
                         sender = nextMsg.SenderAgentId,
                         workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
@@ -839,6 +1306,7 @@ public class SessionsController(
                         effort = nextPrompt.Effort ?? effort,
                         mode = nextPrompt.Mode ?? mode,
                         tier = nextPrompt.Tier ?? tier,
+                        attachments = nextPrompt.Attachments,
                         createdAt = nextMsg.CreatedAt
                     };
                     await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1052,7 +1520,8 @@ public class SessionsController(
     [HttpPost("{id:guid}/queue")]
     public async Task<IActionResult> EnqueuePrompt(Guid id, [FromBody] EnqueuePromptRequest req)
     {
-        if (string.IsNullOrWhiteSpace(req.Prompt))
+        var hasAttachments = req.Attachments is { Count: > 0 };
+        if (string.IsNullOrWhiteSpace(req.Prompt) && !hasAttachments)
         {
             return BadRequest(new { error = "Prompt cannot be empty." });
         }
@@ -1063,10 +1532,14 @@ public class SessionsController(
             return NotFound(new { error = $"Session '{id}' not found." });
         }
 
-        if (req.Prompt.StartsWith("/mesh", StringComparison.OrdinalIgnoreCase) ||
-            req.Prompt.StartsWith("\\mesh", StringComparison.OrdinalIgnoreCase))
+        var effectivePrompt = !string.IsNullOrWhiteSpace(req.Prompt)
+            ? req.Prompt.Trim()
+            : DefaultAttachmentPrompt;
+
+        if (effectivePrompt.StartsWith("/mesh", StringComparison.OrdinalIgnoreCase) ||
+            effectivePrompt.StartsWith("\\mesh", StringComparison.OrdinalIgnoreCase))
         {
-            return await HandleMeshCommandInternalAsync(session, req.Prompt);
+            return await HandleMeshCommandInternalAsync(session, effectivePrompt);
         }
 
         var senderId = !string.IsNullOrWhiteSpace(req.SenderAgentId)
@@ -1076,6 +1549,7 @@ public class SessionsController(
               ?? "operator";
 
         var queue = ExtractPromptQueue(session.MetadataJson);
+        var structuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, req.Attachments);
 
         if (req.SendNow)
         {
@@ -1091,7 +1565,8 @@ public class SessionsController(
                 SenderAgentId = senderId,
                 TargetAgentId = session.CreatorAgentId,
                 EventType = "prompt",
-                Content = req.Prompt.Trim(),
+                Content = effectivePrompt,
+                StructuredPayloadJson = structuredPayloadJson,
                 CreatedAt = DateTimeOffset.UtcNow
             };
             db.SessionMessages.Add(msg);
@@ -1106,12 +1581,18 @@ public class SessionsController(
 
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
+                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
                 var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
                 var promptPayload = new
                 {
                     sessionId = id,
                     messageId = msg.Id,
                     agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                    driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                    personaId = personaId,
+                    personaName = personaName,
+                    personaRole = personaRole,
+                    personaPrompt = personaPrompt,
                     prompt = msg.Content,
                     sender = msg.SenderAgentId,
                     workingDirectory = req.WorkingDirectory ?? workDir,
@@ -1119,6 +1600,7 @@ public class SessionsController(
                     effort = req.Effort ?? effort,
                     mode = req.Mode ?? mode,
                     tier = req.Tier ?? tier,
+                    attachments = req.Attachments,
                     createdAt = msg.CreatedAt
                 };
                 await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1138,7 +1620,8 @@ public class SessionsController(
                 SenderAgentId = senderId,
                 TargetAgentId = session.CreatorAgentId,
                 EventType = "prompt",
-                Content = req.Prompt.Trim(),
+                Content = effectivePrompt,
+                StructuredPayloadJson = structuredPayloadJson,
                 CreatedAt = DateTimeOffset.UtcNow
             };
             db.SessionMessages.Add(msg);
@@ -1153,12 +1636,18 @@ public class SessionsController(
 
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
+                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
                 var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
                 var promptPayload = new
                 {
                     sessionId = id,
                     messageId = msg.Id,
                     agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                    driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                    personaId = personaId,
+                    personaName = personaName,
+                    personaRole = personaRole,
+                    personaPrompt = personaPrompt,
                     prompt = msg.Content,
                     sender = msg.SenderAgentId,
                     workingDirectory = req.WorkingDirectory ?? workDir,
@@ -1166,6 +1655,7 @@ public class SessionsController(
                     effort = req.Effort ?? effort,
                     mode = req.Mode ?? mode,
                     tier = req.Tier ?? tier,
+                    attachments = req.Attachments,
                     createdAt = msg.CreatedAt
                 };
                 await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1178,14 +1668,15 @@ public class SessionsController(
         // Otherwise enqueue for sequential execution
         var queuedItem = new QueuedPromptDto(
             Id: Guid.NewGuid().ToString(),
-            Prompt: req.Prompt.Trim(),
+            Prompt: effectivePrompt,
             Sender: senderId,
             CreatedAt: DateTimeOffset.UtcNow,
             Model: req.Model,
             Effort: req.Effort,
             Tier: req.Tier,
             Mode: req.Mode,
-            WorkingDirectory: req.WorkingDirectory
+            WorkingDirectory: req.WorkingDirectory,
+            Attachments: req.Attachments
         );
         queue.Add(queuedItem);
 
@@ -1248,6 +1739,7 @@ public class SessionsController(
         }
 
         var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+        var structuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, item.Attachments);
 
         var msg = new SessionMessage
         {
@@ -1256,6 +1748,7 @@ public class SessionsController(
             TargetAgentId = session.CreatorAgentId,
             EventType = "prompt",
             Content = item.Prompt,
+            StructuredPayloadJson = structuredPayloadJson,
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.SessionMessages.Add(msg);
@@ -1272,12 +1765,18 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
+            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
             var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
             var promptPayload = new
             {
                 sessionId = id,
                 messageId = msg.Id,
                 agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                personaId = personaId,
+                personaName = personaName,
+                personaRole = personaRole,
+                personaPrompt = personaPrompt,
                 prompt = msg.Content,
                 sender = msg.SenderAgentId,
                 workingDirectory = item.WorkingDirectory ?? workDir,
@@ -1285,6 +1784,7 @@ public class SessionsController(
                 effort = item.Effort ?? effort,
                 mode = item.Mode ?? mode,
                 tier = item.Tier ?? tier,
+                attachments = item.Attachments,
                 createdAt = msg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1386,12 +1886,18 @@ public class SessionsController(
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
             var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
             var promptPayload = new
             {
                 sessionId = id,
                 messageId = promptMsg.Id,
                 agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                personaId = personaId,
+                personaName = personaName,
+                personaRole = personaRole,
+                personaPrompt = personaPrompt,
                 prompt = promptMsg.Content,
                 sender = promptMsg.SenderAgentId,
                 workingDirectory = workDir,
@@ -1406,6 +1912,166 @@ public class SessionsController(
         }
 
         return Ok(new { toolResult = toolResultDto, prompt = promptDto, session });
+    }
+
+    [HttpPost("{id:guid}/attachments")]
+    [RequestSizeLimit(262_144_000)]
+    public async Task<IActionResult> UploadAttachments(Guid id, [FromForm] IFormFileCollection? files = null)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var formFiles = files is { Count: > 0 }
+            ? files
+            : (Request?.HasFormContentType == true ? Request.Form.Files : null);
+
+        if (formFiles == null || formFiles.Count == 0)
+        {
+            return BadRequest(new { error = "At least one file must be provided." });
+        }
+
+        if (formFiles.Count > MaxAttachmentsPerMessage)
+        {
+            return BadRequest(new { error = $"A maximum of {MaxAttachmentsPerMessage} files can be attached per message." });
+        }
+
+        foreach (var file in formFiles)
+        {
+            if (file.Length <= 0)
+            {
+                return BadRequest(new { error = $"File '{file.FileName}' is empty." });
+            }
+
+            if (file.Length > MaxAttachmentSizeBytes)
+            {
+                return BadRequest(new { error = $"File '{file.FileName}' exceeds the 25 MB maximum file size limit." });
+            }
+
+            if (!IsAllowedAttachment(file.FileName, file.ContentType))
+            {
+                return BadRequest(new { error = $"File '{file.FileName}' has an unsupported file type." });
+            }
+        }
+
+        var existingAttachments = ExtractAttachments(session.MetadataJson);
+        var uploaded = new List<SessionAttachmentDto>();
+        var localAttachDir = GetAttachmentDirectory(id);
+
+        foreach (var file in formFiles)
+        {
+            var attachmentId = Guid.NewGuid().ToString("N");
+            var safeFileName = SanitizeFileName(file.FileName);
+            var contentType = !string.IsNullOrWhiteSpace(file.ContentType) && !string.Equals(file.ContentType, "application/octet-stream", StringComparison.OrdinalIgnoreCase)
+                ? file.ContentType
+                : GuessContentTypeFromExtension(safeFileName);
+            var s3Key = $"sessions/{id}/attachments/{attachmentId}/{safeFileName}";
+            var downloadUrl = $"/api/sessions/{id}/attachments/{attachmentId}/content";
+
+            var localFilePath = Path.Combine(localAttachDir, $"{attachmentId}_{safeFileName}");
+            await using (var localStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.Read))
+            {
+                await file.CopyToAsync(localStream, HttpContext?.RequestAborted ?? CancellationToken.None);
+            }
+
+            if (storageService != null)
+            {
+                try
+                {
+                    await using var s3Stream = file.OpenReadStream();
+                    await storageService.UploadStreamAsync(s3Key, s3Stream, contentType, HttpContext?.RequestAborted ?? CancellationToken.None);
+                }
+                catch
+                {
+                    // Graceful fallback to local disk if SeaweedFS S3 is unreachable
+                }
+            }
+
+            var dto = new SessionAttachmentDto(
+                Id: attachmentId,
+                SessionId: id,
+                FileName: safeFileName,
+                ContentType: contentType,
+                SizeBytes: file.Length,
+                S3Key: s3Key,
+                DownloadUrl: downloadUrl,
+                CreatedAt: DateTimeOffset.UtcNow
+            );
+
+            uploaded.Add(dto);
+            existingAttachments.Add(dto);
+        }
+
+        session.MetadataJson = UpdateAttachmentsMetadata(session.MetadataJson, existingAttachments);
+        session.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        return Ok(uploaded);
+    }
+
+    [HttpGet("{id:guid}/attachments/{attachmentId}/content")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetAttachmentContent(Guid id, string attachmentId, [FromQuery] bool download = false)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var attachments = ExtractAttachments(session.MetadataJson);
+        var attachment = attachments.FirstOrDefault(a =>
+            string.Equals(a.Id, attachmentId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.FileName, attachmentId, StringComparison.OrdinalIgnoreCase));
+
+        if (attachment == null)
+        {
+            return NotFound(new { error = $"Attachment '{attachmentId}' not found in session '{id}'." });
+        }
+
+        Stream? contentStream = null;
+        if (storageService != null && !string.IsNullOrWhiteSpace(attachment.S3Key))
+        {
+            try
+            {
+                contentStream = await storageService.DownloadStreamAsync(attachment.S3Key, HttpContext?.RequestAborted ?? CancellationToken.None);
+            }
+            catch
+            {
+                contentStream = null;
+            }
+        }
+
+        if (contentStream == null)
+        {
+            var localAttachDir = GetAttachmentDirectory(id);
+            var localFilePath = Path.Combine(localAttachDir, $"{attachment.Id}_{attachment.FileName}");
+            if (!System.IO.File.Exists(localFilePath))
+            {
+                return NotFound(new { error = $"Attachment content for '{attachment.FileName}' was not found." });
+            }
+
+            contentStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+
+        var contentType = !string.IsNullOrWhiteSpace(attachment.ContentType)
+            ? attachment.ContentType
+            : GuessContentTypeFromExtension(attachment.FileName);
+
+        var isInlineRenderable = !download && (
+            contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(contentType, "application/pdf", StringComparison.OrdinalIgnoreCase) ||
+            contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase));
+
+        var disposition = isInlineRenderable ? "inline" : "attachment";
+        if (Response != null)
+        {
+            Response.Headers.ContentDisposition = $"{disposition}; filename=\"{SanitizeFileName(attachment.FileName)}\"";
+        }
+
+        return File(contentStream, contentType);
     }
 
     [HttpGet("{id:guid}/artifacts")]
@@ -1431,15 +2097,20 @@ public class SessionsController(
                 var fName = fInfo.Name;
                 if (!artifacts.Any(a => string.Equals(a.Name, fName, StringComparison.OrdinalIgnoreCase)))
                 {
+                    var artifactId = Guid.NewGuid().ToString();
+                    var cType = GuessContentTypeFromExtension(fName);
                     artifacts.Add(new SessionArtifactDto(
-                        Id: Guid.NewGuid().ToString(),
+                        Id: artifactId,
                         SessionId: id,
                         Name: fName,
                         Summary: null,
-                        ContentType: fName.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ? "text/markdown" : "application/octet-stream",
+                        ContentType: cType,
                         SizeBytes: fInfo.Length,
                         CreatedAt: fInfo.CreationTimeUtc,
-                        UpdatedAt: fInfo.LastWriteTimeUtc
+                        UpdatedAt: fInfo.LastWriteTimeUtc,
+                        Content: null,
+                        S3Key: $"sessions/{id}/artifacts/{artifactId}/{fName}",
+                        DownloadUrl: $"/api/sessions/{id}/artifacts/{artifactId}/content"
                     ));
                     updated = true;
                 }
@@ -1476,26 +2147,102 @@ public class SessionsController(
             return NotFound(new { error = $"Artifact '{artifactId}' not found in session '{id}'." });
         }
 
-        var content = System.IO.File.Exists(filePath) ? await System.IO.File.ReadAllTextAsync(filePath) : artifact?.Content ?? string.Empty;
+        var contentType = artifact?.ContentType ?? GuessContentTypeFromExtension(safeName);
+        var isBinary = contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(contentType, "application/pdf", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(contentType, "application/zip", StringComparison.OrdinalIgnoreCase);
+
+        string? content = null;
+        if (!isBinary)
+        {
+            content = System.IO.File.Exists(filePath) ? await System.IO.File.ReadAllTextAsync(filePath) : artifact?.Content ?? string.Empty;
+        }
+
         var now = DateTimeOffset.UtcNow;
+        var resolvedId = artifact?.Id ?? Guid.NewGuid().ToString();
+        var downloadUrl = artifact?.DownloadUrl ?? $"/api/sessions/{id}/artifacts/{resolvedId}/content";
         var resultDto = artifact != null
-            ? artifact with { Content = content }
+            ? artifact with { Content = content, DownloadUrl = downloadUrl }
             : new SessionArtifactDto(
-                Id: Guid.NewGuid().ToString(),
+                Id: resolvedId,
                 SessionId: id,
                 Name: safeName,
                 Summary: null,
-                ContentType: safeName.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ? "text/markdown" : "application/octet-stream",
+                ContentType: contentType,
                 SizeBytes: System.IO.File.Exists(filePath) ? new FileInfo(filePath).Length : 0,
                 CreatedAt: now,
                 UpdatedAt: now,
-                Content: content
+                Content: content,
+                S3Key: $"sessions/{id}/artifacts/{resolvedId}/{safeName}",
+                DownloadUrl: downloadUrl
             );
 
         return Ok(resultDto);
     }
 
+    [HttpGet("{id:guid}/artifacts/{artifactId}/content")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetArtifactContent(Guid id, string artifactId, [FromQuery] bool download = false)
+    {
+        var session = await db.AgentSessions.FirstOrDefaultAsync(s => s.Id == id);
+        if (session == null)
+        {
+            return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        var artifacts = ExtractArtifacts(session.MetadataJson);
+        var artifact = artifacts.FirstOrDefault(a =>
+            string.Equals(a.Id, artifactId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.Name, artifactId, StringComparison.OrdinalIgnoreCase));
+
+        var dir = GetArtifactDirectory(id);
+        var safeName = artifact != null ? artifact.Name : Path.GetFileName(artifactId);
+        var filePath = Path.Combine(dir, safeName);
+
+        Stream? contentStream = null;
+        if (storageService != null && !string.IsNullOrWhiteSpace(artifact?.S3Key))
+        {
+            try
+            {
+                contentStream = await storageService.DownloadStreamAsync(artifact.S3Key, HttpContext?.RequestAborted ?? CancellationToken.None);
+            }
+            catch
+            {
+                contentStream = null;
+            }
+        }
+
+        if (contentStream == null)
+        {
+            if (System.IO.File.Exists(filePath))
+            {
+                contentStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            }
+            else if (!string.IsNullOrEmpty(artifact?.Content))
+            {
+                contentStream = new MemoryStream(Encoding.UTF8.GetBytes(artifact.Content));
+            }
+            else
+            {
+                return NotFound(new { error = $"Artifact '{artifactId}' content not found in session '{id}'." });
+            }
+        }
+
+        var contentType = !string.IsNullOrWhiteSpace(artifact?.ContentType)
+            ? artifact.ContentType
+            : GuessContentTypeFromExtension(safeName);
+
+        var disposition = download ? "attachment" : "inline";
+        if (Response != null)
+        {
+            Response.Headers.ContentDisposition = $"{disposition}; filename=\"{SanitizeFileName(safeName)}\"";
+        }
+
+        return File(contentStream, contentType);
+    }
+
     [HttpPost("{id:guid}/artifacts")]
+    [RequestSizeLimit(262_144_000)]
     public async Task<IActionResult> SyncArtifact(Guid id, [FromBody] SyncArtifactRequest req)
     {
         if (string.IsNullOrWhiteSpace(req.Name))
@@ -1512,7 +2259,22 @@ public class SessionsController(
         var dir = GetArtifactDirectory(id);
         var safeFileName = Path.GetFileName(req.Name.Trim());
         var filePath = Path.Combine(dir, safeFileName);
-        await System.IO.File.WriteAllTextAsync(filePath, req.Content ?? string.Empty);
+        var contentType = !string.IsNullOrWhiteSpace(req.ContentType)
+            ? req.ContentType
+            : GuessContentTypeFromExtension(safeFileName);
+
+        byte[] rawBytes;
+        if (!string.IsNullOrWhiteSpace(req.Base64Content))
+        {
+            rawBytes = Convert.FromBase64String(req.Base64Content);
+            await System.IO.File.WriteAllBytesAsync(filePath, rawBytes);
+        }
+        else
+        {
+            var textContent = req.Content ?? string.Empty;
+            rawBytes = Encoding.UTF8.GetBytes(textContent);
+            await System.IO.File.WriteAllTextAsync(filePath, textContent);
+        }
 
         var fileInfo = new FileInfo(filePath);
         var artifacts = ExtractArtifacts(session.MetadataJson);
@@ -1521,19 +2283,37 @@ public class SessionsController(
         var now = DateTimeOffset.UtcNow;
         SessionArtifactDto artifactDto;
         bool isNew = existingIndex < 0;
+        var artifactId = isNew ? Guid.NewGuid().ToString() : artifacts[existingIndex].Id;
+        var s3Key = $"sessions/{id}/artifacts/{artifactId}/{safeFileName}";
+        var downloadUrl = $"/api/sessions/{id}/artifacts/{artifactId}/content";
+
+        if (storageService != null)
+        {
+            try
+            {
+                await using var s3Stream = new MemoryStream(rawBytes);
+                await storageService.UploadStreamAsync(s3Key, s3Stream, contentType, HttpContext?.RequestAborted ?? CancellationToken.None);
+            }
+            catch
+            {
+                // Graceful fallback to local disk if SeaweedFS S3 is unreachable
+            }
+        }
 
         if (isNew)
         {
             artifactDto = new SessionArtifactDto(
-                Id: Guid.NewGuid().ToString(),
+                Id: artifactId,
                 SessionId: id,
                 Name: safeFileName,
                 Summary: req.Summary,
-                ContentType: req.ContentType ?? (safeFileName.EndsWith(".md", StringComparison.OrdinalIgnoreCase) ? "text/markdown" : "application/octet-stream"),
+                ContentType: contentType,
                 SizeBytes: fileInfo.Length,
                 CreatedAt: now,
                 UpdatedAt: now,
-                Content: req.Content
+                Content: string.IsNullOrWhiteSpace(req.Base64Content) ? req.Content : null,
+                S3Key: s3Key,
+                DownloadUrl: downloadUrl
             );
             artifacts.Add(artifactDto);
         }
@@ -1543,10 +2323,12 @@ public class SessionsController(
             artifactDto = old with
             {
                 Summary = req.Summary ?? old.Summary,
-                ContentType = req.ContentType ?? old.ContentType,
+                ContentType = contentType,
                 SizeBytes = fileInfo.Length,
                 UpdatedAt = now,
-                Content = req.Content
+                Content = string.IsNullOrWhiteSpace(req.Base64Content) ? req.Content : null,
+                S3Key = s3Key,
+                DownloadUrl = downloadUrl
             };
             artifacts[existingIndex] = artifactDto;
         }
@@ -1587,7 +2369,10 @@ public record CreateSessionRequest(
     string? Model = null,
     string? Effort = null,
     string? Mode = null,
-    string? Tier = null
+    string? Tier = null,
+    string? PersonaId = null,
+    string? DriverId = null,
+    List<SessionAttachmentDto>? Attachments = null
 );
 
 public record PostMessageRequest(
@@ -1599,7 +2384,8 @@ public record PostMessageRequest(
     string? ToolName = null,
     string? ToolArgsJson = null,
     string? ToolResultJson = null,
-    DateTimeOffset? CreatedAt = null
+    DateTimeOffset? CreatedAt = null,
+    List<SessionAttachmentDto>? Attachments = null
 );
 
 public record UpdateSessionRequest(
@@ -1621,7 +2407,11 @@ public record SessionSummaryDto(
     string? CreatorAgentId,
     int MessageCount,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt
+    DateTimeOffset UpdatedAt,
+    string? DriverId = null,
+    string? DriverName = null,
+    string? PersonaId = null,
+    string? PersonaName = null
 );
 
 public record SessionDetailDto(
@@ -1633,7 +2423,12 @@ public record SessionDetailDto(
     string? CreatorAgentName,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
-    List<SessionMessageDto> Messages
+    List<SessionMessageDto> Messages,
+    string? DriverId = null,
+    string? DriverName = null,
+    string? PersonaId = null,
+    string? PersonaName = null,
+    string? PersonaRole = null
 );
 
 public record SessionMessageDto(
@@ -1659,7 +2454,8 @@ public record QueuedPromptDto(
     string? Effort = null,
     string? Tier = null,
     string? Mode = null,
-    string? WorkingDirectory = null
+    string? WorkingDirectory = null,
+    List<SessionAttachmentDto>? Attachments = null
 );
 
 public record EnqueuePromptRequest(
@@ -1670,7 +2466,8 @@ public record EnqueuePromptRequest(
     string? Effort = null,
     string? Tier = null,
     string? Mode = null,
-    string? WorkingDirectory = null
+    string? WorkingDirectory = null,
+    List<SessionAttachmentDto>? Attachments = null
 );
 
 public record QuestionAnswerDto(
@@ -1694,14 +2491,29 @@ public record SessionArtifactDto(
     long SizeBytes,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
-    string? Content = null
+    string? Content = null,
+    string? S3Key = null,
+    string? DownloadUrl = null
 );
 
 public record SyncArtifactRequest(
     string Name,
     string Content,
     string? Summary = null,
-    string? ContentType = "text/markdown"
+    string? ContentType = "text/markdown",
+    string? Base64Content = null
 );
+
+public record SessionAttachmentDto(
+    string Id,
+    Guid SessionId,
+    string FileName,
+    string ContentType,
+    long SizeBytes,
+    string S3Key,
+    string DownloadUrl,
+    DateTimeOffset CreatedAt
+);
+
 
 
