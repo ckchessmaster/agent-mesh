@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
 import type { Persona, Project, ProjectJob, JobTask, JobMessage } from '../types';
@@ -275,6 +275,66 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     await waitFor(() => {
       expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
         content: '@qa-tester please verify token expiration',
+        senderType: 'user'
+      });
+    });
+  });
+
+  it('opens team member mention autocomplete when typing @ in the job message area and autocompletes persona', async () => {
+    vi.mocked(api.postJobMessage).mockResolvedValue({
+      id: 'm-4',
+      jobId: 'job-101',
+      senderType: 'user',
+      content: '@astra please review security architecture',
+      mentions: ['astra'],
+      createdAt: new Date().toISOString()
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(
+        screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i)
+      ).toBeInTheDocument();
+    });
+
+    const textarea = screen.getByPlaceholderText(
+      /Type your message, tasks, or delegate with @persona/i
+    );
+
+    // Enter @ in the job message area
+    fireEvent.change(textarea, { target: { value: '@' } });
+
+    // Autocomplete palette should appear showing project team members
+    const palette = screen.getByTestId('team-mention-palette');
+    expect(palette).toBeInTheDocument();
+    expect(within(palette).getByText('Team Members')).toBeInTheDocument();
+    expect(within(palette).getByText('Astra')).toBeInTheDocument();
+    expect(within(palette).getByText('QA Tester')).toBeInTheDocument();
+
+    // Select Astra from the autocomplete dropdown
+    const astraOption = screen.getByTestId('team-mention-option-astra');
+    fireEvent.click(astraOption);
+
+    // Textarea updated with mention and palette closed
+    expect((textarea as HTMLTextAreaElement).value).toBe('@astra ');
+    expect(screen.queryByTestId('team-mention-palette')).not.toBeInTheDocument();
+
+    // Finish typing message and send
+    fireEvent.change(textarea, {
+      target: { value: '@astra please review security architecture' }
+    });
+    const sendBtn = screen.getByTitle('Send Message');
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
+        content: '@astra please review security architecture',
         senderType: 'user'
       });
     });

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   GitBranch,
   CheckCircle2,
@@ -13,14 +13,39 @@ import {
   Check,
   Briefcase
 } from 'lucide-react';
-import type { JobMessage, JobTask, Project, ProjectJob } from '../types';
+import type { JobMessage, JobTask, Persona, Project, ProjectJob } from '../types';
 import { ProjectJobStatus } from '../types';
+import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
+
+export function getActiveMentionQuery(
+  text: string,
+  cursorPos: number
+): { query: string; startIndex: number } | null {
+  const beforeCursor = text.slice(0, cursorPos);
+  const lastAtIndex = beforeCursor.lastIndexOf('@');
+  if (lastAtIndex === -1) return null;
+
+  // The @ symbol must be at start of string or preceded by whitespace
+  if (lastAtIndex > 0 && !/\s/.test(beforeCursor[lastAtIndex - 1])) {
+    return null;
+  }
+
+  const query = beforeCursor.slice(lastAtIndex + 1);
+
+  // If there's whitespace inside the query, the mention has ended
+  if (/\s/.test(query)) {
+    return null;
+  }
+
+  return { query, startIndex: lastAtIndex };
+}
 
 interface JobCockpitProps {
   project: Project;
   job: ProjectJob;
   tasks: JobTask[];
   messages: JobMessage[];
+  personas?: Persona[];
   onSendMessage: (content: string) => Promise<void>;
   onAddTask: (title: string) => Promise<void>;
   onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
@@ -34,6 +59,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   job,
   tasks,
   messages,
+  personas = [],
   onSendMessage,
   onAddTask,
   onToggleTask,
@@ -49,14 +75,168 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [resultSummary, setResultSummary] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
 
+  // Team Member Autocomplete Palette State
+  const [mentionState, setMentionState] = useState<{
+    isOpen: boolean;
+    query: string;
+    startIndex: number;
+  }>({
+    isOpen: false,
+    query: '',
+    startIndex: -1
+  });
+  const [mentionHighlightedIndex, setMentionHighlightedIndex] = useState(0);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Team members list: priority given to project's assigned personas, fallback to all personas
+  const teamMembers: MentionableMember[] = useMemo(() => {
+    const assigned = project.assignedPersonas || [];
+    const leadId = project.defaultLeadPersonaId;
+
+    if (assigned.length > 0) {
+      return assigned.map((p) => ({
+        id: p.id,
+        name: p.name,
+        role: p.role,
+        driverId: p.driverId,
+        isLead: p.id === leadId,
+        isAssigned: true
+      }));
+    }
+
+    if (personas && personas.length > 0) {
+      return personas.map((p) => ({
+        id: p.id,
+        name: p.name,
+        role: p.role,
+        driverId: p.driverId,
+        isLead: p.id === leadId,
+        isAssigned: false
+      }));
+    }
+
+    return [];
+  }, [project.assignedPersonas, project.defaultLeadPersonaId, personas]);
+
+  const filteredMentionMembers = useMemo(() => {
+    const q = mentionState.query.toLowerCase().trim();
+    return teamMembers.filter((m) => {
+      if (!q) return true;
+      return (
+        m.id.toLowerCase().includes(q) ||
+        m.name.toLowerCase().includes(q) ||
+        m.role.toLowerCase().includes(q) ||
+        m.driverId.toLowerCase().includes(q)
+      );
+    });
+  }, [teamMembers, mentionState.query]);
 
   useEffect(() => {
     if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [messages]);
+
+  const checkMentionTrigger = (text: string, cursorPos: number) => {
+    const mentionInfo = getActiveMentionQuery(text, cursorPos);
+    if (mentionInfo) {
+      setMentionState({
+        isOpen: true,
+        query: mentionInfo.query,
+        startIndex: mentionInfo.startIndex
+      });
+      setMentionHighlightedIndex(0);
+    } else {
+      setMentionState((prev) => (prev.isOpen ? { ...prev, isOpen: false } : prev));
+    }
+  };
+
+  const handlePromptChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setPrompt(val);
+    const cursorPos = e.target.selectionStart ?? val.length;
+    checkMentionTrigger(val, cursorPos);
+  };
+
+  const handleCursorActivity = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
+    const target = e.currentTarget;
+    checkMentionTrigger(target.value, target.selectionStart ?? target.value.length);
+  };
+
+  const handleSelectMention = (member: MentionableMember) => {
+    const cursorPos = textareaRef.current?.selectionStart ?? prompt.length;
+    const mentionInfo = getActiveMentionQuery(prompt, cursorPos);
+
+    let nextPrompt: string;
+    let nextCursorPos: number;
+
+    if (mentionInfo) {
+      const before = prompt.slice(0, mentionInfo.startIndex);
+      const after = prompt.slice(cursorPos);
+      const afterClean = after.startsWith(' ') ? after.slice(1) : after;
+      const mentionTag = `@${member.id} `;
+      nextPrompt = `${before}${mentionTag}${afterClean}`;
+      nextCursorPos = before.length + mentionTag.length;
+    } else {
+      const mentionTag = `@${member.id} `;
+      nextPrompt = prompt ? `${prompt} ${mentionTag}` : mentionTag;
+      nextCursorPos = nextPrompt.length;
+    }
+
+    setPrompt(nextPrompt);
+    setMentionState({ isOpen: false, query: '', startIndex: -1 });
+    setMentionHighlightedIndex(0);
+
+    requestAnimationFrame(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.setSelectionRange(nextCursorPos, nextCursorPos);
+      }
+    });
+  };
+
+  const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionState.isOpen && filteredMentionMembers.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setMentionHighlightedIndex((prev) => (prev + 1) % filteredMentionMembers.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMentionHighlightedIndex(
+          (prev) => (prev - 1 + filteredMentionMembers.length) % filteredMentionMembers.length
+        );
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMentionState((prev) => ({ ...prev, isOpen: false }));
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const selected =
+          filteredMentionMembers[mentionHighlightedIndex] || filteredMentionMembers[0];
+        if (selected) {
+          handleSelectMention(selected);
+        }
+        return;
+      }
+    } else if (mentionState.isOpen && e.key === 'Escape') {
+      e.preventDefault();
+      setMentionState((prev) => ({ ...prev, isOpen: false }));
+      return;
+    }
+
+    // Normal Enter without Shift to send message
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
 
   const handleSend = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -372,25 +552,33 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         )}
 
         <form onSubmit={handleSend} className="relative flex items-center gap-2">
-          <textarea
-            ref={textareaRef}
-            rows={2}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSend();
-              }
-            }}
-            placeholder="Type your message, tasks, or delegate with @persona (Press Enter to send)..."
-            disabled={isCompleted || isSending}
-            className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition resize-none disabled:opacity-50"
-          />
+          <div className="relative flex-1">
+            <TeamMentionPalette
+              members={teamMembers}
+              query={mentionState.query}
+              isOpen={mentionState.isOpen}
+              highlightedIndex={mentionHighlightedIndex}
+              onSelect={handleSelectMention}
+              onClose={() => setMentionState((prev) => ({ ...prev, isOpen: false }))}
+              triggerRef={textareaRef}
+            />
+            <textarea
+              ref={textareaRef}
+              rows={2}
+              value={prompt}
+              onChange={handlePromptChange}
+              onKeyUp={handleCursorActivity}
+              onClick={handleCursorActivity}
+              onKeyDown={handlePromptKeyDown}
+              placeholder="Type your message, tasks, or delegate with @persona (Press Enter to send)..."
+              disabled={isCompleted || isSending}
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition resize-none disabled:opacity-50"
+            />
+          </div>
           <button
             type="submit"
             disabled={!prompt.trim() || isSending || isCompleted}
-            className="p-3 bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 rounded-xl transition cursor-pointer shrink-0 shadow-md flex items-center justify-center"
+            className="p-3 bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 rounded-xl transition cursor-pointer shrink-0 shadow-md flex items-center justify-center self-stretch"
             title="Send Message"
           >
             <Send className="w-4 h-4" />

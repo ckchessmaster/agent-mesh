@@ -2785,6 +2785,7 @@ export default function App() {
                     job={activeJ}
                     tasks={jobTasks}
                     messages={jobMessages}
+                    personas={personas}
                     onSendMessage={handleSendJobMessage}
                     onAddTask={handleAddTask}
                     onToggleTask={handleToggleTask}
