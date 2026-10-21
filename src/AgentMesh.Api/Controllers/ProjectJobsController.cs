@@ -648,6 +648,9 @@ public class ProjectJobsController(
         };
 
         JobMessage? ackMsg = null;
+        AgentSession? turnSession = null;
+        Persona? turnPersona = null;
+        Agent? turnDriver = null;
 
         // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn!
         if (targetPersonaId != null && req.TurnSessionId == null)
@@ -655,6 +658,7 @@ public class ProjectJobsController(
             var persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == targetPersonaId);
             if (persona != null)
             {
+                turnPersona = persona;
                 var driverId = persona.DriverId.Trim().ToLowerInvariant();
                 var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
                 if (driver == null)
@@ -668,6 +672,7 @@ public class ProjectJobsController(
                     };
                     db.Agents.Add(driver);
                 }
+                turnDriver = driver;
 
                 var turnSessionId = Guid.NewGuid();
 
@@ -722,7 +727,7 @@ public class ProjectJobsController(
                     ["attachments"] = req.Attachments
                 };
 
-                var turnSession = new AgentSession
+                turnSession = new AgentSession
                 {
                     Id = turnSessionId,
                     Title = $"Job Turn: {job.Title} (@{persona.Name})",
@@ -819,6 +824,24 @@ public class ProjectJobsController(
 
         if (hubContext != null)
         {
+            if (turnSession != null && turnPersona != null && turnDriver != null)
+            {
+                await hubContext.Clients.All.SendAsync("SessionCreated", new SessionSummaryDto(
+                    turnSession.Id,
+                    turnSession.Title,
+                    turnSession.Status,
+                    turnSession.MetadataJson,
+                    turnSession.DriverId,
+                    1,
+                    turnSession.CreatedAt,
+                    turnSession.UpdatedAt,
+                    DriverId: turnSession.DriverId,
+                    DriverName: turnDriver.Name,
+                    PersonaId: turnPersona.Id,
+                    PersonaName: turnPersona.Name
+                ));
+            }
+
             await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
             if (ackMsg != null)
             {

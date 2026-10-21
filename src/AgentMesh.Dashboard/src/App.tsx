@@ -514,8 +514,16 @@ export default function App() {
       setEvents(msgs);
       if (latestSession) {
         setSessions((prev) =>
-          prev.map((s) => (s.id === latestSession.id ? { ...s, ...latestSession } : s))
+          prev.some((s) => s.id === latestSession.id)
+            ? prev.map((s) => (s.id === latestSession.id ? { ...s, ...latestSession } : s))
+            : [latestSession, ...prev]
         );
+        if (latestSession.personaId) {
+          setSelectedPersonaId(latestSession.personaId);
+        }
+        if (latestSession.driverId || latestSession.creatorAgentId) {
+          setSelectedAgentId(latestSession.driverId || latestSession.creatorAgentId || null);
+        }
       } else if (msgs.length > 0) {
         const lastMsg = msgs[msgs.length - 1];
         if (lastMsg.eventType === 'response') {
@@ -698,26 +706,6 @@ export default function App() {
       if (connection && signalRConnected) {
         connection.invoke('JoinSession', selectedSessionId).catch(() => {});
       }
-
-      // If the session is not yet loaded in sessions array, fetch it so selectedSession resolves
-      setSessions((prev) => {
-        if (!prev.some((s) => s.id === selectedSessionId) && typeof api.getSession === 'function') {
-          api.getSession(selectedSessionId).then((sess) => {
-            if (sess) {
-              setSessions((curr) => (curr.some((s) => s.id === sess.id) ? curr : [sess, ...curr]));
-              if (sess.personaId) {
-                setSelectedPersonaId(sess.personaId);
-              }
-              if (sess.driverId || sess.creatorAgentId) {
-                setSelectedAgentId(sess.driverId || sess.creatorAgentId || null);
-              }
-            }
-          }).catch((err) => {
-            console.error('Failed to load session details for trajectory view', err);
-          });
-        }
-        return prev;
-      });
     } else {
       if (prevSelectedSessionIdRef.current && connection && signalRConnected) {
         connection.invoke('LeaveSession', prevSelectedSessionIdRef.current).catch(() => {});
@@ -2864,27 +2852,30 @@ export default function App() {
                     }}
                     onSelectTurnSession={async (sessionId) => {
                       setIsCreatingSession(false);
-                      setSelectedSessionId(sessionId);
                       setActiveTab('personas');
+                      setSelectedSessionId(sessionId);
                       const existing = sessions.find((s) => s.id === sessionId);
                       if (existing) {
                         if (existing.personaId) setSelectedPersonaId(existing.personaId);
                         if (existing.driverId || existing.creatorAgentId) {
                           setSelectedAgentId(existing.driverId || existing.creatorAgentId || null);
                         }
-                      } else {
-                        try {
-                          const fetched = await api.getSession(sessionId);
-                          if (fetched) {
-                            setSessions((prev) => (prev.some((s) => s.id === fetched.id) ? prev : [fetched, ...prev]));
-                            if (fetched.personaId) setSelectedPersonaId(fetched.personaId);
-                            if (fetched.driverId || fetched.creatorAgentId) {
-                              setSelectedAgentId(fetched.driverId || fetched.creatorAgentId || null);
-                            }
+                      }
+                      try {
+                        const fetched = await api.getSession(sessionId);
+                        if (fetched) {
+                          setSessions((prev) =>
+                            prev.some((s) => s.id === fetched.id)
+                              ? prev.map((s) => (s.id === fetched.id ? { ...s, ...fetched } : s))
+                              : [fetched, ...prev]
+                          );
+                          if (fetched.personaId) setSelectedPersonaId(fetched.personaId);
+                          if (fetched.driverId || fetched.creatorAgentId) {
+                            setSelectedAgentId(fetched.driverId || fetched.creatorAgentId || null);
                           }
-                        } catch (err) {
-                          console.error('Failed to fetch turn session', err);
                         }
+                      } catch (err) {
+                        console.error('Failed to fetch turn session', err);
                       }
                     }}
                   />
@@ -3321,6 +3312,21 @@ export default function App() {
                         ? 'Waiting for Input'
                         : selectedSession.status}
                     </span>
+                    {selectedSessionMetadata?.jobId && selectedSessionMetadata?.projectId && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedProjectId(selectedSessionMetadata.projectId);
+                          setSelectedJobId(selectedSessionMetadata.jobId);
+                          setActiveTab('projects');
+                        }}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-lg bg-sky-950/80 hover:bg-sky-900/80 text-sky-300 hover:text-white border border-sky-500/30 text-[11px] font-semibold transition cursor-pointer shadow-sm"
+                        title={`Return to Job: ${selectedSessionMetadata.projectName || 'Job'}`}
+                      >
+                        <FolderGit2 className="w-3 h-3 text-sky-400" />
+                        <span>← Back to Job</span>
+                      </button>
+                    )}
                   </div>
 
                   <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-[11px]">
@@ -4468,6 +4474,18 @@ export default function App() {
             )}
           </div>
         </>
+          ) : selectedSessionId ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
+              <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-sky-400">
+                <RefreshCw className="w-7 h-7 animate-spin text-sky-400" />
+              </div>
+              <div className="max-w-md space-y-1.5">
+                <h2 className="text-lg font-bold text-white">Loading Session Trajectory...</h2>
+                <p className="text-xs text-slate-400 font-mono">
+                  Loading telemetry for session <span className="text-sky-300">{selectedSessionId.slice(0, 8)}...</span>
+                </p>
+              </div>
+            </div>
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
               <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-sky-400">

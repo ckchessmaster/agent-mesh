@@ -12,6 +12,7 @@ vi.mock('../services/api', () => ({
     getAgents: vi.fn(),
     getPersonas: vi.fn(),
     getSessions: vi.fn(),
+    getSession: vi.fn(),
     getSessionMessages: vi.fn(),
     getSessionArtifacts: vi.fn(),
     getCapabilities: vi.fn(),
@@ -636,6 +637,58 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
           name: 'Mesh Core System (Updated)'
         })
       );
+    });
+  });
+
+  it('clicking View Turn Execution & Trajectory loads turn session without empty observatory and provides Return to Job button', async () => {
+    vi.mocked(api.getSession).mockResolvedValue({
+      id: 'sess-turn-456',
+      title: 'Job Turn: Implement OAuth Provider (@Astra)',
+      status: 'active',
+      metadataJson: JSON.stringify({
+        jobId: 'job-101',
+        projectId: 'mesh-core',
+        projectName: 'Mesh Core System',
+        personaId: 'astra'
+      }),
+      driverId: 'agy',
+      personaId: 'astra',
+      personaName: 'Astra',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+    vi.mocked(api.getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg-ev-1',
+        sessionId: 'sess-turn-456',
+        eventType: 'thought',
+        content: 'Analyzing OAuth specifications and scopes',
+        createdAt: new Date().toISOString()
+      }
+    ]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
+    });
+
+    // Click View Turn Execution & Trajectory
+    fireEvent.click(screen.getByText('View Turn Execution & Trajectory'));
+
+    // Should load the session details in both sidebar and main panel, not show the empty observatory screen
+    await waitFor(() => {
+      expect(screen.getAllByText('Job Turn: Implement OAuth Provider (@Astra)').length).toBeGreaterThan(0);
+      expect(screen.queryByText('Agent Session Observatory')).not.toBeInTheDocument();
+      expect(screen.getByText('← Back to Job')).toBeInTheDocument();
+    });
+
+    // Click Back to Job returns to Job Cockpit
+    fireEvent.click(screen.getByText('← Back to Job'));
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+      expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
     });
   });
 });

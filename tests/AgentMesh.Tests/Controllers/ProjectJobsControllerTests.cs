@@ -1,4 +1,5 @@
 using AgentMesh.Api.Controllers;
+using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -6,6 +7,7 @@ using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using Xunit;
@@ -349,5 +351,58 @@ public class ProjectJobsControllerTests
         var promptMsg = await db.SessionMessages.FirstOrDefaultAsync(m => m.SessionId == turnSession.Id && m.EventType == "prompt");
         promptMsg.Should().NotBeNull();
         promptMsg!.StructuredPayloadJson.Should().Contain("architecture.pdf");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WithPersonaMention_BroadcastsSessionCreatedSignalREvent()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var driver = new Agent { Id = "agy", Name = "Antigravity", RuntimeType = RuntimeType.CliAgy, TrustTier = TrustTier.SeniorManager };
+        var persona = new Persona { Id = "astra", Name = "Astra", Role = "Tech Lead", DriverId = "agy", PersonaPrompt = "You are Astra." };
+        var project = new Project
+        {
+            Id = "proj-mesh-signalr",
+            Name = "SignalR Test Project",
+            WorkspaceType = WorkspaceType.Git
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-mesh-signalr",
+            Title = "Trajectory Test Job",
+            GitBranchName = "mesh/job-traj"
+        };
+        db.Agents.Add(driver);
+        db.Personas.Add(persona);
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = "proj-mesh-signalr", PersonaId = "astra" });
+        await db.SaveChangesAsync();
+
+        var mockHubContext = new Mock<IHubContext<AgentMeshHub>>();
+        var mockClients = new Mock<IHubClients>();
+        var mockClientProxy = new Mock<IClientProxy>();
+        mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockClients.Setup(c => c.Group(It.IsAny<string>())).Returns(mockClientProxy.Object);
+        mockHubContext.Setup(h => h.Clients).Returns(mockClients.Object);
+
+        var controller = new ProjectJobsController(db, mockHubContext.Object);
+
+        var msgReq = new PostJobMessageRequest(
+            Content: "@astra please execute the trajectory turn"
+        );
+
+        var result = await controller.PostJobMessage(job.Id, msgReq);
+        var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+        var msgDto = ok.Value.Should().BeOfType<JobMessageDto>().Subject;
+
+        // Verify SessionCreated event was broadcast via SignalR
+        mockClientProxy.Verify(
+            c => c.SendCoreAsync(
+                "SessionCreated",
+                It.Is<object?[]>(args => args.Length == 1 && args[0] is SessionSummaryDto && ((SessionSummaryDto)args[0]!).Id == msgDto.TurnSessionId),
+                default),
+            Times.Once);
     }
 }
