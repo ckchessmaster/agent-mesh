@@ -17,6 +17,7 @@ import {
 import type { AgentSession, SessionMessage, Agent } from '../types';
 import { api } from '../services/api';
 import type * as signalR from '@microsoft/signalr';
+import { MarkdownMessage } from './MarkdownMessage';
 
 interface SessionLedgerProps {
   connection?: signalR.HubConnection | null;
@@ -437,8 +438,8 @@ export const SessionLedger: React.FC<SessionLedgerProps> = ({ connection, agents
                           </span>
                         </div>
 
-                        <div className="text-slate-200 leading-relaxed font-sans whitespace-pre-wrap">
-                          {m.content}
+                        <div className="text-slate-200 leading-relaxed font-sans">
+                          <MarkdownMessage content={m.content} />
                         </div>
 
                         {m.structuredPayloadJson && (

@@ -13,6 +13,7 @@ string oidcAuthority;
 if (string.IsNullOrWhiteSpace(externalOidcAuthority))
 {
     dex = builder.AddDockerfile("dex", "dex")
+        .WithVolume("dex-data", "/var/dex")
         .WithHttpEndpoint(port: 8085, targetPort: 5556, name: "http");
 
     oidcAuthority = "http://localhost:8085/dex";

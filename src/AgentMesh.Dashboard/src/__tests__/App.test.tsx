@@ -13,6 +13,7 @@ import type {
 
 vi.mock('../services/api', () => ({
   api: {
+    verifyAuth: vi.fn().mockResolvedValue({ authenticated: true }),
     getStatus: vi.fn(),
     getCapabilities: vi.fn().mockResolvedValue({
       workspace: {

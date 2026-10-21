@@ -8,10 +8,10 @@ import {
   RefreshCw,
   Code,
   Eye,
-  Info,
-  Layers
+  Info
 } from 'lucide-react';
 import type { SessionArtifact } from '../types';
+import { MermaidViewer } from './MermaidViewer';
 
 interface ArtifactViewerProps {
   artifacts: SessionArtifact[];
@@ -63,6 +63,12 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
     return ct === 'application/pdf' || name.endsWith('.pdf');
   };
 
+  const isMermaidArtifact = (artifact?: SessionArtifact | null) => {
+    if (!artifact) return false;
+    const name = (artifact.name || '').toLowerCase();
+    return name.endsWith('.mermaid') || name.endsWith('.mmd');
+  };
+
   const handleDownloadFile = () => {
     if (!activeArtifact) return;
     if ((isImageArtifact(activeArtifact) || isPdfArtifact(activeArtifact)) && !activeArtifact.content) {
@@ -107,17 +113,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
       const codeText = codeBuffer.join('\n');
       if (codeLang.toLowerCase() === 'mermaid') {
         blocks.push(
-          <div key={key} className="my-3 rounded-xl border border-indigo-500/30 bg-slate-900/90 p-3.5 shadow-lg">
-            <div className="flex items-center justify-between mb-2 pb-1.5 border-b border-indigo-500/20 text-[11px] font-mono text-indigo-300">
-              <span className="flex items-center gap-1.5 font-bold uppercase tracking-wider">
-                <Layers className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Mermaid Architecture Diagram</span>
-              </span>
-            </div>
-            <pre className="font-mono text-xs text-indigo-200 overflow-x-auto whitespace-pre p-2 bg-slate-950/70 rounded-lg">
-              {codeText}
-            </pre>
-          </div>
+          <MermaidViewer key={key} code={codeText} />
         );
       } else {
         blocks.push(
@@ -394,6 +390,8 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
                     data-testid="artifact-pdf-preview"
                   />
                 </div>
+              ) : isMermaidArtifact(activeArtifact) && viewMode === 'rendered' ? (
+                <MermaidViewer code={activeArtifact.content || ''} title={activeArtifact.name} />
               ) : viewMode === 'raw' ? (
                 <pre className="font-mono text-xs text-slate-200 bg-slate-900/60 p-4 rounded-xl border border-slate-800/80 overflow-x-auto whitespace-pre-wrap leading-relaxed">
                   {activeArtifact.content || '(binary artifact — switch to View or Download)'}

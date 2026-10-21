@@ -20,9 +20,26 @@ import type {
 } from '../types';
 
 let tokenProvider: (() => string | null) | null = null;
+let unauthorizedHandler: (() => void | Promise<void>) | null = null;
 
 export const setAuthTokenProvider = (provider: (() => string | null) | null) => {
   tokenProvider = provider;
+};
+
+export const setUnauthorizedHandler = (handler: (() => void | Promise<void>) | null) => {
+  unauthorizedHandler = handler;
+};
+
+const apiFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const res = await fetch(input, init);
+  if (res.status === 401 && unauthorizedHandler) {
+    try {
+      void unauthorizedHandler();
+    } catch (e) {
+      console.error('Error in unauthorizedHandler:', e);
+    }
+  }
+  return res;
 };
 
 const getAuthHeadersOnly = (): Record<string, string> => {
@@ -55,46 +72,52 @@ export interface SessionControlOptions {
 }
 
 export const api = {
+  async verifyAuth(): Promise<{ authenticated: boolean; email?: string; name?: string; agentId?: string; trustTier?: string }> {
+    const res = await apiFetch('/api/auth/verify', { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Auth verification failed: ${res.statusText}`);
+    return res.json();
+  },
+
   async getStatus(): Promise<SystemStatusResponse> {
-    const res = await fetch('/api/status', { headers: getHeaders() });
+    const res = await apiFetch('/api/status', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load system status: ${res.statusText}`);
     return res.json();
   },
 
   async getCapabilities(): Promise<SystemCapabilitiesResponse> {
-    const res = await fetch('/api/system/capabilities', { headers: getHeaders() });
+    const res = await apiFetch('/api/system/capabilities', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load system capabilities: ${res.statusText}`);
     return res.json();
   },
 
   async browseFilesystem(path?: string): Promise<FilesystemBrowseResponse> {
     const query = path ? `?path=${encodeURIComponent(path)}` : '';
-    const res = await fetch(`/api/system/filesystem${query}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/system/filesystem${query}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to browse directory: ${res.statusText}`);
     return res.json();
   },
 
   async getAgents(): Promise<Agent[]> {
-    const res = await fetch('/api/agents', { headers: getHeaders() });
+    const res = await apiFetch('/api/agents', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load agents: ${res.statusText}`);
     return res.json();
   },
 
   async getDrivers(): Promise<Agent[]> {
-    const res = await fetch('/api/drivers', { headers: getHeaders() });
+    const res = await apiFetch('/api/drivers', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load drivers: ${res.statusText}`);
     return res.json();
   },
 
   async getPersonas(driverId?: string): Promise<Persona[]> {
     const query = driverId ? `?driverId=${encodeURIComponent(driverId)}` : '';
-    const res = await fetch(`/api/personas${query}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/personas${query}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load personas: ${res.statusText}`);
     return res.json();
   },
 
   async getPersona(id: string): Promise<Persona> {
-    const res = await fetch(`/api/personas/${encodeURIComponent(id)}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(id)}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load persona: ${res.statusText}`);
     return res.json();
   },
@@ -114,7 +137,7 @@ export const api = {
     maxConcurrentJobs?: number;
     trustTier?: number;
   }): Promise<Persona> {
-    const res = await fetch('/api/personas', {
+    const res = await apiFetch('/api/personas', {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -140,7 +163,7 @@ export const api = {
       trustTier?: number;
     }
   ): Promise<Persona> {
-    const res = await fetch(`/api/personas/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -150,7 +173,7 @@ export const api = {
   },
 
   async deletePersona(id: string): Promise<{ status: string; id: string; deletedSessionsCount: number }> {
-    const res = await fetch(`/api/personas/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -159,7 +182,7 @@ export const api = {
   },
 
   async getPersonaSessions(personaId: string): Promise<AgentSession[]> {
-    const res = await fetch(`/api/personas/${encodeURIComponent(personaId)}/sessions`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/sessions`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load persona sessions: ${res.statusText}`);
     return res.json();
   },
@@ -170,7 +193,7 @@ export const api = {
     initialPrompt?: string,
     options?: SessionControlOptions
   ): Promise<AgentSession> {
-    const res = await fetch(`/api/personas/${encodeURIComponent(personaId)}/sessions`, {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/sessions`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify({
@@ -191,7 +214,7 @@ export const api = {
 
   async getAgentUsage(agentId: string, refresh = false): Promise<AgentUsageResponse> {
     const url = `/api/agents/${encodeURIComponent(agentId)}/usage${refresh ? '?refresh=true' : ''}`;
-    const res = await fetch(url, { headers: getHeaders() });
+    const res = await apiFetch(url, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load agent usage: ${res.statusText}`);
     return res.json();
   },
@@ -206,7 +229,7 @@ export const api = {
     memorySummary?: string;
     capabilitiesJson?: string;
   }): Promise<{ agent: Agent; token: string; instructions: string }> {
-    const res = await fetch('/api/agents/register', {
+    const res = await apiFetch('/api/agents/register', {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -222,7 +245,7 @@ export const api = {
     status?: string;
     capabilitiesJson?: string;
   }): Promise<Agent> {
-    const res = await fetch('/api/agents', {
+    const res = await apiFetch('/api/agents', {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -233,13 +256,13 @@ export const api = {
 
   async getJobs(approvalStatus?: string): Promise<StagedJob[]> {
     const query = approvalStatus ? `?approvalStatus=${encodeURIComponent(approvalStatus)}` : '';
-    const res = await fetch(`/api/jobs${query}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/jobs${query}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load jobs: ${res.statusText}`);
     return res.json();
   },
 
   async submitApproval(jobId: string, approved: boolean, reason?: string): Promise<void> {
-    const res = await fetch(`/api/jobs/${jobId}/approval`, {
+    const res = await apiFetch(`/api/jobs/${jobId}/approval`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify({ approved, reason: reason || (approved ? 'Approved via Web Cockpit' : 'Rejected via Web Cockpit') })
@@ -252,13 +275,13 @@ export const api = {
     if (status && status !== 'all') params.append('status', status);
     if (creatorAgentId) params.append('creatorAgentId', creatorAgentId);
     const query = params.toString() ? `?${params.toString()}` : '';
-    const res = await fetch(`/api/sessions${query}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/sessions${query}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load sessions: ${res.statusText}`);
     return res.json();
   },
 
   async getAgentSessions(agentId: string): Promise<AgentSession[]> {
-    const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load agent sessions: ${res.statusText}`);
     return res.json();
   },
@@ -269,7 +292,7 @@ export const api = {
     initialPrompt?: string,
     options?: SessionControlOptions
   ): Promise<AgentSession> {
-    const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify({
@@ -289,13 +312,13 @@ export const api = {
   },
 
   async getSession(id: string): Promise<AgentSession> {
-    const res = await fetch(`/api/sessions/${id}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/sessions/${id}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load session details: ${res.statusText}`);
     return res.json();
   },
 
   async deleteSession(id: string): Promise<{ status: string; id: string; personaId?: string; driverId?: string }> {
-    const res = await fetch(`/api/sessions/${id}`, {
+    const res = await apiFetch(`/api/sessions/${id}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -310,7 +333,7 @@ export const api = {
     creatorAgentId = 'agy-core',
     options?: SessionControlOptions
   ): Promise<AgentSession> {
-    const res = await fetch('/api/sessions', {
+    const res = await apiFetch('/api/sessions', {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify({
@@ -332,7 +355,7 @@ export const api = {
   },
 
   async updateSessionStatus(id: string, status: string): Promise<AgentSession> {
-    const res = await fetch(`/api/sessions/${id}`, {
+    const res = await apiFetch(`/api/sessions/${id}`, {
       method: 'PATCH',
       headers: getHeaders(),
       body: JSON.stringify({ status })
@@ -352,7 +375,7 @@ export const api = {
       workingDirectory?: string;
     }
   ): Promise<AgentSession> {
-    const res = await fetch(`/api/sessions/${id}`, {
+    const res = await apiFetch(`/api/sessions/${id}`, {
       method: 'PATCH',
       headers: getHeaders(),
       body: JSON.stringify(params)
@@ -362,7 +385,7 @@ export const api = {
   },
 
   async getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
-    const res = await fetch(`/api/sessions/${sessionId}/events`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/sessions/${sessionId}/events`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load session events: ${res.statusText}`);
     return res.json();
   },
@@ -370,7 +393,7 @@ export const api = {
   async uploadSessionAttachments(sessionId: string, files: File[]): Promise<SessionAttachment[]> {
     const formData = new FormData();
     files.forEach((f) => formData.append('files', f, f.name));
-    const res = await fetch(`/api/sessions/${sessionId}/attachments`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/attachments`, {
       method: 'POST',
       headers: getAuthHeadersOnly(),
       body: formData
@@ -415,7 +438,7 @@ export const api = {
     eventType = 'prompt',
     attachments?: SessionAttachment[]
   ): Promise<SessionMessage> {
-    const res = await fetch(`/api/sessions/${sessionId}/events`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/events`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify({
@@ -431,7 +454,7 @@ export const api = {
   },
 
   async stopSession(sessionId: string): Promise<{ status: string; sessionId: string }> {
-    const res = await fetch(`/api/sessions/${sessionId}/stop`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/stop`, {
       method: 'POST',
       headers: getHeaders()
     });
@@ -440,7 +463,7 @@ export const api = {
   },
 
   async stopCommand(sessionId: string, commandId: string): Promise<{ status: string; commandId: string }> {
-    const res = await fetch(`/api/sessions/${sessionId}/commands/${encodeURIComponent(commandId)}/stop`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/commands/${encodeURIComponent(commandId)}/stop`, {
       method: 'POST',
       headers: getHeaders()
     });
@@ -463,7 +486,7 @@ export const api = {
       attachments?: SessionAttachment[];
     }
   ): Promise<{ session: AgentSession; queue: QueuedPromptItem[]; dispatched: boolean }> {
-    const res = await fetch(`/api/sessions/${sessionId}/queue`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/queue`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -473,7 +496,7 @@ export const api = {
   },
 
   async dequeuePrompt(sessionId: string, queueItemId: string): Promise<QueuedPromptItem[]> {
-    const res = await fetch(`/api/sessions/${sessionId}/queue/${encodeURIComponent(queueItemId)}`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/queue/${encodeURIComponent(queueItemId)}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -485,7 +508,7 @@ export const api = {
     sessionId: string,
     queueItemId: string
   ): Promise<{ session: AgentSession; queue: QueuedPromptItem[]; dispatched: boolean }> {
-    const res = await fetch(`/api/sessions/${sessionId}/queue/${encodeURIComponent(queueItemId)}/send-now`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/queue/${encodeURIComponent(queueItemId)}/send-now`, {
       method: 'POST',
       headers: getHeaders()
     });
@@ -498,7 +521,7 @@ export const api = {
     sessionId: string,
     req: SubmitAnswerRequest
   ): Promise<{ toolResult: SessionMessage; prompt: SessionMessage; session: AgentSession }> {
-    const res = await fetch(`/api/sessions/${sessionId}/answer`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/answer`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -508,13 +531,13 @@ export const api = {
   },
 
   async getSessionArtifacts(sessionId: string): Promise<SessionArtifact[]> {
-    const res = await fetch(`/api/sessions/${sessionId}/artifacts`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/sessions/${sessionId}/artifacts`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load artifacts: ${res.statusText}`);
     return res.json();
   },
 
   async getSessionArtifact(sessionId: string, artifactId: string): Promise<SessionArtifact> {
-    const res = await fetch(`/api/sessions/${sessionId}/artifacts/${encodeURIComponent(artifactId)}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/sessions/${sessionId}/artifacts/${encodeURIComponent(artifactId)}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load artifact details: ${res.statusText}`);
     return res.json();
   },
@@ -523,7 +546,7 @@ export const api = {
     sessionId: string,
     req: { name: string; content: string; summary?: string; contentType?: string }
   ): Promise<SessionArtifact> {
-    const res = await fetch(`/api/sessions/${sessionId}/artifacts`, {
+    const res = await apiFetch(`/api/sessions/${sessionId}/artifacts`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -533,7 +556,7 @@ export const api = {
   },
 
   async resetMesh(): Promise<{ status: string; message: string }> {
-    const res = await fetch('/api/dev/reset-mesh', {
+    const res = await apiFetch('/api/dev/reset-mesh', {
       method: 'POST',
       headers: getHeaders()
     });
@@ -543,13 +566,13 @@ export const api = {
 
   // Projects API
   async getProjects(): Promise<Project[]> {
-    const res = await fetch('/api/projects', { headers: getHeaders() });
+    const res = await apiFetch('/api/projects', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load projects: ${res.statusText}`);
     return res.json();
   },
 
   async getProject(id: string): Promise<Project> {
-    const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load project: ${res.statusText}`);
     return res.json();
   },
@@ -567,7 +590,7 @@ export const api = {
     defaultLeadPersonaId?: string;
     allowedPersonaIds?: string[];
   }): Promise<Project> {
-    const res = await fetch('/api/projects', {
+    const res = await apiFetch('/api/projects', {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -588,7 +611,7 @@ export const api = {
     defaultLeadPersonaId?: string;
     allowedPersonaIds?: string[];
   }): Promise<Project> {
-    const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -598,7 +621,7 @@ export const api = {
   },
 
   async deleteProject(id: string): Promise<{ status: string; id: string; deletedJobsCount: number }> {
-    const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -607,7 +630,7 @@ export const api = {
   },
 
   async assignProjectPersona(projectId: string, personaId: string): Promise<ProjectPersonaSummary> {
-    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/personas`, {
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/personas`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify({ personaId })
@@ -617,7 +640,7 @@ export const api = {
   },
 
   async removeProjectPersona(projectId: string, personaId: string): Promise<{ status: string }> {
-    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/personas/${encodeURIComponent(personaId)}`, {
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/personas/${encodeURIComponent(personaId)}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -628,13 +651,13 @@ export const api = {
   // Project Jobs API
   async getProjectJobs(projectId: string, includeArchived = true): Promise<ProjectJob[]> {
     const url = `/api/projects/${encodeURIComponent(projectId)}/jobs${includeArchived ? '' : '?includeArchived=false'}`;
-    const res = await fetch(url, { headers: getHeaders() });
+    const res = await apiFetch(url, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load project jobs: ${res.statusText}`);
     return res.json();
   },
 
   async getProjectJob(id: string): Promise<ProjectJob> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load job: ${res.statusText}`);
     return res.json();
   },
@@ -646,7 +669,7 @@ export const api = {
     initialTasks?: string[];
     priority?: number;
   }): Promise<ProjectJob> {
-    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -662,7 +685,7 @@ export const api = {
     resultSummary?: string;
     priority?: number;
   }): Promise<ProjectJob> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -672,7 +695,7 @@ export const api = {
   },
 
   async deleteProjectJob(id: string): Promise<{ status: string; id: string; projectId: string }> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -681,13 +704,13 @@ export const api = {
   },
 
   async getJobTasks(id: string): Promise<JobTask[]> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load job tasks: ${res.statusText}`);
     return res.json();
   },
 
   async addJobTask(id: string, req: { title: string; assignedPersonaId?: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }): Promise<JobTask> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -697,7 +720,7 @@ export const api = {
   },
 
   async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; assignedPersonaId?: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }): Promise<JobTask> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -709,7 +732,7 @@ export const api = {
   async uploadTaskAttachments(jobId: string, taskId: string, files: File[]): Promise<SessionAttachment[]> {
     const formData = new FormData();
     files.forEach((f) => formData.append('files', f, f.name));
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}/attachments`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}/attachments`, {
       method: 'POST',
       headers: getAuthHeadersOnly(),
       body: formData
@@ -737,7 +760,7 @@ export const api = {
   },
 
   async deleteTaskAttachment(jobId: string, taskId: string, attachmentId: string): Promise<void> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(attachmentId)}`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(attachmentId)}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -745,7 +768,7 @@ export const api = {
   },
 
   async deleteJobTask(id: string, taskId: string): Promise<{ status: string; taskId: string }> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
       method: 'DELETE',
       headers: getHeaders()
     });
@@ -754,7 +777,7 @@ export const api = {
   },
 
   async getJobMessages(id: string): Promise<JobMessage[]> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, { headers: getHeaders() });
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load job messages: ${res.statusText}`);
     return res.json();
   },
@@ -762,7 +785,7 @@ export const api = {
   async uploadJobAttachments(jobId: string, files: File[]): Promise<SessionAttachment[]> {
     const formData = new FormData();
     files.forEach((f) => formData.append('files', f, f.name));
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(jobId)}/attachments`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/attachments`, {
       method: 'POST',
       headers: getAuthHeadersOnly(),
       body: formData
@@ -813,7 +836,7 @@ export const api = {
     turnSessionId?: string;
     attachments?: SessionAttachment[];
   }): Promise<JobMessage> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
@@ -823,7 +846,7 @@ export const api = {
   },
 
   async completeJob(id: string, req?: { resultSummary?: string }): Promise<ProjectJob> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/complete`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/complete`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req || {})
@@ -833,7 +856,7 @@ export const api = {
   },
 
   async archiveJob(id: string): Promise<ProjectJob> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/archive`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/archive`, {
       method: 'POST',
       headers: getHeaders()
     });
@@ -842,7 +865,7 @@ export const api = {
   },
 
   async reopenJob(id: string): Promise<ProjectJob> {
-    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/reopen`, {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/reopen`, {
       method: 'POST',
       headers: getHeaders()
     });

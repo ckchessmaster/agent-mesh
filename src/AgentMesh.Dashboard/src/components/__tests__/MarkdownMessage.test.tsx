@@ -55,4 +55,13 @@ describe('MarkdownMessage', () => {
     expect(screen.getByText('WARNING')).toBeInTheDocument();
     expect(screen.getByText('This is a high-risk operation!')).toBeInTheDocument();
   });
+
+  it('renders mermaid diagrams visually with diagram and code toggle options', async () => {
+    const content = '```mermaid\ngraph TD\nClient-->API\n```';
+    render(<MarkdownMessage content={content} />);
+
+    expect(screen.getByText('Mermaid Architecture Diagram')).toBeInTheDocument();
+    expect(await screen.findByTestId('mermaid-viewer')).toBeInTheDocument();
+    expect(await screen.findByTestId('mermaid-svg')).toBeInTheDocument();
+  });
 });
