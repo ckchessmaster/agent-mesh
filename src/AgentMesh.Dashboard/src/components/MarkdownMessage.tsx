@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Check, Copy, Info, AlertTriangle, Lightbulb, ShieldAlert } from 'lucide-react';
+import { MermaidViewer } from './MermaidViewer';
 
 interface MarkdownMessageProps {
   content: string;
@@ -155,7 +156,11 @@ export const MarkdownMessage: React.FC<MarkdownMessageProps> = ({
   let alertBuffer: string[] = [];
 
   const flushCode = (key: string) => {
-    nodes.push(<CodeBlock key={key} language={codeLang} code={codeBuffer.join('\n')} />);
+    if (codeLang.toLowerCase() === 'mermaid') {
+      nodes.push(<MermaidViewer key={key} code={codeBuffer.join('\n')} />);
+    } else {
+      nodes.push(<CodeBlock key={key} language={codeLang} code={codeBuffer.join('\n')} />);
+    }
     inCode = false;
     codeLang = '';
     codeBuffer = [];

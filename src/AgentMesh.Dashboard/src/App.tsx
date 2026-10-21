@@ -73,6 +73,7 @@ import { ProjectModal } from './components/ProjectModal';
 import { NewJobModal } from './components/NewJobModal';
 import { JobCockpit } from './components/JobCockpit';
 import { ProjectList } from './components/ProjectList';
+import { MermaidViewer } from './components/MermaidViewer';
 
 interface StagedAttachmentItem {
   localId: string;
@@ -3830,6 +3831,62 @@ export default function App() {
                     </p>
                   </div>
                 ) : (() => {
+                  const renderSessionResponseText = (raw: string) => {
+                    if (!raw.includes('```mermaid')) {
+                      return (
+                        <div className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200">
+                          {raw}
+                        </div>
+                      );
+                    }
+                    const parts: React.ReactNode[] = [];
+                    const lines = raw.split('\n');
+                    let inMermaid = false;
+                    let mermaidBuffer: string[] = [];
+                    let textBuffer: string[] = [];
+
+                    const flushText = (idx: number) => {
+                      if (textBuffer.length > 0) {
+                        parts.push(
+                          <div key={`text-${idx}`} className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200">
+                            {textBuffer.join('\n')}
+                          </div>
+                        );
+                        textBuffer = [];
+                      }
+                    };
+
+                    for (let i = 0; i < lines.length; i++) {
+                      const line = lines[i];
+                      if (line.trim().startsWith('```mermaid')) {
+                        flushText(i);
+                        inMermaid = true;
+                        mermaidBuffer = [];
+                        continue;
+                      }
+                      if (inMermaid) {
+                        if (line.trim().startsWith('```')) {
+                          inMermaid = false;
+                          parts.push(
+                            <MermaidViewer key={`mermaid-${i}`} code={mermaidBuffer.join('\n')} />
+                          );
+                          mermaidBuffer = [];
+                        } else {
+                          mermaidBuffer.push(line);
+                        }
+                        continue;
+                      }
+                      textBuffer.push(line);
+                    }
+                    flushText(lines.length);
+                    if (inMermaid && mermaidBuffer.length > 0) {
+                      parts.push(
+                        <MermaidViewer key="mermaid-end" code={mermaidBuffer.join('\n')} />
+                      );
+                    }
+                    return <div className="space-y-2">{parts}</div>;
+                  };
+
                   const renderQuestionCard = (
                     cardKey: string,
                     targetId: string,
@@ -4318,9 +4375,7 @@ export default function App() {
                               </span>
                             </div>
                           </div>
-                          <div className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200">
-                            {cleanedContent || ev.content}
-                          </div>
+                          {renderSessionResponseText(cleanedContent || ev.content)}
                         </div>
 
                         {shouldRenderTextQuestions && (
