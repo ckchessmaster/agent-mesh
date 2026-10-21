@@ -570,4 +570,54 @@ describe('JobCockpit - Attachment Support', () => {
 
     expect(screen.queryByTestId('job-active-turn-indicator')).not.toBeInTheDocument();
   });
+
+  it('renders rich markdown formatting in chat messages (headings, bold, lists, code)', () => {
+    const markdownMessages: JobMessage[] = [
+      {
+        id: 'msg-summary',
+        jobId: 'job-1',
+        senderType: 'persona',
+        senderId: 'astra',
+        senderName: 'Astra',
+        content: `### Implementation Summary\n* **Status:** Complete\n1. First deliverable\n\`const ok = true;\``,
+        mentions: [],
+        createdAt: '2026-10-20T10:00:00Z'
+      }
+    ];
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={markdownMessages}
+      />
+    );
+
+    // Formatted markdown elements should be rendered
+    expect(screen.getByRole('heading', { level: 3, name: 'Implementation Summary' })).toBeInTheDocument();
+    expect(screen.getByText('Status:')).toBeInTheDocument();
+    expect(screen.getByText('First deliverable')).toBeInTheDocument();
+    expect(screen.getByText('const ok = true;')).toBeInTheDocument();
+  });
+
+  it('renders team roster in sidebar and supports toggling team sidebar visibility', () => {
+    render(
+      <JobCockpit
+        {...mockProps}
+      />
+    );
+
+    // Team sidebar is visible by default
+    const sidebar = screen.getByTestId('job-team-sidebar');
+    expect(sidebar).toBeInTheDocument();
+    expect(screen.getByText('Assigned Team Members')).toBeInTheDocument();
+
+    // Toggle button collapses sidebar
+    const toggleBtn = screen.getByTestId('toggle-team-sidebar-btn');
+    fireEvent.click(toggleBtn);
+    expect(screen.queryByTestId('job-team-sidebar')).not.toBeInTheDocument();
+
+    // Toggle button re-expands sidebar
+    fireEvent.click(toggleBtn);
+    expect(screen.getByTestId('job-team-sidebar')).toBeInTheDocument();
+  });
 });

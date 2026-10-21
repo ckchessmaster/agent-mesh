@@ -1243,84 +1243,89 @@ public class SessionsController(
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
             await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
-        else if (eventType == "response" && wasThinking)
+        else if (eventType == "response")
         {
             await CheckAndForwardJobTurnResponseAsync(session, message);
 
-            // Auto-advance queued prompts sequentially if any are pending
-            var queue = ExtractPromptQueue(session.MetadataJson);
-            if (queue.Count > 0)
+            if (wasThinking)
             {
-                var nextPrompt = queue[0];
-                queue.RemoveAt(0);
-                session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
-
-                var nextMsg = new SessionMessage
+                // Auto-advance queued prompts sequentially if any are pending
+                var queue = ExtractPromptQueue(session.MetadataJson);
+                if (queue.Count > 0)
                 {
-                    SessionId = id,
-                    SenderAgentId = nextPrompt.Sender,
-                    TargetAgentId = session.CreatorAgentId,
-                    EventType = "prompt",
-                    Content = string.IsNullOrWhiteSpace(nextPrompt.Prompt) ? DefaultAttachmentPrompt : nextPrompt.Prompt,
-                    StructuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, nextPrompt.Attachments),
-                    CreatedAt = DateTimeOffset.UtcNow
-                };
-                db.SessionMessages.Add(nextMsg);
-                session.Status = "thinking";
-                session.UpdatedAt = DateTimeOffset.UtcNow;
+                    var nextPrompt = queue[0];
+                    queue.RemoveAt(0);
+                    session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
 
-                if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
-                {
-                    var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == session.CreatorAgentId);
-                    if (agent != null)
+                    var nextMsg = new SessionMessage
                     {
-                        agent.Status = "busy";
-                        agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                        SessionId = id,
+                        SenderAgentId = nextPrompt.Sender,
+                        TargetAgentId = session.CreatorAgentId,
+                        EventType = "prompt",
+                        Content = string.IsNullOrWhiteSpace(nextPrompt.Prompt) ? DefaultAttachmentPrompt : nextPrompt.Prompt,
+                        StructuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, nextPrompt.Attachments),
+                        CreatedAt = DateTimeOffset.UtcNow
+                    };
+                    db.SessionMessages.Add(nextMsg);
+                    session.Status = "thinking";
+                    session.UpdatedAt = DateTimeOffset.UtcNow;
+
+                    if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                    {
+                        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == session.CreatorAgentId);
+                        if (agent != null)
+                        {
+                            agent.Status = "busy";
+                            agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                        }
+                    }
+
+                    await db.SaveChangesAsync();
+
+                    var nextDto = ToMessageDto(nextMsg);
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", nextDto);
+                    await hubContext.Clients.All.SendAsync("ReceiveMessage", nextDto);
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
+                    await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("SessionUpdated", session);
+                    await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+                    var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+                    var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
+                    if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                    {
+                        var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+                        var promptPayload = new
+                        {
+                            sessionId = id,
+                            messageId = nextMsg.Id,
+                            agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                            driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                            personaId = personaId,
+                            personaName = personaName,
+                            personaRole = personaRole,
+                            personaPrompt = personaPrompt,
+                            prompt = nextMsg.Content,
+                            sender = nextMsg.SenderAgentId,
+                            workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
+                            model = nextPrompt.Model ?? model,
+                            effort = nextPrompt.Effort ?? effort,
+                            mode = nextPrompt.Mode ?? mode,
+                            tier = nextPrompt.Tier ?? tier,
+                            attachments = nextPrompt.Attachments,
+                            createdAt = nextMsg.CreatedAt
+                        };
+                        await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                        await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
                     }
                 }
-
-                await db.SaveChangesAsync();
-
-                var nextDto = ToMessageDto(nextMsg);
-                await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", nextDto);
-                await hubContext.Clients.All.SendAsync("ReceiveMessage", nextDto);
-                await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
-                await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
-                await hubContext.Clients.All.SendAsync("SessionUpdated", session);
-
-                var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
-                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-                if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                else
                 {
-                    var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                    var promptPayload = new
-                    {
-                        sessionId = id,
-                        messageId = nextMsg.Id,
-                        agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                        driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                        personaId = personaId,
-                        personaName = personaName,
-                        personaRole = personaRole,
-                        personaPrompt = personaPrompt,
-                        prompt = nextMsg.Content,
-                        sender = nextMsg.SenderAgentId,
-                        workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
-                        model = nextPrompt.Model ?? model,
-                        effort = nextPrompt.Effort ?? effort,
-                        mode = nextPrompt.Mode ?? mode,
-                        tier = nextPrompt.Tier ?? tier,
-                        attachments = nextPrompt.Attachments,
-                        createdAt = nextMsg.CreatedAt
-                    };
-                    await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                    await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                    // Queue is empty: session completed turn and returned to active/idle. Notify all clients to clear thinking/stop button state!
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("SessionUpdated", session);
+                    await hubContext.Clients.All.SendAsync("SessionUpdated", session);
                 }
-            }
-            else
-            {
-                // Queue is empty: session completed turn and returned to active/idle. Notify all clients to clear thinking/stop button state!
-                await hubContext.Clients.All.SendAsync("SessionUpdated", session);
             }
         }
 

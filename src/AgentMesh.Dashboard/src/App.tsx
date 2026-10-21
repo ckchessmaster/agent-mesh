@@ -507,8 +507,23 @@ export default function App() {
 
   const fetchSessionEvents = useCallback(async (sessionId: string) => {
     try {
-      const msgs = await api.getSessionMessages(sessionId);
+      const [msgs, latestSession] = await Promise.all([
+        api.getSessionMessages(sessionId),
+        api.getSession ? api.getSession(sessionId).catch(() => null) : Promise.resolve(null)
+      ]);
       setEvents(msgs);
+      if (latestSession) {
+        setSessions((prev) =>
+          prev.map((s) => (s.id === latestSession.id ? { ...s, ...latestSession } : s))
+        );
+      } else if (msgs.length > 0) {
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg.eventType === 'response') {
+          setSessions((prev) =>
+            prev.map((s) => (s.id === sessionId && s.status === 'thinking' ? { ...s, status: 'active' } : s))
+          );
+        }
+      }
     } catch (err) {
       console.error('Failed to load session events:', err);
     }
@@ -1009,6 +1024,17 @@ export default function App() {
   }, [newSessionWorkDir, capabilities?.workspace?.currentDirectory, loadBrowseDirectory]);
 
   const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
+  const isSessionThinking = useMemo(() => {
+    if (!selectedSession) return false;
+    if (selectedSession.status !== 'thinking') return false;
+    if (events.length > 0) {
+      const lastEv = events[events.length - 1];
+      if (lastEv.eventType === 'response' || lastEv.eventType === 'system') {
+        return false;
+      }
+    }
+    return true;
+  }, [selectedSession, events]);
   const selectedPersona = personas.find((p) => p.id === (selectedSession?.personaId || selectedPersonaId)) ||
     personas.find((p) => p.id === selectedPersonaId) ||
     personas[0] ||
@@ -3241,14 +3267,14 @@ export default function App() {
                     </h2>
                     <span
                       className={`text-[11px] font-mono px-2.5 py-0.5 rounded-full border ${
-                        selectedSession.status === 'thinking'
+                        isSessionThinking
                           ? 'bg-amber-500/10 text-amber-300 border-amber-500/30 animate-pulse'
                           : selectedSession.status === 'waiting_for_input'
                           ? 'bg-amber-500/20 text-amber-200 border-amber-400 font-semibold shadow-sm animate-pulse flex items-center gap-1.5'
                           : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
                       }`}
                     >
-                      {selectedSession.status === 'thinking'
+                      {isSessionThinking
                         ? 'Thinking...'
                         : selectedSession.status === 'waiting_for_input'
                         ? 'Waiting for Input'
@@ -4065,7 +4091,7 @@ export default function App() {
                   });
                 })()}
 
-                {selectedSession.status === 'thinking' && (
+                {isSessionThinking && (
                   selectedAgent?.status === 'offline' ? (
                     <div className="flex flex-col gap-1.5 px-4 py-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-xs text-amber-200 max-w-xl">
                       <div className="flex items-center gap-2 font-semibold text-amber-300">
@@ -4270,7 +4296,7 @@ export default function App() {
                     <input
                       type="text"
                       placeholder={
-                        selectedSession.status === 'thinking'
+                        isSessionThinking
                           ? `Add instruction to queue for ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
                           : `Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
                       }
@@ -4289,7 +4315,7 @@ export default function App() {
 
                   {/* Stop Button: beside the input bar, enabled when thinking or waiting_for_input */}
                   {(() => {
-                    const isStoppable = selectedSession.status === 'thinking' || selectedSession.status === 'waiting_for_input';
+                    const isStoppable = isSessionThinking || selectedSession.status === 'waiting_for_input';
                     return (
                       <button
                         type="button"
@@ -4313,7 +4339,7 @@ export default function App() {
                   })()}
 
                   {/* Dynamic Send / Queue Split Button */}
-                  {selectedSession.status === 'thinking' ? (
+                  {isSessionThinking ? (
                     <div className="relative flex items-center">
                       <button
                         type="submit"

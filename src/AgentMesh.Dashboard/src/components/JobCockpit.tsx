@@ -23,11 +23,14 @@ import {
   ZoomIn,
   Download,
   AlertCircle,
-  Square
+  Square,
+  Users,
+  RefreshCw
 } from 'lucide-react';
 import type { AgentSession, JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
 import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
+import { MarkdownMessage } from './MarkdownMessage';
 import { api } from '../services/api';
 
 const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
@@ -215,6 +218,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     startIndex: -1
   });
   const [mentionHighlightedIndex, setMentionHighlightedIndex] = useState(0);
+  const [showTeamSidebar, setShowTeamSidebar] = useState(true);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -751,6 +755,24 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             )}
           </div>
 
+          <button
+            type="button"
+            onClick={() => setShowTeamSidebar((prev) => !prev)}
+            title={showTeamSidebar ? 'Hide Team & Activity Sidebar' : 'Show Team & Activity Sidebar'}
+            data-testid="toggle-team-sidebar-btn"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition cursor-pointer ${
+              showTeamSidebar
+                ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
+                : 'bg-slate-950/80 border-slate-800 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Users className="w-3.5 h-3.5" />
+            <span>Team ({teamMembers.length})</span>
+            {activeTurnInfo?.isActive && (
+              <span className="w-2 h-2 rounded-full bg-sky-400 animate-ping shrink-0" />
+            )}
+          </button>
+
           {!isCompleted && (
             <div>
               {showCompleteConfirm ? (
@@ -962,65 +984,69 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         )}
       </div>
 
-      {/* Live Chat Message Feed */}
-      <div
-        ref={messagesContainerRef}
-        onScroll={handleMessagesScroll}
-        data-testid="job-messages-container"
-        className="flex-1 overflow-y-auto p-6 space-y-4 relative"
-      >
-        {messages.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-500">
-            <Bot className="w-12 h-12 stroke-[1.2] text-slate-600 mb-3" />
-            <h3 className="text-sm font-semibold text-slate-300">Job Collaboration Channel Ready</h3>
-            <p className="text-xs text-slate-500 max-w-sm mt-1">
-              Give instructions, attach files, or assign tasks to your team. Use <code className="text-sky-400 font-mono">@persona</code> to tag specific personas.
-            </p>
-          </div>
-        ) : (
-          messages.map((msg) => {
-            const isUser = msg.senderType === 'user';
-            const msgAttachments = extractJobMessageAttachments(msg);
+      {/* Main Workspace: Conversational Chat Flow + Team & Activity Sidebar */}
+      <div className="flex-1 flex min-h-0 overflow-hidden relative">
+        {/* Left Column: Conversational Chat Flow */}
+        <div className="flex-1 flex flex-col min-h-0 relative">
+          {/* Live Chat Message Feed */}
+          <div
+            ref={messagesContainerRef}
+            onScroll={handleMessagesScroll}
+            data-testid="job-messages-container"
+            className="flex-1 overflow-y-auto p-6 space-y-4 relative"
+          >
+            {messages.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-500">
+                <Bot className="w-12 h-12 stroke-[1.2] text-slate-600 mb-3" />
+                <h3 className="text-sm font-semibold text-slate-300">Job Collaboration Channel Ready</h3>
+                <p className="text-xs text-slate-500 max-w-sm mt-1">
+                  Give instructions, attach files, or assign tasks to your team. Use <code className="text-sky-400 font-mono">@persona</code> to tag specific personas.
+                </p>
+              </div>
+            ) : (
+              messages.map((msg) => {
+                const isUser = msg.senderType === 'user';
+                const msgAttachments = extractJobMessageAttachments(msg);
 
-            return (
-              <div
-                key={msg.id}
-                className={`flex gap-3 max-w-3xl ${isUser ? 'ml-auto flex-row-reverse' : ''}`}
-              >
-                <div
-                  className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 border ${
-                    isUser
-                      ? 'bg-sky-500/20 text-sky-300 border-sky-500/30'
-                      : 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
-                  }`}
-                >
-                  {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
-                </div>
-
-                <div className={`space-y-1.5 ${isUser ? 'text-right' : ''}`}>
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="font-semibold text-slate-200">
-                      {isUser ? 'You' : msg.senderName || msg.senderId || 'Persona'}
-                    </span>
-                    {!isUser && msg.senderId && (
-                      <span className="text-[10px] font-mono text-sky-400 bg-sky-500/10 px-1.5 py-0.2 rounded border border-sky-500/20">
-                        @{msg.senderId}
-                      </span>
-                    )}
-                    <span className="text-[10px] text-slate-500">
-                      {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </span>
-                  </div>
-
+                return (
                   <div
-                    className={`p-3.5 rounded-2xl text-xs leading-relaxed border whitespace-pre-wrap ${
-                      isUser
-                        ? 'bg-sky-600/20 border-sky-500/30 text-sky-100 text-left rounded-tr-none'
-                        : 'bg-slate-900 border-slate-800 text-slate-200 rounded-tl-none'
-                    }`}
+                    key={msg.id}
+                    className={`flex gap-3 max-w-3xl ${isUser ? 'ml-auto flex-row-reverse' : ''}`}
                   >
-                    {msg.content}
-                  </div>
+                    <div
+                      className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 border ${
+                        isUser
+                          ? 'bg-sky-500/20 text-sky-300 border-sky-500/30'
+                          : 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
+                      }`}
+                    >
+                      {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+                    </div>
+
+                    <div className={`space-y-1.5 ${isUser ? 'text-right' : ''}`}>
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="font-semibold text-slate-200">
+                          {isUser ? 'You' : msg.senderName || msg.senderId || 'Persona'}
+                        </span>
+                        {!isUser && msg.senderId && (
+                          <span className="text-[10px] font-mono text-sky-400 bg-sky-500/10 px-1.5 py-0.2 rounded border border-sky-500/20">
+                            @{msg.senderId}
+                          </span>
+                        )}
+                        <span className="text-[10px] text-slate-500">
+                          {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+
+                      <div
+                        className={`p-3.5 rounded-2xl text-xs leading-relaxed border ${
+                          isUser
+                            ? 'bg-sky-600/20 border-sky-500/30 text-sky-100 text-left rounded-tr-none'
+                            : 'bg-slate-900 border-slate-800 text-slate-200 rounded-tl-none shadow-sm'
+                        }`}
+                      >
+                        <MarkdownMessage content={msg.content} isUser={isUser} />
+                      </div>
 
                   {/* Message Attachments Rendering */}
                   {msgAttachments.length > 0 && (
@@ -1104,56 +1130,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           })
         )}
 
-        {/* Active Turn Real-Time Feedback Card */}
+        {/* Subtle conversational working indicator at bottom of message stream */}
         {activeTurnInfo?.isActive && (
-          <div
-            className="flex items-center justify-between gap-3 p-3.5 rounded-2xl bg-sky-950/40 border border-sky-500/40 text-xs shadow-lg backdrop-blur-sm"
-            data-testid="job-active-turn-indicator"
-          >
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="relative flex items-center justify-center w-8 h-8 rounded-xl bg-sky-500/20 text-sky-400 border border-sky-500/30 shrink-0">
-                <Bot className="w-4 h-4 animate-pulse" />
-                <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-sky-400 animate-ping" />
-              </div>
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold text-slate-100 truncate">
-                    {activeTurnInfo.personaName} {activeTurnInfo.statusText}
-                  </span>
-                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30 shrink-0 animate-pulse">
-                    Working
-                  </span>
-                </div>
-                <p className="text-[11px] text-slate-400 mt-0.5 truncate">
-                  Executing workspace commands, tests, and active persona logic.
-                </p>
-              </div>
-            </div>
-            {activeTurnInfo.turnSessionId && (
-              <div className="flex items-center gap-2 shrink-0">
-                {onStopTurn && (
-                  <button
-                    type="button"
-                    onClick={() => onStopTurn(activeTurnInfo.turnSessionId!)}
-                    title="Stop active turn execution"
-                    data-testid="job-stop-turn-btn"
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white border border-rose-500/40 text-xs font-semibold transition cursor-pointer shrink-0 shadow-sm animate-pulse"
-                  >
-                    <Square className="w-3.5 h-3.5 fill-current" />
-                    <span>Stop</span>
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => onSelectTurnSession?.(activeTurnInfo.turnSessionId!)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 hover:text-white border border-sky-500/40 text-xs font-semibold transition cursor-pointer shrink-0 shadow-sm"
-                >
-                  <Sparkles className="w-3.5 h-3.5 text-sky-400" />
-                  <span>View Trajectory</span>
-                  <ChevronRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            )}
+          <div className="flex items-center gap-2 py-1.5 px-3 text-xs text-sky-400 font-medium">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400 shrink-0" />
+            <span>{activeTurnInfo.personaName} is working on this turn...</span>
           </div>
         )}
 
@@ -1321,6 +1302,157 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           </button>
         </form>
       </div>
+    </div>
+
+      {/* Team & Activity Sidebar */}
+      {showTeamSidebar && (
+        <aside
+          className="w-80 border-l border-slate-800/80 bg-slate-950/70 backdrop-blur-sm flex flex-col shrink-0 overflow-y-auto"
+          data-testid="job-team-sidebar"
+        >
+          {/* Sidebar Header */}
+          <div className="p-4 border-b border-slate-800/80 flex items-center justify-between shrink-0 bg-slate-900/40">
+            <div className="flex items-center gap-2">
+              <Users className="w-4 h-4 text-sky-400" />
+              <h3 className="text-xs font-bold text-slate-100 uppercase tracking-wider">
+                Team & Activity
+              </h3>
+            </div>
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
+              {teamMembers.length} {teamMembers.length === 1 ? 'member' : 'members'}
+            </span>
+          </div>
+
+          <div className="p-4 space-y-4 flex-1">
+            {/* Active Turn Real-Time Feedback Card (inside sidebar) */}
+            {activeTurnInfo?.isActive && (
+              <div
+                className="p-3.5 rounded-xl bg-sky-950/40 border border-sky-500/40 text-xs shadow-md space-y-3"
+                data-testid="job-active-turn-indicator"
+              >
+                <div className="flex items-center gap-2.5">
+                  <div className="relative flex items-center justify-center w-7 h-7 rounded-lg bg-sky-500/20 text-sky-400 border border-sky-500/30 shrink-0">
+                    <Bot className="w-3.5 h-3.5 animate-pulse" />
+                    <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-sky-400 animate-ping" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 justify-between">
+                      <span className="font-semibold text-slate-100 truncate">
+                        {activeTurnInfo.personaName} {activeTurnInfo.statusText}
+                      </span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30 shrink-0 animate-pulse">
+                        Working
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed mt-0.5">
+                      Executing workspace commands, tests, and active persona logic.
+                    </p>
+                  </div>
+                </div>
+
+                {activeTurnInfo.turnSessionId && (
+                  <div className="flex items-center gap-2 pt-1 border-t border-sky-500/20">
+                    {onStopTurn && (
+                      <button
+                        type="button"
+                        onClick={() => onStopTurn(activeTurnInfo.turnSessionId!)}
+                        title="Stop active turn execution"
+                        data-testid="job-stop-turn-btn"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600/90 hover:bg-rose-500 text-white border border-rose-500/40 text-xs font-semibold transition cursor-pointer shadow-sm animate-pulse"
+                      >
+                        <Square className="w-3 h-3 fill-current" />
+                        <span>Stop</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => onSelectTurnSession?.(activeTurnInfo.turnSessionId!)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 hover:text-white border border-sky-500/40 text-xs font-semibold transition cursor-pointer shadow-sm"
+                    >
+                      <Sparkles className="w-3 h-3 text-sky-400" />
+                      <span>View Trajectory</span>
+                      <ChevronRight className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Team Members List */}
+            <div className="space-y-2">
+              <div className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-semibold px-0.5">
+                Assigned Team Members
+              </div>
+              <div className="space-y-2">
+                {teamMembers.map((member) => {
+                  const isWorking =
+                    activeTurnInfo?.isActive &&
+                    (activeTurnInfo.personaName === member.name ||
+                      activeTurnInfo.personaName === member.id);
+
+                  return (
+                    <div
+                      key={member.id}
+                      className={`p-3 rounded-xl border transition ${
+                        isWorking
+                          ? 'bg-sky-950/25 border-sky-500/40 shadow-sm'
+                          : 'bg-slate-900/50 border-slate-800/80'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div className="relative w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 shrink-0">
+                            <Bot className="w-3.5 h-3.5" />
+                            <span
+                              className={`absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 rounded-full border border-slate-900 ${
+                                isWorking ? 'bg-sky-400 animate-ping' : 'bg-emerald-400'
+                              }`}
+                            />
+                          </div>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-semibold text-xs text-white truncate">
+                                {member.name}
+                              </span>
+                              {member.isLead && (
+                                <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                  Lead
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-slate-400 truncate">
+                              {member.role || 'Member'}
+                            </div>
+                          </div>
+                        </div>
+
+                        <span
+                          className={`text-[9px] font-mono px-1.5 py-0.2 rounded shrink-0 ${
+                            isWorking
+                              ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40 animate-pulse'
+                              : 'bg-slate-800/60 text-slate-400 border border-slate-700/50'
+                          }`}
+                        >
+                          {isWorking ? 'Working' : 'Idle'}
+                        </span>
+                      </div>
+
+                      <div className="mt-2 text-[10px] flex items-center gap-1.5 text-slate-400 font-mono">
+                        <span className="text-sky-400/90">@{member.id}</span>
+                        <span className="text-slate-600">•</span>
+                        <span className="text-slate-400 truncate">
+                          {isWorking ? 'Executing active turn...' : 'Ready for instructions'}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </aside>
+      )}
+    </div>
 
       {/* Internal Fullscreen Image Lightbox Modal fallback */}
       {internalLightbox && (
