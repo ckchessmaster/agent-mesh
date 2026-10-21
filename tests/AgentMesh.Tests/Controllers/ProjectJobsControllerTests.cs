@@ -796,4 +796,110 @@ public class ProjectJobsControllerTests
         createdSessions.Should().HaveCount(1);
         createdSessions[0].Title.Should().Contain("Urgent Priority Job");
     }
+
+    [Fact]
+    public async Task JobTasks_SupportAttachments_AndUploadDeleteCycle()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "proj-task-att", Name = "Task Att Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-task-att",
+            Title = "Task Attachments Job"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        var initialAtt = new JobAttachmentDto(
+            Id: "att-init-1",
+            JobId: job.Id,
+            FileName: "wireframe.png",
+            ContentType: "image/png",
+            SizeBytes: 1024,
+            S3Key: $"jobs/{job.Id}/attachments/att-init-1/wireframe.png",
+            DownloadUrl: $"/api/project-jobs/{job.Id}/attachments/att-init-1/content",
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        // 1. Add Task with Attachment
+        var addRes = await controller.AddJobTask(job.Id, new CreateJobTaskRequest(
+            Title: "Build wireframe UI",
+            Attachments: new List<JobAttachmentDto> { initialAtt }
+        ));
+        var added = (addRes.Should().BeOfType<OkObjectResult>().Subject.Value as JobTaskDto)!;
+        added.Attachments.Should().NotBeNull();
+        added.Attachments.Should().HaveCount(1);
+        added.Attachments![0].FileName.Should().Be("wireframe.png");
+
+        // 2. Upload Task Attachment via dedicated endpoint
+        var txtBytes = System.Text.Encoding.UTF8.GetBytes("task specification notes");
+        var txtStream = new MemoryStream(txtBytes);
+        var formFile = new FormFile(txtStream, 0, txtBytes.Length, "files", "notes.txt")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "text/plain"
+        };
+        var uploadRes = await controller.UploadTaskAttachments(job.Id, added.Id, new FormFileCollection { formFile });
+        var uploadedList = (uploadRes.Should().BeOfType<OkObjectResult>().Subject.Value as List<JobAttachmentDto>)!;
+        uploadedList.Should().HaveCount(1);
+        uploadedList[0].FileName.Should().Be("notes.txt");
+
+        // Verify task in DB has both attachments
+        var tasksRes = await controller.GetJobTasks(job.Id);
+        var tasksList = (tasksRes.Should().BeOfType<OkObjectResult>().Subject.Value as List<JobTaskDto>)!;
+        var taskInDb = tasksList.First(t => t.Id == added.Id);
+        taskInDb.Attachments.Should().HaveCount(2);
+
+        // 3. Delete Task Attachment
+        var delAttRes = await controller.DeleteTaskAttachment(job.Id, added.Id, initialAtt.Id);
+        delAttRes.Should().BeOfType<OkObjectResult>();
+
+        var updatedTasks = ( (await controller.GetJobTasks(job.Id)).Should().BeOfType<OkObjectResult>().Subject.Value as List<JobTaskDto> )!;
+        var taskAfterDel = updatedTasks.First(t => t.Id == added.Id);
+        taskAfterDel.Attachments.Should().HaveCount(1);
+        taskAfterDel.Attachments![0].FileName.Should().Be("notes.txt");
+    }
+
+    [Fact]
+    public async Task GetProjectJobs_WithIncludeArchivedFalse_ExcludesArchivedJobs()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "proj-arch", Name = "Archive Filter Project" };
+        var activeJob = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-arch",
+            Title = "Active Job",
+            Status = ProjectJobStatus.Active
+        };
+        var archivedJob = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-arch",
+            Title = "Archived Job",
+            Status = ProjectJobStatus.Archived
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.AddRange(activeJob, archivedJob);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        // Default (or includeArchived: true) returns all
+        var allJobsRes = await controller.GetProjectJobs("proj-arch", includeArchived: true);
+        var allJobs = (allJobsRes.Should().BeOfType<OkObjectResult>().Subject.Value as List<ProjectJobDto>)!;
+        allJobs.Should().HaveCount(2);
+
+        // includeArchived: false excludes archived
+        var activeOnlyRes = await controller.GetProjectJobs("proj-arch", includeArchived: false);
+        var activeOnly = (activeOnlyRes.Should().BeOfType<OkObjectResult>().Subject.Value as List<ProjectJobDto>)!;
+        activeOnly.Should().HaveCount(1);
+        activeOnly[0].Id.Should().Be(activeJob.Id);
+    }
 }

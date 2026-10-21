@@ -3,6 +3,17 @@ using AgentMesh.Core.Enums;
 
 namespace AgentMesh.Core.Models;
 
+public record JobAttachmentDto(
+    string Id,
+    Guid JobId,
+    string FileName,
+    string ContentType,
+    long SizeBytes,
+    string S3Key,
+    string DownloadUrl,
+    DateTimeOffset CreatedAt
+);
+
 public class JobTaskDto
 {
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -11,6 +22,7 @@ public class JobTaskDto
     public bool RequiresDiscussion { get; set; } = false;
     public string? AssignedPersonaId { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
+    public List<JobAttachmentDto>? Attachments { get; set; } = new();
 }
 
 public class ProjectJob

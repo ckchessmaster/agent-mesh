@@ -626,8 +626,9 @@ export const api = {
   },
 
   // Project Jobs API
-  async getProjectJobs(projectId: string): Promise<ProjectJob[]> {
-    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, { headers: getHeaders() });
+  async getProjectJobs(projectId: string, includeArchived = true): Promise<ProjectJob[]> {
+    const url = `/api/projects/${encodeURIComponent(projectId)}/jobs${includeArchived ? '' : '?includeArchived=false'}`;
+    const res = await fetch(url, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load project jobs: ${res.statusText}`);
     return res.json();
   },
@@ -685,7 +686,7 @@ export const api = {
     return res.json();
   },
 
-  async addJobTask(id: string, req: { title: string; assignedPersonaId?: string; requiresDiscussion?: boolean }): Promise<JobTask> {
+  async addJobTask(id: string, req: { title: string; assignedPersonaId?: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }): Promise<JobTask> {
     const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, {
       method: 'POST',
       headers: getHeaders(),
@@ -695,7 +696,7 @@ export const api = {
     return res.json();
   },
 
-  async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; assignedPersonaId?: string; requiresDiscussion?: boolean }): Promise<JobTask> {
+  async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; assignedPersonaId?: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }): Promise<JobTask> {
     const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
       method: 'PUT',
       headers: getHeaders(),
@@ -703,6 +704,44 @@ export const api = {
     });
     if (!res.ok) throw new Error(`Failed to update task: ${res.statusText}`);
     return res.json();
+  },
+
+  async uploadTaskAttachments(jobId: string, taskId: string, files: File[]): Promise<SessionAttachment[]> {
+    const formData = new FormData();
+    files.forEach((f) => formData.append('files', f, f.name));
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}/attachments`, {
+      method: 'POST',
+      headers: getAuthHeadersOnly(),
+      body: formData
+    });
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errBody = await res.json();
+        if (errBody?.error) errMsg = errBody.error;
+      } catch { }
+      throw new Error(`Failed to upload task attachments: ${errMsg}`);
+    }
+    const raw = await res.json();
+    return (Array.isArray(raw) ? raw : []).map((item: any) => ({
+      id: item.id || item.Id || '',
+      sessionId: jobId,
+      jobId,
+      fileName: item.fileName || item.FileName || item.name || item.Name || '',
+      contentType: item.contentType || item.ContentType || '',
+      sizeBytes: typeof item.sizeBytes === 'number' ? item.sizeBytes : typeof item.SizeBytes === 'number' ? item.SizeBytes : 0,
+      s3Key: item.s3Key || item.S3Key || '',
+      downloadUrl: item.downloadUrl || item.DownloadUrl || (item.id ? `/api/project-jobs/${encodeURIComponent(jobId)}/attachments/${encodeURIComponent(item.id)}/content` : ''),
+      createdAt: item.createdAt || item.CreatedAt || new Date().toISOString()
+    }));
+  },
+
+  async deleteTaskAttachment(jobId: string, taskId: string, attachmentId: string): Promise<void> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(attachmentId)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to delete task attachment: ${res.statusText}`);
   },
 
   async deleteJobTask(id: string, taskId: string): Promise<{ status: string; taskId: string }> {

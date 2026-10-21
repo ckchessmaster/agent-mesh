@@ -45,6 +45,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   const [expandedProjectIds, setExpandedProjectIds] = useState<string[]>([]);
   const [confirmDeleteProjectId, setConfirmDeleteProjectId] = useState<string | null>(null);
   const [confirmDeleteJobId, setConfirmDeleteJobId] = useState<string | null>(null);
+  const [showArchivedByProject, setShowArchivedByProject] = useState<Record<string, boolean>>({});
 
   const toggleExpand = (pId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -201,110 +202,150 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                 )}
 
                 {/* Jobs Sub-List */}
-                {isExpanded && (
-                  <div className="border-t border-slate-800/60 bg-slate-950/50 p-1.5 space-y-1">
-                    {jobs.length === 0 ? (
-                      <div className="p-2 text-center text-slate-600 text-[11px]">
-                        No jobs yet. Click <span className="text-sky-400 font-semibold">+</span> to start a job.
-                      </div>
-                    ) : (
-                      jobs.map((job) => {
-                        const isJobSelected = selectedJobId === job.id;
-                        const isJobDone = job.status === ProjectJobStatus.Completed;
-                        const isJobArchived = job.status === ProjectJobStatus.Archived;
+                {isExpanded && (() => {
+                  const isShowArchived = Boolean(showArchivedByProject[project.id]);
+                  const nonArchivedJobs = jobs.filter((j) => j.status !== ProjectJobStatus.Archived);
+                  const archivedJobs = jobs.filter((j) => j.status === ProjectJobStatus.Archived);
+                  // Archived jobs are hidden by default, unless toggled on or if the selected job is archived
+                  const visibleJobs = isShowArchived
+                    ? jobs
+                    : nonArchivedJobs.concat(archivedJobs.filter((j) => j.id === selectedJobId));
 
-                        return (
-                          <div key={job.id}>
-                            <div
-                              onClick={() => onSelectJob(project.id, job.id)}
-                              className={`p-2 rounded-lg flex items-center justify-between gap-2 text-xs cursor-pointer group/job transition ${
-                                isJobSelected
-                                  ? 'bg-sky-500/20 text-sky-200 border border-sky-500/40'
-                                  : isJobArchived
-                                  ? 'text-slate-400 hover:bg-slate-900/60 border border-transparent'
-                                  : 'text-slate-300 hover:bg-slate-900 border border-transparent'
-                              }`}
-                            >
-                              <div className="flex items-center gap-2 min-w-0">
-                                {isJobArchived ? (
-                                  <Archive className="w-3.5 h-3.5 text-amber-400/80 shrink-0" />
-                                ) : isJobDone ? (
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                                ) : (
-                                  <Clock className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                                )}
-                                <span className={`truncate font-medium ${isJobArchived ? 'text-slate-400' : ''}`}>
-                                  {job.title}
-                                </span>
-                                {isJobArchived && (
-                                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/90 border border-amber-500/25 shrink-0">
-                                    Archived
-                                  </span>
-                                )}
-                              </div>
-
-                              <div className="flex items-center gap-1 shrink-0">
-                                {job.gitBranchName && (
-                                  <span className="text-[10px] font-mono text-slate-500 hidden sm:inline">
-                                    {job.gitBranchName.replace('mesh/', '')}
-                                  </span>
-                                )}
-                                {onArchiveJob && !isJobArchived && (
-                                  <button
-                                    type="button"
-                                    title="Archive Job"
-                                    onClick={async (e) => {
-                                      e.stopPropagation();
-                                      await onArchiveJob(job.id);
-                                    }}
-                                    className="p-0.5 text-slate-500 hover:text-amber-400 opacity-0 group-hover/job:opacity-100 transition"
-                                  >
-                                    <Archive className="w-3 h-3" />
-                                  </button>
-                                )}
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setConfirmDeleteJobId(job.id);
-                                  }}
-                                  className="p-0.5 text-slate-500 hover:text-red-400 opacity-0 group-hover/job:opacity-100 transition"
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                </button>
-                              </div>
+                  return (
+                    <div className="border-t border-slate-800/60 bg-slate-950/50 p-1.5 space-y-1">
+                      {jobs.length === 0 ? (
+                        <div className="p-2 text-center text-slate-600 text-[11px]">
+                          No jobs yet. Click <span className="text-sky-400 font-semibold">+</span> to start a job.
+                        </div>
+                      ) : (
+                        <>
+                          {visibleJobs.length === 0 && archivedJobs.length > 0 && (
+                            <div className="p-2 text-center text-slate-500 text-[11px]">
+                              All {archivedJobs.length} {archivedJobs.length === 1 ? 'job is' : 'jobs are'} archived.
                             </div>
+                          )}
+                          {visibleJobs.map((job) => {
+                            const isJobSelected = selectedJobId === job.id;
+                            const isJobDone = job.status === ProjectJobStatus.Completed;
+                            const isJobArchived = job.status === ProjectJobStatus.Archived;
 
-                            {confirmDeleteJobId === job.id && (
-                              <div className="p-1.5 my-1 bg-red-950/80 border border-red-500/30 rounded flex items-center justify-between text-[11px] text-red-200">
-                                <span>Delete job?</span>
-                                <div className="flex items-center gap-1">
-                                  <button
-                                    type="button"
-                                    onClick={() => setConfirmDeleteJobId(null)}
-                                    className="px-1.5 py-0.5 text-slate-300 hover:text-white"
-                                  >
-                                    Cancel
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={async () => {
-                                      await onDeleteJob(job.id);
-                                      setConfirmDeleteJobId(null);
-                                    }}
-                                    className="px-2 py-0.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded"
-                                  >
-                                    Delete
-                                  </button>
+                            return (
+                              <div key={job.id}>
+                                <div
+                                  onClick={() => onSelectJob(project.id, job.id)}
+                                  className={`p-2 rounded-lg flex items-center justify-between gap-2 text-xs cursor-pointer group/job transition ${
+                                    isJobSelected
+                                      ? 'bg-sky-500/20 text-sky-200 border border-sky-500/40'
+                                      : isJobArchived
+                                      ? 'text-slate-400 hover:bg-slate-900/60 border border-transparent'
+                                      : 'text-slate-300 hover:bg-slate-900 border border-transparent'
+                                  }`}
+                                >
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    {isJobArchived ? (
+                                      <Archive className="w-3.5 h-3.5 text-amber-400/80 shrink-0" />
+                                    ) : isJobDone ? (
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                                    ) : (
+                                      <Clock className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                                    )}
+                                    <span className={`truncate font-medium ${isJobArchived ? 'text-slate-400' : ''}`}>
+                                      {job.title}
+                                    </span>
+                                    {isJobArchived && (
+                                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/90 border border-amber-500/25 shrink-0">
+                                        Archived
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    {job.gitBranchName && (
+                                      <span className="text-[10px] font-mono text-slate-500 hidden sm:inline">
+                                        {job.gitBranchName.replace('mesh/', '')}
+                                      </span>
+                                    )}
+                                    {onArchiveJob && !isJobArchived && (
+                                      <button
+                                        type="button"
+                                        title="Archive Job"
+                                        onClick={async (e) => {
+                                          e.stopPropagation();
+                                          await onArchiveJob(job.id);
+                                        }}
+                                        className="p-0.5 text-slate-500 hover:text-amber-400 opacity-0 group-hover/job:opacity-100 transition cursor-pointer"
+                                      >
+                                        <Archive className="w-3 h-3" />
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setConfirmDeleteJobId(job.id);
+                                      }}
+                                      className="p-0.5 text-slate-500 hover:text-red-400 opacity-0 group-hover/job:opacity-100 transition cursor-pointer"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
                                 </div>
+
+                                {confirmDeleteJobId === job.id && (
+                                  <div className="p-1.5 my-1 bg-red-950/80 border border-red-500/30 rounded flex items-center justify-between text-[11px] text-red-200">
+                                    <span>Delete job?</span>
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteJobId(null)}
+                                        className="px-1.5 py-0.5 text-slate-300 hover:text-white"
+                                      >
+                                        Cancel
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={async () => {
+                                          await onDeleteJob(job.id);
+                                          setConfirmDeleteJobId(null);
+                                        }}
+                                        className="px-2 py-0.5 bg-red-600 hover:bg-red-500 text-white font-bold rounded"
+                                      >
+                                        Delete
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
                               </div>
-                            )}
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                )}
+                            );
+                          })}
+
+                          {archivedJobs.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setShowArchivedByProject((prev) => ({
+                                  ...prev,
+                                  [project.id]: !prev[project.id]
+                                }));
+                              }}
+                              className="w-full mt-1.5 flex items-center justify-between px-2 py-1 text-[11px] text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 rounded-md transition border border-dashed border-slate-800/80 cursor-pointer"
+                              data-testid={`toggle-archived-jobs-${project.id}`}
+                            >
+                              <div className="flex items-center gap-1.5">
+                                <Archive className="w-3 h-3 text-amber-400/80" />
+                                <span>{isShowArchived ? 'Hide Archived' : 'Show Archived'}</span>
+                              </div>
+                              <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                                {archivedJobs.length}
+                              </span>
+                            </button>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })

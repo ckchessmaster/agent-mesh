@@ -303,6 +303,7 @@ export interface JobTask {
   requiresDiscussion?: boolean;
   assignedPersonaId?: string | null;
   completedAt?: string | null;
+  attachments?: SessionAttachment[] | null;
 }
 
 export interface ProjectJob {

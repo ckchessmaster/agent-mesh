@@ -158,9 +158,9 @@ interface JobCockpitProps {
   messages: JobMessage[];
   personas?: Persona[];
   onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
-  onAddTask: (title: string, requiresDiscussion?: boolean) => Promise<void>;
+  onAddTask: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
   onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
-  onUpdateTask?: (taskId: string, updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string }) => Promise<void>;
+  onUpdateTask?: (taskId: string, updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string; attachments?: SessionAttachment[] }) => Promise<void>;
   onDeleteTask: (taskId: string) => Promise<void>;
   onCompleteJob: (resultSummary?: string) => Promise<void>;
   onArchiveJob?: () => Promise<void>;
@@ -220,6 +220,13 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Task Attachment State
+  const [newTaskAttachments, setNewTaskAttachments] = useState<StagedJobAttachmentItem[]>([]);
+  const newTaskFileInputRef = useRef<HTMLInputElement>(null);
+  const existingTaskFileInputRef = useRef<HTMLInputElement>(null);
+  const [targetTaskForUpload, setTargetTaskForUpload] = useState<string | null>(null);
+  const [isUploadingTaskAttachment, setIsUploadingTaskAttachment] = useState<string | null>(null);
 
   // Team Member Autocomplete Palette State
   const [mentionState, setMentionState] = useState<{
@@ -644,16 +651,91 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
+  const handleNewTaskFiles = async (rawFiles: FileList | File[] | null) => {
+    const incoming = Array.from(rawFiles || []);
+    if (incoming.length === 0) return;
+
+    const newItems: StagedJobAttachmentItem[] = incoming.map((f, idx) => ({
+      localId: `new-task-${Date.now()}-${idx}`,
+      file: f,
+      name: f.name,
+      sizeBytes: f.size,
+      contentType: f.type,
+      uploading: true
+    }));
+
+    setNewTaskAttachments((prev) => [...prev, ...newItems]);
+
+    try {
+      const uploaded = onUploadAttachments
+        ? await onUploadAttachments(incoming)
+        : await api.uploadJobAttachments(job.id, incoming);
+
+      setNewTaskAttachments((prev) =>
+        prev.map((item) => {
+          const match = uploaded.find((u) => u.fileName === item.name);
+          return match ? { ...item, uploading: false, uploaded: match } : item;
+        })
+      );
+    } catch (err: any) {
+      setNewTaskAttachments((prev) =>
+        prev.map((item) => {
+          const isIncoming = incoming.some((f) => f.name === item.name);
+          return isIncoming ? { ...item, uploading: false, error: err?.message || 'Upload failed' } : item;
+        })
+      );
+    }
+  };
+
+  const removeNewTaskAttachment = (localId: string) => {
+    setNewTaskAttachments((prev) => prev.filter((a) => a.localId !== localId));
+  };
+
+  const handleUploadExistingTaskFiles = async (taskId: string, rawFiles: FileList | File[] | null) => {
+    const incoming = Array.from(rawFiles || []);
+    if (incoming.length === 0) return;
+
+    setIsUploadingTaskAttachment(taskId);
+    try {
+      const uploaded = await api.uploadTaskAttachments(job.id, taskId, incoming);
+      if (onUpdateTask) {
+        const target = tasks.find((t) => t.id === taskId);
+        const existingAtts = target?.attachments || [];
+        const merged = [...existingAtts];
+        for (const u of uploaded) {
+          if (!merged.some((m) => m.id === u.id)) {
+            merged.push(u);
+          }
+        }
+        await onUpdateTask(taskId, { attachments: merged });
+      }
+    } catch (err: any) {
+      setAttachmentError(err?.message || 'Failed to upload task attachment');
+    } finally {
+      setIsUploadingTaskAttachment(null);
+      setTargetTaskForUpload(null);
+    }
+  };
+
   const handleAddTaskSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTaskTitle.trim() || isAddingTask) return;
     const t = newTaskTitle.trim();
     const reqDisc = newTaskRequiresDiscussion;
+    const uploadedAttachments = newTaskAttachments
+      .map((a) => a.uploaded)
+      .filter((u): u is SessionAttachment => Boolean(u));
+
     setNewTaskTitle('');
     setNewTaskRequiresDiscussion(false);
+    setNewTaskAttachments([]);
     setIsAddingTask(true);
     try {
-      await onAddTask(t, reqDisc);
+      if (uploadedAttachments.length > 0) {
+        await onAddTask(t, reqDisc, uploadedAttachments);
+      } else {
+        await onAddTask(t, reqDisc);
+      }
     } finally {
       setIsAddingTask(false);
     }
@@ -1058,7 +1140,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                           : 'bg-slate-950/60 border-slate-800/80 text-slate-300 hover:border-slate-700/80'
                       }`}
                     >
-                      <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
                         <button
                           type="button"
                           onClick={() => onToggleTask(task.id, !task.isCompleted)}
@@ -1075,17 +1157,80 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                         <span className={`font-mono text-[10px] shrink-0 ${isCurrentFocus ? 'text-sky-400 font-semibold' : 'text-slate-500'}`}>
                           #{idx + 1}
                         </span>
-                        <span
-                          className={`min-w-0 break-words leading-relaxed ${
-                            task.isCompleted
-                              ? 'line-through text-slate-400'
-                              : isCurrentFocus
-                              ? 'text-slate-100 font-semibold'
-                              : 'text-slate-200 font-medium'
-                          }`}
-                        >
-                          {task.title}
-                        </span>
+                        <div className="min-w-0 flex-1">
+                          <span
+                            className={`break-words leading-relaxed ${
+                              task.isCompleted
+                                ? 'line-through text-slate-400'
+                                : isCurrentFocus
+                                ? 'text-slate-100 font-semibold'
+                                : 'text-slate-200 font-medium'
+                            }`}
+                          >
+                            {task.title}
+                          </span>
+                          {/* Task Attachments Badge List */}
+                          {task.attachments && task.attachments.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 mt-1" data-testid={`task-attachments-${task.id}`}>
+                              {task.attachments.map((att) => {
+                                const isImg = isImageAttachment(att.contentType, att.fileName);
+                                return (
+                                  <div
+                                    key={att.id}
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-[10px] text-slate-300 group/taskatt"
+                                    data-testid={`task-att-${att.id}`}
+                                  >
+                                    {isImg ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleOpenLightbox({ url: att.downloadUrl, fileName: att.fileName, sizeBytes: att.sizeBytes })}
+                                        className="cursor-pointer flex items-center gap-1 hover:text-sky-300"
+                                        title="View image"
+                                      >
+                                        <ImageIcon className="w-3 h-3 text-sky-400 shrink-0" />
+                                        <span className="truncate max-w-[110px]">{att.fileName}</span>
+                                      </button>
+                                    ) : (
+                                      <a
+                                        href={att.downloadUrl}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="flex items-center gap-1 text-slate-300 hover:text-sky-300"
+                                        title="Download attachment"
+                                      >
+                                        <Paperclip className="w-3 h-3 text-slate-400 shrink-0" />
+                                        <span className="truncate max-w-[110px]">{att.fileName}</span>
+                                      </a>
+                                    )}
+                                    {att.sizeBytes > 0 && (
+                                      <span className="text-[9px] text-slate-500 font-mono">
+                                        ({formatAttachmentSize(att.sizeBytes)})
+                                      </span>
+                                    )}
+                                    {!task.isCompleted && onUpdateTask && (
+                                      <button
+                                        type="button"
+                                        onClick={async (e) => {
+                                          e.stopPropagation();
+                                          try {
+                                            await api.deleteTaskAttachment(job.id, task.id, att.id);
+                                          } catch { }
+                                          const remaining = (task.attachments || []).filter((a) => a.id !== att.id);
+                                          await onUpdateTask(task.id, { attachments: remaining });
+                                        }}
+                                        className="text-slate-500 hover:text-rose-400 p-0.5 rounded transition cursor-pointer ml-0.5 opacity-0 group-hover/taskatt:opacity-100"
+                                        title="Remove attachment"
+                                        data-testid={`delete-task-att-${att.id}`}
+                                      >
+                                        <X className="w-2.5 h-2.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
                       </div>
 
                       <div className="flex items-center gap-2 shrink-0">
@@ -1123,6 +1268,25 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                         {!task.isCompleted && onUpdateTask && (
                           <button
                             type="button"
+                            disabled={isUploadingTaskAttachment === task.id}
+                            onClick={() => {
+                              setTargetTaskForUpload(task.id);
+                              existingTaskFileInputRef.current?.click();
+                            }}
+                            className="p-1 rounded text-slate-500 hover:text-sky-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer disabled:opacity-50"
+                            title="Attach file to task"
+                            data-testid={`attach-task-${task.id}`}
+                          >
+                            {isUploadingTaskAttachment === task.id ? (
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
+                            ) : (
+                              <Paperclip className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                        )}
+                        {!task.isCompleted && onUpdateTask && (
+                          <button
+                            type="button"
                             onClick={() => onUpdateTask(task.id, { requiresDiscussion: !task.requiresDiscussion })}
                             className={`p-1 rounded transition cursor-pointer ${
                               task.requiresDiscussion
@@ -1152,37 +1316,88 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             )}
 
             {/* Clean Inline Add Task Form */}
-            <form onSubmit={handleAddTaskSubmit} className="flex items-center gap-2 pt-1">
-              <input
-                type="text"
-                value={newTaskTitle}
-                onChange={(e) => setNewTaskTitle(e.target.value)}
-                placeholder="+ Add task..."
-                className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition shadow-inner"
-                data-testid="new-task-input"
-              />
-              <button
-                type="button"
-                onClick={() => setNewTaskRequiresDiscussion((prev) => !prev)}
-                className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
-                  newTaskRequiresDiscussion
-                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold shadow-sm'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                }`}
-                title={newTaskRequiresDiscussion ? 'Flagged for discussion before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
-                data-testid="new-task-discuss-toggle"
-              >
-                <MessageSquareQuote className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Discuss</span>
-              </button>
-              <button
-                type="submit"
-                disabled={!newTaskTitle.trim() || isAddingTask}
-                className="px-3.5 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer shadow-sm"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Add Task</span>
-              </button>
+            <form onSubmit={handleAddTaskSubmit} className="space-y-1.5 pt-1">
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={newTaskTitle}
+                  onChange={(e) => setNewTaskTitle(e.target.value)}
+                  placeholder="+ Add task..."
+                  className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition shadow-inner"
+                  data-testid="new-task-input"
+                />
+                <button
+                  type="button"
+                  onClick={() => newTaskFileInputRef.current?.click()}
+                  className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
+                    newTaskAttachments.length > 0
+                      ? 'bg-sky-500/20 border-sky-500/40 text-sky-300 font-semibold shadow-sm'
+                      : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="Attach files to task"
+                  data-testid="new-task-attach-btn"
+                >
+                  <Paperclip className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">
+                    Attach{newTaskAttachments.length > 0 ? ` (${newTaskAttachments.length})` : ''}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setNewTaskRequiresDiscussion((prev) => !prev)}
+                  className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
+                    newTaskRequiresDiscussion
+                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold shadow-sm'
+                      : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                  title={newTaskRequiresDiscussion ? 'Flagged for discussion before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
+                  data-testid="new-task-discuss-toggle"
+                >
+                  <MessageSquareQuote className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Discuss</span>
+                </button>
+                <button
+                  type="submit"
+                  disabled={!newTaskTitle.trim() || isAddingTask}
+                  className="px-3.5 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer shadow-sm"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add Task</span>
+                </button>
+              </div>
+
+              {/* Staged attachments for new task */}
+              {newTaskAttachments.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 px-1" data-testid="new-task-staged-attachments">
+                  {newTaskAttachments.map((att) => (
+                    <div
+                      key={att.localId}
+                      className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800 text-[10px] text-slate-300"
+                    >
+                      {att.uploading ? (
+                        <RefreshCw className="w-3 h-3 text-sky-400 animate-spin" />
+                      ) : (
+                        <Paperclip className="w-3 h-3 text-sky-400" />
+                      )}
+                      <span className="truncate max-w-[120px]">{att.name}</span>
+                      {att.sizeBytes && (
+                        <span className="text-[9px] text-slate-500 font-mono">
+                          ({formatAttachmentSize(att.sizeBytes)})
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => removeNewTaskAttachment(att.localId)}
+                        className="text-slate-500 hover:text-rose-400 p-0.5 rounded cursor-pointer"
+                        title="Remove file"
+                        data-testid={`remove-new-task-att-${att.localId}`}
+                      >
+                        <X className="w-2.5 h-2.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </form>
           </div>
         )}
@@ -1506,6 +1721,36 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             onChange={(e) => {
               if (e.target.files && e.target.files.length > 0) {
                 void stageFiles(e.target.files);
+                e.target.value = '';
+              }
+            }}
+          />
+
+          {/* Hidden File Input for New Task Attachments */}
+          <input
+            ref={newTaskFileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            data-testid="new-task-file-input"
+            onChange={(e) => {
+              if (e.target.files && e.target.files.length > 0) {
+                void handleNewTaskFiles(e.target.files);
+                e.target.value = '';
+              }
+            }}
+          />
+
+          {/* Hidden File Input for Existing Task Attachments */}
+          <input
+            ref={existingTaskFileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            data-testid="existing-task-file-input"
+            onChange={(e) => {
+              if (e.target.files && e.target.files.length > 0 && targetTaskForUpload) {
+                void handleUploadExistingTaskFiles(targetTaskForUpload, e.target.files);
                 e.target.value = '';
               }
             }}

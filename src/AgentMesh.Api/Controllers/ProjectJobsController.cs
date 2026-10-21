@@ -64,25 +64,16 @@ public record UpdateProjectJobRequest(
 public record CreateJobTaskRequest(
     string Title,
     string? AssignedPersonaId = null,
-    bool? RequiresDiscussion = false
+    bool? RequiresDiscussion = false,
+    List<JobAttachmentDto>? Attachments = null
 );
 
 public record UpdateJobTaskRequest(
     string? Title = null,
     bool? IsCompleted = null,
     string? AssignedPersonaId = null,
-    bool? RequiresDiscussion = null
-);
-
-public record JobAttachmentDto(
-    string Id,
-    Guid JobId,
-    string FileName,
-    string ContentType,
-    long SizeBytes,
-    string S3Key,
-    string DownloadUrl,
-    DateTimeOffset CreatedAt
+    bool? RequiresDiscussion = null,
+    List<JobAttachmentDto>? Attachments = null
 );
 
 public record PostJobMessageRequest(
@@ -127,7 +118,7 @@ public class ProjectJobsController(
 
     [HttpGet("api/projects/{projectId}/jobs")]
     [AllowAnonymous]
-    public async Task<IActionResult> GetProjectJobs(string projectId)
+    public async Task<IActionResult> GetProjectJobs(string projectId, [FromQuery] bool? includeArchived = true)
     {
         var normId = projectId.Trim().ToLowerInvariant();
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normId);
@@ -136,9 +127,16 @@ public class ProjectJobsController(
             return NotFound(new { error = $"Project '{projectId}' not found." });
         }
 
-        var jobs = await db.ProjectJobs
+        var query = db.ProjectJobs
             .AsNoTracking()
-            .Where(j => j.ProjectId == normId)
+            .Where(j => j.ProjectId == normId);
+
+        if (includeArchived == false)
+        {
+            query = query.Where(j => j.Status != ProjectJobStatus.Archived);
+        }
+
+        var jobs = await query
             .OrderByDescending(j => j.CreatedAt)
             .ToListAsync();
 
@@ -327,7 +325,8 @@ public class ProjectJobsController(
             Title = req.Title.Trim(),
             IsCompleted = false,
             RequiresDiscussion = req.RequiresDiscussion ?? false,
-            AssignedPersonaId = req.AssignedPersonaId?.Trim().ToLowerInvariant()
+            AssignedPersonaId = req.AssignedPersonaId?.Trim().ToLowerInvariant(),
+            Attachments = req.Attachments ?? new()
         };
         tasks.Add(newTask);
 
@@ -373,6 +372,10 @@ public class ProjectJobsController(
         {
             task.RequiresDiscussion = req.RequiresDiscussion.Value;
         }
+        if (req.Attachments != null)
+        {
+            task.Attachments = req.Attachments;
+        }
 
         job.TasksJson = JsonSerializer.Serialize(tasks, JsonOpts);
         job.UpdatedAt = DateTimeOffset.UtcNow;
@@ -412,6 +415,136 @@ public class ProjectJobsController(
         }
 
         return Ok(new { status = "deleted", taskId });
+    }
+
+    [HttpPost("api/project-jobs/{id}/tasks/{taskId}/attachments")]
+    [RequestSizeLimit(262_144_000)]
+    public async Task<IActionResult> UploadTaskAttachments(Guid id, Guid taskId, [FromForm] IFormFileCollection? files = null)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var tasks = ParseTasks(job.TasksJson);
+        var task = tasks.FirstOrDefault(t => t.Id == taskId);
+        if (task == null)
+        {
+            return NotFound(new { error = $"Task '{taskId}' not found." });
+        }
+
+        var formFiles = files ?? (Request?.HasFormContentType == true ? Request.Form.Files : null);
+        if (formFiles == null || formFiles.Count == 0)
+        {
+            return BadRequest(new { error = "No files uploaded." });
+        }
+
+        if (formFiles.Count > 10)
+        {
+            return BadRequest(new { error = "Maximum of 10 files can be uploaded per request." });
+        }
+
+        const long maxSizeBytes = 25 * 1024 * 1024;
+        foreach (var file in formFiles)
+        {
+            if (file.Length <= 0) return BadRequest(new { error = $"File '{file.FileName}' is empty." });
+            if (file.Length > maxSizeBytes) return BadRequest(new { error = $"File '{file.FileName}' exceeds the 25 MB maximum file size limit." });
+            if (!SessionsController.IsAllowedAttachment(file.FileName, file.ContentType)) return BadRequest(new { error = $"File '{file.FileName}' has an unsupported file type." });
+        }
+
+        var uploaded = new List<JobAttachmentDto>();
+        var localAttachDir = GetAttachmentDirectory(id);
+
+        foreach (var file in formFiles)
+        {
+            var attachmentId = Guid.NewGuid().ToString("N");
+            var safeFileName = SessionsController.SanitizeFileName(file.FileName);
+            var contentType = !string.IsNullOrWhiteSpace(file.ContentType) && !string.Equals(file.ContentType, "application/octet-stream", StringComparison.OrdinalIgnoreCase)
+                ? file.ContentType
+                : SessionsController.GuessContentTypeFromExtension(safeFileName);
+            var s3Key = $"jobs/{id}/attachments/{attachmentId}/{safeFileName}";
+            var downloadUrl = $"/api/project-jobs/{id}/attachments/{attachmentId}/content";
+
+            var localFilePath = Path.Combine(localAttachDir, $"{attachmentId}_{safeFileName}");
+            await using (var localStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.Read))
+            {
+                await file.CopyToAsync(localStream, HttpContext?.RequestAborted ?? CancellationToken.None);
+            }
+
+            if (storageService != null)
+            {
+                try
+                {
+                    await using var s3Stream = file.OpenReadStream();
+                    await storageService.UploadStreamAsync(s3Key, s3Stream, contentType, HttpContext?.RequestAborted ?? CancellationToken.None);
+                }
+                catch
+                {
+                    // Graceful fallback to local disk if S3 is unreachable
+                }
+            }
+
+            var dto = new JobAttachmentDto(
+                Id: attachmentId,
+                JobId: id,
+                FileName: safeFileName,
+                ContentType: contentType,
+                SizeBytes: file.Length,
+                S3Key: s3Key,
+                DownloadUrl: downloadUrl,
+                CreatedAt: DateTimeOffset.UtcNow
+            );
+
+            uploaded.Add(dto);
+        }
+
+        task.Attachments ??= new List<JobAttachmentDto>();
+        task.Attachments.AddRange(uploaded);
+
+        job.TasksJson = JsonSerializer.Serialize(tasks, JsonOpts);
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = id, tasks });
+        }
+
+        return Ok(uploaded);
+    }
+
+    [HttpDelete("api/project-jobs/{id}/tasks/{taskId}/attachments/{attachmentId}")]
+    public async Task<IActionResult> DeleteTaskAttachment(Guid id, Guid taskId, string attachmentId)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var tasks = ParseTasks(job.TasksJson);
+        var task = tasks.FirstOrDefault(t => t.Id == taskId);
+        if (task == null)
+        {
+            return NotFound(new { error = $"Task '{taskId}' not found." });
+        }
+
+        if (task.Attachments == null || task.Attachments.RemoveAll(a => a.Id == attachmentId) == 0)
+        {
+            return NotFound(new { error = $"Attachment '{attachmentId}' not found in task '{taskId}'." });
+        }
+
+        job.TasksJson = JsonSerializer.Serialize(tasks, JsonOpts);
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = id, tasks });
+        }
+
+        return Ok(new { status = "deleted", attachmentId });
     }
 
     [HttpGet("api/project-jobs/{id}/messages")]
@@ -787,13 +920,33 @@ public class ProjectJobsController(
 
                 var turnSessionId = Guid.NewGuid();
 
-                // If attachments exist, stage them into the turn session's attachment directory
+                var tasks = ParseTasks(job.TasksJson);
+                var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+
+                // Combine message attachments with active task attachments so the agent gets both
+                var combinedAttachments = new List<JobAttachmentDto>();
                 if (req.Attachments is { Count: > 0 })
+                {
+                    combinedAttachments.AddRange(req.Attachments);
+                }
+                if (activeTask?.Attachments is { Count: > 0 })
+                {
+                    foreach (var att in activeTask.Attachments)
+                    {
+                        if (!combinedAttachments.Any(a => a.Id == att.Id))
+                        {
+                            combinedAttachments.Add(att);
+                        }
+                    }
+                }
+
+                // If attachments exist, stage them into the turn session's attachment directory
+                if (combinedAttachments.Count > 0)
                 {
                     var sessionAttachDir = SessionsController.GetAttachmentDirectory(turnSessionId);
                     var jobAttachDir = GetAttachmentDirectory(id);
 
-                    foreach (var att in req.Attachments)
+                    foreach (var att in combinedAttachments)
                     {
                         var safeName = SessionsController.SanitizeFileName(att.FileName);
                         var src = Path.Combine(jobAttachDir, $"{att.Id}_{safeName}");
@@ -836,7 +989,7 @@ public class ProjectJobsController(
                     ["mode"] = persona.DefaultMode,
                     ["tier"] = persona.DefaultTier,
                     ["contextSize"] = persona.DefaultContextSize,
-                    ["attachments"] = req.Attachments
+                    ["attachments"] = combinedAttachments
                 };
 
                 turnSession = new AgentSession
@@ -855,8 +1008,6 @@ public class ProjectJobsController(
                 db.AgentSessions.Add(turnSession);
                 jobMsg.TurnSessionId = turnSession.Id;
 
-                var tasks = ParseTasks(job.TasksJson);
-                var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
                 var taskContext = FormatTaskContext(tasks);
 
                 // Format prompt context for runner
@@ -866,6 +1017,10 @@ public class ProjectJobsController(
                                         taskContext +
                                         effectiveContent;
 
+                var promptPayloadJson = combinedAttachments.Count > 0
+                    ? JsonSerializer.Serialize(new { attachments = combinedAttachments }, JsonOpts)
+                    : structuredPayloadJson;
+
                 var promptMsg = new SessionMessage
                 {
                     SessionId = turnSession.Id,
@@ -873,7 +1028,7 @@ public class ProjectJobsController(
                     TargetAgentId = driverId,
                     EventType = "prompt",
                     Content = promptWithContext,
-                    StructuredPayloadJson = structuredPayloadJson,
+                    StructuredPayloadJson = promptPayloadJson,
                     CreatedAt = DateTimeOffset.UtcNow
                 };
                 db.SessionMessages.Add(promptMsg);
@@ -908,7 +1063,7 @@ public class ProjectJobsController(
                         projectId = project.Id,
                         gitBranch = job.GitBranchName,
                         createdAt = promptMsg.CreatedAt,
-                        attachments = req.Attachments
+                        attachments = combinedAttachments
                     };
 
                     await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", promptPayload);
@@ -1096,11 +1251,18 @@ public class ProjectJobsController(
                     ? "[ ] (Queued - Discuss First)"
                     : "[ ] (Queued)";
             }
-            sb.AppendLine($"{i + 1}. {statusTag} {t.Title}");
+            var attachInfo = (t.Attachments != null && t.Attachments.Count > 0)
+                ? $" (Attachments: {string.Join(", ", t.Attachments.Select(a => a.FileName))})"
+                : "";
+            sb.AppendLine($"{i + 1}. {statusTag} {t.Title}{attachInfo}");
         }
         if (activeTask != null)
         {
             sb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
+            if (activeTask.Attachments is { Count: > 0 })
+            {
+                sb.AppendLine($"[Target Task Attachments]: {string.Join(", ", activeTask.Attachments.Select(a => $"{a.FileName} ({a.DownloadUrl})"))}");
+            }
             sb.AppendLine("[Sequential Execution Rule]: You must work on and complete tasks sequentially one by one in the order listed above. Focus on completing the current active task first before moving to subsequent tasks.");
             if (activeTask.RequiresDiscussion)
             {
@@ -1301,12 +1463,32 @@ public class ProjectJobsController(
 
             var turnSessionId = Guid.NewGuid();
 
+            var tasks = ParseTasks(job.TasksJson);
+            var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+
+            // Combine queued turn attachments with active task attachments so the agent gets both
+            var combinedAttachments = new List<JobAttachmentDto>();
             if (turnToDispatch.Attachments is { Count: > 0 })
+            {
+                combinedAttachments.AddRange(turnToDispatch.Attachments);
+            }
+            if (activeTask?.Attachments is { Count: > 0 })
+            {
+                foreach (var att in activeTask.Attachments)
+                {
+                    if (!combinedAttachments.Any(a => a.Id == att.Id))
+                    {
+                        combinedAttachments.Add(att);
+                    }
+                }
+            }
+
+            if (combinedAttachments.Count > 0)
             {
                 var sessionAttachDir = SessionsController.GetAttachmentDirectory(turnSessionId);
                 var jobAttachDir = GetAttachmentDirectory(job.Id);
 
-                foreach (var att in turnToDispatch.Attachments)
+                foreach (var att in combinedAttachments)
                 {
                     var safeName = SessionsController.SanitizeFileName(att.FileName);
                     var src = Path.Combine(jobAttachDir, $"{att.Id}_{safeName}");
@@ -1344,7 +1526,7 @@ public class ProjectJobsController(
                 ["mode"] = persona.DefaultMode,
                 ["tier"] = persona.DefaultTier,
                 ["contextSize"] = persona.DefaultContextSize,
-                ["attachments"] = turnToDispatch.Attachments
+                ["attachments"] = combinedAttachments
             };
 
             var turnSession = new AgentSession
@@ -1361,8 +1543,6 @@ public class ProjectJobsController(
             };
             db.AgentSessions.Add(turnSession);
 
-            var tasks = ParseTasks(job.TasksJson);
-            var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
             var taskContext = FormatTaskContext(tasks);
 
             var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
@@ -1371,8 +1551,8 @@ public class ProjectJobsController(
                                     taskContext +
                                     turnToDispatch.Content;
 
-            var structuredPayloadJson = turnToDispatch.Attachments is { Count: > 0 }
-                ? JsonSerializer.Serialize(new { attachments = turnToDispatch.Attachments }, JsonOpts)
+            var structuredPayloadJson = combinedAttachments.Count > 0
+                ? JsonSerializer.Serialize(new { attachments = combinedAttachments }, JsonOpts)
                 : null;
 
             var promptMsg = new SessionMessage
@@ -1439,7 +1619,7 @@ public class ProjectJobsController(
                     projectId = project.Id,
                     gitBranch = job.GitBranchName,
                     createdAt = promptMsg.CreatedAt,
-                    attachments = turnToDispatch.Attachments
+                    attachments = combinedAttachments
                 };
 
                 var group = hubContext.Clients?.Group($"agent-{driverId}");

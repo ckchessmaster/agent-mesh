@@ -2,6 +2,15 @@ import { render, screen, fireEvent, within, waitFor } from '@testing-library/rea
 import { describe, it, expect, vi } from 'vitest';
 import { JobCockpit, getActiveMentionQuery } from '../JobCockpit';
 import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment } from '../../types';
+import { api } from '../../services/api';
+
+vi.mock('../../services/api', () => ({
+  api: {
+    uploadJobAttachments: vi.fn(),
+    uploadTaskAttachments: vi.fn(),
+    deleteTaskAttachment: vi.fn()
+  }
+}));
 
 describe('getActiveMentionQuery helper', () => {
   it('detects mention query at beginning of string', () => {
@@ -886,5 +895,108 @@ describe('JobCockpit - Attachment Support', () => {
     // Card now displays unlocked status
     expect(screen.getByText(/Discussion approved — implementation unlocked/i)).toBeInTheDocument();
     expect(screen.queryByTestId('proceed-to-coding-btn')).not.toBeInTheDocument();
+  });
+
+  it('renders task attachments, supports lightbox on image click, allows deleting task attachment, and adding new task with attachments', async () => {
+    const onAddTask = vi.fn().mockResolvedValue(undefined);
+    const onUpdateTask = vi.fn().mockResolvedValue(undefined);
+    const onOpenLightbox = vi.fn();
+
+    const sampleImgAtt: SessionAttachment = {
+      id: 'att-mock-img',
+      sessionId: mockJob.id,
+      fileName: 'mock-ui.png',
+      contentType: 'image/png',
+      sizeBytes: 2048,
+      s3Key: 'mock-ui.png',
+      downloadUrl: '/api/project-jobs/attachments/mock-ui.png',
+      createdAt: new Date().toISOString()
+    };
+
+    const sampleDocAtt: SessionAttachment = {
+      id: 'att-mock-doc',
+      sessionId: mockJob.id,
+      fileName: 'mock-spec.pdf',
+      contentType: 'application/pdf',
+      sizeBytes: 4096,
+      s3Key: 'mock-spec.pdf',
+      downloadUrl: '/api/project-jobs/attachments/mock-spec.pdf',
+      createdAt: new Date().toISOString()
+    };
+
+    const taskWithAtts: JobTask = {
+      id: 'task-with-atts',
+      title: 'Task With Attachments',
+      isCompleted: false,
+      attachments: [sampleImgAtt, sampleDocAtt]
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        tasks={[taskWithAtts]}
+        onAddTask={onAddTask}
+        onUpdateTask={onUpdateTask}
+        onOpenLightbox={onOpenLightbox}
+      />
+    );
+
+    // Verify task attachments rendered
+    expect(screen.getByTestId('task-attachments-task-with-atts')).toBeInTheDocument();
+    expect(screen.getByText('mock-ui.png')).toBeInTheDocument();
+    expect(screen.getByText('mock-spec.pdf')).toBeInTheDocument();
+
+    // Click image attachment to open lightbox
+    fireEvent.click(screen.getByText('mock-ui.png'));
+    expect(onOpenLightbox).toHaveBeenCalledWith({
+      url: '/api/project-jobs/attachments/mock-ui.png',
+      fileName: 'mock-ui.png',
+      sizeBytes: 2048
+    });
+
+    // Delete document attachment from task
+    const delDocBtn = screen.getByTestId('delete-task-att-att-mock-doc');
+    fireEvent.click(delDocBtn);
+    await waitFor(() => {
+      expect(onUpdateTask).toHaveBeenCalledWith('task-with-atts', {
+        attachments: [sampleImgAtt]
+      });
+    });
+
+    // Add new task with staged attachments
+    const newAtt: SessionAttachment = {
+      id: 'att-staged-1',
+      sessionId: mockJob.id,
+      fileName: 'staged-file.txt',
+      contentType: 'text/plain',
+      sizeBytes: 1024,
+      s3Key: 'staged-file.txt',
+      downloadUrl: '/api/project-jobs/attachments/staged-file.txt',
+      createdAt: new Date().toISOString()
+    };
+    vi.mocked(api.uploadJobAttachments).mockResolvedValue([newAtt]);
+
+    const taskInput = screen.getByTestId('new-task-input');
+    fireEvent.change(taskInput, { target: { value: 'Task with new attachment' } });
+
+    const newTaskFileInput = screen.getByTestId('new-task-file-input');
+    const txtFile = new File(['text-content'], 'staged-file.txt', { type: 'text/plain' });
+    fireEvent.change(newTaskFileInput, { target: { files: [txtFile] } });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('new-task-staged-attachments')).toBeInTheDocument();
+      expect(screen.getAllByText('staged-file.txt').length).toBeGreaterThan(0);
+    });
+
+    const addBtn = screen.getByRole('button', { name: /Add Task/i });
+    fireEvent.click(addBtn);
+
+    await waitFor(() => {
+      expect(onAddTask).toHaveBeenCalledWith(
+        'Task with new attachment',
+        false,
+        [newAtt]
+      );
+    });
   });
 });

@@ -67,6 +67,7 @@ import type {
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from './types';
+import { ProjectJobStatus } from './types';
 import { SlashCommandPalette, SLASH_COMMANDS, type SlashCommandItem } from './components/SlashCommandPalette';
 import { ArtifactViewer } from './components/ArtifactViewer';
 import { ProjectModal } from './components/ProjectModal';
@@ -564,7 +565,8 @@ export default function App() {
     if (selectedProjectId) {
       fetchJobsForProject(selectedProjectId).then((jobs) => {
         if (jobs && jobs.length > 0) {
-          setSelectedJobId((cur) => (cur && jobs.some((j) => j.id === cur) ? cur : jobs[0].id));
+          const nonArchived = jobs.filter((j) => j.status !== ProjectJobStatus.Archived);
+          setSelectedJobId((cur) => (cur && jobs.some((j) => j.id === cur) ? cur : (nonArchived[0]?.id ?? jobs[0].id)));
         } else {
           setSelectedJobId(null);
         }
@@ -652,17 +654,18 @@ export default function App() {
     });
   };
 
-  const handleAddTask = async (title: string, requiresDiscussion?: boolean) => {
+  const handleAddTask = async (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => {
     if (!selectedJobId) return;
-    const payload: { title: string; requiresDiscussion?: boolean } = { title };
+    const payload: { title: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] } = { title };
     if (requiresDiscussion) payload.requiresDiscussion = true;
+    if (attachments && attachments.length > 0) payload.attachments = attachments;
     const task = await api.addJobTask(selectedJobId, payload);
     setJobTasks((prev) => (prev.some((t) => t.id === task.id) ? prev : [...prev, task]));
   };
 
   const handleUpdateTask = async (
     taskId: string,
-    updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string }
+    updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string; attachments?: SessionAttachment[] }
   ) => {
     if (!selectedJobId) return;
     const updated = await api.updateJobTask(selectedJobId, taskId, updates);

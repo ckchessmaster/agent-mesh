@@ -692,4 +692,66 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
     });
   });
+
+  it('hides archived jobs by default and allows toggling to show and hide them in the project list', async () => {
+    const activeJob: ProjectJob = {
+      id: 'job-active-1',
+      projectId: 'mesh-core',
+      title: 'Active Job Work',
+      description: 'Active job description',
+      status: ProjectJobStatus.Active,
+      gitBranchName: 'mesh/job-active-1',
+      tasks: [],
+      messageCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const archivedJob: ProjectJob = {
+      id: 'job-archived-1',
+      projectId: 'mesh-core',
+      title: 'Old Archived Sprint',
+      description: 'Archived sprint',
+      status: ProjectJobStatus.Archived,
+      gitBranchName: 'mesh/job-archived-1',
+      tasks: [],
+      messageCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getProjectJobs).mockResolvedValue([activeJob, archivedJob]);
+
+    render(<App />);
+
+    // Active job is rendered by default
+    await waitFor(() => {
+      expect(screen.getAllByText('Active Job Work').length).toBeGreaterThan(0);
+    });
+
+    // Archived job is hidden by default
+    expect(screen.queryByText('Old Archived Sprint')).not.toBeInTheDocument();
+
+    // Toggle button for archived jobs is visible with count 1
+    const toggleArchivedBtn = screen.getByTestId('toggle-archived-jobs-mesh-core');
+    expect(toggleArchivedBtn).toBeInTheDocument();
+    expect(toggleArchivedBtn).toHaveTextContent('Show Archived');
+    expect(toggleArchivedBtn).toHaveTextContent('1');
+
+    // Click Show Archived to reveal
+    fireEvent.click(toggleArchivedBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText('Old Archived Sprint')).toBeInTheDocument();
+      expect(toggleArchivedBtn).toHaveTextContent('Hide Archived');
+    });
+
+    // Click Hide Archived to re-hide
+    fireEvent.click(toggleArchivedBtn);
+
+    await waitFor(() => {
+      expect(screen.queryByText('Old Archived Sprint')).not.toBeInTheDocument();
+      expect(toggleArchivedBtn).toHaveTextContent('Show Archived');
+    });
+  });
 });
