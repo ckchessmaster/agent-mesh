@@ -681,27 +681,37 @@ export default function App() {
   const handleArchiveJob = async (jobId?: string) => {
     const targetId = jobId || selectedJobId;
     if (!targetId) return;
-    const updated = await api.archiveJob(targetId);
-    setJobsByProject((prev) => {
-      const next = { ...prev };
-      for (const pId of Object.keys(next)) {
-        next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
-      }
-      return next;
-    });
+    try {
+      const updated = await api.archiveJob(targetId);
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to archive job:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to archive job');
+    }
   };
 
   const handleReopenJob = async (jobId?: string) => {
     const targetId = jobId || selectedJobId;
     if (!targetId) return;
-    const updated = await api.reopenJob(targetId);
-    setJobsByProject((prev) => {
-      const next = { ...prev };
-      for (const pId of Object.keys(next)) {
-        next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
-      }
-      return next;
-    });
+    try {
+      const updated = await api.reopenJob(targetId);
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to reopen job:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to reopen job');
+    }
   };
 
   const fetchSessionArtifacts = useCallback(async (sessionId: string) => {
