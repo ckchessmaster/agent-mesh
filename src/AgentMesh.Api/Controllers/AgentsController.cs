@@ -304,6 +304,7 @@ public class AgentsController(
         var effectiveEffort = req.Effort != null ? req.Effort : persona?.DefaultEffort;
         var effectiveMode = !string.IsNullOrWhiteSpace(req.Mode) ? req.Mode : persona?.DefaultMode;
         var effectiveTier = !string.IsNullOrWhiteSpace(req.Tier) ? req.Tier : persona?.DefaultTier;
+        var effectiveContextSize = req.ContextSize != null ? req.ContextSize : persona?.DefaultContextSize;
 
         var hasAttachments = req.Attachments is { Count: > 0 };
         var hasInitialPrompt = !string.IsNullOrWhiteSpace(req.InitialPrompt) || hasAttachments;
@@ -317,7 +318,8 @@ public class AgentsController(
             persona?.Id,
             persona?.Name,
             persona?.Role,
-            persona?.PersonaPrompt);
+            persona?.PersonaPrompt,
+            effectiveContextSize);
 
         var session = new AgentSession
         {
@@ -379,6 +381,7 @@ public class AgentsController(
             if (promptMsg != null)
             {
                 var (workDir, model, effort, mode, tier) = SessionsController.ExtractSessionSettings(session.MetadataJson);
+                var contextSize = SessionsController.ExtractSessionContextSize(session.MetadataJson);
                 await hubContext.Clients.Group($"agent-{normalizedId}").SendAsync("PromptReceived", new
                 {
                     sessionId = session.Id,
@@ -396,6 +399,7 @@ public class AgentsController(
                     effort = effort,
                     mode = mode,
                     tier = tier,
+                    contextSize = contextSize,
                     attachments = req.Attachments,
                     createdAt = promptMsg.CreatedAt
                 });
@@ -727,7 +731,8 @@ public record CreateAgentSessionRequest(
     string? Mode = null,
     string? Tier = null,
     string? PersonaId = null,
-    List<SessionAttachmentDto>? Attachments = null
+    List<SessionAttachmentDto>? Attachments = null,
+    string? ContextSize = null
 );
 
 public record AgentDto(

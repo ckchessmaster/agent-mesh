@@ -18,6 +18,7 @@ public class Persona
     public string? DefaultEffort { get; set; }
     public string? DefaultMode { get; set; }
     public string? DefaultTier { get; set; }
+    public string? DefaultContextSize { get; set; }
     public string? DefaultWorkingDirectory { get; set; }
     public TrustTier TrustTier { get; set; } = TrustTier.Intern;
 

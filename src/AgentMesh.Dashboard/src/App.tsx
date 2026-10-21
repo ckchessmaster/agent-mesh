@@ -42,7 +42,8 @@ import {
   File as FileIcon,
   Download,
   ZoomIn,
-  FolderGit2
+  FolderGit2,
+  Maximize2
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -263,6 +264,7 @@ export default function App() {
   const [personaDefaultEffort, setPersonaDefaultEffort] = useState('');
   const [personaDefaultMode, setPersonaDefaultMode] = useState('');
   const [personaDefaultTier, setPersonaDefaultTier] = useState('');
+  const [personaDefaultContextSize, setPersonaDefaultContextSize] = useState('');
   const [personaDefaultWorkDir, setPersonaDefaultWorkDir] = useState('');
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
@@ -289,6 +291,7 @@ export default function App() {
   const [newSessionEffort, setNewSessionEffort] = useState('');
   const [newSessionMode, setNewSessionMode] = useState('');
   const [newSessionTier, setNewSessionTier] = useState('');
+  const [newSessionContextSize, setNewSessionContextSize] = useState('');
 
   // Agent Quota & Usage details modal state
   const [agentUsages, setAgentUsages] = useState<Record<string, AgentUsageResponse>>({});
@@ -297,7 +300,7 @@ export default function App() {
   const [isRefreshingUsage, setIsRefreshingUsage] = useState(false);
 
   // Active session inline control edit popover state
-  const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | null>(null);
+  const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | 'contextSize' | null>(null);
 
   // Active prompt queue and Send Now dropdown state
   const [activeQueue, setActiveQueue] = useState<QueuedPromptItem[]>([]);
@@ -1135,6 +1138,7 @@ export default function App() {
     setPersonaDefaultEffort('');
     setPersonaDefaultMode('');
     setPersonaDefaultTier('');
+    setPersonaDefaultContextSize('');
     setPersonaDefaultWorkDir('');
     setShowPersonaModal(true);
   }, [selectedAgentId, agents]);
@@ -1150,6 +1154,7 @@ export default function App() {
     setPersonaDefaultEffort(persona.defaultEffort || '');
     setPersonaDefaultMode(persona.defaultMode || '');
     setPersonaDefaultTier(persona.defaultTier || '');
+    setPersonaDefaultContextSize(persona.defaultContextSize || '');
     setPersonaDefaultWorkDir(persona.defaultWorkingDirectory || '');
     setShowPersonaModal(true);
   }, []);
@@ -1161,6 +1166,7 @@ export default function App() {
     setNewSessionEffort(persona.defaultEffort || '');
     setNewSessionMode(persona.defaultMode || '');
     setNewSessionTier(persona.defaultTier || '');
+    setNewSessionContextSize(persona.defaultContextSize || '');
     setNewSessionWorkDir(persona.defaultWorkingDirectory || '');
     setIsCreatingSession(true);
   }, []);
@@ -1181,6 +1187,7 @@ export default function App() {
           defaultEffort: personaDefaultEffort || '',
           defaultMode: personaDefaultMode || '',
           defaultTier: personaDefaultTier || '',
+          defaultContextSize: personaDefaultContextSize || '',
           defaultWorkingDirectory: personaDefaultWorkDir || ''
         });
         setShowPersonaModal(false);
@@ -1197,6 +1204,7 @@ export default function App() {
           defaultEffort: personaDefaultEffort || undefined,
           defaultMode: personaDefaultMode || undefined,
           defaultTier: personaDefaultTier || undefined,
+          defaultContextSize: personaDefaultContextSize || undefined,
           defaultWorkingDirectory: personaDefaultWorkDir || undefined
         });
         setShowPersonaModal(false);
@@ -1300,6 +1308,26 @@ export default function App() {
       setNewSessionTier('');
     }
   }, [availableModels, availableModes, availableTiers, newSessionModel, newSessionMode, newSessionTier]);
+
+  const availableContextSizes = useMemo(() => {
+    if (!currentRuntimeCaps) return [];
+    const modelContextIds = selectedModelCap?.contextSizes;
+    if (modelContextIds && modelContextIds.length > 0) {
+      const driverContexts = currentRuntimeCaps.contextSizes || [];
+      return modelContextIds.map((id) => {
+        const match = driverContexts.find((c) => c.id.toLowerCase() === id.toLowerCase());
+        return match || { id, label: id, description: `${id} context window` };
+      });
+    }
+    return currentRuntimeCaps.contextSizes || [];
+  }, [currentRuntimeCaps, selectedModelCap]);
+
+  // Sync / validate context size when model/driver changes
+  useEffect(() => {
+    if (newSessionContextSize && availableContextSizes.length > 0 && !availableContextSizes.some((c) => c.id.toLowerCase() === newSessionContextSize.toLowerCase())) {
+      setNewSessionContextSize('');
+    }
+  }, [availableContextSizes, newSessionContextSize]);
 
   const createPreviewUrl = (file: File): string | undefined => {
     if (isImageAttachment(file.type, file.name) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
@@ -1483,7 +1511,8 @@ export default function App() {
         model: newSessionModel.trim() || undefined,
         effort: newSessionEffort.trim() || undefined,
         mode: newSessionMode.trim() || undefined,
-        tier: newSessionTier.trim() || undefined
+        tier: newSessionTier.trim() || undefined,
+        contextSize: newSessionContextSize.trim() || undefined
       };
       const created = targetPersona && api.createPersonaSession
         ? await api.createPersonaSession(
@@ -1522,6 +1551,7 @@ export default function App() {
       setNewSessionEffort('');
       setNewSessionMode('');
       setNewSessionTier('');
+      setNewSessionContextSize('');
       setNewSessionAttachments([]);
       setIsCreatingSession(false);
       await fetchAllData();
@@ -1538,6 +1568,7 @@ export default function App() {
     model?: string;
     effort?: string;
     tier?: string;
+    contextSize?: string;
     mode?: string;
     workingDirectory?: string;
   }) => {
@@ -1676,6 +1707,26 @@ export default function App() {
           `• Current Mode: **\`${currentMode}\`**\n` +
           `• Supported Modes: \`plan\` | \`auto\` | \`accept-edits\`\n` +
           `• Usage: \`/mesh mode <mode>\` (e.g. \`/mesh mode plan\`)`
+        );
+      }
+      return true;
+    }
+
+    if (subCmd === 'context') {
+      if (arg) {
+        const c = arg.toLowerCase();
+        await handleUpdateSessionControl({ contextSize: c });
+        await emitSystemMessage(`✓ Context size set to "${c}" for active session.`);
+      } else {
+        const currentContext = selectedSessionMetadata?.contextSize || 'default';
+        const ctxList = sessionAvailableContextSizes.length > 0
+          ? sessionAvailableContextSizes.map((c) => `  - \`${c.id}\`${c.label ? ` (${c.label})` : ''}`).join('\n')
+          : '  - Default driver/model context window';
+        await emitSystemMessage(
+          `⚙️ **Context Window Configuration**\n\n` +
+          `• Current Context Size: **\`${currentContext}\`**\n` +
+          `• Available Context Sizes:\n${ctxList}\n\n` +
+          `• Usage: \`/mesh context <size>\` (e.g. \`/mesh context 200k\`)`
         );
       }
       return true;
@@ -2101,6 +2152,19 @@ export default function App() {
     return allEfforts.length > 0 ? allEfforts : ['low', 'medium', 'high'];
   }, [sessionModelCap, currentRuntimeCaps]);
 
+  const sessionAvailableContextSizes = useMemo(() => {
+    if (!currentRuntimeCaps) return [];
+    const modelContextIds = sessionModelCap?.contextSizes;
+    if (modelContextIds && modelContextIds.length > 0) {
+      const driverContexts = currentRuntimeCaps.contextSizes || [];
+      return modelContextIds.map((id) => {
+        const match = driverContexts.find((c) => c.id.toLowerCase() === id.toLowerCase());
+        return match || { id, label: id, description: `${id} context window` };
+      });
+    }
+    return currentRuntimeCaps.contextSizes || [];
+  }, [sessionModelCap, currentRuntimeCaps]);
+
   return (
     <div className="min-h-screen h-screen bg-slate-950 text-slate-100 flex flex-col font-sans overflow-hidden">
       {/* Top Bar */}
@@ -2384,6 +2448,12 @@ export default function App() {
                                 {persona.defaultModel && (
                                   <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-950/40 border border-purple-500/30 text-[10px] font-mono text-purple-300 truncate max-w-[140px]">
                                     <span>{persona.defaultModel}</span>
+                                  </span>
+                                )}
+                                {persona.defaultContextSize && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-950/40 border border-emerald-500/30 text-[10px] font-mono text-emerald-300">
+                                    <Maximize2 className="w-2.5 h-2.5 text-emerald-400" />
+                                    <span>{persona.defaultContextSize}</span>
                                   </span>
                                 )}
                               </div>
@@ -3212,7 +3282,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className={`grid ${availableTiers.length > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'} gap-2.5`}>
+                  <div className={`grid ${availableTiers.length > 0 ? 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-5' : 'grid-cols-2 sm:grid-cols-4'} gap-2.5`}>
                     {/* Model Selection Dropdown */}
                     <div className="space-y-1">
                       <label className="block text-[11px] font-medium text-slate-400">
@@ -3285,6 +3355,28 @@ export default function App() {
                         )}
                       </select>
                     </div>
+
+                    {/* Context Size Dropdown (tied to model/driver) */}
+                    {availableContextSizes.length > 0 && (
+                      <div className="space-y-1">
+                        <label className="block text-[11px] font-medium text-slate-400">
+                          Context Window Size
+                        </label>
+                        <select
+                          aria-label="New Session Context Size"
+                          value={newSessionContextSize}
+                          onChange={(e) => setNewSessionContextSize(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 cursor-pointer"
+                        >
+                          <option value="">Default Context</option>
+                          {availableContextSizes.map((cs) => (
+                            <option key={cs.id} value={cs.id} title={cs.description}>
+                              {cs.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
 
                     {/* Copilot Tier / Optimize For Dropdown */}
                     {availableTiers.length > 0 && (
@@ -3560,6 +3652,48 @@ export default function App() {
                               >
                                 <span>{m.label}</span>
                                 {selectedSessionMetadata?.mode === m.id && <Check className="w-3 h-3 text-sky-400" />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Context Size Selector Badge & Popover */}
+                    {(selectedSessionMetadata?.contextSize || sessionAvailableContextSizes.length > 0) && (
+                      <div className="relative inline-block">
+                        <button
+                          type="button"
+                          onClick={() => setEditingSessionControl((prev) => (prev === 'contextSize' ? null : 'contextSize'))}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
+                          title="Click to change context window size"
+                        >
+                          <Maximize2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                          <span>{selectedSessionMetadata?.contextSize || 'context'}</span>
+                          <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
+                        </button>
+                        {editingSessionControl === 'contextSize' && (
+                          <div className="absolute left-0 top-full mt-1.5 z-40 w-48 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
+                            <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                              Context Window Size
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateSessionControl({ contextSize: '' })}
+                              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                            >
+                              <span>Default Context</span>
+                              {!selectedSessionMetadata?.contextSize && <Check className="w-3 h-3 text-sky-400" />}
+                            </button>
+                            {sessionAvailableContextSizes.map((cs) => (
+                              <button
+                                key={cs.id}
+                                type="button"
+                                onClick={() => handleUpdateSessionControl({ contextSize: cs.id })}
+                                className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                              >
+                                <span className="truncate">{cs.label}</span>
+                                {selectedSessionMetadata?.contextSize === cs.id && <Check className="w-3 h-3 text-sky-400" />}
                               </button>
                             ))}
                           </div>
@@ -5041,8 +5175,16 @@ export default function App() {
         const driverModels = personaModalRuntimeCaps?.models || [];
         const driverModes = personaModalRuntimeCaps?.modes || [];
         const driverTiers = personaModalRuntimeCaps?.tiers || [];
+        const driverContextSizes = personaModalRuntimeCaps?.contextSizes || [];
         const selectedModelObj = driverModels.find((m) => m.id === personaDefaultModel);
         const driverEfforts = selectedModelObj?.efforts || [];
+        const modelContextIds = selectedModelObj?.contextSizes;
+        const availablePersonaContextSizes = (modelContextIds && modelContextIds.length > 0)
+          ? modelContextIds.map((id) => {
+              const match = driverContextSizes.find((c) => c.id.toLowerCase() === id.toLowerCase());
+              return match || { id, label: id, description: `${id} context window` };
+            })
+          : driverContextSizes;
 
         const driverOptions = Array.from(
           new Map(
@@ -5139,6 +5281,7 @@ export default function App() {
                         setPersonaDriverInput(e.target.value);
                         setPersonaDefaultModel('');
                         setPersonaDefaultEffort('');
+                        setPersonaDefaultContextSize('');
                       }}
                       className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
                     >
@@ -5181,7 +5324,14 @@ export default function App() {
                       <select
                         aria-label="Persona Default Model"
                         value={personaDefaultModel}
-                        onChange={(e) => setPersonaDefaultModel(e.target.value)}
+                        onChange={(e) => {
+                          const newModel = e.target.value;
+                          setPersonaDefaultModel(newModel);
+                          const newModelObj = driverModels.find((m) => m.id === newModel);
+                          if (newModelObj?.contextSizes && personaDefaultContextSize && !newModelObj.contextSizes.some((cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase())) {
+                            setPersonaDefaultContextSize('');
+                          }
+                        }}
                         className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
                       >
                         <option value="">Driver Default</option>
@@ -5229,24 +5379,44 @@ export default function App() {
                     </div>
                   </div>
 
-                  {driverTiers.length > 0 && (
+                  <div className={`grid ${driverTiers.length > 0 ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'} gap-2.5`}>
                     <div className="space-y-1">
-                      <label className="block text-[11px] text-slate-400">Default Optimization Tier</label>
+                      <label className="block text-[11px] text-slate-400">Default Context Window Size</label>
                       <select
-                        aria-label="Persona Default Tier"
-                        value={personaDefaultTier}
-                        onChange={(e) => setPersonaDefaultTier(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                        aria-label="Persona Default Context Size"
+                        value={personaDefaultContextSize}
+                        onChange={(e) => setPersonaDefaultContextSize(e.target.value)}
+                        disabled={availablePersonaContextSizes.length === 0}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 disabled:opacity-40 cursor-pointer"
                       >
-                        <option value="">Default Tier</option>
-                        {driverTiers.map((t) => (
-                          <option key={t.id} value={t.id}>
-                            {t.label}
+                        <option value="">Driver / Model Default</option>
+                        {availablePersonaContextSizes.map((cs) => (
+                          <option key={cs.id} value={cs.id} title={cs.description}>
+                            {cs.label}
                           </option>
                         ))}
                       </select>
                     </div>
-                  )}
+
+                    {driverTiers.length > 0 && (
+                      <div className="space-y-1">
+                        <label className="block text-[11px] text-slate-400">Default Optimization Tier</label>
+                        <select
+                          aria-label="Persona Default Tier"
+                          value={personaDefaultTier}
+                          onChange={(e) => setPersonaDefaultTier(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                        >
+                          <option value="">Default Tier</option>
+                          {driverTiers.map((t) => (
+                            <option key={t.id} value={t.id}>
+                              {t.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                  </div>
 
                   <div className="space-y-1">
                     <label className="block text-[11px] text-slate-400">Default Working Directory (Optional)</label>

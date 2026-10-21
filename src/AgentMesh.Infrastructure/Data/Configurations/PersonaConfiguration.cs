@@ -44,6 +44,9 @@ public class PersonaConfiguration : IEntityTypeConfiguration<Persona>
         builder.Property(p => p.DefaultTier)
             .HasMaxLength(64);
 
+        builder.Property(p => p.DefaultContextSize)
+            .HasMaxLength(64);
+
         builder.Property(p => p.DefaultWorkingDirectory)
             .HasMaxLength(512);
 

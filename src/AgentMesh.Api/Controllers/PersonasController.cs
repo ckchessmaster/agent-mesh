@@ -117,6 +117,7 @@ public class PersonasController(
             DefaultEffort = NormalizeOptional(req.DefaultEffort),
             DefaultMode = NormalizeOptional(req.DefaultMode),
             DefaultTier = NormalizeOptional(req.DefaultTier),
+            DefaultContextSize = NormalizeOptional(req.DefaultContextSize),
             DefaultWorkingDirectory = NormalizeOptional(req.DefaultWorkingDirectory),
             TrustTier = req.TrustTier,
             CreatedAt = DateTimeOffset.UtcNow,
@@ -186,6 +187,11 @@ public class PersonasController(
         if (req.DefaultTier != null)
         {
             persona.DefaultTier = NormalizeOptional(req.DefaultTier);
+        }
+
+        if (req.DefaultContextSize != null)
+        {
+            persona.DefaultContextSize = NormalizeOptional(req.DefaultContextSize);
         }
 
         if (req.DefaultWorkingDirectory != null)
@@ -352,6 +358,9 @@ public class PersonasController(
         var effectiveTier = !string.IsNullOrWhiteSpace(req.Tier)
             ? req.Tier
             : persona.DefaultTier;
+        var effectiveContextSize = req.ContextSize != null
+            ? req.ContextSize
+            : persona.DefaultContextSize;
 
         var initialMetadata = SessionsController.MergeSessionMetadata(
             req.MetadataJson,
@@ -363,7 +372,8 @@ public class PersonasController(
             persona.Id,
             persona.Name,
             persona.Role,
-            persona.PersonaPrompt);
+            persona.PersonaPrompt,
+            effectiveContextSize);
 
         var hasAttachments = req.Attachments is { Count: > 0 };
         var hasInitialPrompt = !string.IsNullOrWhiteSpace(req.InitialPrompt) || hasAttachments;
@@ -428,6 +438,7 @@ public class PersonasController(
             if (promptMsg != null)
             {
                 var (workDir, model, effort, mode, tier) = SessionsController.ExtractSessionSettings(session.MetadataJson);
+                var contextSize = SessionsController.ExtractSessionContextSize(session.MetadataJson);
                 var payload = new
                 {
                     sessionId = session.Id,
@@ -445,6 +456,7 @@ public class PersonasController(
                     effort = effort,
                     mode = mode,
                     tier = tier,
+                    contextSize = contextSize,
                     attachments = req.Attachments,
                     createdAt = promptMsg.CreatedAt
                 };
@@ -515,7 +527,8 @@ public class PersonasController(
         (int)p.TrustTier,
         sessionCount,
         p.CreatedAt,
-        p.UpdatedAt
+        p.UpdatedAt,
+        p.DefaultContextSize
     );
 }
 
@@ -530,7 +543,8 @@ public record CreatePersonaRequest(
     string? DefaultMode = null,
     string? DefaultTier = null,
     string? DefaultWorkingDirectory = null,
-    TrustTier TrustTier = TrustTier.Intern
+    TrustTier TrustTier = TrustTier.Intern,
+    string? DefaultContextSize = null
 );
 
 public record UpdatePersonaRequest(
@@ -543,7 +557,8 @@ public record UpdatePersonaRequest(
     string? DefaultMode = null,
     string? DefaultTier = null,
     string? DefaultWorkingDirectory = null,
-    TrustTier? TrustTier = null
+    TrustTier? TrustTier = null,
+    string? DefaultContextSize = null
 );
 
 public record PersonaDto(
@@ -562,5 +577,6 @@ public record PersonaDto(
     int TrustTier,
     int SessionCount,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt
+    DateTimeOffset UpdatedAt,
+    string? DefaultContextSize = null
 );

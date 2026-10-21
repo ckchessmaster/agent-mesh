@@ -50,6 +50,7 @@ export interface SessionControlOptions {
   effort?: string;
   mode?: string;
   tier?: string;
+  contextSize?: string;
   attachments?: SessionAttachment[];
 }
 
@@ -108,6 +109,7 @@ export const api = {
     defaultEffort?: string;
     defaultMode?: string;
     defaultTier?: string;
+    defaultContextSize?: string;
     defaultWorkingDirectory?: string;
     trustTier?: number;
   }): Promise<Persona> {
@@ -131,6 +133,7 @@ export const api = {
       defaultEffort?: string;
       defaultMode?: string;
       defaultTier?: string;
+      defaultContextSize?: string;
       defaultWorkingDirectory?: string;
       trustTier?: number;
     }
@@ -176,6 +179,7 @@ export const api = {
         effort: options?.effort,
         mode: options?.mode,
         tier: options?.tier,
+        contextSize: options?.contextSize,
         attachments: options?.attachments
       })
     });
@@ -274,6 +278,7 @@ export const api = {
         effort: options?.effort,
         mode: options?.mode,
         tier: options?.tier,
+        contextSize: options?.contextSize,
         attachments: options?.attachments
       })
     });
@@ -316,6 +321,7 @@ export const api = {
         effort: options?.effort,
         mode: options?.mode,
         tier: options?.tier,
+        contextSize: options?.contextSize,
         attachments: options?.attachments
       })
     });
@@ -339,6 +345,7 @@ export const api = {
       model?: string;
       effort?: string;
       tier?: string;
+      contextSize?: string;
       mode?: string;
       workingDirectory?: string;
     }
@@ -448,6 +455,7 @@ export const api = {
       model?: string;
       effort?: string;
       tier?: string;
+      contextSize?: string;
       mode?: string;
       workingDirectory?: string;
       attachments?: SessionAttachment[];

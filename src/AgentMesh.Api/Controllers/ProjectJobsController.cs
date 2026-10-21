@@ -729,6 +729,7 @@ public class ProjectJobsController(
                     ["effort"] = persona.DefaultEffort,
                     ["mode"] = persona.DefaultMode,
                     ["tier"] = persona.DefaultTier,
+                    ["contextSize"] = persona.DefaultContextSize,
                     ["attachments"] = req.Attachments
                 };
 
@@ -813,6 +814,7 @@ public class ProjectJobsController(
                         effort = persona.DefaultEffort,
                         mode = persona.DefaultMode,
                         tier = persona.DefaultTier,
+                        contextSize = persona.DefaultContextSize,
                         jobId = job.Id,
                         projectId = project.Id,
                         gitBranch = job.GitBranchName,

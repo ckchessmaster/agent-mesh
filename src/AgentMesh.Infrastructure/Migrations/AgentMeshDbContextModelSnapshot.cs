@@ -364,6 +364,11 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnName("created_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
 
+                    b.Property<string>("DefaultContextSize")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("default_context_size");
+
                     b.Property<string>("DefaultEffort")
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)")
