@@ -74,16 +74,18 @@ public class ProjectJobsControllerTests
         var controller = new ProjectJobsController(db);
 
         // 1. Add Task
-        var addRes = await controller.AddJobTask(job.Id, new CreateJobTaskRequest("New feature"));
+        var addRes = await controller.AddJobTask(job.Id, new CreateJobTaskRequest("New feature", RequiresDiscussion: true));
         var added = (addRes.Should().BeOfType<OkObjectResult>().Subject.Value as JobTaskDto)!;
         added.Title.Should().Be("New feature");
         added.IsCompleted.Should().BeFalse();
+        added.RequiresDiscussion.Should().BeTrue();
 
         // 2. Toggle Task
-        var updateRes = await controller.UpdateJobTask(job.Id, added.Id, new UpdateJobTaskRequest(IsCompleted: true));
+        var updateRes = await controller.UpdateJobTask(job.Id, added.Id, new UpdateJobTaskRequest(IsCompleted: true, RequiresDiscussion: false));
         var updated = (updateRes.Should().BeOfType<OkObjectResult>().Subject.Value as JobTaskDto)!;
         updated.IsCompleted.Should().BeTrue();
         updated.CompletedAt.Should().NotBeNull();
+        updated.RequiresDiscussion.Should().BeFalse();
 
         // 3. Delete Task
         var delRes = await controller.DeleteJobTask(job.Id, added.Id);
@@ -211,6 +213,64 @@ public class ProjectJobsControllerTests
         promptMsg.Content.Should().Contain("[ ] (Queued) Third Step Queued");
         promptMsg.Content.Should().Contain("[Current Target Task]: \"Second Step Active\"");
         promptMsg.Content.Should().Contain("[Sequential Execution Rule]");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WithDiscussionRequiredTask_SetsDiscussionAckAndPromptDirective()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var driver = new Agent { Id = "agy", Name = "Antigravity", RuntimeType = RuntimeType.CliAgy, TrustTier = TrustTier.SeniorManager };
+        var persona = new Persona { Id = "astra", Name = "Astra", Role = "Tech Lead", DriverId = "agy", PersonaPrompt = "You are Astra." };
+        var project = new Project
+        {
+            Id = "proj-discuss",
+            Name = "Task Discuss Project",
+            WorkspaceType = WorkspaceType.Git
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-discuss",
+            Title = "Discussion Feature Job",
+            GitBranchName = "mesh/job-discuss",
+            TasksJson = System.Text.Json.JsonSerializer.Serialize(new List<JobTaskDto>
+            {
+                new() { Id = Guid.NewGuid(), Title = "First Step Completed", IsCompleted = true, CompletedAt = DateTimeOffset.UtcNow },
+                new() { Id = Guid.NewGuid(), Title = "Second Step Needs Discussion", IsCompleted = false, RequiresDiscussion = true },
+                new() { Id = Guid.NewGuid(), Title = "Third Step Queued Discuss", IsCompleted = false, RequiresDiscussion = true }
+            })
+        };
+        db.Agents.Add(driver);
+        db.Personas.Add(persona);
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = "proj-discuss", PersonaId = "astra" });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var msgReq = new PostJobMessageRequest(
+            Content: "@astra please work on the tasks"
+        );
+
+        var result = await controller.PostJobMessage(job.Id, msgReq);
+        result.Should().BeOfType<OkObjectResult>();
+
+        // Verify acknowledgment message includes discussion-specific phrasing
+        var ackMsg = await db.JobMessages.FirstOrDefaultAsync(m => m.JobId == job.Id && m.SenderType == "persona");
+        ackMsg.Should().NotBeNull();
+        ackMsg!.Content.Should().Be("I'm on it — starting discussion on \"Second Step Needs Discussion\" before coding.");
+
+        // Verify prompt content includes discussion tags, rule, and [READY_TO_PROCEED] instruction
+        var promptMsg = await db.SessionMessages.FirstOrDefaultAsync(m => m.EventType == "prompt");
+        promptMsg.Should().NotBeNull();
+        promptMsg!.Content.Should().Contain("[Job Tasks & Sequential Checklist]:");
+        promptMsg.Content.Should().Contain("[x] First Step Completed");
+        promptMsg.Content.Should().Contain("[ ] (CURRENT ACTIVE FOCUS - DISCUSSION REQUIRED) Second Step Needs Discussion");
+        promptMsg.Content.Should().Contain("[ ] (Queued - Discuss First) Third Step Queued Discuss");
+        promptMsg.Content.Should().Contain("[Current Target Task]: \"Second Step Needs Discussion\"");
+        promptMsg.Content.Should().Contain("[Discussion Required Rule]");
+        promptMsg.Content.Should().Contain("[READY_TO_PROCEED]");
     }
 
     [Fact]

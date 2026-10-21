@@ -63,13 +63,15 @@ public record UpdateProjectJobRequest(
 
 public record CreateJobTaskRequest(
     string Title,
-    string? AssignedPersonaId = null
+    string? AssignedPersonaId = null,
+    bool? RequiresDiscussion = false
 );
 
 public record UpdateJobTaskRequest(
     string? Title = null,
     bool? IsCompleted = null,
-    string? AssignedPersonaId = null
+    string? AssignedPersonaId = null,
+    bool? RequiresDiscussion = null
 );
 
 public record JobAttachmentDto(
@@ -324,6 +326,7 @@ public class ProjectJobsController(
             Id = Guid.NewGuid(),
             Title = req.Title.Trim(),
             IsCompleted = false,
+            RequiresDiscussion = req.RequiresDiscussion ?? false,
             AssignedPersonaId = req.AssignedPersonaId?.Trim().ToLowerInvariant()
         };
         tasks.Add(newTask);
@@ -365,6 +368,10 @@ public class ProjectJobsController(
         if (req.AssignedPersonaId != null)
         {
             task.AssignedPersonaId = req.AssignedPersonaId.Trim().ToLowerInvariant();
+        }
+        if (req.RequiresDiscussion.HasValue)
+        {
+            task.RequiresDiscussion = req.RequiresDiscussion.Value;
         }
 
         job.TasksJson = JsonSerializer.Serialize(tasks, JsonOpts);
@@ -850,30 +857,13 @@ public class ProjectJobsController(
 
                 var tasks = ParseTasks(job.TasksJson);
                 var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
-
-                var taskContextSb = new System.Text.StringBuilder();
-                if (tasks.Count > 0)
-                {
-                    taskContextSb.AppendLine("[Job Tasks & Sequential Checklist]:");
-                    for (int i = 0; i < tasks.Count; i++)
-                    {
-                        var t = tasks[i];
-                        var statusTag = t.IsCompleted ? "[x]" : (t.Id == activeTask?.Id ? "[ ] (CURRENT ACTIVE FOCUS)" : "[ ] (Queued)");
-                        taskContextSb.AppendLine($"{i + 1}. {statusTag} {t.Title}");
-                    }
-                    if (activeTask != null)
-                    {
-                        taskContextSb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
-                        taskContextSb.AppendLine("[Sequential Execution Rule]: You must work on and complete tasks sequentially one by one in the order listed above. Focus on completing the current active task first before moving to subsequent tasks.");
-                    }
-                    taskContextSb.AppendLine();
-                }
+                var taskContext = FormatTaskContext(tasks);
 
                 // Format prompt context for runner
                 var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
                                         (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
                                         $"[Job Context: {job.Title} - {job.Description}]\n\n" +
-                                        taskContextSb +
+                                        taskContext +
                                         effectiveContent;
 
                 var promptMsg = new SessionMessage
@@ -928,7 +918,9 @@ public class ProjectJobsController(
                 if (req.SenderType == "user")
                 {
                     var ackContent = activeTask != null
-                        ? $"I'm on it — starting work on \"{activeTask.Title}\" now."
+                        ? (activeTask.RequiresDiscussion
+                            ? $"I'm on it — starting discussion on \"{activeTask.Title}\" before coding."
+                            : $"I'm on it — starting work on \"{activeTask.Title}\" now.")
                         : "I'm on it — starting work on this now.";
 
                     ackMsg = new JobMessage
@@ -1075,6 +1067,48 @@ public class ProjectJobsController(
         {
             return new();
         }
+    }
+
+    private static string FormatTaskContext(List<JobTaskDto> tasks)
+    {
+        if (tasks.Count == 0) return string.Empty;
+
+        var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("[Job Tasks & Sequential Checklist]:");
+        for (int i = 0; i < tasks.Count; i++)
+        {
+            var t = tasks[i];
+            string statusTag;
+            if (t.IsCompleted)
+            {
+                statusTag = "[x]";
+            }
+            else if (t.Id == activeTask?.Id)
+            {
+                statusTag = t.RequiresDiscussion
+                    ? "[ ] (CURRENT ACTIVE FOCUS - DISCUSSION REQUIRED)"
+                    : "[ ] (CURRENT ACTIVE FOCUS)";
+            }
+            else
+            {
+                statusTag = t.RequiresDiscussion
+                    ? "[ ] (Queued - Discuss First)"
+                    : "[ ] (Queued)";
+            }
+            sb.AppendLine($"{i + 1}. {statusTag} {t.Title}");
+        }
+        if (activeTask != null)
+        {
+            sb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
+            sb.AppendLine("[Sequential Execution Rule]: You must work on and complete tasks sequentially one by one in the order listed above. Focus on completing the current active task first before moving to subsequent tasks.");
+            if (activeTask.RequiresDiscussion)
+            {
+                sb.AppendLine("[Discussion Required Rule]: This task is flagged for discussion before starting coding. Do NOT write or edit code yet. Discuss requirements, clarify questions, evaluate design/architecture trade-offs, or conduct an alignment interview with the user. When you and the user have reached alignment and you are ready to begin implementation, conclude your response by including the tag [READY_TO_PROCEED] so the user can review and approve proceeding to code.");
+            }
+        }
+        sb.AppendLine();
+        return sb.ToString();
     }
 
     public static List<QueuedJobTurnDto> ParseQueuedTurns(string? json)
@@ -1329,29 +1363,12 @@ public class ProjectJobsController(
 
             var tasks = ParseTasks(job.TasksJson);
             var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
-
-            var taskContextSb = new System.Text.StringBuilder();
-            if (tasks.Count > 0)
-            {
-                taskContextSb.AppendLine("[Job Tasks & Sequential Checklist]:");
-                for (int i = 0; i < tasks.Count; i++)
-                {
-                    var t = tasks[i];
-                    var statusTag = t.IsCompleted ? "[x]" : (t.Id == activeTask?.Id ? "[ ] (CURRENT ACTIVE FOCUS)" : "[ ] (Queued)");
-                    taskContextSb.AppendLine($"{i + 1}. {statusTag} {t.Title}");
-                }
-                if (activeTask != null)
-                {
-                    taskContextSb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
-                    taskContextSb.AppendLine("[Sequential Execution Rule]: You must work on and complete tasks sequentially one by one in the order listed above. Focus on completing the current active task first before moving to subsequent tasks.");
-                }
-                taskContextSb.AppendLine();
-            }
+            var taskContext = FormatTaskContext(tasks);
 
             var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
                                     (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
                                     $"[Job Context: {job.Title} - {job.Description}]\n\n" +
-                                    taskContextSb +
+                                    taskContext +
                                     turnToDispatch.Content;
 
             var structuredPayloadJson = turnToDispatch.Attachments is { Count: > 0 }
@@ -1377,7 +1394,9 @@ public class ProjectJobsController(
             }
 
             var ackContent = activeTask != null
-                ? $"I'm on it — starting work on \"{activeTask.Title}\" now."
+                ? (activeTask.RequiresDiscussion
+                    ? $"I'm on it — starting discussion on \"{activeTask.Title}\" before coding."
+                    : $"I'm on it — starting work on \"{activeTask.Title}\" now.")
                 : "I'm on it — starting work on this now.";
 
             var ackMsg = new JobMessage

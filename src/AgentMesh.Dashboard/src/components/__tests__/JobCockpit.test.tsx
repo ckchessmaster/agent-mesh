@@ -768,4 +768,123 @@ describe('JobCockpit - Attachment Support', () => {
     // Queued badge on team member
     expect(screen.getByText('Queued (1)')).toBeInTheDocument();
   });
+
+  it('renders Discuss First badge, allows toggling discussion requirement, and adding a task with discussion enabled', async () => {
+    const onAddTask = vi.fn().mockResolvedValue(undefined);
+    const onUpdateTask = vi.fn().mockResolvedValue(undefined);
+
+    const testTasks: JobTask[] = [
+      { id: 'task-1', title: 'Task with Discussion', isCompleted: false, requiresDiscussion: true },
+      { id: 'task-2', title: 'Standard Task', isCompleted: false, requiresDiscussion: false }
+    ];
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        tasks={testTasks}
+        onAddTask={onAddTask}
+        onUpdateTask={onUpdateTask}
+      />
+    );
+
+    // Current focus badge has [Discuss] tag
+    expect(screen.getByTestId('current-focus-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('focus-discuss-tag')).toHaveTextContent('[Discuss]');
+
+    // Task 1 has Discuss First badge
+    expect(screen.getByTestId('task-discuss-task-1')).toBeInTheDocument();
+    expect(screen.getByText('Discuss First')).toBeInTheDocument();
+
+    // Toggle discussion on Task 2
+    const toggleTask2Btn = screen.getByTestId('toggle-discuss-task-task-2');
+    fireEvent.click(toggleTask2Btn);
+    expect(onUpdateTask).toHaveBeenCalledWith('task-2', { requiresDiscussion: true });
+
+    // Toggle discussion on Task 1 off
+    const toggleTask1Btn = screen.getByTestId('toggle-discuss-task-task-1');
+    fireEvent.click(toggleTask1Btn);
+    expect(onUpdateTask).toHaveBeenCalledWith('task-1', { requiresDiscussion: false });
+
+    // Inline task form with Discuss toggle
+    const input = screen.getByTestId('new-task-input');
+    const discussToggle = screen.getByTestId('new-task-discuss-toggle');
+    fireEvent.change(input, { target: { value: 'New Architecture Task' } });
+    fireEvent.click(discussToggle);
+
+    // Submit form
+    const addBtn = screen.getByRole('button', { name: /Add Task/i });
+    fireEvent.click(addBtn);
+
+    expect(onAddTask).toHaveBeenCalledWith('New Architecture Task', true);
+  });
+
+  it('renders interactive Ready to Proceed card when agent outputs [READY_TO_PROCEED], strips tag from message, and allows proceeding to code', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const onUpdateTask = vi.fn().mockResolvedValue(undefined);
+
+    const discussionTask: JobTask = {
+      id: 'task-discuss-1',
+      title: 'Database Schema Review',
+      isCompleted: false,
+      requiresDiscussion: true
+    };
+
+    const agentMsg: JobMessage = {
+      id: 'msg-ready-1',
+      jobId: mockJob.id,
+      senderType: 'persona',
+      senderId: 'astra',
+      senderName: 'Astra',
+      content: 'I have evaluated the database trade-offs and we are aligned on using PostgreSQL JSONB.\n\n[READY_TO_PROCEED]',
+      mentions: [],
+      createdAt: new Date().toISOString()
+    };
+
+    const { rerender } = render(
+      <JobCockpit
+        {...mockProps}
+        tasks={[discussionTask]}
+        messages={[agentMsg]}
+        onSendMessage={onSendMessage}
+        onUpdateTask={onUpdateTask}
+      />
+    );
+
+    // Verify tag is stripped from rendered message text
+    expect(screen.queryByText(/\[READY_TO_PROCEED\]/)).not.toBeInTheDocument();
+    expect(screen.getByText(/I have evaluated the database trade-offs/i)).toBeInTheDocument();
+
+    // Verify Ready to Proceed card is rendered
+    expect(screen.getByTestId('ready-to-proceed-card-msg-ready-1')).toBeInTheDocument();
+    expect(screen.getByText('Ready to Proceed')).toBeInTheDocument();
+    expect(screen.getByText('Alignment Proposed')).toBeInTheDocument();
+
+    // Click Proceed to Coding
+    const proceedBtn = screen.getByTestId('proceed-to-coding-btn');
+    expect(proceedBtn).toBeInTheDocument();
+    fireEvent.click(proceedBtn);
+
+    // Verify discussion requirement unflagged and message dispatched
+    await waitFor(() => {
+      expect(onUpdateTask).toHaveBeenCalledWith('task-discuss-1', { requiresDiscussion: false });
+      expect(onSendMessage).toHaveBeenCalledWith(
+        expect.stringContaining('Discussion approved — proceed with implementation of "Database Schema Review".')
+      );
+    });
+
+    // Rerender with task discussion cleared
+    rerender(
+      <JobCockpit
+        {...mockProps}
+        tasks={[{ ...discussionTask, requiresDiscussion: false }]}
+        messages={[agentMsg]}
+        onSendMessage={onSendMessage}
+        onUpdateTask={onUpdateTask}
+      />
+    );
+
+    // Card now displays unlocked status
+    expect(screen.getByText(/Discussion approved — implementation unlocked/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('proceed-to-coding-btn')).not.toBeInTheDocument();
+  });
 });

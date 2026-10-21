@@ -652,16 +652,25 @@ export default function App() {
     });
   };
 
-  const handleAddTask = async (title: string) => {
+  const handleAddTask = async (title: string, requiresDiscussion?: boolean) => {
     if (!selectedJobId) return;
-    const task = await api.addJobTask(selectedJobId, { title });
+    const payload: { title: string; requiresDiscussion?: boolean } = { title };
+    if (requiresDiscussion) payload.requiresDiscussion = true;
+    const task = await api.addJobTask(selectedJobId, payload);
     setJobTasks((prev) => (prev.some((t) => t.id === task.id) ? prev : [...prev, task]));
   };
 
-  const handleToggleTask = async (taskId: string, isCompleted: boolean) => {
+  const handleUpdateTask = async (
+    taskId: string,
+    updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string }
+  ) => {
     if (!selectedJobId) return;
-    const updated = await api.updateJobTask(selectedJobId, taskId, { isCompleted });
+    const updated = await api.updateJobTask(selectedJobId, taskId, updates);
     setJobTasks((prev) => prev.map((t) => (t.id === taskId ? updated : t)));
+  };
+
+  const handleToggleTask = async (taskId: string, isCompleted: boolean) => {
+    await handleUpdateTask(taskId, { isCompleted });
   };
 
   const handleDeleteTask = async (taskId: string) => {
@@ -2959,6 +2968,7 @@ export default function App() {
                     onSendMessage={handleSendJobMessage}
                     onAddTask={handleAddTask}
                     onToggleTask={handleToggleTask}
+                    onUpdateTask={handleUpdateTask}
                     onDeleteTask={handleDeleteTask}
                     onCompleteJob={handleCompleteJob}
                     onArchiveJob={handleArchiveJob}

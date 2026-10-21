@@ -685,7 +685,7 @@ export const api = {
     return res.json();
   },
 
-  async addJobTask(id: string, req: { title: string; assignedPersonaId?: string }): Promise<JobTask> {
+  async addJobTask(id: string, req: { title: string; assignedPersonaId?: string; requiresDiscussion?: boolean }): Promise<JobTask> {
     const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, {
       method: 'POST',
       headers: getHeaders(),
@@ -695,7 +695,7 @@ export const api = {
     return res.json();
   },
 
-  async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; assignedPersonaId?: string }): Promise<JobTask> {
+  async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; assignedPersonaId?: string; requiresDiscussion?: boolean }): Promise<JobTask> {
     const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
       method: 'PUT',
       headers: getHeaders(),

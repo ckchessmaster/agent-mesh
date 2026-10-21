@@ -300,6 +300,7 @@ export interface JobTask {
   id: string;
   title: string;
   isCompleted: boolean;
+  requiresDiscussion?: boolean;
   assignedPersonaId?: string | null;
   completedAt?: string | null;
 }

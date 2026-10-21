@@ -8,6 +8,7 @@ public class JobTaskDto
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Title { get; set; } = string.Empty;
     public bool IsCompleted { get; set; }
+    public bool RequiresDiscussion { get; set; } = false;
     public string? AssignedPersonaId { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
 }

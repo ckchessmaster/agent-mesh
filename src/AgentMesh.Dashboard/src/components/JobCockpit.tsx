@@ -28,7 +28,9 @@ import {
   RefreshCw,
   Archive,
   RotateCcw,
-  Clock
+  Clock,
+  MessageSquareQuote,
+  Play
 } from 'lucide-react';
 import type { AgentSession, JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
@@ -156,8 +158,9 @@ interface JobCockpitProps {
   messages: JobMessage[];
   personas?: Persona[];
   onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
-  onAddTask: (title: string) => Promise<void>;
+  onAddTask: (title: string, requiresDiscussion?: boolean) => Promise<void>;
   onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
+  onUpdateTask?: (taskId: string, updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string }) => Promise<void>;
   onDeleteTask: (taskId: string) => Promise<void>;
   onCompleteJob: (resultSummary?: string) => Promise<void>;
   onArchiveJob?: () => Promise<void>;
@@ -180,6 +183,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onSendMessage,
   onAddTask,
   onToggleTask,
+  onUpdateTask,
   onDeleteTask,
   onCompleteJob,
   onArchiveJob,
@@ -192,6 +196,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 }) => {
   const [prompt, setPrompt] = useState('');
   const [newTaskTitle, setNewTaskTitle] = useState('');
+  const [newTaskRequiresDiscussion, setNewTaskRequiresDiscussion] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isAddingTask, setIsAddingTask] = useState(false);
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
@@ -643,13 +648,24 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     e.preventDefault();
     if (!newTaskTitle.trim() || isAddingTask) return;
     const t = newTaskTitle.trim();
+    const reqDisc = newTaskRequiresDiscussion;
     setNewTaskTitle('');
+    setNewTaskRequiresDiscussion(false);
     setIsAddingTask(true);
     try {
-      await onAddTask(t);
+      await onAddTask(t, reqDisc);
     } finally {
       setIsAddingTask(false);
     }
+  };
+
+  const handleProceedToCoding = async (targetTask?: JobTask, personaId?: string | null) => {
+    if (targetTask && onUpdateTask && targetTask.requiresDiscussion) {
+      await onUpdateTask(targetTask.id, { requiresDiscussion: false });
+    }
+    const mentionPrefix = personaId ? `@${personaId} ` : '';
+    const proceedText = `${mentionPrefix}Discussion approved — proceed with implementation of "${targetTask?.title || 'the task'}".`;
+    await onSendMessage(proceedText);
   };
 
   const handleMentionInsert = (personaId: string) => {
@@ -949,12 +965,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             </span>
             {firstPendingTask && (
               <span
-                className="hidden xl:inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg bg-sky-500/10 text-sky-300 border border-sky-500/25 max-w-xs truncate"
-                title={`Current sequential target: ${firstPendingTask.title}`}
+                className={`hidden xl:inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg border max-w-xs truncate ${
+                  firstPendingTask.requiresDiscussion
+                    ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                    : 'bg-sky-500/10 text-sky-300 border-sky-500/25'
+                }`}
+                title={`Current sequential target: ${firstPendingTask.title}${firstPendingTask.requiresDiscussion ? ' (Discussion Required)' : ''}`}
                 data-testid="current-focus-badge"
               >
-                <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse shrink-0" />
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${firstPendingTask.requiresDiscussion ? 'bg-amber-400 animate-pulse' : 'bg-sky-400 animate-pulse'}`} />
                 <span className="text-slate-400 font-normal">Focus:</span>
+                {firstPendingTask.requiresDiscussion && (
+                  <span className="text-amber-400 font-semibold" data-testid="focus-discuss-tag">[Discuss]</span>
+                )}
                 <span className="truncate">#{firstPendingTaskIndex + 1} {firstPendingTask.title}</span>
               </span>
             )}
@@ -1070,18 +1093,47 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                           <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
                             Completed
                           </span>
-                        ) : isCurrentFocus ? (
-                          <span
-                            className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
-                            data-testid={`task-focus-${task.id}`}
-                          >
-                            <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
-                            In Progress
-                          </span>
                         ) : (
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
-                            Queued
-                          </span>
+                          <>
+                            {task.requiresDiscussion && (
+                              <span
+                                className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 font-semibold"
+                                data-testid={`task-discuss-${task.id}`}
+                                title="Discussion required before starting coding"
+                              >
+                                <MessageSquareQuote className="w-3 h-3 text-amber-400 shrink-0" />
+                                Discuss First
+                              </span>
+                            )}
+                            {isCurrentFocus ? (
+                              <span
+                                className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
+                                data-testid={`task-focus-${task.id}`}
+                              >
+                                <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+                                In Progress
+                              </span>
+                            ) : (
+                              <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
+                                Queued
+                              </span>
+                            )}
+                          </>
+                        )}
+                        {!task.isCompleted && onUpdateTask && (
+                          <button
+                            type="button"
+                            onClick={() => onUpdateTask(task.id, { requiresDiscussion: !task.requiresDiscussion })}
+                            className={`p-1 rounded transition cursor-pointer ${
+                              task.requiresDiscussion
+                                ? 'text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30'
+                                : 'text-slate-500 hover:text-amber-400 hover:bg-slate-800 opacity-0 group-hover:opacity-100'
+                            }`}
+                            title={task.requiresDiscussion ? 'Discussion required before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
+                            data-testid={`toggle-discuss-task-${task.id}`}
+                          >
+                            <MessageSquareQuote className="w-3.5 h-3.5" />
+                          </button>
                         )}
                         <button
                           type="button"
@@ -1109,6 +1161,20 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition shadow-inner"
                 data-testid="new-task-input"
               />
+              <button
+                type="button"
+                onClick={() => setNewTaskRequiresDiscussion((prev) => !prev)}
+                className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
+                  newTaskRequiresDiscussion
+                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold shadow-sm'
+                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+                title={newTaskRequiresDiscussion ? 'Flagged for discussion before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
+                data-testid="new-task-discuss-toggle"
+              >
+                <MessageSquareQuote className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Discuss</span>
+              </button>
               <button
                 type="submit"
                 disabled={!newTaskTitle.trim() || isAddingTask}
@@ -1176,15 +1242,67 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                         </span>
                       </div>
 
-                      <div
-                        className={`p-3.5 rounded-2xl text-xs leading-relaxed border ${
-                          isUser
-                            ? 'bg-sky-600/20 border-sky-500/30 text-sky-100 text-left rounded-tr-none'
-                            : 'bg-slate-900 border-slate-800 text-slate-200 rounded-tl-none shadow-sm'
-                        }`}
-                      >
-                        <MarkdownMessage content={msg.content} isUser={isUser} />
-                      </div>
+                      {(() => {
+                        const hasReadyToProceed = !isUser && msg.content.includes('[READY_TO_PROCEED]');
+                        const displayContent = hasReadyToProceed
+                          ? msg.content.replace(/\[READY_TO_PROCEED\]/gi, '').trim()
+                          : msg.content;
+
+                        return (
+                          <>
+                            <div
+                              className={`p-3.5 rounded-2xl text-xs leading-relaxed border ${
+                                isUser
+                                  ? 'bg-sky-600/20 border-sky-500/30 text-sky-100 text-left rounded-tr-none'
+                                  : 'bg-slate-900 border-slate-800 text-slate-200 rounded-tl-none shadow-sm text-left'
+                              }`}
+                            >
+                              <MarkdownMessage content={displayContent} isUser={isUser} />
+                            </div>
+
+                            {hasReadyToProceed && (
+                              <div
+                                className="mt-2.5 p-3.5 rounded-2xl bg-sky-950/30 border border-sky-500/30 text-xs space-y-2.5 shadow-sm text-left"
+                                data-testid={`ready-to-proceed-card-${msg.id}`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="flex items-center gap-2 text-sky-200 font-semibold">
+                                    <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
+                                    <span>Ready to Proceed</span>
+                                  </div>
+                                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-300 border border-sky-500/25">
+                                    Alignment Proposed
+                                  </span>
+                                </div>
+                                <p className="text-[11px] text-slate-300 leading-relaxed">
+                                  The team has aligned on requirements and is ready to begin coding on the target task. Confirm to proceed with implementation, or reply in chat to continue discussing.
+                                </p>
+                                <div className="flex items-center gap-2 pt-1 flex-wrap">
+                                  {firstPendingTask && firstPendingTask.requiresDiscussion ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleProceedToCoding(firstPendingTask, msg.senderId)}
+                                      className="px-3.5 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 cursor-pointer shadow-sm"
+                                      data-testid="proceed-to-coding-btn"
+                                    >
+                                      <Play className="w-3.5 h-3.5 fill-current" />
+                                      <span>Proceed to Coding</span>
+                                    </button>
+                                  ) : (
+                                    <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 font-medium">
+                                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                                      <span>Discussion approved — implementation unlocked</span>
+                                    </div>
+                                  )}
+                                  <span className="text-[11px] text-slate-500 italic ml-1">
+                                    or continue talking below
+                                  </span>
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
 
                   {/* Message Attachments Rendering */}
                   {msgAttachments.length > 0 && (
