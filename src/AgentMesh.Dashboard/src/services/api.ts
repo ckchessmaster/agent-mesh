@@ -111,6 +111,7 @@ export const api = {
     defaultTier?: string;
     defaultContextSize?: string;
     defaultWorkingDirectory?: string;
+    maxConcurrentJobs?: number;
     trustTier?: number;
   }): Promise<Persona> {
     const res = await fetch('/api/personas', {
@@ -135,6 +136,7 @@ export const api = {
       defaultTier?: string;
       defaultContextSize?: string;
       defaultWorkingDirectory?: string;
+      maxConcurrentJobs?: number;
       trustTier?: number;
     }
   ): Promise<Persona> {
@@ -641,6 +643,7 @@ export const api = {
     description?: string;
     gitBranchName?: string;
     initialTasks?: string[];
+    priority?: number;
   }): Promise<ProjectJob> {
     const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
       method: 'POST',
@@ -656,6 +659,7 @@ export const api = {
     description?: string;
     status?: number;
     resultSummary?: string;
+    priority?: number;
   }): Promise<ProjectJob> {
     const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
       method: 'PUT',

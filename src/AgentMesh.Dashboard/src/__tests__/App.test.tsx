@@ -1829,6 +1829,69 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
       );
     });
   });
+
+  it('supports configuring persona max concurrent jobs in the persona modal and displaying it in the sidebar', async () => {
+    const mockDriver: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      role: 'Autonomous Codebase Driver',
+      status: 'online',
+      runtimeType: 'CliAgy',
+      trustTier: 3,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockPersona: Persona = {
+      id: 'astra-lead',
+      name: 'Astra Lead',
+      role: 'Tech Lead',
+      personaPrompt: 'Ship robust code.',
+      driverId: 'agy',
+      driverName: 'Antigravity CLI',
+      driverStatus: 'online',
+      maxConcurrentJobs: 2,
+      trustTier: 3,
+      sessionCount: 0,
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockDriver]);
+    vi.mocked(api.getPersonas).mockResolvedValue([mockPersona]);
+    vi.mocked(api.updatePersona).mockResolvedValue({
+      ...mockPersona,
+      maxConcurrentJobs: 3
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Astra Lead')).toBeInTheDocument();
+      expect(screen.getByText('Max 2 Jobs')).toBeInTheDocument();
+    });
+
+    // Open edit persona modal
+    const editBtn = screen.getByTitle('Edit Astra Lead');
+    fireEvent.click(editBtn);
+
+    expect(screen.getByText('Edit Persona: Astra Lead')).toBeInTheDocument();
+
+    const maxJobsInput = screen.getByLabelText('Persona Max Concurrent Jobs') as HTMLInputElement;
+    expect(maxJobsInput.value).toBe('2');
+
+    fireEvent.change(maxJobsInput, { target: { value: '3' } });
+    expect(maxJobsInput.value).toBe('3');
+
+    fireEvent.click(screen.getByRole('button', { name: /Save Changes/i }));
+
+    await waitFor(() => {
+      expect(api.updatePersona).toHaveBeenCalledWith(
+        'astra-lead',
+        expect.objectContaining({
+          maxConcurrentJobs: 3
+        })
+      );
+    });
+  });
 });
 
 

@@ -25,21 +25,40 @@ public record ProjectJobDto(
     string? ResultSummary,
     int MessageCount,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt
+    DateTimeOffset UpdatedAt,
+    ProjectJobPriority Priority = ProjectJobPriority.Normal,
+    List<QueuedJobTurnDto>? QueuedTurns = null
+);
+
+public record QueuedJobTurnDto(
+    Guid Id,
+    Guid JobId,
+    string ProjectId,
+    string TargetPersonaId,
+    string SenderType,
+    string? SenderId,
+    string? SenderName,
+    string Content,
+    List<string> Mentions,
+    List<JobAttachmentDto>? Attachments,
+    ProjectJobPriority Priority,
+    DateTimeOffset CreatedAt
 );
 
 public record CreateProjectJobRequest(
     string Title,
     string? Description = null,
     string? GitBranchName = null,
-    List<string>? InitialTasks = null
+    List<string>? InitialTasks = null,
+    ProjectJobPriority? Priority = null
 );
 
 public record UpdateProjectJobRequest(
     string? Title = null,
     string? Description = null,
     ProjectJobStatus? Status = null,
-    string? ResultSummary = null
+    string? ResultSummary = null,
+    ProjectJobPriority? Priority = null
 );
 
 public record CreateJobTaskRequest(
@@ -194,11 +213,13 @@ public class ProjectJobsController(
             Title = req.Title.Trim(),
             Description = req.Description?.Trim() ?? string.Empty,
             Status = ProjectJobStatus.Active,
+            Priority = req.Priority ?? ProjectJobPriority.Normal,
             GitBranchName = branch,
             S3ArchiveKey = project.WorkspaceType == WorkspaceType.S3Archive
                 ? $"projects/{normId}/jobs/{jobId}/workspace.tar.gz"
                 : null,
             TasksJson = JsonSerializer.Serialize(tasks, JsonOpts),
+            QueuedTurnsJson = "[]",
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
         };
@@ -229,6 +250,7 @@ public class ProjectJobsController(
         if (!string.IsNullOrWhiteSpace(req.Title)) job.Title = req.Title.Trim();
         if (req.Description != null) job.Description = req.Description.Trim();
         if (req.Status.HasValue) job.Status = req.Status.Value;
+        if (req.Priority.HasValue) job.Priority = req.Priority.Value;
         if (req.ResultSummary != null) job.ResultSummary = req.ResultSummary.Trim();
 
         job.UpdatedAt = DateTimeOffset.UtcNow;
@@ -657,12 +679,89 @@ public class ProjectJobsController(
         Persona? turnPersona = null;
         Agent? turnDriver = null;
 
-        // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn!
+        // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn or queue!
         if (targetPersonaId != null && req.TurnSessionId == null)
         {
             var persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == targetPersonaId);
             if (persona != null)
             {
+                // Check MaxConcurrentJobs limit
+                bool shouldQueue = false;
+                string? busyJobTitle = null;
+
+                if (persona.MaxConcurrentJobs.HasValue && persona.MaxConcurrentJobs.Value > 0)
+                {
+                    var activeTurnSessions = await db.AgentSessions
+                        .AsNoTracking()
+                        .Where(s => s.PersonaId == persona.Id && (s.Status == "thinking" || s.Status == "busy"))
+                        .ToListAsync();
+
+                    var busyJobIds = activeTurnSessions
+                        .Select(s => ExtractJobId(s.MetadataJson))
+                        .Where(jid => jid.HasValue && jid.Value != id)
+                        .Select(jid => jid!.Value)
+                        .Distinct()
+                        .ToList();
+
+                    if (busyJobIds.Count >= persona.MaxConcurrentJobs.Value)
+                    {
+                        shouldQueue = true;
+                        var firstBusyJob = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == busyJobIds[0]);
+                        busyJobTitle = firstBusyJob?.Title ?? "another job";
+                    }
+                }
+
+                if (shouldQueue)
+                {
+                    var queuedTurns = ParseQueuedTurns(job.QueuedTurnsJson);
+                    var queuedTurn = new QueuedJobTurnDto(
+                        Id: Guid.NewGuid(),
+                        JobId: id,
+                        ProjectId: project.Id,
+                        TargetPersonaId: persona.Id,
+                        SenderType: req.SenderType,
+                        SenderId: req.SenderId,
+                        SenderName: req.SenderName,
+                        Content: effectiveContent,
+                        Mentions: mentions,
+                        Attachments: req.Attachments,
+                        Priority: job.Priority,
+                        CreatedAt: DateTimeOffset.UtcNow
+                    );
+                    queuedTurns.Add(queuedTurn);
+                    job.QueuedTurnsJson = JsonSerializer.Serialize(queuedTurns, JsonOpts);
+                    job.UpdatedAt = DateTimeOffset.UtcNow;
+
+                    db.JobMessages.Add(jobMsg);
+
+                    var busyContent = $"I'm currently busy working on another job (\"{busyJobTitle}\"), but I've queued this up and will start as soon as I'm done!";
+                    var busyMsg = new JobMessage
+                    {
+                        Id = Guid.NewGuid(),
+                        JobId = id,
+                        SenderType = "persona",
+                        SenderId = persona.Id,
+                        SenderName = persona.Name,
+                        Content = busyContent,
+                        MentionsJson = JsonSerializer.Serialize(new List<string> { persona.Id }, JsonOpts),
+                        TurnSessionId = null,
+                        CreatedAt = DateTimeOffset.UtcNow
+                    };
+                    db.JobMessages.Add(busyMsg);
+                    await db.SaveChangesAsync();
+
+                    if (hubContext != null)
+                    {
+                        await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(jobMsg));
+                        await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(busyMsg));
+                        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+                        var jobDto = ToDto(job, project.Name, msgCount);
+                        await hubContext.Clients.All.SendAsync("JobUpdated", jobDto);
+                    }
+
+                    return Ok(ToMessageDto(jobMsg));
+                }
+
                 turnPersona = persona;
                 var driverId = persona.DriverId.Trim().ToLowerInvariant();
                 var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
@@ -978,6 +1077,35 @@ public class ProjectJobsController(
         }
     }
 
+    public static List<QueuedJobTurnDto> ParseQueuedTurns(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return new();
+        try
+        {
+            return JsonSerializer.Deserialize<List<QueuedJobTurnDto>>(json, JsonOpts) ?? new();
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    public static Guid? ExtractJobId(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(metadataJson);
+            if (doc.RootElement.TryGetProperty("jobId", out var elem))
+            {
+                var val = elem.GetString();
+                if (Guid.TryParse(val, out var jid)) return jid;
+            }
+        }
+        catch { }
+        return null;
+    }
+
     private static ProjectJobDto ToDto(ProjectJob j, string? projectName, int msgCount)
     {
         return new ProjectJobDto(
@@ -993,7 +1121,9 @@ public class ProjectJobsController(
             j.ResultSummary,
             msgCount,
             j.CreatedAt,
-            j.UpdatedAt
+            j.UpdatedAt,
+            j.Priority,
+            ParseQueuedTurns(j.QueuedTurnsJson)
         );
     }
 
@@ -1051,5 +1181,264 @@ public class ProjectJobsController(
             m.CreatedAt,
             attachments
         );
+    }
+
+    public static async Task CheckAndDispatchQueuedJobTurnsAsync(
+        AgentMeshDbContext db,
+        IHubContext<AgentMeshHub>? hubContext,
+        string personaId)
+    {
+        if (string.IsNullOrWhiteSpace(personaId)) return;
+        var normPersonaId = personaId.Trim().ToLowerInvariant();
+        var persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == normPersonaId);
+        if (persona == null) return;
+
+        var candidateJobs = await db.ProjectJobs
+            .Where(j => j.Status == ProjectJobStatus.Active && j.QueuedTurnsJson != "[]")
+            .ToListAsync();
+
+        if (candidateJobs.Count == 0) return;
+
+        var allQueuedTurns = new List<(ProjectJob Job, QueuedJobTurnDto Turn)>();
+        foreach (var job in candidateJobs)
+        {
+            var turns = ParseQueuedTurns(job.QueuedTurnsJson);
+            foreach (var t in turns)
+            {
+                if (string.Equals(t.TargetPersonaId, normPersonaId, StringComparison.OrdinalIgnoreCase))
+                {
+                    allQueuedTurns.Add((job, t));
+                }
+            }
+        }
+
+        if (allQueuedTurns.Count == 0) return;
+
+        var orderedTurns = allQueuedTurns
+            .OrderByDescending(x => (int)x.Job.Priority)
+            .ThenBy(x => x.Turn.CreatedAt)
+            .ToList();
+
+        int availableSlots = int.MaxValue;
+        if (persona.MaxConcurrentJobs.HasValue && persona.MaxConcurrentJobs.Value > 0)
+        {
+            var activeTurnSessions = await db.AgentSessions
+                .AsNoTracking()
+                .Where(s => s.PersonaId == normPersonaId && (s.Status == "thinking" || s.Status == "busy"))
+                .ToListAsync();
+
+            var busyJobIds = activeTurnSessions
+                .Select(s => ExtractJobId(s.MetadataJson))
+                .Where(jid => jid.HasValue)
+                .Select(jid => jid!.Value)
+                .Distinct()
+                .ToHashSet();
+
+            availableSlots = Math.Max(0, persona.MaxConcurrentJobs.Value - busyJobIds.Count);
+        }
+
+        if (availableSlots <= 0) return;
+
+        foreach (var (job, turnToDispatch) in orderedTurns)
+        {
+            if (availableSlots <= 0) break;
+
+            var turns = ParseQueuedTurns(job.QueuedTurnsJson);
+            turns.RemoveAll(t => t.Id == turnToDispatch.Id);
+            job.QueuedTurnsJson = JsonSerializer.Serialize(turns, JsonOpts);
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+
+            var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+            if (project == null) continue;
+
+            var driverId = persona.DriverId.Trim().ToLowerInvariant();
+            var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
+            if (driver == null)
+            {
+                driver = new Agent
+                {
+                    Id = driverId,
+                    Name = $"Driver {driverId}",
+                    RuntimeType = RuntimeType.CliAgy,
+                    TrustTier = TrustTier.SeniorManager
+                };
+                db.Agents.Add(driver);
+            }
+
+            var turnSessionId = Guid.NewGuid();
+
+            if (turnToDispatch.Attachments is { Count: > 0 })
+            {
+                var sessionAttachDir = SessionsController.GetAttachmentDirectory(turnSessionId);
+                var jobAttachDir = GetAttachmentDirectory(job.Id);
+
+                foreach (var att in turnToDispatch.Attachments)
+                {
+                    var safeName = SessionsController.SanitizeFileName(att.FileName);
+                    var src = Path.Combine(jobAttachDir, $"{att.Id}_{safeName}");
+                    if (!System.IO.File.Exists(src))
+                    {
+                        src = Directory.GetFiles(jobAttachDir, $"{att.Id}_*").FirstOrDefault() ??
+                              Directory.GetFiles(jobAttachDir, $"*{att.Id}*").FirstOrDefault();
+                    }
+                    if (src != null && System.IO.File.Exists(src))
+                    {
+                        var dest = Path.Combine(sessionAttachDir, $"{att.Id}_{safeName}");
+                        try { System.IO.File.Copy(src, dest, overwrite: true); } catch { }
+                    }
+                }
+            }
+
+            var turnMetadata = new Dictionary<string, object?>
+            {
+                ["jobId"] = job.Id.ToString(),
+                ["projectId"] = project.Id,
+                ["projectName"] = project.Name,
+                ["workspaceType"] = project.WorkspaceType.ToString(),
+                ["gitBranch"] = job.GitBranchName,
+                ["gitUrl"] = project.GitRepositoryUrl,
+                ["gitBaseBranch"] = project.GitBaseBranch,
+                ["s3ArchiveKey"] = job.S3ArchiveKey,
+                ["projectInstructions"] = project.ProjectInstructions,
+                ["personaId"] = persona.Id,
+                ["personaName"] = persona.Name,
+                ["personaRole"] = persona.Role,
+                ["personaPrompt"] = persona.PersonaPrompt,
+                ["workingDirectory"] = persona.DefaultWorkingDirectory,
+                ["model"] = persona.DefaultModel,
+                ["effort"] = persona.DefaultEffort,
+                ["mode"] = persona.DefaultMode,
+                ["tier"] = persona.DefaultTier,
+                ["contextSize"] = persona.DefaultContextSize,
+                ["attachments"] = turnToDispatch.Attachments
+            };
+
+            var turnSession = new AgentSession
+            {
+                Id = turnSessionId,
+                Title = $"Job Turn: {job.Title} (@{persona.Name})",
+                Status = "thinking",
+                MetadataJson = JsonSerializer.Serialize(turnMetadata, JsonOpts),
+                PersonaId = persona.Id,
+                DriverId = driverId,
+                CreatorAgentId = driverId,
+                CreatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+            db.AgentSessions.Add(turnSession);
+
+            var tasks = ParseTasks(job.TasksJson);
+            var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+
+            var taskContextSb = new System.Text.StringBuilder();
+            if (tasks.Count > 0)
+            {
+                taskContextSb.AppendLine("[Job Tasks & Sequential Checklist]:");
+                for (int i = 0; i < tasks.Count; i++)
+                {
+                    var t = tasks[i];
+                    var statusTag = t.IsCompleted ? "[x]" : (t.Id == activeTask?.Id ? "[ ] (CURRENT ACTIVE FOCUS)" : "[ ] (Queued)");
+                    taskContextSb.AppendLine($"{i + 1}. {statusTag} {t.Title}");
+                }
+                if (activeTask != null)
+                {
+                    taskContextSb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
+                    taskContextSb.AppendLine("[Sequential Execution Rule]: You must work on and complete tasks sequentially one by one in the order listed above. Focus on completing the current active task first before moving to subsequent tasks.");
+                }
+                taskContextSb.AppendLine();
+            }
+
+            var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
+                                    (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
+                                    $"[Job Context: {job.Title} - {job.Description}]\n\n" +
+                                    taskContextSb +
+                                    turnToDispatch.Content;
+
+            var structuredPayloadJson = turnToDispatch.Attachments is { Count: > 0 }
+                ? JsonSerializer.Serialize(new { attachments = turnToDispatch.Attachments }, JsonOpts)
+                : null;
+
+            var promptMsg = new SessionMessage
+            {
+                SessionId = turnSession.Id,
+                SenderAgentId = turnToDispatch.SenderType == "persona" ? (turnToDispatch.SenderId ?? "agent") : "operator",
+                TargetAgentId = driverId,
+                EventType = "prompt",
+                Content = promptWithContext,
+                StructuredPayloadJson = structuredPayloadJson,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            db.SessionMessages.Add(promptMsg);
+
+            if (AgentMeshHub.IsAgentConnected(driverId))
+            {
+                driver.Status = "busy";
+                driver.LastHeartbeatAt = DateTimeOffset.UtcNow;
+            }
+
+            var ackContent = activeTask != null
+                ? $"I'm on it — starting work on \"{activeTask.Title}\" now."
+                : "I'm on it — starting work on this now.";
+
+            var ackMsg = new JobMessage
+            {
+                Id = Guid.NewGuid(),
+                JobId = job.Id,
+                SenderType = "persona",
+                SenderId = persona.Id,
+                SenderName = persona.Name,
+                Content = ackContent,
+                MentionsJson = JsonSerializer.Serialize(new List<string> { persona.Id }, JsonOpts),
+                TurnSessionId = turnSession.Id,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            db.JobMessages.Add(ackMsg);
+
+            await db.SaveChangesAsync();
+
+            if (hubContext != null)
+            {
+                var promptPayload = new
+                {
+                    sessionId = turnSession.Id,
+                    messageId = promptMsg.Id,
+                    agentId = driverId,
+                    driverId = driverId,
+                    personaId = persona.Id,
+                    personaName = persona.Name,
+                    personaRole = persona.Role,
+                    personaPrompt = persona.PersonaPrompt,
+                    prompt = promptMsg.Content,
+                    sender = promptMsg.SenderAgentId,
+                    workingDirectory = persona.DefaultWorkingDirectory,
+                    model = persona.DefaultModel,
+                    effort = persona.DefaultEffort,
+                    mode = persona.DefaultMode,
+                    tier = persona.DefaultTier,
+                    contextSize = persona.DefaultContextSize,
+                    jobId = job.Id,
+                    projectId = project.Id,
+                    gitBranch = job.GitBranchName,
+                    createdAt = promptMsg.CreatedAt,
+                    attachments = turnToDispatch.Attachments
+                };
+
+                var group = hubContext.Clients?.Group($"agent-{driverId}");
+                if (group != null)
+                {
+                    await group.SendAsync("PromptReceived", promptPayload);
+                }
+                if (hubContext.Clients?.All != null)
+                {
+                    await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                    await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(ackMsg));
+                    var msgCount = await db.JobMessages.CountAsync(m => m.JobId == job.Id);
+                    var jobDto = ToDto(job, project.Name, msgCount);
+                    await hubContext.Clients.All.SendAsync("JobUpdated", jobDto);
+                }
+            }
+
+            availableSlots--;
+        }
     }
 }

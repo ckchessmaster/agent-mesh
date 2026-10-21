@@ -20,6 +20,7 @@ public class Persona
     public string? DefaultTier { get; set; }
     public string? DefaultContextSize { get; set; }
     public string? DefaultWorkingDirectory { get; set; }
+    public int? MaxConcurrentJobs { get; set; }
     public TrustTier TrustTier { get; set; } = TrustTier.Intern;
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;

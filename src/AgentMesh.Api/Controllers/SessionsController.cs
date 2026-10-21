@@ -1370,6 +1370,11 @@ public class SessionsController(
                     // Queue is empty: session completed turn and returned to active/idle. Notify all clients to clear thinking/stop button state!
                     await hubContext.Clients.Group($"session-{id}").SendAsync("SessionUpdated", session);
                     await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+                    if (!string.IsNullOrWhiteSpace(session.PersonaId))
+                    {
+                        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+                    }
                 }
             }
         }
@@ -1490,6 +1495,11 @@ public class SessionsController(
         db.SessionMessages.Add(auditMsg);
         await db.SaveChangesAsync();
 
+        if (!string.IsNullOrWhiteSpace(session.PersonaId))
+        {
+            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+        }
+
         var auditDto = ToMessageDto(auditMsg);
         await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", auditDto);
         await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
@@ -1547,6 +1557,11 @@ public class SessionsController(
         };
         db.SessionMessages.Add(auditMsg);
         await db.SaveChangesAsync();
+
+        if (!string.IsNullOrWhiteSpace(session.PersonaId))
+        {
+            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+        }
 
         var auditDto = ToMessageDto(auditMsg);
         await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", auditDto);

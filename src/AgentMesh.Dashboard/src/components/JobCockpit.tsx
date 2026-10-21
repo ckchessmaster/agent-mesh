@@ -27,7 +27,8 @@ import {
   Users,
   RefreshCw,
   Archive,
-  RotateCcw
+  RotateCcw,
+  Clock
 } from 'lucide-react';
 import type { AgentSession, JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
@@ -758,6 +759,22 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               ) : (
                 <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40">
                   Active Job
+                </span>
+              )}
+              {job.priority !== undefined && (
+                <span
+                  className={`text-[11px] font-semibold px-2 py-0.5 rounded-md border flex items-center gap-1 ${
+                    job.priority === 3
+                      ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                      : job.priority === 2
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                      : job.priority === 0
+                      ? 'bg-slate-800 text-slate-400 border-slate-700'
+                      : 'bg-sky-500/20 text-sky-300 border-sky-500/40'
+                  }`}
+                  data-testid="job-priority-badge"
+                >
+                  {job.priority === 3 ? 'Urgent' : job.priority === 2 ? 'High' : job.priority === 0 ? 'Low' : 'Normal'}
                 </span>
               )}
             </div>
@@ -1505,6 +1522,33 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               </div>
             )}
 
+            {/* Queued Turns Card */}
+            {job.queuedTurns && job.queuedTurns.length > 0 && (
+              <div
+                className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-xs shadow-md space-y-2.5"
+                data-testid="job-queued-turns-indicator"
+              >
+                <div className="flex items-center gap-2.5">
+                  <div className="relative flex items-center justify-center w-7 h-7 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30 shrink-0">
+                    <Clock className="w-3.5 h-3.5 animate-spin" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 justify-between">
+                      <span className="font-semibold text-amber-200 truncate">
+                        {job.queuedTurns.length} Queued Turn{job.queuedTurns.length === 1 ? '' : 's'}
+                      </span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 shrink-0">
+                        Waiting for Slot
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-amber-300/80 leading-relaxed mt-0.5">
+                      Target persona reached concurrency limit on other jobs. Will execute automatically when free.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Team Members List */}
             <div className="space-y-2">
               <div className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-semibold px-0.5">
@@ -1516,6 +1560,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     activeTurnInfo?.isActive &&
                     (activeTurnInfo.personaName === member.name ||
                       activeTurnInfo.personaName === member.id);
+                  const queuedCount = (job.queuedTurns || []).filter(
+                    (t) => t.targetPersonaId === member.id
+                  ).length;
+                  const personaObj = personas.find((p) => p.id === member.id);
 
                   return (
                     <div
@@ -1523,6 +1571,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                       className={`p-3 rounded-xl border transition ${
                         isWorking
                           ? 'bg-sky-950/25 border-sky-500/40 shadow-sm'
+                          : queuedCount > 0
+                          ? 'bg-amber-950/20 border-amber-500/30'
                           : 'bg-slate-900/50 border-slate-800/80'
                       }`}
                     >
@@ -1532,7 +1582,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                             <Bot className="w-3.5 h-3.5" />
                             <span
                               className={`absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 rounded-full border border-slate-900 ${
-                                isWorking ? 'bg-sky-400 animate-ping' : 'bg-emerald-400'
+                                isWorking
+                                  ? 'bg-sky-400 animate-ping'
+                                  : queuedCount > 0
+                                  ? 'bg-amber-400'
+                                  : 'bg-emerald-400'
                               }`}
                             />
                           </div>
@@ -1557,10 +1611,12 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                           className={`text-[9px] font-mono px-1.5 py-0.2 rounded shrink-0 ${
                             isWorking
                               ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40 animate-pulse'
+                              : queuedCount > 0
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                               : 'bg-slate-800/60 text-slate-400 border border-slate-700/50'
                           }`}
                         >
-                          {isWorking ? 'Working' : 'Idle'}
+                          {isWorking ? 'Working' : queuedCount > 0 ? `Queued (${queuedCount})` : 'Idle'}
                         </span>
                       </div>
 
@@ -1568,7 +1624,13 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                         <span className="text-sky-400/90">@{member.id}</span>
                         <span className="text-slate-600">•</span>
                         <span className="text-slate-400 truncate">
-                          {isWorking ? 'Executing active turn...' : 'Ready for instructions'}
+                          {isWorking
+                            ? 'Executing active turn...'
+                            : queuedCount > 0
+                            ? `${queuedCount} turn(s) queued`
+                            : personaObj?.maxConcurrentJobs
+                            ? `Max ${personaObj.maxConcurrentJobs} job(s)`
+                            : 'Ready for instructions'}
                         </span>
                       </div>
                     </div>

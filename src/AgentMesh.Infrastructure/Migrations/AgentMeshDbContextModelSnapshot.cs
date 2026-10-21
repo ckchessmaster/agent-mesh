@@ -400,6 +400,10 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("driver_id");
 
+                    b.Property<int?>("MaxConcurrentJobs")
+                        .HasColumnType("integer")
+                        .HasColumnName("max_concurrent_jobs");
+
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasMaxLength(128)
@@ -552,11 +556,24 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDefaultValue("")
                         .HasColumnName("git_branch_name");
 
+                    b.Property<int>("Priority")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(1)
+                        .HasColumnName("priority");
+
                     b.Property<string>("ProjectId")
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)")
                         .HasColumnName("project_id");
+
+                    b.Property<string>("QueuedTurnsJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("[]")
+                        .HasColumnName("queued_turns");
 
                     b.Property<string>("ResultSummary")
                         .HasColumnType("text")

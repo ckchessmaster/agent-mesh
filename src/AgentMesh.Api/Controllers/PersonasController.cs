@@ -119,6 +119,7 @@ public class PersonasController(
             DefaultTier = NormalizeOptional(req.DefaultTier),
             DefaultContextSize = NormalizeOptional(req.DefaultContextSize),
             DefaultWorkingDirectory = NormalizeOptional(req.DefaultWorkingDirectory),
+            MaxConcurrentJobs = req.MaxConcurrentJobs > 0 ? req.MaxConcurrentJobs : null,
             TrustTier = req.TrustTier,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
@@ -197,6 +198,11 @@ public class PersonasController(
         if (req.DefaultWorkingDirectory != null)
         {
             persona.DefaultWorkingDirectory = NormalizeOptional(req.DefaultWorkingDirectory);
+        }
+
+        if (req.MaxConcurrentJobs.HasValue)
+        {
+            persona.MaxConcurrentJobs = req.MaxConcurrentJobs.Value > 0 ? req.MaxConcurrentJobs.Value : null;
         }
 
         if (req.TrustTier.HasValue)
@@ -528,7 +534,8 @@ public class PersonasController(
         sessionCount,
         p.CreatedAt,
         p.UpdatedAt,
-        p.DefaultContextSize
+        p.DefaultContextSize,
+        p.MaxConcurrentJobs
     );
 }
 
@@ -544,7 +551,8 @@ public record CreatePersonaRequest(
     string? DefaultTier = null,
     string? DefaultWorkingDirectory = null,
     TrustTier TrustTier = TrustTier.Intern,
-    string? DefaultContextSize = null
+    string? DefaultContextSize = null,
+    int? MaxConcurrentJobs = null
 );
 
 public record UpdatePersonaRequest(
@@ -558,7 +566,8 @@ public record UpdatePersonaRequest(
     string? DefaultTier = null,
     string? DefaultWorkingDirectory = null,
     TrustTier? TrustTier = null,
-    string? DefaultContextSize = null
+    string? DefaultContextSize = null,
+    int? MaxConcurrentJobs = null
 );
 
 public record PersonaDto(
@@ -578,5 +587,6 @@ public record PersonaDto(
     int SessionCount,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
-    string? DefaultContextSize = null
+    string? DefaultContextSize = null,
+    int? MaxConcurrentJobs = null
 );

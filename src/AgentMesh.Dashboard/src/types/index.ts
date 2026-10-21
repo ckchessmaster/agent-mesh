@@ -19,6 +19,7 @@ export interface Persona {
   defaultTier?: string | null;
   defaultContextSize?: string | null;
   defaultWorkingDirectory?: string | null;
+  maxConcurrentJobs?: number | null;
   trustTier: number;
   sessionCount?: number;
   createdAt: string;
@@ -246,6 +247,29 @@ export const ProjectJobStatus = {
 } as const;
 export type ProjectJobStatus = (typeof ProjectJobStatus)[keyof typeof ProjectJobStatus];
 
+export const ProjectJobPriority = {
+  Low: 0,
+  Normal: 1,
+  High: 2,
+  Urgent: 3
+} as const;
+export type ProjectJobPriority = (typeof ProjectJobPriority)[keyof typeof ProjectJobPriority];
+
+export interface QueuedJobTurnDto {
+  id: string;
+  jobId: string;
+  projectId: string;
+  targetPersonaId: string;
+  senderType: string;
+  senderId?: string | null;
+  senderName?: string | null;
+  content: string;
+  mentions: string[];
+  attachments?: SessionAttachment[] | null;
+  priority: ProjectJobPriority | number;
+  createdAt: string;
+}
+
 export interface ProjectPersonaSummary {
   id: string;
   name: string;
@@ -291,6 +315,8 @@ export interface ProjectJob {
   s3ArchiveKey?: string | null;
   tasks: JobTask[];
   resultSummary?: string | null;
+  priority?: ProjectJobPriority | number;
+  queuedTurns?: QueuedJobTurnDto[];
   messageCount: number;
   createdAt: string;
   updatedAt: string;

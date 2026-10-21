@@ -11,6 +11,7 @@ interface NewJobModalProps {
     description?: string;
     gitBranchName?: string;
     initialTasks?: string[];
+    priority?: number;
   }) => Promise<void>;
 }
 
@@ -23,6 +24,7 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [gitBranch, setGitBranch] = useState('');
+  const [priority, setPriority] = useState<number>(1);
   const [tasksText, setTasksText] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +49,8 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
         title: title.trim(),
         description: description.trim() || undefined,
         gitBranchName: gitBranch.trim() || undefined,
-        initialTasks: initialTasks.length > 0 ? initialTasks : undefined
+        initialTasks: initialTasks.length > 0 ? initialTasks : undefined,
+        priority
       });
       onClose();
     } catch (err: any) {
@@ -130,6 +133,22 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
               />
             </div>
           )}
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+              Priority
+            </label>
+            <select
+              value={priority}
+              onChange={(e) => setPriority(Number(e.target.value))}
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
+            >
+              <option value={0}>Low</option>
+              <option value={1}>Normal</option>
+              <option value={2}>High</option>
+              <option value={3}>Urgent</option>
+            </select>
+          </div>
 
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-1.5">

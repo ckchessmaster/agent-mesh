@@ -29,6 +29,10 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
             .HasDefaultValue(ProjectJobStatus.Active)
             .IsRequired();
 
+        builder.Property(j => j.Priority)
+            .HasDefaultValue(ProjectJobPriority.Normal)
+            .IsRequired();
+
         builder.Property(j => j.GitBranchName)
             .HasMaxLength(128)
             .HasDefaultValue(string.Empty)
@@ -39,6 +43,12 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
 
         builder.Property(j => j.TasksJson)
             .HasColumnName("tasks")
+            .HasColumnType("jsonb")
+            .HasDefaultValue("[]")
+            .IsRequired();
+
+        builder.Property(j => j.QueuedTurnsJson)
+            .HasColumnName("queued_turns")
             .HasColumnType("jsonb")
             .HasDefaultValue("[]")
             .IsRequired();

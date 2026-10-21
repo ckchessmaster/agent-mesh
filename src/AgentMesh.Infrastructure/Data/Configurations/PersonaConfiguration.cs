@@ -50,6 +50,8 @@ public class PersonaConfiguration : IEntityTypeConfiguration<Persona>
         builder.Property(p => p.DefaultWorkingDirectory)
             .HasMaxLength(512);
 
+        builder.Property(p => p.MaxConcurrentJobs);
+
         builder.Property(p => p.TrustTier)
             .HasDefaultValue(TrustTier.Intern)
             .IsRequired();

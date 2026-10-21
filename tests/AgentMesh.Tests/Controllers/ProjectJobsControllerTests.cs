@@ -484,6 +484,7 @@ public class ProjectJobsControllerTests
         var mockClients = new Mock<IHubClients>();
         var mockClientProxy = new Mock<IClientProxy>();
         mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockClients.Setup(c => c.Group(It.IsAny<string>())).Returns(mockClientProxy.Object);
         mockHubContext.Setup(h => h.Clients).Returns(mockClients.Object);
 
         var controller = new ProjectJobsController(db, mockHubContext.Object);
@@ -534,5 +535,205 @@ public class ProjectJobsControllerTests
         var result = await controller.PostJobMessage(job.Id, msgReq);
         var badRequest = result.Should().BeOfType<BadRequestObjectResult>().Subject;
         badRequest.Value.ToString().Should().Contain("archived");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WhenPersonaAtMaxConcurrentJobs_EnqueuesTurnAndPostsConversationalNotice()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var persona = new Persona
+        {
+            Id = "astra",
+            Name = "Astra",
+            Role = "Tech Lead",
+            DriverId = "agy",
+            MaxConcurrentJobs = 1
+        };
+        var project = new Project
+        {
+            Id = "concurrency-proj",
+            Name = "Concurrency Project",
+            DefaultLeadPersonaId = "astra"
+        };
+        var job1 = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "concurrency-proj",
+            Title = "First Active Job",
+            Status = ProjectJobStatus.Active
+        };
+        var job2 = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "concurrency-proj",
+            Title = "Second Job To Queue",
+            Status = ProjectJobStatus.Active,
+            Priority = ProjectJobPriority.High
+        };
+
+        // Active session for Astra on job1
+        var activeSessionJob1 = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            PersonaId = "astra",
+            DriverId = "agy",
+            Status = "thinking",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new { jobId = job1.Id.ToString() })
+        };
+
+        db.Personas.Add(persona);
+        db.Projects.Add(project);
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = "concurrency-proj", PersonaId = "astra" });
+        db.ProjectJobs.AddRange(job1, job2);
+        db.AgentSessions.Add(activeSessionJob1);
+        await db.SaveChangesAsync();
+
+        var mockHubContext = new Mock<IHubContext<AgentMeshHub>>();
+        var mockClients = new Mock<IHubClients>();
+        var mockClientProxy = new Mock<IClientProxy>();
+        mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockClients.Setup(c => c.Group(It.IsAny<string>())).Returns(mockClientProxy.Object);
+        mockHubContext.Setup(h => h.Clients).Returns(mockClients.Object);
+
+        var controller = new ProjectJobsController(db, mockHubContext.Object);
+
+        // Post message on job2 targeting @astra
+        var msgReq = new PostJobMessageRequest(Content: "@astra please work on this second job");
+        var res = await controller.PostJobMessage(job2.Id, msgReq);
+
+        var okRes = res.Should().BeOfType<OkObjectResult>().Subject;
+        var msgDto = okRes.Value.Should().BeOfType<JobMessageDto>().Subject;
+        msgDto.Content.Should().Be("@astra please work on this second job");
+
+        // Verify turn was enqueued in job2
+        var updatedJob2 = await db.ProjectJobs.FindAsync(job2.Id);
+        var queuedTurns = ProjectJobsController.ParseQueuedTurns(updatedJob2!.QueuedTurnsJson);
+        queuedTurns.Should().HaveCount(1);
+        queuedTurns[0].TargetPersonaId.Should().Be("astra");
+
+        // Verify conversational reply was added
+        var job2Messages = await db.JobMessages.Where(m => m.JobId == job2.Id).OrderBy(m => m.CreatedAt).ToListAsync();
+        job2Messages.Should().HaveCount(2);
+        var busyReply = job2Messages.Last();
+        busyReply.SenderType.Should().Be("persona");
+        busyReply.SenderId.Should().Be("astra");
+        busyReply.Content.Should().Contain("I'm currently busy working on another job (\"First Active Job\")");
+        busyReply.Content.Should().Contain("queued this up and will start as soon as I'm done");
+
+        // Now job1 finishes its turn: dispatch queued turns for astra
+        activeSessionJob1.Status = "active";
+        await db.SaveChangesAsync();
+
+        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, mockHubContext.Object, "astra");
+
+        // Verify job2 queued turn was dequeued
+        var dispatchedJob2 = await db.ProjectJobs.FindAsync(job2.Id);
+        var remainingQueuedTurns = ProjectJobsController.ParseQueuedTurns(dispatchedJob2!.QueuedTurnsJson);
+        remainingQueuedTurns.Should().BeEmpty();
+
+        // Verify a new session was created for job2
+        var job2Sessions = await db.AgentSessions.Where(s => s.PersonaId == "astra" && s.Id != activeSessionJob1.Id).ToListAsync();
+        job2Sessions.Should().HaveCount(1);
+        job2Sessions[0].Status.Should().Be("thinking");
+    }
+
+    [Fact]
+    public async Task CheckAndDispatchQueuedJobTurns_DispatchesHigherPriorityJobBeforeLowerPriority()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var persona = new Persona
+        {
+            Id = "astra",
+            Name = "Astra",
+            Role = "Tech Lead",
+            DriverId = "agy",
+            MaxConcurrentJobs = 1
+        };
+        var project = new Project
+        {
+            Id = "prio-proj",
+            Name = "Priority Project"
+        };
+
+        var jobLow = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "prio-proj",
+            Title = "Low Priority Job",
+            Status = ProjectJobStatus.Active,
+            Priority = ProjectJobPriority.Low
+        };
+        var jobUrgent = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "prio-proj",
+            Title = "Urgent Priority Job",
+            Status = ProjectJobStatus.Active,
+            Priority = ProjectJobPriority.Urgent
+        };
+
+        // Queue Low priority job turn first
+        var turnLow = new QueuedJobTurnDto(
+            Id: Guid.NewGuid(),
+            JobId: jobLow.Id,
+            ProjectId: "prio-proj",
+            TargetPersonaId: "astra",
+            SenderType: "user",
+            SenderId: "user",
+            SenderName: "Operator",
+            Content: "Low priority work",
+            Mentions: new List<string> { "astra" },
+            Attachments: null,
+            Priority: ProjectJobPriority.Low,
+            CreatedAt: DateTimeOffset.UtcNow.AddMinutes(-10)
+        );
+        jobLow.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { turnLow });
+
+        // Queue Urgent priority job turn later
+        var turnUrgent = new QueuedJobTurnDto(
+            Id: Guid.NewGuid(),
+            JobId: jobUrgent.Id,
+            ProjectId: "prio-proj",
+            TargetPersonaId: "astra",
+            SenderType: "user",
+            SenderId: "user",
+            SenderName: "Operator",
+            Content: "Urgent priority work",
+            Mentions: new List<string> { "astra" },
+            Attachments: null,
+            Priority: ProjectJobPriority.Urgent,
+            CreatedAt: DateTimeOffset.UtcNow.AddMinutes(-5)
+        );
+        jobUrgent.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { turnUrgent });
+
+        db.Personas.Add(persona);
+        db.Projects.Add(project);
+        db.ProjectJobs.AddRange(jobLow, jobUrgent);
+        await db.SaveChangesAsync();
+
+        var mockHubContext = new Mock<IHubContext<AgentMeshHub>>();
+        var mockClients = new Mock<IHubClients>();
+        var mockClientProxy = new Mock<IClientProxy>();
+        mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockClients.Setup(c => c.Group(It.IsAny<string>())).Returns(mockClientProxy.Object);
+        mockHubContext.Setup(h => h.Clients).Returns(mockClients.Object);
+
+        // Since MaxConcurrentJobs is 1 and active jobs = 0, dispatching should pick Urgent first!
+        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, mockHubContext.Object, "astra");
+
+        // Verify Urgent job turn was dequeued
+        var updatedUrgent = await db.ProjectJobs.FindAsync(jobUrgent.Id);
+        ProjectJobsController.ParseQueuedTurns(updatedUrgent!.QueuedTurnsJson).Should().BeEmpty();
+
+        // Low priority job turn should still be queued
+        var updatedLow = await db.ProjectJobs.FindAsync(jobLow.Id);
+        ProjectJobsController.ParseQueuedTurns(updatedLow!.QueuedTurnsJson).Should().HaveCount(1);
+
+        // Only 1 session was created (for Urgent job)
+        var createdSessions = await db.AgentSessions.Where(s => s.PersonaId == "astra").ToListAsync();
+        createdSessions.Should().HaveCount(1);
+        createdSessions[0].Title.Should().Contain("Urgent Priority Job");
     }
 }

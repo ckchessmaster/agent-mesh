@@ -266,6 +266,7 @@ export default function App() {
   const [personaDefaultTier, setPersonaDefaultTier] = useState('');
   const [personaDefaultContextSize, setPersonaDefaultContextSize] = useState('');
   const [personaDefaultWorkDir, setPersonaDefaultWorkDir] = useState('');
+  const [personaMaxConcurrentJobs, setPersonaMaxConcurrentJobs] = useState<string>('');
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
 
@@ -1140,6 +1141,7 @@ export default function App() {
     setPersonaDefaultTier('');
     setPersonaDefaultContextSize('');
     setPersonaDefaultWorkDir('');
+    setPersonaMaxConcurrentJobs('');
     setShowPersonaModal(true);
   }, [selectedAgentId, agents]);
 
@@ -1156,6 +1158,7 @@ export default function App() {
     setPersonaDefaultTier(persona.defaultTier || '');
     setPersonaDefaultContextSize(persona.defaultContextSize || '');
     setPersonaDefaultWorkDir(persona.defaultWorkingDirectory || '');
+    setPersonaMaxConcurrentJobs(persona.maxConcurrentJobs ? String(persona.maxConcurrentJobs) : '');
     setShowPersonaModal(true);
   }, []);
 
@@ -1188,7 +1191,8 @@ export default function App() {
           defaultMode: personaDefaultMode || '',
           defaultTier: personaDefaultTier || '',
           defaultContextSize: personaDefaultContextSize || '',
-          defaultWorkingDirectory: personaDefaultWorkDir || ''
+          defaultWorkingDirectory: personaDefaultWorkDir || '',
+          maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined
         });
         setShowPersonaModal(false);
         await fetchAllData();
@@ -1205,7 +1209,8 @@ export default function App() {
           defaultMode: personaDefaultMode || undefined,
           defaultTier: personaDefaultTier || undefined,
           defaultContextSize: personaDefaultContextSize || undefined,
-          defaultWorkingDirectory: personaDefaultWorkDir || undefined
+          defaultWorkingDirectory: personaDefaultWorkDir || undefined,
+          maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined
         });
         setShowPersonaModal(false);
         setHasUserSwitchedTab(true);
@@ -2454,6 +2459,11 @@ export default function App() {
                                   <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-950/40 border border-emerald-500/30 text-[10px] font-mono text-emerald-300">
                                     <Maximize2 className="w-2.5 h-2.5 text-emerald-400" />
                                     <span>{persona.defaultContextSize}</span>
+                                  </span>
+                                )}
+                                {persona.maxConcurrentJobs && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-950/40 border border-amber-500/30 text-[10px] font-mono text-amber-300">
+                                    <span>Max {persona.maxConcurrentJobs} {persona.maxConcurrentJobs === 1 ? 'Job' : 'Jobs'}</span>
                                   </span>
                                 )}
                               </div>
@@ -5416,6 +5426,22 @@ export default function App() {
                         </select>
                       </div>
                     )}
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="block text-[11px] text-slate-400">Max Concurrent Jobs (Optional)</label>
+                    <input
+                      type="number"
+                      min="1"
+                      placeholder="Leave empty for unlimited jobs"
+                      aria-label="Persona Max Concurrent Jobs"
+                      value={personaMaxConcurrentJobs}
+                      onChange={(e) => setPersonaMaxConcurrentJobs(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white font-mono focus:outline-none focus:border-sky-500"
+                    />
+                    <p className="text-[10px] text-slate-500">
+                      Limit how many jobs this persona can actively execute turns in simultaneously. Additional turns will queue until a slot frees up.
+                    </p>
                   </div>
 
                   <div className="space-y-1">

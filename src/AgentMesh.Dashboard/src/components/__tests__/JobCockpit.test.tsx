@@ -708,4 +708,64 @@ describe('JobCockpit - Attachment Support', () => {
     expect(screen.getByTestId('task-focus-task-2')).toBeInTheDocument();
     expect(screen.getByText('Queued')).toBeInTheDocument();
   });
+
+  it('renders priority badge in job header', () => {
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={{
+          ...mockJob,
+          priority: 3 // Urgent
+        }}
+      />
+    );
+
+    const prioBadge = screen.getByTestId('job-priority-badge');
+    expect(prioBadge).toBeInTheDocument();
+    expect(prioBadge).toHaveTextContent('Urgent');
+  });
+
+  it('renders Queued Turns indicator in sidebar and shows queued status on team member', () => {
+    const queuedTurn = {
+      id: 'turn-1',
+      jobId: mockJob.id,
+      projectId: mockJob.projectId,
+      targetPersonaId: 'agy-astra',
+      senderType: 'user',
+      content: 'Queued turn prompt',
+      mentions: ['agy-astra'],
+      priority: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={{
+          ...mockJob,
+          queuedTurns: [queuedTurn]
+        }}
+        personas={[
+          {
+            id: 'agy-astra',
+            name: 'Astra',
+            role: 'Tech Lead',
+            personaPrompt: '',
+            driverId: 'agy',
+            maxConcurrentJobs: 1,
+            trustTier: 1,
+            createdAt: new Date().toISOString()
+          }
+        ]}
+      />
+    );
+
+    // Queued turns indicator in sidebar
+    expect(screen.getByTestId('job-queued-turns-indicator')).toBeInTheDocument();
+    expect(screen.getByText(/1 Queued Turn/i)).toBeInTheDocument();
+    expect(screen.getByText(/Waiting for Slot/i)).toBeInTheDocument();
+
+    // Queued badge on team member
+    expect(screen.getByText('Queued (1)')).toBeInTheDocument();
+  });
 });
