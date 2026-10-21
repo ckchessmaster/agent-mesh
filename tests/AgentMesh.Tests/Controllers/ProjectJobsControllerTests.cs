@@ -157,6 +157,63 @@ public class ProjectJobsControllerTests
     }
 
     [Fact]
+    public async Task PostJobMessage_WithPendingTasks_IncludesActiveTaskInAckAndPromptContext()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var driver = new Agent { Id = "agy", Name = "Antigravity", RuntimeType = RuntimeType.CliAgy, TrustTier = TrustTier.SeniorManager };
+        var persona = new Persona { Id = "astra", Name = "Astra", Role = "Tech Lead", DriverId = "agy", PersonaPrompt = "You are Astra." };
+        var project = new Project
+        {
+            Id = "proj-tasks",
+            Name = "Task Sequence Project",
+            WorkspaceType = WorkspaceType.Git
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-tasks",
+            Title = "Sequential Feature Job",
+            GitBranchName = "mesh/job-seq",
+            TasksJson = System.Text.Json.JsonSerializer.Serialize(new List<JobTaskDto>
+            {
+                new() { Id = Guid.NewGuid(), Title = "First Step Completed", IsCompleted = true, CompletedAt = DateTimeOffset.UtcNow },
+                new() { Id = Guid.NewGuid(), Title = "Second Step Active", IsCompleted = false },
+                new() { Id = Guid.NewGuid(), Title = "Third Step Queued", IsCompleted = false }
+            })
+        };
+        db.Agents.Add(driver);
+        db.Personas.Add(persona);
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = "proj-tasks", PersonaId = "astra" });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var msgReq = new PostJobMessageRequest(
+            Content: "@astra please work on the tasks"
+        );
+
+        var result = await controller.PostJobMessage(job.Id, msgReq);
+        result.Should().BeOfType<OkObjectResult>();
+
+        // Verify acknowledgment message includes active task title
+        var ackMsg = await db.JobMessages.FirstOrDefaultAsync(m => m.JobId == job.Id && m.SenderType == "persona");
+        ackMsg.Should().NotBeNull();
+        ackMsg!.Content.Should().Be("I'm on it — starting work on \"Second Step Active\" now.");
+
+        // Verify prompt content includes sequential checklist and active task instruction
+        var promptMsg = await db.SessionMessages.FirstOrDefaultAsync(m => m.EventType == "prompt");
+        promptMsg.Should().NotBeNull();
+        promptMsg!.Content.Should().Contain("[Job Tasks & Sequential Checklist]:");
+        promptMsg.Content.Should().Contain("[x] First Step Completed");
+        promptMsg.Content.Should().Contain("[ ] (CURRENT ACTIVE FOCUS) Second Step Active");
+        promptMsg.Content.Should().Contain("[ ] (Queued) Third Step Queued");
+        promptMsg.Content.Should().Contain("[Current Target Task]: \"Second Step Active\"");
+        promptMsg.Content.Should().Contain("[Sequential Execution Rule]");
+    }
+
+    [Fact]
     public async Task CompleteJob_SetsStatusToCompleted()
     {
         using var db = TestDbContextFactory.Create();

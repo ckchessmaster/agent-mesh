@@ -748,10 +748,32 @@ public class ProjectJobsController(
                 db.AgentSessions.Add(turnSession);
                 jobMsg.TurnSessionId = turnSession.Id;
 
+                var tasks = ParseTasks(job.TasksJson);
+                var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+
+                var taskContextSb = new System.Text.StringBuilder();
+                if (tasks.Count > 0)
+                {
+                    taskContextSb.AppendLine("[Job Tasks & Sequential Checklist]:");
+                    for (int i = 0; i < tasks.Count; i++)
+                    {
+                        var t = tasks[i];
+                        var statusTag = t.IsCompleted ? "[x]" : (t.Id == activeTask?.Id ? "[ ] (CURRENT ACTIVE FOCUS)" : "[ ] (Queued)");
+                        taskContextSb.AppendLine($"{i + 1}. {statusTag} {t.Title}");
+                    }
+                    if (activeTask != null)
+                    {
+                        taskContextSb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
+                        taskContextSb.AppendLine("[Sequential Execution Rule]: You must work on and complete tasks sequentially one by one in the order listed above. Focus on completing the current active task first before moving to subsequent tasks.");
+                    }
+                    taskContextSb.AppendLine();
+                }
+
                 // Format prompt context for runner
                 var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
                                         (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
                                         $"[Job Context: {job.Title} - {job.Description}]\n\n" +
+                                        taskContextSb +
                                         effectiveContent;
 
                 var promptMsg = new SessionMessage
@@ -804,6 +826,10 @@ public class ProjectJobsController(
 
                 if (req.SenderType == "user")
                 {
+                    var ackContent = activeTask != null
+                        ? $"I'm on it — starting work on \"{activeTask.Title}\" now."
+                        : "I'm on it — starting work on this now.";
+
                     ackMsg = new JobMessage
                     {
                         Id = Guid.NewGuid(),
@@ -811,7 +837,7 @@ public class ProjectJobsController(
                         SenderType = "persona",
                         SenderId = persona.Id,
                         SenderName = persona.Name,
-                        Content = "I'm on it — starting work on this now.",
+                        Content = ackContent,
                         MentionsJson = JsonSerializer.Serialize(new List<string>(), JsonOpts),
                         TurnSessionId = turnSession.Id,
                         CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(2)

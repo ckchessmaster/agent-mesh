@@ -680,4 +680,32 @@ describe('JobCockpit - Attachment Support', () => {
     fireEvent.click(reopenBtn);
     expect(onReopenJob).toHaveBeenCalledTimes(1);
   });
+
+  it('renders sequential task badges (Completed, In Progress, Queued) and current focus header banner', () => {
+    const sequentialTasks: JobTask[] = [
+      { id: 'task-1', title: 'First Task Done', isCompleted: true, completedAt: new Date().toISOString() },
+      { id: 'task-2', title: 'Second Task Active', isCompleted: false },
+      { id: 'task-3', title: 'Third Task Queued', isCompleted: false }
+    ];
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        tasks={sequentialTasks}
+      />
+    );
+
+    // Current focus badge in header
+    expect(screen.getByTestId('current-focus-badge')).toBeInTheDocument();
+    expect(screen.getByText(/#2 Second Task Active/i)).toBeInTheDocument();
+
+    // Switch to All to see completed and pending tasks
+    const allBtn = screen.getByRole('button', { name: /^All/i });
+    fireEvent.click(allBtn);
+
+    // Badges in task rows
+    expect(screen.getByText('Completed')).toBeInTheDocument();
+    expect(screen.getByTestId('task-focus-task-2')).toBeInTheDocument();
+    expect(screen.getByText('Queued')).toBeInTheDocument();
+  });
 });

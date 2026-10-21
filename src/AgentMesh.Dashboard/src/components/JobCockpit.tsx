@@ -695,6 +695,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
   const completedCount = uniqueTasks.filter((t) => t.isCompleted).length;
   const progressPercent = uniqueTasks.length > 0 ? Math.round((completedCount / uniqueTasks.length) * 100) : 0;
+  const firstPendingTask = uniqueTasks.find((t) => !t.isCompleted);
+  const firstPendingTaskId = firstPendingTask?.id;
+  const firstPendingTaskIndex = firstPendingTask ? uniqueTasks.findIndex((t) => t.id === firstPendingTaskId) : -1;
 
   return (
     <div
@@ -927,6 +930,17 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
               ({completedCount}/{uniqueTasks.length} completed • {progressPercent}%)
             </span>
+            {firstPendingTask && (
+              <span
+                className="hidden xl:inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg bg-sky-500/10 text-sky-300 border border-sky-500/25 max-w-xs truncate"
+                title={`Current sequential target: ${firstPendingTask.title}`}
+                data-testid="current-focus-badge"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse shrink-0" />
+                <span className="text-slate-400 font-normal">Focus:</span>
+                <span className="truncate">#{firstPendingTaskIndex + 1} {firstPendingTask.title}</span>
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-3 shrink-0">
@@ -990,65 +1004,81 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               </div>
             ) : (
               <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1" data-testid="job-tasks-list">
-                {filteredTasks.map((task, idx) => (
-                  <div
-                    key={task.id}
-                    className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-xs transition group ${
-                      task.isCompleted
-                        ? 'bg-emerald-950/15 border-emerald-500/25 text-emerald-300/80'
-                        : 'bg-slate-950/70 border-slate-800 text-slate-200 hover:border-slate-700/80 shadow-sm'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <button
-                        type="button"
-                        onClick={() => onToggleTask(task.id, !task.isCompleted)}
-                        className="cursor-pointer text-slate-400 hover:text-sky-400 transition shrink-0 p-0.5"
-                        title={task.isCompleted ? 'Mark as incomplete' : 'Mark as complete'}
-                        data-testid={`toggle-task-${task.id}`}
-                      >
-                        {task.isCompleted ? (
-                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                        ) : (
-                          <Circle className="w-4 h-4 text-slate-500 hover:text-sky-400" />
-                        )}
-                      </button>
-                      <span className="font-mono text-[10px] text-slate-500 shrink-0">
-                        #{idx + 1}
-                      </span>
-                      <span
-                        className={`min-w-0 break-words leading-relaxed ${
-                          task.isCompleted
-                            ? 'line-through text-slate-400'
-                            : 'text-slate-100 font-medium'
-                        }`}
-                      >
-                        {task.title}
-                      </span>
-                    </div>
+                {filteredTasks.map((task, idx) => {
+                  const isCurrentFocus = !task.isCompleted && task.id === firstPendingTaskId;
 
-                    <div className="flex items-center gap-2 shrink-0">
-                      {task.isCompleted ? (
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
-                          Completed
+                  return (
+                    <div
+                      key={task.id}
+                      className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-xs transition group ${
+                        task.isCompleted
+                          ? 'bg-emerald-950/15 border-emerald-500/25 text-emerald-300/80'
+                          : isCurrentFocus
+                          ? 'bg-sky-950/25 border-sky-500/40 text-slate-100 shadow-sm ring-1 ring-sky-500/20'
+                          : 'bg-slate-950/60 border-slate-800/80 text-slate-300 hover:border-slate-700/80'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <button
+                          type="button"
+                          onClick={() => onToggleTask(task.id, !task.isCompleted)}
+                          className="cursor-pointer text-slate-400 hover:text-sky-400 transition shrink-0 p-0.5"
+                          title={task.isCompleted ? 'Mark as incomplete' : 'Mark as complete'}
+                          data-testid={`toggle-task-${task.id}`}
+                        >
+                          {task.isCompleted ? (
+                            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                          ) : (
+                            <Circle className="w-4 h-4 text-slate-500 hover:text-sky-400" />
+                          )}
+                        </button>
+                        <span className={`font-mono text-[10px] shrink-0 ${isCurrentFocus ? 'text-sky-400 font-semibold' : 'text-slate-500'}`}>
+                          #{idx + 1}
                         </span>
-                      ) : (
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
-                          Active
+                        <span
+                          className={`min-w-0 break-words leading-relaxed ${
+                            task.isCompleted
+                              ? 'line-through text-slate-400'
+                              : isCurrentFocus
+                              ? 'text-slate-100 font-semibold'
+                              : 'text-slate-200 font-medium'
+                          }`}
+                        >
+                          {task.title}
                         </span>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => onDeleteTask(task.id)}
-                        className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer"
-                        title="Delete task"
-                        data-testid={`delete-task-${task.id}`}
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        {task.isCompleted ? (
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                            Completed
+                          </span>
+                        ) : isCurrentFocus ? (
+                          <span
+                            className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
+                            data-testid={`task-focus-${task.id}`}
+                          >
+                            <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+                            In Progress
+                          </span>
+                        ) : (
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
+                            Queued
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => onDeleteTask(task.id)}
+                          className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer"
+                          title="Delete task"
+                          data-testid={`delete-task-${task.id}`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
