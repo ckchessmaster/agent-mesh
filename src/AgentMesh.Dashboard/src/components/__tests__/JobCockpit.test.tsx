@@ -468,10 +468,18 @@ describe('JobCockpit - Attachment Support', () => {
     expect(screen.getByText(/1\/3 completed/i)).toBeInTheDocument();
     expect(screen.getByTestId('job-tasks-list')).toBeInTheDocument();
 
-    // Verify task rows & indices
+    // Verify default 'pending' filter shows only pending tasks
     expect(screen.getByText('#1')).toBeInTheDocument();
+    expect(screen.getByText('Task Beta')).toBeInTheDocument();
+    expect(screen.getByText('Task Gamma')).toBeInTheDocument();
+    expect(screen.queryByText('Task Alpha')).not.toBeInTheDocument();
+
+    // Filter to All shows all tasks
+    const allFilterBtn = screen.getByRole('button', { name: /^All/i });
+    fireEvent.click(allFilterBtn);
     expect(screen.getByText('Task Alpha')).toBeInTheDocument();
     expect(screen.getByText('Task Beta')).toBeInTheDocument();
+    expect(screen.getByText('Task Gamma')).toBeInTheDocument();
 
     // Filter to only Completed
     const doneFilterBtn = screen.getByRole('button', { name: /^Done/i });

@@ -90,6 +90,7 @@ vi.mock('../services/api', () => ({
       }
     }),
     getSessions: vi.fn().mockResolvedValue([]),
+    getSession: vi.fn().mockResolvedValue(null),
     getSessionMessages: vi.fn().mockResolvedValue([]),
     resetMesh: vi.fn(),
     createAgentSession: vi.fn(),

@@ -225,6 +225,12 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     // Task checklist bar displays progress (1/2 completed)
     expect(screen.getByText(/1\/2 completed/i)).toBeInTheDocument();
+    // Default filter is 'pending', showing only incomplete tasks
+    expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+    expect(screen.queryByText('Implement OAuth endpoints')).not.toBeInTheDocument();
+
+    // Clicking All filter shows all tasks including completed
+    fireEvent.click(screen.getByRole('button', { name: /^All/i }));
     expect(screen.getByText('Implement OAuth endpoints')).toBeInTheDocument();
     expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
 

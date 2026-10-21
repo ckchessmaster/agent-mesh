@@ -193,7 +193,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
   // Task checklist presentation state
   const [isTasksExpanded, setIsTasksExpanded] = useState(true);
-  const [taskFilter, setTaskFilter] = useState<'all' | 'pending' | 'completed'>('all');
+  const [taskFilter, setTaskFilter] = useState<'all' | 'pending' | 'completed'>('pending');
 
   // Attachment & Drag-Drop State
   const [stagedAttachments, setStagedAttachments] = useState<StagedJobAttachmentItem[]>([]);
@@ -895,6 +895,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               <div className="py-3 px-4 rounded-xl bg-slate-950/40 border border-slate-800/60 text-center text-xs text-slate-500">
                 {uniqueTasks.length === 0
                   ? 'No tasks yet. Add an objective below to track deliverables for this job.'
+                  : taskFilter === 'pending' && completedCount === uniqueTasks.length
+                  ? `All ${uniqueTasks.length} tasks completed! Switch to All or Done to review.`
                   : `No ${taskFilter} tasks found.`}
               </div>
             ) : (

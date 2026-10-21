@@ -698,6 +698,26 @@ export default function App() {
       if (connection && signalRConnected) {
         connection.invoke('JoinSession', selectedSessionId).catch(() => {});
       }
+
+      // If the session is not yet loaded in sessions array, fetch it so selectedSession resolves
+      setSessions((prev) => {
+        if (!prev.some((s) => s.id === selectedSessionId) && typeof api.getSession === 'function') {
+          api.getSession(selectedSessionId).then((sess) => {
+            if (sess) {
+              setSessions((curr) => (curr.some((s) => s.id === sess.id) ? curr : [sess, ...curr]));
+              if (sess.personaId) {
+                setSelectedPersonaId(sess.personaId);
+              }
+              if (sess.driverId || sess.creatorAgentId) {
+                setSelectedAgentId(sess.driverId || sess.creatorAgentId || null);
+              }
+            }
+          }).catch((err) => {
+            console.error('Failed to load session details for trajectory view', err);
+          });
+        }
+        return prev;
+      });
     } else {
       if (prevSelectedSessionIdRef.current && connection && signalRConnected) {
         connection.invoke('LeaveSession', prevSelectedSessionIdRef.current).catch(() => {});
@@ -2842,9 +2862,30 @@ export default function App() {
                       setEditingProject(activeProj);
                       setShowProjectModal(true);
                     }}
-                    onSelectTurnSession={(sessionId) => {
+                    onSelectTurnSession={async (sessionId) => {
+                      setIsCreatingSession(false);
                       setSelectedSessionId(sessionId);
                       setActiveTab('personas');
+                      const existing = sessions.find((s) => s.id === sessionId);
+                      if (existing) {
+                        if (existing.personaId) setSelectedPersonaId(existing.personaId);
+                        if (existing.driverId || existing.creatorAgentId) {
+                          setSelectedAgentId(existing.driverId || existing.creatorAgentId || null);
+                        }
+                      } else {
+                        try {
+                          const fetched = await api.getSession(sessionId);
+                          if (fetched) {
+                            setSessions((prev) => (prev.some((s) => s.id === fetched.id) ? prev : [fetched, ...prev]));
+                            if (fetched.personaId) setSelectedPersonaId(fetched.personaId);
+                            if (fetched.driverId || fetched.creatorAgentId) {
+                              setSelectedAgentId(fetched.driverId || fetched.creatorAgentId || null);
+                            }
+                          }
+                        } catch (err) {
+                          console.error('Failed to fetch turn session', err);
+                        }
+                      }
                     }}
                   />
                 );
