@@ -1,7 +1,7 @@
 import { useEffect, type ReactNode } from 'react';
 import { AuthProvider as OidcAuthProvider, useAuth as useOidcAuth, hasAuthParams } from 'react-oidc-context';
 import { oidcConfig } from './authConfig';
-import { setAuthTokenProvider } from '../services/api';
+import { api, setAuthTokenProvider, setUnauthorizedHandler } from '../services/api';
 import { RefreshCw, ShieldAlert } from 'lucide-react';
 
 interface AuthGateProps {
@@ -17,6 +17,89 @@ function AuthGate({ children }: AuthGateProps) {
   }, [auth.user]);
 
   const isCallback = typeof window !== 'undefined' && window.location.pathname === '/auth/callback';
+
+  // Handle 401 Unauthorized responses from the API
+  useEffect(() => {
+    let isHandling401 = false;
+    const handleUnauthorized = async () => {
+      if (isHandling401) return;
+      isHandling401 = true;
+      console.warn('API returned 401 Unauthorized. Attempting session renewal or redirecting to login...');
+      try {
+        if (auth.signinSilent) {
+          const renewedUser = await auth.signinSilent();
+          if (renewedUser && !renewedUser.expired) {
+            isHandling401 = false;
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('Silent session renewal failed after 401:', err);
+      }
+
+      try {
+        await auth.removeUser?.();
+      } catch (err) {
+        console.error('Failed to remove user after 401:', err);
+      }
+
+      auth.signinRedirect?.()?.catch((err: unknown) => {
+        console.error('Failed to redirect to login after 401:', err);
+      });
+    };
+
+    setUnauthorizedHandler(handleUnauthorized);
+    return () => {
+      setUnauthorizedHandler(null);
+    };
+  }, [auth]);
+
+  // Listen to token expiration and renewal error events
+  useEffect(() => {
+    if (!auth.events) return;
+
+    const onTokenExpired = () => {
+      console.warn('OIDC access token expired. Triggering renewal or redirect.');
+      if (auth.signinSilent) {
+        auth.signinSilent().catch(() => {
+          auth.removeUser?.().finally(() => {
+            auth.signinRedirect?.();
+          });
+        });
+      } else {
+        auth.removeUser?.().finally(() => {
+          auth.signinRedirect?.();
+        });
+      }
+    };
+
+    const removeTokenExpired = auth.events.addAccessTokenExpired?.(onTokenExpired);
+    const removeRenewError = auth.events.addSilentRenewError?.(onTokenExpired);
+
+    return () => {
+      removeTokenExpired?.();
+      removeRenewError?.();
+    };
+  }, [auth]);
+
+  // Verify stored token against server on initial mount / user load
+  useEffect(() => {
+    if (!auth.isAuthenticated || !auth.user || isCallback) {
+      return;
+    }
+
+    let isMounted = true;
+    api.verifyAuth?.().catch((err: unknown) => {
+      if (isMounted) {
+        console.warn('Initial session verification failed with server:', err);
+        // apiFetch already triggers unauthorizedHandler if status was 401
+      }
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [auth.isAuthenticated, auth.user, isCallback]);
 
   useEffect(() => {
     // If not authenticated, not loading, no error, and not handling callback, automatically redirect to OIDC provider

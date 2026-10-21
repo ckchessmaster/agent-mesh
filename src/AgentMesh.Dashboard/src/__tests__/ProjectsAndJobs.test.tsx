@@ -8,6 +8,7 @@ import { WorkspaceType, ProjectJobStatus } from '../types';
 
 vi.mock('../services/api', () => ({
   api: {
+    verifyAuth: vi.fn().mockResolvedValue({ authenticated: true }),
     getStatus: vi.fn(),
     getAgents: vi.fn(),
     getPersonas: vi.fn(),

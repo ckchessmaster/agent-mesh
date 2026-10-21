@@ -426,6 +426,12 @@ export default function App() {
 
   const fetchAllData = useCallback(async () => {
     try {
+      if (api.verifyAuth) {
+        await api.verifyAuth().catch((err) => {
+          throw err;
+        });
+      }
+
       const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes] = await Promise.all([
         api.getStatus(),
         api.getAgents(),

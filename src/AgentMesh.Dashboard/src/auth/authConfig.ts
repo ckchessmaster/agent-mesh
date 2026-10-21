@@ -7,7 +7,7 @@ export const oidcConfig: UserManagerSettings = {
   redirect_uri: `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'}/auth/callback`,
   post_logout_redirect_uri: typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000',
   response_type: 'code',
-  scope: 'openid profile email',
+  scope: 'openid profile email offline_access',
   userStore: typeof window !== 'undefined' ? new WebStorageStateStore({ store: window.localStorage }) : undefined,
   automaticSilentRenew: true,
   loadUserInfo: true

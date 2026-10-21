@@ -1,6 +1,8 @@
 issuer: http://localhost:8085/dex
 storage:
-  type: memory
+  type: sqlite3
+  config:
+    file: /var/dex/dex.db
 web:
   http: 0.0.0.0:5556
   allowedOrigins:
@@ -13,6 +15,12 @@ enablePasswordDB: true
 
 oauth2:
   skipApprovalScreen: true
+
+expiry:
+  deviceRequests: "5m"
+  signingKeys: "720h"
+  idTokens: "24h"
+  authCodes: "10m"
 
 staticClients:
   - id: agentmesh-dashboard
