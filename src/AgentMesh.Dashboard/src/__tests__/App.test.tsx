@@ -33,9 +33,14 @@ vi.mock('../services/api', () => ({
             { id: 'auto', label: 'Auto (Autonomous)', description: 'Auto execution' },
             { id: 'plan', label: 'Plan Only', description: 'Plan only' }
           ],
+          contextSizes: [
+            { id: '128k', label: '128k Tokens', description: '128k context' },
+            { id: '200k', label: '200k Tokens', description: '200k context' },
+            { id: '1m', label: '1M Tokens', description: '1M context' }
+          ],
           models: [
-            { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] },
-            { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'] }
+            { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'], contextSizes: ['200k', '1m'] },
+            { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'], contextSizes: ['128k', '200k'] }
           ]
         }
       }
@@ -90,6 +95,7 @@ vi.mock('../services/api', () => ({
       }
     }),
     getSessions: vi.fn().mockResolvedValue([]),
+    getSession: vi.fn().mockResolvedValue(null),
     getSessionMessages: vi.fn().mockResolvedValue([]),
     resetMesh: vi.fn(),
     createAgentSession: vi.fn(),
@@ -153,9 +159,14 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
           { id: 'auto', label: 'Auto (Autonomous)', description: 'Auto execution' },
           { id: 'plan', label: 'Plan Only', description: 'Plan only' }
         ],
+        contextSizes: [
+          { id: '128k', label: '128k Tokens', description: '128k context' },
+          { id: '200k', label: '200k Tokens', description: '200k context' },
+          { id: '1m', label: '1M Tokens', description: '1M context' }
+        ],
         models: [
-          { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] },
-          { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'] }
+          { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'], contextSizes: ['200k', '1m'] },
+          { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'], contextSizes: ['128k', '200k'] }
         ]
       }
     }
@@ -1211,6 +1222,7 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
       defaultModel: 'gemini-4-argon',
       defaultEffort: 'high',
       defaultMode: 'plan',
+      defaultContextSize: '1m',
       trustTier: 3,
       sessionCount: 1,
       createdAt: new Date().toISOString()
@@ -1230,7 +1242,8 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
         personaName: 'Security Auditor',
         model: 'gemini-4-argon',
         effort: 'high',
-        mode: 'plan'
+        mode: 'plan',
+        contextSize: '1m'
       }),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
@@ -1272,6 +1285,7 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     expect((selects[0] as HTMLSelectElement).value).toBe('gemini-4-argon');
     expect((selects[1] as HTMLSelectElement).value).toBe('high');
     expect((selects[2] as HTMLSelectElement).value).toBe('plan');
+    expect((selects[3] as HTMLSelectElement).value).toBe('1m');
 
     // Can also access any other model on the Driver (e.g. gpt-oss-120b)
     expect(screen.getByRole('option', { name: 'GPT-OSS 120b' })).toBeInTheDocument();
@@ -1289,7 +1303,8 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
         expect.objectContaining({
           model: 'gemini-4-argon',
           effort: 'high',
-          mode: 'plan'
+          mode: 'plan',
+          contextSize: '1m'
         })
       );
     });
@@ -1740,6 +1755,79 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     expect(downloadLink).toBeInTheDocument();
     expect(downloadLink).toHaveAttribute('href', expect.stringContaining('/api/sessions/session-pascal-att/attachments/att-doc-999/content'));
     expect(downloadLink.getAttribute('href')).not.toContain('undefined');
+  });
+
+  it('supports configuring persona default context size per driver and model, and updating it in the persona modal', async () => {
+    const mockDriver: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      role: 'Autonomous Codebase Driver',
+      status: 'online',
+      runtimeType: 'CliAgy',
+      trustTier: 3,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockPersona: Persona = {
+      id: 'sec-auditor',
+      name: 'Security Auditor',
+      role: 'Principal AppSec Architect',
+      personaPrompt: 'Review all authentication and token flows.',
+      driverId: 'agy',
+      driverName: 'Antigravity CLI',
+      driverStatus: 'online',
+      defaultModel: 'gemini-4-argon',
+      defaultEffort: 'high',
+      defaultMode: 'plan',
+      defaultContextSize: '1m',
+      trustTier: 3,
+      sessionCount: 0,
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockDriver]);
+    vi.mocked(api.getPersonas).mockResolvedValue([mockPersona]);
+    vi.mocked(api.updatePersona).mockResolvedValue({
+      ...mockPersona,
+      defaultModel: 'gpt-oss-120b',
+      defaultContextSize: '200k'
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Security Auditor')).toBeInTheDocument();
+      expect(screen.getByText('1m')).toBeInTheDocument();
+    });
+
+    // Open edit persona modal
+    const editBtn = screen.getByTitle('Edit Security Auditor');
+    fireEvent.click(editBtn);
+
+    expect(screen.getByText('Edit Persona: Security Auditor')).toBeInTheDocument();
+
+    const contextSizeSelect = screen.getByLabelText('Persona Default Context Size') as HTMLSelectElement;
+    expect(contextSizeSelect.value).toBe('1m');
+
+    // Change model to gpt-oss-120b (supports 128k, 200k)
+    const modelSelect = screen.getByLabelText('Persona Default Model') as HTMLSelectElement;
+    fireEvent.change(modelSelect, { target: { value: 'gpt-oss-120b' } });
+
+    // Since 1m is not supported by gpt-oss-120b, context size should reset or let user select 200k
+    fireEvent.change(contextSizeSelect, { target: { value: '200k' } });
+    expect(contextSizeSelect.value).toBe('200k');
+
+    fireEvent.click(screen.getByRole('button', { name: /Save Changes/i }));
+
+    await waitFor(() => {
+      expect(api.updatePersona).toHaveBeenCalledWith(
+        'sec-auditor',
+        expect.objectContaining({
+          defaultModel: 'gpt-oss-120b',
+          defaultContextSize: '200k'
+        })
+      );
+    });
   });
 });
 

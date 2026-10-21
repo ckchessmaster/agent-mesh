@@ -42,7 +42,8 @@ import {
   File as FileIcon,
   Download,
   ZoomIn,
-  FolderGit2
+  FolderGit2,
+  Maximize2
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -263,6 +264,7 @@ export default function App() {
   const [personaDefaultEffort, setPersonaDefaultEffort] = useState('');
   const [personaDefaultMode, setPersonaDefaultMode] = useState('');
   const [personaDefaultTier, setPersonaDefaultTier] = useState('');
+  const [personaDefaultContextSize, setPersonaDefaultContextSize] = useState('');
   const [personaDefaultWorkDir, setPersonaDefaultWorkDir] = useState('');
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
@@ -289,6 +291,7 @@ export default function App() {
   const [newSessionEffort, setNewSessionEffort] = useState('');
   const [newSessionMode, setNewSessionMode] = useState('');
   const [newSessionTier, setNewSessionTier] = useState('');
+  const [newSessionContextSize, setNewSessionContextSize] = useState('');
 
   // Agent Quota & Usage details modal state
   const [agentUsages, setAgentUsages] = useState<Record<string, AgentUsageResponse>>({});
@@ -297,7 +300,7 @@ export default function App() {
   const [isRefreshingUsage, setIsRefreshingUsage] = useState(false);
 
   // Active session inline control edit popover state
-  const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | null>(null);
+  const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | 'contextSize' | null>(null);
 
   // Active prompt queue and Send Now dropdown state
   const [activeQueue, setActiveQueue] = useState<QueuedPromptItem[]>([]);
@@ -349,6 +352,7 @@ export default function App() {
     }
   });
   const [isScrolledUp, setIsScrolledUp] = useState(false);
+  const userScrolledUpRef = useRef(false);
 
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const timelineContainerRef = useRef<HTMLDivElement | null>(null);
@@ -363,14 +367,8 @@ export default function App() {
         localStorage.setItem('agentmesh_autoscroll_enabled', String(next));
       } catch {}
       if (next && timelineContainerRef.current) {
-        if (typeof timelineContainerRef.current.scrollTo === 'function') {
-          timelineContainerRef.current.scrollTo({
-            top: timelineContainerRef.current.scrollHeight,
-            behavior: 'smooth'
-          });
-        } else {
-          timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
-        }
+        userScrolledUpRef.current = false;
+        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
         setIsScrolledUp(false);
       }
       return next;
@@ -378,15 +376,9 @@ export default function App() {
   };
 
   const handleScrollToBottom = () => {
+    userScrolledUpRef.current = false;
     if (timelineContainerRef.current) {
-      if (typeof timelineContainerRef.current.scrollTo === 'function') {
-        timelineContainerRef.current.scrollTo({
-          top: timelineContainerRef.current.scrollHeight,
-          behavior: 'smooth'
-        });
-      } else {
-        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
-      }
+      timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
     }
     setIsScrolledUp(false);
   };
@@ -394,8 +386,14 @@ export default function App() {
   const handleTimelineScroll = () => {
     if (!timelineContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = timelineContainerRef.current;
-    const isNearBottom = scrollHeight - (scrollTop + clientHeight) < 150;
-    setIsScrolledUp(!isNearBottom);
+    const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
+    if (distanceFromBottom < 80) {
+      userScrolledUpRef.current = false;
+      setIsScrolledUp(false);
+    } else if (distanceFromBottom > 200) {
+      userScrolledUpRef.current = true;
+      setIsScrolledUp(true);
+    }
   };
 
   const handleOpenUsageModal = async (agent: Agent) => {
@@ -512,8 +510,31 @@ export default function App() {
 
   const fetchSessionEvents = useCallback(async (sessionId: string) => {
     try {
-      const msgs = await api.getSessionMessages(sessionId);
+      const [msgs, latestSession] = await Promise.all([
+        api.getSessionMessages(sessionId),
+        api.getSession ? api.getSession(sessionId).catch(() => null) : Promise.resolve(null)
+      ]);
       setEvents(msgs);
+      if (latestSession) {
+        setSessions((prev) =>
+          prev.some((s) => s.id === latestSession.id)
+            ? prev.map((s) => (s.id === latestSession.id ? { ...s, ...latestSession } : s))
+            : [latestSession, ...prev]
+        );
+        if (latestSession.personaId) {
+          setSelectedPersonaId(latestSession.personaId);
+        }
+        if (latestSession.driverId || latestSession.creatorAgentId) {
+          setSelectedAgentId(latestSession.driverId || latestSession.creatorAgentId || null);
+        }
+      } else if (msgs.length > 0) {
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg.eventType === 'response') {
+          setSessions((prev) =>
+            prev.map((s) => (s.id === sessionId && s.status === 'thinking' ? { ...s, status: 'active' } : s))
+          );
+        }
+      }
     } catch (err) {
       console.error('Failed to load session events:', err);
     }
@@ -573,7 +594,7 @@ export default function App() {
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
     } else {
       const created = await api.createProject(req);
-      setProjects((prev) => [created, ...prev]);
+      setProjects((prev) => (prev.some((p) => p.id === created.id) ? prev : [created, ...prev]));
       setSelectedProjectId(created.id);
       fetchJobsForProject(created.id);
     }
@@ -593,7 +614,10 @@ export default function App() {
     const created = await api.createProjectJob(jobModalProject.id, req);
     setJobsByProject((prev) => ({
       ...prev,
-      [jobModalProject.id]: [created, ...(prev[jobModalProject.id] || [])]
+      [jobModalProject.id]: [
+        created,
+        ...(prev[jobModalProject.id] || []).filter((j) => j.id !== created.id)
+      ]
     }));
     handleSelectJob(jobModalProject.id, created.id);
   };
@@ -614,9 +638,13 @@ export default function App() {
     }
   };
 
-  const handleSendJobMessage = async (content: string) => {
+  const handleSendJobMessage = async (content: string, attachments?: SessionAttachment[]) => {
     if (!selectedJobId) return;
-    const msg = await api.postJobMessage(selectedJobId, { content, senderType: 'user' });
+    const msg = await api.postJobMessage(selectedJobId, {
+      content,
+      senderType: 'user',
+      attachments
+    });
     setJobMessages((prev) => {
       if (prev.some((m) => m.id === msg.id)) return prev;
       return [...prev, msg];
@@ -626,7 +654,7 @@ export default function App() {
   const handleAddTask = async (title: string) => {
     if (!selectedJobId) return;
     const task = await api.addJobTask(selectedJobId, { title });
-    setJobTasks((prev) => [...prev, task]);
+    setJobTasks((prev) => (prev.some((t) => t.id === task.id) ? prev : [...prev, task]));
   };
 
   const handleToggleTask = async (taskId: string, isCompleted: boolean) => {
@@ -651,6 +679,42 @@ export default function App() {
       }
       return next;
     });
+  };
+
+  const handleArchiveJob = async (jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const updated = await api.archiveJob(targetId);
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to archive job:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to archive job');
+    }
+  };
+
+  const handleReopenJob = async (jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const updated = await api.reopenJob(targetId);
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to reopen job:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to reopen job');
+    }
   };
 
   const fetchSessionArtifacts = useCallback(async (sessionId: string) => {
@@ -733,7 +797,14 @@ export default function App() {
             ? {
                 ...s,
                 messageCount: (s.messageCount || 0) + 1,
-                status: (msg.eventType === 'prompt' || msg.eventType === 'thought' || msg.eventType === 'tool_call') ? 'thinking' : s.status,
+                status:
+                  msg.eventType === 'tool_call' && (msg.toolName === 'ask_question' || msg.toolName === 'ask_user')
+                    ? 'waiting_for_input'
+                    : (msg.eventType === 'prompt' || msg.eventType === 'thought' || msg.eventType === 'tool_call')
+                    ? 'thinking'
+                    : msg.eventType === 'response'
+                    ? (s.status === 'waiting_for_input' ? 'waiting_for_input' : 'active')
+                    : s.status,
                 updatedAt: msg.createdAt || new Date().toISOString()
               }
             : s
@@ -775,7 +846,12 @@ export default function App() {
       });
     };
 
-    const handleSessionUpdated = () => {
+    const handleSessionUpdated = (updatedSession?: AgentSession) => {
+      if (updatedSession?.id) {
+        setSessions((prev) =>
+          prev.map((s) => (s.id === updatedSession.id ? { ...s, ...updatedSession } : s))
+        );
+      }
       fetchAllData();
       if (selectedSessionId) {
         fetchSessionArtifacts(selectedSessionId);
@@ -832,8 +908,22 @@ export default function App() {
 
     const handleJobTaskUpdated = (data: { jobId: string; tasks: JobTask[] }) => {
       if (data.jobId === selectedJobId) {
-        setJobTasks(data.tasks);
+        const unique = (data.tasks || []).filter(
+          (t, idx, self) => idx === self.findIndex((x) => x.id === t.id)
+        );
+        setJobTasks(unique);
       }
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          if (next[pId]?.some((j) => j.id === data.jobId)) {
+            next[pId] = next[pId].map((j) =>
+              j.id === data.jobId ? { ...j, tasks: data.tasks } : j
+            );
+          }
+        }
+        return next;
+      });
     };
 
     const handleJobCreated = (job: ProjectJob) => {
@@ -922,6 +1012,7 @@ export default function App() {
   useEffect(() => {
     if (isSessionSwitchingRef.current) {
       isSessionSwitchingRef.current = false;
+      userScrolledUpRef.current = false;
       if (timelineContainerRef.current) {
         timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
       }
@@ -929,16 +1020,15 @@ export default function App() {
       return;
     }
 
-    if (!autoScrollEnabled) {
+    if (!autoScrollEnabled || userScrolledUpRef.current) {
       return;
     }
 
     if (timelineContainerRef.current) {
-      const { scrollTop, scrollHeight, clientHeight } = timelineContainerRef.current;
-      const isNearBottom = scrollHeight - (scrollTop + clientHeight) < 150;
-      if (isNearBottom && typeof timelineEndRef.current?.scrollIntoView === 'function') {
-        timelineEndRef.current.scrollIntoView({ behavior: 'smooth' });
-      }
+      timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
+      setIsScrolledUp(false);
+    } else if (typeof timelineEndRef.current?.scrollIntoView === 'function') {
+      timelineEndRef.current.scrollIntoView({ behavior: 'auto' });
     }
   }, [events, autoScrollEnabled]);
 
@@ -981,6 +1071,17 @@ export default function App() {
   }, [newSessionWorkDir, capabilities?.workspace?.currentDirectory, loadBrowseDirectory]);
 
   const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
+  const isSessionThinking = useMemo(() => {
+    if (!selectedSession) return false;
+    if (selectedSession.status !== 'thinking') return false;
+    if (events.length > 0) {
+      const lastEv = events[events.length - 1];
+      if (lastEv.eventType === 'response' || lastEv.eventType === 'system') {
+        return false;
+      }
+    }
+    return true;
+  }, [selectedSession, events]);
   const selectedPersona = personas.find((p) => p.id === (selectedSession?.personaId || selectedPersonaId)) ||
     personas.find((p) => p.id === selectedPersonaId) ||
     personas[0] ||
@@ -1037,6 +1138,7 @@ export default function App() {
     setPersonaDefaultEffort('');
     setPersonaDefaultMode('');
     setPersonaDefaultTier('');
+    setPersonaDefaultContextSize('');
     setPersonaDefaultWorkDir('');
     setShowPersonaModal(true);
   }, [selectedAgentId, agents]);
@@ -1052,6 +1154,7 @@ export default function App() {
     setPersonaDefaultEffort(persona.defaultEffort || '');
     setPersonaDefaultMode(persona.defaultMode || '');
     setPersonaDefaultTier(persona.defaultTier || '');
+    setPersonaDefaultContextSize(persona.defaultContextSize || '');
     setPersonaDefaultWorkDir(persona.defaultWorkingDirectory || '');
     setShowPersonaModal(true);
   }, []);
@@ -1063,6 +1166,7 @@ export default function App() {
     setNewSessionEffort(persona.defaultEffort || '');
     setNewSessionMode(persona.defaultMode || '');
     setNewSessionTier(persona.defaultTier || '');
+    setNewSessionContextSize(persona.defaultContextSize || '');
     setNewSessionWorkDir(persona.defaultWorkingDirectory || '');
     setIsCreatingSession(true);
   }, []);
@@ -1083,6 +1187,7 @@ export default function App() {
           defaultEffort: personaDefaultEffort || '',
           defaultMode: personaDefaultMode || '',
           defaultTier: personaDefaultTier || '',
+          defaultContextSize: personaDefaultContextSize || '',
           defaultWorkingDirectory: personaDefaultWorkDir || ''
         });
         setShowPersonaModal(false);
@@ -1099,6 +1204,7 @@ export default function App() {
           defaultEffort: personaDefaultEffort || undefined,
           defaultMode: personaDefaultMode || undefined,
           defaultTier: personaDefaultTier || undefined,
+          defaultContextSize: personaDefaultContextSize || undefined,
           defaultWorkingDirectory: personaDefaultWorkDir || undefined
         });
         setShowPersonaModal(false);
@@ -1202,6 +1308,26 @@ export default function App() {
       setNewSessionTier('');
     }
   }, [availableModels, availableModes, availableTiers, newSessionModel, newSessionMode, newSessionTier]);
+
+  const availableContextSizes = useMemo(() => {
+    if (!currentRuntimeCaps) return [];
+    const modelContextIds = selectedModelCap?.contextSizes;
+    if (modelContextIds && modelContextIds.length > 0) {
+      const driverContexts = currentRuntimeCaps.contextSizes || [];
+      return modelContextIds.map((id) => {
+        const match = driverContexts.find((c) => c.id.toLowerCase() === id.toLowerCase());
+        return match || { id, label: id, description: `${id} context window` };
+      });
+    }
+    return currentRuntimeCaps.contextSizes || [];
+  }, [currentRuntimeCaps, selectedModelCap]);
+
+  // Sync / validate context size when model/driver changes
+  useEffect(() => {
+    if (newSessionContextSize && availableContextSizes.length > 0 && !availableContextSizes.some((c) => c.id.toLowerCase() === newSessionContextSize.toLowerCase())) {
+      setNewSessionContextSize('');
+    }
+  }, [availableContextSizes, newSessionContextSize]);
 
   const createPreviewUrl = (file: File): string | undefined => {
     if (isImageAttachment(file.type, file.name) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
@@ -1385,7 +1511,8 @@ export default function App() {
         model: newSessionModel.trim() || undefined,
         effort: newSessionEffort.trim() || undefined,
         mode: newSessionMode.trim() || undefined,
-        tier: newSessionTier.trim() || undefined
+        tier: newSessionTier.trim() || undefined,
+        contextSize: newSessionContextSize.trim() || undefined
       };
       const created = targetPersona && api.createPersonaSession
         ? await api.createPersonaSession(
@@ -1424,6 +1551,7 @@ export default function App() {
       setNewSessionEffort('');
       setNewSessionMode('');
       setNewSessionTier('');
+      setNewSessionContextSize('');
       setNewSessionAttachments([]);
       setIsCreatingSession(false);
       await fetchAllData();
@@ -1440,6 +1568,7 @@ export default function App() {
     model?: string;
     effort?: string;
     tier?: string;
+    contextSize?: string;
     mode?: string;
     workingDirectory?: string;
   }) => {
@@ -1578,6 +1707,26 @@ export default function App() {
           `• Current Mode: **\`${currentMode}\`**\n` +
           `• Supported Modes: \`plan\` | \`auto\` | \`accept-edits\`\n` +
           `• Usage: \`/mesh mode <mode>\` (e.g. \`/mesh mode plan\`)`
+        );
+      }
+      return true;
+    }
+
+    if (subCmd === 'context') {
+      if (arg) {
+        const c = arg.toLowerCase();
+        await handleUpdateSessionControl({ contextSize: c });
+        await emitSystemMessage(`✓ Context size set to "${c}" for active session.`);
+      } else {
+        const currentContext = selectedSessionMetadata?.contextSize || 'default';
+        const ctxList = sessionAvailableContextSizes.length > 0
+          ? sessionAvailableContextSizes.map((c) => `  - \`${c.id}\`${c.label ? ` (${c.label})` : ''}`).join('\n')
+          : '  - Default driver/model context window';
+        await emitSystemMessage(
+          `⚙️ **Context Window Configuration**\n\n` +
+          `• Current Context Size: **\`${currentContext}\`**\n` +
+          `• Available Context Sizes:\n${ctxList}\n\n` +
+          `• Usage: \`/mesh context <size>\` (e.g. \`/mesh context 200k\`)`
         );
       }
       return true;
@@ -1790,13 +1939,16 @@ export default function App() {
     }
   };
 
-  const handleStopSession = async () => {
-    if (!selectedSessionId) return;
+  const handleStopSession = async (sessionId?: string | React.MouseEvent) => {
+    const targetSessionId = typeof sessionId === 'string' && sessionId ? sessionId : selectedSessionId;
+    if (!targetSessionId) return;
     setIsActionPending(true);
     try {
-      await api.stopSession(selectedSessionId);
+      await api.stopSession(targetSessionId);
       await fetchAllData();
-      await fetchSessionEvents(selectedSessionId);
+      if (selectedSessionId) {
+        await fetchSessionEvents(selectedSessionId);
+      }
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Failed to stop model');
     } finally {
@@ -2000,6 +2152,19 @@ export default function App() {
     return allEfforts.length > 0 ? allEfforts : ['low', 'medium', 'high'];
   }, [sessionModelCap, currentRuntimeCaps]);
 
+  const sessionAvailableContextSizes = useMemo(() => {
+    if (!currentRuntimeCaps) return [];
+    const modelContextIds = sessionModelCap?.contextSizes;
+    if (modelContextIds && modelContextIds.length > 0) {
+      const driverContexts = currentRuntimeCaps.contextSizes || [];
+      return modelContextIds.map((id) => {
+        const match = driverContexts.find((c) => c.id.toLowerCase() === id.toLowerCase());
+        return match || { id, label: id, description: `${id} context window` };
+      });
+    }
+    return currentRuntimeCaps.contextSizes || [];
+  }, [sessionModelCap, currentRuntimeCaps]);
+
   return (
     <div className="min-h-screen h-screen bg-slate-950 text-slate-100 flex flex-col font-sans overflow-hidden">
       {/* Top Bar */}
@@ -2167,8 +2332,13 @@ export default function App() {
                 setJobModalProject(proj);
                 setShowJobModal(true);
               }}
+              onEditProject={(proj) => {
+                setEditingProject(proj);
+                setShowProjectModal(true);
+              }}
               onDeleteProject={handleDeleteProject}
               onDeleteJob={handleDeleteJob}
+              onArchiveJob={handleArchiveJob}
             />
           ) : activeTab === 'personas' ? (
             <>
@@ -2278,6 +2448,12 @@ export default function App() {
                                 {persona.defaultModel && (
                                   <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-950/40 border border-purple-500/30 text-[10px] font-mono text-purple-300 truncate max-w-[140px]">
                                     <span>{persona.defaultModel}</span>
+                                  </span>
+                                )}
+                                {persona.defaultContextSize && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-950/40 border border-emerald-500/30 text-[10px] font-mono text-emerald-300">
+                                    <Maximize2 className="w-2.5 h-2.5 text-emerald-400" />
+                                    <span>{persona.defaultContextSize}</span>
                                   </span>
                                 )}
                               </div>
@@ -2768,14 +2944,48 @@ export default function App() {
                     job={activeJ}
                     tasks={jobTasks}
                     messages={jobMessages}
+                    personas={personas}
+                    sessions={sessions}
                     onSendMessage={handleSendJobMessage}
                     onAddTask={handleAddTask}
                     onToggleTask={handleToggleTask}
                     onDeleteTask={handleDeleteTask}
                     onCompleteJob={handleCompleteJob}
-                    onSelectTurnSession={(sessionId) => {
-                      setSelectedSessionId(sessionId);
+                    onArchiveJob={handleArchiveJob}
+                    onReopenJob={handleReopenJob}
+                    onOpenLightbox={setLightboxAttachment}
+                    onStopTurn={handleStopSession}
+                    onEditProject={() => {
+                      setEditingProject(activeProj);
+                      setShowProjectModal(true);
+                    }}
+                    onSelectTurnSession={async (sessionId) => {
+                      setIsCreatingSession(false);
                       setActiveTab('personas');
+                      setSelectedSessionId(sessionId);
+                      const existing = sessions.find((s) => s.id === sessionId);
+                      if (existing) {
+                        if (existing.personaId) setSelectedPersonaId(existing.personaId);
+                        if (existing.driverId || existing.creatorAgentId) {
+                          setSelectedAgentId(existing.driverId || existing.creatorAgentId || null);
+                        }
+                      }
+                      try {
+                        const fetched = await api.getSession(sessionId);
+                        if (fetched) {
+                          setSessions((prev) =>
+                            prev.some((s) => s.id === fetched.id)
+                              ? prev.map((s) => (s.id === fetched.id ? { ...s, ...fetched } : s))
+                              : [fetched, ...prev]
+                          );
+                          if (fetched.personaId) setSelectedPersonaId(fetched.personaId);
+                          if (fetched.driverId || fetched.creatorAgentId) {
+                            setSelectedAgentId(fetched.driverId || fetched.creatorAgentId || null);
+                          }
+                        }
+                      } catch (err) {
+                        console.error('Failed to fetch turn session', err);
+                      }
                     }}
                   />
                 );
@@ -3072,7 +3282,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className={`grid ${availableTiers.length > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'} gap-2.5`}>
+                  <div className={`grid ${availableTiers.length > 0 ? 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-5' : 'grid-cols-2 sm:grid-cols-4'} gap-2.5`}>
                     {/* Model Selection Dropdown */}
                     <div className="space-y-1">
                       <label className="block text-[11px] font-medium text-slate-400">
@@ -3146,6 +3356,28 @@ export default function App() {
                       </select>
                     </div>
 
+                    {/* Context Size Dropdown (tied to model/driver) */}
+                    {availableContextSizes.length > 0 && (
+                      <div className="space-y-1">
+                        <label className="block text-[11px] font-medium text-slate-400">
+                          Context Window Size
+                        </label>
+                        <select
+                          aria-label="New Session Context Size"
+                          value={newSessionContextSize}
+                          onChange={(e) => setNewSessionContextSize(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 cursor-pointer"
+                        >
+                          <option value="">Default Context</option>
+                          {availableContextSizes.map((cs) => (
+                            <option key={cs.id} value={cs.id} title={cs.description}>
+                              {cs.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
                     {/* Copilot Tier / Optimize For Dropdown */}
                     {availableTiers.length > 0 && (
                       <div className="space-y-1">
@@ -3198,19 +3430,34 @@ export default function App() {
                     </h2>
                     <span
                       className={`text-[11px] font-mono px-2.5 py-0.5 rounded-full border ${
-                        selectedSession.status === 'thinking'
+                        isSessionThinking
                           ? 'bg-amber-500/10 text-amber-300 border-amber-500/30 animate-pulse'
                           : selectedSession.status === 'waiting_for_input'
                           ? 'bg-amber-500/20 text-amber-200 border-amber-400 font-semibold shadow-sm animate-pulse flex items-center gap-1.5'
                           : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
                       }`}
                     >
-                      {selectedSession.status === 'thinking'
+                      {isSessionThinking
                         ? 'Thinking...'
                         : selectedSession.status === 'waiting_for_input'
                         ? 'Waiting for Input'
                         : selectedSession.status}
                     </span>
+                    {selectedSessionMetadata?.jobId && selectedSessionMetadata?.projectId && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedProjectId(selectedSessionMetadata.projectId);
+                          setSelectedJobId(selectedSessionMetadata.jobId);
+                          setActiveTab('projects');
+                        }}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-lg bg-sky-950/80 hover:bg-sky-900/80 text-sky-300 hover:text-white border border-sky-500/30 text-[11px] font-semibold transition cursor-pointer shadow-sm"
+                        title={`Return to Job: ${selectedSessionMetadata.projectName || 'Job'}`}
+                      >
+                        <FolderGit2 className="w-3 h-3 text-sky-400" />
+                        <span>← Back to Job</span>
+                      </button>
+                    )}
                   </div>
 
                   <div className="flex flex-wrap items-center gap-1.5 mt-1 font-mono text-[11px]">
@@ -3405,6 +3652,48 @@ export default function App() {
                               >
                                 <span>{m.label}</span>
                                 {selectedSessionMetadata?.mode === m.id && <Check className="w-3 h-3 text-sky-400" />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Context Size Selector Badge & Popover */}
+                    {(selectedSessionMetadata?.contextSize || sessionAvailableContextSizes.length > 0) && (
+                      <div className="relative inline-block">
+                        <button
+                          type="button"
+                          onClick={() => setEditingSessionControl((prev) => (prev === 'contextSize' ? null : 'contextSize'))}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
+                          title="Click to change context window size"
+                        >
+                          <Maximize2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                          <span>{selectedSessionMetadata?.contextSize || 'context'}</span>
+                          <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
+                        </button>
+                        {editingSessionControl === 'contextSize' && (
+                          <div className="absolute left-0 top-full mt-1.5 z-40 w-48 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
+                            <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                              Context Window Size
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateSessionControl({ contextSize: '' })}
+                              className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                            >
+                              <span>Default Context</span>
+                              {!selectedSessionMetadata?.contextSize && <Check className="w-3 h-3 text-sky-400" />}
+                            </button>
+                            {sessionAvailableContextSizes.map((cs) => (
+                              <button
+                                key={cs.id}
+                                type="button"
+                                onClick={() => handleUpdateSessionControl({ contextSize: cs.id })}
+                                className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
+                              >
+                                <span className="truncate">{cs.label}</span>
+                                {selectedSessionMetadata?.contextSize === cs.id && <Check className="w-3 h-3 text-sky-400" />}
                               </button>
                             ))}
                           </div>
@@ -4022,7 +4311,7 @@ export default function App() {
                   });
                 })()}
 
-                {selectedSession.status === 'thinking' && (
+                {isSessionThinking && (
                   selectedAgent?.status === 'offline' ? (
                     <div className="flex flex-col gap-1.5 px-4 py-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-xs text-amber-200 max-w-xl">
                       <div className="flex items-center gap-2 font-semibold text-amber-300">
@@ -4227,7 +4516,7 @@ export default function App() {
                     <input
                       type="text"
                       placeholder={
-                        selectedSession.status === 'thinking'
+                        isSessionThinking
                           ? `Add instruction to queue for ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
                           : `Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
                       }
@@ -4246,7 +4535,7 @@ export default function App() {
 
                   {/* Stop Button: beside the input bar, enabled when thinking or waiting_for_input */}
                   {(() => {
-                    const isStoppable = selectedSession.status === 'thinking' || selectedSession.status === 'waiting_for_input';
+                    const isStoppable = isSessionThinking || selectedSession.status === 'waiting_for_input';
                     return (
                       <button
                         type="button"
@@ -4270,7 +4559,7 @@ export default function App() {
                   })()}
 
                   {/* Dynamic Send / Queue Split Button */}
-                  {selectedSession.status === 'thinking' ? (
+                  {isSessionThinking ? (
                     <div className="relative flex items-center">
                       <button
                         type="submit"
@@ -4358,6 +4647,18 @@ export default function App() {
             )}
           </div>
         </>
+          ) : selectedSessionId ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
+              <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-sky-400">
+                <RefreshCw className="w-7 h-7 animate-spin text-sky-400" />
+              </div>
+              <div className="max-w-md space-y-1.5">
+                <h2 className="text-lg font-bold text-white">Loading Session Trajectory...</h2>
+                <p className="text-xs text-slate-400 font-mono">
+                  Loading telemetry for session <span className="text-sky-300">{selectedSessionId.slice(0, 8)}...</span>
+                </p>
+              </div>
+            </div>
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
               <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-sky-400">
@@ -4874,8 +5175,16 @@ export default function App() {
         const driverModels = personaModalRuntimeCaps?.models || [];
         const driverModes = personaModalRuntimeCaps?.modes || [];
         const driverTiers = personaModalRuntimeCaps?.tiers || [];
+        const driverContextSizes = personaModalRuntimeCaps?.contextSizes || [];
         const selectedModelObj = driverModels.find((m) => m.id === personaDefaultModel);
         const driverEfforts = selectedModelObj?.efforts || [];
+        const modelContextIds = selectedModelObj?.contextSizes;
+        const availablePersonaContextSizes = (modelContextIds && modelContextIds.length > 0)
+          ? modelContextIds.map((id) => {
+              const match = driverContextSizes.find((c) => c.id.toLowerCase() === id.toLowerCase());
+              return match || { id, label: id, description: `${id} context window` };
+            })
+          : driverContextSizes;
 
         const driverOptions = Array.from(
           new Map(
@@ -4972,6 +5281,7 @@ export default function App() {
                         setPersonaDriverInput(e.target.value);
                         setPersonaDefaultModel('');
                         setPersonaDefaultEffort('');
+                        setPersonaDefaultContextSize('');
                       }}
                       className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
                     >
@@ -5014,7 +5324,14 @@ export default function App() {
                       <select
                         aria-label="Persona Default Model"
                         value={personaDefaultModel}
-                        onChange={(e) => setPersonaDefaultModel(e.target.value)}
+                        onChange={(e) => {
+                          const newModel = e.target.value;
+                          setPersonaDefaultModel(newModel);
+                          const newModelObj = driverModels.find((m) => m.id === newModel);
+                          if (newModelObj?.contextSizes && personaDefaultContextSize && !newModelObj.contextSizes.some((cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase())) {
+                            setPersonaDefaultContextSize('');
+                          }
+                        }}
                         className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
                       >
                         <option value="">Driver Default</option>
@@ -5062,24 +5379,44 @@ export default function App() {
                     </div>
                   </div>
 
-                  {driverTiers.length > 0 && (
+                  <div className={`grid ${driverTiers.length > 0 ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'} gap-2.5`}>
                     <div className="space-y-1">
-                      <label className="block text-[11px] text-slate-400">Default Optimization Tier</label>
+                      <label className="block text-[11px] text-slate-400">Default Context Window Size</label>
                       <select
-                        aria-label="Persona Default Tier"
-                        value={personaDefaultTier}
-                        onChange={(e) => setPersonaDefaultTier(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                        aria-label="Persona Default Context Size"
+                        value={personaDefaultContextSize}
+                        onChange={(e) => setPersonaDefaultContextSize(e.target.value)}
+                        disabled={availablePersonaContextSizes.length === 0}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 disabled:opacity-40 cursor-pointer"
                       >
-                        <option value="">Default Tier</option>
-                        {driverTiers.map((t) => (
-                          <option key={t.id} value={t.id}>
-                            {t.label}
+                        <option value="">Driver / Model Default</option>
+                        {availablePersonaContextSizes.map((cs) => (
+                          <option key={cs.id} value={cs.id} title={cs.description}>
+                            {cs.label}
                           </option>
                         ))}
                       </select>
                     </div>
-                  )}
+
+                    {driverTiers.length > 0 && (
+                      <div className="space-y-1">
+                        <label className="block text-[11px] text-slate-400">Default Optimization Tier</label>
+                        <select
+                          aria-label="Persona Default Tier"
+                          value={personaDefaultTier}
+                          onChange={(e) => setPersonaDefaultTier(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                        >
+                          <option value="">Default Tier</option>
+                          {driverTiers.map((t) => (
+                            <option key={t.id} value={t.id}>
+                              {t.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                  </div>
 
                   <div className="space-y-1">
                     <label className="block text-[11px] text-slate-400">Default Working Directory (Optional)</label>

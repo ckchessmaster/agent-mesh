@@ -62,6 +62,14 @@ export const SLASH_COMMANDS: SlashCommandItem[] = [
     insertText: '/mesh effort '
   },
   {
+    command: '/mesh context',
+    category: 'mesh',
+    label: 'Context Size',
+    description: 'Set context window size (e.g. 128k, 200k, 500k, 1m, 2m, auto)',
+    usage: '/mesh context <size>',
+    insertText: '/mesh context '
+  },
+  {
     command: '/mesh artifacts',
     category: 'mesh',
     label: 'Toggle Artifacts',

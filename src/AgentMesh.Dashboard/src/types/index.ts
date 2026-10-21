@@ -17,6 +17,7 @@ export interface Persona {
   defaultEffort?: string | null;
   defaultMode?: string | null;
   defaultTier?: string | null;
+  defaultContextSize?: string | null;
   defaultWorkingDirectory?: string | null;
   trustTier: number;
   sessionCount?: number;
@@ -145,10 +146,17 @@ export interface TierOption {
   description: string;
 }
 
+export interface ContextSizeOption {
+  id: string;
+  label: string;
+  description: string;
+}
+
 export interface ModelCapability {
   id: string;
   name: string;
   efforts: string[];
+  contextSizes?: string[];
 }
 
 export interface RuntimeCapabilities {
@@ -157,6 +165,7 @@ export interface RuntimeCapabilities {
   modes: ModeOption[];
   models: ModelCapability[];
   tiers?: TierOption[];
+  contextSizes?: ContextSizeOption[];
 }
 
 export interface SystemCapabilitiesResponse {
@@ -297,6 +306,7 @@ export interface JobMessage {
   mentions: string[];
   turnSessionId?: string | null;
   structuredPayloadJson?: string | null;
+  attachments?: SessionAttachment[] | null;
   createdAt: string;
 }
 
@@ -308,6 +318,7 @@ export interface QueuedPromptItem {
   model?: string | null;
   effort?: string | null;
   tier?: string | null;
+  contextSize?: string | null;
   mode?: string | null;
   workingDirectory?: string | null;
   attachments?: SessionAttachment[] | null;

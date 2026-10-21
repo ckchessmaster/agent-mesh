@@ -50,6 +50,7 @@ export interface SessionControlOptions {
   effort?: string;
   mode?: string;
   tier?: string;
+  contextSize?: string;
   attachments?: SessionAttachment[];
 }
 
@@ -108,6 +109,7 @@ export const api = {
     defaultEffort?: string;
     defaultMode?: string;
     defaultTier?: string;
+    defaultContextSize?: string;
     defaultWorkingDirectory?: string;
     trustTier?: number;
   }): Promise<Persona> {
@@ -131,6 +133,7 @@ export const api = {
       defaultEffort?: string;
       defaultMode?: string;
       defaultTier?: string;
+      defaultContextSize?: string;
       defaultWorkingDirectory?: string;
       trustTier?: number;
     }
@@ -176,6 +179,7 @@ export const api = {
         effort: options?.effort,
         mode: options?.mode,
         tier: options?.tier,
+        contextSize: options?.contextSize,
         attachments: options?.attachments
       })
     });
@@ -274,6 +278,7 @@ export const api = {
         effort: options?.effort,
         mode: options?.mode,
         tier: options?.tier,
+        contextSize: options?.contextSize,
         attachments: options?.attachments
       })
     });
@@ -316,6 +321,7 @@ export const api = {
         effort: options?.effort,
         mode: options?.mode,
         tier: options?.tier,
+        contextSize: options?.contextSize,
         attachments: options?.attachments
       })
     });
@@ -339,6 +345,7 @@ export const api = {
       model?: string;
       effort?: string;
       tier?: string;
+      contextSize?: string;
       mode?: string;
       workingDirectory?: string;
     }
@@ -448,6 +455,7 @@ export const api = {
       model?: string;
       effort?: string;
       tier?: string;
+      contextSize?: string;
       mode?: string;
       workingDirectory?: string;
       attachments?: SessionAttachment[];
@@ -708,11 +716,59 @@ export const api = {
     return res.json();
   },
 
+  async uploadJobAttachments(jobId: string, files: File[]): Promise<SessionAttachment[]> {
+    const formData = new FormData();
+    files.forEach((f) => formData.append('files', f, f.name));
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(jobId)}/attachments`, {
+      method: 'POST',
+      headers: getAuthHeadersOnly(),
+      body: formData
+    });
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errBody = await res.json();
+        if (errBody?.error) errMsg = errBody.error;
+      } catch {
+        // Ignore JSON parse error
+      }
+      throw new Error(`Failed to upload attachments: ${errMsg}`);
+    }
+    const raw = await res.json();
+    return (Array.isArray(raw) ? raw : []).map((item: any) => {
+      const id = item.id || item.Id || '';
+      const fileName = item.fileName || item.FileName || item.name || item.Name || '';
+      const contentType = item.contentType || item.ContentType || '';
+      const sizeBytes = typeof item.sizeBytes === 'number'
+        ? item.sizeBytes
+        : typeof item.SizeBytes === 'number'
+        ? item.SizeBytes
+        : (typeof item.size === 'number' ? item.size : 0);
+      const s3Key = item.s3Key || item.S3Key || '';
+      const targetId = id || fileName;
+      const downloadUrl = item.downloadUrl || item.DownloadUrl || (targetId ? `/api/project-jobs/${encodeURIComponent(jobId)}/attachments/${encodeURIComponent(targetId)}/content` : '');
+      const createdAt = item.createdAt || item.CreatedAt || new Date().toISOString();
+
+      return {
+        id,
+        sessionId: jobId,
+        fileName,
+        contentType,
+        sizeBytes,
+        s3Key,
+        downloadUrl,
+        createdAt
+      };
+    });
+  },
+
   async postJobMessage(id: string, req: {
     content: string;
     senderType?: string;
     senderId?: string;
     senderName?: string;
+    turnSessionId?: string;
+    attachments?: SessionAttachment[];
   }): Promise<JobMessage> {
     const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, {
       method: 'POST',
@@ -730,6 +786,24 @@ export const api = {
       body: JSON.stringify(req || {})
     });
     if (!res.ok) throw new Error(`Failed to complete job: ${res.statusText}`);
+    return res.json();
+  },
+
+  async archiveJob(id: string): Promise<ProjectJob> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/archive`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to archive job: ${res.statusText}`);
+    return res.json();
+  },
+
+  async reopenJob(id: string): Promise<ProjectJob> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/reopen`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to reopen job: ${res.statusText}`);
     return res.json();
   }
 };

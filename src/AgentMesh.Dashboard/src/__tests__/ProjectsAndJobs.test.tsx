@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
 import type { Persona, Project, ProjectJob, JobTask, JobMessage } from '../types';
@@ -12,6 +12,7 @@ vi.mock('../services/api', () => ({
     getAgents: vi.fn(),
     getPersonas: vi.fn(),
     getSessions: vi.fn(),
+    getSession: vi.fn(),
     getSessionMessages: vi.fn(),
     getSessionArtifacts: vi.fn(),
     getCapabilities: vi.fn(),
@@ -32,6 +33,7 @@ vi.mock('../services/api', () => ({
     deleteJobTask: vi.fn(),
     getJobMessages: vi.fn(),
     postJobMessage: vi.fn(),
+    uploadJobAttachments: vi.fn(),
     completeJob: vi.fn()
   }
 }));
@@ -52,9 +54,14 @@ vi.mock('../auth/AuthProvider', () => ({
   }))
 }));
 
+const signalRHandlers: Record<string, Function> = {};
 const mockSignalRConnection = {
-  on: vi.fn(),
-  off: vi.fn(),
+  on: vi.fn((event: string, cb: Function) => {
+    signalRHandlers[event] = cb;
+  }),
+  off: vi.fn((event: string) => {
+    delete signalRHandlers[event];
+  }),
   invoke: vi.fn().mockResolvedValue(undefined)
 };
 
@@ -219,6 +226,12 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     // Task checklist bar displays progress (1/2 completed)
     expect(screen.getByText(/1\/2 completed/i)).toBeInTheDocument();
+    // Default filter is 'pending', showing only incomplete tasks
+    expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+    expect(screen.queryByText('Implement OAuth endpoints')).not.toBeInTheDocument();
+
+    // Clicking All filter shows all tasks including completed
+    fireEvent.click(screen.getByRole('button', { name: /^All/i }));
     expect(screen.getByText('Implement OAuth endpoints')).toBeInTheDocument();
     expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
 
@@ -270,6 +283,66 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     await waitFor(() => {
       expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
         content: '@qa-tester please verify token expiration',
+        senderType: 'user'
+      });
+    });
+  });
+
+  it('opens team member mention autocomplete when typing @ in the job message area and autocompletes persona', async () => {
+    vi.mocked(api.postJobMessage).mockResolvedValue({
+      id: 'm-4',
+      jobId: 'job-101',
+      senderType: 'user',
+      content: '@astra please review security architecture',
+      mentions: ['astra'],
+      createdAt: new Date().toISOString()
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(
+        screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i)
+      ).toBeInTheDocument();
+    });
+
+    const textarea = screen.getByPlaceholderText(
+      /Type your message, tasks, or delegate with @persona/i
+    );
+
+    // Enter @ in the job message area
+    fireEvent.change(textarea, { target: { value: '@' } });
+
+    // Autocomplete palette should appear showing project team members
+    const palette = screen.getByTestId('team-mention-palette');
+    expect(palette).toBeInTheDocument();
+    expect(within(palette).getByText('Team Members')).toBeInTheDocument();
+    expect(within(palette).getByText('Astra')).toBeInTheDocument();
+    expect(within(palette).getByText('QA Tester')).toBeInTheDocument();
+
+    // Select Astra from the autocomplete dropdown
+    const astraOption = screen.getByTestId('team-mention-option-astra');
+    fireEvent.click(astraOption);
+
+    // Textarea updated with mention and palette closed
+    expect((textarea as HTMLTextAreaElement).value).toBe('@astra ');
+    expect(screen.queryByTestId('team-mention-palette')).not.toBeInTheDocument();
+
+    // Finish typing message and send
+    fireEvent.change(textarea, {
+      target: { value: '@astra please review security architecture' }
+    });
+    const sendBtn = screen.getByTitle('Send Message');
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
+        content: '@astra please review security architecture',
         senderType: 'user'
       });
     });
@@ -342,6 +415,281 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       expect(api.completeJob).toHaveBeenCalledWith('job-101', {
         resultSummary: 'OAuth verified across all providers'
       });
+    });
+  });
+
+  it('does not create duplicate project rows when creating a project even if SignalR arrives concurrently', async () => {
+    const newProject: Project = {
+      id: 'mesh-billing',
+      name: 'Mesh Billing Subsystem',
+      description: 'Stripe webhook handling',
+      workspaceType: WorkspaceType.Git,
+      gitBaseBranch: 'main',
+      projectInstructions: '',
+      assignedPersonas: [],
+      jobCount: 0,
+      activeJobCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.createProject).mockImplementation(async () => {
+      if (signalRHandlers['ProjectCreated']) {
+        signalRHandlers['ProjectCreated'](newProject);
+      }
+      return newProject;
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('New Project')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('New Project'));
+
+    const nameInput = screen.getByPlaceholderText('e.g. AgentMesh Core');
+    fireEvent.change(nameInput, { target: { value: 'Mesh Billing Subsystem' } });
+    fireEvent.submit(nameInput.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Mesh Billing Subsystem')).toHaveLength(1);
+    });
+  });
+
+  it('does not create duplicate job rows when creating a job even if SignalR arrives concurrently', async () => {
+    const newJob: ProjectJob = {
+      id: 'job-102',
+      projectId: 'mesh-core',
+      projectName: 'Mesh Core System',
+      title: 'Setup Redis Distributed Lock',
+      description: '',
+      status: ProjectJobStatus.Active,
+      gitBranchName: 'mesh/job-redis-lock',
+      tasks: [],
+      messageCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.createProjectJob).mockImplementation(async () => {
+      if (signalRHandlers['JobCreated']) {
+        signalRHandlers['JobCreated'](newJob);
+      }
+      return newJob;
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Create new Job in this project')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTitle('Create new Job in this project'));
+
+    const jobTitleInput = screen.getByPlaceholderText('e.g. Implement OAuth2 flow with Google & GitHub');
+    fireEvent.change(jobTitleInput, { target: { value: 'Setup Redis Distributed Lock' } });
+    fireEvent.submit(jobTitleInput.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Setup Redis Distributed Lock')).toHaveLength(1);
+    });
+  });
+
+  it('does not create duplicate task items in checklist when adding a task even if SignalR arrives concurrently', async () => {
+    const newTask: JobTask = {
+      id: 'task-3',
+      title: 'Deploy to staging',
+      isCompleted: false
+    };
+
+    vi.mocked(api.addJobTask).mockImplementation(async () => {
+      if (signalRHandlers['JobTaskUpdated']) {
+        signalRHandlers['JobTaskUpdated']({
+          jobId: 'job-101',
+          tasks: [...mockTasks, newTask]
+        });
+      }
+      return newTask;
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+    });
+
+    const addTaskInput = screen.getByPlaceholderText('+ Add task...');
+    fireEvent.change(addTaskInput, { target: { value: 'Deploy to staging' } });
+    fireEvent.submit(addTaskInput.closest('form')!);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Deploy to staging')).toHaveLength(1);
+    });
+  });
+
+  it('allows attaching files in job cockpit, stages them, sends attachments to postJobMessage, and renders attachments in job messages', async () => {
+    const uploadedAtt = {
+      id: 'att-job-99',
+      sessionId: 'job-101',
+      fileName: 'spec.pdf',
+      contentType: 'application/pdf',
+      sizeBytes: 4096,
+      s3Key: 'jobs/job-101/attachments/att-job-99/spec.pdf',
+      downloadUrl: '/api/project-jobs/job-101/attachments/att-job-99/content',
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.uploadJobAttachments).mockResolvedValue([uploadedAtt]);
+
+    const createdJobMsg: JobMessage = {
+      id: 'msg-job-created-1',
+      jobId: 'job-101',
+      senderType: 'user',
+      content: 'Please review the attached file(s).',
+      mentions: [],
+      structuredPayloadJson: JSON.stringify({
+        attachments: [uploadedAtt]
+      }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.postJobMessage).mockResolvedValue(createdJobMsg);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('job-attach-btn')).toBeInTheDocument();
+    });
+
+    const fileInput = screen.getByTestId('job-file-input');
+    const pdfFile = new File(['pdf-data'], 'spec.pdf', { type: 'application/pdf' });
+    fireEvent.change(fileInput, { target: { files: [pdfFile] } });
+
+    await waitFor(() => {
+      expect(api.uploadJobAttachments).toHaveBeenCalledWith('job-101', [pdfFile]);
+      expect(screen.getByTestId('job-staged-attachments')).toBeInTheDocument();
+      expect(screen.getByText('spec.pdf')).toBeInTheDocument();
+    });
+
+    const sendBtn = screen.getByRole('button', { name: /Send Message/i });
+    expect(sendBtn).not.toBeDisabled();
+
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
+        content: 'Please review the attached file(s).',
+        senderType: 'user',
+        attachments: [uploadedAtt]
+      });
+    });
+
+    // The message with attachment is rendered in the message feed
+    await waitFor(() => {
+      expect(screen.getByTestId('job-message-attachments-msg-job-created-1')).toBeInTheDocument();
+      expect(screen.getByText('spec.pdf')).toBeInTheDocument();
+    });
+  });
+
+  it('allows editing project details and team members from project list and updates project', async () => {
+    const updatedProj = {
+      ...mockProject,
+      name: 'Mesh Core System (Updated)',
+      description: 'Updated description'
+    };
+    vi.mocked(api.updateProject).mockResolvedValue(updatedProj);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('edit-project-btn-mesh-core')).toBeInTheDocument();
+    });
+
+    // Click edit button on project in sidebar
+    fireEvent.click(screen.getByTestId('edit-project-btn-mesh-core'));
+
+    // Modal opens in edit mode
+    await waitFor(() => {
+      expect(screen.getByText('Edit Project')).toBeInTheDocument();
+    });
+
+    const nameInput = screen.getByDisplayValue('Mesh Core System');
+    fireEvent.change(nameInput, { target: { value: 'Mesh Core System (Updated)' } });
+
+    const saveBtn = screen.getByRole('button', { name: /Update Project/i });
+    fireEvent.click(saveBtn);
+
+    await waitFor(() => {
+      expect(api.updateProject).toHaveBeenCalledWith(
+        'mesh-core',
+        expect.objectContaining({
+          name: 'Mesh Core System (Updated)'
+        })
+      );
+    });
+  });
+
+  it('clicking View Turn Execution & Trajectory loads turn session without empty observatory and provides Return to Job button', async () => {
+    vi.mocked(api.getSession).mockResolvedValue({
+      id: 'sess-turn-456',
+      title: 'Job Turn: Implement OAuth Provider (@Astra)',
+      status: 'active',
+      metadataJson: JSON.stringify({
+        jobId: 'job-101',
+        projectId: 'mesh-core',
+        projectName: 'Mesh Core System',
+        personaId: 'astra'
+      }),
+      driverId: 'agy',
+      personaId: 'astra',
+      personaName: 'Astra',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+    vi.mocked(api.getSessionMessages).mockResolvedValue([
+      {
+        id: 'msg-ev-1',
+        sessionId: 'sess-turn-456',
+        senderAgentId: 'astra',
+        eventType: 'thought',
+        content: 'Analyzing OAuth specifications and scopes',
+        createdAt: new Date().toISOString()
+      }
+    ]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
+    });
+
+    // Click View Turn Execution & Trajectory
+    fireEvent.click(screen.getByText('View Turn Execution & Trajectory'));
+
+    // Should load the session details in both sidebar and main panel, not show the empty observatory screen
+    await waitFor(() => {
+      expect(screen.getAllByText('Job Turn: Implement OAuth Provider (@Astra)').length).toBeGreaterThan(0);
+      expect(screen.queryByText('Agent Session Observatory')).not.toBeInTheDocument();
+      expect(screen.getByText('← Back to Job')).toBeInTheDocument();
+    });
+
+    // Click Back to Job returns to Job Cockpit
+    fireEvent.click(screen.getByText('← Back to Job'));
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+      expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
     });
   });
 });

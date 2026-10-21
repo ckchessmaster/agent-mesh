@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -52,12 +53,24 @@ public record UpdateJobTaskRequest(
     string? AssignedPersonaId = null
 );
 
+public record JobAttachmentDto(
+    string Id,
+    Guid JobId,
+    string FileName,
+    string ContentType,
+    long SizeBytes,
+    string S3Key,
+    string DownloadUrl,
+    DateTimeOffset CreatedAt
+);
+
 public record PostJobMessageRequest(
     string Content,
     string SenderType = "user",
     string? SenderId = null,
     string? SenderName = null,
-    Guid? TurnSessionId = null
+    Guid? TurnSessionId = null,
+    List<JobAttachmentDto>? Attachments = null
 );
 
 public record CompleteJobRequest(
@@ -74,14 +87,16 @@ public record JobMessageDto(
     List<string> Mentions,
     Guid? TurnSessionId,
     string? StructuredPayloadJson,
-    DateTimeOffset CreatedAt
+    DateTimeOffset CreatedAt,
+    List<JobAttachmentDto>? Attachments = null
 );
 
 [ApiController]
 [Authorize]
 public class ProjectJobsController(
     AgentMeshDbContext db,
-    IHubContext<AgentMeshHub>? hubContext = null) : ControllerBase
+    IHubContext<AgentMeshHub>? hubContext = null,
+    IStorageService? storageService = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -390,18 +405,199 @@ public class ProjectJobsController(
         return Ok(dtos);
     }
 
+    [HttpPost("api/project-jobs/{id}/attachments")]
+    [RequestSizeLimit(262_144_000)]
+    public async Task<IActionResult> UploadJobAttachments(Guid id, [FromForm] IFormFileCollection? files = null)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var formFiles = files ?? (Request?.HasFormContentType == true ? Request.Form.Files : null);
+        if (formFiles == null || formFiles.Count == 0)
+        {
+            return BadRequest(new { error = "No files uploaded." });
+        }
+
+        if (formFiles.Count > 10)
+        {
+            return BadRequest(new { error = "Maximum of 10 files can be uploaded per message." });
+        }
+
+        const long maxSizeBytes = 25 * 1024 * 1024;
+        foreach (var file in formFiles)
+        {
+            if (file.Length <= 0)
+            {
+                return BadRequest(new { error = $"File '{file.FileName}' is empty." });
+            }
+
+            if (file.Length > maxSizeBytes)
+            {
+                return BadRequest(new { error = $"File '{file.FileName}' exceeds the 25 MB maximum file size limit." });
+            }
+
+            if (!SessionsController.IsAllowedAttachment(file.FileName, file.ContentType))
+            {
+                return BadRequest(new { error = $"File '{file.FileName}' has an unsupported file type." });
+            }
+        }
+
+        var uploaded = new List<JobAttachmentDto>();
+        var localAttachDir = GetAttachmentDirectory(id);
+
+        foreach (var file in formFiles)
+        {
+            var attachmentId = Guid.NewGuid().ToString("N");
+            var safeFileName = SessionsController.SanitizeFileName(file.FileName);
+            var contentType = !string.IsNullOrWhiteSpace(file.ContentType) && !string.Equals(file.ContentType, "application/octet-stream", StringComparison.OrdinalIgnoreCase)
+                ? file.ContentType
+                : SessionsController.GuessContentTypeFromExtension(safeFileName);
+            var s3Key = $"jobs/{id}/attachments/{attachmentId}/{safeFileName}";
+            var downloadUrl = $"/api/project-jobs/{id}/attachments/{attachmentId}/content";
+
+            var localFilePath = Path.Combine(localAttachDir, $"{attachmentId}_{safeFileName}");
+            await using (var localStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.Read))
+            {
+                await file.CopyToAsync(localStream, HttpContext?.RequestAborted ?? CancellationToken.None);
+            }
+
+            if (storageService != null)
+            {
+                try
+                {
+                    await using var s3Stream = file.OpenReadStream();
+                    await storageService.UploadStreamAsync(s3Key, s3Stream, contentType, HttpContext?.RequestAborted ?? CancellationToken.None);
+                }
+                catch
+                {
+                    // Graceful fallback to local disk if S3 is unreachable
+                }
+            }
+
+            var dto = new JobAttachmentDto(
+                Id: attachmentId,
+                JobId: id,
+                FileName: safeFileName,
+                ContentType: contentType,
+                SizeBytes: file.Length,
+                S3Key: s3Key,
+                DownloadUrl: downloadUrl,
+                CreatedAt: DateTimeOffset.UtcNow
+            );
+
+            uploaded.Add(dto);
+        }
+
+        return Ok(uploaded);
+    }
+
+    [HttpGet("api/project-jobs/{id}/attachments/{attachmentId}/content")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetAttachmentContent(Guid id, string attachmentId, [FromQuery] bool download = false)
+    {
+        var job = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var localAttachDir = GetAttachmentDirectory(id);
+        string? localFilePath = null;
+        string? safeName = null;
+
+        if (Directory.Exists(localAttachDir))
+        {
+            var matchingFile = Directory.GetFiles(localAttachDir, $"{attachmentId}_*").FirstOrDefault()
+                ?? Directory.GetFiles(localAttachDir, $"*{attachmentId}*").FirstOrDefault();
+            if (matchingFile != null)
+            {
+                localFilePath = matchingFile;
+                var fn = Path.GetFileName(matchingFile);
+                var underscoreIdx = fn.IndexOf('_');
+                safeName = underscoreIdx >= 0 ? fn[(underscoreIdx + 1)..] : fn;
+            }
+        }
+
+        if (localFilePath == null)
+        {
+            // Also check session artifacts folder as fallback
+            var sessionAttachDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "artifacts", id.ToString(), "attachments");
+            if (Directory.Exists(sessionAttachDir))
+            {
+                var candidate = Directory.GetFiles(sessionAttachDir, $"{attachmentId}_*").FirstOrDefault()
+                    ?? Directory.GetFiles(sessionAttachDir, $"*{attachmentId}*").FirstOrDefault();
+                if (candidate != null)
+                {
+                    localFilePath = candidate;
+                    var fn = Path.GetFileName(candidate);
+                    var underscoreIdx = fn.IndexOf('_');
+                    safeName = underscoreIdx >= 0 ? fn[(underscoreIdx + 1)..] : fn;
+                }
+            }
+        }
+
+        Stream? contentStream = null;
+        if (localFilePath != null && System.IO.File.Exists(localFilePath))
+        {
+            contentStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+        else if (storageService != null)
+        {
+            try
+            {
+                var s3Key = $"jobs/{id}/attachments/{attachmentId}/{safeName ?? "attachment"}";
+                contentStream = await storageService.DownloadStreamAsync(s3Key, HttpContext?.RequestAborted ?? CancellationToken.None);
+            }
+            catch
+            {
+                contentStream = null;
+            }
+        }
+
+        if (contentStream == null)
+        {
+            return NotFound(new { error = $"Attachment '{attachmentId}' not found for job {id}." });
+        }
+
+        var contentType = SessionsController.GuessContentTypeFromExtension(safeName ?? "attachment.bin");
+        var isInlineRenderable = !download && (
+            contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+            contentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) ||
+            contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase));
+
+        var disposition = isInlineRenderable ? "inline" : "attachment";
+        if (Response != null)
+        {
+            Response.Headers.ContentDisposition = $"{disposition}; filename=\"{SessionsController.SanitizeFileName(safeName)}\"";
+        }
+
+        return File(contentStream, contentType);
+    }
+
     [HttpPost("api/project-jobs/{id}/messages")]
     public async Task<IActionResult> PostJobMessage(Guid id, [FromBody] PostJobMessageRequest req)
     {
-        if (string.IsNullOrWhiteSpace(req.Content))
+        var effectiveContent = !string.IsNullOrWhiteSpace(req.Content)
+            ? req.Content.Trim()
+            : (req.Attachments is { Count: > 0 } ? "Please review the attached file(s)." : string.Empty);
+
+        if (string.IsNullOrWhiteSpace(effectiveContent))
         {
-            return BadRequest(new { error = "Message content is required." });
+            return BadRequest(new { error = "Message content or at least one attachment is required." });
         }
 
         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
         if (job == null)
         {
             return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        if (job.Status == ProjectJobStatus.Archived)
+        {
+            return BadRequest(new { error = "Cannot post messages to an archived job. Please reopen the job first." });
         }
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
@@ -411,7 +607,7 @@ public class ProjectJobsController(
         }
 
         // Parse @mentions
-        var matches = Regex.Matches(req.Content, @"@([a-zA-Z0-9_\-]+)");
+        var matches = Regex.Matches(effectiveContent, @"@([a-zA-Z0-9_\-]+)");
         var mentions = matches.Select(m => m.Groups[1].Value.ToLowerInvariant()).Distinct().ToList();
 
         var assignedPersonaIds = await db.ProjectPersonas
@@ -436,6 +632,12 @@ public class ProjectJobsController(
             }
         }
 
+        string? structuredPayloadJson = null;
+        if (req.Attachments is { Count: > 0 })
+        {
+            structuredPayloadJson = JsonSerializer.Serialize(new { attachments = req.Attachments }, JsonOpts);
+        }
+
         var jobMsg = new JobMessage
         {
             Id = Guid.NewGuid(),
@@ -443,11 +645,17 @@ public class ProjectJobsController(
             SenderType = req.SenderType,
             SenderId = req.SenderId,
             SenderName = req.SenderName,
-            Content = req.Content.Trim(),
+            Content = effectiveContent,
             MentionsJson = JsonSerializer.Serialize(mentions, JsonOpts),
             TurnSessionId = req.TurnSessionId,
+            StructuredPayloadJson = structuredPayloadJson,
             CreatedAt = DateTimeOffset.UtcNow
         };
+
+        JobMessage? ackMsg = null;
+        AgentSession? turnSession = null;
+        Persona? turnPersona = null;
+        Agent? turnDriver = null;
 
         // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn!
         if (targetPersonaId != null && req.TurnSessionId == null)
@@ -455,6 +663,7 @@ public class ProjectJobsController(
             var persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == targetPersonaId);
             if (persona != null)
             {
+                turnPersona = persona;
                 var driverId = persona.DriverId.Trim().ToLowerInvariant();
                 var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
                 if (driver == null)
@@ -467,6 +676,36 @@ public class ProjectJobsController(
                         TrustTier = TrustTier.SeniorManager
                     };
                     db.Agents.Add(driver);
+                }
+                turnDriver = driver;
+
+                var turnSessionId = Guid.NewGuid();
+
+                // If attachments exist, stage them into the turn session's attachment directory
+                if (req.Attachments is { Count: > 0 })
+                {
+                    var sessionAttachDir = SessionsController.GetAttachmentDirectory(turnSessionId);
+                    var jobAttachDir = GetAttachmentDirectory(id);
+
+                    foreach (var att in req.Attachments)
+                    {
+                        var safeName = SessionsController.SanitizeFileName(att.FileName);
+                        var src = Path.Combine(jobAttachDir, $"{att.Id}_{safeName}");
+                        if (!System.IO.File.Exists(src))
+                        {
+                            src = Directory.GetFiles(jobAttachDir, $"{att.Id}_*").FirstOrDefault() ??
+                                  Directory.GetFiles(jobAttachDir, $"*{att.Id}*").FirstOrDefault();
+                        }
+                        if (src != null && System.IO.File.Exists(src))
+                        {
+                            var dest = Path.Combine(sessionAttachDir, $"{att.Id}_{safeName}");
+                            try
+                            {
+                                System.IO.File.Copy(src, dest, overwrite: true);
+                            }
+                            catch { }
+                        }
+                    }
                 }
 
                 // Create turn metadata
@@ -489,12 +728,14 @@ public class ProjectJobsController(
                     ["model"] = persona.DefaultModel,
                     ["effort"] = persona.DefaultEffort,
                     ["mode"] = persona.DefaultMode,
-                    ["tier"] = persona.DefaultTier
+                    ["tier"] = persona.DefaultTier,
+                    ["contextSize"] = persona.DefaultContextSize,
+                    ["attachments"] = req.Attachments
                 };
 
-                var turnSession = new AgentSession
+                turnSession = new AgentSession
                 {
-                    Id = Guid.NewGuid(),
+                    Id = turnSessionId,
                     Title = $"Job Turn: {job.Title} (@{persona.Name})",
                     Status = "thinking",
                     MetadataJson = JsonSerializer.Serialize(turnMetadata, JsonOpts),
@@ -508,11 +749,33 @@ public class ProjectJobsController(
                 db.AgentSessions.Add(turnSession);
                 jobMsg.TurnSessionId = turnSession.Id;
 
+                var tasks = ParseTasks(job.TasksJson);
+                var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+
+                var taskContextSb = new System.Text.StringBuilder();
+                if (tasks.Count > 0)
+                {
+                    taskContextSb.AppendLine("[Job Tasks & Sequential Checklist]:");
+                    for (int i = 0; i < tasks.Count; i++)
+                    {
+                        var t = tasks[i];
+                        var statusTag = t.IsCompleted ? "[x]" : (t.Id == activeTask?.Id ? "[ ] (CURRENT ACTIVE FOCUS)" : "[ ] (Queued)");
+                        taskContextSb.AppendLine($"{i + 1}. {statusTag} {t.Title}");
+                    }
+                    if (activeTask != null)
+                    {
+                        taskContextSb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
+                        taskContextSb.AppendLine("[Sequential Execution Rule]: You must work on and complete tasks sequentially one by one in the order listed above. Focus on completing the current active task first before moving to subsequent tasks.");
+                    }
+                    taskContextSb.AppendLine();
+                }
+
                 // Format prompt context for runner
                 var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
                                         (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
                                         $"[Job Context: {job.Title} - {job.Description}]\n\n" +
-                                        req.Content.Trim();
+                                        taskContextSb +
+                                        effectiveContent;
 
                 var promptMsg = new SessionMessage
                 {
@@ -521,6 +784,7 @@ public class ProjectJobsController(
                     TargetAgentId = driverId,
                     EventType = "prompt",
                     Content = promptWithContext,
+                    StructuredPayloadJson = structuredPayloadJson,
                     CreatedAt = DateTimeOffset.UtcNow
                 };
                 db.SessionMessages.Add(promptMsg);
@@ -550,14 +814,37 @@ public class ProjectJobsController(
                         effort = persona.DefaultEffort,
                         mode = persona.DefaultMode,
                         tier = persona.DefaultTier,
+                        contextSize = persona.DefaultContextSize,
                         jobId = job.Id,
                         projectId = project.Id,
                         gitBranch = job.GitBranchName,
-                        createdAt = promptMsg.CreatedAt
+                        createdAt = promptMsg.CreatedAt,
+                        attachments = req.Attachments
                     };
 
                     await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", promptPayload);
                     await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                }
+
+                if (req.SenderType == "user")
+                {
+                    var ackContent = activeTask != null
+                        ? $"I'm on it — starting work on \"{activeTask.Title}\" now."
+                        : "I'm on it — starting work on this now.";
+
+                    ackMsg = new JobMessage
+                    {
+                        Id = Guid.NewGuid(),
+                        JobId = id,
+                        SenderType = "persona",
+                        SenderId = persona.Id,
+                        SenderName = persona.Name,
+                        Content = ackContent,
+                        MentionsJson = JsonSerializer.Serialize(new List<string>(), JsonOpts),
+                        TurnSessionId = turnSession.Id,
+                        CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(2)
+                    };
+                    db.JobMessages.Add(ackMsg);
                 }
             }
         }
@@ -570,7 +857,30 @@ public class ProjectJobsController(
 
         if (hubContext != null)
         {
+            if (turnSession != null && turnPersona != null && turnDriver != null)
+            {
+                await hubContext.Clients.All.SendAsync("SessionCreated", new SessionSummaryDto(
+                    turnSession.Id,
+                    turnSession.Title,
+                    turnSession.Status,
+                    turnSession.MetadataJson,
+                    turnSession.DriverId,
+                    1,
+                    turnSession.CreatedAt,
+                    turnSession.UpdatedAt,
+                    DriverId: turnSession.DriverId,
+                    DriverName: turnDriver.Name,
+                    PersonaId: turnPersona.Id,
+                    PersonaName: turnPersona.Name
+                ));
+            }
+
             await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
+            if (ackMsg != null)
+            {
+                var ackDto = ToMessageDto(ackMsg);
+                await hubContext.Clients.All.SendAsync("JobMessageAdded", ackDto);
+            }
         }
 
         return Ok(msgDto);
@@ -590,6 +900,56 @@ public class ProjectJobsController(
         {
             job.ResultSummary = req.ResultSummary.Trim();
         }
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(dto);
+    }
+
+    [HttpPost("api/project-jobs/{id}/archive")]
+    public async Task<IActionResult> ArchiveJob(Guid id)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        job.Status = ProjectJobStatus.Archived;
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(dto);
+    }
+
+    [HttpPost("api/project-jobs/{id}/reopen")]
+    public async Task<IActionResult> ReopenJob(Guid id)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        job.Status = ProjectJobStatus.Active;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
@@ -637,6 +997,19 @@ public class ProjectJobsController(
         );
     }
 
+    public static string GetAttachmentDirectory(Guid jobId)
+    {
+        var basePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".agentmesh",
+            "artifacts",
+            "jobs",
+            jobId.ToString(),
+            "attachments");
+        Directory.CreateDirectory(basePath);
+        return basePath;
+    }
+
     private static JobMessageDto ToMessageDto(JobMessage m)
     {
         List<string> mentions;
@@ -649,6 +1022,22 @@ public class ProjectJobsController(
             mentions = new();
         }
 
+        List<JobAttachmentDto>? attachments = null;
+        if (!string.IsNullOrWhiteSpace(m.StructuredPayloadJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(m.StructuredPayloadJson);
+                if ((doc.RootElement.TryGetProperty("attachments", out var aElem) ||
+                     doc.RootElement.TryGetProperty("Attachments", out aElem)) &&
+                    aElem.ValueKind == JsonValueKind.Array)
+                {
+                    attachments = JsonSerializer.Deserialize<List<JobAttachmentDto>>(aElem.GetRawText(), JsonOpts);
+                }
+            }
+            catch { }
+        }
+
         return new JobMessageDto(
             m.Id,
             m.JobId,
@@ -659,7 +1048,8 @@ public class ProjectJobsController(
             mentions,
             m.TurnSessionId,
             m.StructuredPayloadJson,
-            m.CreatedAt
+            m.CreatedAt,
+            attachments
         );
     }
 }

@@ -68,6 +68,9 @@ public class PromptReceivedEvent
     [JsonPropertyName("tier")]
     public string? Tier { get; set; }
 
+    [JsonPropertyName("contextSize")]
+    public string? ContextSize { get; set; }
+
     [JsonPropertyName("jobId")]
     public string? JobId { get; set; }
 

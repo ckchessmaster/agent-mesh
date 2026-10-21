@@ -31,8 +31,8 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!title.trim()) {
-      setError('Job Title is required.');
+    if (!title.trim() || isSubmitting) {
+      if (!title.trim()) setError('Job Title is required.');
       return;
     }
     setIsSubmitting(true);

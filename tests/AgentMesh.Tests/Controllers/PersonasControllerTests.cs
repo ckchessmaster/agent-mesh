@@ -43,7 +43,8 @@ public class PersonasControllerTests
             PersonaPrompt: "Design distributed microservices.",
             DefaultModel: "gemini-4-argon",
             DefaultEffort: "high",
-            DefaultMode: "plan"
+            DefaultMode: "plan",
+            DefaultContextSize: "1m"
         );
 
         // Act
@@ -60,6 +61,7 @@ public class PersonasControllerTests
         dto.DefaultModel.Should().Be("gemini-4-argon");
         dto.DefaultEffort.Should().Be("high");
         dto.DefaultMode.Should().Be("plan");
+        dto.DefaultContextSize.Should().Be("1m");
 
         // Verify Driver was auto-created in db.Agents
         var driver = await db.Agents.FindAsync("agy");
@@ -113,6 +115,7 @@ public class PersonasControllerTests
             DefaultModel: "gemini-4-argon",
             DefaultEffort: "high",
             DefaultMode: "plan",
+            DefaultContextSize: "500k",
             DefaultWorkingDirectory: "/workspace/sec"
         ));
 
@@ -134,6 +137,7 @@ public class PersonasControllerTests
         doc.RootElement.GetProperty("model").GetString().Should().Be("gemini-4-argon");
         doc.RootElement.GetProperty("effort").GetString().Should().Be("high");
         doc.RootElement.GetProperty("mode").GetString().Should().Be("plan");
+        doc.RootElement.GetProperty("contextSize").GetString().Should().Be("500k");
         doc.RootElement.GetProperty("workingDirectory").GetString().Should().Be("/workspace/sec");
         doc.RootElement.GetProperty("personaId").GetString().Should().Be("sec-auditor");
         doc.RootElement.GetProperty("personaName").GetString().Should().Be("Agy Security Auditor");
@@ -191,6 +195,34 @@ public class PersonasControllerTests
         var reloadedOld = await db.AgentSessions.FindAsync(existingSession.Id);
         reloadedOld!.DriverId.Should().Be("agy");
         newSession.DriverId.Should().Be("copilot");
+    }
+
+    [Fact]
+    public async Task UpdatePersona_UpdatesDefaultContextSize_Successfully()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var personasController = new PersonasController(db);
+
+        await personasController.CreatePersona(new CreatePersonaRequest(
+            Name: "Context Switcher",
+            DriverId: "agy",
+            Id: "ctx-switcher",
+            DefaultContextSize: "200k"
+        ));
+
+        // Act
+        var updateRes = await personasController.UpdatePersona("ctx-switcher", new UpdatePersonaRequest(
+            DefaultContextSize: "2m"
+        ));
+
+        // Assert
+        var updated = updateRes.Should().BeOfType<OkObjectResult>().Subject
+            .Value.Should().BeOfType<PersonaDto>().Subject;
+        updated.DefaultContextSize.Should().Be("2m");
+
+        var reloaded = await db.Personas.FindAsync("ctx-switcher");
+        reloaded!.DefaultContextSize.Should().Be("2m");
     }
 
     [Fact]

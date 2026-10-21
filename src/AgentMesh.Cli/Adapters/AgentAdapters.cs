@@ -928,6 +928,7 @@ public class AgyAdapter : IAgentAdapter
                                 model = effectiveModel,
                                 effort = promptEvent.Effort,
                                 mode = promptEvent.Mode,
+                                contextSize = promptEvent.ContextSize,
                                 usage = new
                                 {
                                     inputTokens = lastInputTokens,
@@ -1005,6 +1006,7 @@ public class AgyAdapter : IAgentAdapter
                         model = fallbackEffectiveModel,
                         effort = promptEvent.Effort,
                         mode = promptEvent.Mode,
+                        contextSize = promptEvent.ContextSize,
                         usage = new
                         {
                             inputTokens = lastInputTokens,
@@ -1103,7 +1105,10 @@ public class ClaudeAdapter : IAgentAdapter
                 promptEvent.SessionId,
                 promptEvent.Attachments);
             var escapedPrompt = promptEnvelope.Replace("\"", "\\\"");
-            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\" -p \"{escapedPrompt}\"", cwd, ct);
+            var autocompactArg = !string.IsNullOrWhiteSpace(promptEvent.ContextSize)
+                ? $" --autocompact \"{promptEvent.ContextSize.Trim()}\""
+                : "";
+            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\"{autocompactArg} -p \"{escapedPrompt}\"", cwd, ct);
             ct.ThrowIfCancellationRequested();
             var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut : stdErr;
 
@@ -1126,7 +1131,8 @@ public class ClaudeAdapter : IAgentAdapter
                 {
                     model = promptEvent.Model ?? "claude-3-7-sonnet",
                     effort = promptEvent.Effort,
-                    mode = promptEvent.Mode
+                    mode = promptEvent.Mode,
+                    contextSize = promptEvent.ContextSize
                 });
 
                 await onEvent(new TrajectoryEventPayload
@@ -1150,7 +1156,8 @@ public class ClaudeAdapter : IAgentAdapter
             {
                 model = promptEvent.Model ?? "claude-3-7-sonnet",
                 effort = promptEvent.Effort,
-                mode = promptEvent.Mode
+                mode = promptEvent.Mode,
+                contextSize = promptEvent.ContextSize
             });
 
             await onEvent(new TrajectoryEventPayload
@@ -1230,6 +1237,16 @@ public class CopilotAdapter : IAgentAdapter
                 }
             }
 
+            if (!string.IsNullOrWhiteSpace(promptEvent.ContextSize))
+            {
+                var ctxVal = promptEvent.ContextSize.Trim().ToLowerInvariant();
+                var copilotContextTier = ctxVal is "long_context" or "500k" or "1m" or "2m"
+                    ? "long_context"
+                    : "default";
+                psi.ArgumentList.Add("--context");
+                psi.ArgumentList.Add(copilotContextTier);
+            }
+
             var promptEnvelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(
                 promptEvent.Prompt,
                 preset.Id,
@@ -1282,7 +1299,8 @@ public class CopilotAdapter : IAgentAdapter
                     {
                         model = promptEvent.Model ?? "gpt-4o",
                         tier = promptEvent.Tier,
-                        mode = promptEvent.Mode
+                        mode = promptEvent.Mode,
+                        contextSize = promptEvent.ContextSize
                     });
 
                     await onEvent(new TrajectoryEventPayload
@@ -1306,7 +1324,8 @@ public class CopilotAdapter : IAgentAdapter
                 {
                     model = promptEvent.Model ?? "gpt-4o",
                     tier = promptEvent.Tier,
-                    mode = promptEvent.Mode
+                    mode = promptEvent.Mode,
+                    contextSize = promptEvent.ContextSize
                 });
 
                 await onEvent(new TrajectoryEventPayload

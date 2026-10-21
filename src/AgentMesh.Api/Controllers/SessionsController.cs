@@ -329,7 +329,8 @@ public class SessionsController(
         string? personaId = null,
         string? personaName = null,
         string? personaRole = null,
-        string? personaPrompt = null)
+        string? personaPrompt = null,
+        string? contextSize = null)
     {
         var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrWhiteSpace(existingJson))
@@ -354,6 +355,11 @@ public class SessionsController(
         }
         if (!string.IsNullOrWhiteSpace(mode)) dict["mode"] = mode.Trim();
         if (!string.IsNullOrWhiteSpace(tier)) dict["tier"] = tier.Trim();
+        if (contextSize != null)
+        {
+            if (string.IsNullOrWhiteSpace(contextSize)) dict.Remove("contextSize");
+            else dict["contextSize"] = contextSize.Trim();
+        }
         if (!string.IsNullOrWhiteSpace(personaId)) dict["personaId"] = personaId.Trim();
         if (!string.IsNullOrWhiteSpace(personaName)) dict["personaName"] = personaName.Trim();
         if (!string.IsNullOrWhiteSpace(personaRole)) dict["personaRole"] = personaRole.Trim();
@@ -413,6 +419,20 @@ public class SessionsController(
         catch
         {
             return (null, null, null, null, null);
+        }
+    }
+
+    public static string? ExtractSessionContextSize(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
+            return doc.RootElement.TryGetProperty("contextSize", out var cs) ? cs.GetString() : null;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -830,6 +850,7 @@ public class SessionsController(
         var effectiveEffort = req.Effort != null ? req.Effort : persona?.DefaultEffort;
         var effectiveMode = !string.IsNullOrWhiteSpace(req.Mode) ? req.Mode : persona?.DefaultMode;
         var effectiveTier = !string.IsNullOrWhiteSpace(req.Tier) ? req.Tier : persona?.DefaultTier;
+        var effectiveContextSize = req.ContextSize != null ? req.ContextSize : persona?.DefaultContextSize;
 
         var initialMetadata = MergeSessionMetadata(
             req.MetadataJson,
@@ -841,7 +862,8 @@ public class SessionsController(
             persona?.Id ?? req.PersonaId,
             persona?.Name,
             persona?.Role,
-            persona?.PersonaPrompt);
+            persona?.PersonaPrompt,
+            effectiveContextSize);
 
         var hasAttachments = req.Attachments is { Count: > 0 };
         var hasInitialPrompt = !string.IsNullOrWhiteSpace(req.InitialMessage) || hasAttachments;
@@ -892,6 +914,7 @@ public class SessionsController(
         if (initialMsg != null && !string.IsNullOrWhiteSpace(callerAgentId))
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var contextSize = ExtractSessionContextSize(session.MetadataJson);
             var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
             var targetGroup = $"agent-{callerAgentId}";
             var promptPayload = new
@@ -911,6 +934,7 @@ public class SessionsController(
                 effort = effort,
                 mode = mode,
                 tier = tier,
+                contextSize = contextSize,
                 attachments = req.Attachments,
                 createdAt = initialMsg.CreatedAt
             };
@@ -958,6 +982,7 @@ public class SessionsController(
                 "• **`/mesh mode <plan|auto|accept-edits>`**: Switch session execution mode\n" +
                 "• **`/mesh model <model-id>`**: Set active model (e.g. gemini-3.8-flash)\n" +
                 "• **`/mesh effort <low|medium|high|max>`**: Set reasoning effort\n" +
+                "• **`/mesh context <size>`**: Set context window size (e.g. 128k, 200k, 500k, 1m, 2m, auto)\n" +
                 "• **`/mesh artifacts`**: Toggle side-by-side Artifacts panel\n" +
                 "• **`/mesh queue <prompt>`**: Enqueue prompt sequentially\n" +
                 "• **`/mesh clear`**: Clear event timeline filters\n\n" +
@@ -1029,6 +1054,22 @@ public class SessionsController(
                     $"• Current Mode: **`{currentMode ?? "auto"}`**\n" +
                     $"• Supported Modes: `plan` | `auto` | `accept-edits`\n" +
                     $"• Usage: `/mesh mode <mode>` (e.g. `/mesh mode plan`)";
+            }
+        }
+        else if (subCmd == "context")
+        {
+            if (!string.IsNullOrWhiteSpace(arg))
+            {
+                var ctxVal = arg.ToLowerInvariant();
+                session.MetadataJson = MergeSessionMetadata(session.MetadataJson, null, null, null, null, null, contextSize: ctxVal);
+                systemResponse = $"✓ Context size set to \"{ctxVal}\" for session '{session.Title}'.";
+            }
+            else
+            {
+                var currentCtx = ExtractSessionContextSize(session.MetadataJson);
+                systemResponse = $"⚙️ **Context Size Configuration**\n\n" +
+                    $"• Current Context Size: **`{currentCtx ?? "default"}`**\n" +
+                    $"• Usage: `/mesh context <size>` (e.g. `/mesh context 1m` or `/mesh context long_context`)";
             }
         }
         else if (subCmd == "queue")
@@ -1218,6 +1259,7 @@ public class SessionsController(
         if (eventType == "prompt" && !string.IsNullOrWhiteSpace(message.TargetAgentId))
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var contextSize = ExtractSessionContextSize(session.MetadataJson);
             var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
             var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
             var promptPayload = new
@@ -1237,84 +1279,97 @@ public class SessionsController(
                 effort = effort,
                 mode = mode,
                 tier = tier,
+                contextSize = contextSize,
                 attachments = messageAttachments.Count > 0 ? messageAttachments : null,
                 createdAt = message.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
             await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
-        else if (eventType == "response" && wasThinking)
+        else if (eventType == "response")
         {
             await CheckAndForwardJobTurnResponseAsync(session, message);
 
-            // Auto-advance queued prompts sequentially if any are pending
-            var queue = ExtractPromptQueue(session.MetadataJson);
-            if (queue.Count > 0)
+            if (wasThinking)
             {
-                var nextPrompt = queue[0];
-                queue.RemoveAt(0);
-                session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
-
-                var nextMsg = new SessionMessage
+                // Auto-advance queued prompts sequentially if any are pending
+                var queue = ExtractPromptQueue(session.MetadataJson);
+                if (queue.Count > 0)
                 {
-                    SessionId = id,
-                    SenderAgentId = nextPrompt.Sender,
-                    TargetAgentId = session.CreatorAgentId,
-                    EventType = "prompt",
-                    Content = string.IsNullOrWhiteSpace(nextPrompt.Prompt) ? DefaultAttachmentPrompt : nextPrompt.Prompt,
-                    StructuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, nextPrompt.Attachments),
-                    CreatedAt = DateTimeOffset.UtcNow
-                };
-                db.SessionMessages.Add(nextMsg);
-                session.Status = "thinking";
-                session.UpdatedAt = DateTimeOffset.UtcNow;
+                    var nextPrompt = queue[0];
+                    queue.RemoveAt(0);
+                    session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
 
-                if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
-                {
-                    var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == session.CreatorAgentId);
-                    if (agent != null)
+                    var nextMsg = new SessionMessage
                     {
-                        agent.Status = "busy";
-                        agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                        SessionId = id,
+                        SenderAgentId = nextPrompt.Sender,
+                        TargetAgentId = session.CreatorAgentId,
+                        EventType = "prompt",
+                        Content = string.IsNullOrWhiteSpace(nextPrompt.Prompt) ? DefaultAttachmentPrompt : nextPrompt.Prompt,
+                        StructuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, nextPrompt.Attachments),
+                        CreatedAt = DateTimeOffset.UtcNow
+                    };
+                    db.SessionMessages.Add(nextMsg);
+                    session.Status = "thinking";
+                    session.UpdatedAt = DateTimeOffset.UtcNow;
+
+                    if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                    {
+                        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == session.CreatorAgentId);
+                        if (agent != null)
+                        {
+                            agent.Status = "busy";
+                            agent.LastHeartbeatAt = DateTimeOffset.UtcNow;
+                        }
+                    }
+
+                    await db.SaveChangesAsync();
+
+                    var nextDto = ToMessageDto(nextMsg);
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", nextDto);
+                    await hubContext.Clients.All.SendAsync("ReceiveMessage", nextDto);
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
+                    await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("SessionUpdated", session);
+                    await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+                    var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+                    var contextSize = ExtractSessionContextSize(session.MetadataJson);
+                    var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
+                    if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                    {
+                        var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
+                        var promptPayload = new
+                        {
+                            sessionId = id,
+                            messageId = nextMsg.Id,
+                            agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                            driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
+                            personaId = personaId,
+                            personaName = personaName,
+                            personaRole = personaRole,
+                            personaPrompt = personaPrompt,
+                            prompt = nextMsg.Content,
+                            sender = nextMsg.SenderAgentId,
+                            workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
+                            model = nextPrompt.Model ?? model,
+                            effort = nextPrompt.Effort ?? effort,
+                            mode = nextPrompt.Mode ?? mode,
+                            tier = nextPrompt.Tier ?? tier,
+                            contextSize = nextPrompt.ContextSize ?? contextSize,
+                            attachments = nextPrompt.Attachments,
+                            createdAt = nextMsg.CreatedAt
+                        };
+                        await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                        await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
                     }
                 }
-
-                await db.SaveChangesAsync();
-
-                var nextDto = ToMessageDto(nextMsg);
-                await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", nextDto);
-                await hubContext.Clients.All.SendAsync("ReceiveMessage", nextDto);
-                await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue });
-                await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue });
-                await hubContext.Clients.All.SendAsync("SessionUpdated", session);
-
-                var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
-                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-                if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+                else
                 {
-                    var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                    var promptPayload = new
-                    {
-                        sessionId = id,
-                        messageId = nextMsg.Id,
-                        agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                        driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                        personaId = personaId,
-                        personaName = personaName,
-                        personaRole = personaRole,
-                        personaPrompt = personaPrompt,
-                        prompt = nextMsg.Content,
-                        sender = nextMsg.SenderAgentId,
-                        workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
-                        model = nextPrompt.Model ?? model,
-                        effort = nextPrompt.Effort ?? effort,
-                        mode = nextPrompt.Mode ?? mode,
-                        tier = nextPrompt.Tier ?? tier,
-                        attachments = nextPrompt.Attachments,
-                        createdAt = nextMsg.CreatedAt
-                    };
-                    await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                    await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                    // Queue is empty: session completed turn and returned to active/idle. Notify all clients to clear thinking/stop button state!
+                    await hubContext.Clients.Group($"session-{id}").SendAsync("SessionUpdated", session);
+                    await hubContext.Clients.All.SendAsync("SessionUpdated", session);
                 }
             }
         }
@@ -1342,8 +1397,9 @@ public class SessionsController(
         }
 
         var (oldWorkDir, oldModel, oldEffort, oldMode, oldTier) = ExtractSessionSettings(session.MetadataJson);
+        var oldContextSize = ExtractSessionContextSize(session.MetadataJson);
 
-        if (req.MetadataJson != null || req.Model != null || req.Effort != null || req.Tier != null || req.Mode != null || req.WorkingDirectory != null)
+        if (req.MetadataJson != null || req.Model != null || req.Effort != null || req.Tier != null || req.Mode != null || req.WorkingDirectory != null || req.ContextSize != null)
         {
             session.MetadataJson = MergeSessionMetadata(
                 req.MetadataJson ?? session.MetadataJson,
@@ -1351,7 +1407,8 @@ public class SessionsController(
                 req.Model,
                 req.Effort,
                 req.Mode,
-                req.Tier
+                req.Tier,
+                contextSize: req.ContextSize
             );
         }
 
@@ -1363,6 +1420,8 @@ public class SessionsController(
             changes.Add(string.IsNullOrWhiteSpace(req.Effort) ? "Reasoning effort reset to default" : $"Effort set to '{req.Effort}'");
         if (!string.IsNullOrWhiteSpace(req.Tier) && req.Tier != oldTier)
             changes.Add($"Tier set to '{req.Tier}'");
+        if (req.ContextSize != null && req.ContextSize != oldContextSize)
+            changes.Add(string.IsNullOrWhiteSpace(req.ContextSize) ? "Context size reset to default" : $"Context size set to '{req.ContextSize}'");
         if (!string.IsNullOrWhiteSpace(req.Mode) && req.Mode != oldMode)
             changes.Add($"Mode set to '{req.Mode}'");
         if (!string.IsNullOrWhiteSpace(req.WorkingDirectory) && req.WorkingDirectory != oldWorkDir)
@@ -1563,6 +1622,7 @@ public class SessionsController(
             }
 
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var contextSize = ExtractSessionContextSize(session.MetadataJson);
             var msg = new SessionMessage
             {
                 SessionId = id,
@@ -1604,6 +1664,7 @@ public class SessionsController(
                     effort = req.Effort ?? effort,
                     mode = req.Mode ?? mode,
                     tier = req.Tier ?? tier,
+                    contextSize = req.ContextSize ?? contextSize,
                     attachments = req.Attachments,
                     createdAt = msg.CreatedAt
                 };
@@ -1618,6 +1679,7 @@ public class SessionsController(
         if (session.Status != "thinking" && queue.Count == 0)
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var contextSize = ExtractSessionContextSize(session.MetadataJson);
             var msg = new SessionMessage
             {
                 SessionId = id,
@@ -1659,6 +1721,7 @@ public class SessionsController(
                     effort = req.Effort ?? effort,
                     mode = req.Mode ?? mode,
                     tier = req.Tier ?? tier,
+                    contextSize = req.ContextSize ?? contextSize,
                     attachments = req.Attachments,
                     createdAt = msg.CreatedAt
                 };
@@ -1680,7 +1743,8 @@ public class SessionsController(
             Tier: req.Tier,
             Mode: req.Mode,
             WorkingDirectory: req.WorkingDirectory,
-            Attachments: req.Attachments
+            Attachments: req.Attachments,
+            ContextSize: req.ContextSize
         );
         queue.Add(queuedItem);
 
@@ -1743,6 +1807,7 @@ public class SessionsController(
         }
 
         var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+        var contextSize = ExtractSessionContextSize(session.MetadataJson);
         var structuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, item.Attachments);
 
         var msg = new SessionMessage
@@ -1788,6 +1853,7 @@ public class SessionsController(
                 effort = item.Effort ?? effort,
                 mode = item.Mode ?? mode,
                 tier = item.Tier ?? tier,
+                contextSize = item.ContextSize ?? contextSize,
                 attachments = item.Attachments,
                 createdAt = msg.CreatedAt
             };
@@ -1890,6 +1956,7 @@ public class SessionsController(
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+            var contextSize = ExtractSessionContextSize(session.MetadataJson);
             var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
             var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
             var promptPayload = new
@@ -1909,6 +1976,7 @@ public class SessionsController(
                 effort = effort,
                 mode = mode,
                 tier = tier,
+                contextSize = contextSize,
                 createdAt = promptMsg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -2082,6 +2150,41 @@ public class SessionsController(
                     );
                 }
             }
+        }
+
+        if (attachment == null && !string.IsNullOrWhiteSpace(session.MetadataJson))
+        {
+            try
+            {
+                using var metaDoc = JsonDocument.Parse(session.MetadataJson);
+                if (metaDoc.RootElement.TryGetProperty("jobId", out var jProp) &&
+                    Guid.TryParse(jProp.GetString(), out var jobId))
+                {
+                    var jobAttachDir = ProjectJobsController.GetAttachmentDirectory(jobId);
+                    if (Directory.Exists(jobAttachDir))
+                    {
+                        var matchingJobFile = Directory.GetFiles(jobAttachDir, $"{attachmentId}_*").FirstOrDefault()
+                            ?? Directory.GetFiles(jobAttachDir, $"*{attachmentId}*").FirstOrDefault();
+                        if (matchingJobFile != null)
+                        {
+                            var fn = Path.GetFileName(matchingJobFile);
+                            var underscoreIdx = fn.IndexOf('_');
+                            var safeFn = underscoreIdx >= 0 ? fn[(underscoreIdx + 1)..] : fn;
+                            attachment = new SessionAttachmentDto(
+                                Id: attachmentId,
+                                SessionId: id,
+                                FileName: safeFn,
+                                ContentType: GuessContentTypeFromExtension(safeFn),
+                                SizeBytes: new FileInfo(matchingJobFile).Length,
+                                S3Key: $"jobs/{jobId}/attachments/{attachmentId}/{safeFn}",
+                                DownloadUrl: $"/api/sessions/{id}/attachments/{attachmentId}/content",
+                                CreatedAt: DateTimeOffset.UtcNow
+                            );
+                        }
+                    }
+                }
+            }
+            catch { }
         }
 
         if (attachment == null)
@@ -2536,7 +2639,8 @@ public class SessionsController(
                             ["model"] = nextPersona.DefaultModel,
                             ["effort"] = nextPersona.DefaultEffort,
                             ["mode"] = nextPersona.DefaultMode,
-                            ["tier"] = nextPersona.DefaultTier
+                            ["tier"] = nextPersona.DefaultTier,
+                            ["contextSize"] = nextPersona.DefaultContextSize
                         };
 
                         var nextTurnSession = new AgentSession
@@ -2594,6 +2698,7 @@ public class SessionsController(
                             effort = nextPersona.DefaultEffort,
                             mode = nextPersona.DefaultMode,
                             tier = nextPersona.DefaultTier,
+                            contextSize = nextPersona.DefaultContextSize,
                             jobId = job.Id,
                             projectId = project.Id,
                             gitBranch = job.GitBranchName,
@@ -2622,7 +2727,8 @@ public record CreateSessionRequest(
     string? Tier = null,
     string? PersonaId = null,
     string? DriverId = null,
-    List<SessionAttachmentDto>? Attachments = null
+    List<SessionAttachmentDto>? Attachments = null,
+    string? ContextSize = null
 );
 
 public record PostMessageRequest(
@@ -2646,7 +2752,8 @@ public record UpdateSessionRequest(
     string? Effort = null,
     string? Tier = null,
     string? Mode = null,
-    string? WorkingDirectory = null
+    string? WorkingDirectory = null,
+    string? ContextSize = null
 );
 
 public record SessionSummaryDto(
@@ -2705,7 +2812,8 @@ public record QueuedPromptDto(
     [property: JsonPropertyName("tier")] string? Tier = null,
     [property: JsonPropertyName("mode")] string? Mode = null,
     [property: JsonPropertyName("workingDirectory")] string? WorkingDirectory = null,
-    [property: JsonPropertyName("attachments")] List<SessionAttachmentDto>? Attachments = null
+    [property: JsonPropertyName("attachments")] List<SessionAttachmentDto>? Attachments = null,
+    [property: JsonPropertyName("contextSize")] string? ContextSize = null
 );
 
 public record EnqueuePromptRequest(
@@ -2717,7 +2825,8 @@ public record EnqueuePromptRequest(
     string? Tier = null,
     string? Mode = null,
     string? WorkingDirectory = null,
-    List<SessionAttachmentDto>? Attachments = null
+    List<SessionAttachmentDto>? Attachments = null,
+    string? ContextSize = null
 );
 
 public record QuestionAnswerDto(
