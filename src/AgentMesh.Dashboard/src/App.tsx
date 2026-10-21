@@ -678,6 +678,32 @@ export default function App() {
     });
   };
 
+  const handleArchiveJob = async (jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    const updated = await api.archiveJob(targetId);
+    setJobsByProject((prev) => {
+      const next = { ...prev };
+      for (const pId of Object.keys(next)) {
+        next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+      }
+      return next;
+    });
+  };
+
+  const handleReopenJob = async (jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    const updated = await api.reopenJob(targetId);
+    setJobsByProject((prev) => {
+      const next = { ...prev };
+      for (const pId of Object.keys(next)) {
+        next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+      }
+      return next;
+    });
+  };
+
   const fetchSessionArtifacts = useCallback(async (sessionId: string) => {
     try {
       const list = await api.getSessionArtifacts(sessionId);
@@ -2238,6 +2264,7 @@ export default function App() {
               }}
               onDeleteProject={handleDeleteProject}
               onDeleteJob={handleDeleteJob}
+              onArchiveJob={handleArchiveJob}
             />
           ) : activeTab === 'personas' ? (
             <>
@@ -2844,6 +2871,8 @@ export default function App() {
                     onToggleTask={handleToggleTask}
                     onDeleteTask={handleDeleteTask}
                     onCompleteJob={handleCompleteJob}
+                    onArchiveJob={handleArchiveJob}
+                    onReopenJob={handleReopenJob}
                     onOpenLightbox={setLightboxAttachment}
                     onStopTurn={handleStopSession}
                     onEditProject={() => {

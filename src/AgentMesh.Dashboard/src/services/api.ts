@@ -779,5 +779,23 @@ export const api = {
     });
     if (!res.ok) throw new Error(`Failed to complete job: ${res.statusText}`);
     return res.json();
+  },
+
+  async archiveJob(id: string): Promise<ProjectJob> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/archive`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to archive job: ${res.statusText}`);
+    return res.json();
+  },
+
+  async reopenJob(id: string): Promise<ProjectJob> {
+    const res = await fetch(`/api/project-jobs/${encodeURIComponent(id)}/reopen`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to reopen job: ${res.statusText}`);
+    return res.json();
   }
 };

@@ -7,7 +7,8 @@ import {
   ChevronRight,
   Trash2,
   CheckCircle2,
-  Clock
+  Clock,
+  Archive
 } from 'lucide-react';
 import type { Project, ProjectJob } from '../types';
 import { ProjectJobStatus } from '../types';
@@ -24,6 +25,7 @@ interface ProjectListProps {
   onEditProject?: (project: Project) => void;
   onDeleteProject: (projectId: string) => Promise<void>;
   onDeleteJob: (jobId: string) => Promise<void>;
+  onArchiveJob?: (jobId: string) => Promise<void>;
 }
 
 export const ProjectList: React.FC<ProjectListProps> = ({
@@ -37,7 +39,8 @@ export const ProjectList: React.FC<ProjectListProps> = ({
   onOpenNewJobModal,
   onEditProject,
   onDeleteProject,
-  onDeleteJob
+  onDeleteJob,
+  onArchiveJob
 }) => {
   const [expandedProjectIds, setExpandedProjectIds] = useState<string[]>([]);
   const [confirmDeleteProjectId, setConfirmDeleteProjectId] = useState<string | null>(null);
@@ -208,6 +211,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                       jobs.map((job) => {
                         const isJobSelected = selectedJobId === job.id;
                         const isJobDone = job.status === ProjectJobStatus.Completed;
+                        const isJobArchived = job.status === ProjectJobStatus.Archived;
 
                         return (
                           <div key={job.id}>
@@ -216,16 +220,27 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                               className={`p-2 rounded-lg flex items-center justify-between gap-2 text-xs cursor-pointer group/job transition ${
                                 isJobSelected
                                   ? 'bg-sky-500/20 text-sky-200 border border-sky-500/40'
+                                  : isJobArchived
+                                  ? 'text-slate-400 hover:bg-slate-900/60 border border-transparent'
                                   : 'text-slate-300 hover:bg-slate-900 border border-transparent'
                               }`}
                             >
                               <div className="flex items-center gap-2 min-w-0">
-                                {isJobDone ? (
+                                {isJobArchived ? (
+                                  <Archive className="w-3.5 h-3.5 text-amber-400/80 shrink-0" />
+                                ) : isJobDone ? (
                                   <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                                 ) : (
                                   <Clock className="w-3.5 h-3.5 text-sky-400 shrink-0" />
                                 )}
-                                <span className="truncate font-medium">{job.title}</span>
+                                <span className={`truncate font-medium ${isJobArchived ? 'text-slate-400' : ''}`}>
+                                  {job.title}
+                                </span>
+                                {isJobArchived && (
+                                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/90 border border-amber-500/25 shrink-0">
+                                    Archived
+                                  </span>
+                                )}
                               </div>
 
                               <div className="flex items-center gap-1 shrink-0">
@@ -233,6 +248,19 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                                   <span className="text-[10px] font-mono text-slate-500 hidden sm:inline">
                                     {job.gitBranchName.replace('mesh/', '')}
                                   </span>
+                                )}
+                                {onArchiveJob && !isJobArchived && (
+                                  <button
+                                    type="button"
+                                    title="Archive Job"
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      await onArchiveJob(job.id);
+                                    }}
+                                    className="p-0.5 text-slate-500 hover:text-amber-400 opacity-0 group-hover/job:opacity-100 transition"
+                                  >
+                                    <Archive className="w-3 h-3" />
+                                  </button>
                                 )}
                                 <button
                                   type="button"

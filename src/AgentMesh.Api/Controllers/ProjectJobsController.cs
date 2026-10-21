@@ -595,6 +595,11 @@ public class ProjectJobsController(
             return NotFound(new { error = $"Job '{id}' not found." });
         }
 
+        if (job.Status == ProjectJobStatus.Archived)
+        {
+            return BadRequest(new { error = "Cannot post messages to an archived job. Please reopen the job first." });
+        }
+
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         if (project == null)
         {
@@ -867,6 +872,56 @@ public class ProjectJobsController(
         {
             job.ResultSummary = req.ResultSummary.Trim();
         }
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(dto);
+    }
+
+    [HttpPost("api/project-jobs/{id}/archive")]
+    public async Task<IActionResult> ArchiveJob(Guid id)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        job.Status = ProjectJobStatus.Archived;
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(dto);
+    }
+
+    [HttpPost("api/project-jobs/{id}/reopen")]
+    public async Task<IActionResult> ReopenJob(Guid id)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        job.Status = ProjectJobStatus.Active;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 

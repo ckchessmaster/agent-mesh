@@ -25,7 +25,9 @@ import {
   AlertCircle,
   Square,
   Users,
-  RefreshCw
+  RefreshCw,
+  Archive,
+  RotateCcw
 } from 'lucide-react';
 import type { AgentSession, JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
@@ -157,6 +159,8 @@ interface JobCockpitProps {
   onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
   onDeleteTask: (taskId: string) => Promise<void>;
   onCompleteJob: (resultSummary?: string) => Promise<void>;
+  onArchiveJob?: () => Promise<void>;
+  onReopenJob?: () => Promise<void>;
   onSelectTurnSession?: (sessionId: string) => void;
   onOpenLightbox?: (item: { url: string; fileName: string; sizeBytes?: number }) => void;
   onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
@@ -177,6 +181,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onToggleTask,
   onDeleteTask,
   onCompleteJob,
+  onArchiveJob,
+  onReopenJob,
   onSelectTurnSession,
   onOpenLightbox,
   onUploadAttachments,
@@ -188,8 +194,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [isSending, setIsSending] = useState(false);
   const [isAddingTask, setIsAddingTask] = useState(false);
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
+  const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
   const [resultSummary, setResultSummary] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
+  const [isArchiving, setIsArchiving] = useState(false);
 
   // Task checklist presentation state
   const [isTasksExpanded, setIsTasksExpanded] = useState(true);
@@ -592,7 +600,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
   const hasPendingUploads = stagedAttachments.some((a) => a.uploading);
   const isCompleted = job.status === ProjectJobStatus.Completed;
-  const canSend = Boolean(prompt.trim() || readyStagedAttachments.length > 0) && !hasPendingUploads && !isSending && !isCompleted;
+  const isArchived = job.status === ProjectJobStatus.Archived;
+  const isClosed = isCompleted || isArchived;
+  const canSend = Boolean(prompt.trim() || readyStagedAttachments.length > 0) && !hasPendingUploads && !isSending && !isClosed;
 
   const handleSend = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -662,6 +672,27 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
+  const handleConfirmArchive = async () => {
+    if (!onArchiveJob) return;
+    setIsArchiving(true);
+    try {
+      await onArchiveJob();
+      setShowArchiveConfirm(false);
+    } finally {
+      setIsArchiving(false);
+    }
+  };
+
+  const handleConfirmReopen = async () => {
+    if (!onReopenJob) return;
+    setIsArchiving(true);
+    try {
+      await onReopenJob();
+    } finally {
+      setIsArchiving(false);
+    }
+  };
+
   const completedCount = uniqueTasks.filter((t) => t.isCompleted).length;
   const progressPercent = uniqueTasks.length > 0 ? Math.round((completedCount / uniqueTasks.length) * 100) : 0;
 
@@ -713,7 +744,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   {job.gitBranchName}
                 </span>
               )}
-              {isCompleted ? (
+              {isArchived ? (
+                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1">
+                  <Archive className="w-3 h-3" /> Archived
+                </span>
+              ) : isCompleted ? (
                 <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
                   <Check className="w-3 h-3" /> Completed
                 </span>
@@ -773,42 +808,96 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             )}
           </button>
 
-          {!isCompleted && (
-            <div>
-              {showCompleteConfirm ? (
-                <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl">
-                  <input
-                    type="text"
-                    value={resultSummary}
-                    onChange={(e) => setResultSummary(e.target.value)}
-                    placeholder="Summary of deliverables..."
-                    className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none w-48"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowCompleteConfirm(false)}
-                    className="px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleConfirmComplete}
-                    disabled={isCompleting}
-                    className="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm"
-                  >
-                    {isCompleting ? 'Merging...' : 'Confirm & Merge'}
-                  </button>
+          {isArchived ? (
+            onReopenJob && (
+              <button
+                type="button"
+                onClick={handleConfirmReopen}
+                disabled={isArchiving}
+                className="px-3.5 py-1.5 bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/40 text-sky-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                data-testid="cockpit-reopen-job-btn"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>{isArchiving ? 'Reopening...' : 'Reopen Job'}</span>
+              </button>
+            )
+          ) : (
+            <div className="flex items-center gap-2">
+              {!isCompleted && (
+                <div>
+                  {showCompleteConfirm ? (
+                    <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl">
+                      <input
+                        type="text"
+                        value={resultSummary}
+                        onChange={(e) => setResultSummary(e.target.value)}
+                        placeholder="Summary of deliverables..."
+                        className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none w-48"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowCompleteConfirm(false)}
+                        className="px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConfirmComplete}
+                        disabled={isCompleting}
+                        className="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm"
+                      >
+                        {isCompleting ? 'Merging...' : 'Confirm & Merge'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowCompleteConfirm(true)}
+                      className="px-3.5 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      <span>Complete & Merge Job</span>
+                    </button>
+                  )}
                 </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setShowCompleteConfirm(true)}
-                  className="px-3.5 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
-                >
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Complete & Merge Job</span>
-                </button>
+              )}
+
+              {onArchiveJob && (
+                <div>
+                  {showArchiveConfirm ? (
+                    <div className="flex items-center gap-2 bg-slate-900 border border-amber-500/40 p-1.5 rounded-xl">
+                      <span className="text-xs text-amber-200">Archive job?</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowArchiveConfirm(false)}
+                        className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConfirmArchive}
+                        disabled={isArchiving}
+                        className="px-3 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm"
+                        data-testid="cockpit-confirm-archive-btn"
+                      >
+                        {isArchiving ? 'Archiving...' : 'Confirm Archive'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowArchiveConfirm(true)}
+                      title="Archive and close this job"
+                      className="px-3 py-1.5 bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                      data-testid="cockpit-archive-job-btn"
+                    >
+                      <Archive className="w-3.5 h-3.5 text-slate-400" />
+                      <span>Archive</span>
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           )}
@@ -1264,7 +1353,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             title="Attach files (Images, PDFs, Code, Logs, ZIP — max 25 MB)"
             aria-label="Attach files"
             data-testid="job-attach-btn"
-            disabled={isCompleted || isSending}
+            disabled={isClosed || isSending}
             className="p-3 bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-sky-300 disabled:opacity-40 rounded-xl transition cursor-pointer shrink-0 shadow-md flex items-center justify-center self-stretch"
           >
             <Paperclip className="w-4 h-4" />
@@ -1289,8 +1378,14 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               onClick={handleCursorActivity}
               onKeyDown={handlePromptKeyDown}
               onPaste={handlePaste}
-              placeholder="Type your message, tasks, or delegate with @persona (Press Enter to send)..."
-              disabled={isCompleted || isSending}
+              placeholder={
+                isArchived
+                  ? "This job is archived and read-only. Reopen the job to post messages..."
+                  : isCompleted
+                  ? "Job completed. Reopen or post new turns if needed..."
+                  : "Type your message, tasks, or delegate with @persona (Press Enter to send)..."
+              }
+              disabled={isClosed || isSending}
               className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition resize-none disabled:opacity-50"
             />
           </div>

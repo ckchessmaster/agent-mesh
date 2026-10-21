@@ -628,4 +628,56 @@ describe('JobCockpit - Attachment Support', () => {
     fireEvent.click(toggleBtn);
     expect(screen.getByTestId('job-team-sidebar')).toBeInTheDocument();
   });
+
+  it('renders archive job button and calls onArchiveJob upon confirmation', async () => {
+    const onArchiveJob = vi.fn().mockResolvedValue(undefined);
+    render(
+      <JobCockpit
+        {...mockProps}
+        onArchiveJob={onArchiveJob}
+      />
+    );
+
+    const archiveBtn = screen.getByTestId('cockpit-archive-job-btn');
+    expect(archiveBtn).toBeInTheDocument();
+
+    fireEvent.click(archiveBtn);
+    expect(screen.getByText('Archive job?')).toBeInTheDocument();
+
+    const confirmBtn = screen.getByTestId('cockpit-confirm-archive-btn');
+    fireEvent.click(confirmBtn);
+
+    expect(onArchiveJob).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders archived job state with reopen button, disabled composer, and calls onReopenJob', async () => {
+    const onReopenJob = vi.fn().mockResolvedValue(undefined);
+    const archivedJob = {
+      ...mockJob,
+      status: ProjectJobStatus.Archived
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={archivedJob}
+        onReopenJob={onReopenJob}
+      />
+    );
+
+    // Shows Archived status badge
+    expect(screen.getByText('Archived')).toBeInTheDocument();
+
+    // Reopen button appears
+    const reopenBtn = screen.getByTestId('cockpit-reopen-job-btn');
+    expect(reopenBtn).toBeInTheDocument();
+
+    // Composer is disabled with archived message
+    const textarea = screen.getByPlaceholderText(/This job is archived and read-only/i);
+    expect(textarea).toBeDisabled();
+
+    // Clicking reopen calls onReopenJob
+    fireEvent.click(reopenBtn);
+    expect(onReopenJob).toHaveBeenCalledTimes(1);
+  });
 });

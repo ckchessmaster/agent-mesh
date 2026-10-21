@@ -405,4 +405,77 @@ public class ProjectJobsControllerTests
                 default),
             Times.Once);
     }
+
+    [Fact]
+    public async Task ArchiveJob_And_ReopenJob_UpdatesStatusAndBroadcastsSignalR()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "archive-test", Name = "Archive Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "archive-test",
+            Title = "Job To Archive",
+            Status = ProjectJobStatus.Active
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var mockHubContext = new Mock<IHubContext<AgentMeshHub>>();
+        var mockClients = new Mock<IHubClients>();
+        var mockClientProxy = new Mock<IClientProxy>();
+        mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockHubContext.Setup(h => h.Clients).Returns(mockClients.Object);
+
+        var controller = new ProjectJobsController(db, mockHubContext.Object);
+
+        // 1. Archive
+        var archiveRes = await controller.ArchiveJob(job.Id);
+        var okArchive = archiveRes.Should().BeOfType<OkObjectResult>().Subject;
+        var dtoArchive = okArchive.Value.Should().BeOfType<ProjectJobDto>().Subject;
+        dtoArchive.Status.Should().Be(ProjectJobStatus.Archived);
+
+        var inDbArchived = await db.ProjectJobs.FindAsync(job.Id);
+        inDbArchived!.Status.Should().Be(ProjectJobStatus.Archived);
+
+        mockClientProxy.Verify(
+            c => c.SendCoreAsync("JobUpdated", It.IsAny<object?[]>(), default),
+            Times.Once);
+
+        // 2. Reopen
+        var reopenRes = await controller.ReopenJob(job.Id);
+        var okReopen = reopenRes.Should().BeOfType<OkObjectResult>().Subject;
+        var dtoReopen = okReopen.Value.Should().BeOfType<ProjectJobDto>().Subject;
+        dtoReopen.Status.Should().Be(ProjectJobStatus.Active);
+
+        var inDbReopened = await db.ProjectJobs.FindAsync(job.Id);
+        inDbReopened!.Status.Should().Be(ProjectJobStatus.Active);
+    }
+
+    [Fact]
+    public async Task PostJobMessage_OnArchivedJob_ReturnsBadRequest()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "archived-chat", Name = "Archived Chat" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "archived-chat",
+            Title = "Archived Job",
+            Status = ProjectJobStatus.Archived
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var msgReq = new PostJobMessageRequest(Content: "Hello to archived job");
+
+        var result = await controller.PostJobMessage(job.Id, msgReq);
+        var badRequest = result.Should().BeOfType<BadRequestObjectResult>().Subject;
+        badRequest.Value.ToString().Should().Contain("archived");
+    }
 }
