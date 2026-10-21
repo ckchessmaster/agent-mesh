@@ -661,6 +661,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       {
         id: 'msg-ev-1',
         sessionId: 'sess-turn-456',
+        senderAgentId: 'astra',
         eventType: 'thought',
         content: 'Analyzing OAuth specifications and scopes',
         createdAt: new Date().toISOString()
