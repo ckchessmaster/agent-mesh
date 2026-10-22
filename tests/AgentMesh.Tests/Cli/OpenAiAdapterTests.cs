@@ -189,4 +189,64 @@ public class OpenAiAdapterTests
         events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Connecting to OpenAI-compatible server"));
         events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Failed to connect to OpenAI-compatible endpoint"));
     }
+
+    [Fact]
+    public void ConfigStore_PopulateFromRemote_ExtractsOpenAiSettingsCorrectly()
+    {
+        var configStore = new ConfigStore();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Agent spence-ai",
+            AdapterType = "generic"
+        };
+
+        var remote = new RemoteAgentDto(
+            Id: "spence-ai",
+            Name: "Spence Private AI",
+            Role: "Autonomous Agent",
+            Status: "offline",
+            SessionCount: 1,
+            LastHeartbeatAt: DateTimeOffset.UtcNow,
+            CapabilitiesJson: JsonSerializer.Serialize(new
+            {
+                adapter = "openai",
+                endpoint = "http://127.0.0.1:11435/v1",
+                apiKey = "sk-test-key",
+                defaultModel = "qwen3.8-flash-next"
+            })
+        );
+
+        configStore.PopulateFromRemote(preset, remote);
+
+        preset.Name.Should().Be("Spence Private AI");
+        preset.Role.Should().Be("Autonomous Agent");
+        preset.AdapterType.Should().Be("openai");
+        preset.Endpoint.Should().Be("http://127.0.0.1:11435/v1");
+        preset.ApiKey.Should().Be("sk-test-key");
+        preset.DefaultModel.Should().Be("qwen3.8-flash-next");
+        preset.Capabilities.Should().Contain("run_command");
+    }
+
+    [Fact]
+    public void MeshClient_SerializePresetCapabilities_SerializesOpenAiMetadata()
+    {
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence Private AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11435/v1",
+            ApiKey = "sk-key",
+            DefaultModel = "qwen3.8-flash-next",
+            Capabilities = new List<string> { "run_command", "read_file" }
+        };
+
+        var json = MeshClient.SerializePresetCapabilities(preset);
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("adapter").GetString().Should().Be("openai");
+        doc.RootElement.GetProperty("endpoint").GetString().Should().Be("http://127.0.0.1:11435/v1");
+        doc.RootElement.GetProperty("apiKey").GetString().Should().Be("sk-key");
+        doc.RootElement.GetProperty("defaultModel").GetString().Should().Be("qwen3.8-flash-next");
+    }
 }

@@ -188,5 +188,6 @@ public record RemoteAgentDto(
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("status")] string Status,
     [property: JsonPropertyName("sessionCount")] int SessionCount,
-    [property: JsonPropertyName("lastHeartbeatAt")] DateTimeOffset? LastHeartbeatAt
+    [property: JsonPropertyName("lastHeartbeatAt")] DateTimeOffset? LastHeartbeatAt,
+    [property: JsonPropertyName("capabilitiesJson")] string? CapabilitiesJson = null
 );

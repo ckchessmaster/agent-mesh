@@ -27,6 +27,7 @@ staticClients:
     redirectURIs:
       - 'http://localhost:3000/auth/callback'
       - 'http://127.0.0.1:3000/auth/callback'
+      - 'http://192.168.20.159:3000/auth/callback'
     name: 'AgentMesh Dashboard'
     public: true
 

@@ -9,6 +9,10 @@ export default defineConfig({
     strictPort: true,
     host: true,
     proxy: {
+      '/dex': {
+        target: 'http://localhost:8085',
+        changeOrigin: true
+      },
       '/api': {
         target: process.env.services__api__http__0 || 'http://localhost:5000',
         changeOrigin: true

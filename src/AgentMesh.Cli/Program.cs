@@ -120,7 +120,15 @@ public static class Program
                 {
                     try
                     {
-                        await manager.StartAgentAsync(targetId, customCommand, customRole, cts.Token);
+                        await manager.StartAgentAsync(
+                            targetId,
+                            customCommand,
+                            customRole,
+                            customAdapter,
+                            customEndpoint,
+                            customApiKey,
+                            customDefaultModel,
+                            cts.Token);
                         startedCount++;
                     }
                     catch (Exception ex)

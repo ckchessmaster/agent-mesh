@@ -110,6 +110,61 @@ public class ConfigStore
         return preset;
     }
 
+    public void PopulateFromRemote(AgentPresetConfig preset, RemoteAgentDto remote)
+    {
+        if (!string.IsNullOrWhiteSpace(remote.Name))
+        {
+            preset.Name = remote.Name;
+        }
+        if (!string.IsNullOrWhiteSpace(remote.Role))
+        {
+            preset.Role = remote.Role;
+        }
+
+        if (!string.IsNullOrWhiteSpace(remote.CapabilitiesJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(remote.CapabilitiesJson);
+                var root = doc.RootElement;
+                if (root.ValueKind == JsonValueKind.Object)
+                {
+                    if (root.TryGetProperty("adapter", out var a) && a.ValueKind == JsonValueKind.String)
+                    {
+                        var adapter = a.GetString();
+                        if (!string.IsNullOrWhiteSpace(adapter))
+                        {
+                            preset.AdapterType = adapter.ToLowerInvariant();
+                        }
+                    }
+                    if (root.TryGetProperty("endpoint", out var ep) && ep.ValueKind == JsonValueKind.String)
+                    {
+                        preset.Endpoint = ep.GetString();
+                    }
+                    if (root.TryGetProperty("apiKey", out var k) && k.ValueKind == JsonValueKind.String)
+                    {
+                        preset.ApiKey = k.GetString();
+                    }
+                    if (root.TryGetProperty("defaultModel", out var dm) && dm.ValueKind == JsonValueKind.String)
+                    {
+                        preset.DefaultModel = dm.GetString();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase))
+        {
+            if (preset.Capabilities == null || preset.Capabilities.Count == 0 ||
+                preset.Capabilities.SequenceEqual(new[] { "shell", "inspect_workspace" }))
+            {
+                preset.Capabilities = GetDefaultCapabilities("openai");
+            }
+            preset.Command = null;
+        }
+    }
+
     private static void EnsureBuiltInPresets(CliConfig config)
     {
         if (!config.Agents.ContainsKey("agy"))
