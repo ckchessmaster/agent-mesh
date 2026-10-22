@@ -153,6 +153,18 @@ public class ConfigStore
                     {
                         preset.TimeoutSeconds = tVal;
                     }
+                    if (root.TryGetProperty("maxRetries", out var mr) && mr.TryGetInt32(out var mrVal))
+                    {
+                        preset.MaxRetries = mrVal;
+                    }
+                    if (root.TryGetProperty("retryDelayMilliseconds", out var rdm) && rdm.TryGetInt32(out var rdmVal))
+                    {
+                        preset.RetryDelayMilliseconds = rdmVal;
+                    }
+                    if ((root.TryGetProperty("maxSteps", out var ms) || root.TryGetProperty("steps", out ms)) && ms.TryGetInt32(out var msVal))
+                    {
+                        preset.MaxSteps = msVal;
+                    }
                 }
             }
             catch { }

@@ -28,6 +28,7 @@ public class AgentPresetConfig
     public int? TimeoutSeconds { get; set; }
     public int? MaxRetries { get; set; }
     public int? RetryDelayMilliseconds { get; set; }
+    public int? MaxSteps { get; set; }
 }
 
 public class PromptReceivedEvent

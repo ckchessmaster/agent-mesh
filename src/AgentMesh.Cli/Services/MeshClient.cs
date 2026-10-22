@@ -72,6 +72,9 @@ public class MeshClient
                 ["apiKey"] = preset.ApiKey,
                 ["defaultModel"] = preset.DefaultModel,
                 ["timeoutSeconds"] = preset.TimeoutSeconds,
+                ["maxRetries"] = preset.MaxRetries,
+                ["retryDelayMilliseconds"] = preset.RetryDelayMilliseconds,
+                ["maxSteps"] = preset.MaxSteps,
                 ["capabilities"] = preset.Capabilities
             };
             return JsonSerializer.Serialize(caps);

@@ -355,9 +355,17 @@ public class AgentRunnerInstance : IAsyncDisposable
             }
 
             var adapter = AgentAdapterFactory.Create(_preset);
+            var terminalEventEmitted = false;
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>
             {
                 turnToken.ThrowIfCancellationRequested();
+
+                if (string.Equals(trajectoryEv.EventType, "response", StringComparison.OrdinalIgnoreCase) ||
+                    (string.Equals(trajectoryEv.EventType, "tool_call", StringComparison.OrdinalIgnoreCase) &&
+                     string.Equals(trajectoryEv.ToolName, "ask_question", StringComparison.OrdinalIgnoreCase)))
+                {
+                    terminalEventEmitted = true;
+                }
 
                 if (!string.IsNullOrWhiteSpace(trajectoryEv.StructuredPayloadJson))
                 {
@@ -386,6 +394,21 @@ public class AgentRunnerInstance : IAsyncDisposable
                     trajectoryEv,
                     turnToken);
             }, turnToken);
+
+            if (!terminalEventEmitted && !turnToken.IsCancellationRequested)
+            {
+                _onLog(_preset.Id, $"Warning: Turn completed without a terminal response or question event. Emitting fallback completion response.");
+                await _meshClient.PostTrajectoryEventAsync(
+                    ev.SessionId,
+                    _preset.Id,
+                    _agentToken,
+                    new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = $"Turn completed by agent `@{_preset.Id}`."
+                    },
+                    turnToken);
+            }
 
             if (!string.IsNullOrWhiteSpace(ev.GitBranch))
             {

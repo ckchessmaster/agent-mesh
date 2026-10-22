@@ -484,6 +484,171 @@ public class OpenAiAdapterTests
         }
     }
 
+    [Fact]
+    public void ResolveMaxSteps_ReturnsPresetValueWhenConfigured()
+    {
+        var preset = new AgentPresetConfig { MaxSteps = 50 };
+        OpenAiAdapter.ResolveMaxSteps(preset).Should().Be(50);
+    }
+
+    [Fact]
+    public void ResolveMaxSteps_ReturnsDefault100WhenUnset()
+    {
+        var preset = new AgentPresetConfig();
+        var origEnv = Environment.GetEnvironmentVariable("OPENAI_MAX_STEPS");
+        try
+        {
+            Environment.SetEnvironmentVariable("OPENAI_MAX_STEPS", null);
+            Environment.SetEnvironmentVariable("AGENT_MAX_STEPS", null);
+            OpenAiAdapter.ResolveMaxSteps(preset).Should().Be(100);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENAI_MAX_STEPS", origEnv);
+        }
+    }
+
+    [Fact]
+    public void ResolveMaxSteps_ReturnsEnvVarWhenSet()
+    {
+        var preset = new AgentPresetConfig();
+        var origEnv = Environment.GetEnvironmentVariable("OPENAI_MAX_STEPS");
+        try
+        {
+            Environment.SetEnvironmentVariable("OPENAI_MAX_STEPS", "75");
+            OpenAiAdapter.ResolveMaxSteps(preset).Should().Be(75);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENAI_MAX_STEPS", origEnv);
+        }
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WhenMaxStepsReached_EmitsThoughtAndSummaryResponse()
+    {
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence Private AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11435/v1",
+            MaxSteps = 2 // Low step limit for test
+        };
+
+        var sessionId = Guid.NewGuid();
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = sessionId,
+            MessageId = Guid.NewGuid(),
+            AgentId = "spence-ai",
+            Prompt = "Run tasks",
+            Sender = "operator"
+        };
+
+        var requestCount = 0;
+        using var mockClient = new HttpClient(new MockHttpMessageHandler(req =>
+        {
+            requestCount++;
+            if (requestCount <= 2)
+            {
+                // Return a tool call for each step to consume maxSteps
+                var toolCallSse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_" + requestCount + "\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"command\\\":\\\"echo step" + requestCount + "\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+                return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new StringContent(toolCallSse, System.Text.Encoding.UTF8, "text/event-stream")
+                };
+            }
+
+            // Summary request (stream = false)
+            var summaryJson = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Completed 2 steps of tool execution. Ready to continue.\"}}]}";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(summaryJson, System.Text.Encoding.UTF8, "application/json")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            // Verify that it executed 2 tool calls, then hit max steps
+            events.Where(e => e.EventType == "tool_call").Should().HaveCount(2);
+            // Must emit thought about reaching max steps
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Reached maximum tool execution steps limit (2)"));
+            // Must emit final response so session does NOT hang in thinking
+            var finalResp = events.FirstOrDefault(e => e.EventType == "response");
+            finalResp.Should().NotBeNull();
+            finalResp!.Content.Should().Contain("Completed 2 steps");
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+        }
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WhenFinalContentEmpty_EmitsNonEmptyFallbackResponse()
+    {
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence Private AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11435/v1"
+        };
+
+        var sessionId = Guid.NewGuid();
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = sessionId,
+            MessageId = Guid.NewGuid(),
+            AgentId = "spence-ai",
+            Prompt = "Hello",
+            Sender = "operator"
+        };
+
+        using var mockClient = new HttpClient(new MockHttpMessageHandler(_ =>
+        {
+            // Model returns empty content delta, only reasoning
+            var sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I am thinking deeply about this...\"}}]}\n\ndata: [DONE]\n\n";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            var resp = events.FirstOrDefault(e => e.EventType == "response");
+            resp.Should().NotBeNull();
+            resp!.Content.Should().NotBeNullOrWhiteSpace();
+            resp.Content.Should().Be("I am thinking deeply about this...");
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+        }
+    }
+
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

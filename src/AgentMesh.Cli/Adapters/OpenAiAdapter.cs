@@ -62,6 +62,20 @@ public class OpenAiAdapter : IAgentAdapter
         return 2; // 2 retries (3 total attempts)
     }
 
+    public static int ResolveMaxSteps(AgentPresetConfig preset)
+    {
+        if (preset.MaxSteps.HasValue && preset.MaxSteps.Value > 0)
+            return preset.MaxSteps.Value;
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_MAX_STEPS"), out var envSteps) && envSteps > 0)
+            return envSteps;
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("AGENT_MAX_STEPS"), out var agentSteps) && agentSteps > 0)
+            return agentSteps;
+
+        return 100;
+    }
+
     public static int GetRetryDelayMilliseconds(HttpResponseMessage? response, int attempt, AgentPresetConfig? preset = null)
     {
         if (preset != null && preset.RetryDelayMilliseconds.HasValue && preset.RetryDelayMilliseconds.Value >= 0)
@@ -330,8 +344,10 @@ public class OpenAiAdapter : IAgentAdapter
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
         var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
 
-        var maxSteps = 25;
+        var maxSteps = ResolveMaxSteps(preset);
         var stepCount = 0;
+        var responseEmitted = false;
+        var askedQuestion = false;
         long totalInputTokens = 0;
         long totalOutputTokens = 0;
         long totalTokens = 0;
@@ -511,10 +527,29 @@ public class OpenAiAdapter : IAgentAdapter
             using (var stream = await activeResponse.Content.ReadAsStreamAsync(ct))
             using (var reader = new StreamReader(stream))
             {
-                string? line;
-                while ((line = await reader.ReadLineAsync(ct)) != null)
+                var streamReadTimeout = TimeSpan.FromSeconds(Math.Max(120, timeoutSeconds));
+                while (true)
                 {
                     ct.ThrowIfCancellationRequested();
+                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    readCts.CancelAfter(streamReadTimeout);
+
+                    string? line;
+                    try
+                    {
+                        line = await reader.ReadLineAsync(readCts.Token);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && readCts.IsCancellationRequested)
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] Streaming response timed out after {streamReadTimeout.TotalSeconds:F0}s of inactivity from server."
+                        });
+                        break;
+                    }
+
+                    if (line == null) break;
                     if (string.IsNullOrWhiteSpace(line)) continue;
 
                     var trimmed = line.Trim();
@@ -629,7 +664,6 @@ public class OpenAiAdapter : IAgentAdapter
             {
                 var executedToolCalls = new List<OpenAiToolCall>();
                 var toolResults = new List<(string CallId, string Output)>();
-                var askedQuestion = false;
 
                 foreach (var kvp in toolCallsByIndex)
                 {
@@ -648,6 +682,7 @@ public class OpenAiAdapter : IAgentAdapter
                     if (string.Equals(toolName, "ask_question", StringComparison.OrdinalIgnoreCase))
                     {
                         askedQuestion = true;
+                        responseEmitted = true;
                         await onEvent(new TrajectoryEventPayload
                         {
                             EventType = "tool_call",
@@ -715,6 +750,8 @@ public class OpenAiAdapter : IAgentAdapter
             {
                 if (string.Equals(fbName, "ask_question", StringComparison.OrdinalIgnoreCase))
                 {
+                    askedQuestion = true;
+                    responseEmitted = true;
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "tool_call",
@@ -753,6 +790,8 @@ public class OpenAiAdapter : IAgentAdapter
             var extractedQuestions = AgentAdapterFactory.ExtractQuestionsFromOutput(finalContent);
             if (extractedQuestions.Count > 0)
             {
+                askedQuestion = true;
+                responseEmitted = true;
                 var qJson = JsonSerializer.Serialize(new
                 {
                     questions = extractedQuestions.Select(q => new
@@ -774,7 +813,11 @@ public class OpenAiAdapter : IAgentAdapter
             }
 
             // No tool calls - final assistant response
-            history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
+            var effectiveContent = !string.IsNullOrWhiteSpace(finalContent)
+                ? finalContent
+                : (reasoningBuilder.Length > 0 ? reasoningBuilder.ToString().Trim() : "Turn completed.");
+
+            history.Add(new OpenAiMessage { Role = "assistant", Content = effectiveContent });
 
             sw.Stop();
             var duration = sw.Elapsed.TotalSeconds;
@@ -797,14 +840,116 @@ public class OpenAiAdapter : IAgentAdapter
                 });
             }
 
+            responseEmitted = true;
             await onEvent(new TrajectoryEventPayload
             {
                 EventType = "response",
-                Content = finalContent,
+                Content = effectiveContent,
                 StructuredPayloadJson = structuredJson
             });
 
             break;
+        }
+
+        if (!responseEmitted && !askedQuestion)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[@{preset.Id}] Reached maximum tool execution steps limit ({maxSteps}). Requesting final summary..."
+            });
+
+            string? summaryContent = null;
+            try
+            {
+                var summaryHistory = new List<OpenAiMessage>(history)
+                {
+                    new OpenAiMessage
+                    {
+                        Role = "user",
+                        Content = $"[System Notice: You have reached the maximum allowed tool execution steps limit ({maxSteps}) for this turn. Please summarize what you have accomplished so far, the current status of your changes, and what next steps remain so the operator can review and continue.]"
+                    }
+                };
+
+                var summaryReqBody = new Dictionary<string, object?>
+                {
+                    ["model"] = effectiveModel,
+                    ["messages"] = summaryHistory.Select(m => m.ToSerializableObject()).ToList(),
+                    ["stream"] = false
+                };
+
+                using var sumHttpReq = new HttpRequestMessage(HttpMethod.Post, chatUrl);
+                if (!string.IsNullOrWhiteSpace(apiKey))
+                {
+                    sumHttpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                }
+                if (preset.CustomHeaders != null)
+                {
+                    foreach (var kvp in preset.CustomHeaders)
+                    {
+                        sumHttpReq.Headers.TryAddWithoutValidation(kvp.Key, kvp.Value);
+                    }
+                }
+                sumHttpReq.Content = new StringContent(JsonSerializer.Serialize(summaryReqBody), Encoding.UTF8, "application/json");
+
+                using var sumCts = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Min(120, timeoutSeconds)));
+                using var sumLinked = CancellationTokenSource.CreateLinkedTokenSource(ct, sumCts.Token);
+
+                using var sumRes = await HttpClientInstance.SendAsync(sumHttpReq, sumLinked.Token);
+                if (sumRes.IsSuccessStatusCode)
+                {
+                    var sumJson = await sumRes.Content.ReadAsStringAsync(sumLinked.Token);
+                    using var sumDoc = JsonDocument.Parse(sumJson);
+                    if (sumDoc.RootElement.TryGetProperty("choices", out var ch) && ch.GetArrayLength() > 0)
+                    {
+                        var choice = ch[0];
+                        if (choice.TryGetProperty("message", out var msgElem) &&
+                            msgElem.TryGetProperty("content", out var cVal) &&
+                            cVal.ValueKind == JsonValueKind.String)
+                        {
+                            summaryContent = cVal.GetString();
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Fall back to canned summary if completion call fails
+            }
+
+            var finalMsg = !string.IsNullOrWhiteSpace(summaryContent)
+                ? summaryContent.Trim()
+                : $"⚠️ Agent `@{preset.Id}` reached maximum tool execution steps limit ({maxSteps}). Current progress has been preserved in workspace. Please reply with instructions or 'continue' to resume.";
+
+            sw.Stop();
+            var duration = sw.Elapsed.TotalSeconds;
+            string? structuredJson = null;
+            if (totalTokens > 0 || duration > 0)
+            {
+                structuredJson = JsonSerializer.Serialize(new
+                {
+                    model = effectiveModel,
+                    effort = promptEvent.Effort,
+                    mode = promptEvent.Mode,
+                    contextSize = promptEvent.ContextSize,
+                    usage = new
+                    {
+                        inputTokens = totalInputTokens,
+                        outputTokens = totalOutputTokens,
+                        totalTokens = totalTokens > 0 ? totalTokens : totalInputTokens + totalOutputTokens,
+                        durationSeconds = duration
+                    }
+                });
+            }
+
+            history.Add(new OpenAiMessage { Role = "assistant", Content = finalMsg });
+
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "response",
+                Content = finalMsg,
+                StructuredPayloadJson = structuredJson
+            });
         }
     }
 
