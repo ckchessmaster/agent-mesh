@@ -999,4 +999,159 @@ describe('JobCockpit - Attachment Support', () => {
       );
     });
   });
+
+  it('surfaces questions from agent messages, renders interactive question cards, shows Waiting for Input badge and composer hint, and allows submitting answers', async () => {
+    const onAnswerQuestion = vi.fn().mockResolvedValue(undefined);
+
+    const questionMsg: JobMessage = {
+      id: 'msg-question-1',
+      jobId: mockJob.id,
+      senderType: 'persona',
+      senderId: 'persona-astra',
+      senderName: 'Astra',
+      content: 'I have a question before we start coding:',
+      turnSessionId: 'turn-session-qa-1',
+      structuredPayloadJson: JSON.stringify({
+        toolName: 'ask_question',
+        questions: [
+          {
+            question: 'Which database should we use?',
+            options: ['PostgreSQL', 'SQLite', 'MongoDB'],
+            is_multi_select: false
+          }
+        ]
+      }),
+      createdAt: '2026-10-21T18:00:00Z'
+    };
+
+    const waitingSession: AgentSession = {
+      id: 'turn-session-qa-1',
+      title: 'Turn Session QA',
+      status: 'waiting_for_input',
+      createdAt: '2026-10-21T18:00:00Z',
+      updatedAt: '2026-10-21T18:00:00Z'
+    };
+
+    const { rerender } = render(
+      <JobCockpit
+        {...mockProps}
+        messages={[questionMsg]}
+        sessions={[waitingSession]}
+        onAnswerQuestion={onAnswerQuestion}
+      />
+    );
+
+    // Question card is rendered
+    expect(screen.getByTestId('question-card-msg-question-1')).toBeInTheDocument();
+    expect(screen.getByText('Agent Question — Human Input Required')).toBeInTheDocument();
+    expect(screen.getByText('Which database should we use?')).toBeInTheDocument();
+    expect(screen.getByText('PostgreSQL')).toBeInTheDocument();
+    expect(screen.getByText('SQLite')).toBeInTheDocument();
+    expect(screen.getByText('MongoDB')).toBeInTheDocument();
+
+    // Waiting for Input badge is rendered in header
+    expect(screen.getByTestId('waiting-for-input-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('waiting-for-input-badge')).toHaveTextContent('Waiting for Input');
+
+    // Contextual composer placeholder
+    const textarea = screen.getByPlaceholderText(/Agent is waiting for your answer above/i);
+    expect(textarea).toBeInTheDocument();
+
+    // Select PostgreSQL option pill
+    fireEvent.click(screen.getByText('PostgreSQL'));
+
+    // Submit answer via button
+    const submitBtn = screen.getByRole('button', { name: /Submit Answer/i });
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(onAnswerQuestion).toHaveBeenCalledWith(
+        'turn-session-qa-1',
+        expect.objectContaining({
+          toolCallId: 'msg-question-1',
+          answers: [
+            expect.objectContaining({
+              question: 'Which database should we use?',
+              selectedOptions: ['PostgreSQL']
+            })
+          ]
+        })
+      );
+    });
+
+    // Answered state renders
+    const answerMsg: JobMessage = {
+      id: 'msg-answer-1',
+      jobId: mockJob.id,
+      senderType: 'user',
+      senderId: 'user-1',
+      senderName: 'You',
+      content: 'User answered question:\nQ: Which database should we use? -> A: PostgreSQL',
+      createdAt: '2026-10-21T18:01:00Z'
+    };
+
+    rerender(
+      <JobCockpit
+        {...mockProps}
+        messages={[questionMsg, answerMsg]}
+        sessions={[{ ...waitingSession, status: 'active' }]}
+        onAnswerQuestion={onAnswerQuestion}
+      />
+    );
+
+    // Question card transitioned to Answered
+    expect(screen.getByTestId('question-card-answered-msg-question-1')).toBeInTheDocument();
+    expect(screen.getByText('Agent Question — Answered')).toBeInTheDocument();
+    expect(screen.queryByTestId('waiting-for-input-badge')).not.toBeInTheDocument();
+  });
+
+  it('answers pending question automatically when operator types response into main composer', async () => {
+    const onAnswerQuestion = vi.fn().mockResolvedValue(undefined);
+
+    const questionMsg: JobMessage = {
+      id: 'msg-question-comp',
+      jobId: mockJob.id,
+      senderType: 'persona',
+      senderId: 'persona-astra',
+      senderName: 'Astra',
+      content: 'Please let me know:\n1. What architecture style should we follow?',
+      turnSessionId: 'turn-session-comp-1',
+      createdAt: '2026-10-21T18:10:00Z'
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={[questionMsg]}
+        onAnswerQuestion={onAnswerQuestion}
+      />
+    );
+
+    // Question card is rendered from text question
+    const qCard = screen.getByTestId('question-card-msg-question-comp');
+    expect(within(qCard).getByText('What architecture style should we follow?')).toBeInTheDocument();
+
+    // Type answer into composer textarea
+    const textarea = screen.getByPlaceholderText(/Agent is waiting for your answer above/i);
+    fireEvent.change(textarea, { target: { value: 'Microservices with gRPC' } });
+
+    // Submit composer
+    const sendBtn = screen.getByTitle('Send Message');
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(onAnswerQuestion).toHaveBeenCalledWith(
+        'turn-session-comp-1',
+        expect.objectContaining({
+          toolCallId: 'msg-question-comp',
+          answers: [
+            expect.objectContaining({
+              question: 'What architecture style should we follow?',
+              customText: 'Microservices with gRPC'
+            })
+          ]
+        })
+      );
+    });
+  });
 });

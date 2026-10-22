@@ -35,7 +35,8 @@ vi.mock('../services/api', () => ({
     getJobMessages: vi.fn(),
     postJobMessage: vi.fn(),
     uploadJobAttachments: vi.fn(),
-    completeJob: vi.fn()
+    completeJob: vi.fn(),
+    submitQuestionAnswer: vi.fn()
   }
 }));
 
@@ -753,6 +754,91 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     await waitFor(() => {
       expect(screen.queryByText('Old Archived Sprint')).not.toBeInTheDocument();
       expect(toggleArchivedBtn).toHaveTextContent('Show Archived');
+    });
+  });
+
+  it('surfaces questions in job chat, renders interactive question cards, and calls submitQuestionAnswer when answered', async () => {
+    const jobWithQuestion: ProjectJob = {
+      id: 'job-q-101',
+      projectId: 'mesh-core',
+      title: 'Question Workflow Job',
+      description: 'Job with question',
+      status: ProjectJobStatus.Active,
+      gitBranchName: 'mesh/job-q-101',
+      tasks: [],
+      messageCount: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const questionMsg: JobMessage = {
+      id: 'msg-job-q-1',
+      jobId: 'job-q-101',
+      senderType: 'persona',
+      senderId: 'agy-astra',
+      senderName: 'Astra',
+      content: 'I have a question before we begin:',
+      turnSessionId: 'sess-q-turn-1',
+      structuredPayloadJson: JSON.stringify({
+        toolName: 'ask_question',
+        questions: [
+          {
+            question: 'Should we enable streaming logs?',
+            options: ['Yes', 'No'],
+            is_multi_select: false
+          }
+        ]
+      }),
+      createdAt: new Date().toISOString()
+    };
+
+    const turnSession: AgentSession = {
+      id: 'sess-q-turn-1',
+      title: 'Turn Session Q',
+      status: 'waiting_for_input',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getProjectJobs).mockResolvedValue([jobWithQuestion]);
+    vi.mocked(api.getJobMessages).mockResolvedValue([questionMsg]);
+    vi.mocked(api.getSessions).mockResolvedValue([turnSession]);
+    vi.mocked(api.submitQuestionAnswer).mockResolvedValue({
+      toolResult: {} as any,
+      prompt: {} as any,
+      session: turnSession
+    });
+
+    render(<App />);
+
+    // Wait for job chat to load
+    await waitFor(() => {
+      expect(screen.getByTestId('question-card-msg-job-q-1')).toBeInTheDocument();
+      expect(screen.getByText('Should we enable streaming logs?')).toBeInTheDocument();
+    });
+
+    // Option pill 'Yes' is rendered
+    const yesBtn = screen.getByText('Yes');
+    expect(yesBtn).toBeInTheDocument();
+    fireEvent.click(yesBtn);
+
+    // Click Submit Answer
+    const submitBtn = screen.getByRole('button', { name: /Submit Answer/i });
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(api.submitQuestionAnswer).toHaveBeenCalledWith(
+        'sess-q-turn-1',
+        expect.objectContaining({
+          toolCallId: 'msg-job-q-1',
+          answers: [
+            expect.objectContaining({
+              question: 'Should we enable streaming logs?',
+              selectedOptions: ['Yes']
+            })
+          ]
+        })
+      );
     });
   });
 });

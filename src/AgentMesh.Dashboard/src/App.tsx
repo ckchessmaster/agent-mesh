@@ -661,6 +661,31 @@ export default function App() {
     });
   };
 
+  const handleJobQuestionAnswer = async (
+    sessionIdOrTargetId: string,
+    payload: { toolCallId: string; answers: QuestionAnswerPayload[]; answerSummary: string }
+  ) => {
+    const matchingSession = sessions.find((s) => s.id === sessionIdOrTargetId);
+    if (matchingSession) {
+      await api.submitQuestionAnswer(matchingSession.id, {
+        toolCallId: payload.toolCallId,
+        answers: payload.answers
+      });
+    } else {
+      if (selectedJobId) {
+        await api.postJobMessage(selectedJobId, {
+          content: `User answered question:\n${payload.answerSummary}\nPlease proceed with this answer.`,
+          senderType: 'user'
+        });
+      }
+    }
+    if (selectedJobId) {
+      const msgs = await api.getJobMessages(selectedJobId);
+      setJobMessages(msgs);
+    }
+    await fetchAllData();
+  };
+
   const handleAddTask = async (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => {
     if (!selectedJobId) return;
     const payload: { title: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] } = { title };
@@ -2985,6 +3010,7 @@ export default function App() {
                     onReopenJob={handleReopenJob}
                     onOpenLightbox={setLightboxAttachment}
                     onStopTurn={handleStopSession}
+                    onAnswerQuestion={handleJobQuestionAnswer}
                     onEditProject={() => {
                       setEditingProject(activeProj);
                       setShowProjectModal(true);

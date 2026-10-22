@@ -963,6 +963,104 @@ public class SessionsControllerTests
             }
         }
     }
+
+    [Fact]
+    public async Task PostMessage_AskQuestionToolCall_ForwardsToJobMessages_AndAnswerForwardsBack()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project
+        {
+            Id = "proj-qa",
+            Name = "QA Project"
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "QA Job",
+            GitBranchName = "mesh/job-qa"
+        };
+        var persona = new Persona
+        {
+            Id = "persona-qa",
+            Name = "QA Persona",
+            DriverId = "agy"
+        };
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Job Turn Session",
+            Status = "thinking",
+            PersonaId = persona.Id,
+            CreatorAgentId = "agy",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                jobId = job.Id.ToString(),
+                projectId = project.Id
+            })
+        };
+
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.Personas.Add(persona);
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        var questionsPayload = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            questions = new[]
+            {
+                new { question = "Which DB?", options = new[] { "PG", "SQLite" }, is_multi_select = false }
+            }
+        });
+
+        // Act 1: Persona posts ask_question tool_call event
+        var toolCallRes = await controller.PostMessage(session.Id, new PostMessageRequest(
+            Content: "Asking database preference",
+            SenderAgentId: "agy",
+            EventType: "tool_call",
+            ToolName: "ask_question",
+            ToolArgsJson: questionsPayload,
+            StructuredPayloadJson: questionsPayload
+        ));
+
+        // Assert 1: Session transitions to waiting_for_input and JobMessage is created
+        toolCallRes.Should().BeOfType<CreatedAtActionResult>();
+        session.Status.Should().Be("waiting_for_input");
+
+        var jobMsgs = db.JobMessages.Where(m => m.JobId == job.Id).ToList();
+        jobMsgs.Should().ContainSingle();
+        var qMsg = jobMsgs[0];
+        qMsg.SenderType.Should().Be("persona");
+        qMsg.SenderId.Should().Be(persona.Id);
+        qMsg.TurnSessionId.Should().Be(session.Id);
+        qMsg.StructuredPayloadJson.Should().Contain("Which DB?");
+
+        // Act 2: Human submits answer to the question
+        var answerRes = await controller.SubmitAnswer(session.Id, new SubmitAnswerRequest(
+            ToolCallId: qMsg.Id,
+            Answers: new List<QuestionAnswerDto>
+            {
+                new(0, "Which DB?", new List<string> { "PG" }, "")
+            }
+        ));
+
+        // Assert 2: Session transitions back to thinking, answer is forwarded to JobMessages
+        answerRes.Should().BeOfType<OkObjectResult>();
+        session.Status.Should().Be("thinking");
+
+        var allJobMsgs = db.JobMessages.Where(m => m.JobId == job.Id).OrderBy(m => m.CreatedAt).ToList();
+        allJobMsgs.Should().HaveCount(2);
+        var aMsg = allJobMsgs[1];
+        aMsg.SenderType.Should().Be("user");
+        aMsg.Content.Should().Contain("User answered question:");
+        aMsg.Content.Should().Contain("Which DB? -> A: PG");
+        aMsg.TurnSessionId.Should().Be(session.Id);
+    }
 }
 
 

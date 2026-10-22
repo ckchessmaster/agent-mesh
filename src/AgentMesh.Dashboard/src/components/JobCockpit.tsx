@@ -30,12 +30,14 @@ import {
   RotateCcw,
   Clock,
   MessageSquareQuote,
-  Play
+  Play,
+  HelpCircle
 } from 'lucide-react';
-import type { AgentSession, JobMessage, JobTask, Persona, Project, ProjectJob, SessionAttachment } from '../types';
+import type { AgentSession, AskQuestionItem, JobMessage, JobTask, Persona, Project, ProjectJob, QuestionAnswerPayload, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
 import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
 import { MarkdownMessage } from './MarkdownMessage';
+import { QuestionCard, parseTextQuestions } from './QuestionCard';
 import { api } from '../services/api';
 
 const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
@@ -171,6 +173,10 @@ interface JobCockpitProps {
   onEditProject?: () => void;
   onStopTurn?: (sessionId: string) => Promise<void>;
   sessions?: AgentSession[];
+  onAnswerQuestion?: (
+    sessionIdOrTargetId: string,
+    payload: { toolCallId: string; answers: QuestionAnswerPayload[]; answerSummary: string }
+  ) => Promise<void>;
 }
 
 export const JobCockpit: React.FC<JobCockpitProps> = ({
@@ -192,7 +198,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onOpenLightbox,
   onUploadAttachments,
   onEditProject,
-  onStopTurn
+  onStopTurn,
+  onAnswerQuestion
 }) => {
   const [prompt, setPrompt] = useState('');
   const [newTaskTitle, setNewTaskTitle] = useState('');
@@ -240,6 +247,89 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   });
   const [mentionHighlightedIndex, setMentionHighlightedIndex] = useState(0);
   const [showTeamSidebar, setShowTeamSidebar] = useState(true);
+
+  // Question answering state
+  const [submittingQuestionId, setSubmittingQuestionId] = useState<string | null>(null);
+  const [answeredQuestionIds, setAnsweredQuestionIds] = useState<string[]>([]);
+
+  const handleAnswerQuestion = async (
+    msg: JobMessage,
+    questions: AskQuestionItem[],
+    answers: QuestionAnswerPayload[]
+  ) => {
+    setSubmittingQuestionId(msg.id);
+    try {
+      const parts = answers.map((ans) => {
+        const chosen = [
+          ...(ans.selectedOptions || []),
+          ...(ans.customText?.trim() ? [ans.customText.trim()] : [])
+        ];
+        return `Q: ${ans.question} -> A: ${chosen.length > 0 ? chosen.join(', ') : 'User skipped'}`;
+      });
+      const answerSummary = parts.join('\n');
+
+      if (onAnswerQuestion) {
+        await onAnswerQuestion(msg.turnSessionId || msg.id, {
+          toolCallId: msg.id,
+          answers,
+          answerSummary
+        });
+      } else if (msg.turnSessionId) {
+        await api.submitQuestionAnswer(msg.turnSessionId, {
+          toolCallId: msg.id,
+          answers
+        });
+      } else {
+        await onSendMessage(
+          `User answered question:\n${answerSummary}\nPlease proceed with this answer.`,
+          []
+        );
+      }
+      setAnsweredQuestionIds((prev) => [...prev, msg.id]);
+    } catch (err) {
+      console.error('Failed to submit question answer:', err);
+    } finally {
+      setSubmittingQuestionId(null);
+    }
+  };
+
+  const pendingQuestion = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.senderType === 'user') continue;
+      let qs: AskQuestionItem[] = [];
+      if (m.structuredPayloadJson) {
+        try {
+          const p = JSON.parse(m.structuredPayloadJson);
+          if (Array.isArray(p.questions) && p.questions.length > 0) qs = p.questions;
+        } catch {}
+      }
+      if (qs.length === 0) {
+        qs = parseTextQuestions(m.content);
+      }
+      if (qs.length > 0) {
+        const isAns =
+          answeredQuestionIds.includes(m.id) ||
+          messages.slice(i + 1).some(
+            (other) =>
+              other.senderType === 'user' &&
+              (other.content.includes('User answered question') || other.structuredPayloadJson?.includes(m.id))
+          );
+        if (!isAns) {
+          return { msg: m, questions: qs };
+        }
+      }
+    }
+    return null;
+  }, [messages, answeredQuestionIds]);
+
+  const isSessionWaitingForInput = useMemo(() => {
+    return sessions.some(
+      (s) => s.status === 'waiting_for_input' && messages.some((m) => m.turnSessionId === s.id)
+    );
+  }, [sessions, messages]);
+
+  const isWaitingForInput = Boolean(pendingQuestion || isSessionWaitingForInput);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -635,6 +725,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           createdAt: new Date().toISOString()
         }
     );
+
+    if (pendingQuestion && text && attachmentsToSend.length === 0) {
+      setPrompt('');
+      const answers: QuestionAnswerPayload[] = pendingQuestion.questions.map((q, idx) => ({
+        questionIndex: idx,
+        question: q.question,
+        selectedOptions: [],
+        customText: text
+      }));
+      await handleAnswerQuestion(pendingQuestion.msg, pendingQuestion.questions, answers);
+      return;
+    }
+
     const effectiveText = text || (attachmentsToSend.length > 0 ? DEFAULT_ATTACHMENT_PROMPT : '');
 
     setPrompt('');
@@ -857,6 +960,14 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               ) : (
                 <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40">
                   Active Job
+                </span>
+              )}
+              {isWaitingForInput && (
+                <span
+                  className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 animate-pulse"
+                  data-testid="waiting-for-input-badge"
+                >
+                  <HelpCircle className="w-3 h-3 text-amber-400" /> Waiting for Input
                 </span>
               )}
               {job.priority !== undefined && (
@@ -1515,6 +1626,58 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                                 </div>
                               </div>
                             )}
+
+                            {(() => {
+                              const msgQuestions = (() => {
+                                if (isUser) return [];
+                                if (msg.structuredPayloadJson) {
+                                  try {
+                                    const p = JSON.parse(msg.structuredPayloadJson);
+                                    if (Array.isArray(p.questions) && p.questions.length > 0) return p.questions as AskQuestionItem[];
+                                  } catch {}
+                                }
+                                return parseTextQuestions(msg.content);
+                              })();
+
+                              if (msgQuestions.length === 0) return null;
+
+                              const isMsgQuestionAnswered =
+                                answeredQuestionIds.includes(msg.id) ||
+                                messages.some(
+                                  (other) =>
+                                    other.senderType === 'user' &&
+                                    new Date(other.createdAt).getTime() >= new Date(msg.createdAt).getTime() &&
+                                    (other.content.includes('User answered question') || other.structuredPayloadJson?.includes(msg.id))
+                                );
+
+                              const answeredText = (() => {
+                                if (!isMsgQuestionAnswered) return undefined;
+                                const ans = messages.find(
+                                  (other) =>
+                                    other.senderType === 'user' &&
+                                    new Date(other.createdAt).getTime() >= new Date(msg.createdAt).getTime() &&
+                                    other.content.includes('User answered question')
+                                );
+                                return ans?.content.replace(/^User answered question:\n?/i, '');
+                              })();
+
+                              return (
+                                <div className="mt-2.5 text-left" data-testid={`job-question-container-${msg.id}`}>
+                                  <QuestionCard
+                                    cardKey={`job-q-${msg.id}`}
+                                    targetId={msg.id}
+                                    eventCreatedAt={msg.createdAt}
+                                    parsedQuestions={msgQuestions}
+                                    isAnswered={isMsgQuestionAnswered}
+                                    answeredContent={answeredText}
+                                    isSubmitting={submittingQuestionId === msg.id}
+                                    onSubmit={async (answers) => {
+                                      await handleAnswerQuestion(msg, msgQuestions, answers);
+                                    }}
+                                  />
+                                </div>
+                              );
+                            })()}
                           </>
                         );
                       })()}
@@ -1793,6 +1956,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   ? "This job is archived and read-only. Reopen the job to post messages..."
                   : isCompleted
                   ? "Job completed. Reopen or post new turns if needed..."
+                  : isWaitingForInput
+                  ? "Agent is waiting for your answer above (type here or use the card above to respond)..."
                   : "Type your message, tasks, or delegate with @persona (Press Enter to send)..."
               }
               disabled={isClosed || isSending}

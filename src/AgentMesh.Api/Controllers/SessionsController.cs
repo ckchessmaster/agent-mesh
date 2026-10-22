@@ -1378,6 +1378,10 @@ public class SessionsController(
                 }
             }
         }
+        else if (eventType == "tool_call" && string.Equals(req.ToolName, "ask_question", StringComparison.OrdinalIgnoreCase))
+        {
+            await CheckAndForwardJobTurnQuestionAsync(session, message);
+        }
 
         return CreatedAtAction(nameof(GetMessages), new { id }, messageDto);
     }
@@ -1967,6 +1971,63 @@ public class SessionsController(
         await hubContext.Clients.All.SendAsync("ReceiveMessage", promptDto);
 
         await hubContext.Clients.All.SendAsync("SessionUpdated", session);
+
+        // If this session is part of a project job turn, forward the answer to JobMessages
+        if (!string.IsNullOrWhiteSpace(session.MetadataJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(session.MetadataJson);
+                if (doc.RootElement.TryGetProperty("jobId", out var jElem))
+                {
+                    var jobIdStr = jElem.GetString();
+                    if (!string.IsNullOrWhiteSpace(jobIdStr) && Guid.TryParse(jobIdStr, out var jobId))
+                    {
+                        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
+                        if (job != null)
+                        {
+                            var answerMsg = new JobMessage
+                            {
+                                Id = Guid.NewGuid(),
+                                JobId = jobId,
+                                SenderType = "user",
+                                SenderId = senderId,
+                                SenderName = "You",
+                                Content = $"User answered question:\n{answerSummary}",
+                                MentionsJson = "[]",
+                                TurnSessionId = session.Id,
+                                StructuredPayloadJson = JsonSerializer.Serialize(new
+                                {
+                                    toolCallId = req.ToolCallId,
+                                    answers = req.Answers,
+                                    toolName = "ask_question"
+                                }, JsonOptions),
+                                CreatedAt = DateTimeOffset.UtcNow
+                            };
+                            db.JobMessages.Add(answerMsg);
+                            job.UpdatedAt = DateTimeOffset.UtcNow;
+                            await db.SaveChangesAsync();
+
+                            var answerDto = new JobMessageDto(
+                                answerMsg.Id,
+                                answerMsg.JobId,
+                                answerMsg.SenderType,
+                                answerMsg.SenderId,
+                                answerMsg.SenderName,
+                                answerMsg.Content,
+                                new List<string>(),
+                                answerMsg.TurnSessionId,
+                                answerMsg.StructuredPayloadJson,
+                                answerMsg.CreatedAt
+                            );
+
+                            await hubContext.Clients.All.SendAsync("JobMessageAdded", answerDto);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
 
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
@@ -2725,6 +2786,65 @@ public class SessionsController(
                     }
                 }
             }
+        }
+        catch { }
+    }
+
+    private async Task CheckAndForwardJobTurnQuestionAsync(AgentSession session, SessionMessage questionMessage)
+    {
+        if (string.IsNullOrWhiteSpace(session.MetadataJson)) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(session.MetadataJson);
+            if (!doc.RootElement.TryGetProperty("jobId", out var jElem)) return;
+            var jobIdStr = jElem.GetString();
+            if (string.IsNullOrWhiteSpace(jobIdStr) || !Guid.TryParse(jobIdStr, out var jobId)) return;
+
+            var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
+            if (job == null) return;
+
+            var payload = questionMessage.StructuredPayloadJson ?? questionMessage.ToolArgsJson;
+            var alreadyPosted = await db.JobMessages.AnyAsync(m => m.JobId == jobId && m.TurnSessionId == session.Id && m.StructuredPayloadJson == payload);
+            if (alreadyPosted) return;
+
+            var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
+
+            var content = !string.IsNullOrWhiteSpace(questionMessage.Content) && questionMessage.Content != "Asking question"
+                ? questionMessage.Content
+                : "I have a question and need your input before proceeding:";
+
+            var jobMsg = new JobMessage
+            {
+                Id = Guid.NewGuid(),
+                JobId = jobId,
+                SenderType = "persona",
+                SenderId = pId ?? session.PersonaId,
+                SenderName = pName ?? session.PersonaId,
+                Content = content,
+                MentionsJson = "[]",
+                TurnSessionId = session.Id,
+                StructuredPayloadJson = payload,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+
+            db.JobMessages.Add(jobMsg);
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+
+            var msgDto = new JobMessageDto(
+                jobMsg.Id,
+                jobMsg.JobId,
+                jobMsg.SenderType,
+                jobMsg.SenderId,
+                jobMsg.SenderName,
+                jobMsg.Content,
+                new List<string>(),
+                jobMsg.TurnSessionId,
+                jobMsg.StructuredPayloadJson,
+                jobMsg.CreatedAt
+            );
+
+            await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
         }
         catch { }
     }
