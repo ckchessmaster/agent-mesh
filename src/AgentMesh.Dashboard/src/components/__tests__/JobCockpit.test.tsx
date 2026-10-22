@@ -1200,4 +1200,46 @@ describe('JobCockpit - Attachment Support', () => {
       );
     });
   });
+
+  it('auto-supersedes older question cards and clears Waiting for Input badge when any subsequent user message is sent', async () => {
+    const questionMsg: JobMessage = {
+      id: 'msg-old-question',
+      jobId: mockJob.id,
+      senderType: 'persona',
+      senderId: 'persona-astra',
+      senderName: 'Astra',
+      content: 'Please choose:\n1. Which caching strategy should we use?',
+      turnSessionId: 'turn-session-1',
+      createdAt: '2026-10-21T18:00:00Z'
+    };
+
+    const subsequentPlainUserMsg: JobMessage = {
+      id: 'msg-user-subsequent',
+      jobId: mockJob.id,
+      senderType: 'user',
+      senderId: 'user-1',
+      senderName: 'You',
+      content: 'Let us stick with memory for now and proceed with the rest.',
+      createdAt: '2026-10-21T18:05:00Z'
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={[questionMsg, subsequentPlainUserMsg]}
+      />
+    );
+
+    // Question card is rendered in answered/addressed state
+    expect(screen.getByTestId('question-card-answered-msg-old-question')).toBeInTheDocument();
+    expect(screen.getByText('Agent Question — Answered')).toBeInTheDocument();
+    expect(screen.getByText(/Addressed in subsequent reply/i)).toBeInTheDocument();
+
+    // Waiting for Input badge is NOT present in the header
+    expect(screen.queryByTestId('waiting-for-input-badge')).not.toBeInTheDocument();
+
+    // Main composer is NOT blocked by question placeholder
+    const textarea = screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i);
+    expect(textarea).toBeInTheDocument();
+  });
 });

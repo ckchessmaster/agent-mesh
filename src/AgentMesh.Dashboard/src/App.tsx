@@ -236,7 +236,7 @@ export default function App() {
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [activeTab, setActiveTab] = useState<'projects' | 'personas' | 'drivers'>('personas');
-  const [hasUserSwitchedTab, setHasUserSwitchedTab] = useState(false);
+  const hasUserSwitchedTabRef = useRef(false);
   const [selectedPersonaId, setSelectedPersonaId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -444,15 +444,25 @@ export default function App() {
       setStatusData(statusRes);
       setAgents(agentsRes);
       setPersonas(personasRes);
-      setSessions(sessionsRes);
+      setSessions((prev) => {
+        if (!sessionsRes || sessionsRes.length === 0) return prev;
+        const fetchedMap = new Map(sessionsRes.map((s) => [s.id, s]));
+        const result = [...sessionsRes];
+        for (const s of prev) {
+          if (!fetchedMap.has(s.id)) {
+            result.push(s);
+          }
+        }
+        return result;
+      });
       setProjects(projectsRes || []);
       if (capsRes) {
         setCapabilities(capsRes);
       }
       setApiError(null);
 
-      // If no personas exist but drivers exist and user hasn't manually switched tab, show Drivers tab
-      if (!hasUserSwitchedTab) {
+      // If user hasn't manually switched tab, select initial tab
+      if (!hasUserSwitchedTabRef.current) {
         if (projectsRes && projectsRes.length > 0) {
           setActiveTab('projects');
         } else if (personasRes.length > 0) {
@@ -515,7 +525,7 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
-  }, [hasUserSwitchedTab]);
+  }, []);
 
   const fetchSessionEvents = useCallback(async (sessionId: string) => {
     try {
@@ -1257,7 +1267,7 @@ export default function App() {
           maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined
         });
         setShowPersonaModal(false);
-        setHasUserSwitchedTab(true);
+        hasUserSwitchedTabRef.current = true;
         setActiveTab('personas');
         await fetchAllData();
         setSelectedPersonaId(created.id);
@@ -2255,7 +2265,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setHasUserSwitchedTab(true);
+                hasUserSwitchedTabRef.current = true;
                 setActiveTab('projects');
               }}
               className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
@@ -2274,7 +2284,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setHasUserSwitchedTab(true);
+                hasUserSwitchedTabRef.current = true;
                 setActiveTab('personas');
               }}
               className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
@@ -2293,7 +2303,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setHasUserSwitchedTab(true);
+                hasUserSwitchedTabRef.current = true;
                 setActiveTab('drivers');
               }}
               className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
@@ -3016,6 +3026,7 @@ export default function App() {
                       setShowProjectModal(true);
                     }}
                     onSelectTurnSession={async (sessionId) => {
+                      hasUserSwitchedTabRef.current = true;
                       setIsCreatingSession(false);
                       setActiveTab('personas');
                       setSelectedSessionId(sessionId);
@@ -3503,6 +3514,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
+                          hasUserSwitchedTabRef.current = true;
                           setSelectedProjectId(selectedSessionMetadata.projectId);
                           setSelectedJobId(selectedSessionMetadata.jobId);
                           setActiveTab('projects');

@@ -294,9 +294,15 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   };
 
   const pendingQuestion = useMemo(() => {
+    // Only search backwards from the latest messages.
+    // If a user message has already been sent after a question,
+    // that question is superseded and cannot be an active "pending question".
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
-      if (m.senderType === 'user') continue;
+      if (m.senderType === 'user') {
+        // Any question asked before this user message has already been replied to / superseded
+        break;
+      }
       let qs: AskQuestionItem[] = [];
       if (m.structuredPayloadJson) {
         try {
@@ -308,13 +314,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         qs = parseTextQuestions(m.content);
       }
       if (qs.length > 0) {
-        const isAns =
-          answeredQuestionIds.includes(m.id) ||
-          messages.slice(i + 1).some(
-            (other) =>
-              other.senderType === 'user' &&
-              (other.content.includes('User answered question') || other.structuredPayloadJson?.includes(m.id))
-          );
+        const isAns = answeredQuestionIds.includes(m.id);
         if (!isAns) {
           return { msg: m, questions: qs };
         }
@@ -324,8 +324,15 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   }, [messages, answeredQuestionIds]);
 
   const isSessionWaitingForInput = useMemo(() => {
+    const lastMsgWithSession = [...messages].reverse().find((m) => m.turnSessionId);
+    if (!lastMsgWithSession?.turnSessionId) return false;
+    const lastUserMsgIdx = [...messages].reverse().findIndex((m) => m.senderType === 'user');
+    const lastTurnMsgIdx = [...messages].reverse().findIndex((m) => m.id === lastMsgWithSession.id);
+    if (lastUserMsgIdx !== -1 && lastUserMsgIdx < lastTurnMsgIdx) {
+      return false;
+    }
     return sessions.some(
-      (s) => s.status === 'waiting_for_input' && messages.some((m) => m.turnSessionId === s.id)
+      (s) => s.id === lastMsgWithSession.turnSessionId && s.status === 'waiting_for_input'
     );
   }, [sessions, messages]);
 
@@ -1654,24 +1661,24 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
                               if (msgQuestions.length === 0) return null;
 
+                              const msgIndex = messages.findIndex((m) => m.id === msg.id);
+                              const subsequentUserMsg = messages
+                                .slice(msgIndex >= 0 ? msgIndex + 1 : 0)
+                                .find((other) => other.senderType === 'user');
+
                               const isMsgQuestionAnswered =
                                 answeredQuestionIds.includes(msg.id) ||
-                                messages.some(
-                                  (other) =>
-                                    other.senderType === 'user' &&
-                                    new Date(other.createdAt).getTime() >= new Date(msg.createdAt).getTime() &&
-                                    (other.content.includes('User answered question') || other.structuredPayloadJson?.includes(msg.id))
-                                );
+                                Boolean(subsequentUserMsg);
 
                               const answeredText = (() => {
                                 if (!isMsgQuestionAnswered) return undefined;
-                                const ans = messages.find(
-                                  (other) =>
-                                    other.senderType === 'user' &&
-                                    new Date(other.createdAt).getTime() >= new Date(msg.createdAt).getTime() &&
-                                    other.content.includes('User answered question')
-                                );
-                                return ans?.content.replace(/^User answered question:\n?/i, '');
+                                if (subsequentUserMsg?.content) {
+                                  if (subsequentUserMsg.content.includes('User answered question')) {
+                                    return subsequentUserMsg.content.replace(/^User answered question:\n?/i, '');
+                                  }
+                                  return `Addressed in subsequent reply: "${subsequentUserMsg.content.slice(0, 120)}${subsequentUserMsg.content.length > 120 ? '...' : ''}"`;
+                                }
+                                return 'Answer submitted';
                               })();
 
                               return (

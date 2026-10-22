@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
 import type { Persona, Project, ProjectJob, JobTask, JobMessage } from '../types';
@@ -840,5 +840,35 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
         })
       );
     });
+  });
+
+  it('does not drag user back to projects tab when viewing personas tab and background session update arrives', async () => {
+    render(<App />);
+
+    // Initially loads on projects tab (since project exists)
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Personas & Sessions/i })).toBeInTheDocument();
+    });
+
+    // Switch to Personas & Sessions tab
+    const personasTabBtn = screen.getByRole('button', { name: /Personas & Sessions/i });
+    fireEvent.click(personasTabBtn);
+
+    // Verify Personas tab is active
+    await waitFor(() => {
+      expect(screen.getByText('New Persona')).toBeInTheDocument();
+      expect(screen.getByText('Astra')).toBeInTheDocument();
+    });
+
+    // Simulate background SignalR event (SessionUpdated)
+    await act(async () => {
+      if (signalRHandlers['SessionUpdated']) {
+        await signalRHandlers['SessionUpdated']({ id: 'sess-bg-1', status: 'thinking' });
+      }
+    });
+
+    // Verify user remains on Personas tab and is NOT dragged back to projects tab
+    expect(screen.getByText('New Persona')).toBeInTheDocument();
+    expect(screen.queryByTestId('job-dropzone-overlay')).not.toBeInTheDocument();
   });
 });
