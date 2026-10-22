@@ -25,6 +25,9 @@ public class AgentPresetConfig
     public string? ApiKey { get; set; }
     public string? DefaultModel { get; set; }
     public Dictionary<string, string>? CustomHeaders { get; set; }
+    public int? TimeoutSeconds { get; set; }
+    public int? MaxRetries { get; set; }
+    public int? RetryDelayMilliseconds { get; set; }
 }
 
 public class PromptReceivedEvent

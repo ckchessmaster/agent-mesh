@@ -249,4 +249,246 @@ public class OpenAiAdapterTests
         doc.RootElement.GetProperty("apiKey").GetString().Should().Be("sk-key");
         doc.RootElement.GetProperty("defaultModel").GetString().Should().Be("qwen3.8-flash-next");
     }
+
+    [Fact]
+    public void ResolveTimeoutSeconds_UsesPresetOrEnvOrDefault()
+    {
+        var presetWithTimeout = new AgentPresetConfig { TimeoutSeconds = 900 };
+        OpenAiAdapter.ResolveTimeoutSeconds(presetWithTimeout).Should().Be(900);
+
+        var presetDefault = new AgentPresetConfig();
+        OpenAiAdapter.ResolveTimeoutSeconds(presetDefault).Should().Be(600); // 10 minutes default
+    }
+
+    [Fact]
+    public void ResolveModelContextLimit_ResolvesKnownModelsAndOptions()
+    {
+        OpenAiAdapter.ResolveModelContextLimit("qwen3.8-flash-next", null).Should().Be(524_288);
+        OpenAiAdapter.ResolveModelContextLimit("llama3.3", null).Should().Be(131_072);
+        OpenAiAdapter.ResolveModelContextLimit("qwen2.5-coder", null).Should().Be(131_072);
+        OpenAiAdapter.ResolveModelContextLimit("custom", "256k").Should().Be(262_144);
+        OpenAiAdapter.ResolveModelContextLimit("custom", "1m").Should().Be(1_048_576);
+        OpenAiAdapter.ResolveModelContextLimit("unknown", "default").Should().Be(131_072);
+    }
+
+    [Fact]
+    public void ParseContextWindowError_ParsesLiteLlmAndOpenAiFormats()
+    {
+        var litellmError = "{\"error\":{\"message\":\"litellm.BadRequestError: OpenAIException - request exceeds the context window: prompt (548337 tokens) leaves no room to answer in the context (524288); requests are never truncated. Received Model Group=qwen3.8-flash-next\\nAvailable Model Group Fallbacks=None\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"400\"}}";
+        var (isLiteLlm, promptTokens, contextLimit) = OpenAiAdapter.ParseContextWindowError(litellmError);
+        isLiteLlm.Should().BeTrue();
+        promptTokens.Should().Be(548_337);
+        contextLimit.Should().Be(524_288);
+
+        var openAiError = "maximum context length is 131072 tokens. However, your messages resulted in 140000 tokens.";
+        var (isOpenAi, pt2, cl2) = OpenAiAdapter.ParseContextWindowError(openAiError);
+        isOpenAi.Should().BeTrue();
+        pt2.Should().Be(140_000);
+        cl2.Should().Be(131_072);
+
+        var normalError = "Invalid model identifier";
+        var (isNormal, _, _) = OpenAiAdapter.ParseContextWindowError(normalError);
+        isNormal.Should().BeFalse();
+    }
+
+    [Fact]
+    public void CompactHistory_TruncatesOlderToolOutputsAndPrunesEarlierTurns()
+    {
+        var history = new List<OpenAiMessage>
+        {
+            new() { Role = "system", Content = "You are an autonomous engineer." },
+            new() { Role = "user", Content = "Please inspect files." },
+            new() { Role = "assistant", Content = "I will read the big file.", ToolCalls = new List<OpenAiToolCall> { new() { Id = "call_1", Function = new() { Name = "read_file" } } } },
+            new() { Role = "tool", ToolCallId = "call_1", Content = new string('A', 5000) },
+            new() { Role = "assistant", Content = "I read it, now editing." },
+            new() { Role = "user", Content = "Continue your work." },
+            new() { Role = "assistant", Content = "Running final build.", ToolCalls = new List<OpenAiToolCall> { new() { Id = "call_2", Function = new() { Name = "run_command" } } } },
+            new() { Role = "tool", ToolCallId = "call_2", Content = "Exit Code: 0" }
+        };
+
+        var initialTokens = OpenAiAdapter.EstimateTotalTokens(history);
+        initialTokens.Should().BeGreaterThan(1000);
+
+        // Compact to 400 tokens
+        var compacted = OpenAiAdapter.CompactHistory(history, 400);
+        compacted.Should().BeTrue();
+
+        // System prompt preserved
+        history[0].Role.Should().Be("system");
+        history[0].Content.Should().Contain("autonomous engineer");
+
+        // Older tool output truncated
+        var compactedTokens = OpenAiAdapter.EstimateTotalTokens(history);
+        compactedTokens.Should().BeLessThan(initialTokens);
+    }
+
+    [Fact]
+    public void TruncateToolResult_CapsLargeResultsAtHeadAndTail()
+    {
+        var small = "Small output";
+        OpenAiAdapter.TruncateToolResult(small, 50_000).Should().Be(small);
+
+        var large = new string('X', 60_000);
+        var truncated = OpenAiAdapter.TruncateToolResult(large, 50_000);
+        truncated.Length.Should().BeLessThan(large.Length);
+        truncated.Should().Contain("Output truncated");
+        truncated.Should().StartWith(new string('X', 100));
+        truncated.Should().EndWith(new string('X', 100));
+    }
+
+    [Fact]
+    public void IsRetryableStatusCode_IdentifiesTransientErrors()
+    {
+        OpenAiAdapter.IsRetryableStatusCode(429).Should().BeTrue();
+        OpenAiAdapter.IsRetryableStatusCode(500).Should().BeTrue();
+        OpenAiAdapter.IsRetryableStatusCode(502).Should().BeTrue();
+        OpenAiAdapter.IsRetryableStatusCode(503).Should().BeTrue();
+        OpenAiAdapter.IsRetryableStatusCode(504).Should().BeTrue();
+
+        OpenAiAdapter.IsRetryableStatusCode(400).Should().BeFalse();
+        OpenAiAdapter.IsRetryableStatusCode(401).Should().BeFalse();
+        OpenAiAdapter.IsRetryableStatusCode(403).Should().BeFalse();
+        OpenAiAdapter.IsRetryableStatusCode(404).Should().BeFalse();
+        OpenAiAdapter.IsRetryableStatusCode(200).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WithTransient503_RetriesAndSucceeds()
+    {
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence Private AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11435/v1",
+            DefaultModel = "qwen3.8-flash-next",
+            MaxRetries = 2,
+            RetryDelayMilliseconds = 1
+        };
+
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = Guid.NewGuid(),
+            MessageId = Guid.NewGuid(),
+            AgentId = "spence-ai",
+            Prompt = "Hello after retry",
+            Sender = "operator"
+        };
+
+        var attempt = 0;
+        using var mockClient = new HttpClient(new MockHttpMessageHandler(_ =>
+        {
+            attempt++;
+            if (attempt == 1)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable)
+                {
+                    ReasonPhrase = "Service Unavailable",
+                    Content = new StringContent("Model loading into VRAM...")
+                };
+            }
+
+            var sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello back!\"}}]}\n\ndata: [DONE]\n\n";
+            var res = new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+            return res;
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            attempt.Should().Be(2);
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("HTTP 503"));
+            events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Hello back!"));
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+        }
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WithContextLimit400_CompactsHistoryAndRetries()
+    {
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence Private AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11435/v1",
+            DefaultModel = "qwen3.8-flash-next",
+            MaxRetries = 2,
+            RetryDelayMilliseconds = 1
+        };
+
+        var sessionId = Guid.NewGuid();
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = sessionId,
+            MessageId = Guid.NewGuid(),
+            AgentId = "spence-ai",
+            Prompt = "Please help me",
+            Sender = "operator"
+        };
+
+        var attempt = 0;
+        using var mockClient = new HttpClient(new MockHttpMessageHandler(_ =>
+        {
+            attempt++;
+            if (attempt == 1)
+            {
+                var errJson = "{\"error\":{\"message\":\"litellm.BadRequestError: OpenAIException - request exceeds the context window: prompt (548337 tokens) leaves no room to answer in the context (524288); requests are never truncated.\"}}";
+                return new HttpResponseMessage(System.Net.HttpStatusCode.BadRequest)
+                {
+                    ReasonPhrase = "Bad Request",
+                    Content = new StringContent(errJson)
+                };
+            }
+
+            var sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Context recovered!\"}}]}\n\ndata: [DONE]\n\n";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            attempt.Should().Be(2);
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Context window exceeded"));
+            events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Context recovered!"));
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+        }
+    }
+
+    private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(handler(request));
+        }
+    }
 }

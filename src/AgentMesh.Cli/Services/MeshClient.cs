@@ -71,6 +71,7 @@ public class MeshClient
                 ["endpoint"] = preset.Endpoint,
                 ["apiKey"] = preset.ApiKey,
                 ["defaultModel"] = preset.DefaultModel,
+                ["timeoutSeconds"] = preset.TimeoutSeconds,
                 ["capabilities"] = preset.Capabilities
             };
             return JsonSerializer.Serialize(caps);

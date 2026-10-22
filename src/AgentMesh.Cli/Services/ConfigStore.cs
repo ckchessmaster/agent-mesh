@@ -149,6 +149,10 @@ public class ConfigStore
                     {
                         preset.DefaultModel = dm.GetString();
                     }
+                    if ((root.TryGetProperty("timeoutSeconds", out var ts) || root.TryGetProperty("timeout", out ts)) && ts.TryGetInt32(out var tVal))
+                    {
+                        preset.TimeoutSeconds = tVal;
+                    }
                 }
             }
             catch { }

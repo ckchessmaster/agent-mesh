@@ -16,7 +16,19 @@ public class OpenAiAdapter : IAgentAdapter
     public string AdapterType => "openai";
 
     private static readonly ConcurrentDictionary<Guid, List<OpenAiMessage>> SessionHistories = new();
-    private static readonly HttpClient HttpClient = new() { Timeout = TimeSpan.FromMinutes(5) };
+    private static readonly HttpClient DefaultHttpClient = new() { Timeout = Timeout.InfiniteTimeSpan };
+
+    public static HttpClient HttpClientInstance = DefaultHttpClient;
+
+    public static void SetHttpClientForTest(HttpClient client)
+    {
+        HttpClientInstance = client;
+    }
+
+    public static void ResetHttpClientForTest()
+    {
+        HttpClientInstance = DefaultHttpClient;
+    }
 
     public static void ClearSessionHistory(Guid sessionId)
     {
@@ -26,6 +38,236 @@ public class OpenAiAdapter : IAgentAdapter
     public static List<OpenAiMessage>? GetSessionHistory(Guid sessionId)
     {
         return SessionHistories.TryGetValue(sessionId, out var history) ? history : null;
+    }
+
+    public static int ResolveTimeoutSeconds(AgentPresetConfig preset)
+    {
+        if (preset.TimeoutSeconds.HasValue && preset.TimeoutSeconds.Value > 0)
+            return preset.TimeoutSeconds.Value;
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_TIMEOUT_SECONDS"), out var envSec) && envSec > 0)
+            return envSec;
+
+        return 600; // 10 minutes default (increased from 100s / 5m)
+    }
+
+    public static int ResolveMaxRetries(AgentPresetConfig preset)
+    {
+        if (preset.MaxRetries.HasValue && preset.MaxRetries.Value >= 0)
+            return preset.MaxRetries.Value;
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_MAX_RETRIES"), out var envRetries) && envRetries >= 0)
+            return envRetries;
+
+        return 2; // 2 retries (3 total attempts)
+    }
+
+    public static int GetRetryDelayMilliseconds(HttpResponseMessage? response, int attempt, AgentPresetConfig? preset = null)
+    {
+        if (preset != null && preset.RetryDelayMilliseconds.HasValue && preset.RetryDelayMilliseconds.Value >= 0)
+            return preset.RetryDelayMilliseconds.Value;
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_RETRY_DELAY_MS"), out var envDelay) && envDelay >= 0)
+            return envDelay;
+
+        if (response != null && response.Headers.TryGetValues("Retry-After", out var values))
+        {
+            var first = values.FirstOrDefault();
+            if (int.TryParse(first, out var sec) && sec > 0 && sec <= 60)
+            {
+                return sec * 1000;
+            }
+        }
+
+        return Math.Min(15_000, (int)Math.Pow(2, attempt - 1) * 1000);
+    }
+
+    public static bool IsRetryableStatusCode(int statusCode)
+    {
+        return statusCode == 429 || // Too Many Requests / Rate Limited
+               statusCode == 500 || // Internal Server Error
+               statusCode == 502 || // Bad Gateway
+               statusCode == 503 || // Service Unavailable (model loading / warming up)
+               statusCode == 504;   // Gateway Timeout
+    }
+
+    public static int ResolveModelContextLimit(string model, string? contextSizeOption)
+    {
+        if (!string.IsNullOrWhiteSpace(contextSizeOption) && !contextSizeOption.Equals("default", StringComparison.OrdinalIgnoreCase))
+        {
+            var normalized = contextSizeOption.Trim().ToLowerInvariant();
+            if (normalized.EndsWith("k") && int.TryParse(normalized[..^1], out var k))
+                return k * 1024;
+            if (normalized.EndsWith("m") && int.TryParse(normalized[..^1], out var m))
+                return m * 1024 * 1024;
+            if (int.TryParse(normalized, out var exact))
+                return exact;
+        }
+
+        var mLower = model.ToLowerInvariant();
+        if (mLower.Contains("qwen3") || mLower.Contains("qwen-3")) return 524_288; // 512k tokens
+        if (mLower.Contains("qwen2.5") || mLower.Contains("qwen-2.5")) return 131_072; // 128k
+        if (mLower.Contains("llama-3") || mLower.Contains("llama3")) return 131_072; // 128k
+        if (mLower.Contains("gpt-4o")) return 131_072; // 128k
+        if (mLower.Contains("deepseek")) return 131_072; // 128k
+
+        return 131_072; // 128k safe default
+    }
+
+    public static int EstimateMessageTokens(OpenAiMessage message)
+    {
+        var charCount = (message.Role?.Length ?? 0) + (message.Content?.Length ?? 0);
+        if (message.ToolCalls != null)
+        {
+            foreach (var tc in message.ToolCalls)
+            {
+                charCount += (tc.Function?.Name?.Length ?? 0) + (tc.Function?.Arguments?.Length ?? 0) + (tc.Id?.Length ?? 0);
+            }
+        }
+        return (int)Math.Ceiling(charCount / 3.6);
+    }
+
+    public static int EstimateTotalTokens(IEnumerable<OpenAiMessage> messages)
+    {
+        return messages.Sum(EstimateMessageTokens);
+    }
+
+    public static (bool IsContextLimit, int? PromptTokens, int? ContextLimit) ParseContextWindowError(string errorContent)
+    {
+        if (string.IsNullOrWhiteSpace(errorContent)) return (false, null, null);
+
+        // LiteLLM style: "request exceeds the context window: prompt (548337 tokens) leaves no room to answer in the context (524288); requests are never truncated."
+        var m1 = Regex.Match(errorContent, @"prompt\s*\(([0-9]+)\s*tokens\).*?context\s*\(([0-9]+)\)", RegexOptions.IgnoreCase);
+        if (m1.Success && int.TryParse(m1.Groups[1].Value, out var pt) && int.TryParse(m1.Groups[2].Value, out var cl))
+        {
+            return (true, pt, cl);
+        }
+
+        // OpenAI style: "maximum context length is 131072 tokens. However, your messages resulted in 140000 tokens."
+        var m2 = Regex.Match(errorContent, @"maximum context length is\s*([0-9]+)\s*tokens.*?resulted in\s*([0-9]+)\s*tokens", RegexOptions.IgnoreCase);
+        if (m2.Success && int.TryParse(m2.Groups[1].Value, out var cl2) && int.TryParse(m2.Groups[2].Value, out var pt2))
+        {
+            return (true, pt2, cl2);
+        }
+
+        // Generic context limit regex
+        var m3 = Regex.Match(errorContent, @"context\s*length\s*exceeded.*?([0-9]+)", RegexOptions.IgnoreCase);
+        if (m3.Success && int.TryParse(m3.Groups[1].Value, out var cl3))
+        {
+            return (true, null, cl3);
+        }
+
+        if (errorContent.Contains("exceeds the context window", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("context_length_exceeded", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("maximum context length", StringComparison.OrdinalIgnoreCase) ||
+            (errorContent.Contains("context", StringComparison.OrdinalIgnoreCase) && errorContent.Contains("too large", StringComparison.OrdinalIgnoreCase)))
+        {
+            return (true, null, null);
+        }
+
+        return (false, null, null);
+    }
+
+    public static bool CompactHistory(List<OpenAiMessage> history, int targetMaxTokens, bool forceAggressive = false)
+    {
+        if (history.Count <= 1) return false;
+
+        var modified = false;
+        var protectedTailCount = forceAggressive ? 2 : 4;
+        var cutoff = Math.Max(1, history.Count - protectedTailCount);
+
+        // Phase 1: Truncate older tool output messages
+        for (int i = 1; i < cutoff; i++)
+        {
+            var msg = history[i];
+            var maxLen = forceAggressive ? 200 : 400;
+            if (msg.Role == "tool" && !string.IsNullOrEmpty(msg.Content) && msg.Content.Length > maxLen)
+            {
+                var snippetLen = forceAggressive ? 100 : 200;
+                var snippet = msg.Content.Length > snippetLen ? msg.Content[..snippetLen].Trim() : msg.Content;
+                msg.Content = $"[Tool output compacted to preserve context: {snippet}... (trimmed)]";
+                modified = true;
+            }
+            else if (msg.Role == "user" && msg.Content != null && msg.Content.StartsWith("Tool Result for ") && msg.Content.Length > maxLen)
+            {
+                var snippetLen = forceAggressive ? 100 : 200;
+                var snippet = msg.Content.Length > snippetLen ? msg.Content[..snippetLen].Trim() : msg.Content;
+                msg.Content = $"[Tool output compacted to preserve context: {snippet}... (trimmed)]";
+                modified = true;
+            }
+        }
+
+        if (EstimateTotalTokens(history) <= targetMaxTokens && modified && !forceAggressive)
+            return true;
+
+        // Phase 2: If still over limit, slide older message turns atomically
+        var prunedTurns = 0;
+        while (history.Count > (protectedTailCount + 1) && EstimateTotalTokens(history) > targetMaxTokens)
+        {
+            var msg1 = history[1];
+            if (msg1.Role == "user")
+            {
+                history.RemoveAt(1);
+                prunedTurns++;
+                modified = true;
+            }
+            else if (msg1.Role == "assistant")
+            {
+                history.RemoveAt(1);
+                modified = true;
+                while (history.Count > 1 && history[1].Role == "tool")
+                {
+                    history.RemoveAt(1);
+                }
+                prunedTurns++;
+            }
+            else
+            {
+                history.RemoveAt(1);
+                modified = true;
+            }
+        }
+
+        if (prunedTurns > 0)
+        {
+            history.Insert(1, new OpenAiMessage
+            {
+                Role = "system",
+                Content = $"[Context Compaction: {prunedTurns} earlier conversation turns were pruned to keep within the model context window. Work continues from recent context below.]"
+            });
+        }
+
+        // Phase 3: For aggressive context recovery, truncate any oversized individual message
+        if (forceAggressive)
+        {
+            for (int i = 1; i < history.Count; i++)
+            {
+                var msg = history[i];
+                var estTokens = EstimateMessageTokens(msg);
+                if (estTokens > targetMaxTokens && !string.IsNullOrEmpty(msg.Content))
+                {
+                    var maxChars = Math.Max(2000, targetMaxTokens * 3);
+                    if (msg.Content.Length > maxChars)
+                    {
+                        msg.Content = TruncateToolResult(msg.Content, maxChars);
+                        modified = true;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        return modified;
+    }
+
+    public static string TruncateToolResult(string result, int maxChars = 50_000)
+    {
+        if (string.IsNullOrEmpty(result) || result.Length <= maxChars) return result;
+        var headLength = maxChars / 2;
+        var tailLength = maxChars / 3;
+        var omitted = result.Length - (headLength + tailLength);
+        return $"{result[..headLength]}\n\n[... Output truncated: {omitted} characters omitted to preserve context window ...]\n\n{result[^tailLength..]}";
     }
 
     public async Task ExecutePromptAsync(
@@ -59,11 +301,15 @@ public class OpenAiAdapter : IAgentAdapter
                 ? preset.DefaultModel.Trim()
                 : "llama3.3";
 
+        var timeoutSeconds = ResolveTimeoutSeconds(preset);
+        var maxRetries = ResolveMaxRetries(preset);
+        var modelContextLimit = ResolveModelContextLimit(effectiveModel, promptEvent.ContextSize);
+
         ct.ThrowIfCancellationRequested();
         await onEvent(new TrajectoryEventPayload
         {
             EventType = "thought",
-            Content = $"[@{preset.Id}] Connecting to OpenAI-compatible server at {endpoint} using model '{effectiveModel}'..."
+            Content = $"[@{preset.Id}] Connecting to OpenAI-compatible server at {endpoint} using model '{effectiveModel}' (timeout: {timeoutSeconds}s, context: {modelContextLimit} tokens)..."
         });
 
         // Initialize or retrieve session history
@@ -96,70 +342,173 @@ public class OpenAiAdapter : IAgentAdapter
             stepCount++;
             ct.ThrowIfCancellationRequested();
 
-            var reqBody = new Dictionary<string, object?>
+            // Proactive history compaction
+            var targetMaxTokens = (int)(modelContextLimit * 0.80);
+            if (EstimateTotalTokens(history) > targetMaxTokens)
             {
-                ["model"] = effectiveModel,
-                ["messages"] = history.Select(m => m.ToSerializableObject()).ToList(),
-                ["stream"] = true
-            };
-
-            if (toolsDefinition != null && toolsDefinition.Count > 0)
-            {
-                reqBody["tools"] = toolsDefinition;
-                reqBody["tool_choice"] = "auto";
-            }
-
-            using var httpReq = new HttpRequestMessage(HttpMethod.Post, chatUrl);
-            httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-            if (!string.IsNullOrWhiteSpace(apiKey))
-            {
-                httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-            }
-
-            if (preset.CustomHeaders != null)
-            {
-                foreach (var kvp in preset.CustomHeaders)
+                var beforeEst = EstimateTotalTokens(history);
+                var compacted = CompactHistory(history, targetMaxTokens);
+                if (compacted)
                 {
-                    httpReq.Headers.TryAddWithoutValidation(kvp.Key, kvp.Value);
+                    var afterEst = EstimateTotalTokens(history);
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = $"[@{preset.Id}] Proactively compacted conversation history ({beforeEst} -> {afterEst} tokens) to remain within {modelContextLimit} context limit."
+                    });
                 }
             }
 
-            var jsonContent = JsonSerializer.Serialize(reqBody);
-            httpReq.Content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+            HttpResponseMessage? httpRes = null;
+            var retryAttempt = 0;
 
-            HttpResponseMessage httpRes;
-            try
+            while (true)
             {
-                httpRes = await HttpClient.SendAsync(httpReq, HttpCompletionOption.ResponseHeadersRead, ct);
-            }
-            catch (Exception ex)
-            {
-                var errorMsg = $"Failed to connect to OpenAI-compatible endpoint ({chatUrl}): {ex.Message}";
-                await onEvent(new TrajectoryEventPayload
+                ct.ThrowIfCancellationRequested();
+
+                var reqBody = new Dictionary<string, object?>
                 {
-                    EventType = "response",
-                    Content = $"❌ {errorMsg}\n\nPlease verify that your server is running and accessible at `{endpoint}`."
-                });
-                return;
+                    ["model"] = effectiveModel,
+                    ["messages"] = history.Select(m => m.ToSerializableObject()).ToList(),
+                    ["stream"] = true
+                };
+
+                if (toolsDefinition != null && toolsDefinition.Count > 0)
+                {
+                    reqBody["tools"] = toolsDefinition;
+                    reqBody["tool_choice"] = "auto";
+                }
+
+                using var httpReq = new HttpRequestMessage(HttpMethod.Post, chatUrl);
+                httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+                if (!string.IsNullOrWhiteSpace(apiKey))
+                {
+                    httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                }
+
+                if (preset.CustomHeaders != null)
+                {
+                    foreach (var kvp in preset.CustomHeaders)
+                    {
+                        httpReq.Headers.TryAddWithoutValidation(kvp.Key, kvp.Value);
+                    }
+                }
+
+                var jsonContent = JsonSerializer.Serialize(reqBody);
+                httpReq.Content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+                try
+                {
+                    httpRes = await HttpClientInstance.SendAsync(httpReq, HttpCompletionOption.ResponseHeadersRead, linkedCts.Token);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+                {
+                    if (retryAttempt < maxRetries)
+                    {
+                        retryAttempt++;
+                        var delayMs = GetRetryDelayMilliseconds(null, retryAttempt, preset);
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] Initial handshake to OpenAI endpoint timed out after {timeoutSeconds}s (likely loading weights/experts into VRAM). Retrying in {delayMs / 1000.0:F1}s (attempt {retryAttempt}/{maxRetries})..."
+                        });
+                        await Task.Delay(delayMs, ct);
+                        continue;
+                    }
+
+                    var errorMsg = $"Initial handshake to OpenAI-compatible endpoint ({chatUrl}) timed out after {timeoutSeconds}s. The server may still be loading weights/experts into VRAM or under heavy load.";
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = $"❌ {errorMsg}\n\nYou can increase the timeout by setting `timeoutSeconds` in the agent config or the `OPENAI_TIMEOUT_SECONDS` environment variable."
+                    });
+                    return;
+                }
+                catch (Exception ex) when (ex is HttpRequestException || ex is IOException)
+                {
+                    if (retryAttempt < maxRetries)
+                    {
+                        retryAttempt++;
+                        var delayMs = GetRetryDelayMilliseconds(null, retryAttempt, preset);
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] Network error connecting to OpenAI endpoint ({ex.Message}). Retrying in {delayMs / 1000.0:F1}s (attempt {retryAttempt}/{maxRetries})..."
+                        });
+                        await Task.Delay(delayMs, ct);
+                        continue;
+                    }
+
+                    var errorMsg = $"Failed to connect to OpenAI-compatible endpoint ({chatUrl}): {ex.Message}";
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = $"❌ {errorMsg}\n\nPlease verify that your server is running and accessible at `{endpoint}`."
+                    });
+                    return;
+                }
+
+                if (!httpRes.IsSuccessStatusCode)
+                {
+                    var errContent = await httpRes.Content.ReadAsStringAsync(ct);
+                    var statusCode = (int)httpRes.StatusCode;
+
+                    var (isContextErr, promptTokens, parsedLimit) = ParseContextWindowError(errContent);
+                    if (isContextErr)
+                    {
+                        var effectiveLimit = parsedLimit ?? modelContextLimit;
+                        var targetTokens = (int)(effectiveLimit * 0.70);
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] Context window exceeded ({promptTokens?.ToString() ?? "prompt"} tokens vs {effectiveLimit} limit). Compacting history and retrying..."
+                        });
+
+                        var compacted = CompactHistory(history, targetTokens, forceAggressive: true);
+                        if (compacted)
+                        {
+                            httpRes.Dispose();
+                            continue;
+                        }
+                    }
+
+                    if (IsRetryableStatusCode(statusCode) && retryAttempt < maxRetries)
+                    {
+                        retryAttempt++;
+                        var delayMs = GetRetryDelayMilliseconds(httpRes, retryAttempt, preset);
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] OpenAI server returned HTTP {statusCode} ({httpRes.ReasonPhrase}). Retrying in {delayMs / 1000.0:F1}s (attempt {retryAttempt}/{maxRetries})..."
+                        });
+                        httpRes.Dispose();
+                        await Task.Delay(delayMs, ct);
+                        continue;
+                    }
+
+                    var errorMsg = $"OpenAI server error (HTTP {statusCode} {httpRes.ReasonPhrase}): {errContent}";
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = $"❌ {errorMsg}"
+                    });
+                    httpRes.Dispose();
+                    return;
+                }
+
+                break;
             }
 
-            if (!httpRes.IsSuccessStatusCode)
-            {
-                var errContent = await httpRes.Content.ReadAsStringAsync(ct);
-                var errorMsg = $"OpenAI server error (HTTP {(int)httpRes.StatusCode} {httpRes.ReasonPhrase}): {errContent}";
-                await onEvent(new TrajectoryEventPayload
-                {
-                    EventType = "response",
-                    Content = $"❌ {errorMsg}"
-                });
-                return;
-            }
+            using var activeResponse = httpRes!;
 
             var contentBuilder = new StringBuilder();
             var reasoningBuilder = new StringBuilder();
             var toolCallsByIndex = new SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)>();
 
-            using (var stream = await httpRes.Content.ReadAsStreamAsync(ct))
+            using (var stream = await activeResponse.Content.ReadAsStreamAsync(ct))
             using (var reader = new StreamReader(stream))
             {
                 string? line;
@@ -619,6 +968,12 @@ public class OpenAiAdapter : IAgentAdapter
     }
 
     public static async Task<string> ExecuteToolLocallyAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
+    {
+        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct);
+        return TruncateToolResult(rawResult);
+    }
+
+    private static async Task<string> ExecuteToolLocallyRawAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
     {
         try
         {
