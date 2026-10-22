@@ -783,6 +783,59 @@ export default function App() {
     }
   };
 
+  const applyJobFromServer = useCallback((job?: ProjectJob) => {
+    if (!job) return;
+    setJobsByProject((prev) => ({
+      ...prev,
+      [job.projectId]: (prev[job.projectId] || []).map((j) => (j.id === job.id ? job : j))
+    }));
+  }, []);
+
+  const handleCancelQueuedJobTurn = async (turnId: string, jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const job = await api.cancelQueuedJobTurn(targetId, turnId);
+      // Trust the server DTO; the local filter can diverge from what was actually removed.
+      if (job) {
+        applyJobFromServer(job);
+      } else {
+        setJobsByProject((prev) => {
+          const next = { ...prev };
+          for (const pId of Object.keys(next)) {
+            next[pId] = next[pId].map((j) => {
+              if (j.id === targetId) {
+                const updatedQueued = (j.queuedTurns || []).filter((t) => t.id !== turnId);
+                return { ...j, queuedTurns: updatedQueued };
+              }
+              return j;
+            });
+          }
+          return next;
+        });
+      }
+      const msgs = await api.getJobMessages(targetId);
+      setJobMessages(msgs);
+    } catch (err) {
+      console.error('Failed to cancel queued turn:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turn');
+    }
+  };
+
+  const handleCancelQueuedJobTurns = async (personaId: string, jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const job = await api.cancelQueuedJobTurns(targetId, personaId);
+      if (job) applyJobFromServer(job);
+      const msgs = await api.getJobMessages(targetId);
+      setJobMessages(msgs);
+    } catch (err) {
+      console.error('Failed to cancel queued turns:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turns');
+    }
+  };
+
   const fetchSessionArtifacts = useCallback(async (sessionId: string) => {
     try {
       const list = await api.getSessionArtifacts(sessionId);
@@ -3221,6 +3274,8 @@ export default function App() {
                     onReopenJob={handleReopenJob}
                     onOpenLightbox={setLightboxAttachment}
                     onStopTurn={handleStopSession}
+                    onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}
+                    onCancelQueuedTurns={(personaId) => handleCancelQueuedJobTurns(personaId, activeJ.id)}
                     onAnswerQuestion={handleJobQuestionAnswer}
                     onEditProject={() => {
                       setEditingProject(activeProj);
