@@ -690,6 +690,52 @@ describe('JobCockpit - Attachment Support', () => {
     expect(onReopenJob).toHaveBeenCalledTimes(1);
   });
 
+  it('does not block chat on completed jobs: enables composer and attach button, allows sending messages, and provides Reopen and Archive buttons', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const onReopenJob = vi.fn().mockResolvedValue(undefined);
+    const onArchiveJob = vi.fn().mockResolvedValue(undefined);
+    const completedJob = {
+      ...mockJob,
+      status: ProjectJobStatus.Completed
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={completedJob}
+        onSendMessage={onSendMessage}
+        onReopenJob={onReopenJob}
+        onArchiveJob={onArchiveJob}
+      />
+    );
+
+    // Shows Completed status badge
+    expect(screen.getByText('Completed')).toBeInTheDocument();
+
+    // Reopen and Archive buttons appear
+    expect(screen.getByTestId('cockpit-reopen-job-btn')).toBeInTheDocument();
+    expect(screen.getByTestId('cockpit-archive-job-btn')).toBeInTheDocument();
+
+    // Complete & Merge button is NOT shown because it's already completed
+    expect(screen.queryByText('Complete & Merge Job')).not.toBeInTheDocument();
+
+    // Composer is NOT disabled
+    const textarea = screen.getByPlaceholderText(/Job completed. Continue discussion, delegate with @persona, or reopen if needed.../i);
+    expect(textarea).not.toBeDisabled();
+
+    // Attach button is NOT disabled
+    const attachBtn = screen.getByTestId('job-attach-btn');
+    expect(attachBtn).not.toBeDisabled();
+
+    // Can send a follow-up message in the completed job
+    fireEvent.change(textarea, { target: { value: 'Great job, team! Let us review the results.' } });
+    const sendBtn = screen.getByRole('button', { name: /Send Message/i });
+    expect(sendBtn).not.toBeDisabled();
+
+    fireEvent.click(sendBtn);
+    expect(onSendMessage).toHaveBeenCalledWith('Great job, team! Let us review the results.', undefined);
+  });
+
   it('renders sequential task badges (Completed, In Progress, Queued) and current focus header banner', () => {
     const sequentialTasks: JobTask[] = [
       { id: 'task-1', title: 'First Task Done', isCompleted: true, completedAt: new Date().toISOString() },

@@ -704,7 +704,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const hasPendingUploads = stagedAttachments.some((a) => a.uploading);
   const isCompleted = job.status === ProjectJobStatus.Completed;
   const isArchived = job.status === ProjectJobStatus.Archived;
-  const isClosed = isCompleted || isArchived;
+  const isClosed = isArchived;
   const canSend = Boolean(prompt.trim() || readyStagedAttachments.length > 0) && !hasPendingUploads && !isSending && !isClosed;
 
   const handleSend = async (e?: React.FormEvent) => {
@@ -1052,7 +1052,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             )
           ) : (
             <div className="flex items-center gap-2">
-              {!isCompleted && (
+              {!isCompleted ? (
                 <div>
                   {showCompleteConfirm ? (
                     <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl">
@@ -1090,6 +1090,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     </button>
                   )}
                 </div>
+              ) : (
+                onReopenJob && (
+                  <button
+                    type="button"
+                    onClick={handleConfirmReopen}
+                    disabled={isArchiving}
+                    className="px-3.5 py-1.5 bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/40 text-sky-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                    data-testid="cockpit-reopen-job-btn"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>{isArchiving ? 'Reopening...' : 'Reopen Job'}</span>
+                  </button>
+                )
               )}
 
               {onArchiveJob && (
@@ -1954,10 +1967,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               placeholder={
                 isArchived
                   ? "This job is archived and read-only. Reopen the job to post messages..."
-                  : isCompleted
-                  ? "Job completed. Reopen or post new turns if needed..."
                   : isWaitingForInput
                   ? "Agent is waiting for your answer above (type here or use the card above to respond)..."
+                  : isCompleted
+                  ? "Job completed. Continue discussion, delegate with @persona, or reopen if needed..."
                   : "Type your message, tasks, or delegate with @persona (Press Enter to send)..."
               }
               disabled={isClosed || isSending}
