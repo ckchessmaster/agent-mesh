@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { JobCockpit, getActiveMentionQuery } from '../JobCockpit';
-import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment } from '../../types';
+import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment, type AgentSession } from '../../types';
 import { api } from '../../services/api';
 
 vi.mock('../../services/api', () => ({
@@ -1056,6 +1056,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'persona-astra',
       senderName: 'Astra',
       content: 'I have a question before we start coding:',
+      mentions: [],
       turnSessionId: 'turn-session-qa-1',
       structuredPayloadJson: JSON.stringify({
         toolName: 'ask_question',
@@ -1074,6 +1075,7 @@ describe('JobCockpit - Attachment Support', () => {
       id: 'turn-session-qa-1',
       title: 'Turn Session QA',
       status: 'waiting_for_input',
+      metadataJson: '{}',
       createdAt: '2026-10-21T18:00:00Z',
       updatedAt: '2026-10-21T18:00:00Z'
     };
@@ -1133,6 +1135,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'user-1',
       senderName: 'You',
       content: 'User answered question:\nQ: Which database should we use? -> A: PostgreSQL',
+      mentions: [],
       createdAt: '2026-10-21T18:01:00Z'
     };
 
@@ -1161,6 +1164,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'persona-astra',
       senderName: 'Astra',
       content: 'Please let me know:\n1. What architecture style should we follow?',
+      mentions: [],
       turnSessionId: 'turn-session-comp-1',
       createdAt: '2026-10-21T18:10:00Z'
     };
@@ -1209,6 +1213,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'persona-astra',
       senderName: 'Astra',
       content: 'Please choose:\n1. Which caching strategy should we use?',
+      mentions: [],
       turnSessionId: 'turn-session-1',
       createdAt: '2026-10-21T18:00:00Z'
     };
@@ -1220,6 +1225,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'user-1',
       senderName: 'You',
       content: 'Let us stick with memory for now and proceed with the rest.',
+      mentions: [],
       createdAt: '2026-10-21T18:05:00Z'
     };
 

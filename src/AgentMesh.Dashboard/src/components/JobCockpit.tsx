@@ -254,7 +254,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
   const handleAnswerQuestion = async (
     msg: JobMessage,
-    questions: AskQuestionItem[],
+    _questions: AskQuestionItem[],
     answers: QuestionAnswerPayload[]
   ) => {
     setSubmittingQuestionId(msg.id);

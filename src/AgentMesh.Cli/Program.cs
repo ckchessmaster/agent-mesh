@@ -25,6 +25,9 @@ public static class Program
         string? customRole = null;
         string? customName = null;
         string? customAdapter = null;
+        string? customEndpoint = null;
+        string? customApiKey = null;
+        string? customDefaultModel = null;
         var runOnce = false;
 
         for (var i = 0; i < args.Length; i++)
@@ -53,6 +56,18 @@ public static class Program
             else if (arg is "--adapter" or "-a" && i + 1 < args.Length)
             {
                 customAdapter = args[++i];
+            }
+            else if (arg is "--endpoint" or "-e" && i + 1 < args.Length)
+            {
+                customEndpoint = args[++i];
+            }
+            else if (arg is "--api-key" or "-k" && i + 1 < args.Length)
+            {
+                customApiKey = args[++i];
+            }
+            else if (arg is "--model" or "-m" && i + 1 < args.Length)
+            {
+                customDefaultModel = args[++i];
             }
             else if (arg is "--once")
             {
@@ -158,7 +173,7 @@ public static class Program
             {
                 if (subArgs.Count == 0)
                 {
-                    AnsiConsole.MarkupLine("[red]Usage:[/] agentmesh add <agent-id> [[--name <name>]] [[--role <role>]] [[--adapter <agy|claude|copilot|generic>]] [[--command <cmd>]]");
+                    AnsiConsole.MarkupLine("[red]Usage:[/] agentmesh add <agent-id> [[--name <name>]] [[--role <role>]] [[--adapter <agy|claude|copilot|openai|generic>]] [[--command <cmd>]] [[--endpoint <url>]] [[--api-key <key>]] [[--model <model>]]");
                     return 1;
                 }
 
@@ -166,6 +181,9 @@ public static class Program
                 var preset = configStore.ResolveOrCreatePreset(config, id, customCommand, customRole);
                 if (!string.IsNullOrWhiteSpace(customName)) preset.Name = customName;
                 if (!string.IsNullOrWhiteSpace(customAdapter)) preset.AdapterType = customAdapter.ToLowerInvariant();
+                if (!string.IsNullOrWhiteSpace(customEndpoint)) preset.Endpoint = customEndpoint;
+                if (!string.IsNullOrWhiteSpace(customApiKey)) preset.ApiKey = customApiKey;
+                if (!string.IsNullOrWhiteSpace(customDefaultModel)) preset.DefaultModel = customDefaultModel;
                 configStore.Save(config);
 
                 try
@@ -173,6 +191,14 @@ public static class Program
                     var token = await meshClient.EnsureAgentRegisteredAsync(preset, cts.Token);
                     AnsiConsole.MarkupLine($"[green]✓ Registered agent[/] [bold white]@{Markup.Escape(preset.Id)}[/] ({Markup.Escape(preset.Name)})");
                     AnsiConsole.MarkupLine($"  [grey]Adapter:[/] {Markup.Escape(preset.AdapterType)}");
+                    if (!string.IsNullOrWhiteSpace(preset.Endpoint))
+                    {
+                        AnsiConsole.MarkupLine($"  [grey]Endpoint:[/] {Markup.Escape(preset.Endpoint)}");
+                    }
+                    if (!string.IsNullOrWhiteSpace(preset.DefaultModel))
+                    {
+                        AnsiConsole.MarkupLine($"  [grey]Model:[/]    {Markup.Escape(preset.DefaultModel)}");
+                    }
                     AnsiConsole.MarkupLine($"  [grey]Token:[/]   {Markup.Escape(token[..Math.Min(16, token.Length)])}...");
                     AnsiConsole.MarkupLine($"  [grey]Start:[/]   [cyan]agentmesh start {Markup.Escape(preset.Id)}[/]");
                     return 0;

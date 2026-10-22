@@ -90,6 +90,16 @@ export const api = {
     return res.json();
   },
 
+  async testOpenAiServer(req: { endpoint: string; apiKey?: string }): Promise<{ success: boolean; error?: string; models: { id: string; name: string }[] }> {
+    const res = await apiFetch('/api/system/drivers/test-openai', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to test OpenAI server: ${res.statusText}`);
+    return res.json();
+  },
+
   async browseFilesystem(path?: string): Promise<FilesystemBrowseResponse> {
     const query = path ? `?path=${encodeURIComponent(path)}` : '';
     const res = await apiFetch(`/api/system/filesystem${query}`, { headers: getHeaders() });

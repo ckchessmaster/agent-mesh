@@ -19,6 +19,12 @@ public class AgentPresetConfig
     public string? Arguments { get; set; }
     public string? Token { get; set; }
     public List<string> Capabilities { get; set; } = new();
+
+    // Custom OpenAI compatible server settings
+    public string? Endpoint { get; set; } // e.g. http://localhost:11434/v1
+    public string? ApiKey { get; set; }
+    public string? DefaultModel { get; set; }
+    public Dictionary<string, string>? CustomHeaders { get; set; }
 }
 
 public class PromptReceivedEvent

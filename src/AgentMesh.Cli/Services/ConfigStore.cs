@@ -159,6 +159,10 @@ public class ConfigStore
         if (id.StartsWith("agy", StringComparison.OrdinalIgnoreCase)) return "agy";
         if (id.StartsWith("claude", StringComparison.OrdinalIgnoreCase)) return "claude";
         if (id.StartsWith("copilot", StringComparison.OrdinalIgnoreCase)) return "copilot";
+        if (id.StartsWith("openai", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("ollama", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("vllm", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("lmstudio", StringComparison.OrdinalIgnoreCase)) return "openai";
         return "generic";
     }
 
@@ -167,6 +171,7 @@ public class ConfigStore
         "agy" => $"Antigravity ({id})",
         "claude" => $"Claude Code ({id})",
         "copilot" => $"GitHub Copilot ({id})",
+        "openai" => $"OpenAI Compatible ({id})",
         _ => $"Agent {id}"
     };
 
@@ -175,6 +180,7 @@ public class ConfigStore
         "agy" => "Autonomous Codebase Engineer",
         "claude" => "Anthropic Terminal Architect",
         "copilot" => "Shell & Git Specialist",
+        "openai" => "Autonomous AI Engineer",
         _ => "Codebase Engineer"
     };
 
@@ -183,6 +189,7 @@ public class ConfigStore
         "agy" => "agy",
         "claude" => "claude",
         "copilot" => "gh",
+        "openai" => null,
         _ => null
     };
 
@@ -191,6 +198,7 @@ public class ConfigStore
         "agy" => new List<string> { "run_command", "view_file", "replace_file_content" },
         "claude" => new List<string> { "bash", "edit_file", "read_file" },
         "copilot" => new List<string> { "explain", "suggest" },
+        "openai" => new List<string> { "run_command", "read_file", "write_file", "edit_file", "ask_question" },
         _ => new List<string> { "shell", "inspect_workspace" }
     };
 }
