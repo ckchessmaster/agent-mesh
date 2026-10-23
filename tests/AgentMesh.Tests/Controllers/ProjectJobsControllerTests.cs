@@ -3,6 +3,7 @@ using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using AgentMesh.Infrastructure.Data;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
@@ -1170,5 +1171,454 @@ public class ProjectJobsControllerTests
         var remainingTurns = ProjectJobsController.ParseQueuedTurns(updatedJob!.QueuedTurnsJson);
         remainingTurns.Should().HaveCount(1);
         remainingTurns[0].TargetPersonaId.Should().Be("soren");
+    }
+
+    // ---------------------------------------------------------------------
+    // Task assignment / reassignment
+    // ---------------------------------------------------------------------
+
+    private static ProjectJob MakeAssignmentJob(
+        string projectId,
+        string title,
+        List<JobTaskDto> tasks,
+        List<QueuedJobTurnDto>? queuedTurns = null,
+        ProjectJobPriority priority = ProjectJobPriority.Normal)
+    {
+        return new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = projectId,
+            Title = title,
+            Status = ProjectJobStatus.Active,
+            Priority = priority,
+            TasksJson = System.Text.Json.JsonSerializer.Serialize(tasks),
+            QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(queuedTurns ?? new List<QueuedJobTurnDto>())
+        };
+    }
+
+    private static QueuedJobTurnDto MakeQueuedTurn(Guid jobId, string projectId, string personaId, string content) =>
+        new(
+            Id: Guid.NewGuid(),
+            JobId: jobId,
+            ProjectId: projectId,
+            TargetPersonaId: personaId,
+            SenderType: "user",
+            SenderId: "operator",
+            SenderName: "Operator",
+            Content: content,
+            Mentions: new List<string> { personaId },
+            Attachments: null,
+            Priority: ProjectJobPriority.Normal,
+            CreatedAt: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+    private static (AgentMeshDbContext Db, Project Project, Persona Astra, Persona Soren) BuildAssignmentContext(
+        string projectId,
+        int? astraMaxConcurrentJobs = null,
+        int? sorenMaxConcurrentJobs = null)
+    {
+        var db = TestDbContextFactory.Create();
+        var astra = new Persona { Id = "astra", Name = "Astra", Role = "Tech Lead", DriverId = "agy", MaxConcurrentJobs = astraMaxConcurrentJobs };
+        var soren = new Persona { Id = "soren", Name = "Soren", Role = "Engineer", DriverId = "agy", MaxConcurrentJobs = sorenMaxConcurrentJobs };
+        var project = new Project { Id = projectId, Name = "Assignment Project", WorkspaceType = WorkspaceType.Git };
+        db.Agents.Add(new Agent { Id = "agy", Name = "Antigravity", RuntimeType = RuntimeType.CliAgy, TrustTier = TrustTier.SeniorManager });
+        db.Personas.AddRange(astra, soren);
+        db.Projects.Add(project);
+        db.ProjectPersonas.AddRange(
+            new ProjectPersona { ProjectId = projectId, PersonaId = "astra" },
+            new ProjectPersona { ProjectId = projectId, PersonaId = "soren" });
+        return (db, project, astra, soren);
+    }
+
+    [Fact]
+    public async Task AssignJobTask_SetsAssigneeAndReturnsServerAuthoritativeJob()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-basic");
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Wire up assignee picker" };
+        var job = MakeAssignmentJob(project.Id, "Assign Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, task.Id, new AssignJobTaskRequest("astra"));
+
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+        var payload = ok.Value.Should().BeOfType<AssignJobTaskResult>().Subject;
+        payload.Task.AssignedPersonaId.Should().Be("astra");
+        payload.ToPersonaName.Should().Be("Astra");
+        payload.FromPersonaId.Should().BeNull();
+        payload.Job.Should().NotBeNull();
+        payload.Job.Tasks.Single().AssignedPersonaId.Should().Be("astra");
+
+        var persisted = ProjectJobsController.ParseTasks((await db.ProjectJobs.FindAsync(job.Id))!.TasksJson);
+        persisted.Single().AssignedPersonaId.Should().Be("astra");
+    }
+
+    [Fact]
+    public async Task AssignJobTask_NormalizesCaseAndAcceptsEmptyStringToUnassign()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-unassign");
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Unassign me", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Unassign Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        var upper = await controller.AssignJobTask(job.Id, task.Id, new AssignJobTaskRequest("  ASTRA "));
+        ((AssignJobTaskResult)upper.Should().BeOfType<OkObjectResult>().Subject.Value!).ToPersonaId.Should().Be("astra");
+
+        var cleared = await controller.AssignJobTask(job.Id, task.Id, new AssignJobTaskRequest(""));
+        var clearedResult = (AssignJobTaskResult)cleared.Should().BeOfType<OkObjectResult>().Subject.Value!;
+        clearedResult.ToPersonaId.Should().BeNull();
+        clearedResult.ToPersonaName.Should().BeNull();
+
+        var persisted = ProjectJobsController.ParseTasks((await db.ProjectJobs.FindAsync(job.Id))!.TasksJson);
+        persisted.Single().AssignedPersonaId.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task AssignJobTask_UnknownPersona_ReturnsBadRequestAndLeavesTaskUntouched()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-unknown");
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Ghost assignee" };
+        var job = MakeAssignmentJob(project.Id, "Unknown Assignee Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, task.Id, new AssignJobTaskRequest("nobody"));
+
+        res.Should().BeOfType<BadRequestObjectResult>();
+
+        var persisted = ProjectJobsController.ParseTasks((await db.ProjectJobs.FindAsync(job.Id))!.TasksJson);
+        persisted.Single().AssignedPersonaId.Should().BeNull();
+        (await db.JobMessages.CountAsync(m => m.JobId == job.Id)).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task AssignJobTask_PersonaNotOnProjectTeam_ReturnsBadRequest()
+    {
+        // Routing only considers team members, so an outsider assignee would be unreachable.
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-noteam");
+        db.Personas.Add(new Persona { Id = "stranger", Name = "Stranger", Role = "Guest", DriverId = "agy" });
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Unreachable assignee" };
+        var job = MakeAssignmentJob(project.Id, "No Team Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, task.Id, new AssignJobTaskRequest("stranger"));
+
+        res.Should().BeOfType<BadRequestObjectResult>();
+        ProjectJobsController.ParseTasks((await db.ProjectJobs.FindAsync(job.Id))!.TasksJson)
+            .Single().AssignedPersonaId.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task AssignJobTask_WhenProjectHasNoTeamDefined_AllowsAnyExistingPersona()
+    {
+        // Mirrors the dashboard, which falls back to listing every persona when a project has
+        // no team yet; refusing to assign there would lock the operator out of a fresh project.
+        var db = TestDbContextFactory.Create();
+        db.Personas.Add(new Persona { Id = "astra", Name = "Astra", Role = "Tech Lead", DriverId = "agy" });
+        var project = new Project { Id = "proj-noteam", Name = "No Team Project", WorkspaceType = WorkspaceType.Git };
+        db.Projects.Add(project);
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Bootstrap task" };
+        var job = MakeAssignmentJob(project.Id, "Bootstrap Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, task.Id, new AssignJobTaskRequest("astra"));
+
+        ((AssignJobTaskResult)res.Should().BeOfType<OkObjectResult>().Subject.Value!).ToPersonaId.Should().Be("astra");
+    }
+
+    [Fact]
+    public async Task AssignJobTask_UnknownTask_ReturnsNotFound()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-badtask");
+        var job = MakeAssignmentJob(project.Id, "No Task Job", new List<JobTaskDto>
+        {
+            new() { Id = Guid.NewGuid(), Title = "Real task" }
+        });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, Guid.NewGuid(), new AssignJobTaskRequest("astra"));
+
+        res.Should().BeOfType<NotFoundObjectResult>();
+    }
+
+    [Fact]
+    public async Task AssignJobTask_ReassigningFocusTaskHandsQueuedTurnsToNewAssigneeAndAudits()
+    {
+        // Astra is at its concurrency limit, so the operator's follow-up is parked in the
+        // job queue. Reassigning the task must move that parked work, otherwise the turn
+        // runs for the persona that no longer owns it.
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-move", astraMaxConcurrentJobs: 1);
+        var focusTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Fix auto-scroll", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Reassign Job", new List<JobTaskDto> { focusTask });
+        var queuedTurn = MakeQueuedTurn(job.Id, project.Id, "astra", "please fix the scroll behaviour");
+        job.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { queuedTurn });
+
+        var otherBusyJob = MakeAssignmentJob(project.Id, "Astra Busy Job", new List<JobTaskDto>());
+        db.ProjectJobs.AddRange(job, otherBusyJob);
+        db.AgentSessions.Add(new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            PersonaId = "astra",
+            DriverId = "agy",
+            Status = "thinking",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new { jobId = otherBusyJob.Id.ToString() })
+        });
+        await db.SaveChangesAsync();
+
+        var mockHubContext = new Mock<IHubContext<AgentMeshHub>>();
+        var mockClients = new Mock<IHubClients>();
+        var mockClientProxy = new Mock<IClientProxy>();
+        mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockClients.Setup(c => c.Group(It.IsAny<string>())).Returns(mockClientProxy.Object);
+        mockHubContext.Setup(h => h.Clients).Returns(mockClients.Object);
+
+        var controller = new ProjectJobsController(db, mockHubContext.Object);
+        var res = await controller.AssignJobTask(job.Id, focusTask.Id, new AssignJobTaskRequest("soren"));
+        var result = (AssignJobTaskResult)res.Should().BeOfType<OkObjectResult>().Subject.Value!;
+
+        result.ToPersonaId.Should().Be("soren");
+        result.FromPersonaId.Should().Be("astra");
+        result.IsTargetTask.Should().BeTrue();
+        result.MovedQueuedTurnCount.Should().Be(1);
+        result.FromPersonaName.Should().Be("Astra");
+        result.ToPersonaName.Should().Be("Soren");
+
+        var audit = await db.JobMessages.Where(m => m.JobId == job.Id && m.SenderType == "system").ToListAsync();
+        audit.Should().HaveCount(1);
+        audit[0].Content.Should().Contain("Fix auto-scroll");
+        audit[0].Content.Should().Contain("@Astra");
+        audit[0].Content.Should().Contain("@Soren");
+        audit[0].Content.Should().Contain("1 queued turn");
+
+        // Soren has a free slot, so the handed-over turn runs for the new assignee at once.
+        // Without this the turn would only drain when some *other* Soren session finished —
+        // and an idle Soren has none, so the work would strand in the queue permanently.
+        var persistedTurns = ProjectJobsController.ParseQueuedTurns((await db.ProjectJobs.FindAsync(job.Id))!.QueuedTurnsJson);
+        persistedTurns.Should().BeEmpty();
+
+        var sorenSession = await db.AgentSessions.SingleAsync(s => s.PersonaId == "soren");
+        sorenSession.Status.Should().Be("thinking");
+        var sorenPrompt = await db.SessionMessages.SingleAsync(m => m.SessionId == sorenSession.Id && m.EventType == "prompt");
+        sorenPrompt.Content.Should().Contain("please fix the scroll behaviour");
+        sorenPrompt.Content.Should().Contain("[Current Target Task]: \"Fix auto-scroll\"");
+
+        var sorenAck = await db.JobMessages.SingleAsync(m => m.JobId == job.Id && m.SenderId == "soren");
+        sorenAck.Content.Should().Be("I'm on it — starting work on \"Fix auto-scroll\" now.");
+
+        // Astra must not be offered the work it just lost.
+        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, mockHubContext.Object, "astra");
+        await db.Entry(sorenSession).ReloadAsync();
+        sorenSession.Status.Should().Be("thinking");
+        (await db.AgentSessions.CountAsync(s => s.PersonaId == "astra" && s.Status == "thinking")).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task AssignJobTask_WhenNewAssigneeIsAlsoBusy_HandedOverTurnStaysQueuedForThem()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-bothbusy", astraMaxConcurrentJobs: 1, sorenMaxConcurrentJobs: 1);
+        var focusTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Handover while busy", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Both Busy Job", new List<JobTaskDto> { focusTask });
+        var queuedTurn = MakeQueuedTurn(job.Id, project.Id, "astra", "queued work for the focus task");
+        job.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { queuedTurn });
+
+        var astraBusyJob = MakeAssignmentJob(project.Id, "Astra Busy Job", new List<JobTaskDto>());
+        var sorenBusyJob = MakeAssignmentJob(project.Id, "Soren Busy Job", new List<JobTaskDto>());
+        db.ProjectJobs.AddRange(job, astraBusyJob, sorenBusyJob);
+        db.AgentSessions.AddRange(
+            new AgentSession
+            {
+                Id = Guid.NewGuid(), PersonaId = "astra", DriverId = "agy", Status = "thinking",
+                MetadataJson = System.Text.Json.JsonSerializer.Serialize(new { jobId = astraBusyJob.Id.ToString() })
+            },
+            new AgentSession
+            {
+                Id = Guid.NewGuid(), PersonaId = "soren", DriverId = "agy", Status = "thinking",
+                MetadataJson = System.Text.Json.JsonSerializer.Serialize(new { jobId = sorenBusyJob.Id.ToString() })
+            });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, focusTask.Id, new AssignJobTaskRequest("soren"));
+        var result = (AssignJobTaskResult)res.Should().BeOfType<OkObjectResult>().Subject.Value!;
+
+        result.MovedQueuedTurnCount.Should().Be(1);
+        result.DispatchedToNewAssignee.Should().BeFalse();
+
+        var persistedTurns = ProjectJobsController.ParseQueuedTurns((await db.ProjectJobs.FindAsync(job.Id))!.QueuedTurnsJson);
+        persistedTurns.Should().ContainSingle(t => t.TargetPersonaId == "soren");
+        (await db.AgentSessions.CountAsync(s => s.PersonaId == "soren")).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task AssignJobTask_TakeQueuedTurnsFalse_LeavesPreviousAssigneesQueueInPlace()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-keep");
+        var focusTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Keep the queue", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Keep Queue Job", new List<JobTaskDto> { focusTask });
+        var queuedTurn = MakeQueuedTurn(job.Id, project.Id, "astra", "queued for astra");
+        job.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { queuedTurn });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, focusTask.Id, new AssignJobTaskRequest("soren", TakeQueuedTurns: false));
+        var result = (AssignJobTaskResult)res.Should().BeOfType<OkObjectResult>().Subject.Value!;
+
+        result.ToPersonaId.Should().Be("soren");
+        result.MovedQueuedTurnCount.Should().Be(0);
+        ProjectJobsController.ParseQueuedTurns((await db.ProjectJobs.FindAsync(job.Id))!.QueuedTurnsJson)
+            .Should().ContainSingle(t => t.TargetPersonaId == "astra");
+        (await db.JobMessages.CountAsync(m => m.JobId == job.Id && m.SenderType == "system")).Should().Be(0);
+        (await db.AgentSessions.CountAsync(s => s.PersonaId == "soren")).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task AssignJobTask_ReassigningANonFocusTaskDoesNotStealTheFocusOwnersQueuedTurns()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-nonfocus");
+        var focusTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Focus task", AssignedPersonaId = "astra" };
+        var laterTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Later task", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Non Focus Job", new List<JobTaskDto> { focusTask, laterTask });
+        var queuedTurn = MakeQueuedTurn(job.Id, project.Id, "astra", "work on the focus task");
+        job.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { queuedTurn });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, laterTask.Id, new AssignJobTaskRequest("soren"));
+        var result = (AssignJobTaskResult)res.Should().BeOfType<OkObjectResult>().Subject.Value!;
+
+        result.IsTargetTask.Should().BeFalse();
+        result.MovedQueuedTurnCount.Should().Be(0);
+        ProjectJobsController.ParseQueuedTurns((await db.ProjectJobs.FindAsync(job.Id))!.QueuedTurnsJson)
+            .Should().ContainSingle(t => t.TargetPersonaId == "astra");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WithoutMention_RoutesToAssigneeOfTargetTask()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-route");
+        project.DefaultLeadPersonaId = "soren";
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Assigned to astra", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Routing Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.PostJobMessage(job.Id, new PostJobMessageRequest(Content: "get this done please"));
+        res.Should().BeOfType<OkObjectResult>();
+
+        var turnSession = await db.AgentSessions.SingleAsync(s => s.Status == "thinking");
+        turnSession.PersonaId.Should().Be("astra");
+        var ack = await db.JobMessages.SingleAsync(m => m.SenderType == "persona");
+        ack.SenderId.Should().Be("astra");
+        ack.Content.Should().Be("I'm on it — starting work on \"Assigned to astra\" now.");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_ExplicitMentionStillWinsOverTaskAssignee()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-mention");
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Assigned to astra", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Mention Wins Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(Content: "@soren can you take this one instead?"));
+
+        (await db.AgentSessions.SingleAsync(s => s.Status == "thinking")).PersonaId.Should().Be("soren");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_NamesTheTaskTheMentionedPersonaActuallyOwns()
+    {
+        // Two people own different tasks in one job. The ack must name the responder's own
+        // task, not the first pending row in the list — that mismatch is what made the
+        // operator see "starting work on X" while the agent was doing Y.
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-target");
+        var astraTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Astra review task", AssignedPersonaId = "astra" };
+        var sorenTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Soren implementation task", AssignedPersonaId = "soren" };
+        var job = MakeAssignmentJob(project.Id, "Split Targets Job", new List<JobTaskDto> { astraTask, sorenTask });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(Content: "@soren start on yours"));
+
+        var ack = await db.JobMessages.SingleAsync(m => m.SenderType == "persona");
+        ack.SenderId.Should().Be("soren");
+        ack.Content.Should().Be("I'm on it — starting work on \"Soren implementation task\" now.");
+
+        var prompt = await db.SessionMessages.SingleAsync(m => m.EventType == "prompt");
+        prompt.Content.Should().Contain("[Current Target Task]: \"Soren implementation task\"");
+        prompt.Content.Should().Contain("[ ] (CURRENT ACTIVE FOCUS) Soren implementation task");
+        prompt.Content.Should().Contain("[ ] (Queued) Astra review task [Assigned: @Astra]");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_DoesNotClaimAnUnownedTaskWhenEveryPendingTaskBelongsToSomeoneElse()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-noclaim");
+        var astraTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Astra only task", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "No Claim Job", new List<JobTaskDto> { astraTask });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(Content: "@soren quick question before you start"));
+
+        var ack = await db.JobMessages.SingleAsync(m => m.SenderType == "persona");
+        ack.SenderId.Should().Be("soren");
+        ack.Content.Should().NotContain("Astra only task");
+        ack.Content.Should().Be("I'm on it — looking at this now.");
+    }
+
+    [Fact]
+    public async Task PromptContext_NamesTheAssigneeAndTellsUnassignedPersonasNotToStart()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-warn");
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Locked to astra", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Warn Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(Content: "@soren are you able to look at this?"));
+
+        var prompt = await db.SessionMessages.SingleAsync(m => m.EventType == "prompt");
+        prompt.Content.Should().Contain("[Assigned: @Astra]");
+        prompt.Content.Should().Contain("[Task Ownership Rule]");
+        prompt.Content.Should().Contain("assigned to other team members (@Astra)");
+    }
+
+    [Fact]
+    public async Task PromptContext_LeavesChecklistUnchangedWhenNothingIsAssigned()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-plain");
+        var job = MakeAssignmentJob(project.Id, "Plain Job", new List<JobTaskDto>
+        {
+            new() { Id = Guid.NewGuid(), Title = "Unassigned task" }
+        });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(Content: "@astra go"));
+
+        var prompt = await db.SessionMessages.SingleAsync(m => m.EventType == "prompt");
+        prompt.Content.Should().Contain("[ ] (CURRENT ACTIVE FOCUS) Unassigned task");
+        prompt.Content.Should().NotContain("[Assigned:");
+        prompt.Content.Should().NotContain("[Task Ownership Rule]");
     }
 }

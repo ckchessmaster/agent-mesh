@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
@@ -68,12 +68,30 @@ public record CreateJobTaskRequest(
     List<JobAttachmentDto>? Attachments = null
 );
 
+// AssignedPersonaId is deliberately absent: assignment is a routing change with queue
+// side effects, so it goes through AssignJobTask instead of the generic field update.
 public record UpdateJobTaskRequest(
     string? Title = null,
     bool? IsCompleted = null,
-    string? AssignedPersonaId = null,
     bool? RequiresDiscussion = null,
     List<JobAttachmentDto>? Attachments = null
+);
+
+public record AssignJobTaskRequest(
+    string? PersonaId,
+    bool? TakeQueuedTurns = true
+);
+
+public record AssignJobTaskResult(
+    JobTaskDto Task,
+    string? FromPersonaId,
+    string? ToPersonaId,
+    string? FromPersonaName,
+    string? ToPersonaName,
+    bool IsTargetTask,
+    int MovedQueuedTurnCount,
+    bool DispatchedToNewAssignee,
+    ProjectJobDto Job
 );
 
 public record PostJobMessageRequest(
@@ -364,10 +382,6 @@ public class ProjectJobsController(
             task.IsCompleted = req.IsCompleted.Value;
             task.CompletedAt = req.IsCompleted.Value ? DateTimeOffset.UtcNow : null;
         }
-        if (req.AssignedPersonaId != null)
-        {
-            task.AssignedPersonaId = req.AssignedPersonaId.Trim().ToLowerInvariant();
-        }
         if (req.RequiresDiscussion.HasValue)
         {
             task.RequiresDiscussion = req.RequiresDiscussion.Value;
@@ -387,6 +401,156 @@ public class ProjectJobsController(
         }
 
         return Ok(task);
+    }
+
+    /// <summary>
+    /// Assigns or reassigns a task, and hands the queued work that belonged to the outgoing
+    /// assignee over to the new one.
+    ///
+    /// Assignment is not just a label: queued turns are keyed by target persona, so moving a
+    /// task without moving its parked turns leaves the previous assignee running work it no
+    /// longer owns — which is exactly the "someone else grabbed my task" complaint. The move
+    /// is scoped to the task that was the outgoing assignee's focus, so reassigning a later
+    /// task cannot steal the turns parked for the one still in progress.
+    /// </summary>
+    [HttpPut("api/project-jobs/{id}/tasks/{taskId}/assignee")]
+    public async Task<IActionResult> AssignJobTask(Guid id, Guid taskId, [FromBody] AssignJobTaskRequest req)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        // Empty/null payload means "unassign"; anything else must name a persona that exists,
+        // otherwise routing would silently fall back to the project lead later on.
+        var toPersonaId = string.IsNullOrWhiteSpace(req.PersonaId) ? null : req.PersonaId.Trim().ToLowerInvariant();
+        Persona? toPersona = null;
+        if (toPersonaId != null)
+        {
+            toPersona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == toPersonaId);
+            if (toPersona == null)
+            {
+                return BadRequest(new { error = $"Persona '{req.PersonaId}' not found. Assign to a persona that exists, or clear the assignee." });
+            }
+
+            // Turn routing only considers personas on the project team, so assigning an
+            // outsider would leave the task labelled with someone who can never be reached.
+            // Projects with no team defined yet fall back to every persona, matching the
+            // dashboard's own team list.
+            var teamIds = await db.ProjectPersonas
+                .AsNoTracking()
+                .Where(pp => pp.ProjectId == job.ProjectId)
+                .Select(pp => pp.PersonaId)
+                .ToListAsync();
+            if (teamIds.Count > 0 && !teamIds.Contains(toPersonaId))
+            {
+                return BadRequest(new { error = $"Persona '{toPersona.Name}' is not on the team for project '{job.ProjectId}'. Add them to the project first, or pick an existing team member." });
+            }
+        }
+
+        var tasks = ParseTasks(job.TasksJson);
+        var task = tasks.FirstOrDefault(t => t.Id == taskId);
+        if (task == null)
+        {
+            return NotFound(new { error = $"Task '{taskId}' not found." });
+        }
+
+        var fromPersonaId = string.IsNullOrWhiteSpace(task.AssignedPersonaId)
+            ? null
+            : task.AssignedPersonaId.Trim().ToLowerInvariant();
+
+        // Evaluated before the change: was this the outgoing assignee's focus task?
+        var wasFocusTask = fromPersonaId != null && ResolveTargetTask(tasks, fromPersonaId)?.Id == task.Id;
+
+        task.AssignedPersonaId = toPersonaId;
+
+        var movedTurnCount = 0;
+        var takeQueuedTurns = req.TakeQueuedTurns ?? true;
+        List<Guid> movedTurnIds = new();
+        if (takeQueuedTurns && wasFocusTask && toPersonaId != null && fromPersonaId != null)
+        {
+            var queuedTurns = ParseQueuedTurns(job.QueuedTurnsJson);
+            var parked = queuedTurns
+                .Where(t => string.Equals(t.TargetPersonaId, fromPersonaId, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (parked.Count > 0)
+            {
+                movedTurnIds = parked.Select(t => t.Id).ToList();
+                queuedTurns = queuedTurns
+                    .Select(t => movedTurnIds.Contains(t.Id) ? t with { TargetPersonaId = toPersonaId } : t)
+                    .ToList();
+                job.QueuedTurnsJson = JsonSerializer.Serialize(queuedTurns, JsonOpts);
+                movedTurnCount = parked.Count;
+            }
+        }
+
+        job.TasksJson = JsonSerializer.Serialize(tasks, JsonOpts);
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+
+        JobMessage? auditMsg = null;
+        var fromPersonaName = fromPersonaId == null ? null : await ResolvePersonaNameAsync(fromPersonaId);
+        var toPersonaName = toPersonaId == null ? null : (toPersona?.Name ?? toPersonaId);
+        if (movedTurnCount > 0)
+        {
+            auditMsg = new JobMessage
+            {
+                Id = Guid.NewGuid(),
+                JobId = id,
+                SenderType = "system",
+                SenderId = "operator",
+                SenderName = "System",
+                Content = $"Task \"{task.Title}\" reassigned from @{fromPersonaName} to @{toPersonaName} — moved {movedTurnCount} queued turn{(movedTurnCount == 1 ? "" : "s")} to @{toPersonaName}.",
+                MentionsJson = JsonSerializer.Serialize(new List<string> { fromPersonaId!, toPersonaId! }, JsonOpts),
+                TurnSessionId = null,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+            db.JobMessages.Add(auditMsg);
+        }
+
+        await db.SaveChangesAsync();
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = id, tasks });
+            if (auditMsg != null)
+            {
+                await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(auditMsg));
+            }
+        }
+
+        // The new assignee may be idle with nothing else to wake them, so the handed-over
+        // turn would otherwise sit in the queue until some unrelated session finished.
+        var dispatched = false;
+        if (movedTurnCount > 0 && toPersonaId != null)
+        {
+            await CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, toPersonaId);
+            // Checked by turn id, not "queue is empty": another teammate may still have work
+            // parked on this job, which would make an empty-queue check report a failure to
+            // hand over that actually succeeded.
+            var stillParked = ParseQueuedTurns(job.QueuedTurnsJson);
+            dispatched = movedTurnIds.All(turnId => stillParked.All(t => t.Id != turnId));
+        }
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(new AssignJobTaskResult(
+            Task: task,
+            FromPersonaId: fromPersonaId,
+            ToPersonaId: toPersonaId,
+            FromPersonaName: fromPersonaName,
+            ToPersonaName: toPersonaName,
+            IsTargetTask: wasFocusTask,
+            MovedQueuedTurnCount: movedTurnCount,
+            DispatchedToNewAssignee: dispatched,
+            Job: dto));
     }
 
     [HttpDelete("api/project-jobs/{id}/tasks/{taskId}")]
@@ -781,6 +945,22 @@ public class ProjectJobsController(
         // Check if an assigned persona was mentioned
         string? targetPersonaId = mentions.FirstOrDefault(m => assignedPersonaIds.Contains(m));
 
+        // No mention: whoever owns the next pending task is the one expected to act, so an
+        // unaddressed follow-up lands with them instead of defaulting to the lead every time.
+        if (targetPersonaId == null && req.SenderType == "user")
+        {
+            var nextPendingTask = ParseTasks(job.TasksJson).FirstOrDefault(t => !t.IsCompleted);
+            var assigneeId = nextPendingTask?.AssignedPersonaId?.Trim().ToLowerInvariant();
+            if (assigneeId != null && assignedPersonaIds.Contains(assigneeId))
+            {
+                targetPersonaId = assigneeId;
+                if (!mentions.Contains(targetPersonaId))
+                {
+                    mentions.Add(targetPersonaId);
+                }
+            }
+        }
+
         // If no explicit mention and message comes from user, fall back to DefaultLeadPersonaId if assigned
         if (targetPersonaId == null && req.SenderType == "user" && !string.IsNullOrWhiteSpace(project.DefaultLeadPersonaId))
         {
@@ -921,7 +1101,10 @@ public class ProjectJobsController(
                 var turnSessionId = Guid.NewGuid();
 
                 var tasks = ParseTasks(job.TasksJson);
-                var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+                var assigneeNames = await ResolveAssigneeNamesAsync(db, tasks);
+                // Per-assignee: naming the first pending row regardless of who owns it is how
+                // the ack ended up advertising work this persona was never going to do.
+                var activeTask = ResolveTargetTask(tasks, persona.Id);
 
                 // Combine message attachments with active task attachments so the agent gets both
                 var combinedAttachments = new List<JobAttachmentDto>();
@@ -1008,7 +1191,7 @@ public class ProjectJobsController(
                 db.AgentSessions.Add(turnSession);
                 jobMsg.TurnSessionId = turnSession.Id;
 
-                var taskContext = FormatTaskContext(tasks);
+                var taskContext = FormatTaskContext(tasks, persona.Id, assigneeNames);
 
                 // Format prompt context for runner
                 var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
@@ -1072,11 +1255,7 @@ public class ProjectJobsController(
 
                 if (req.SenderType == "user")
                 {
-                    var ackContent = activeTask != null
-                        ? (activeTask.RequiresDiscussion
-                            ? $"I'm on it — starting discussion on \"{activeTask.Title}\" before coding."
-                            : $"I'm on it — starting work on \"{activeTask.Title}\" now.")
-                        : "I'm on it — starting work on this now.";
+                    var ackContent = BuildAckContent(tasks, activeTask);
 
                     ackMsg = new JobMessage
                     {
@@ -1331,7 +1510,7 @@ public class ProjectJobsController(
         return Ok(new { message = $"Cancelled {turnsToRemove.Count} queued turn(s).", count = turnsToRemove.Count, job = dto });
     }
 
-    private static List<JobTaskDto> ParseTasks(string tasksJson)
+    public static List<JobTaskDto> ParseTasks(string tasksJson)
     {
         if (string.IsNullOrWhiteSpace(tasksJson)) return new();
         try
@@ -1344,11 +1523,38 @@ public class ProjectJobsController(
         }
     }
 
-    private static string FormatTaskContext(List<JobTaskDto> tasks)
+    /// <summary>
+    /// Resolves the task a persona should treat as its current focus.
+    ///
+    /// Order of preference: the first pending task assigned to them, then the first pending
+    /// task nobody owns (still up for grabs, which is the "tell an agent to grab it" flow),
+    /// then null. Returning null rather than "the first pending task whatever its assignee"
+    /// is what stops a persona from announcing that it is starting someone else's work.
+    /// </summary>
+    public static JobTaskDto? ResolveTargetTask(List<JobTaskDto> tasks, string? personaId)
+    {
+        var pending = tasks.Where(t => !t.IsCompleted).ToList();
+        if (pending.Count == 0) return null;
+
+        var norm = string.IsNullOrWhiteSpace(personaId) ? null : personaId.Trim().ToLowerInvariant();
+        if (norm == null) return pending[0];
+
+        var mine = pending.FirstOrDefault(t => string.Equals(t.AssignedPersonaId?.Trim(), norm, StringComparison.OrdinalIgnoreCase));
+        if (mine != null) return mine;
+
+        return pending.FirstOrDefault(t => string.IsNullOrWhiteSpace(t.AssignedPersonaId));
+    }
+
+    /// <summary>
+    /// Renders the sequential checklist for a specific persona. Tasks owned by somebody else
+    /// are labelled with their assignee and an ownership rule is appended, so a persona that
+    /// is looped in on a job it does not own does not start work that belongs to a teammate.
+    /// </summary>
+    private static string FormatTaskContext(List<JobTaskDto> tasks, string? personaId, IReadOnlyDictionary<string, string>? personaNamesById = null)
     {
         if (tasks.Count == 0) return string.Empty;
 
-        var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+        var activeTask = ResolveTargetTask(tasks, personaId);
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("[Job Tasks & Sequential Checklist]:");
         for (int i = 0; i < tasks.Count; i++)
@@ -1371,11 +1577,16 @@ public class ProjectJobsController(
                     ? "[ ] (Queued - Discuss First)"
                     : "[ ] (Queued)";
             }
+
+            var ownerTag = string.IsNullOrWhiteSpace(t.AssignedPersonaId)
+                ? ""
+                : $" [Assigned: @{ResolvePersonaDisplayName(t.AssignedPersonaId, personaNamesById)}]";
             var attachInfo = (t.Attachments != null && t.Attachments.Count > 0)
                 ? $" (Attachments: {string.Join(", ", t.Attachments.Select(a => a.FileName))})"
                 : "";
-            sb.AppendLine($"{i + 1}. {statusTag} {t.Title}{attachInfo}");
+            sb.AppendLine($"{i + 1}. {statusTag} {t.Title}{ownerTag}{attachInfo}");
         }
+
         if (activeTask != null)
         {
             sb.AppendLine($"[Current Target Task]: \"{activeTask.Title}\"");
@@ -1389,8 +1600,93 @@ public class ProjectJobsController(
                 sb.AppendLine("[Discussion Required Rule]: This task is flagged for discussion before starting coding. Do NOT write or edit code yet. Discuss requirements, clarify questions, evaluate design/architecture trade-offs, or conduct an alignment interview with the user. When you and the user have reached alignment and you are ready to begin implementation, conclude your response by including the tag [READY_TO_PROCEED] so the user can review and approve proceeding to code.");
             }
         }
+        else
+        {
+            var ownedElsewhere = tasks.Any(t => !t.IsCompleted && !string.IsNullOrWhiteSpace(t.AssignedPersonaId));
+            if (ownedElsewhere)
+            {
+                sb.AppendLine("[Current Target Task]: none assigned to you - every pending task in this job belongs to another team member.");
+            }
+        }
+
+        var otherOwned = tasks
+            .Where(t => !t.IsCompleted
+                        && !string.IsNullOrWhiteSpace(t.AssignedPersonaId)
+                        && !string.Equals(t.AssignedPersonaId.Trim(), personaId?.Trim() ?? string.Empty, StringComparison.OrdinalIgnoreCase))
+            .Select(t => ResolvePersonaDisplayName(t.AssignedPersonaId!, personaNamesById))
+            .Distinct()
+            .ToList();
+        if (otherOwned.Count > 0)
+        {
+            var ownedList = string.Join(", ", otherOwned.Select(n => "@" + n));
+            sb.AppendLine($"[Task Ownership Rule]: These pending tasks are assigned to other team members ({ownedList}). Do NOT start or claim them; if the user asks you to, ask them to reassign the task first. Only work on tasks assigned to you or tasks with no assignee.");
+        }
         sb.AppendLine();
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Acknowledgement text shown the moment a turn starts.
+    ///
+    /// Three cases, because the old single string lied in one of them: with a task list the
+    /// ack named the *first pending row* even when that row belonged to a teammate, so the
+    /// operator read "starting work on X" while the agent was doing Y. Naming only the task
+    /// this persona actually owns keeps the ack truthful; a job with no task list at all
+    /// still gets the generic phrasing, since there is nothing specific to name.
+    /// </summary>
+    private static string BuildAckContent(List<JobTaskDto> tasks, JobTaskDto? activeTask)
+    {
+        if (activeTask != null)
+        {
+            return activeTask.RequiresDiscussion
+                ? $"I'm on it — starting discussion on \"{activeTask.Title}\" before coding."
+                : $"I'm on it — starting work on \"{activeTask.Title}\" now.";
+        }
+
+        var pendingOwnedByOthers = tasks.Any(t => !t.IsCompleted && !string.IsNullOrWhiteSpace(t.AssignedPersonaId));
+        if (pendingOwnedByOthers)
+        {
+            return "I'm on it — looking at this now.";
+        }
+
+        return "I'm on it — starting work on this now.";
+    }
+
+    private static string ResolvePersonaDisplayName(string personaId, IReadOnlyDictionary<string, string>? personaNamesById)
+    {
+        var norm = personaId.Trim().ToLowerInvariant();
+        if (personaNamesById != null && personaNamesById.TryGetValue(norm, out var name) && !string.IsNullOrWhiteSpace(name))
+        {
+            return name;
+        }
+        return personaId;
+    }
+
+    private async Task<string> ResolvePersonaNameAsync(string personaId)
+    {
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == personaId);
+        return persona?.Name ?? personaId;
+    }
+
+    /// <summary>
+    /// Display names for every assignee referenced by the task list, so the prompt checklist
+    /// can say "@Astra" instead of an id the model has to guess at.
+    /// </summary>
+    // Static because the queued-turn dispatcher is static and shares this helper; it takes
+    // the context rather than closing over the controller's.
+    private static async Task<IReadOnlyDictionary<string, string>> ResolveAssigneeNamesAsync(
+        AgentMeshDbContext db, List<JobTaskDto> tasks)
+    {
+        var ids = tasks
+            .Where(t => !string.IsNullOrWhiteSpace(t.AssignedPersonaId))
+            .Select(t => t.AssignedPersonaId!.Trim().ToLowerInvariant())
+            .Distinct()
+            .ToList();
+        if (ids.Count == 0) return new Dictionary<string, string>();
+
+        return await db.Personas.AsNoTracking()
+            .Where(p => ids.Contains(p.Id))
+            .ToDictionaryAsync(p => p.Id, p => p.Name);
     }
 
     public static List<QueuedJobTurnDto> ParseQueuedTurns(string? json)
@@ -1584,7 +1880,8 @@ public class ProjectJobsController(
             var turnSessionId = Guid.NewGuid();
 
             var tasks = ParseTasks(job.TasksJson);
-            var activeTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+            var assigneeNames = await ResolveAssigneeNamesAsync(db, tasks);
+            var activeTask = ResolveTargetTask(tasks, persona.Id);
 
             // Combine queued turn attachments with active task attachments so the agent gets both
             var combinedAttachments = new List<JobAttachmentDto>();
@@ -1663,7 +1960,7 @@ public class ProjectJobsController(
             };
             db.AgentSessions.Add(turnSession);
 
-            var taskContext = FormatTaskContext(tasks);
+            var taskContext = FormatTaskContext(tasks, persona.Id, assigneeNames);
 
             var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
                                     (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
@@ -1693,11 +1990,7 @@ public class ProjectJobsController(
                 driver.LastHeartbeatAt = DateTimeOffset.UtcNow;
             }
 
-            var ackContent = activeTask != null
-                ? (activeTask.RequiresDiscussion
-                    ? $"I'm on it — starting discussion on \"{activeTask.Title}\" before coding."
-                    : $"I'm on it — starting work on \"{activeTask.Title}\" now.")
-                : "I'm on it — starting work on this now.";
+            var ackContent = BuildAckContent(tasks, activeTask);
 
             var ackMsg = new JobMessage
             {
