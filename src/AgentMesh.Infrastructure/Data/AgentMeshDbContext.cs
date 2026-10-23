@@ -1,4 +1,4 @@
-using AgentMesh.Core.Models;
+﻿using AgentMesh.Core.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace AgentMesh.Infrastructure.Data;
@@ -15,6 +15,8 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     public DbSet<ProjectPersona> ProjectPersonas => Set<ProjectPersona>();
     public DbSet<ProjectJob> ProjectJobs => Set<ProjectJob>();
     public DbSet<JobMessage> JobMessages => Set<JobMessage>();
+    public DbSet<JobWorkspaceState> JobWorkspaceStates => Set<JobWorkspaceState>();
+    public DbSet<JobHandoff> JobHandoffs => Set<JobHandoff>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {

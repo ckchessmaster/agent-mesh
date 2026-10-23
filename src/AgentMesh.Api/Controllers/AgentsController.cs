@@ -1,12 +1,14 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Claims;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using AgentMesh.Api.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -96,7 +98,13 @@ public class AgentsController(
             if (!string.IsNullOrWhiteSpace(req.Role)) existing.Role = req.Role.Trim();
             if (!string.IsNullOrWhiteSpace(req.Status)) existing.Status = req.Status.Trim().ToLowerInvariant();
             if (!string.IsNullOrWhiteSpace(req.PersonaPrompt)) existing.PersonaPrompt = req.PersonaPrompt;
-            if (!string.IsNullOrWhiteSpace(req.CapabilitiesJson)) existing.CapabilitiesJson = req.CapabilitiesJson;
+            // Patch, never replace: callers only know the fields they render, and a rebuilt blob
+            // used to erase whatever the other caller had written.
+            if (!string.IsNullOrWhiteSpace(req.CapabilitiesJson))
+            {
+                existing.CapabilitiesJson = DriverCapabilities.Merge(existing.CapabilitiesJson, req.CapabilitiesJson)
+                    ?? existing.CapabilitiesJson;
+            }
             existing.LastHeartbeatAt = DateTimeOffset.UtcNow;
             existing.UpdatedAt = DateTimeOffset.UtcNow;
 
@@ -193,6 +201,79 @@ public class AgentsController(
         var sessionCount = await db.AgentSessions.CountAsync(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId);
         var personas = await GetDriverPersonasSummaryAsync(normalizedId);
         return Ok(ToDto(agent, sessionCount, personas));
+    }
+
+    /// <summary>
+    /// Reads a driver's runtime configuration out of its capability blob, without the API key.
+    /// </summary>
+    [HttpGet("{id}/config")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetDriverConfig(string id)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        return Ok(DriverCapabilities.Parse(agent.CapabilitiesJson));
+    }
+
+    /// <summary>
+    /// Updates a driver's runtime configuration. Sends only the fields being changed; the blob is
+    /// merged, so unset fields keep their stored values.
+    /// </summary>
+    [HttpPut("{id}/config")]
+    public async Task<IActionResult> UpdateDriverConfig(string id, [FromBody] UpdateDriverConfigRequest req)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        var patch = new JsonObject();
+        if (req.Endpoint is not null) patch["endpoint"] = req.Endpoint;
+        if (req.DefaultModel is not null) patch["defaultModel"] = req.DefaultModel;
+        if (req.TimeoutSeconds is not null) patch["timeoutSeconds"] = req.TimeoutSeconds;
+        if (req.MaxRetries is not null) patch["maxRetries"] = req.MaxRetries;
+        if (req.RetryDelayMilliseconds is not null) patch["retryDelayMilliseconds"] = req.RetryDelayMilliseconds;
+        if (req.MaxSteps is not null) patch["maxSteps"] = req.MaxSteps;
+        if (req.Capabilities is not null)
+        {
+            var caps = new JsonArray();
+            foreach (var cap in req.Capabilities) caps.Add(JsonValue.Create(cap));
+            patch["capabilities"] = caps;
+        }
+
+        // The key is write-only from the dashboard's point of view: an empty/absent value means
+        // "leave what's stored", never "erase". Clearing it requires the CLI's local config.
+        if (!string.IsNullOrWhiteSpace(req.ApiKey)) patch["apiKey"] = req.ApiKey;
+
+        if (req.Adapter is not null) patch["adapter"] = req.Adapter;
+
+        if (patch.Count == 0)
+        {
+            return Ok(DriverCapabilities.Parse(agent.CapabilitiesJson));
+        }
+
+        agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+            ?? agent.CapabilitiesJson;
+        agent.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var sessionCount = await db.AgentSessions.CountAsync(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId);
+        var personas = await GetDriverPersonasSummaryAsync(normalizedId);
+        var dto = ToDto(agent, sessionCount, personas);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("AgentUpdated", dto);
+        }
+
+        return Ok(DriverCapabilities.Parse(agent.CapabilitiesJson));
     }
 
     [HttpGet("{id}/personas")]
@@ -698,7 +779,8 @@ public class AgentsController(
         a.CapabilitiesJson,
         a.LastHeartbeatAt,
         sessionCount,
-        personas ?? new List<DriverPersonaSummaryDto>()
+        personas ?? new List<DriverPersonaSummaryDto>(),
+        DriverCapabilities.Parse(a.CapabilitiesJson)
     );
 }
 
@@ -719,6 +801,22 @@ public record RegisterAgentRequest(
     string? Role = null,
     string? Status = null,
     string? CapabilitiesJson = null
+);
+
+/// <summary>
+/// Patch-style driver config update. Null fields are left untouched; a blank ApiKey means
+/// "keep the stored one" rather than "clear it".
+/// </summary>
+public record UpdateDriverConfigRequest(
+    string? Adapter = null,
+    string? Endpoint = null,
+    string? ApiKey = null,
+    string? DefaultModel = null,
+    int? TimeoutSeconds = null,
+    int? MaxRetries = null,
+    int? RetryDelayMilliseconds = null,
+    int? MaxSteps = null,
+    List<string>? Capabilities = null
 );
 
 public record CreateAgentSessionRequest(
@@ -747,7 +845,9 @@ public record AgentDto(
     string CapabilitiesJson = "[]",
     DateTimeOffset? LastHeartbeatAt = null,
     int SessionCount = 0,
-    List<DriverPersonaSummaryDto>? Personas = null
+    List<DriverPersonaSummaryDto>? Personas = null,
+    /// <summary>Parsed runtime limits. Safe to render: never contains the API key.</summary>
+    DriverCapabilitiesView? Config = null
 );
 
 public record QuotaBucketDto(

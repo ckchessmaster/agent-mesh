@@ -284,6 +284,106 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.ToTable("agent_sessions", (string)null);
                 });
 
+            modelBuilder.Entity("AgentMesh.Core.Models.JobHandoff", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("completed_at");
+
+                    b.Property<DateTimeOffset>("DeclaredAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("declared_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("Error")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasColumnName("error");
+
+                    b.Property<string>("ExpectedHeadCommit")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("expected_head_commit");
+
+                    b.Property<string>("FromPersonaId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("from_persona_id");
+
+                    b.Property<Guid?>("FromTurnSessionId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("from_turn_session_id");
+
+                    b.Property<string>("HandoffNote")
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)")
+                        .HasColumnName("handoff_note");
+
+                    b.Property<Guid>("JobId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("job_id");
+
+                    b.Property<string>("ProjectId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("project_id");
+
+                    b.Property<DateTimeOffset>("ReleaseDeadlineAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("release_deadline_at");
+
+                    b.Property<int?>("ReleaseReason")
+                        .HasColumnType("integer")
+                        .HasColumnName("release_reason");
+
+                    b.Property<DateTimeOffset?>("ReleasedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("released_at");
+
+                    b.Property<int>("Status")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(0)
+                        .HasColumnName("status");
+
+                    b.Property<string>("ToPersonaId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("to_persona_id");
+
+                    b.Property<Guid?>("ToTurnSessionId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("to_turn_session_id");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.HasKey("Id")
+                        .HasName("pk_job_handoffs");
+
+                    b.HasIndex("JobId")
+                        .IsUnique()
+                        .HasDatabaseName("ux_job_handoffs_open_per_job")
+                        .HasFilter("status IN (0, 1, 2)");
+
+                    b.HasIndex("Status", "ReleaseDeadlineAt")
+                        .HasDatabaseName("ix_job_handoffs_status_deadline");
+
+                    b.ToTable("job_handoffs", (string)null);
+                });
+
             modelBuilder.Entity("AgentMesh.Core.Models.JobMessage", b =>
                 {
                     b.Property<Guid>("Id")
@@ -349,6 +449,100 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDatabaseName("ix_job_messages_turn_session_id");
 
                     b.ToTable("job_messages", (string)null);
+                });
+
+            modelBuilder.Entity("AgentMesh.Core.Models.JobWorkspaceState", b =>
+                {
+                    b.Property<Guid>("JobId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("job_id");
+
+                    b.Property<string>("BundleS3Key")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("bundle_s3key");
+
+                    b.Property<string>("ContentHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("content_hash");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("GitRef")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("git_ref");
+
+                    b.Property<string>("GitRemoteUrl")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("git_remote_url");
+
+                    b.Property<string>("HeadCommit")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("head_commit");
+
+                    b.Property<DateTimeOffset?>("LastSavedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("last_saved_at");
+
+                    b.Property<string>("LastSavedByAgentId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("last_saved_by_agent_id");
+
+                    b.Property<string>("LastSavedByPersonaId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("last_saved_by_persona_id");
+
+                    b.Property<Guid?>("LastSavedTurnSessionId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("last_saved_turn_session_id");
+
+                    b.Property<DateTimeOffset?>("LeaseAcquiredAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("lease_acquired_at");
+
+                    b.Property<string>("LeaseHolderAgentId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("lease_holder_agent_id");
+
+                    b.Property<string>("LeaseHolderPersonaId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("lease_holder_persona_id");
+
+                    b.Property<string>("ProjectId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("project_id");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.HasKey("JobId")
+                        .HasName("pk_job_workspace_states");
+
+                    b.HasIndex("LastSavedByAgentId")
+                        .HasDatabaseName("ix_job_workspace_states_last_saved_agent");
+
+                    b.HasIndex("LeaseHolderAgentId")
+                        .HasDatabaseName("ix_job_workspace_states_lease_holder");
+
+                    b.ToTable("job_workspace_states", (string)null);
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.Persona", b =>

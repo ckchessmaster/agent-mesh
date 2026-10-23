@@ -1344,4 +1344,76 @@ describe('JobCockpit - Attachment Support', () => {
     const textarea = screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i);
     expect(textarea).toBeInTheDocument();
   });
+
+  it('renders question cards with object options { label, description } and headers without crashing', async () => {
+    const onAnswerQuestion = vi.fn().mockResolvedValue(undefined);
+
+    const questionMsg: JobMessage = {
+      id: 'msg-question-obj-options',
+      jobId: mockJob.id,
+      senderType: 'persona',
+      senderId: 'spence-ai-rook',
+      senderName: 'Rook',
+      content: 'I have a question and need your input before proceeding:',
+      mentions: [],
+      turnSessionId: 'turn-session-rook-1',
+      structuredPayloadJson: JSON.stringify({
+        questions: [
+          {
+            header: 'Workspace persistence',
+            options: [
+              {
+                label: '[RECOMMENDED] Per-job workspace: key the dir by jobId',
+                description: 'Changes AgentProcessManager workspace resolution.'
+              },
+              {
+                label: 'Git as the handoff bus: outgoing agent commits and pushes',
+                description: 'Keeps per-session dirs.'
+              }
+            ],
+            question: "Where does a job's work actually live?",
+            is_multi_select: false
+          }
+        ]
+      }),
+      createdAt: '2026-10-22T21:31:00Z'
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={[questionMsg]}
+        onAnswerQuestion={onAnswerQuestion}
+      />
+    );
+
+    // Verify question card renders without throwing
+    expect(screen.getByTestId('question-card-msg-question-obj-options')).toBeInTheDocument();
+    expect(screen.getByText('Workspace persistence')).toBeInTheDocument();
+    expect(screen.getByText("Where does a job's work actually live?")).toBeInTheDocument();
+    expect(screen.getByText('[RECOMMENDED] Per-job workspace: key the dir by jobId')).toBeInTheDocument();
+    expect(screen.getByText('Changes AgentProcessManager workspace resolution.')).toBeInTheDocument();
+
+    // Select the recommended option
+    fireEvent.click(screen.getByText('[RECOMMENDED] Per-job workspace: key the dir by jobId'));
+
+    // Submit answer
+    const submitBtn = screen.getByText('Submit Answer');
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(onAnswerQuestion).toHaveBeenCalledWith(
+        'turn-session-rook-1',
+        expect.objectContaining({
+          toolCallId: 'msg-question-obj-options',
+          answers: [
+            expect.objectContaining({
+              question: "Where does a job's work actually live?",
+              selectedOptions: ['[RECOMMENDED] Per-job workspace: key the dir by jobId']
+            })
+          ]
+        })
+      );
+    });
+  });
 });
