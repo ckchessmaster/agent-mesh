@@ -355,9 +355,17 @@ public class AgentRunnerInstance : IAsyncDisposable
             }
 
             var adapter = AgentAdapterFactory.Create(_preset);
+            var terminalEventEmitted = false;
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>
             {
                 turnToken.ThrowIfCancellationRequested();
+
+                if (string.Equals(trajectoryEv.EventType, "response", StringComparison.OrdinalIgnoreCase) ||
+                    (string.Equals(trajectoryEv.EventType, "tool_call", StringComparison.OrdinalIgnoreCase) &&
+                     string.Equals(trajectoryEv.ToolName, "ask_question", StringComparison.OrdinalIgnoreCase)))
+                {
+                    terminalEventEmitted = true;
+                }
 
                 if (!string.IsNullOrWhiteSpace(trajectoryEv.StructuredPayloadJson))
                 {
@@ -386,6 +394,21 @@ public class AgentRunnerInstance : IAsyncDisposable
                     trajectoryEv,
                     turnToken);
             }, turnToken);
+
+            if (!terminalEventEmitted && !turnToken.IsCancellationRequested)
+            {
+                _onLog(_preset.Id, $"Warning: Turn completed without a terminal response or question event. Emitting fallback completion response.");
+                await _meshClient.PostTrajectoryEventAsync(
+                    ev.SessionId,
+                    _preset.Id,
+                    _agentToken,
+                    new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = $"Turn completed by agent `@{_preset.Id}`."
+                    },
+                    turnToken);
+            }
 
             if (!string.IsNullOrWhiteSpace(ev.GitBranch))
             {
@@ -654,6 +677,10 @@ public class AgentProcessManager : IAsyncDisposable
         string agentId,
         string? customCommand = null,
         string? customRole = null,
+        string? customAdapter = null,
+        string? customEndpoint = null,
+        string? customApiKey = null,
+        string? customDefaultModel = null,
         CancellationToken ct = default)
     {
         var normalizedId = agentId.Trim().ToLowerInvariant();
@@ -663,7 +690,36 @@ public class AgentProcessManager : IAsyncDisposable
             return existingRunner.State;
         }
 
+        RemoteAgentDto? remoteAgent = null;
+        try
+        {
+            remoteAgent = await _meshClient.GetMeshAgentAsync(normalizedId, ct);
+        }
+        catch { }
+
         var preset = _configStore.ResolveOrCreatePreset(_config, normalizedId, customCommand, customRole);
+        if (remoteAgent != null)
+        {
+            _configStore.PopulateFromRemote(preset, remoteAgent);
+        }
+
+        if (!string.IsNullOrWhiteSpace(customCommand)) preset.Command = customCommand;
+        if (!string.IsNullOrWhiteSpace(customRole)) preset.Role = customRole;
+        if (!string.IsNullOrWhiteSpace(customAdapter)) preset.AdapterType = customAdapter.ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(customEndpoint)) preset.Endpoint = customEndpoint;
+        if (!string.IsNullOrWhiteSpace(customApiKey)) preset.ApiKey = customApiKey;
+        if (!string.IsNullOrWhiteSpace(customDefaultModel)) preset.DefaultModel = customDefaultModel;
+
+        if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) &&
+            (preset.Capabilities == null || preset.Capabilities.Count == 0 ||
+             preset.Capabilities.SequenceEqual(new[] { "shell", "inspect_workspace" })))
+        {
+            preset.Capabilities = new List<string> { "run_command", "read_file", "write_file", "edit_file", "ask_question" };
+            preset.Command = null;
+        }
+
+        _configStore.Save(_config);
+
         var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog, () => OnStateChanged?.Invoke());
         _runners[normalizedId] = runner;
 

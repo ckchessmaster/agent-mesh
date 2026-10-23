@@ -19,6 +19,16 @@ public class AgentPresetConfig
     public string? Arguments { get; set; }
     public string? Token { get; set; }
     public List<string> Capabilities { get; set; } = new();
+
+    // Custom OpenAI compatible server settings
+    public string? Endpoint { get; set; } // e.g. http://localhost:11434/v1
+    public string? ApiKey { get; set; }
+    public string? DefaultModel { get; set; }
+    public Dictionary<string, string>? CustomHeaders { get; set; }
+    public int? TimeoutSeconds { get; set; }
+    public int? MaxRetries { get; set; }
+    public int? RetryDelayMilliseconds { get; set; }
+    public int? MaxSteps { get; set; }
 }
 
 public class PromptReceivedEvent
@@ -182,5 +192,6 @@ public record RemoteAgentDto(
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("status")] string Status,
     [property: JsonPropertyName("sessionCount")] int SessionCount,
-    [property: JsonPropertyName("lastHeartbeatAt")] DateTimeOffset? LastHeartbeatAt
+    [property: JsonPropertyName("lastHeartbeatAt")] DateTimeOffset? LastHeartbeatAt,
+    [property: JsonPropertyName("capabilitiesJson")] string? CapabilitiesJson = null
 );

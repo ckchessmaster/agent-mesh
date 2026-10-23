@@ -88,9 +88,15 @@ public class DashboardTui
             var changed = false;
             foreach (var remote in remoteAgents)
             {
-                if (!_config.Agents.ContainsKey(remote.Id))
+                if (!_config.Agents.TryGetValue(remote.Id, out var existing))
                 {
-                    _configStore.ResolveOrCreatePreset(_config, remote.Id, customRole: remote.Role);
+                    var preset = _configStore.ResolveOrCreatePreset(_config, remote.Id, customRole: remote.Role);
+                    _configStore.PopulateFromRemote(preset, remote);
+                    changed = true;
+                }
+                else
+                {
+                    _configStore.PopulateFromRemote(existing, remote);
                     changed = true;
                 }
             }

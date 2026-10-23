@@ -142,6 +142,35 @@ public class SystemController : ControllerBase
                     new("1m", "1M Tokens", "Maximum 1M token context window (Claude 5.5)")
                 }
             ),
+            ["openai"] = new(
+                Adapter: "openai",
+                Name: "Custom OpenAI Compatible Server",
+                Modes: new List<ModeOptionDto>
+                {
+                    new("auto", "Auto (Autonomous)", "Autonomous tool loop using OpenAI function calling"),
+                    new("plan", "Plan Only", "Explores codebase and plans changes without modifying files"),
+                    new("direct", "Direct Chat", "Direct conversational responses without executing tools")
+                },
+                Models: new List<ModelCapabilityDto>
+                {
+                    new("llama3.3", "Llama 3.3 (70B)", new[] { "low", "medium", "high" }, new[] { "8k", "32k", "128k" }),
+                    new("qwen2.5-coder", "Qwen 2.5 Coder (32B)", new[] { "low", "medium", "high" }, new[] { "32k", "128k" }),
+                    new("deepseek-r1", "DeepSeek-R1 (Reasoning)", new[] { "high" }, new[] { "64k", "128k" }),
+                    new("gpt-4o", "GPT-4o", new[] { "low", "medium", "high" }, new[] { "128k" }),
+                    new("gpt-4o-mini", "GPT-4o Mini", Array.Empty<string>(), new[] { "128k" }),
+                    new("custom", "Custom / Other Model", Array.Empty<string>(), new[] { "default", "32k", "128k" })
+                },
+                ContextSizes: new List<ContextSizeOptionDto>
+                {
+                    new("default", "Default Context", "Default context size for model"),
+                    new("8k", "8k Tokens", "Compact 8k token context window"),
+                    new("32k", "32k Tokens", "Standard 32k token context window"),
+                    new("64k", "64k Tokens", "Extended 64k token context window"),
+                    new("128k", "128k Tokens", "Large 128k token context window"),
+                    new("256k", "256k Tokens", "Long 256k token context window"),
+                    new("1m", "1M Tokens", "1M token context window")
+                }
+            ),
             ["generic"] = new(
                 Adapter: "generic",
                 Name: "Custom Command Agent",
@@ -217,6 +246,61 @@ public class SystemController : ControllerBase
             ParentPath: parentPath,
             Directories: subDirs
         ));
+    }
+
+    [HttpPost("drivers/test-openai")]
+    public async Task<IActionResult> TestOpenAiServer([FromBody] TestOpenAiServerRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Endpoint))
+        {
+            return BadRequest(new TestOpenAiServerResponse(false, "Endpoint URL is required.", new()));
+        }
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+            var baseEndpoint = req.Endpoint.Trim().TrimEnd('/');
+            var modelsUrl = baseEndpoint.EndsWith("/models", StringComparison.OrdinalIgnoreCase)
+                ? baseEndpoint
+                : $"{baseEndpoint}/models";
+
+            using var httpReq = new HttpRequestMessage(HttpMethod.Get, modelsUrl);
+            if (!string.IsNullOrWhiteSpace(req.ApiKey))
+            {
+                httpReq.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", req.ApiKey.Trim());
+            }
+
+            using var res = await client.SendAsync(httpReq);
+            if (!res.IsSuccessStatusCode)
+            {
+                return Ok(new TestOpenAiServerResponse(false, $"Server returned HTTP {(int)res.StatusCode} ({res.ReasonPhrase})", new()));
+            }
+
+            var json = await res.Content.ReadAsStringAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var models = new List<OpenAiModelItemDto>();
+
+            if (doc.RootElement.TryGetProperty("data", out var dataArr) && dataArr.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                foreach (var elem in dataArr.EnumerateArray())
+                {
+                    if (elem.TryGetProperty("id", out var idProp))
+                    {
+                        var id = idProp.GetString();
+                        if (!string.IsNullOrWhiteSpace(id))
+                        {
+                            models.Add(new OpenAiModelItemDto(id, id));
+                        }
+                    }
+                }
+            }
+
+            return Ok(new TestOpenAiServerResponse(true, null, models));
+        }
+        catch (Exception ex)
+        {
+            return Ok(new TestOpenAiServerResponse(false, $"Connection failed: {ex.Message}", new()));
+        }
     }
 
     private static async Task<List<ModelCapabilityDto>> GetAgyModelsAsync()
@@ -442,3 +526,9 @@ public record FilesystemBrowseResponse(
     string? ParentPath,
     List<DirectoryItemDto> Directories
 );
+
+public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null);
+
+public record OpenAiModelItemDto(string Id, string Name);
+
+public record TestOpenAiServerResponse(bool Success, string? Error, List<OpenAiModelItemDto> Models);

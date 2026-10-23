@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { JobCockpit, getActiveMentionQuery } from '../JobCockpit';
-import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment } from '../../types';
+import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment, type AgentSession } from '../../types';
 import { api } from '../../services/api';
 
 vi.mock('../../services/api', () => ({
@@ -793,6 +793,8 @@ describe('JobCockpit - Attachment Support', () => {
       createdAt: new Date().toISOString()
     };
 
+    const onCancelQueuedTurn = vi.fn();
+
     render(
       <JobCockpit
         {...mockProps}
@@ -812,6 +814,7 @@ describe('JobCockpit - Attachment Support', () => {
             createdAt: new Date().toISOString()
           }
         ]}
+        onCancelQueuedTurn={onCancelQueuedTurn}
       />
     );
 
@@ -822,6 +825,99 @@ describe('JobCockpit - Attachment Support', () => {
 
     // Queued badge on team member
     expect(screen.getByText('Queued (1)')).toBeInTheDocument();
+
+    // Individual queued turn item and cancel button
+    expect(screen.getByTestId(`queued-turn-item-${queuedTurn.id}`)).toBeInTheDocument();
+    expect(screen.getByText('Queued turn prompt')).toBeInTheDocument();
+    const cancelTurnBtn = screen.getByTestId(`cancel-queued-turn-btn-${queuedTurn.id}`);
+    expect(cancelTurnBtn).toBeInTheDocument();
+
+    // Member card cancel queued button
+    const cancelMemberBtn = screen.getByTestId('cancel-member-queued-turns-agy-astra');
+    expect(cancelMemberBtn).toBeInTheDocument();
+
+    // Click cancel on the queued turn item
+    fireEvent.click(cancelTurnBtn);
+    expect(onCancelQueuedTurn).toHaveBeenCalledWith(queuedTurn.id);
+
+    // Click cancel on the member card
+    fireEvent.click(cancelMemberBtn);
+    expect(onCancelQueuedTurn).toHaveBeenCalledWith(queuedTurn.id);
+  });
+
+  it('cancels all of a member queued turns with a single bulk call (no per-turn fan-out)', () => {
+    const mkTurn = (id: string, content: string) => ({
+      id,
+      jobId: mockJob.id,
+      projectId: mockJob.projectId,
+      targetPersonaId: 'agy-astra',
+      senderType: 'user',
+      content,
+      mentions: ['agy-astra'],
+      priority: 1,
+      createdAt: new Date().toISOString()
+    });
+
+    const onCancelQueuedTurn = vi.fn();
+    const onCancelQueuedTurns = vi.fn();
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={{
+          ...mockJob,
+          queuedTurns: [mkTurn('turn-a', 'First queued prompt'), mkTurn('turn-b', 'Second queued prompt')]
+        }}
+        personas={[
+          {
+            id: 'agy-astra',
+            name: 'Astra',
+            role: 'Tech Lead',
+            personaPrompt: '',
+            driverId: 'agy',
+            maxConcurrentJobs: 1,
+            trustTier: 1,
+            createdAt: new Date().toISOString()
+          }
+        ]}
+        onCancelQueuedTurn={onCancelQueuedTurn}
+        onCancelQueuedTurns={onCancelQueuedTurns}
+      />
+    );
+
+    expect(screen.getByTestId('queued-turn-item-turn-a')).toBeInTheDocument();
+    expect(screen.getByTestId('queued-turn-item-turn-b')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('cancel-member-queued-turns-agy-astra'));
+
+    // Exactly one bulk request for this persona; concurrent per-turn DELETEs race on
+    // read-modify-write of QueuedTurnsJson and lose updates.
+    expect(onCancelQueuedTurns).toHaveBeenCalledTimes(1);
+    expect(onCancelQueuedTurns).toHaveBeenCalledWith('agy-astra');
+    expect(onCancelQueuedTurn).not.toHaveBeenCalled();
+  });
+
+  it('renders system message pills in the job chat timeline', () => {
+    const systemMsg: JobMessage = {
+      id: 'sys-msg-1',
+      jobId: 'job-1',
+      senderType: 'system',
+      senderId: 'operator',
+      senderName: 'System',
+      content: 'Queued turn for @Rook was cancelled.',
+      mentions: ['spence-ai-rook'],
+      createdAt: new Date().toISOString()
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={[systemMsg]}
+      />
+    );
+
+    expect(screen.getByTestId('system-message-sys-msg-1')).toBeInTheDocument();
+    expect(screen.getByText('Queued turn for @Rook was cancelled.')).toBeInTheDocument();
   });
 
   it('renders Discuss First badge, allows toggling discussion requirement, and adding a task with discussion enabled', async () => {
@@ -1056,6 +1152,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'persona-astra',
       senderName: 'Astra',
       content: 'I have a question before we start coding:',
+      mentions: [],
       turnSessionId: 'turn-session-qa-1',
       structuredPayloadJson: JSON.stringify({
         toolName: 'ask_question',
@@ -1074,6 +1171,7 @@ describe('JobCockpit - Attachment Support', () => {
       id: 'turn-session-qa-1',
       title: 'Turn Session QA',
       status: 'waiting_for_input',
+      metadataJson: '{}',
       createdAt: '2026-10-21T18:00:00Z',
       updatedAt: '2026-10-21T18:00:00Z'
     };
@@ -1133,6 +1231,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'user-1',
       senderName: 'You',
       content: 'User answered question:\nQ: Which database should we use? -> A: PostgreSQL',
+      mentions: [],
       createdAt: '2026-10-21T18:01:00Z'
     };
 
@@ -1161,6 +1260,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'persona-astra',
       senderName: 'Astra',
       content: 'Please let me know:\n1. What architecture style should we follow?',
+      mentions: [],
       turnSessionId: 'turn-session-comp-1',
       createdAt: '2026-10-21T18:10:00Z'
     };
@@ -1209,6 +1309,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'persona-astra',
       senderName: 'Astra',
       content: 'Please choose:\n1. Which caching strategy should we use?',
+      mentions: [],
       turnSessionId: 'turn-session-1',
       createdAt: '2026-10-21T18:00:00Z'
     };
@@ -1220,6 +1321,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'user-1',
       senderName: 'You',
       content: 'Let us stick with memory for now and proceed with the rest.',
+      mentions: [],
       createdAt: '2026-10-21T18:05:00Z'
     };
 

@@ -45,9 +45,47 @@ public class MeshClient
         return await res.Content.ReadFromJsonAsync<List<RemoteAgentDto>>(cancellationToken: ct) ?? new();
     }
 
+    public async Task<RemoteAgentDto?> GetMeshAgentAsync(string agentId, CancellationToken ct = default)
+    {
+        try
+        {
+            using var req = CreateRequest(HttpMethod.Get, $"api/agents/{Uri.EscapeDataString(agentId.Trim().ToLowerInvariant())}", _config.MasterToken);
+            using var res = await _http.SendAsync(req, ct);
+            if (!res.IsSuccessStatusCode) return null;
+            return await res.Content.ReadFromJsonAsync<RemoteAgentDto>(cancellationToken: ct);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static string SerializePresetCapabilities(AgentPresetConfig preset)
+    {
+        if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) ||
+            !string.IsNullOrWhiteSpace(preset.Endpoint))
+        {
+            var caps = new Dictionary<string, object?>
+            {
+                ["adapter"] = "openai",
+                ["endpoint"] = preset.Endpoint,
+                ["apiKey"] = preset.ApiKey,
+                ["defaultModel"] = preset.DefaultModel,
+                ["timeoutSeconds"] = preset.TimeoutSeconds,
+                ["maxRetries"] = preset.MaxRetries,
+                ["retryDelayMilliseconds"] = preset.RetryDelayMilliseconds,
+                ["maxSteps"] = preset.MaxSteps,
+                ["capabilities"] = preset.Capabilities
+            };
+            return JsonSerializer.Serialize(caps);
+        }
+
+        return JsonSerializer.Serialize(preset.Capabilities);
+    }
+
     public async Task<string> EnsureAgentRegisteredAsync(AgentPresetConfig preset, CancellationToken ct = default)
     {
-        var capabilitiesJson = JsonSerializer.Serialize(preset.Capabilities);
+        var capabilitiesJson = SerializePresetCapabilities(preset);
 
         var registerPayload = new
         {
@@ -96,7 +134,7 @@ public class MeshClient
     {
         try
         {
-            var capabilitiesJson = JsonSerializer.Serialize(preset.Capabilities);
+            var capabilitiesJson = SerializePresetCapabilities(preset);
             using var req = CreateRequest(HttpMethod.Post, "api/agents", preset.Token ?? _config.MasterToken, preset.Id);
             req.Content = JsonContent.Create(new
             {

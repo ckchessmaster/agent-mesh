@@ -172,6 +172,8 @@ interface JobCockpitProps {
   onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
   onEditProject?: () => void;
   onStopTurn?: (sessionId: string) => Promise<void>;
+  onCancelQueuedTurn?: (turnId: string) => Promise<void> | void;
+  onCancelQueuedTurns?: (personaId: string) => Promise<void> | void;
   sessions?: AgentSession[];
   onAnswerQuestion?: (
     sessionIdOrTargetId: string,
@@ -199,6 +201,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onUploadAttachments,
   onEditProject,
   onStopTurn,
+  onCancelQueuedTurn,
+  onCancelQueuedTurns,
   onAnswerQuestion
 }) => {
   const [prompt, setPrompt] = useState('');
@@ -254,7 +258,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
   const handleAnswerQuestion = async (
     msg: JobMessage,
-    questions: AskQuestionItem[],
+    _questions: AskQuestionItem[],
     answers: QuestionAnswerPayload[]
   ) => {
     setSubmittingQuestionId(msg.id);
@@ -1556,7 +1560,26 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             ) : (
               messages.map((msg) => {
                 const isUser = msg.senderType === 'user';
+                const isSystem = msg.senderType === 'system';
                 const msgAttachments = extractJobMessageAttachments(msg);
+
+                if (isSystem) {
+                  return (
+                    <div
+                      key={msg.id}
+                      className="flex justify-center my-2"
+                      data-testid={`system-message-${msg.id}`}
+                    >
+                      <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-800/80 border border-slate-700/60 text-xs text-slate-300 shadow-sm max-w-xl text-center">
+                        <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span>{msg.content}</span>
+                        <span className="text-[10px] text-slate-500 font-mono shrink-0">
+                          {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                }
 
                 return (
                   <div
@@ -2094,6 +2117,45 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     </p>
                   </div>
                 </div>
+
+                {/* Individual Queued Turns */}
+                <div className="space-y-1.5 pt-1.5 border-t border-amber-500/20">
+                  {job.queuedTurns.map((turn) => {
+                    const targetPersona = personas.find((p) => p.id === turn.targetPersonaId);
+                    const displayName = targetPersona?.name || turn.targetPersonaId;
+                    return (
+                      <div
+                        key={turn.id}
+                        data-testid={`queued-turn-item-${turn.id}`}
+                        className="flex items-center justify-between gap-2 p-2 rounded-lg bg-amber-900/30 border border-amber-500/25 text-[11px]"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-semibold text-amber-200 truncate">@{displayName}</span>
+                            <span className="text-[10px] text-amber-400/60 font-mono">
+                              {new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-amber-300/70 truncate mt-0.5 font-mono">
+                            {turn.content.slice(0, 60)}{turn.content.length > 60 ? '...' : ''}
+                          </p>
+                        </div>
+                        {onCancelQueuedTurn && (
+                          <button
+                            type="button"
+                            onClick={() => onCancelQueuedTurn(turn.id)}
+                            title="Cancel queued turn"
+                            data-testid={`cancel-queued-turn-btn-${turn.id}`}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-rose-600/80 hover:bg-rose-500 text-white font-medium text-[10px] transition cursor-pointer shrink-0 shadow-sm"
+                          >
+                            <X className="w-3 h-3" />
+                            <span>Cancel</span>
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
@@ -2181,6 +2243,36 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                             : 'Ready for instructions'}
                         </span>
                       </div>
+
+                      {queuedCount > 0 && (onCancelQueuedTurns || onCancelQueuedTurn) && (
+                        <div className="mt-2 pt-1.5 border-t border-amber-500/20 flex items-center justify-between">
+                          <span className="text-[10px] text-amber-300/80 font-medium">
+                            {queuedCount} turn{queuedCount === 1 ? '' : 's'} waiting
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const turnsForMember = (job.queuedTurns || []).filter(
+                                (t) => t.targetPersonaId === member.id
+                              );
+                              if (turnsForMember.length === 0) return;
+                              // Prefer the bulk endpoint: N concurrent per-turn DELETEs each
+                              // read-modify-write QueuedTurnsJson and lose updates.
+                              if (onCancelQueuedTurns) {
+                                onCancelQueuedTurns(member.id);
+                                return;
+                              }
+                              turnsForMember.forEach((t) => onCancelQueuedTurn?.(t.id));
+                            }}
+                            title={`Cancel queued turns for ${member.name}`}
+                            data-testid={`cancel-member-queued-turns-${member.id}`}
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-600/80 hover:bg-rose-500 text-white font-medium text-[10px] transition cursor-pointer shadow-sm"
+                          >
+                            <X className="w-2.5 h-2.5" />
+                            <span>Cancel</span>
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}

@@ -56,6 +56,7 @@ import type {
   FilesystemBrowseResponse,
   JobMessage,
   JobTask,
+  ModelCapability,
   Persona,
   Project,
   ProjectJob,
@@ -311,9 +312,19 @@ export default function App() {
 
   // Quick Register Agent modal/drawer state
   const [showRegisterModal, setShowRegisterModal] = useState(false);
+  const [newAgentType, setNewAgentType] = useState<'agy' | 'claude' | 'copilot' | 'openai' | 'generic'>('openai');
   const [newAgentId, setNewAgentId] = useState('');
   const [newAgentName, setNewAgentName] = useState('');
-  const [newAgentRole, setNewAgentRole] = useState('Codebase Engineer');
+  const [newAgentRole, setNewAgentRole] = useState('Autonomous AI Engineer');
+  const [newAgentEndpoint, setNewAgentEndpoint] = useState('http://localhost:11434/v1');
+  const [newAgentApiKey, setNewAgentApiKey] = useState('');
+  const [newAgentModel, setNewAgentModel] = useState('');
+  const [isTestingOpenAi, setIsTestingOpenAi] = useState(false);
+  const [openAiTestResult, setOpenAiTestResult] = useState<{
+    success: boolean;
+    message: string;
+    models: { id: string; name: string }[];
+  } | null>(null);
 
   // Interactive Question & Answer state (keyed by toolCallId)
   const [questionAnswers, setQuestionAnswers] = useState<
@@ -905,6 +916,59 @@ export default function App() {
     }
   };
 
+  const applyJobFromServer = useCallback((job?: ProjectJob) => {
+    if (!job) return;
+    setJobsByProject((prev) => ({
+      ...prev,
+      [job.projectId]: (prev[job.projectId] || []).map((j) => (j.id === job.id ? job : j))
+    }));
+  }, []);
+
+  const handleCancelQueuedJobTurn = async (turnId: string, jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const job = await api.cancelQueuedJobTurn(targetId, turnId);
+      // Trust the server DTO; the local filter can diverge from what was actually removed.
+      if (job) {
+        applyJobFromServer(job);
+      } else {
+        setJobsByProject((prev) => {
+          const next = { ...prev };
+          for (const pId of Object.keys(next)) {
+            next[pId] = next[pId].map((j) => {
+              if (j.id === targetId) {
+                const updatedQueued = (j.queuedTurns || []).filter((t) => t.id !== turnId);
+                return { ...j, queuedTurns: updatedQueued };
+              }
+              return j;
+            });
+          }
+          return next;
+        });
+      }
+      const msgs = await api.getJobMessages(targetId);
+      setJobMessages(msgs);
+    } catch (err) {
+      console.error('Failed to cancel queued turn:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turn');
+    }
+  };
+
+  const handleCancelQueuedJobTurns = async (personaId: string, jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const job = await api.cancelQueuedJobTurns(targetId, personaId);
+      if (job) applyJobFromServer(job);
+      const msgs = await api.getJobMessages(targetId);
+      setJobMessages(msgs);
+    } catch (err) {
+      console.error('Failed to cancel queued turns:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turns');
+    }
+  };
+
   const fetchSessionArtifacts = useCallback(async (sessionId: string) => {
     try {
       const list = await api.getSessionArtifacts(sessionId);
@@ -1271,6 +1335,7 @@ export default function App() {
     let key = 'agy';
     if (idLower.includes('copilot') || nameLower.includes('copilot')) key = 'copilot';
     else if (idLower.includes('claude') || nameLower.includes('claude')) key = 'claude';
+    else if (idLower.includes('openai') || nameLower.includes('openai') || idLower.includes('ollama') || nameLower.includes('ollama') || idLower.includes('vllm') || nameLower.includes('vllm') || idLower.includes('lmstudio') || nameLower.includes('lmstudio')) key = 'openai';
     else if (idLower.includes('agy') || idLower.includes('antigravity') || nameLower.includes('agy') || nameLower.includes('antigravity')) key = 'agy';
     else if (capabilities.agentRuntimes[idLower]) key = idLower;
     else key = 'agy';
@@ -1440,8 +1505,27 @@ export default function App() {
   };
 
   const availableModels = useMemo(() => {
-    return currentRuntimeCaps?.models || [];
-  }, [currentRuntimeCaps]);
+    const baseModels = currentRuntimeCaps?.models || [];
+    const agent = isCreatingSession ? activeCreationAgent : selectedAgent;
+    let extraModels: ModelCapability[] = [];
+    if (agent?.capabilitiesJson) {
+      try {
+        const parsed = JSON.parse(agent.capabilitiesJson);
+        if (Array.isArray(parsed.models)) {
+          extraModels = parsed.models.map((m: any) => ({
+            id: m.id || m.name,
+            name: m.name || m.id,
+            efforts: ['low', 'medium', 'high'],
+            contextSizes: ['32k', '128k']
+          }));
+        }
+      } catch {}
+    }
+    return [
+      ...extraModels,
+      ...baseModels.filter((m) => !extraModels.some((em) => em.id === m.id))
+    ];
+  }, [currentRuntimeCaps, isCreatingSession, activeCreationAgent, selectedAgent]);
 
   const availableModes = useMemo(() => {
     return currentRuntimeCaps?.modes || [];
@@ -1453,8 +1537,8 @@ export default function App() {
 
   const selectedModelCap = useMemo(() => {
     if (!newSessionModel || !currentRuntimeCaps) return null;
-    return currentRuntimeCaps.models.find((m) => m.id === newSessionModel) || null;
-  }, [currentRuntimeCaps, newSessionModel]);
+    return availableModels.find((m) => m.id === newSessionModel) || null;
+  }, [availableModels, currentRuntimeCaps, newSessionModel]);
 
   const availableEfforts = useMemo(() => {
     return selectedModelCap?.efforts || [];
@@ -1469,7 +1553,7 @@ export default function App() {
 
   // Sync / validate model, mode, tier when agent changes
   useEffect(() => {
-    if (newSessionModel && availableModels.length > 0 && !availableModels.some((m) => m.id === newSessionModel)) {
+    if (newSessionModel && availableModels.length > 0 && !availableModels.some((m) => m.id === newSessionModel) && currentRuntimeCaps?.adapter !== 'openai') {
       setNewSessionModel('');
     }
     if (newSessionMode && availableModes.length > 0 && !availableModes.some((m) => m.id === newSessionMode)) {
@@ -2218,20 +2302,71 @@ export default function App() {
     }
   };
 
+  const handleTestOpenAi = async () => {
+    if (!newAgentEndpoint.trim()) return;
+    setIsTestingOpenAi(true);
+    setOpenAiTestResult(null);
+    try {
+      const res = await api.testOpenAiServer({
+        endpoint: newAgentEndpoint.trim(),
+        apiKey: newAgentApiKey.trim() || undefined
+      });
+      if (res.success) {
+        setOpenAiTestResult({
+          success: true,
+          message: `Connected successfully! Found ${res.models.length} model(s).`,
+          models: res.models
+        });
+        if (res.models.length > 0 && !newAgentModel) {
+          setNewAgentModel(res.models[0].id);
+        }
+      } else {
+        setOpenAiTestResult({
+          success: false,
+          message: res.error || 'Failed to connect to OpenAI-compatible server.',
+          models: []
+        });
+      }
+    } catch (err) {
+      setOpenAiTestResult({
+        success: false,
+        message: err instanceof Error ? err.message : 'Connection failed.',
+        models: []
+      });
+    } finally {
+      setIsTestingOpenAi(false);
+    }
+  };
+
   const handleRegisterAgent = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newAgentId.trim() || !newAgentName.trim()) return;
 
     setIsActionPending(true);
     try {
+      let capabilitiesJson: string | undefined = undefined;
+      if (newAgentType === 'openai') {
+        const caps = {
+          adapter: 'openai',
+          endpoint: newAgentEndpoint.trim(),
+          apiKey: newAgentApiKey.trim() || undefined,
+          defaultModel: newAgentModel.trim() || undefined,
+          models: openAiTestResult?.models || (newAgentModel.trim() ? [{ id: newAgentModel.trim(), name: newAgentModel.trim() }] : [])
+        };
+        capabilitiesJson = JSON.stringify(caps);
+      }
+
       const created = await api.upsertAgent({
         id: newAgentId.trim().toLowerCase(),
         name: newAgentName.trim(),
         role: newAgentRole.trim() || 'Autonomous Agent',
-        status: 'offline'
+        status: 'offline',
+        capabilitiesJson
       });
       setNewAgentId('');
       setNewAgentName('');
+      setNewAgentModel('');
+      setOpenAiTestResult(null);
       setShowRegisterModal(false);
       await fetchAllData();
       setSelectedAgentId(created.id);
@@ -2815,9 +2950,34 @@ export default function App() {
                   className="p-3.5 bg-slate-900/90 border-b border-slate-800 space-y-2.5 text-xs"
                 >
                   <div className="font-semibold text-slate-200">Register Live Driver</div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">Driver Type</label>
+                    <select
+                      aria-label="Driver Type"
+                      value={newAgentType}
+                      onChange={(e) => {
+                        const t = e.target.value as any;
+                        setNewAgentType(t);
+                        if (t === 'openai' && !newAgentId) {
+                          setNewAgentId('ollama-local');
+                          setNewAgentName('Local Ollama Server');
+                          setNewAgentRole('Autonomous AI Engineer');
+                        }
+                      }}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 cursor-pointer"
+                    >
+                      <option value="openai">OpenAI Compatible Server (Ollama / vLLM / LM Studio / OpenAI)</option>
+                      <option value="agy">Antigravity CLI (agy)</option>
+                      <option value="claude">Claude Code CLI</option>
+                      <option value="copilot">GitHub Copilot CLI</option>
+                      <option value="generic">Custom Command Agent</option>
+                    </select>
+                  </div>
+
                   <input
                     type="text"
-                    placeholder="Driver ID (e.g. agy-cli)"
+                    placeholder="Driver ID (e.g. agy-cli, ollama-local)"
                     value={newAgentId}
                     onChange={(e) => setNewAgentId(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
@@ -2825,7 +2985,7 @@ export default function App() {
                   />
                   <input
                     type="text"
-                    placeholder="Display Name (e.g. Agy Local CLI)"
+                    placeholder="Display Name (e.g. Agy Local CLI, Ollama Local)"
                     value={newAgentName}
                     onChange={(e) => setNewAgentName(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
@@ -2833,22 +2993,116 @@ export default function App() {
                   />
                   <input
                     type="text"
-                    placeholder="Role (e.g. Codebase Engineer)"
+                    placeholder="Role (e.g. Codebase Engineer, Autonomous AI Engineer)"
                     value={newAgentRole}
                     onChange={(e) => setNewAgentRole(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
                   />
+
+                  {newAgentType === 'openai' && (
+                    <div className="space-y-2 p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">Endpoint URL</label>
+                        <input
+                          type="text"
+                          aria-label="OpenAI Endpoint URL"
+                          placeholder="http://localhost:11434/v1"
+                          value={newAgentEndpoint}
+                          onChange={(e) => setNewAgentEndpoint(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">API Key (Optional)</label>
+                        <input
+                          type="password"
+                          aria-label="OpenAI API Key"
+                          placeholder="sk-... (optional for local servers)"
+                          value={newAgentApiKey}
+                          onChange={(e) => setNewAgentApiKey(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500"
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={handleTestOpenAi}
+                          disabled={isTestingOpenAi || !newAgentEndpoint.trim()}
+                          className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-400 font-medium text-[11px] flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                        >
+                          {isTestingOpenAi && <RefreshCw className="w-3 h-3 animate-spin" />}
+                          <span>Test & Fetch Models</span>
+                        </button>
+                      </div>
+
+                      {openAiTestResult && (
+                        <div
+                          className={`p-2 rounded text-[11px] ${
+                            openAiTestResult.success
+                              ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/40'
+                              : 'bg-rose-950/40 text-rose-300 border border-rose-800/40'
+                          }`}
+                        >
+                          {openAiTestResult.message}
+                        </div>
+                      )}
+
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">Default Model</label>
+                        {openAiTestResult?.models && openAiTestResult.models.length > 0 ? (
+                          <div className="space-y-1">
+                            <select
+                              aria-label="Fetched Model Selection"
+                              value={newAgentModel}
+                              onChange={(e) => setNewAgentModel(e.target.value)}
+                              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 text-[11px] focus:outline-none focus:border-sky-500 cursor-pointer"
+                            >
+                              <option value="">Select a fetched model...</option>
+                              {openAiTestResult.models.map((m) => (
+                                <option key={m.id} value={m.id}>
+                                  {m.name || m.id}
+                                </option>
+                              ))}
+                            </select>
+                            <input
+                              type="text"
+                              aria-label="Custom Model Input"
+                              placeholder="Or type custom model name (e.g. qwen2.5-coder:32b)"
+                              value={newAgentModel}
+                              onChange={(e) => setNewAgentModel(e.target.value)}
+                              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 text-[11px] focus:outline-none focus:border-sky-500 font-mono"
+                            />
+                          </div>
+                        ) : (
+                          <input
+                            type="text"
+                            aria-label="Custom Model Input"
+                            placeholder="e.g. llama3.3, qwen2.5-coder, gpt-4o"
+                            value={newAgentModel}
+                            onChange={(e) => setNewAgentModel(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 text-[11px] focus:outline-none focus:border-sky-500 font-mono"
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="flex justify-end gap-2 pt-1">
                     <button
                       type="button"
-                      onClick={() => setShowRegisterModal(false)}
+                      onClick={() => {
+                        setShowRegisterModal(false);
+                        setOpenAiTestResult(null);
+                      }}
                       className="px-2.5 py-1 rounded text-slate-400 hover:text-slate-200"
                     >
                       Cancel
                     </button>
                     <button
                       type="submit"
-                      className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium"
+                      disabled={isActionPending}
+                      className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium disabled:opacity-50"
                     >
                       Register
                     </button>
@@ -3132,6 +3386,8 @@ export default function App() {
                     onReopenJob={handleReopenJob}
                     onOpenLightbox={setLightboxAttachment}
                     onStopTurn={handleStopSession}
+                    onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}
+                    onCancelQueuedTurns={(personaId) => handleCancelQueuedJobTurns(personaId, activeJ.id)}
                     onAnswerQuestion={handleJobQuestionAnswer}
                     onEditProject={() => {
                       setEditingProject(activeProj);
@@ -3479,6 +3735,16 @@ export default function App() {
                           </option>
                         ))}
                       </select>
+                      {currentRuntimeCaps?.adapter === 'openai' && (
+                        <input
+                          type="text"
+                          aria-label="Custom Session Model Input"
+                          placeholder="Or custom model name..."
+                          value={newSessionModel}
+                          onChange={(e) => setNewSessionModel(e.target.value)}
+                          className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                        />
+                      )}
                     </div>
 
                     {/* Reasoning Effort Dropdown (tied to model) */}
@@ -5406,7 +5672,26 @@ export default function App() {
 
       {/* Create / Edit Persona Modal */}
       {showPersonaModal && (() => {
-        const driverModels = personaModalRuntimeCaps?.models || [];
+        const driverAgent = agents.find((a) => a.id.toLowerCase() === personaDriverInput.toLowerCase());
+        let extraModels: ModelCapability[] = [];
+        if (driverAgent?.capabilitiesJson) {
+          try {
+            const parsed = JSON.parse(driverAgent.capabilitiesJson);
+            if (Array.isArray(parsed.models)) {
+              extraModels = parsed.models.map((m: any) => ({
+                id: m.id || m.name,
+                name: m.name || m.id,
+                efforts: ['low', 'medium', 'high'],
+                contextSizes: ['32k', '128k']
+              }));
+            }
+          } catch {}
+        }
+        const baseDriverModels = personaModalRuntimeCaps?.models || [];
+        const driverModels = [
+          ...extraModels,
+          ...baseDriverModels.filter((m) => !extraModels.some((em) => em.id === m.id))
+        ];
         const driverModes = personaModalRuntimeCaps?.modes || [];
         const driverTiers = personaModalRuntimeCaps?.tiers || [];
         const driverContextSizes = personaModalRuntimeCaps?.contextSizes || [];
@@ -5575,6 +5860,16 @@ export default function App() {
                           </option>
                         ))}
                       </select>
+                      {personaModalRuntimeCaps?.adapter === 'openai' && (
+                        <input
+                          type="text"
+                          aria-label="Custom Persona Model Input"
+                          placeholder="Or custom model name..."
+                          value={personaDefaultModel}
+                          onChange={(e) => setPersonaDefaultModel(e.target.value)}
+                          className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                        />
+                      )}
                     </div>
 
                     <div className="space-y-1">

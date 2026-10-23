@@ -110,6 +110,77 @@ public class ConfigStore
         return preset;
     }
 
+    public void PopulateFromRemote(AgentPresetConfig preset, RemoteAgentDto remote)
+    {
+        if (!string.IsNullOrWhiteSpace(remote.Name))
+        {
+            preset.Name = remote.Name;
+        }
+        if (!string.IsNullOrWhiteSpace(remote.Role))
+        {
+            preset.Role = remote.Role;
+        }
+
+        if (!string.IsNullOrWhiteSpace(remote.CapabilitiesJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(remote.CapabilitiesJson);
+                var root = doc.RootElement;
+                if (root.ValueKind == JsonValueKind.Object)
+                {
+                    if (root.TryGetProperty("adapter", out var a) && a.ValueKind == JsonValueKind.String)
+                    {
+                        var adapter = a.GetString();
+                        if (!string.IsNullOrWhiteSpace(adapter))
+                        {
+                            preset.AdapterType = adapter.ToLowerInvariant();
+                        }
+                    }
+                    if (root.TryGetProperty("endpoint", out var ep) && ep.ValueKind == JsonValueKind.String)
+                    {
+                        preset.Endpoint = ep.GetString();
+                    }
+                    if (root.TryGetProperty("apiKey", out var k) && k.ValueKind == JsonValueKind.String)
+                    {
+                        preset.ApiKey = k.GetString();
+                    }
+                    if (root.TryGetProperty("defaultModel", out var dm) && dm.ValueKind == JsonValueKind.String)
+                    {
+                        preset.DefaultModel = dm.GetString();
+                    }
+                    if ((root.TryGetProperty("timeoutSeconds", out var ts) || root.TryGetProperty("timeout", out ts)) && ts.TryGetInt32(out var tVal))
+                    {
+                        preset.TimeoutSeconds = tVal;
+                    }
+                    if (root.TryGetProperty("maxRetries", out var mr) && mr.TryGetInt32(out var mrVal))
+                    {
+                        preset.MaxRetries = mrVal;
+                    }
+                    if (root.TryGetProperty("retryDelayMilliseconds", out var rdm) && rdm.TryGetInt32(out var rdmVal))
+                    {
+                        preset.RetryDelayMilliseconds = rdmVal;
+                    }
+                    if ((root.TryGetProperty("maxSteps", out var ms) || root.TryGetProperty("steps", out ms)) && ms.TryGetInt32(out var msVal))
+                    {
+                        preset.MaxSteps = msVal;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase))
+        {
+            if (preset.Capabilities == null || preset.Capabilities.Count == 0 ||
+                preset.Capabilities.SequenceEqual(new[] { "shell", "inspect_workspace" }))
+            {
+                preset.Capabilities = GetDefaultCapabilities("openai");
+            }
+            preset.Command = null;
+        }
+    }
+
     private static void EnsureBuiltInPresets(CliConfig config)
     {
         if (!config.Agents.ContainsKey("agy"))
@@ -159,6 +230,10 @@ public class ConfigStore
         if (id.StartsWith("agy", StringComparison.OrdinalIgnoreCase)) return "agy";
         if (id.StartsWith("claude", StringComparison.OrdinalIgnoreCase)) return "claude";
         if (id.StartsWith("copilot", StringComparison.OrdinalIgnoreCase)) return "copilot";
+        if (id.StartsWith("openai", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("ollama", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("vllm", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("lmstudio", StringComparison.OrdinalIgnoreCase)) return "openai";
         return "generic";
     }
 
@@ -167,6 +242,7 @@ public class ConfigStore
         "agy" => $"Antigravity ({id})",
         "claude" => $"Claude Code ({id})",
         "copilot" => $"GitHub Copilot ({id})",
+        "openai" => $"OpenAI Compatible ({id})",
         _ => $"Agent {id}"
     };
 
@@ -175,6 +251,7 @@ public class ConfigStore
         "agy" => "Autonomous Codebase Engineer",
         "claude" => "Anthropic Terminal Architect",
         "copilot" => "Shell & Git Specialist",
+        "openai" => "Autonomous AI Engineer",
         _ => "Codebase Engineer"
     };
 
@@ -183,6 +260,7 @@ public class ConfigStore
         "agy" => "agy",
         "claude" => "claude",
         "copilot" => "gh",
+        "openai" => null,
         _ => null
     };
 
@@ -191,6 +269,7 @@ public class ConfigStore
         "agy" => new List<string> { "run_command", "view_file", "replace_file_content" },
         "claude" => new List<string> { "bash", "edit_file", "read_file" },
         "copilot" => new List<string> { "explain", "suggest" },
+        "openai" => new List<string> { "run_command", "read_file", "write_file", "edit_file", "ask_question" },
         _ => new List<string> { "shell", "inspect_workspace" }
     };
 }

@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
-import type { Persona, Project, ProjectJob, JobTask, JobMessage } from '../types';
+import type { Persona, Project, ProjectJob, JobTask, JobMessage, AgentSession } from '../types';
 import { WorkspaceType, ProjectJobStatus } from '../types';
 
 vi.mock('../services/api', () => ({
@@ -778,6 +778,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       senderId: 'agy-astra',
       senderName: 'Astra',
       content: 'I have a question before we begin:',
+      mentions: [],
       turnSessionId: 'sess-q-turn-1',
       structuredPayloadJson: JSON.stringify({
         toolName: 'ask_question',
@@ -796,6 +797,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       id: 'sess-q-turn-1',
       title: 'Turn Session Q',
       status: 'waiting_for_input',
+      metadataJson: '{}',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };

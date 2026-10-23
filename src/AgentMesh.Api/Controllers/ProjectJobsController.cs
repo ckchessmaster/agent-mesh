@@ -1211,6 +1211,126 @@ public class ProjectJobsController(
         return Ok(dto);
     }
 
+    [HttpDelete("api/project-jobs/{id}/queued-turns/{turnId}")]
+    public async Task<IActionResult> CancelQueuedTurn(Guid id, Guid turnId)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var queuedTurns = ParseQueuedTurns(job.QueuedTurnsJson);
+        var turnToRemove = queuedTurns.FirstOrDefault(t => t.Id == turnId);
+        if (turnToRemove == null)
+        {
+            return NotFound(new { error = $"Queued turn '{turnId}' not found on job '{id}'." });
+        }
+
+        queuedTurns.RemoveAll(t => t.Id == turnId);
+        job.QueuedTurnsJson = JsonSerializer.Serialize(queuedTurns, JsonOpts);
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == turnToRemove.TargetPersonaId);
+        var personaName = persona?.Name ?? turnToRemove.TargetPersonaId;
+        var cancelMsg = new JobMessage
+        {
+            Id = Guid.NewGuid(),
+            JobId = id,
+            SenderType = "system",
+            SenderId = "operator",
+            SenderName = "System",
+            Content = $"Queued turn for @{personaName} was cancelled.",
+            MentionsJson = JsonSerializer.Serialize(new List<string> { turnToRemove.TargetPersonaId }, JsonOpts),
+            TurnSessionId = null,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.JobMessages.Add(cancelMsg);
+
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(cancelMsg));
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(new { message = "Queued turn cancelled successfully.", turnId, job = dto });
+    }
+
+    [HttpDelete("api/project-jobs/{id}/queued-turns")]
+    public async Task<IActionResult> CancelQueuedTurns(Guid id, [FromQuery] string? personaId = null)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var queuedTurns = ParseQueuedTurns(job.QueuedTurnsJson);
+        if (queuedTurns.Count == 0)
+        {
+            return Ok(new { message = "No queued turns to cancel.", count = 0 });
+        }
+
+        List<QueuedJobTurnDto> turnsToRemove;
+        if (!string.IsNullOrWhiteSpace(personaId))
+        {
+            var normPersonaId = personaId.Trim().ToLowerInvariant();
+            turnsToRemove = queuedTurns.Where(t => string.Equals(t.TargetPersonaId, normPersonaId, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+        else
+        {
+            turnsToRemove = queuedTurns.ToList();
+        }
+
+        if (turnsToRemove.Count == 0)
+        {
+            return Ok(new { message = "No matching queued turns to cancel.", count = 0 });
+        }
+
+        queuedTurns.RemoveAll(t => turnsToRemove.Any(r => r.Id == t.Id));
+        job.QueuedTurnsJson = JsonSerializer.Serialize(queuedTurns, JsonOpts);
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+
+        var targetPersonaIds = turnsToRemove.Select(t => t.TargetPersonaId).Distinct().ToList();
+        var nameById = await db.Personas.AsNoTracking()
+            .Where(p => targetPersonaIds.Contains(p.Id))
+            .ToDictionaryAsync(p => p.Id, p => p.Name);
+        var targetNames = string.Join(", ", targetPersonaIds.Select(pid => "@" + (nameById.TryGetValue(pid, out var n) ? n : pid)));
+        var cancelMsg = new JobMessage
+        {
+            Id = Guid.NewGuid(),
+            JobId = id,
+            SenderType = "system",
+            SenderId = "operator",
+            SenderName = "System",
+            Content = $"Cancelled {turnsToRemove.Count} queued turn(s) for {targetNames}.",
+            MentionsJson = JsonSerializer.Serialize(targetPersonaIds, JsonOpts),
+            TurnSessionId = null,
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.JobMessages.Add(cancelMsg);
+
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(cancelMsg));
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(new { message = $"Cancelled {turnsToRemove.Count} queued turn(s).", count = turnsToRemove.Count, job = dto });
+    }
+
     private static List<JobTaskDto> ParseTasks(string tasksJson)
     {
         if (string.IsNullOrWhiteSpace(tasksJson)) return new();

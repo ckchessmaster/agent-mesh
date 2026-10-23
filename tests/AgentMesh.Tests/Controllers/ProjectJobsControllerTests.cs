@@ -902,4 +902,273 @@ public class ProjectJobsControllerTests
         activeOnly.Should().HaveCount(1);
         activeOnly[0].Id.Should().Be(activeJob.Id);
     }
+
+    [Fact]
+    public async Task CancelQueuedTurn_RemovesTurn_CreatesSystemMessage_AndBroadcasts()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "proj-queued", Name = "Queued Turn Project" };
+        var persona = new Persona
+        {
+            Id = "spence-ai-rook",
+            Name = "Rook",
+            Role = "Software Engineer",
+            DriverId = "spence-ai",
+            PersonaPrompt = "Code"
+        };
+
+        var turnId = Guid.NewGuid();
+        var jobId = Guid.NewGuid();
+        var queuedTurn = new QueuedJobTurnDto(
+            Id: turnId,
+            JobId: jobId,
+            ProjectId: project.Id,
+            TargetPersonaId: persona.Id,
+            SenderType: "user",
+            SenderId: null,
+            SenderName: null,
+            Content: "Refactor timeout logic",
+            Mentions: new List<string> { persona.Id },
+            Attachments: null,
+            Priority: ProjectJobPriority.Normal,
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = project.Id,
+            Title = "Bug Hunt",
+            GitBranchName = "mesh/bug-hunt",
+            Priority = ProjectJobPriority.Normal,
+            QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { queuedTurn })
+        };
+
+        db.Personas.Add(persona);
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var mockHubContext = new Mock<IHubContext<AgentMeshHub>>();
+        var mockClients = new Mock<IHubClients>();
+        var mockClientProxy = new Mock<IClientProxy>();
+        mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockClients.Setup(c => c.Group(It.IsAny<string>())).Returns(mockClientProxy.Object);
+        mockHubContext.Setup(h => h.Clients).Returns(mockClients.Object);
+
+        var controller = new ProjectJobsController(db, mockHubContext.Object);
+
+        var res = await controller.CancelQueuedTurn(job.Id, turnId);
+        res.Should().BeOfType<OkObjectResult>();
+
+        // Verify turn was removed from job
+        var updatedJob = await db.ProjectJobs.FindAsync(job.Id);
+        var turns = ProjectJobsController.ParseQueuedTurns(updatedJob!.QueuedTurnsJson);
+        turns.Should().BeEmpty();
+
+        // Verify system cancellation message was posted
+        var messages = await db.JobMessages.Where(m => m.JobId == job.Id).ToListAsync();
+        messages.Should().HaveCount(1);
+        messages[0].SenderType.Should().Be("system");
+        messages[0].Content.Should().Contain("Queued turn for @Rook was cancelled.");
+
+        // Verify hub broadcasts were made
+        mockClientProxy.Verify(
+            p => p.SendCoreAsync("JobMessageCreated", It.IsAny<object[]>(), default),
+            Times.Once);
+        mockClientProxy.Verify(
+            p => p.SendCoreAsync("JobUpdated", It.IsAny<object[]>(), default),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task CancelQueuedTurn_ReturnsNotFound_WhenTurnDoesNotExist()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "proj-queued-404", Name = "Queued Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Bug Hunt",
+            GitBranchName = "mesh/bug-hunt",
+            QueuedTurnsJson = "[]"
+        };
+
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.CancelQueuedTurn(job.Id, Guid.NewGuid());
+        res.Should().BeOfType<NotFoundObjectResult>();
+    }
+
+    [Fact]
+    public async Task CancelQueuedTurns_CancelsAllForPersona_WithSingleSystemMessage_AndReturnsJobDto()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "proj-bulk", Name = "Bulk Project" };
+        var jobId = Guid.NewGuid();
+
+        QueuedJobTurnDto Mk(string personaId, string content) => new(
+            Id: Guid.NewGuid(),
+            JobId: jobId,
+            ProjectId: project.Id,
+            TargetPersonaId: personaId,
+            SenderType: "user",
+            SenderId: null,
+            SenderName: null,
+            Content: content,
+            Mentions: new List<string> { personaId },
+            Attachments: null,
+            Priority: ProjectJobPriority.Normal,
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        var rookTurns = new List<QueuedJobTurnDto> { Mk("rook", "one"), Mk("rook", "two"), Mk("rook", "three") };
+        var others = new List<QueuedJobTurnDto> { Mk("soren", "keep me") };
+        var all = rookTurns.Concat(others).ToList();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = project.Id,
+            Title = "Bug Hunt",
+            GitBranchName = "mesh/bug-hunt",
+            QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(all)
+        };
+
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "spence-ai", PersonaPrompt = "Code" });
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        var res = await controller.CancelQueuedTurns(job.Id, "rook");
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+
+        // Bulk cancel must emit ONE audit message, not one per turn (the fan-out
+        // equivalent produced N messages and raced on QueuedTurnsJson).
+        var messages = await db.JobMessages.Where(m => m.JobId == job.Id).ToListAsync();
+        messages.Should().HaveCount(1);
+        messages[0].SenderType.Should().Be("system");
+        messages[0].Content.Should().Contain("3 queued turn(s)");
+        // Display name, not raw persona id, matching the single-cancel message format.
+        messages[0].Content.Should().Contain("@Rook");
+
+        var remaining = ProjectJobsController.ParseQueuedTurns(job.QueuedTurnsJson);
+        remaining.Should().HaveCount(1);
+        remaining[0].Content.Should().Be("keep me");
+
+        // The dashboard relies on this DTO to sync authoritative queue state.
+        ok.Value.Should().NotBeNull();
+        var props = ok.Value!.GetType().GetProperties().ToDictionary(p => p.Name, p => p.GetValue(ok.Value));
+        props.Should().ContainKey("job");
+        props["job"].Should().BeOfType<ProjectJobDto>();
+        props["count"].Should().Be(3);
+        ((ProjectJobDto)props["job"]!).QueuedTurns.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task CancelQueuedTurns_ReturnsZeroCount_WhenNothingQueued()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "proj-empty-queue", Name = "Empty Queue Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Bug Hunt",
+            GitBranchName = "mesh/bug-hunt",
+            QueuedTurnsJson = "[]"
+        };
+
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.CancelQueuedTurns(job.Id);
+        res.Should().BeOfType<OkObjectResult>();
+
+        (await db.JobMessages.CountAsync(m => m.JobId == job.Id)).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task CancelQueuedTurn_ReturnsNotFound_WhenJobDoesNotExist()
+    {
+        using var db = TestDbContextFactory.Create();
+        var controller = new ProjectJobsController(db);
+        var res = await controller.CancelQueuedTurn(Guid.NewGuid(), Guid.NewGuid());
+        res.Should().BeOfType<NotFoundObjectResult>();
+    }
+
+    [Fact]
+    public async Task CancelQueuedTurns_FiltersByPersona_WhenPersonaIdSpecified()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "proj-multi-queued", Name = "Multi Queued Project" };
+        var jobId = Guid.NewGuid();
+
+        var turnRook = new QueuedJobTurnDto(
+            Id: Guid.NewGuid(),
+            JobId: jobId,
+            ProjectId: project.Id,
+            TargetPersonaId: "rook",
+            SenderType: "user",
+            SenderId: null,
+            SenderName: null,
+            Content: "Task for rook",
+            Mentions: new List<string> { "rook" },
+            Attachments: null,
+            Priority: ProjectJobPriority.Normal,
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        var turnSoren = new QueuedJobTurnDto(
+            Id: Guid.NewGuid(),
+            JobId: jobId,
+            ProjectId: project.Id,
+            TargetPersonaId: "soren",
+            SenderType: "user",
+            SenderId: null,
+            SenderName: null,
+            Content: "Task for soren",
+            Mentions: new List<string> { "soren" },
+            Attachments: null,
+            Priority: ProjectJobPriority.Normal,
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = project.Id,
+            Title = "Bug Hunt",
+            GitBranchName = "mesh/bug-hunt",
+            QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { turnRook, turnSoren })
+        };
+
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        // Cancel only rook's queued turn
+        var res = await controller.CancelQueuedTurns(job.Id, "rook");
+        res.Should().BeOfType<OkObjectResult>();
+
+        var updatedJob = await db.ProjectJobs.FindAsync(job.Id);
+        var remainingTurns = ProjectJobsController.ParseQueuedTurns(updatedJob!.QueuedTurnsJson);
+        remainingTurns.Should().HaveCount(1);
+        remainingTurns[0].TargetPersonaId.Should().Be("soren");
+    }
 }

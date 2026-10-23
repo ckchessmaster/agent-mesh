@@ -90,6 +90,16 @@ export const api = {
     return res.json();
   },
 
+  async testOpenAiServer(req: { endpoint: string; apiKey?: string }): Promise<{ success: boolean; error?: string; models: { id: string; name: string }[] }> {
+    const res = await apiFetch('/api/system/drivers/test-openai', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to test OpenAI server: ${res.statusText}`);
+    return res.json();
+  },
+
   async browseFilesystem(path?: string): Promise<FilesystemBrowseResponse> {
     const query = path ? `?path=${encodeURIComponent(path)}` : '';
     const res = await apiFetch(`/api/system/filesystem${query}`, { headers: getHeaders() });
@@ -871,5 +881,34 @@ export const api = {
     });
     if (!res.ok) throw new Error(`Failed to reopen job: ${res.statusText}`);
     return res.json();
+  },
+
+  async cancelQueuedJobTurn(jobId: string, turnId: string): Promise<ProjectJob | undefined> {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/queued-turns/${encodeURIComponent(turnId)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || err.message || `Failed to cancel queued turn: ${res.statusText}`);
+    }
+    const body = await res.json().catch(() => ({}));
+    return body?.job as ProjectJob | undefined;
+  },
+
+  async cancelQueuedJobTurns(jobId: string, personaId?: string): Promise<ProjectJob | undefined> {
+    const url = personaId
+      ? `/api/project-jobs/${encodeURIComponent(jobId)}/queued-turns?personaId=${encodeURIComponent(personaId)}`
+      : `/api/project-jobs/${encodeURIComponent(jobId)}/queued-turns`;
+    const res = await apiFetch(url, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || err.message || `Failed to cancel queued turns: ${res.statusText}`);
+    }
+    const body = await res.json().catch(() => ({}));
+    return body?.job as ProjectJob | undefined;
   }
 };
