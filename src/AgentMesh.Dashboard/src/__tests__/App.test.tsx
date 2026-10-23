@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+﻿import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
@@ -103,6 +103,7 @@ vi.mock('../services/api', () => ({
     updateSessionControls: vi.fn(),
     postSessionMessage: vi.fn(),
     upsertAgent: vi.fn(),
+    updateDriverConfig: vi.fn().mockResolvedValue({ adapter: 'openai', maxSteps: 250 }),
     stopSession: vi.fn().mockResolvedValue({ status: 'stopped', sessionId: 's1' }),
     stopCommand: vi.fn().mockResolvedValue({ status: 'stopped', commandId: 'c1' }),
     enqueuePrompt: vi.fn().mockResolvedValue({ session: {}, queue: [], dispatched: false }),
@@ -1893,6 +1894,86 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
       );
     });
   });
-});
+  it('opens the driver config modal from the driver row and saves limits through the API', async () => {
+    const openAiDriver: Agent = {
+      id: 'spence-ai',
+      name: 'Spence Private AI',
+      role: 'Autonomous Agent',
+      status: 'online',
+      runtimeType: 3,
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({ adapter: 'openai' }),
+      config: {
+        adapter: 'openai',
+        endpoint: 'http://127.0.0.1:11435/v1',
+        defaultModel: 'qwen3',
+        maxSteps: 100,
+        timeoutSeconds: 300,
+        maxRetries: 4,
+        hasApiKey: true
+      }
+    };
 
+    vi.mocked(api.getAgents).mockResolvedValue([openAiDriver]);
+    vi.mocked(api.getSessions).mockResolvedValue([]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Spence Private AI')).toBeInTheDocument();
+    });
+
+    // The trigger must exist per driver row; before this wiring the modal was built
+    // and unit-tested in isolation but nothing in the app could ever open it.
+    fireEvent.click(screen.getByRole('button', { name: 'Configure Spence Private AI driver settings' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Configure driver Spence Private AI' });
+    expect(dialog).toBeInTheDocument();
+    expect(screen.getByLabelText(/Max steps per turn/i)).toHaveValue(100);
+
+    fireEvent.change(screen.getByLabelText(/Max steps per turn/i), { target: { value: '250' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => {
+      expect(api.updateDriverConfig).toHaveBeenCalledWith('spence-ai', { maxSteps: 250 });
+    });
+
+    // Saved config comes back from the API and the modal closes, so a reopen shows the new value.
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Configure driver Spence Private AI' })).not.toBeInTheDocument();
+    });
+  });
+
+  it('does not offer turn limits for CLI drivers, which have no step loop to configure', async () => {
+    const cliDriver: Agent = {
+      id: 'claude',
+      name: 'Claude Code CLI',
+      role: 'Terminal Architect',
+      status: 'online',
+      runtimeType: 0,
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({ adapter: 'claude' }),
+      config: { adapter: 'claude', hasApiKey: false }
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([cliDriver]);
+    vi.mocked(api.getSessions).mockResolvedValue([]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Claude Code CLI')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Configure Claude Code CLI driver settings' }));
+    await screen.findByRole('dialog', { name: 'Configure driver Claude Code CLI' });
+
+    expect(screen.queryByLabelText(/Max steps per turn/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Endpoint URL/i)).not.toBeInTheDocument();
+  });
+});
 

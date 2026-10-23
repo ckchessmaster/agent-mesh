@@ -326,7 +326,6 @@ export default function App() {
   const [newAgentEndpoint, setNewAgentEndpoint] = useState('http://localhost:11434/v1');
   const [newAgentApiKey, setNewAgentApiKey] = useState('');
   const [newAgentModel, setNewAgentModel] = useState('');
-  const [newAgentMaxSteps, setNewAgentMaxSteps] = useState('');
   const [isTestingOpenAi, setIsTestingOpenAi] = useState(false);
   const [openAiTestResult, setOpenAiTestResult] = useState<{
     success: boolean;
@@ -3293,17 +3292,32 @@ export default function App() {
                             </div>
                           </div>
 
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedAgentId(agent.id);
-                              setIsCreatingSession(true);
-                            }}
-                            className="p-1 rounded-md bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition shrink-0 cursor-pointer"
-                            title={`New Session with ${agent.name}`}
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                          </button>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfigAgent(agent);
+                              }}
+                              className="p-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-sky-400 transition cursor-pointer"
+                              title={`Configure ${agent.name} (endpoint, API key, limits)`}
+                              aria-label={`Configure ${agent.name} driver settings`}
+                            >
+                              <Sliders className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedAgentId(agent.id);
+                                setIsCreatingSession(true);
+                              }}
+                              className="p-1 rounded-md bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition cursor-pointer"
+                              title={`New Session with ${agent.name}`}
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
 
                         {/* Driver's Sessions (across all associated Personas) */}
@@ -6149,6 +6163,16 @@ export default function App() {
           onClose={() => setShowJobModal(false)}
           project={jobModalProject}
           onCreate={handleCreateJob}
+        />
+      )}
+
+      {configAgent && (
+        <DriverConfigModal
+          agent={configAgent}
+          initialConfig={agents.find((a) => a.id === configAgent.id)?.config ?? configAgent.config}
+          saving={isSavingDriverConfig}
+          onClose={() => setConfigAgent(null)}
+          onSave={(patch) => handleSaveDriverConfig(configAgent.id, patch)}
         />
       )}
     </div>
