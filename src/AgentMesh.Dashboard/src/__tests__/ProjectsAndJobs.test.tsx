@@ -31,6 +31,7 @@ vi.mock('../services/api', () => ({
     getJobTasks: vi.fn(),
     addJobTask: vi.fn(),
     updateJobTask: vi.fn(),
+    assignJobTask: vi.fn(),
     deleteJobTask: vi.fn(),
     getJobMessages: vi.fn(),
     postJobMessage: vi.fn(),
@@ -383,6 +384,105 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     await waitFor(() => {
       expect(api.addJobTask).toHaveBeenCalledWith('job-101', { title: 'Deploy to staging' });
     });
+  });
+
+  it('applies the server job DTO after reassigning a task, converging queue and chat', async () => {
+    // Reassignment can move parked queued turns and append a system message. Patching only
+    // the assignee field locally would leave the queue and the transcript disagreeing with
+    // the DB, so App must take the returned job wholesale.
+    const reassignedJob: ProjectJob = {
+      ...mockJob,
+      tasks: [
+        { ...mockTasks[0] },
+        { ...mockTasks[1], assignedPersonaId: 'qa-tester' }
+      ],
+      queuedTurns: [
+        {
+          id: 'turn-9',
+          jobId: 'job-101',
+          projectId: 'mesh-core',
+          targetPersonaId: 'qa-tester',
+          senderType: 'user',
+          content: 'please cover token exchange',
+          mentions: ['qa-tester'],
+          priority: 1,
+          createdAt: new Date().toISOString()
+        }
+      ]
+    };
+
+    vi.mocked(api.assignJobTask).mockResolvedValue({
+      task: reassignedJob.tasks[1],
+      fromPersonaId: null,
+      toPersonaId: 'qa-tester',
+      fromPersonaName: null,
+      toPersonaName: 'QA Tester',
+      isTargetTask: true,
+      movedQueuedTurnCount: 1,
+      dispatchedToNewAssignee: false,
+      job: reassignedJob
+    });
+
+    const messagesAfterHandover: JobMessage[] = [
+      ...mockMessages,
+      {
+        id: 'm-system-1',
+        jobId: 'job-101',
+        senderType: 'system',
+        senderName: 'System',
+        content: 'Task "Write integration test coverage" reassigned from @Astra to @QA Tester — moved 1 queued turn to @QA Tester.',
+        mentions: ['astra', 'qa-tester'],
+        createdAt: new Date().toISOString()
+      }
+    ];
+    vi.mocked(api.getJobMessages).mockResolvedValue(messagesAfterHandover);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    const assignSelect = await screen.findByTestId('assign-task-task-2');
+    fireEvent.change(assignSelect, { target: { value: 'qa-tester' } });
+
+    await waitFor(() => {
+      expect(api.assignJobTask).toHaveBeenCalledWith('job-101', 'task-2', 'qa-tester');
+    });
+
+    // Row reflects the server's answer, not an optimistic guess.
+    await waitFor(() => {
+      expect((screen.getByTestId('assign-task-task-2') as HTMLSelectElement).value).toBe('qa-tester');
+    });
+
+    // The handover message is pulled back in so the chat explains why the queue moved.
+    await waitFor(() => {
+      expect(screen.getByText(/reassigned from @Astra to @QA Tester/)).toBeInTheDocument();
+    });
+  });
+
+  it('shows the server rejection inline when assigning to someone off the team', async () => {
+    vi.mocked(api.assignJobTask).mockRejectedValue(
+      new Error("Persona 'Ghost' is not on the team for project 'mesh-core'")
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+    const assignSelect = await screen.findByTestId('assign-task-task-2');
+    fireEvent.change(assignSelect, { target: { value: 'astra' } });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('task-assign-error')).toHaveTextContent('is not on the team');
+    });
+
+    // The row must not look assigned when the server said no.
+    expect((screen.getByTestId('assign-task-task-2') as HTMLSelectElement).value).toBe('');
   });
 
   it('supports completing and merging a job with result summary', async () => {

@@ -306,6 +306,18 @@ export interface JobTask {
   attachments?: SessionAttachment[] | null;
 }
 
+export interface AssignJobTaskResult {
+  task: JobTask;
+  fromPersonaId?: string | null;
+  toPersonaId?: string | null;
+  fromPersonaName?: string | null;
+  toPersonaName?: string | null;
+  isTargetTask: boolean;
+  movedQueuedTurnCount: number;
+  dispatchedToNewAssignee: boolean;
+  job: ProjectJob;
+}
+
 export interface ProjectJob {
   id: string;
   projectId: string;

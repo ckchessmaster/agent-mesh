@@ -130,6 +130,23 @@ export interface StagedJobAttachmentItem {
   uploaded?: SessionAttachment;
 }
 
+/**
+ * Which pending task a persona would treat as its focus: the first one assigned to them,
+ * else the first nobody owns (the "tell an agent to grab it" flow), else the first pending.
+ * Mirrors ProjectJobsController.ResolveTargetTask so the cockpit can point a queued turn's
+ * reassignment at the right task without another round trip.
+ */
+export function resolveTargetTaskId(tasks: JobTask[], personaId?: string | null): string | null {
+  const pending = tasks.filter((t) => !t.isCompleted);
+  if (pending.length === 0) return null;
+  if (!personaId) return pending[0].id;
+  const norm = personaId.trim().toLowerCase();
+  const mine = pending.find((t) => (t.assignedPersonaId || '').trim().toLowerCase() === norm);
+  if (mine) return mine.id;
+  const unowned = pending.find((t) => !(t.assignedPersonaId || '').trim());
+  return unowned ? unowned.id : pending[0].id;
+}
+
 export function getActiveMentionQuery(
   text: string,
   cursorPos: number
@@ -162,7 +179,9 @@ interface JobCockpitProps {
   onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
   onAddTask: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
   onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
-  onUpdateTask?: (taskId: string, updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string; attachments?: SessionAttachment[] }) => Promise<void>;
+  onUpdateTask?: (taskId: string, updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }) => Promise<void>;
+  /** Assign/reassign a task. Passing null clears the assignee. */
+  onAssignTask?: (taskId: string, personaId: string | null) => Promise<void>;
   onDeleteTask: (taskId: string) => Promise<void>;
   onCompleteJob: (resultSummary?: string) => Promise<void>;
   onArchiveJob?: () => Promise<void>;
@@ -192,6 +211,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onAddTask,
   onToggleTask,
   onUpdateTask,
+  onAssignTask,
   onDeleteTask,
   onCompleteJob,
   onArchiveJob,
@@ -237,6 +257,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const newTaskFileInputRef = useRef<HTMLInputElement>(null);
   const existingTaskFileInputRef = useRef<HTMLInputElement>(null);
   const [targetTaskForUpload, setTargetTaskForUpload] = useState<string | null>(null);
+
+  // Assignment: which row is mid-request, and the last failure to surface inline.
+  const [assigningTaskId, setAssigningTaskId] = useState<string | null>(null);
+  const [assignError, setAssignError] = useState<string | null>(null);
   const [isUploadingTaskAttachment, setIsUploadingTaskAttachment] = useState<string | null>(null);
 
   // Team Member Autocomplete Palette State
@@ -483,6 +507,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
     return [];
   }, [project.assignedPersonas, project.defaultLeadPersonaId, personas]);
+
+  // Assignee ids come from the server, but the cockpit shows display names.
+  const memberNameFor = useCallback(
+    (personaId?: string | null) => {
+      if (!personaId) return '';
+      const norm = personaId.trim().toLowerCase();
+      const member = teamMembers.find((m) => m.id.toLowerCase() === norm);
+      if (member) return member.name;
+      const persona = personas.find((p) => p.id.toLowerCase() === norm);
+      return persona?.name || personaId;
+    },
+    [teamMembers, personas]
+  );
 
   const filteredMentionMembers = useMemo(() => {
     const q = mentionState.query.toLowerCase().trim();
@@ -852,6 +889,22 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       }
     } finally {
       setIsAddingTask(false);
+    }
+  };
+
+  const handleAssignTask = async (taskId: string, rawValue: string) => {
+    if (!onAssignTask) return;
+    const personaId = rawValue ? rawValue : null;
+    setAssigningTaskId(taskId);
+    setAssignError(null);
+    try {
+      await onAssignTask(taskId, personaId);
+    } catch (err) {
+      // Keep the failure inline on the row that caused it: a silent revert looks like the
+      // click did nothing, which is how people end up clicking assign three times.
+      setAssignError(err instanceof Error ? err.message : 'Failed to assign task');
+    } finally {
+      setAssigningTaskId(null);
     }
   };
 
@@ -1369,6 +1422,43 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                       </div>
 
                       <div className="flex items-center gap-2 shrink-0">
+                        {!task.isCompleted && onAssignTask ? (
+                          <select
+                            value={task.assignedPersonaId || ''}
+                            disabled={assigningTaskId === task.id}
+                            onChange={(e) => handleAssignTask(task.id, e.target.value)}
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={`Assignee for task ${task.title}`}
+                            data-testid={`assign-task-${task.id}`}
+                            title={
+                              task.assignedPersonaId
+                                ? `Assigned to @${memberNameFor(task.assignedPersonaId)} — change assignee`
+                                : 'Unassigned — pick who owns this task'
+                            }
+                            className={`max-w-[130px] rounded-md border px-1.5 py-1 text-[10px] transition focus:outline-none focus:border-sky-500 disabled:opacity-50 cursor-pointer ${
+                              task.assignedPersonaId
+                                ? 'bg-sky-500/10 border-sky-500/30 text-sky-200'
+                                : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            <option value="">Unassigned</option>
+                            {teamMembers.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                {m.name}
+                              </option>
+                            ))}
+                          </select>
+                        ) : task.assignedPersonaId ? (
+                          // Completed rows keep the assignee as read-only history: reassigning
+                          // work that is already done would move nothing but the label.
+                          <span
+                            className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/60 text-slate-400 border border-slate-700/50 truncate max-w-[110px]"
+                            title={`Was handled by @${memberNameFor(task.assignedPersonaId)}`}
+                            data-testid={`task-assignee-static-${task.id}`}
+                          >
+                            @{memberNameFor(task.assignedPersonaId)}
+                          </span>
+                        ) : null}
                         {task.isCompleted ? (
                           <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
                             Completed
@@ -1447,6 +1537,26 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     </div>
                   );
                 })}
+              </div>
+            )}
+
+            {assignError && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 px-3 py-2 rounded-xl bg-rose-950/40 border border-rose-500/40 text-[11px] text-rose-200"
+                data-testid="task-assign-error"
+              >
+                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-400" />
+                <span className="min-w-0 flex-1 break-words">{assignError}</span>
+                <button
+                  type="button"
+                  onClick={() => setAssignError(null)}
+                  className="text-rose-300 hover:text-white p-0.5 rounded transition cursor-pointer shrink-0"
+                  title="Dismiss"
+                  data-testid="task-assign-error-dismiss"
+                >
+                  <X className="w-3 h-3" />
+                </button>
               </div>
             )}
 
@@ -2140,6 +2250,47 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                             {turn.content.slice(0, 60)}{turn.content.length > 60 ? '...' : ''}
                           </p>
                         </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                        {onAssignTask && (
+                          <select
+                            value={turn.targetPersonaId}
+                            disabled={assigningTaskId === `turn:${turn.id}`}
+                            onChange={async (e) => {
+                              const nextPersona = e.target.value;
+                              if (!nextPersona || nextPersona === turn.targetPersonaId) return;
+                              // The queued message belongs to whoever was going to run the
+                              // task it landed on, so redirecting it means reassigning that
+                              // task — which is what moves the turn server-side.
+                              const targetTaskId = resolveTargetTaskId(uniqueTasks, turn.targetPersonaId);
+                              if (!targetTaskId) {
+                                setAssignError('This queued turn has no task to reassign. Add a task first, or cancel the turn.');
+                                return;
+                              }
+                              setAssigningTaskId(`turn:${turn.id}`);
+                              setAssignError(null);
+                              try {
+                                await onAssignTask(targetTaskId, nextPersona);
+                              } catch (err) {
+                                setAssignError(err instanceof Error ? err.message : 'Failed to reassign queued turn');
+                              } finally {
+                                setAssigningTaskId(null);
+                              }
+                            }}
+                            aria-label={`Reassign queued turn for ${displayName}`}
+                            data-testid={`reassign-queued-turn-${turn.id}`}
+                            title="Send this queued turn to a different team member"
+                            className="max-w-[110px] rounded-md border bg-amber-950/60 border-amber-500/30 text-amber-100 px-1.5 py-1 text-[10px] transition focus:outline-none focus:border-sky-500 disabled:opacity-50 cursor-pointer"
+                          >
+                            <option value={turn.targetPersonaId}>@{displayName}</option>
+                            {teamMembers
+                              .filter((m) => m.id !== turn.targetPersonaId)
+                              .map((m) => (
+                                <option key={m.id} value={m.id}>
+                                  → {m.name}
+                                </option>
+                              ))}
+                          </select>
+                        )}
                         {onCancelQueuedTurn && (
                           <button
                             type="button"
@@ -2152,6 +2303,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                             <span>Cancel</span>
                           </button>
                         )}
+                        </div>
                       </div>
                     );
                   })}

@@ -460,27 +460,36 @@ public class ProjectJobsController(
             ? null
             : task.AssignedPersonaId.Trim().ToLowerInvariant();
 
-        // Evaluated before the change: was this the outgoing assignee's focus task?
-        var wasFocusTask = fromPersonaId != null && ResolveTargetTask(tasks, fromPersonaId)?.Id == task.Id;
+        // Who was about to do this task, worked out from the parked turns rather than from
+        // the label alone. A task can be unassigned and still have someone queued to run it
+        // (the "tell an agent to grab it" flow), and in that case the operator redirecting
+        // the work expects the queued message to follow it. Resolved before the change, so
+        // it reflects the outgoing state.
+        var queuedTurnsBefore = ParseQueuedTurns(job.QueuedTurnsJson);
+        var outgoingPersonaId = fromPersonaId
+            ?? queuedTurnsBefore
+                .Select(t => t.TargetPersonaId?.Trim().ToLowerInvariant())
+                .FirstOrDefault(pid => pid != null && ResolveTargetTask(tasks, pid)?.Id == task.Id);
+
+        var wasFocusTask = outgoingPersonaId != null && ResolveTargetTask(tasks, outgoingPersonaId)?.Id == task.Id;
 
         task.AssignedPersonaId = toPersonaId;
 
         var movedTurnCount = 0;
         var takeQueuedTurns = req.TakeQueuedTurns ?? true;
         List<Guid> movedTurnIds = new();
-        if (takeQueuedTurns && wasFocusTask && toPersonaId != null && fromPersonaId != null)
+        if (takeQueuedTurns && wasFocusTask && toPersonaId != null && outgoingPersonaId != null)
         {
-            var queuedTurns = ParseQueuedTurns(job.QueuedTurnsJson);
-            var parked = queuedTurns
-                .Where(t => string.Equals(t.TargetPersonaId, fromPersonaId, StringComparison.OrdinalIgnoreCase))
+            var parked = queuedTurnsBefore
+                .Where(t => string.Equals(t.TargetPersonaId, outgoingPersonaId, StringComparison.OrdinalIgnoreCase))
                 .ToList();
             if (parked.Count > 0)
             {
                 movedTurnIds = parked.Select(t => t.Id).ToList();
-                queuedTurns = queuedTurns
+                var rewritten = queuedTurnsBefore
                     .Select(t => movedTurnIds.Contains(t.Id) ? t with { TargetPersonaId = toPersonaId } : t)
                     .ToList();
-                job.QueuedTurnsJson = JsonSerializer.Serialize(queuedTurns, JsonOpts);
+                job.QueuedTurnsJson = JsonSerializer.Serialize(rewritten, JsonOpts);
                 movedTurnCount = parked.Count;
             }
         }
@@ -489,7 +498,7 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
 
         JobMessage? auditMsg = null;
-        var fromPersonaName = fromPersonaId == null ? null : await ResolvePersonaNameAsync(fromPersonaId);
+        var outgoingPersonaName = outgoingPersonaId == null ? null : await ResolvePersonaNameAsync(outgoingPersonaId);
         var toPersonaName = toPersonaId == null ? null : (toPersona?.Name ?? toPersonaId);
         if (movedTurnCount > 0)
         {
@@ -500,8 +509,8 @@ public class ProjectJobsController(
                 SenderType = "system",
                 SenderId = "operator",
                 SenderName = "System",
-                Content = $"Task \"{task.Title}\" reassigned from @{fromPersonaName} to @{toPersonaName} — moved {movedTurnCount} queued turn{(movedTurnCount == 1 ? "" : "s")} to @{toPersonaName}.",
-                MentionsJson = JsonSerializer.Serialize(new List<string> { fromPersonaId!, toPersonaId! }, JsonOpts),
+                Content = $"Task \"{task.Title}\" reassigned from @{outgoingPersonaName} to @{toPersonaName} — moved {movedTurnCount} queued turn{(movedTurnCount == 1 ? "" : "s")} to @{toPersonaName}.",
+                MentionsJson = JsonSerializer.Serialize(new List<string> { outgoingPersonaId!, toPersonaId! }, JsonOpts),
                 TurnSessionId = null,
                 CreatedAt = DateTimeOffset.UtcNow
             };
@@ -545,7 +554,7 @@ public class ProjectJobsController(
             Task: task,
             FromPersonaId: fromPersonaId,
             ToPersonaId: toPersonaId,
-            FromPersonaName: fromPersonaName,
+            FromPersonaName: outgoingPersonaName,
             ToPersonaName: toPersonaName,
             IsTargetTask: wasFocusTask,
             MovedQueuedTurnCount: movedTurnCount,

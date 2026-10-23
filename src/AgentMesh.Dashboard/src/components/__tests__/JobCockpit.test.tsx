@@ -1,6 +1,6 @@
-import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
+﻿import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
-import { JobCockpit, getActiveMentionQuery } from '../JobCockpit';
+import { JobCockpit, getActiveMentionQuery, resolveTargetTaskId } from '../JobCockpit';
 import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment, type AgentSession } from '../../types';
 import { api } from '../../services/api';
 
@@ -1343,5 +1343,166 @@ describe('JobCockpit - Attachment Support', () => {
     // Main composer is NOT blocked by question placeholder
     const textarea = screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i);
     expect(textarea).toBeInTheDocument();
+  });
+});
+
+describe('JobCockpit - Task assignment and reassignment', () => {
+  const mockProject: Project = {
+    id: 'agent-mesh',
+    name: 'Agent Mesh',
+    description: '',
+    workspaceType: 0,
+    gitBaseBranch: 'main',
+    projectInstructions: '',
+    defaultLeadPersonaId: 'agy-astra',
+    defaultLeadPersonaName: 'Astra',
+    assignedPersonas: [
+      { id: 'agy-astra', name: 'Astra', role: 'Tech Lead', driverId: 'agy' },
+      { id: 'agy-soren', name: 'Soren', role: 'Codebase Engineer', driverId: 'agy' }
+    ],
+    jobCount: 1,
+    activeJobCount: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const mockJob: ProjectJob = {
+    id: 'job-assign-1',
+    projectId: 'agent-mesh',
+    projectName: 'Agent Mesh',
+    title: 'Assignment Interface Test',
+    description: '',
+    status: ProjectJobStatus.Active,
+    gitBranchName: 'mesh/job-assign-1',
+    tasks: [],
+    messageCount: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const mockProps = {
+    project: mockProject,
+    job: mockJob,
+    tasks: [] as JobTask[],
+    messages: [] as JobMessage[],
+    onSendMessage: vi.fn(),
+    onAddTask: vi.fn(),
+    onToggleTask: vi.fn(),
+    onDeleteTask: vi.fn(),
+    onCompleteJob: vi.fn()
+  };
+
+  const assignedTasks: JobTask[] = [
+    { id: 't-1', title: 'Owned by Astra', isCompleted: false, assignedPersonaId: 'agy-astra' },
+    { id: 't-2', title: 'Nobody owns this', isCompleted: false }
+  ];
+
+  it('resolveTargetTaskId prefers the persona\'s own task, then an unowned one', () => {
+    expect(resolveTargetTaskId(assignedTasks, 'agy-astra')).toBe('t-1');
+    // Soren owns nothing, so he picks up the unowned row rather than Astra's.
+    expect(resolveTargetTaskId(assignedTasks, 'agy-soren')).toBe('t-2');
+    expect(resolveTargetTaskId(assignedTasks, null)).toBe('t-1');
+    expect(resolveTargetTaskId([], 'agy-astra')).toBeNull();
+
+    // Everything owned: nobody else may claim a teammate's task.
+    const allOwned: JobTask[] = [
+      { id: 'a', title: 'A', isCompleted: false, assignedPersonaId: 'agy-astra' }
+    ];
+    expect(resolveTargetTaskId(allOwned, 'agy-soren')).toBe('a');
+  });
+
+  it('renders an assignee picker per task row and sends the chosen persona', () => {
+    const onAssignTask = vi.fn().mockResolvedValue(undefined);
+    render(<JobCockpit {...mockProps} tasks={assignedTasks} onAssignTask={onAssignTask} />);
+
+    const astraSelect = screen.getByTestId('assign-task-t-1');
+    const unassignedSelect = screen.getByTestId('assign-task-t-2');
+    expect((astraSelect as HTMLSelectElement).value).toBe('agy-astra');
+    expect((unassignedSelect as HTMLSelectElement).value).toBe('');
+    // The row must offer the team by display name, not raw persona ids.
+    expect(within(astraSelect).getByRole('option', { name: 'Soren' })).toBeInTheDocument();
+    expect(within(astraSelect).getByRole('option', { name: 'Unassigned' })).toBeInTheDocument();
+
+    fireEvent.change(unassignedSelect, { target: { value: 'agy-soren' } });
+    expect(onAssignTask).toHaveBeenCalledWith('t-2', 'agy-soren');
+
+    // Choosing "Unassigned" clears rather than being ignored.
+    fireEvent.change(astraSelect, { target: { value: '' } });
+    expect(onAssignTask).toHaveBeenCalledWith('t-1', null);
+  });
+
+  it('surfaces a failed assignment inline instead of reverting silently', async () => {
+    const onAssignTask = vi.fn().mockRejectedValue(new Error("Persona 'x' is not on the team"));
+    render(<JobCockpit {...mockProps} tasks={assignedTasks} onAssignTask={onAssignTask} />);
+
+    fireEvent.change(screen.getByTestId('assign-task-t-2'), { target: { value: 'agy-soren' } });
+
+    await waitFor(() => {
+      const alert = screen.getByTestId('task-assign-error');
+      expect(alert).toHaveTextContent("Persona 'x' is not on the team");
+    });
+
+    fireEvent.click(screen.getByTestId('task-assign-error-dismiss'));
+    expect(screen.queryByTestId('task-assign-error')).not.toBeInTheDocument();
+  });
+
+  it('hides the assignee picker when no handler is provided', () => {
+    render(<JobCockpit {...mockProps} tasks={assignedTasks} />);
+    expect(screen.queryByTestId('assign-task-t-1')).not.toBeInTheDocument();
+  });
+
+  it('shows a completed task\'s assignee as read-only history rather than a picker', () => {
+    const done: JobTask[] = [
+      { id: 't-9', title: 'Shipped', isCompleted: true, assignedPersonaId: 'agy-astra' }
+    ];
+    const onAssignTask = vi.fn();
+    render(<JobCockpit {...mockProps} tasks={done} onAssignTask={onAssignTask} />);
+
+    // Filter defaults to pending, so switch to All to see the row.
+    fireEvent.click(screen.getByRole('button', { name: /^All/i }));
+    expect(screen.queryByTestId('assign-task-t-9')).not.toBeInTheDocument();
+    expect(screen.getByTestId('task-assignee-static-t-9')).toHaveTextContent('@Astra');
+  });
+
+  it('reassigns a queued turn by moving the task it was parked on', () => {
+    const onAssignTask = vi.fn().mockResolvedValue(undefined);
+    const queuedJob: ProjectJob = {
+      ...mockJob,
+      queuedTurns: [
+        {
+          id: 'turn-1',
+          jobId: 'job-1',
+          projectId: 'agent-mesh',
+          targetPersonaId: 'agy-astra',
+          senderType: 'user',
+          senderName: 'Operator',
+          content: 'please finish the scroll fix',
+          mentions: ['agy-astra'],
+          priority: 1,
+          createdAt: new Date().toISOString()
+        }
+      ]
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={queuedJob}
+        tasks={assignedTasks}
+        onAssignTask={onAssignTask}
+        onCancelQueuedTurn={vi.fn()}
+      />
+    );
+
+    expect(screen.getByTestId('queued-turn-item-turn-1')).toBeInTheDocument();
+    const reassign = screen.getByTestId('reassign-queued-turn-turn-1');
+    expect((reassign as HTMLSelectElement).value).toBe('agy-astra');
+    // Only the *other* teammates are offered as targets.
+    expect(within(reassign).getByRole('option', { name: /Soren/ })).toBeInTheDocument();
+    expect(within(reassign).queryByRole('option', { name: /Astra/ })).not.toBeInTheDocument();
+
+    fireEvent.change(reassign, { target: { value: 'agy-soren' } });
+    // Astra's focus task is t-1, so that is the task whose queue must move.
+    expect(onAssignTask).toHaveBeenCalledWith('t-1', 'agy-soren');
   });
 });

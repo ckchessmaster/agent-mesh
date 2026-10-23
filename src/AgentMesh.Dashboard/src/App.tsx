@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
+﻿import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Bot,
   Brain,
@@ -851,7 +851,7 @@ export default function App() {
 
   const handleUpdateTask = async (
     taskId: string,
-    updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; assignedPersonaId?: string; attachments?: SessionAttachment[] }
+    updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }
   ) => {
     if (!selectedJobId) return;
     const updated = await api.updateJobTask(selectedJobId, taskId, updates);
@@ -860,6 +860,33 @@ export default function App() {
 
   const handleToggleTask = async (taskId: string, isCompleted: boolean) => {
     await handleUpdateTask(taskId, { isCompleted });
+  };
+
+  const handleAssignTask = async (taskId: string, personaId: string | null) => {
+    if (!selectedJobId) return;
+    try {
+      const result = await api.assignJobTask(selectedJobId, taskId, personaId);
+      // The server DTO is authoritative for both lists: a reassignment can move queued turns
+      // and append a system message, so patching only the assignee field would leave the
+      // queue and the checklist disagreeing with the DB.
+      if (result.job) {
+        applyJobFromServer(result.job);
+        setJobTasks(result.job.tasks || []);
+      } else {
+        // No DTO to trust (older server): fall back to the single row rather than clearing
+        // the whole checklist.
+        setJobTasks((prev) => prev.map((t) => (t.id === taskId ? result.task : t)));
+      }
+      if (result.movedQueuedTurnCount > 0) {
+        const msgs = await api.getJobMessages(selectedJobId);
+        setJobMessages(msgs);
+      }
+    } catch (err) {
+      console.error('Failed to assign task:', err);
+      // Rethrown so the cockpit can show it against the row that failed instead of a
+      // generic banner far away from where the click happened.
+      throw err;
+    }
   };
 
   const handleDeleteTask = async (taskId: string) => {
@@ -3380,6 +3407,7 @@ export default function App() {
                     onAddTask={handleAddTask}
                     onToggleTask={handleToggleTask}
                     onUpdateTask={handleUpdateTask}
+                    onAssignTask={handleAssignTask}
                     onDeleteTask={handleDeleteTask}
                     onCompleteJob={handleCompleteJob}
                     onArchiveJob={handleArchiveJob}

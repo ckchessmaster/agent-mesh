@@ -5,6 +5,7 @@ import type {
   FilesystemBrowseResponse,
   JobMessage,
   JobTask,
+  AssignJobTaskResult,
   Persona,
   Project,
   ProjectJob,
@@ -719,6 +720,8 @@ export const api = {
     return res.json();
   },
 
+  /** assignedPersonaId is accepted on create (a task can be born owned); updates must go
+   * through assignJobTask, which also moves the queued turns that follow assignment. */
   async addJobTask(id: string, req: { title: string; assignedPersonaId?: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }): Promise<JobTask> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks`, {
       method: 'POST',
@@ -729,13 +732,40 @@ export const api = {
     return res.json();
   },
 
-  async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; assignedPersonaId?: string; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }): Promise<JobTask> {
+  async updateJobTask(id: string, taskId: string, req: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }): Promise<JobTask> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(req)
     });
     if (!res.ok) throw new Error(`Failed to update task: ${res.statusText}`);
+    return res.json();
+  },
+
+  /**
+   * Assigns/reassigns a task. The server returns the full job DTO because reassignment can
+   * move queued turns and append a system message; filtering those locally would diverge
+   * from what actually persisted.
+   */
+  async assignJobTask(
+    jobId: string,
+    taskId: string,
+    personaId: string | null,
+    takeQueuedTurns = true
+  ): Promise<AssignJobTaskResult> {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}/assignee`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ personaId, takeQueuedTurns })
+    });
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errBody = await res.json();
+        if (errBody?.error) errMsg = errBody.error;
+      } catch { }
+      throw new Error(`Failed to assign task: ${errMsg}`);
+    }
     return res.json();
   },
 

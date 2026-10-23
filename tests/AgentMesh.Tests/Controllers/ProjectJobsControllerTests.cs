@@ -1392,6 +1392,10 @@ public class ProjectJobsControllerTests
         result.MovedQueuedTurnCount.Should().Be(1);
         result.FromPersonaName.Should().Be("Astra");
         result.ToPersonaName.Should().Be("Soren");
+        result.DispatchedToNewAssignee.Should().BeTrue();
+        // The DTO handed back must match what was persisted, so open cockpits converge.
+        result.Job.QueuedTurns.Should().BeEmpty();
+        result.Job.Tasks.Single().AssignedPersonaId.Should().Be("soren");
 
         var audit = await db.JobMessages.Where(m => m.JobId == job.Id && m.SenderType == "system").ToListAsync();
         audit.Should().HaveCount(1);
@@ -1457,6 +1461,70 @@ public class ProjectJobsControllerTests
         var persistedTurns = ProjectJobsController.ParseQueuedTurns((await db.ProjectJobs.FindAsync(job.Id))!.QueuedTurnsJson);
         persistedTurns.Should().ContainSingle(t => t.TargetPersonaId == "soren");
         (await db.AgentSessions.CountAsync(s => s.PersonaId == "soren")).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task AssignJobTask_ReportsDispatchedByTurnIdNotByEmptyQueue()
+    {
+        // Soren also has his own work parked on this job. After the handover the queue is
+        // still non-empty, so an "is the queue empty?" check would report a handover that
+        // actually succeeded as a failure.
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-dispatchflag", sorenMaxConcurrentJobs: 1);
+        var focusTask = new JobTaskDto { Id = Guid.NewGuid(), Title = "Dispatch check", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "Dispatch Flag Job", new List<JobTaskDto> { focusTask });
+
+        // Same job, so priority ties and the dispatcher drains by CreatedAt: making the
+        // handed-over turn the older one means it runs while Soren's own newer message stays
+        // parked, leaving a non-empty queue behind a successful handover.
+        var astraTurn = MakeQueuedTurn(job.Id, project.Id, "astra", "handed over to soren");
+        var sorenTurn = MakeQueuedTurn(job.Id, project.Id, "soren", "soren's own newer message");
+        sorenTurn = sorenTurn with { CreatedAt = astraTurn.CreatedAt.AddMinutes(1) };
+        job.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { astraTurn, sorenTurn });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, focusTask.Id, new AssignJobTaskRequest("soren"));
+        var result = (AssignJobTaskResult)res.Should().BeOfType<OkObjectResult>().Subject.Value!;
+
+        result.MovedQueuedTurnCount.Should().Be(1);
+        result.DispatchedToNewAssignee.Should().BeTrue();
+
+        // Soren is single-slot: the handed-over turn ran, his own newer message is still
+        // parked, and the queue is therefore NOT empty despite the handover succeeding.
+        var remaining = ProjectJobsController.ParseQueuedTurns((await db.ProjectJobs.FindAsync(job.Id))!.QueuedTurnsJson);
+        remaining.Should().ContainSingle();
+        remaining[0].Id.Should().Be(sorenTurn.Id);
+        (await db.AgentSessions.CountAsync(s => s.PersonaId == "soren")).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task AssignJobTask_AssigningAnUnassignedTaskWithParkedTurnsMovesThem()
+    {
+        // The "tell an agent to grab it" flow leaves a task unlabelled but someone queued to
+        // run it. Redirecting the work must move that parked message, or the grabber still
+        // executes it and the operator's new choice is ignored.
+        var (db, project, _, _) = BuildAssignmentContext("proj-assign-grab");
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "Grabbed task" };
+        var job = MakeAssignmentJob(project.Id, "Grab Job", new List<JobTaskDto> { task });
+        var queuedTurn = MakeQueuedTurn(job.Id, project.Id, "astra", "you grab the unassigned task");
+        job.QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new List<QueuedJobTurnDto> { queuedTurn });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var res = await controller.AssignJobTask(job.Id, task.Id, new AssignJobTaskRequest("soren"));
+        var result = (AssignJobTaskResult)res.Should().BeOfType<OkObjectResult>().Subject.Value!;
+
+        result.FromPersonaId.Should().BeNull();
+        result.FromPersonaName.Should().Be("Astra");
+        result.IsTargetTask.Should().BeTrue();
+        result.MovedQueuedTurnCount.Should().Be(1);
+        ProjectJobsController.ParseQueuedTurns((await db.ProjectJobs.FindAsync(job.Id))!.QueuedTurnsJson)
+            .Should().BeEmpty();
+
+        var audit = await db.JobMessages.SingleAsync(m => m.SenderType == "system");
+        audit.Content.Should().Contain("@Astra").And.Contain("@Soren");
     }
 
     [Fact]
