@@ -1,7 +1,8 @@
-import type {
+﻿import type {
   Agent,
   AgentSession,
   AgentUsageResponse,
+  DriverConfig,
   FilesystemBrowseResponse,
   JobMessage,
   JobTask,
@@ -262,6 +263,39 @@ export const api = {
       body: JSON.stringify(req)
     });
     if (!res.ok) throw new Error(`Failed to register/update agent: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getDriverConfig(agentId: string): Promise<DriverConfig> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/config`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load driver config: ${res.statusText}`);
+    return res.json();
+  },
+
+  /**
+   * Patch-style update. Send only changed fields — the server merges, so omitted fields keep
+   * their stored values. An empty apiKey means "leave the stored key alone".
+   */
+  async updateDriverConfig(
+    agentId: string,
+    req: {
+      adapter?: string;
+      endpoint?: string;
+      apiKey?: string;
+      defaultModel?: string;
+      timeoutSeconds?: number;
+      maxRetries?: number;
+      retryDelayMilliseconds?: number;
+      maxSteps?: number;
+      capabilities?: string[];
+    }
+  ): Promise<DriverConfig> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/config`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to update driver config: ${res.statusText}`);
     return res.json();
   },
 

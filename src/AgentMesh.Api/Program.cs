@@ -1,6 +1,7 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Api.Tools;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
@@ -90,6 +91,15 @@ builder.Services.AddAuthorization();
 
 // Configure SeaweedFS S3 Storage
 builder.Services.AddSeaweedS3Storage(builder.Configuration);
+
+// Per-job workspaces + gated handoff.
+// The durable workspace state is what makes handoff work across machines: a runner's local
+// directory is a cache, so anything not saved here is treated as lost when the next persona starts.
+builder.Services.Configure<JobHandoffOptions>(builder.Configuration.GetSection(JobHandoffOptions.SectionName));
+builder.Services.AddScoped<IJobWorkspaceService, JobWorkspaceService>();
+builder.Services.AddScoped<JobTurnDispatcher>();
+builder.Services.AddScoped<IJobHandoffService, JobHandoffService>();
+builder.Services.AddHostedService<JobHandoffReaper>();
 
 // Configure CORS
 builder.Services.AddCors(options =>

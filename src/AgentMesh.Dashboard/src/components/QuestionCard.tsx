@@ -1,6 +1,21 @@
 import React, { useState } from 'react';
 import { HelpCircle, CheckCircle2, Check, RefreshCw, Send } from 'lucide-react';
-import type { AskQuestionItem, QuestionAnswerPayload } from '../types';
+import type { AskQuestionItem, AskQuestionOption, QuestionAnswerPayload } from '../types';
+
+export function getOptionLabel(opt: AskQuestionOption): string {
+  if (typeof opt === 'string') return opt;
+  if (opt && typeof opt === 'object') {
+    return opt.label || opt.text || opt.title || opt.value || JSON.stringify(opt);
+  }
+  return String(opt ?? '');
+}
+
+export function getOptionDescription(opt: AskQuestionOption): string | undefined {
+  if (opt && typeof opt === 'object' && opt.description) {
+    return opt.description;
+  }
+  return undefined;
+}
 
 export function parseTextQuestions(content: string): AskQuestionItem[] {
   if (!content) return [];
@@ -139,8 +154,13 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
         <div className="space-y-3">
           {parsedQuestions.map((q, idx) => (
             <div key={idx} className="space-y-1.5">
-              <div className="text-xs font-medium text-slate-200">
-                {q.question}
+              <div className="text-xs font-medium text-slate-200 flex items-center gap-1.5 flex-wrap">
+                {q.header && (
+                  <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono shrink-0">
+                    {q.header}
+                  </span>
+                )}
+                <span>{q.question}</span>
               </div>
               <div className="text-xs text-emerald-300 font-mono bg-emerald-950/40 border border-emerald-500/30 rounded-lg px-3 py-2 whitespace-pre-wrap">
                 {answeredContent || 'Answer submitted'}
@@ -210,13 +230,19 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
         {parsedQuestions.map((q, idx) => {
           const selectedOpts = selectedOptions[idx] || [];
           const customText = customTexts[idx] || '';
+          const hasDescriptions = q.options && q.options.some((opt) => Boolean(getOptionDescription(opt)));
 
           return (
             <div key={idx} className="space-y-2.5">
-              <div className="text-xs font-semibold text-slate-100 flex items-center gap-1.5">
-                <span className="w-5 h-5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 inline-flex items-center justify-center text-[10px] shrink-0">
+              <div className="text-xs font-semibold text-slate-100 flex items-center gap-1.5 flex-wrap">
+                <span className="w-5 h-5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 inline-flex items-center justify-center text-[10px] shrink-0 font-mono">
                   {idx + 1}
                 </span>
+                {q.header && (
+                  <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono shrink-0">
+                    {q.header}
+                  </span>
+                )}
                 <span>{q.question}</span>
                 {q.is_multi_select && (
                   <span className="text-[10px] font-normal text-slate-400 font-mono">
@@ -226,40 +252,55 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
               </div>
 
               {q.options && q.options.length > 0 && (
-                <div className="flex flex-wrap gap-2 pt-1">
-                  {q.options.map((opt) => {
-                    const isSelected = selectedOpts.includes(opt);
+                <div className={`pt-1 ${hasDescriptions ? 'flex flex-col gap-2' : 'flex flex-wrap gap-2'}`}>
+                  {q.options.map((opt, optIdx) => {
+                    const optLabel = getOptionLabel(opt);
+                    const optDesc = getOptionDescription(opt);
+                    const isSelected = selectedOpts.includes(optLabel);
+                    const optKey = `${optLabel}-${optIdx}`;
+
                     return (
                       <button
-                        key={opt}
+                        key={optKey}
                         type="button"
                         onClick={() => {
                           const existing = selectedOptions[idx] || [];
                           let nextSelected: string[];
                           let nextCustom = customTexts;
                           if (q.is_multi_select) {
-                            nextSelected = existing.includes(opt)
-                              ? existing.filter((x) => x !== opt)
-                              : [...existing, opt];
+                            nextSelected = existing.includes(optLabel)
+                              ? existing.filter((x) => x !== optLabel)
+                              : [...existing, optLabel];
                           } else {
-                            nextSelected = existing.includes(opt) ? [] : [opt];
+                            nextSelected = existing.includes(optLabel) ? [] : [optLabel];
                             nextCustom = { ...customTexts, [idx]: '' };
                           }
                           setSelectedOptions((prev) => ({ ...prev, [idx]: nextSelected }));
                           setCustomTexts(nextCustom);
                         }}
-                        className={`px-3 py-1.5 rounded-xl text-xs font-medium border transition cursor-pointer flex items-center gap-1.5 ${
+                        className={`rounded-xl text-xs font-medium border transition cursor-pointer flex text-left ${
+                          optDesc ? 'p-3 items-start gap-2.5 w-full' : 'px-3 py-1.5 items-center gap-1.5'
+                        } ${
                           isSelected
                             ? 'bg-sky-500/25 text-sky-200 border-sky-400 font-semibold shadow-sm'
                             : 'bg-slate-900/80 text-slate-300 border-slate-700/80 hover:bg-slate-800 hover:text-slate-100'
                         }`}
                       >
-                        {isSelected ? (
-                          <Check className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                        ) : (
-                          <span className="w-3.5 h-3.5 rounded-full border border-slate-600 shrink-0 inline-block" />
-                        )}
-                        <span>{opt}</span>
+                        <div className={optDesc ? 'pt-0.5 shrink-0' : 'shrink-0'}>
+                          {isSelected ? (
+                            <Check className="w-3.5 h-3.5 text-sky-400" />
+                          ) : (
+                            <span className="w-3.5 h-3.5 rounded-full border border-slate-600 inline-block" />
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <span className={optDesc ? 'font-semibold block text-slate-100' : ''}>{optLabel}</span>
+                          {optDesc && (
+                            <span className="block text-[11px] text-slate-400 mt-1 leading-relaxed font-normal">
+                              {optDesc}
+                            </span>
+                          )}
+                        </div>
                       </button>
                     );
                   })}

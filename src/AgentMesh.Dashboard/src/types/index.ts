@@ -1,4 +1,4 @@
-export interface DriverPersonaSummary {
+﻿export interface DriverPersonaSummary {
   id: string;
   name: string;
   role: string;
@@ -26,6 +26,22 @@ export interface Persona {
   updatedAt?: string;
 }
 
+/**
+ * Parsed driver runtime config, as returned by GET /api/agents/{id}/config and mirrored on
+ * Agent.config. The API never sends the API key itself — only whether one is stored.
+ */
+export interface DriverConfig {
+  adapter?: string | null;
+  endpoint?: string | null;
+  defaultModel?: string | null;
+  timeoutSeconds?: number | null;
+  maxRetries?: number | null;
+  retryDelayMilliseconds?: number | null;
+  maxSteps?: number | null;
+  capabilities?: string[];
+  hasApiKey?: boolean;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -36,6 +52,7 @@ export interface Agent {
   personaPrompt?: string;
   memorySummary?: string;
   capabilitiesJson?: string;
+  config?: DriverConfig;
   lastHeartbeatAt?: string;
   sessionCount?: number;
   personas?: DriverPersonaSummary[];
@@ -364,9 +381,20 @@ export interface QueuedPromptItem {
   attachments?: SessionAttachment[] | null;
 }
 
+export interface AskQuestionOptionObject {
+  label?: string;
+  text?: string;
+  value?: string;
+  title?: string;
+  description?: string;
+}
+
+export type AskQuestionOption = string | AskQuestionOptionObject;
+
 export interface AskQuestionItem {
   question: string;
-  options: string[];
+  header?: string;
+  options: AskQuestionOption[];
   is_multi_select?: boolean;
 }
 
