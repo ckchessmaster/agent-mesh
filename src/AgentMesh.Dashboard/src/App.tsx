@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Bot,
   Brain,
@@ -357,32 +357,165 @@ export default function App() {
   const [isScrolledUp, setIsScrolledUp] = useState(false);
   const userScrolledUpRef = useRef(false);
 
-  const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const timelineContainerRef = useRef<HTMLDivElement | null>(null);
-  const isSessionSwitchingRef = useRef(false);
   const prevSelectedSessionIdRef = useRef<string | null>(null);
   const { connection, connected: signalRConnected } = useSignalR('/hubs/agent-mesh');
 
-  const handleToggleAutoScroll = () => {
-    setAutoScrollEnabled((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem('agentmesh_autoscroll_enabled', String(next));
-      } catch {}
-      if (next && timelineContainerRef.current) {
+  // --- Session trajectory "stick to bottom" -------------------------------------------
+  // The code this replaces pinned once per session switch from an effect keyed on
+  // `events`. That missed the cases operators actually hit:
+  //   (a) the stream unmounts while Projects & Jobs (or the new-session composer) is open,
+  //       so coming back mounts it at scrollTop 0 with `events` unchanged and nothing
+  //       ever re-pins;
+  //   (b) the pin fires against the *previous* session's still-rendered transcript, so it
+  //       is spent on the wrong content and the real transcript lands at the top;
+  //   (c) the transcript grows after the pin — mermaid resolves to SVG asynchronously,
+  //       images decode late — so the scrollHeight measured at pin time is already stale.
+  //
+  // One function decides, from three distinct reasons to pin:
+  //   * forced — the stream just mounted, or the operator asked (jump to bottom, or
+  //              re-enable auto-scroll). Pin unconditionally.
+  //   * new    — the transcript on screen changed identity (navigation) or gained events,
+  //              i.e. a React render produced content we have not pinned yet.
+  //   * grew   — the DOM got taller without a React render (case c). Only the observers
+  //              can see that, so only they are allowed to ask for it.
+  //
+  // A scrollHeight read forces layout, so it happens only when we are about to write
+  // scrollTop or are explicitly checking for growth — never on an ordinary render of what
+  // is a very large component.
+  const autoScrollEnabledRef = useRef(autoScrollEnabled);
+  const forceTimelinePinRef = useRef(true);
+  const pinnedTranscriptOwnerRef = useRef<string | null>(null);
+  const pinnedTranscriptContentRef = useRef<string | null>(null);
+  const pinnedTimelineHeightRef = useRef(-1);
+  const timelineObserversCleanupRef = useRef<(() => void) | null>(null);
+  const syncTimelineScrollRef = useRef<
+    (options: { allowGrowthPin: boolean }) => void
+  >(() => {});
+
+  // Assigned during render rather than from an effect: the stream's ref callback fires
+  // during commit, before passive effects run, and needs the current values immediately.
+  autoScrollEnabledRef.current = autoScrollEnabled;
+
+  const syncTimelineScroll = useCallback(
+    ({ allowGrowthPin }: { allowGrowthPin: boolean }) => {
+      const container = timelineContainerRef.current;
+      if (!container) {
+        // Stream not mounted. Invalidate the cached height so the next mount counts as
+        // growth even if the transcript is byte-identical.
+        pinnedTimelineHeightRef.current = -1;
+        return;
+      }
+
+      // Owner is taken from the events themselves, not from selectedSessionId: while a
+      // fetch is in flight the stream still shows the previous session's transcript, and
+      // pinning against that would both look wrong and spend the pin (case b).
+      const owner = events.length > 0 ? events[events.length - 1].sessionId : null;
+      const contentKey = `${events.length}|${events[events.length - 1]?.id ?? ''}`;
+      // A different session's transcript on screen means the operator navigated here, so
+      // the newest event is what they came to see.
+      const ownerChanged = pinnedTranscriptOwnerRef.current !== owner;
+      const following = autoScrollEnabledRef.current && !userScrolledUpRef.current;
+      // More events on the same transcript: follow them only if still tracking.
+      const contentChanged = pinnedTranscriptContentRef.current !== contentKey;
+
+      let shouldPin = forceTimelinePinRef.current || ownerChanged || (following && contentChanged);
+      if (!shouldPin && allowGrowthPin && following) {
+        shouldPin = container.scrollHeight !== pinnedTimelineHeightRef.current;
+      }
+      if (!shouldPin) return;
+
+      forceTimelinePinRef.current = false;
+      // Assigning scrollTop (rather than scrollIntoView) keeps the scroll on the timeline
+      // container and avoids dragging ancestor scrollables around.
+      container.scrollTop = container.scrollHeight;
+      pinnedTimelineHeightRef.current = container.scrollHeight;
+      pinnedTranscriptOwnerRef.current = owner;
+      pinnedTranscriptContentRef.current = contentKey;
+
+      if (ownerChanged) {
+        // Opening a transcript clears any "scrolled up" carried over from the previous one,
+        // so live events on the new session are followed again.
         userScrolledUpRef.current = false;
-        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
         setIsScrolledUp(false);
       }
-      return next;
-    });
+    },
+    [events]
+  );
+
+  // Also assigned during render: the ref callback below calls it synchronously on mount.
+  syncTimelineScrollRef.current = syncTimelineScroll;
+
+  // Runs before paint on renders that can change which transcript is on screen, so the top
+  // of a newly opened session is never flashed. Deliberately keyed on the transcript
+  // instead of running every render: growth that happens without a React render is the
+  // observers' job, and an unrelated re-render should not pay for a layout read.
+  useLayoutEffect(() => {
+    syncTimelineScroll({ allowGrowthPin: false });
+  }, [syncTimelineScroll]);
+
+  // Container ref callback: mounting the stream is itself a reason to pin, and it is the
+  // only place that learns when the observed node comes and goes.
+  const handleTimelineContainerRef = useCallback((node: HTMLDivElement | null) => {
+    timelineContainerRef.current = node;
+    timelineObserversCleanupRef.current?.();
+    timelineObserversCleanupRef.current = null;
+    if (!node) {
+      pinnedTimelineHeightRef.current = -1;
+      return;
+    }
+
+    // Freshly mounted: it is at scrollTop 0 no matter what our caches say (case a).
+    forceTimelinePinRef.current = true;
+    syncTimelineScrollRef.current({ allowGrowthPin: false });
+
+    if (typeof MutationObserver === 'undefined') return;
+
+    // Content can grow without a React render: async mermaid SVG injection, streamed DOM,
+    // lazily decoded images. Re-pin while the operator is still following (case c).
+    const observer = new MutationObserver(() => syncTimelineScrollRef.current({ allowGrowthPin: true }));
+    observer.observe(node, { childList: true, subtree: true });
+
+    // An <img> changing intrinsic size on decode does not touch the DOM tree.
+    const handleMediaLoad = (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target && target.tagName === 'IMG') syncTimelineScrollRef.current({ allowGrowthPin: true });
+    };
+    node.addEventListener('load', handleMediaLoad, true);
+
+    timelineObserversCleanupRef.current = () => {
+      observer.disconnect();
+      node.removeEventListener('load', handleMediaLoad, true);
+    };
+  }, []);
+
+  // A viewport resize moves the bottom without firing a scroll event on the container.
+  useEffect(() => {
+    const handleWindowResize = () => syncTimelineScrollRef.current({ allowGrowthPin: true });
+    window.addEventListener('resize', handleWindowResize);
+    return () => window.removeEventListener('resize', handleWindowResize);
+  }, []);
+
+  const handleToggleAutoScroll = () => {
+    const next = !autoScrollEnabled;
+    try {
+      localStorage.setItem('agentmesh_autoscroll_enabled', String(next));
+    } catch {}
+    setAutoScrollEnabled(next);
+    if (next) {
+      // Turning following back on means "catch me up to now". Done here rather than in the
+      // state updater so the scroll write isn't run twice under StrictMode.
+      userScrolledUpRef.current = false;
+      forceTimelinePinRef.current = true;
+      syncTimelineScrollRef.current({ allowGrowthPin: false });
+      setIsScrolledUp(false);
+    }
   };
 
   const handleScrollToBottom = () => {
     userScrolledUpRef.current = false;
-    if (timelineContainerRef.current) {
-      timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
-    }
+    forceTimelinePinRef.current = true;
+    syncTimelineScrollRef.current({ allowGrowthPin: false });
     setIsScrolledUp(false);
   };
 
@@ -789,7 +922,10 @@ export default function App() {
   }, [fetchAllData]);
 
   useEffect(() => {
-    isSessionSwitchingRef.current = true;
+    // No pin is applied here on purpose. The trajectory still shows the previous
+    // session's transcript until this fetch resolves, and pinning that would both look
+    // wrong and consume the pin. syncTimelineScroll pins when *this* session's
+    // transcript is first mounted, keyed on the owner of the events on screen.
     if (selectedSessionId) {
       if (prevSelectedSessionIdRef.current && prevSelectedSessionIdRef.current !== selectedSessionId && connection && signalRConnected) {
         connection.invoke('LeaveSession', prevSelectedSessionIdRef.current).catch(() => {});
@@ -1062,30 +1198,6 @@ export default function App() {
       connection.off('ProjectDeleted', handleProjectDeleted);
     };
   }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents, fetchSessionArtifacts]);
-
-  // Auto-scroll timeline when events change or session switches
-  useEffect(() => {
-    if (isSessionSwitchingRef.current) {
-      isSessionSwitchingRef.current = false;
-      userScrolledUpRef.current = false;
-      if (timelineContainerRef.current) {
-        timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
-      }
-      setIsScrolledUp(false);
-      return;
-    }
-
-    if (!autoScrollEnabled || userScrolledUpRef.current) {
-      return;
-    }
-
-    if (timelineContainerRef.current) {
-      timelineContainerRef.current.scrollTop = timelineContainerRef.current.scrollHeight;
-      setIsScrolledUp(false);
-    } else if (typeof timelineEndRef.current?.scrollIntoView === 'function') {
-      timelineEndRef.current.scrollIntoView({ behavior: 'auto' });
-    }
-  }, [events, autoScrollEnabled]);
 
   const handleResetMesh = async () => {
     setIsActionPending(true);
@@ -3865,9 +3977,10 @@ export default function App() {
                   )}
                   {/* Trajectory Events Stream */}
                   <div
-                    ref={timelineContainerRef}
+                    ref={handleTimelineContainerRef}
                     onScroll={handleTimelineScroll}
                     className="flex-1 overflow-y-auto p-6 space-y-4"
+                    data-testid="session-timeline"
                   >
                 {events.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 space-y-2">
@@ -4455,7 +4568,6 @@ export default function App() {
                   )
                 )}
 
-                <div ref={timelineEndRef} />
               </div>
 
               {/* Floating Jump to bottom button when scrolled up */}
