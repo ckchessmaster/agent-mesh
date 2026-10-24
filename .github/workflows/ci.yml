@@ -103,3 +103,11 @@ jobs:
           file: deploy/docker/Dockerfile.dashboard
           push: false
           tags: agent-mesh-dashboard:ci-test
+
+      - name: Build Persona Runner Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.persona
+          push: false
+          tags: agent-mesh-persona-runner:ci-test

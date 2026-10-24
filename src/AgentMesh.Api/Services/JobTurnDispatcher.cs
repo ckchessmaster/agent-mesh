@@ -1,6 +1,7 @@
-﻿using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
@@ -41,7 +42,8 @@ public record DispatchedJobTurn(AgentSession Session, SessionMessage PromptMessa
 public class JobTurnDispatcher(
     AgentMeshDbContext db,
     IHubContext<AgentMeshHub>? hubContext = null,
-    IJobWorkspaceService? workspaces = null)
+    IJobWorkspaceService? workspaces = null,
+    IPersonaContainerManager? containerManager = null)
 {
     internal static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -56,6 +58,19 @@ public class JobTurnDispatcher(
         var job = req.Job;
         var project = req.Project;
         var persona = req.Persona;
+
+        // Auto-wake persona container environment if needed
+        if (containerManager != null && !string.IsNullOrWhiteSpace(persona.Id))
+        {
+            try
+            {
+                await containerManager.EnsureRunningAsync(persona.Id, ct);
+            }
+            catch
+            {
+                // Ignore startup errors here; offline buffer handles transient delays
+            }
+        }
 
         var driver = await ResolveDriverAsync(persona, ct);
         var driverId = driver.Id;
@@ -217,6 +232,12 @@ public class JobTurnDispatcher(
             workspaceHeadCommit = hydration?.HeadCommit,
             workspaceBundleKey = hydration?.BundleS3Key
         };
+
+        var personaGroup = hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}");
+        if (personaGroup != null)
+        {
+            await personaGroup.SendAsync("PromptReceived", payload, ct);
+        }
 
         var group = hubContext.Clients.Group($"agent-{driverId}");
         if (group != null)

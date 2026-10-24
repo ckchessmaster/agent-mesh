@@ -244,4 +244,116 @@ public class PersonasControllerTests
         (await db.Personas.FindAsync("temp-persona")).Should().BeNull();
         (await db.AgentSessions.FindAsync(createdSession.Id)).Should().BeNull();
     }
+
+    [Fact]
+    public async Task GetPersonaEnvironment_ReturnsStatus_FromContainerManager()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.GetStatusAsync("architect", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("architect", "running", "docker", "c12345", DateTimeOffset.UtcNow));
+
+        var controller = new PersonasController(db, _mockHubContext.Object, mockManager.Object);
+        await controller.CreatePersona(new CreatePersonaRequest("Architect", "agy", "architect"));
+
+        // Act
+        var res = await controller.GetPersonaEnvironment("architect", CancellationToken.None);
+
+        // Assert
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+        var status = ok.Value.Should().BeOfType<PersonaEnvironmentStatus>().Subject;
+        status.Status.Should().Be("running");
+        status.Runtime.Should().Be("docker");
+        status.ContainerId.Should().Be("c12345");
+    }
+
+    [Fact]
+    public async Task WakePersonaEnvironment_CallsEnsureRunning()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.EnsureRunningAsync("frontend-dev", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        mockManager.Setup(m => m.GetStatusAsync("frontend-dev", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("frontend-dev", "running", "podman"));
+
+        var controller = new PersonasController(db, _mockHubContext.Object, mockManager.Object);
+        await controller.CreatePersona(new CreatePersonaRequest("Frontend Dev", "claude", "frontend-dev"));
+
+        // Act
+        var res = await controller.WakePersonaEnvironment("frontend-dev", CancellationToken.None);
+
+        // Assert
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+        var status = ok.Value.Should().BeOfType<PersonaEnvironmentStatus>().Subject;
+        status.Status.Should().Be("running");
+        mockManager.Verify(m => m.EnsureRunningAsync("frontend-dev", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task StopPersonaEnvironment_CallsStop()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.StopAsync("qa-engineer", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        mockManager.Setup(m => m.GetStatusAsync("qa-engineer", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("qa-engineer", "stopped", "docker"));
+
+        var controller = new PersonasController(db, _mockHubContext.Object, mockManager.Object);
+        await controller.CreatePersona(new CreatePersonaRequest("QA Engineer", "openai", "qa-engineer"));
+
+        // Act
+        var res = await controller.StopPersonaEnvironment("qa-engineer", CancellationToken.None);
+
+        // Assert
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+        var status = ok.Value.Should().BeOfType<PersonaEnvironmentStatus>().Subject;
+        status.Status.Should().Be("stopped");
+        mockManager.Verify(m => m.StopAsync("qa-engineer", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task GetPersonaEnvironmentLogs_ReturnsLogs()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.GetLogsAsync("architect", 50, It.IsAny<CancellationToken>()))
+            .ReturnsAsync("Container booting up...\nReady for prompts.");
+
+        var controller = new PersonasController(db, _mockHubContext.Object, mockManager.Object);
+        await controller.CreatePersona(new CreatePersonaRequest("Architect", "agy", "architect"));
+
+        // Act
+        var res = await controller.GetPersonaEnvironmentLogs("architect", 50, CancellationToken.None);
+
+        // Assert
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+        var json = JsonSerializer.Serialize(ok.Value);
+        json.Should().Contain("Container booting up...");
+    }
+
+    [Fact]
+    public async Task CreatePersonaSession_WithInitialPrompt_AutoWakesEnvironment()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.EnsureRunningAsync("backend-dev", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var controller = new PersonasController(db, _mockHubContext.Object, mockManager.Object);
+        await controller.CreatePersona(new CreatePersonaRequest("Backend Dev", "agy", "backend-dev"));
+
+        // Act
+        var sRes = await controller.CreatePersonaSession("backend-dev", new CreateAgentSessionRequest("New Task", "Implement feature X"));
+
+        // Assert
+        sRes.Should().BeOfType<CreatedAtActionResult>();
+        mockManager.Verify(m => m.EnsureRunningAsync("backend-dev", It.IsAny<CancellationToken>()), Times.Once);
+    }
 }

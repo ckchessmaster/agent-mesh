@@ -20,6 +20,11 @@ public class AgentPresetConfig
     public string? Token { get; set; }
     public List<string> Capabilities { get; set; } = new();
 
+    // Dedicated Persona Mode
+    public string? PersonaId { get; set; }
+    public string? PersonaName { get; set; }
+    public string? PersonaPrompt { get; set; }
+
     // Custom OpenAI compatible server settings
     public string? Endpoint { get; set; } // e.g. http://localhost:11434/v1
     public string? ApiKey { get; set; }
@@ -194,4 +199,23 @@ public record RemoteAgentDto(
     [property: JsonPropertyName("sessionCount")] int SessionCount,
     [property: JsonPropertyName("lastHeartbeatAt")] DateTimeOffset? LastHeartbeatAt,
     [property: JsonPropertyName("capabilitiesJson")] string? CapabilitiesJson = null
+);
+
+public record RemotePersonaDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("personaPrompt")] string? PersonaPrompt,
+    [property: JsonPropertyName("driverId")] string DriverId,
+    [property: JsonPropertyName("driverName")] string? DriverName = null,
+    [property: JsonPropertyName("driverStatus")] string? DriverStatus = null,
+    [property: JsonPropertyName("defaultModel")] string? DefaultModel = null,
+    [property: JsonPropertyName("defaultEffort")] string? DefaultEffort = null,
+    [property: JsonPropertyName("defaultMode")] string? DefaultMode = null,
+    [property: JsonPropertyName("defaultTier")] string? DefaultTier = null,
+    [property: JsonPropertyName("defaultWorkingDirectory")] string? DefaultWorkingDirectory = null,
+    [property: JsonPropertyName("trustTier")] int TrustTier = 1,
+    [property: JsonPropertyName("sessionCount")] int SessionCount = 0,
+    [property: JsonPropertyName("defaultContextSize")] string? DefaultContextSize = null,
+    [property: JsonPropertyName("maxConcurrentJobs")] int? MaxConcurrentJobs = null
 );

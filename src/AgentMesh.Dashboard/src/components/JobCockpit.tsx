@@ -430,24 +430,34 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       const personaObj =
         personas.find((p) => p.id === mention) ||
         project.assignedPersonas?.find((p) => p.id === mention);
+      const isOffline = personaObj?.driverStatus === 'offline';
       return {
         isActive: true,
+        isOffline,
+        driverId: personaObj?.driverId,
         personaName: personaObj?.name || mention || 'Persona',
         turnSessionId: lastMsg.turnSessionId,
-        statusText: 'is actively working on this task...'
+        statusText: isOffline ? 'is queued (waiting for runner connection)...' : 'is actively working on this task...'
       };
     }
 
     if (
       lastMsg.senderType === 'persona' &&
       lastMsg.turnSessionId &&
-      (lastMsg.content.includes("I'm on it") || lastMsg.content.includes('starting work'))
+      (lastMsg.content.includes("I'm on it") || lastMsg.content.includes('starting work') || lastMsg.content.includes('queued'))
     ) {
+      const personaObj =
+        personas.find((p) => p.id === lastMsg.senderId) ||
+        project.assignedPersonas?.find((p) => p.id === lastMsg.senderId) ||
+        personas.find((p) => p.name === lastMsg.senderName);
+      const isOffline = personaObj?.driverStatus === 'offline';
       return {
         isActive: true,
+        isOffline,
+        driverId: personaObj?.driverId,
         personaName: lastMsg.senderName || 'Persona',
         turnSessionId: lastMsg.turnSessionId,
-        statusText: 'is actively working on this task...'
+        statusText: isOffline ? 'is queued (waiting for runner connection)...' : 'is actively working on this task...'
       };
     }
 
@@ -1919,9 +1929,17 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
         {/* Subtle conversational working indicator at bottom of message stream */}
         {activeTurnInfo?.isActive && (
-          <div className="flex items-center gap-2 py-1.5 px-3 text-xs text-sky-400 font-medium">
-            <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400 shrink-0" />
-            <span>{activeTurnInfo.personaName} is working on this turn...</span>
+          <div className={`flex items-center gap-2 py-1.5 px-3 text-xs font-medium ${activeTurnInfo.isOffline ? 'text-amber-400' : 'text-sky-400'}`}>
+            {activeTurnInfo.isOffline ? (
+              <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            ) : (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400 shrink-0" />
+            )}
+            <span>
+              {activeTurnInfo.isOffline
+                ? `${activeTurnInfo.personaName} is queued (waiting for runner @${activeTurnInfo.driverId || 'agent'} to connect)...`
+                : `${activeTurnInfo.personaName} is working on this turn...`}
+            </span>
           </div>
         )}
 
@@ -2152,25 +2170,49 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             {/* Active Turn Real-Time Feedback Card (inside sidebar) */}
             {activeTurnInfo?.isActive && (
               <div
-                className="p-3.5 rounded-xl bg-sky-950/40 border border-sky-500/40 text-xs shadow-md space-y-3"
+                className={`p-3.5 rounded-xl text-xs shadow-md space-y-3 ${
+                  activeTurnInfo.isOffline
+                    ? 'bg-amber-950/40 border border-amber-500/40 text-amber-200'
+                    : 'bg-sky-950/40 border border-sky-500/40'
+                }`}
                 data-testid="job-active-turn-indicator"
               >
                 <div className="flex items-center gap-2.5">
-                  <div className="relative flex items-center justify-center w-7 h-7 rounded-lg bg-sky-500/20 text-sky-400 border border-sky-500/30 shrink-0">
-                    <Bot className="w-3.5 h-3.5 animate-pulse" />
-                    <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-sky-400 animate-ping" />
+                  <div
+                    className={`relative flex items-center justify-center w-7 h-7 rounded-lg shrink-0 ${
+                      activeTurnInfo.isOffline
+                        ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                        : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
+                    }`}
+                  >
+                    {activeTurnInfo.isOffline ? (
+                      <AlertCircle className="w-3.5 h-3.5 text-amber-400" />
+                    ) : (
+                      <>
+                        <Bot className="w-3.5 h-3.5 animate-pulse" />
+                        <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-sky-400 animate-ping" />
+                      </>
+                    )}
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5 justify-between">
                       <span className="font-semibold text-slate-100 truncate">
                         {activeTurnInfo.personaName} {activeTurnInfo.statusText}
                       </span>
-                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30 shrink-0 animate-pulse">
-                        Working
+                      <span
+                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded border shrink-0 ${
+                          activeTurnInfo.isOffline
+                            ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                            : 'bg-sky-500/20 text-sky-300 border-sky-500/30 animate-pulse'
+                        }`}
+                      >
+                        {activeTurnInfo.isOffline ? 'Queued' : 'Working'}
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-400 leading-relaxed mt-0.5">
-                      Executing workspace commands, tests, and active persona logic.
+                      {activeTurnInfo.isOffline
+                        ? `Connect the runner via terminal: agentmesh start ${activeTurnInfo.driverId || 'agy'}`
+                        : 'Executing workspace commands, tests, and active persona logic.'}
                     </p>
                   </div>
                 </div>

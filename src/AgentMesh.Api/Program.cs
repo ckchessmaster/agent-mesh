@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -6,6 +6,7 @@ using AgentMesh.Api.Tools;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Storage;
+using AgentMesh.Infrastructure.Containers;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -100,6 +101,10 @@ builder.Services.AddScoped<IJobWorkspaceService, JobWorkspaceService>();
 builder.Services.AddScoped<JobTurnDispatcher>();
 builder.Services.AddScoped<IJobHandoffService, JobHandoffService>();
 builder.Services.AddHostedService<JobHandoffReaper>();
+
+// Dedicated Persona Container Environments & Idle Reaper
+builder.Services.AddPersonaContainerManager(builder.Configuration);
+builder.Services.AddHostedService<PersonaIdleReaperService>();
 
 // Configure CORS
 builder.Services.AddCors(options =>

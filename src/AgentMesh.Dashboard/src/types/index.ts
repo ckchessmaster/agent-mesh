@@ -1,4 +1,4 @@
-﻿export interface DriverPersonaSummary {
+export interface DriverPersonaSummary {
   id: string;
   name: string;
   role: string;
@@ -24,6 +24,17 @@ export interface Persona {
   sessionCount?: number;
   createdAt: string;
   updatedAt?: string;
+}
+
+export interface PersonaEnvironmentStatus {
+  personaId: string;
+  status: 'stopped' | 'running' | 'starting' | 'error' | 'none' | string;
+  runtime: 'docker' | 'podman' | 'kubernetes' | 'none' | string;
+  containerId?: string | null;
+  startedAt?: string | null;
+  lastActivityAt?: string | null;
+  memoryUsageBytes?: number | null;
+  errorMessage?: string | null;
 }
 
 /**
@@ -292,6 +303,8 @@ export interface ProjectPersonaSummary {
   name: string;
   role: string;
   driverId: string;
+  driverName?: string;
+  driverStatus?: 'online' | 'busy' | 'offline' | string;
 }
 
 export interface Project {

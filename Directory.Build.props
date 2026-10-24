@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <Version Condition="'$(Version)' == ''">0.2.0</Version>
+    <AssemblyVersion Condition="'$(AssemblyVersion)' == ''">0.2.0.0</AssemblyVersion>
+    <FileVersion Condition="'$(FileVersion)' == ''">0.2.0.0</FileVersion>
+    <InformationalVersion Condition="'$(InformationalVersion)' == ''">0.2.0</InformationalVersion>
+    <Authors>AgentMesh Team</Authors>
+    <Company>AgentMesh</Company>
+    <Product>AgentMesh</Product>
+    <Copyright>Copyright © 2026 AgentMesh</Copyright>
+  </PropertyGroup>
+</Project>

@@ -21,5 +21,7 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ .Release.Name }}-config
+            - secretRef:
+                name: {{ .Values.config.secretName | default "agent-mesh-secrets" }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

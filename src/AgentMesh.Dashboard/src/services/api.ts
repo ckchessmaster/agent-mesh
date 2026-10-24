@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   Agent,
   AgentSession,
   AgentUsageResponse,
@@ -8,6 +8,7 @@
   JobTask,
   AssignJobTaskResult,
   Persona,
+  PersonaEnvironmentStatus,
   Project,
   ProjectJob,
   ProjectPersonaSummary,
@@ -221,6 +222,36 @@ export const api = {
       })
     });
     if (!res.ok) throw new Error(`Failed to create persona session: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getPersonaEnvironment(personaId: string): Promise<PersonaEnvironmentStatus> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load persona environment status: ${res.statusText}`);
+    return res.json();
+  },
+
+  async wakePersonaEnvironment(personaId: string): Promise<PersonaEnvironmentStatus> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/wake`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to wake persona environment: ${res.statusText}`);
+    return res.json();
+  },
+
+  async stopPersonaEnvironment(personaId: string): Promise<PersonaEnvironmentStatus> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/stop`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to stop persona environment: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getPersonaEnvironmentLogs(personaId: string, tail = 100): Promise<{ logs: string }> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/logs?tail=${tail}`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load persona environment logs: ${res.statusText}`);
     return res.json();
   },
 

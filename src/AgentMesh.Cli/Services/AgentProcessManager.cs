@@ -6,6 +6,20 @@ using Microsoft.AspNetCore.SignalR.Client;
 
 namespace AgentMesh.Cli.Services;
 
+public class InfiniteRetryPolicy : IRetryPolicy
+{
+    public TimeSpan? NextRetryDelay(RetryContext retryContext)
+    {
+        return retryContext.PreviousRetryCount switch
+        {
+            0 => TimeSpan.Zero,
+            1 => TimeSpan.FromSeconds(2),
+            2 => TimeSpan.FromSeconds(5),
+            _ => TimeSpan.FromSeconds(10)
+        };
+    }
+}
+
 public class AgentRunnerInstance : IAsyncDisposable
 {
     private readonly AgentPresetConfig _preset;
@@ -18,6 +32,7 @@ public class AgentRunnerInstance : IAsyncDisposable
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _stoppedSessions = new();
     private readonly SemaphoreSlim _turnLock = new(1, 1);
     private CancellationTokenSource? _activeTurnCts;
+    private Task? _pollTask;
 
     private HubConnection? _hubConnection;
     private string? _agentToken;
@@ -63,7 +78,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                 options.AccessTokenProvider = () => Task.FromResult<string?>(_agentToken);
                 options.Headers["X-Agent-Id"] = _preset.Id;
             })
-            .WithAutomaticReconnect()
+            .WithAutomaticReconnect(new InfiniteRetryPolicy())
             .Build();
 
         static string? GetJsonPropString(JsonElement elem, string name)
@@ -80,11 +95,25 @@ public class AgentRunnerInstance : IAsyncDisposable
             return null;
         }
 
+        bool MatchesRunner(string? targetAgent, string? targetPersona)
+        {
+            var myPersona = _preset.PersonaId?.Trim().TrimStart('@');
+            if (!string.IsNullOrEmpty(myPersona))
+            {
+                if (!string.IsNullOrEmpty(targetPersona))
+                {
+                    return string.Equals(targetPersona.Trim().TrimStart('@'), myPersona, StringComparison.OrdinalIgnoreCase);
+                }
+                return string.Equals(targetAgent?.Trim().TrimStart('@'), myPersona, StringComparison.OrdinalIgnoreCase);
+            }
+
+            var myAgent = _preset.Id?.Trim().TrimStart('@');
+            return string.Equals(targetAgent?.Trim().TrimStart('@'), myAgent, StringComparison.OrdinalIgnoreCase);
+        }
+
         _hubConnection.On<PromptReceivedEvent>("PromptReceived", async (ev) =>
         {
-            var targetAgent = ev.AgentId?.Trim().TrimStart('@');
-            var myAgent = _preset.Id?.Trim().TrimStart('@');
-            if (!string.Equals(targetAgent, myAgent, StringComparison.OrdinalIgnoreCase))
+            if (!MatchesRunner(ev.AgentId, ev.PersonaId))
                 return;
 
             await HandlePromptAsync(ev, _cts.Token);
@@ -95,8 +124,8 @@ public class AgentRunnerInstance : IAsyncDisposable
             try
             {
                 var targetAgent = GetJsonPropString(elem, "agentId")?.Trim().TrimStart('@');
-                var myAgent = _preset.Id?.Trim().TrimStart('@');
-                if (!string.Equals(targetAgent, myAgent, StringComparison.OrdinalIgnoreCase))
+                var personaId = GetJsonPropString(elem, "personaId");
+                if (!MatchesRunner(targetAgent, personaId))
                     return;
 
                 var sidStr = GetJsonPropString(elem, "sessionId");
@@ -112,7 +141,6 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var effort = GetJsonPropString(elem, "effort");
                 var mode = GetJsonPropString(elem, "mode");
                 var tier = GetJsonPropString(elem, "tier");
-                var personaId = GetJsonPropString(elem, "personaId");
                 var personaName = GetJsonPropString(elem, "personaName");
                 var personaRole = GetJsonPropString(elem, "personaRole");
                 var personaPrompt = GetJsonPropString(elem, "personaPrompt");
@@ -188,6 +216,14 @@ public class AgentRunnerInstance : IAsyncDisposable
             catch { }
         });
 
+        _hubConnection.Reconnecting += (exception) =>
+        {
+            State.State = RunnerConnectionState.Connecting;
+            _onStateChanged();
+            _onLog(_preset.Id, $"Mesh connection interrupted. Reconnecting... ({exception?.Message ?? "network"})");
+            return Task.CompletedTask;
+        };
+
         _hubConnection.Reconnected += async (_) =>
         {
             State.State = RunnerConnectionState.Online;
@@ -196,20 +232,65 @@ public class AgentRunnerInstance : IAsyncDisposable
             await _meshClient.SetAgentStatusAsync(_preset, "online");
             if (_hubConnection != null)
             {
+                if (!string.IsNullOrWhiteSpace(_preset.PersonaId))
+                {
+                    try { await _hubConnection.InvokeAsync("RegisterPersonaRunner", _preset.PersonaId, _preset.Id); } catch { }
+                }
                 try { await _hubConnection.InvokeAsync("RegisterAgentRunner", _preset.Id); } catch { }
             }
+            await CheckAndProcessPendingPromptsAsync(_cts.Token);
         };
 
-        _hubConnection.Closed += (_) =>
+        _hubConnection.Closed += async (ex) =>
         {
             State.State = RunnerConnectionState.Offline;
             _onStateChanged();
-            _onLog(_preset.Id, $"Disconnected from Mesh hub.");
-            return Task.CompletedTask;
+            _onLog(_preset.Id, $"Disconnected from Mesh hub{(ex != null ? $": {ex.Message}" : ".")}");
+
+            if (!_cts.IsCancellationRequested)
+            {
+                _ = Task.Run(async () =>
+                {
+                    while (!_cts.IsCancellationRequested && State.State == RunnerConnectionState.Offline)
+                    {
+                        try
+                        {
+                            await Task.Delay(5000, _cts.Token);
+                            if (_hubConnection != null && _hubConnection.State == HubConnectionState.Disconnected)
+                            {
+                                State.State = RunnerConnectionState.Connecting;
+                                _onStateChanged();
+                                _onLog(_preset.Id, "Attempting to re-establish hub connection...");
+                                await _hubConnection.StartAsync(_cts.Token);
+                                if (!string.IsNullOrWhiteSpace(_preset.PersonaId))
+                                {
+                                    try { await _hubConnection.InvokeAsync("RegisterPersonaRunner", _preset.PersonaId, _preset.Id, _cts.Token); } catch { }
+                                }
+                                try { await _hubConnection.InvokeAsync("RegisterAgentRunner", _preset.Id, _cts.Token); } catch { }
+                                State.State = RunnerConnectionState.Online;
+                                _onStateChanged();
+                                _onLog(_preset.Id, "Re-established connection to Mesh hub.");
+                                await _meshClient.SetAgentStatusAsync(_preset, "online", _cts.Token);
+                                await CheckAndProcessPendingPromptsAsync(_cts.Token);
+                                break;
+                            }
+                        }
+                        catch
+                        {
+                            State.State = RunnerConnectionState.Offline;
+                            _onStateChanged();
+                        }
+                    }
+                }, _cts.Token);
+            }
         };
 
         await _hubConnection.StartAsync(ct);
 
+        if (!string.IsNullOrWhiteSpace(_preset.PersonaId))
+        {
+            try { await _hubConnection.InvokeAsync("RegisterPersonaRunner", _preset.PersonaId, _preset.Id, ct); } catch { }
+        }
         try
         {
             await _hubConnection.InvokeAsync("RegisterAgentRunner", _preset.Id, ct);
@@ -225,11 +306,56 @@ public class AgentRunnerInstance : IAsyncDisposable
         _onLog(_preset.Id, $"ONLINE & listening for prompts (adapter: {_preset.AdapterType})");
 
         // Process any prompts that were queued while this agent was offline
-        var pendingPrompts = await _meshClient.GetPendingPromptsForAgentAsync(_preset.Id, _agentToken, ct);
-        foreach (var pending in pendingPrompts)
+        await CheckAndProcessPendingPromptsAsync(_cts.Token);
+
+        // Start background poll loop to ensure no prompts are missed even during brief network or hub hiccups
+        _pollTask = Task.Run(() => StartPendingPromptPollLoopAsync(_cts.Token));
+    }
+
+    private async Task StartPendingPromptPollLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
         {
-            _onLog(_preset.Id, $"Found queued prompt in session {pending.SessionId.ToString()[..8]}: \"{pending.Prompt}\"");
-            _ = Task.Run(() => HandlePromptAsync(pending, _cts.Token), _cts.Token);
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                if (State.State is RunnerConnectionState.Online or RunnerConnectionState.Busy)
+                {
+                    await CheckAndProcessPendingPromptsAsync(ct);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch
+            {
+                // Silently ignore transient poll failures
+            }
+        }
+    }
+
+    private async Task CheckAndProcessPendingPromptsAsync(CancellationToken ct)
+    {
+        try
+        {
+            var pendingPrompts = !string.IsNullOrWhiteSpace(_preset.PersonaId)
+                ? await _meshClient.GetPendingPromptsForPersonaAsync(_preset.PersonaId, _agentToken, ct)
+                : await _meshClient.GetPendingPromptsForAgentAsync(_preset.Id, _agentToken, ct);
+
+            foreach (var pending in pendingPrompts)
+            {
+                if (pending.MessageId != Guid.Empty && _processedMessages.ContainsKey(pending.MessageId))
+                {
+                    continue;
+                }
+                _onLog(_preset.Id, $"Found pending prompt in session {pending.SessionId.ToString()[..8]}: \"{pending.Prompt}\"");
+                _ = Task.Run(() => HandlePromptAsync(pending, _cts.Token), _cts.Token);
+            }
+        }
+        catch
+        {
+            // Transient fetch error
         }
     }
 
@@ -242,7 +368,9 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
 
         var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
-        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
+        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) ||
+                           string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase) ||
+                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent, _preset.PersonaId, StringComparison.OrdinalIgnoreCase));
 
         if (matchesSession || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
         {
@@ -264,7 +392,9 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
 
         var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
-        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) || string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase);
+        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) ||
+                           string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase) ||
+                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent, _preset.PersonaId, StringComparison.OrdinalIgnoreCase));
 
         if (matchesSession || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
         {
@@ -326,7 +456,9 @@ public class AgentRunnerInstance : IAsyncDisposable
             // Resolve working directory: explicit working directory or persistent sandbox workspace
             var effectiveWorkDir = !string.IsNullOrWhiteSpace(ev.WorkingDirectory)
                 ? ev.WorkingDirectory.Trim()
-                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "workspaces", ev.SessionId.ToString());
+                : (Directory.Exists("/workspace")
+                    ? "/workspace"
+                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "workspaces", ev.SessionId.ToString()));
 
             try
             {
@@ -488,6 +620,11 @@ public class AgentRunnerInstance : IAsyncDisposable
     public async Task StopAsync()
     {
         await _cts.CancelAsync();
+        if (_pollTask != null)
+        {
+            try { await _pollTask; } catch { }
+            _pollTask = null;
+        }
         await _meshClient.SetAgentStatusAsync(_preset, "offline");
         if (_hubConnection != null)
         {
@@ -733,6 +870,81 @@ public class AgentProcessManager : IAsyncDisposable
             runner.State.LastError = ex.Message;
             OnStateChanged?.Invoke();
             RecordLog(normalizedId, $"Failed to connect: {ex.Message}");
+            throw;
+        }
+
+        return runner.State;
+    }
+
+    public async Task<AgentRuntimeState> StartPersonaAsync(
+        string personaId,
+        string? customDriver = null,
+        string? customCommand = null,
+        string? customModel = null,
+        CancellationToken ct = default)
+    {
+        var normalizedPersonaId = personaId.Trim().ToLowerInvariant();
+        if (_runners.TryGetValue(normalizedPersonaId, out var existingRunner) &&
+            existingRunner.State.State is RunnerConnectionState.Online or RunnerConnectionState.Busy)
+        {
+            return existingRunner.State;
+        }
+
+        RemotePersonaDto? remotePersona = null;
+        try
+        {
+            remotePersona = await _meshClient.GetPersonaAsync(normalizedPersonaId, ct);
+        }
+        catch { }
+
+        var driverId = (!string.IsNullOrWhiteSpace(customDriver)
+            ? customDriver
+            : remotePersona?.DriverId ?? "openai").Trim().ToLowerInvariant();
+
+        RemoteAgentDto? remoteDriver = null;
+        try
+        {
+            remoteDriver = await _meshClient.GetMeshAgentAsync(driverId, ct);
+        }
+        catch { }
+
+        var preset = _configStore.ResolveOrCreatePreset(_config, driverId, customCommand);
+        if (remoteDriver != null)
+        {
+            _configStore.PopulateFromRemote(preset, remoteDriver);
+        }
+
+        preset.PersonaId = normalizedPersonaId;
+        preset.PersonaName = remotePersona?.Name ?? normalizedPersonaId;
+        preset.PersonaPrompt = remotePersona?.PersonaPrompt ?? "";
+        preset.Name = $"{remotePersona?.Name ?? normalizedPersonaId} (@{driverId})";
+        preset.Role = remotePersona?.Role ?? preset.Role;
+
+        if (!string.IsNullOrWhiteSpace(customCommand)) preset.Command = customCommand;
+        if (!string.IsNullOrWhiteSpace(customModel)) preset.DefaultModel = customModel;
+        else if (!string.IsNullOrWhiteSpace(remotePersona?.DefaultModel)) preset.DefaultModel = remotePersona.DefaultModel;
+
+        if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) &&
+            (preset.Capabilities == null || preset.Capabilities.Count == 0 ||
+             preset.Capabilities.SequenceEqual(new[] { "shell", "inspect_workspace" })))
+        {
+            preset.Capabilities = new List<string> { "run_command", "read_file", "write_file", "edit_file", "ask_question" };
+            preset.Command = null;
+        }
+
+        var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog, () => OnStateChanged?.Invoke());
+        _runners[normalizedPersonaId] = runner;
+
+        try
+        {
+            await runner.StartAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            runner.State.State = RunnerConnectionState.Error;
+            runner.State.LastError = ex.Message;
+            OnStateChanged?.Invoke();
+            RecordLog(normalizedPersonaId, $"Failed to connect persona @{normalizedPersonaId}: {ex.Message}");
             throw;
         }
 

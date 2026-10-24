@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Claims;
@@ -767,21 +767,33 @@ public class AgentsController(
         return null;
     }
 
-    private static AgentDto ToDto(Agent a, int sessionCount, List<DriverPersonaSummaryDto>? personas = null) => new(
-        a.Id,
-        a.Name,
-        a.RuntimeType.ToString(),
-        (int)a.TrustTier,
-        a.PersonaPrompt,
-        a.CreatedAt,
-        a.Role,
-        a.Status,
-        a.CapabilitiesJson,
-        a.LastHeartbeatAt,
-        sessionCount,
-        personas ?? new List<DriverPersonaSummaryDto>(),
-        DriverCapabilities.Parse(a.CapabilitiesJson)
-    );
+    private static AgentDto ToDto(Agent a, int sessionCount, List<DriverPersonaSummaryDto>? personas = null)
+    {
+        var isConnected = AgentMeshHub.IsAgentConnected(a.Id);
+        var status = isConnected
+            ? (a.Status == "busy" ? "busy" : "online")
+            : (a.Status == "busy" && a.LastHeartbeatAt > DateTimeOffset.UtcNow.AddMinutes(-5)
+                ? "busy"
+                : (a.LastHeartbeatAt > DateTimeOffset.UtcNow.AddSeconds(-60)
+                    ? a.Status
+                    : "offline"));
+
+        return new(
+            a.Id,
+            a.Name,
+            a.RuntimeType.ToString(),
+            (int)a.TrustTier,
+            a.PersonaPrompt,
+            a.CreatedAt,
+            a.Role,
+            status,
+            a.CapabilitiesJson,
+            a.LastHeartbeatAt,
+            sessionCount,
+            personas ?? new List<DriverPersonaSummaryDto>(),
+            DriverCapabilities.Parse(a.CapabilitiesJson)
+        );
+    }
 }
 
 public record DriverPersonaSummaryDto(

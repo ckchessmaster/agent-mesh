@@ -8,6 +8,7 @@ namespace AgentMesh.Api.Hubs;
 public class AgentMeshHub(AgentMeshDbContext? db = null) : Hub
 {
     private static readonly ConcurrentDictionary<string, string> ConnectionAgents = new();
+    private static readonly ConcurrentDictionary<string, string> ConnectionPersonas = new();
 
     public static bool IsAgentConnected(string agentId)
     {
@@ -16,10 +17,24 @@ public class AgentMeshHub(AgentMeshDbContext? db = null) : Hub
         return ConnectionAgents.Values.Any(v => v == normalized);
     }
 
+    public static bool IsPersonaConnected(string personaId)
+    {
+        if (string.IsNullOrWhiteSpace(personaId)) return false;
+        var normalized = personaId.Trim().ToLowerInvariant();
+        return ConnectionPersonas.Values.Any(v => v == normalized);
+    }
+
     public static IReadOnlyCollection<string> GetConnectedAgentIds() =>
         ConnectionAgents.Values.Distinct().ToList();
 
-    public static void ClearConnections() => ConnectionAgents.Clear();
+    public static IReadOnlyCollection<string> GetConnectedPersonaIds() =>
+        ConnectionPersonas.Values.Distinct().ToList();
+
+    public static void ClearConnections()
+    {
+        ConnectionAgents.Clear();
+        ConnectionPersonas.Clear();
+    }
 
     public async Task JoinSession(string sessionId)
     {
@@ -29,6 +44,29 @@ public class AgentMeshHub(AgentMeshDbContext? db = null) : Hub
     public async Task LeaveSession(string sessionId)
     {
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"session-{sessionId}");
+    }
+
+    public async Task RegisterPersonaRunner(string personaId, string? driverId = null)
+    {
+        if (string.IsNullOrWhiteSpace(personaId)) return;
+
+        var normalizedPersonaId = personaId.Trim().ToLowerInvariant();
+        ConnectionPersonas[Context.ConnectionId] = normalizedPersonaId;
+        await Groups.AddToGroupAsync(Context.ConnectionId, $"persona-{normalizedPersonaId}");
+
+        if (!string.IsNullOrWhiteSpace(driverId))
+        {
+            await RegisterAgentRunner(driverId);
+        }
+
+        await Clients.All.SendAsync("PersonaRunnerStatusChanged", new
+        {
+            personaId = normalizedPersonaId,
+            driverId = driverId?.Trim().ToLowerInvariant(),
+            status = "online",
+            connectionId = Context.ConnectionId,
+            timestamp = DateTimeOffset.UtcNow
+        });
     }
 
     public async Task RegisterAgentRunner(string agentId)
@@ -70,6 +108,21 @@ public class AgentMeshHub(AgentMeshDbContext? db = null) : Hub
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
+        if (ConnectionPersonas.TryRemove(Context.ConnectionId, out var personaId))
+        {
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"persona-{personaId}");
+            var stillConnected = ConnectionPersonas.Values.Any(v => v == personaId);
+            if (!stillConnected)
+            {
+                await Clients.All.SendAsync("PersonaRunnerStatusChanged", new
+                {
+                    personaId,
+                    status = "offline",
+                    timestamp = DateTimeOffset.UtcNow
+                });
+            }
+        }
+
         if (ConnectionAgents.TryRemove(Context.ConnectionId, out var agentId))
         {
             await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"agent-{agentId}");

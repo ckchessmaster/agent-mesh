@@ -15,7 +15,8 @@ namespace AgentMesh.Api.Controllers;
 [Authorize]
 public class PersonasController(
     AgentMeshDbContext db,
-    IHubContext<AgentMeshHub>? hubContext = null) : ControllerBase
+    IHubContext<AgentMeshHub>? hubContext = null,
+    AgentMesh.Core.Services.IPersonaContainerManager? containerManager = null) : ControllerBase
 {
     [HttpGet]
     [AllowAnonymous]
@@ -331,6 +332,85 @@ public class PersonasController(
         return Ok(result);
     }
 
+    [HttpGet("{id}/environment")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetPersonaEnvironment(string id, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return Ok(new AgentMesh.Core.Services.PersonaEnvironmentStatus(normalizedId, "none", "none"));
+        }
+
+        var status = await containerManager.GetStatusAsync(normalizedId, ct);
+        return Ok(status);
+    }
+
+    [HttpPost("{id}/environment/wake")]
+    public async Task<IActionResult> WakePersonaEnvironment(string id, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        await containerManager.EnsureRunningAsync(normalizedId, ct);
+        var status = await containerManager.GetStatusAsync(normalizedId, ct);
+        return Ok(status);
+    }
+
+    [HttpPost("{id}/environment/stop")]
+    public async Task<IActionResult> StopPersonaEnvironment(string id, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        await containerManager.StopAsync(normalizedId, ct);
+        var status = await containerManager.GetStatusAsync(normalizedId, ct);
+        return Ok(status);
+    }
+
+    [HttpGet("{id}/environment/logs")]
+    public async Task<IActionResult> GetPersonaEnvironmentLogs(string id, [FromQuery] int tail = 100, CancellationToken ct = default)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return Ok(new { logs = "Container manager is not available." });
+        }
+
+        var logs = await containerManager.GetLogsAsync(normalizedId, Math.Clamp(tail, 10, 1000), ct);
+        return Ok(new { logs });
+    }
+
     [HttpPost("{id}/sessions")]
     public async Task<IActionResult> CreatePersonaSession(string id, [FromBody] CreateAgentSessionRequest req)
     {
@@ -400,6 +480,12 @@ public class PersonasController(
         SessionMessage? promptMsg = null;
         if (hasInitialPrompt)
         {
+            if (containerManager != null)
+            {
+                var ct = HttpContext?.RequestAborted ?? CancellationToken.None;
+                try { await containerManager.EnsureRunningAsync(persona.Id, ct); } catch { }
+            }
+
             var effectivePrompt = !string.IsNullOrWhiteSpace(req.InitialPrompt)
                 ? req.InitialPrompt.Trim()
                 : SessionsController.DefaultAttachmentPrompt;
@@ -466,6 +552,7 @@ public class PersonasController(
                     attachments = req.Attachments,
                     createdAt = promptMsg.CreatedAt
                 };
+                await hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", payload);
                 await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", payload);
                 await hubContext.Clients.All.SendAsync("PromptReceived", payload);
             }

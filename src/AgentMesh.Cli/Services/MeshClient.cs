@@ -60,6 +60,21 @@ public class MeshClient
         }
     }
 
+    public async Task<RemotePersonaDto?> GetPersonaAsync(string personaId, CancellationToken ct = default)
+    {
+        try
+        {
+            using var req = CreateRequest(HttpMethod.Get, $"api/personas/{Uri.EscapeDataString(personaId.Trim().ToLowerInvariant())}", _config.MasterToken);
+            using var res = await _http.SendAsync(req, ct);
+            if (!res.IsSuccessStatusCode) return null;
+            return await res.Content.ReadFromJsonAsync<RemotePersonaDto>(cancellationToken: ct);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public static string SerializePresetCapabilities(AgentPresetConfig preset)
     {
         if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) ||
@@ -301,6 +316,133 @@ public class MeshClient
         {
             // Ignore transient lookup errors on startup
         }
+
+        return pending;
+    }
+
+    public async Task<List<PromptReceivedEvent>> GetPendingPromptsForPersonaAsync(string personaId, string? agentToken, CancellationToken ct = default)
+    {
+        var pending = new List<PromptReceivedEvent>();
+        try
+        {
+            var token = !string.IsNullOrWhiteSpace(agentToken) ? agentToken : _config.MasterToken;
+            using var sessionsReq = CreateRequest(HttpMethod.Get, $"api/personas/{Uri.EscapeDataString(personaId.Trim().ToLowerInvariant())}/sessions", token);
+            using var sessionsRes = await _http.SendAsync(sessionsReq, ct);
+            if (!sessionsRes.IsSuccessStatusCode) return pending;
+
+            using var sessionsDoc = await JsonDocument.ParseAsync(await sessionsRes.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            foreach (var sElem in sessionsDoc.RootElement.EnumerateArray())
+            {
+                var status = sElem.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
+                if (!string.Equals(status, "thinking", StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (!sElem.TryGetProperty("id", out var idProp) || !Guid.TryParse(idProp.GetString(), out var sessionId))
+                    continue;
+
+                string? workDir = null, model = null, effort = null, mode = null;
+                string? pId = personaId, personaName = null, personaRole = null, personaPrompt = null;
+                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null;
+                string? driverId = sElem.TryGetProperty("driverId", out var didProp) ? didProp.GetString() : null;
+
+                if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
+                {
+                    pId = topPid.GetString();
+                }
+                if (sElem.TryGetProperty("personaName", out var topPname) && topPname.ValueKind == JsonValueKind.String)
+                {
+                    personaName = topPname.GetString();
+                }
+                if (sElem.TryGetProperty("metadataJson", out var metaProp) && !string.IsNullOrWhiteSpace(metaProp.GetString()))
+                {
+                    try
+                    {
+                        using var mDoc = JsonDocument.Parse(metaProp.GetString()!);
+                        var mRoot = mDoc.RootElement;
+                        if (mRoot.TryGetProperty("workingDirectory", out var wd)) workDir = wd.GetString();
+                        if (mRoot.TryGetProperty("model", out var m)) model = m.GetString();
+                        if (mRoot.TryGetProperty("effort", out var ef)) effort = ef.GetString();
+                        if (mRoot.TryGetProperty("mode", out var md)) mode = md.GetString();
+                        if (mRoot.TryGetProperty("personaId", out var pid)) pId ??= pid.GetString();
+                        if (mRoot.TryGetProperty("personaName", out var pn)) personaName ??= pn.GetString();
+                        if (mRoot.TryGetProperty("personaRole", out var pr)) personaRole = pr.GetString();
+                        if (mRoot.TryGetProperty("personaPrompt", out var pp)) personaPrompt = pp.GetString();
+                        if (mRoot.TryGetProperty("jobId", out var jid)) jobId = jid.GetString();
+                        if (mRoot.TryGetProperty("projectId", out var projid)) projectId = projid.GetString();
+                        if (mRoot.TryGetProperty("gitBranch", out var gb)) gitBranch = gb.GetString();
+                        if (mRoot.TryGetProperty("workspaceType", out var wt)) workspaceType = wt.GetString();
+                    }
+                    catch { }
+                }
+
+                using var eventsReq = CreateRequest(HttpMethod.Get, $"api/sessions/{sessionId}/events", token);
+                using var eventsRes = await _http.SendAsync(eventsReq, ct);
+                if (!eventsRes.IsSuccessStatusCode) continue;
+
+                using var eventsDoc = await JsonDocument.ParseAsync(await eventsRes.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+                var arr = eventsDoc.RootElement;
+                if (arr.GetArrayLength() == 0) continue;
+
+                var lastEv = arr[arr.GetArrayLength() - 1];
+                var evType = lastEv.TryGetProperty("eventType", out var etProp) ? etProp.GetString() : null;
+                if (string.Equals(evType, "prompt", StringComparison.OrdinalIgnoreCase))
+                {
+                    var content = lastEv.TryGetProperty("content", out var cProp) ? cProp.GetString() ?? "" : "";
+                    var sender = lastEv.TryGetProperty("senderAgentId", out var saProp) ? saProp.GetString() ?? "operator" : "operator";
+                    var msgId = lastEv.TryGetProperty("id", out var mProp) && Guid.TryParse(mProp.GetString(), out var mid)
+                        ? mid
+                        : Guid.NewGuid();
+
+                    var createdAt = lastEv.TryGetProperty("createdAt", out var caProp) && caProp.TryGetDateTimeOffset(out var dto)
+                        ? dto
+                        : DateTimeOffset.UtcNow;
+
+                    List<AttachmentItem>? attachments = null;
+                    if (lastEv.TryGetProperty("structuredPayloadJson", out var spProp) &&
+                        spProp.ValueKind == JsonValueKind.String &&
+                        !string.IsNullOrWhiteSpace(spProp.GetString()))
+                    {
+                        try
+                        {
+                            using var spDoc = JsonDocument.Parse(spProp.GetString()!);
+                            if (spDoc.RootElement.TryGetProperty("attachments", out var attElem) &&
+                                attElem.ValueKind == JsonValueKind.Array)
+                            {
+                                attachments = JsonSerializer.Deserialize<List<AttachmentItem>>(attElem.GetRawText(), new JsonSerializerOptions
+                                {
+                                    PropertyNameCaseInsensitive = true
+                                });
+                            }
+                        }
+                        catch { }
+                    }
+
+                    pending.Add(new PromptReceivedEvent
+                    {
+                        SessionId = sessionId,
+                        MessageId = msgId,
+                        AgentId = driverId ?? personaId,
+                        DriverId = driverId,
+                        PersonaId = pId,
+                        PersonaName = personaName,
+                        PersonaRole = personaRole,
+                        PersonaPrompt = personaPrompt,
+                        Prompt = content,
+                        Sender = sender,
+                        WorkingDirectory = workDir,
+                        Model = model,
+                        Effort = effort,
+                        Mode = mode,
+                        JobId = jobId,
+                        ProjectId = projectId,
+                        GitBranch = gitBranch,
+                        WorkspaceType = workspaceType,
+                        Attachments = attachments,
+                        CreatedAt = createdAt
+                    });
+                }
+            }
+        }
+        catch { }
 
         return pending;
     }

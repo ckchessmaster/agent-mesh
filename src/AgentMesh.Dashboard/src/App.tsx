@@ -1,4 +1,4 @@
-﻿import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Bot,
   Brain,
@@ -43,7 +43,8 @@ import {
   Download,
   ZoomIn,
   FolderGit2,
-  Maximize2
+  Maximize2,
+  Box
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -79,6 +80,7 @@ import { MermaidViewer } from './components/MermaidViewer';
 import { getOptionLabel, getOptionDescription } from './components/QuestionCard';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { DriverConfigModal } from './components/DriverConfigModal';
+import { PersonaEnvironmentModal } from './components/PersonaEnvironmentModal';
 
 interface StagedAttachmentItem {
   localId: string;
@@ -273,6 +275,7 @@ export default function App() {
   const [personaDefaultContextSize, setPersonaDefaultContextSize] = useState('');
   const [personaDefaultWorkDir, setPersonaDefaultWorkDir] = useState('');
   const [personaMaxConcurrentJobs, setPersonaMaxConcurrentJobs] = useState<string>('');
+  const [inspectingPersonaEnv, setInspectingPersonaEnv] = useState<Persona | null>(null);
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
 
@@ -2821,6 +2824,17 @@ export default function App() {
                           </div>
 
                           <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setInspectingPersonaEnv(persona);
+                              }}
+                              className="p-1 rounded-md text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition cursor-pointer"
+                              title={`Inspect ${persona.name} container dev environment`}
+                            >
+                              <Box className="w-3 h-3 text-sky-400" />
+                            </button>
                             <button
                               type="button"
                               onClick={(e) => {
@@ -6173,6 +6187,13 @@ export default function App() {
           saving={isSavingDriverConfig}
           onClose={() => setConfigAgent(null)}
           onSave={(patch) => handleSaveDriverConfig(configAgent.id, patch)}
+        />
+      )}
+
+      {inspectingPersonaEnv && (
+        <PersonaEnvironmentModal
+          persona={inspectingPersonaEnv}
+          onClose={() => setInspectingPersonaEnv(null)}
         />
       )}
     </div>

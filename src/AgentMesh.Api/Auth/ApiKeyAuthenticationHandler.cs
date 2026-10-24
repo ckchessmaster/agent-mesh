@@ -40,6 +40,11 @@ public class ApiKeyAuthenticationHandler(
             providedKey = customHeader.ToString().Trim();
         }
 
+        if (string.IsNullOrEmpty(providedKey) && Request.Query.TryGetValue("access_token", out var queryToken))
+        {
+            providedKey = queryToken.ToString().Trim();
+        }
+
         if (string.IsNullOrEmpty(providedKey))
         {
             return AuthenticateResult.NoResult();

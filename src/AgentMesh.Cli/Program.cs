@@ -19,7 +19,7 @@ public static class Program
         var configStore = new ConfigStore();
         var config = configStore.Load();
 
-        // Parse global options (--url, --token, --command, --role, --adapter, --name, --once)
+        // Parse global options (--url, --token, --command, --role, --adapter, --name, --once, --persona, --driver, --headless)
         var positional = new List<string>();
         string? customCommand = null;
         string? customRole = null;
@@ -29,6 +29,9 @@ public static class Program
         string? customApiKey = null;
         string? customDefaultModel = null;
         var runOnce = false;
+        var headless = false;
+        string? targetPersonaId = Environment.GetEnvironmentVariable("AGENTMESH_PERSONA_ID");
+        string? targetDriverId = Environment.GetEnvironmentVariable("AGENTMESH_DRIVER_ID");
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -40,6 +43,19 @@ public static class Program
             else if (arg is "--token" && i + 1 < args.Length)
             {
                 config.MasterToken = args[++i].Trim();
+            }
+            else if (arg is "--persona" or "-p" && i + 1 < args.Length)
+            {
+                targetPersonaId = args[++i].Trim();
+                headless = true;
+            }
+            else if (arg is "--driver" or "-d" && i + 1 < args.Length)
+            {
+                targetDriverId = args[++i].Trim();
+            }
+            else if (arg is "--headless")
+            {
+                headless = true;
             }
             else if (arg is "--command" or "-c" && i + 1 < args.Length)
             {
@@ -79,12 +95,20 @@ public static class Program
             }
         }
 
-        var subcommand = positional.Count > 0 ? positional[0].ToLowerInvariant() : "tui";
+        var defaultSubcommand = (headless || !string.IsNullOrWhiteSpace(targetPersonaId)) ? "run" : "tui";
+        var subcommand = positional.Count > 0 ? positional[0].ToLowerInvariant() : defaultSubcommand;
         var subArgs = positional.Skip(1).ToList();
 
         if (subcommand is "help" or "--help" or "-h")
         {
             PrintHelp(configStore.ConfigFilePath);
+            return 0;
+        }
+
+        if (subcommand is "version" or "--version" or "-v")
+        {
+            var version = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.2.0";
+            AnsiConsole.MarkupLine($"[bold skyblue1]AgentMesh CLI[/] version [bold white]{version}[/]");
             return 0;
         }
 
@@ -102,6 +126,56 @@ public static class Program
 
             case "start" or "connect" or "run":
             {
+                if (!string.IsNullOrWhiteSpace(targetPersonaId))
+                {
+                    AnsiConsole.MarkupLine($"[bold skyblue1]AgentMesh Persona Runner[/] for [bold green]@{Markup.Escape(targetPersonaId)}[/] connecting to [underline]{Markup.Escape(config.MeshUrl)}[/]...");
+
+                    manager.OnActivityLog += (agentId, msg) =>
+                    {
+                        AnsiConsole.MarkupLine($"[grey]{DateTimeOffset.Now:HH:mm:ss}[/] [bold skyblue1]@{Markup.Escape(agentId),-10}[/] {Markup.Escape(msg)}");
+                    };
+
+                    try
+                    {
+                        await manager.StartPersonaAsync(
+                            targetPersonaId,
+                            targetDriverId,
+                            customCommand,
+                            customDefaultModel,
+                            cts.Token);
+                    }
+                    catch (Exception ex)
+                    {
+                        AnsiConsole.MarkupLine($"[red]Failed to start persona @{Markup.Escape(targetPersonaId)}:[/] {Markup.Escape(ex.Message)}");
+                        return 1;
+                    }
+
+                    if (runOnce)
+                    {
+                        await Task.Delay(1500, cts.Token);
+                        while (manager.GetAllAgentStates().Any(s => s.State == RunnerConnectionState.Busy) && !cts.Token.IsCancellationRequested)
+                        {
+                            await Task.Delay(300, cts.Token);
+                        }
+                        await manager.StopAllAsync();
+                        return 0;
+                    }
+
+                    AnsiConsole.MarkupLine("[green]Persona runner listening for session prompts. Press Ctrl+C to stop.[/]");
+                    try
+                    {
+                        await Task.Delay(Timeout.Infinite, cts.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+
+                    AnsiConsole.MarkupLine("\n[yellow]Stopping persona runner...[/]");
+                    await manager.StopAllAsync();
+                    AnsiConsole.MarkupLine("[green]Disconnected cleanly.[/]");
+                    return 0;
+                }
+
                 var targets = subArgs.Count > 0 ? subArgs : new List<string> { "agy" };
                 if (targets.Contains("--all", StringComparer.OrdinalIgnoreCase))
                 {
@@ -304,11 +378,15 @@ public static class Program
         AnsiConsole.MarkupLine("  [cyan]agentmesh[/]                             Launch interactive multi-agent TUI dashboard");
         AnsiConsole.MarkupLine("  [cyan]agentmesh tui [[agent1 agent2...]][/]      Launch TUI and immediately start specified agents");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start <agent1> [[agent2...]][/]  Start and connect one or more agents (e.g. agy, claude, test)");
+        AnsiConsole.MarkupLine("  [cyan]agentmesh run --persona <id> [[options]][/] Start as a dedicated persona runner");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start --all[/]                 Start all configured agent presets concurrently");
         AnsiConsole.MarkupLine("  [cyan]agentmesh list[/]                        Show all local presets and live Mesh connection status");
         AnsiConsole.MarkupLine("  [cyan]agentmesh add <id> [[options]][/]          Add or configure a custom agent preset");
         AnsiConsole.MarkupLine("  [cyan]agentmesh config [[--url <url>]][/]        View or update Mesh URL and operator token\n");
         AnsiConsole.MarkupLine("[bold]Options:[/]");
+        AnsiConsole.MarkupLine("  [grey]--persona, -p <id>[/]  Dedicated persona ID (auto-binds to persona in Mesh)");
+        AnsiConsole.MarkupLine("  [grey]--driver, -d <drv>[/]  Driver/harness to use for persona (e.g. openai, agy, claude)");
+        AnsiConsole.MarkupLine("  [grey]--headless[/]          Run headless without interactive TUI");
         AnsiConsole.MarkupLine("  [grey]--url <url>[/]         AgentMesh API URL (default: http://localhost:5000)");
         AnsiConsole.MarkupLine("  [grey]--token <token>[/]     Operator/master token for auto-registration");
         AnsiConsole.MarkupLine("  [grey]--command, -c <cmd>[/] Custom CLI command to execute for prompts");

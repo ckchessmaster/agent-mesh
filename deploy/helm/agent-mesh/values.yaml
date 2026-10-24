@@ -10,8 +10,8 @@ ingress:
 
 api:
   image:
-    repository: "agent-mesh-api"
-    tag: "latest"
+    repository: "ghcr.io/your-org/agent-mesh-api"
+    tag: "0.2.0"
     pullPolicy: IfNotPresent
   port: 5000
   resources:
@@ -24,8 +24,8 @@ api:
 
 worker:
   image:
-    repository: "agent-mesh-worker"
-    tag: "latest"
+    repository: "ghcr.io/your-org/agent-mesh-worker"
+    tag: "0.2.0"
     pullPolicy: IfNotPresent
   resources:
     limits:
@@ -35,28 +35,11 @@ worker:
       cpu: 100m
       memory: 128Mi
 
-config:
-  staticApiKey: "mesh-default-secret-key"
-  temporalHost: "temporal:7233"
-  temporalNamespace: "default"
-  postgresHost: "postgres"
-  postgresPort: 5432
-  postgresDatabase: "agentdb"
-  postgresUser: "postgres"
-  postgresPassword: "postgrespassword"
-  redisHost: "redis:6379"
-  storage:
-    serviceUrl: "http://seaweedfs:8333"
-    bucketName: "agent-mesh-artifacts"
-    accessKey: "agentmesh-storage-key"
-    secretKey: "AgentMesh#SecureS3Pass2026!"
-    thresholdBytes: 65536
-
 dashboard:
   replicas: 1
   image:
-    repository: "agent-mesh-dashboard"
-    tag: "latest"
+    repository: "ghcr.io/your-org/agent-mesh-dashboard"
+    tag: "0.2.0"
     pullPolicy: IfNotPresent
   resources:
     limits:
@@ -65,3 +48,20 @@ dashboard:
     requests:
       cpu: 50m
       memory: 64Mi
+
+config:
+  # Name of the pre-created Kubernetes Secret containing sensitive credentials
+  # (Auth__StaticApiKey, ConnectionStrings__agentdb, ConnectionStrings__redis, Storage__S3__AccessKey, Storage__S3__SecretKey)
+  secretName: "agent-mesh-secrets"
+  temporalHost: "temporal:7233"
+  temporalNamespace: "default"
+  storage:
+    serviceUrl: "http://seaweedfs:8333"
+    bucketName: "agent-mesh-artifacts"
+    thresholdBytes: 65536
+  personaRunner:
+    image:
+      repository: "ghcr.io/your-org/agentmesh-persona-runner"
+      tag: "0.2.0"
+      pullPolicy: IfNotPresent
+    idleTimeoutMinutes: 30
