@@ -1,0 +1,95 @@
+{{- if .Values.dex.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-dex-config
+  labels:
+    app: {{ .Release.Name }}-dex
+data:
+  config.yaml: |
+    issuer: https://{{ .Values.ingress.host }}/dex
+    storage:
+      type: memory
+    web:
+      http: 0.0.0.0:5556
+      allowedOrigins:
+        - 'https://{{ .Values.ingress.host }}'
+        - '*'
+    telemetry:
+      http: 0.0.0.0:5558
+    enablePasswordDB: true
+    oauth2:
+      skipApprovalScreen: true
+    expiry:
+      deviceRequests: "5m"
+      signingKeys: "720h"
+      idTokens: "24h"
+      authCodes: "10m"
+    staticClients:
+      - id: {{ .Values.config.oidc.clientId | quote }}
+        redirectURIs:
+          - 'https://{{ .Values.ingress.host }}/auth/callback'
+        name: 'AgentMesh Dashboard'
+        public: true
+    staticPasswords:
+      - email: {{ .Values.dex.adminEmail | quote }}
+        hash: {{ .Values.dex.adminPasswordHash | quote }}
+        username: "admin"
+        userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+        groups:
+          - "admin"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-dex
+  labels:
+    app: {{ .Release.Name }}-dex
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5556
+      targetPort: 5556
+      protocol: TCP
+      name: http
+  selector:
+    app: {{ .Release.Name }}-dex
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-dex
+  labels:
+    app: {{ .Release.Name }}-dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-dex
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-dex
+    spec:
+      containers:
+        - name: dex
+          image: "{{ .Values.dex.image.repository }}:{{ .Values.dex.image.tag }}"
+          imagePullPolicy: {{ .Values.dex.image.pullPolicy }}
+          command: ["dex", "serve", "/etc/dex/cfg/config.yaml"]
+          ports:
+            - containerPort: 5556
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /dex/healthz
+              port: 5558
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: dex-config
+              mountPath: /etc/dex/cfg
+      volumes:
+        - name: dex-config
+          configMap:
+            name: {{ .Release.Name }}-dex-config
+{{- end }}

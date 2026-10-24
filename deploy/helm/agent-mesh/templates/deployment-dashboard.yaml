@@ -33,5 +33,13 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+          volumeMounts:
+            - name: dashboard-config
+              mountPath: /usr/share/nginx/html/config.js
+              subPath: config.js
           resources:
             {{- toYaml .Values.dashboard.resources | nindent 12 }}
+      volumes:
+        - name: dashboard-config
+          configMap:
+            name: {{ .Release.Name }}-dashboard-config

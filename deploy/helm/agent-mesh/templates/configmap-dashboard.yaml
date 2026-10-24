@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-dashboard-config
+  labels:
+    app: {{ .Release.Name }}-dashboard
+data:
+  config.js: |
+    window.__AGENTMESH_CONFIG__ = {
+      oidcAuthority: {{ if .Values.config.oidc.authority }}{{ .Values.config.oidc.authority | quote }}{{ else if .Values.dex.enabled }}"https://{{ .Values.ingress.host }}/dex"{{ else }}"http://localhost:8085/dex"{{ end }},
+      oidcClientId: {{ .Values.config.oidc.clientId | quote }}
+    };

@@ -149,6 +149,17 @@ app.MapMcp("/mcp");
 
 app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online", Version = "1.0.0" }));
 
+app.MapGet("/api/auth/config", (IConfiguration config) =>
+{
+    var authority = config["Oidc:Authority"] ?? "http://localhost:8085/dex";
+    var clientId = config["Oidc:ClientId"] ?? "agentmesh-dashboard";
+    return Results.Ok(new
+    {
+        authority,
+        clientId
+    });
+}).AllowAnonymous();
+
 app.MapGet("/api/status", async (IServiceProvider sp, IConfiguration config) =>
 {
     var swTotal = System.Diagnostics.Stopwatch.StartNew();

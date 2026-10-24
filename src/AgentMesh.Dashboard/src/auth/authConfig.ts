@@ -1,13 +1,26 @@
 import type { UserManagerSettings } from 'oidc-client-ts';
 import { WebStorageStateStore } from 'oidc-client-ts';
 
+interface RuntimeConfig {
+  oidcAuthority?: string;
+  oidcClientId?: string;
+}
+
+declare global {
+  interface Window {
+    __AGENTMESH_CONFIG__?: RuntimeConfig;
+  }
+}
+
 const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
-const configuredAuthority = import.meta.env.VITE_OIDC_AUTHORITY;
+const runtimeConfig = (typeof window !== 'undefined' && window.__AGENTMESH_CONFIG__) || {};
+const configuredAuthority = runtimeConfig.oidcAuthority || import.meta.env.VITE_OIDC_AUTHORITY;
+const configuredClientId = runtimeConfig.oidcClientId || import.meta.env.VITE_OIDC_CLIENT_ID || 'agentmesh-dashboard';
 const isLocalDex = !configuredAuthority || configuredAuthority.includes('localhost:8085');
 
 export const oidcConfig: UserManagerSettings = {
   authority: configuredAuthority || 'http://localhost:8085/dex',
-  client_id: import.meta.env.VITE_OIDC_CLIENT_ID || 'agentmesh-dashboard',
+  client_id: configuredClientId,
   redirect_uri: `${origin}/auth/callback`,
   post_logout_redirect_uri: origin,
   response_type: 'code',

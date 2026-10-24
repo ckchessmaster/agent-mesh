@@ -59,9 +59,28 @@ config:
     serviceUrl: "http://seaweedfs:8333"
     bucketName: "agent-mesh-artifacts"
     thresholdBytes: 65536
+  oidc:
+    # URL of your OpenID Connect identity provider (e.g. Keycloak, Okta, Authentik, Azure AD / Entra ID, or Dex)
+    # If dex.enabled is true and authority is left blank, it automatically defaults to: https://<ingress.host>/dex
+    authority: ""
+    # OIDC Client ID configured in the IdP for the Dashboard (public PKCE client)
+    clientId: "agentmesh-dashboard"
+    # Enforce HTTPS metadata validation (set to true in production)
+    requireHttpsMetadata: true
   personaRunner:
     image:
       repository: "ghcr.io/your-org/agentmesh-persona-runner"
       tag: "0.2.0"
       pullPolicy: IfNotPresent
     idleTimeoutMinutes: 30
+
+# Optional: In-cluster Dex OIDC Provider (turn on if you don't have an external corporate IdP)
+dex:
+  enabled: false
+  image:
+    repository: "ghcr.io/dexidp/dex"
+    tag: "v2.41.1"
+    pullPolicy: IfNotPresent
+  adminEmail: "admin@agentmesh.local"
+  # Default bcrypt hash for "password" - MUST be changed for production!
+  adminPasswordHash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"

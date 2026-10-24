@@ -7,6 +7,9 @@ data:
   Storage__S3__ServiceUrl: {{ .Values.config.storage.serviceUrl | quote }}
   Storage__S3__BucketName: {{ .Values.config.storage.bucketName | quote }}
   Storage__S3__ThresholdBytes: {{ .Values.config.storage.thresholdBytes | quote }}
+  Oidc__Authority: {{ if .Values.config.oidc.authority }}{{ .Values.config.oidc.authority | quote }}{{ else if .Values.dex.enabled }}"https://{{ .Values.ingress.host }}/dex"{{ else }}"http://localhost:8085/dex"{{ end }}
+  Oidc__ClientId: {{ .Values.config.oidc.clientId | quote }}
+  Oidc__RequireHttpsMetadata: {{ .Values.config.oidc.requireHttpsMetadata | quote }}
   PersonaContainer__Runtime: "kubernetes"
   PersonaContainer__Image: "{{ .Values.config.personaRunner.image.repository }}:{{ .Values.config.personaRunner.image.tag }}"
   PersonaContainer__IdleTimeoutMinutes: {{ .Values.config.personaRunner.idleTimeoutMinutes | quote }}

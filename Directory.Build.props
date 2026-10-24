@@ -4,9 +4,9 @@
     <AssemblyVersion Condition="'$(AssemblyVersion)' == ''">0.2.0.0</AssemblyVersion>
     <FileVersion Condition="'$(FileVersion)' == ''">0.2.0.0</FileVersion>
     <InformationalVersion Condition="'$(InformationalVersion)' == ''">0.2.0</InformationalVersion>
-    <Authors>AgentMesh Team</Authors>
-    <Company>AgentMesh</Company>
+    <Authors>Christopher Kingdon</Authors>
+    <Company>Christopher Kingdon</Company>
     <Product>AgentMesh</Product>
-    <Copyright>Copyright © 2026 AgentMesh</Copyright>
+    <Copyright>Copyright © 2026 Christopher Kingdon</Copyright>
   </PropertyGroup>
 </Project>
