@@ -1,0 +1,12 @@
+**/.git
+**/.github
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/.vs
+**/.idea
+**/*.user
+**/*.suo
+**/TestResults
+deploy/helm

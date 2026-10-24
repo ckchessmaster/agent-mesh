@@ -4,9 +4,18 @@ metadata:
   name: {{ .Release.Name }}-config
 data:
   Temporal__Host: {{ .Values.config.temporalHost | quote }}
-  Storage__S3__ServiceUrl: {{ .Values.config.storage.serviceUrl | quote }}
-  Storage__S3__BucketName: {{ .Values.config.storage.bucketName | quote }}
-  Storage__S3__ThresholdBytes: {{ .Values.config.storage.thresholdBytes | quote }}
+  Temporal__Namespace: {{ .Values.config.temporalNamespace | default "default" | quote }}
+{{- $sUrl := .Values.config.storage.serviceUrl }}
+{{- $bName := .Values.config.storage.bucketName }}
+{{- $tBytes := .Values.config.storage.thresholdBytes }}
+{{- if kindIs "map" .Values.config.storage.serviceUrl }}
+  {{- $sUrl = .Values.config.storage.serviceUrl.serviceUrl }}
+  {{- $bName = .Values.config.storage.serviceUrl.bucketName | default .Values.config.storage.bucketName }}
+  {{- $tBytes = .Values.config.storage.serviceUrl.thresholdBytes | default .Values.config.storage.thresholdBytes }}
+{{- end }}
+  Storage__S3__ServiceUrl: {{ $sUrl | quote }}
+  Storage__S3__BucketName: {{ $bName | quote }}
+  Storage__S3__ThresholdBytes: {{ $tBytes | quote }}
   Oidc__Authority: {{ if .Values.config.oidc.authority }}{{ .Values.config.oidc.authority | quote }}{{ else if .Values.dex.enabled }}"https://{{ .Values.ingress.host }}/dex"{{ else }}"http://localhost:8085/dex"{{ end }}
   Oidc__ClientId: {{ .Values.config.oidc.clientId | quote }}
   Oidc__RequireHttpsMetadata: {{ .Values.config.oidc.requireHttpsMetadata | quote }}

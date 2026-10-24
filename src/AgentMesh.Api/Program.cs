@@ -21,7 +21,8 @@ builder.AddRedisClient("redis");
 
 // Configure Temporal Client
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
-builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespace: "default");
+var temporalNamespace = builder.Configuration["Temporal:Namespace"] ?? "default";
+builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespace: temporalNamespace);
 
 // Configure Authentication & Authorization
 builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();

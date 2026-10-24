@@ -15,12 +15,13 @@ builder.AddRedisClient("redis");
 builder.Services.AddSeaweedS3Storage(builder.Configuration);
 
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
+var temporalNamespace = builder.Configuration["Temporal:Namespace"] ?? "default";
 
 builder.Services.AddHttpClient<NotificationActivities>();
 
 builder.Services.AddHostedTemporalWorker(
     clientTargetHost: temporalHost,
-    clientNamespace: "default",
+    clientNamespace: temporalNamespace,
     taskQueue: "agent-task-queue")
     .AddWorkflow<AgentTaskWorkflow>()
     .AddScopedActivities<DatabaseActivities>()

@@ -10,3 +10,40 @@ data:
       oidcAuthority: {{ if .Values.config.oidc.authority }}{{ .Values.config.oidc.authority | quote }}{{ else if .Values.dex.enabled }}"https://{{ .Values.ingress.host }}/dex"{{ else }}"http://localhost:8085/dex"{{ end }},
       oidcClientId: {{ .Values.config.oidc.clientId | quote }}
     };
+  default.conf: |
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            root /usr/share/nginx/html;
+            index index.html index.htm;
+            try_files $uri $uri/ /index.html;
+        }
+
+        location = /favicon.ico {
+            try_files /favicon.ico /favicon.svg =204;
+            access_log off;
+            log_not_found off;
+        }
+
+        # Don't cache index.html or config.js so updates take effect immediately
+        location ~* (index\.html|config\.js)$ {
+            root /usr/share/nginx/html;
+            add_header Cache-Control "no-cache, no-store, must-revalidate";
+            add_header Pragma "no-cache";
+            add_header Expires "0";
+        }
+
+        # Cache static assets (hashed bundles)
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+            root /usr/share/nginx/html;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        error_page 500 502 503 504 /50x.html;
+        location = /50x.html {
+            root /usr/share/nginx/html;
+        }
+    }
