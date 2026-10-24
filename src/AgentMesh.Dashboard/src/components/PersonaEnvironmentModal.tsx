@@ -99,9 +99,9 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
 
         {/* Content */}
         <div className="p-5 overflow-y-auto space-y-4 flex-1">
-          {error && (
-            <div className="p-3 rounded-lg bg-red-950/40 border border-red-500/30 text-xs text-red-300">
-              {error}
+          {(error || status?.errorMessage) && (
+            <div className="p-3 rounded-lg bg-red-950/40 border border-red-500/30 text-xs text-red-300 leading-relaxed font-mono whitespace-pre-wrap break-all">
+              {error || status?.errorMessage}
             </div>
           )}
 

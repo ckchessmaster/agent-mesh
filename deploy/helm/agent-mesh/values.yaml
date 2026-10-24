@@ -69,7 +69,7 @@ config:
     requireHttpsMetadata: true
   personaRunner:
     image:
-      repository: "ghcr.io/ckchessmaster/agentmesh-persona-runner"
+      repository: "ghcr.io/your-org/agent-mesh-persona-runner"
       tag: "0.2.0"
       pullPolicy: IfNotPresent
     # Name of an existing kubernetes.io/dockerconfigjson secret if the image is in a private registry

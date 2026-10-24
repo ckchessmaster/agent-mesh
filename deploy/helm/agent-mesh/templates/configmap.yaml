@@ -26,3 +26,6 @@ data:
   PersonaContainer__ImagePullSecret: {{ .Values.config.personaRunner.imagePullSecret | quote }}
 {{- end }}
   PersonaContainer__IdleTimeoutMinutes: {{ .Values.config.personaRunner.idleTimeoutMinutes | quote }}
+  Kubernetes__ApiUrl: "http://{{ .Release.Name }}-api:{{ .Values.api.port | default 5000 }}"
+  Kubernetes__SecretName: {{ .Values.config.secretName | default "agent-mesh-secrets" | quote }}
+  Kubernetes__Namespace: {{ .Release.Namespace | quote }}

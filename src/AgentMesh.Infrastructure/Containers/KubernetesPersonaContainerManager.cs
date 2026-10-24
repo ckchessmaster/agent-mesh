@@ -60,6 +60,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
     public async Task<PersonaEnvironmentStatus> GetStatusAsync(string personaId, CancellationToken ct = default)
     {
         var deploymentName = GetDeploymentName(personaId);
+        var normPersonaId = personaId.Trim().ToLowerInvariant();
 
         try
         {
@@ -68,6 +69,41 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var readyReplicas = deployment.Status.ReadyReplicas ?? 0;
 
             var status = readyReplicas > 0 ? "running" : (replicas > 0 ? "starting" : "stopped");
+            string? errorMessage = null;
+
+            if (readyReplicas == 0 && replicas > 0)
+            {
+                try
+                {
+                    var pods = await _client.CoreV1.ListNamespacedPodAsync(
+                        _namespace,
+                        labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
+                        cancellationToken: ct);
+
+                    var activePod = pods.Items.OrderByDescending(p => p.Metadata.CreationTimestamp).FirstOrDefault();
+                    if (activePod?.Status?.ContainerStatuses != null)
+                    {
+                        var runnerStatus = activePod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == "persona-runner")
+                                           ?? activePod.Status.ContainerStatuses.FirstOrDefault();
+
+                        if (runnerStatus?.State?.Waiting != null)
+                        {
+                            var reason = runnerStatus.State.Waiting.Reason;
+                            if (reason == "CrashLoopBackOff" || reason == "ImagePullBackOff" || reason == "ErrImagePull" || reason == "Error")
+                            {
+                                status = "error";
+                                errorMessage = runnerStatus.State.Waiting.Message ?? reason;
+                            }
+                        }
+                        else if (runnerStatus?.State?.Terminated != null && runnerStatus.State.Terminated.ExitCode != 0)
+                        {
+                            status = "error";
+                            errorMessage = runnerStatus.State.Terminated.Message ?? $"Container exited with code {runnerStatus.State.Terminated.ExitCode}";
+                        }
+                    }
+                }
+                catch { }
+            }
 
             return new PersonaEnvironmentStatus(
                 PersonaId: personaId,
@@ -75,7 +111,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 Runtime: RuntimeName,
                 ContainerId: deploymentName,
                 StartedAt: deployment.Metadata.CreationTimestamp,
-                LastActivityAt: DateTimeOffset.UtcNow);
+                LastActivityAt: DateTimeOffset.UtcNow,
+                ErrorMessage: errorMessage);
         }
         catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
@@ -97,56 +134,6 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var currentPullPolicy = _config["PersonaContainer:PullPolicy"];
         var currentImagePullSecret = _config["PersonaContainer:ImagePullSecret"];
 
-        try
-        {
-            var deployment = await _client.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, _namespace, cancellationToken: ct);
-            var runnerContainer = deployment.Spec?.Template?.Spec?.Containers?.FirstOrDefault(c => c.Name == "persona-runner");
-            var needsImageUpdate = runnerContainer != null && !string.Equals(runnerContainer.Image, currentConfigImage, StringComparison.OrdinalIgnoreCase);
-            var isScaledDown = (deployment.Spec?.Replicas ?? 0) == 0;
-
-            if (needsImageUpdate || isScaledDown)
-            {
-                _logger.LogInformation("Updating deployment {Name} for @{PersonaId}: Replicas={Replicas}, Image={Image} (was {OldImage})",
-                    deploymentName, personaId, 1, currentConfigImage, runnerContainer?.Image);
-
-                var containerPatch = new Dictionary<string, object>
-                {
-                    ["name"] = "persona-runner",
-                    ["image"] = currentConfigImage
-                };
-                if (!string.IsNullOrWhiteSpace(currentPullPolicy))
-                {
-                    containerPatch["imagePullPolicy"] = currentPullPolicy;
-                }
-
-                var patchDoc = new
-                {
-                    spec = new
-                    {
-                        replicas = 1,
-                        template = new
-                        {
-                            spec = new
-                            {
-                                containers = new[] { containerPatch }
-                            }
-                        }
-                    }
-                };
-
-                var patchJson = JsonSerializer.Serialize(patchDoc);
-                var patch = new V1Patch(patchJson, V1Patch.PatchType.MergePatch);
-                await _client.AppsV1.PatchNamespacedDeploymentAsync(patch, deploymentName, _namespace, cancellationToken: ct);
-            }
-            return;
-        }
-        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            // Create deployment
-        }
-
-        _logger.LogInformation("Creating new deployment {Name} for @{PersonaId} in namespace {Namespace} with image {Image}", deploymentName, personaId, _namespace, currentConfigImage);
-
         var meshUrl = _config["Kubernetes:ApiUrl"] ??
                       _config["AGENTMESH_URL"] ??
                       "http://agent-mesh-api:5000";
@@ -167,6 +154,104 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var envFrom = new List<V1EnvFromSource>();
         var secretName = _config["Kubernetes:SecretName"] ?? "agent-mesh-secrets";
         envFrom.Add(new V1EnvFromSource { SecretRef = new V1SecretEnvSource { Name = secretName, Optional = true } });
+
+        try
+        {
+            var deployment = await _client.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, _namespace, cancellationToken: ct);
+            var runnerContainer = deployment.Spec?.Template?.Spec?.Containers?.FirstOrDefault(c => c.Name == "persona-runner");
+            var currentImage = runnerContainer?.Image;
+            var currentPull = runnerContainer?.ImagePullPolicy;
+            var currentPersonaEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_PERSONA_ID")?.Value;
+            var currentUrlEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_URL")?.Value;
+            var hasWorkspaceMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/workspace") == true;
+            var hasWorkspaceVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "workspace-storage") == true;
+
+            var isScaledDown = (deployment.Spec?.Replicas ?? 0) == 0;
+            var needsImageUpdate = runnerContainer != null && !string.Equals(currentImage, currentConfigImage, StringComparison.OrdinalIgnoreCase);
+            var needsPullPolicyUpdate = !string.IsNullOrWhiteSpace(currentPullPolicy) && !string.Equals(currentPull, currentPullPolicy, StringComparison.OrdinalIgnoreCase);
+            var needsEnvUpdate = runnerContainer == null ||
+                                 !string.Equals(currentPersonaEnv, normPersonaId, StringComparison.OrdinalIgnoreCase) ||
+                                 !string.Equals(currentUrlEnv, meshUrl, StringComparison.OrdinalIgnoreCase);
+            var needsVolumeUpdate = !hasWorkspaceMount || !hasWorkspaceVolume;
+
+            // Query status to detect crashed/error pods that need a kick
+            var currentStatus = await GetStatusAsync(personaId, ct);
+            var isFailed = currentStatus.Status == "error";
+
+            if (isScaledDown || needsImageUpdate || needsPullPolicyUpdate || needsEnvUpdate || needsVolumeUpdate || isFailed)
+            {
+                _logger.LogInformation("Updating deployment {Name} for @{PersonaId}: Replicas=1, Image={Image} (was {OldImage}), EnvUpdated={EnvUpdated}, IsFailed={IsFailed}",
+                    deploymentName, personaId, currentConfigImage, currentImage, needsEnvUpdate, isFailed);
+
+                var containerPatch = new Dictionary<string, object>
+                {
+                    ["name"] = "persona-runner",
+                    ["image"] = currentConfigImage,
+                    ["env"] = env.Select(e => new { name = e.Name, value = e.Value }).ToList(),
+                    ["envFrom"] = envFrom.Select(ef => new
+                    {
+                        secretRef = new { name = ef.SecretRef?.Name, optional = ef.SecretRef?.Optional }
+                    }).ToList(),
+                    ["volumeMounts"] = new[]
+                    {
+                        new { name = "workspace-storage", mountPath = "/workspace" }
+                    }
+                };
+
+                if (!string.IsNullOrWhiteSpace(currentPullPolicy))
+                {
+                    containerPatch["imagePullPolicy"] = currentPullPolicy;
+                }
+
+                var podSpecPatch = new Dictionary<string, object>
+                {
+                    ["containers"] = new[] { containerPatch },
+                    ["volumes"] = new[]
+                    {
+                        new { name = "workspace-storage", emptyDir = new { } }
+                    }
+                };
+
+                if (!string.IsNullOrWhiteSpace(currentImagePullSecret))
+                {
+                    podSpecPatch["imagePullSecrets"] = new[]
+                    {
+                        new { name = currentImagePullSecret }
+                    };
+                }
+
+                var patchDoc = new
+                {
+                    spec = new
+                    {
+                        replicas = 1,
+                        template = new
+                        {
+                            metadata = new
+                            {
+                                labels = labels,
+                                annotations = new Dictionary<string, string>
+                                {
+                                    ["kubectl.kubernetes.io/restartedAt"] = DateTimeOffset.UtcNow.ToString("o")
+                                }
+                            },
+                            spec = podSpecPatch
+                        }
+                    }
+                };
+
+                var patchJson = JsonSerializer.Serialize(patchDoc);
+                var patch = new V1Patch(patchJson, V1Patch.PatchType.StrategicMergePatch);
+                await _client.AppsV1.PatchNamespacedDeploymentAsync(patch, deploymentName, _namespace, cancellationToken: ct);
+            }
+            return;
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            // Create deployment
+        }
+
+        _logger.LogInformation("Creating new deployment {Name} for @{PersonaId} in namespace {Namespace} with image {Image}", deploymentName, personaId, _namespace, currentConfigImage);
 
         var newDeployment = new V1Deployment
         {
@@ -253,7 +338,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 return "No pods found for persona.";
             }
 
-            var pod = pods.Items[0];
+            var pod = pods.Items.OrderByDescending(p => p.Metadata.CreationTimestamp).FirstOrDefault();
+            if (pod == null)
+            {
+                return "No pods found for persona.";
+            }
             using var stream = await _client.CoreV1.ReadNamespacedPodLogAsync(
                 pod.Metadata.Name,
                 _namespace,

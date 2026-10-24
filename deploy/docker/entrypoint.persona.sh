@@ -7,6 +7,12 @@ export AGENTMESH_TOKEN="${AGENTMESH_TOKEN:-}"
 export AGENTMESH_PERSONA_ID="${AGENTMESH_PERSONA_ID:-}"
 export AGENTMESH_DRIVER_ID="${AGENTMESH_DRIVER_ID:-}"
 
+# Allow persona ID to be passed as first argument if not defined in environment
+if [ -z "$AGENTMESH_PERSONA_ID" ] && [ -n "$1" ] && [[ "$1" != -* ]]; then
+    export AGENTMESH_PERSONA_ID="$1"
+    shift
+fi
+
 # Ensure workspace directory exists and is marked safe for git operations
 mkdir -p /workspace
 cd /workspace
