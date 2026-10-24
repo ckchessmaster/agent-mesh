@@ -2211,7 +2211,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     </div>
                     <p className="text-[11px] text-slate-400 leading-relaxed mt-0.5">
                       {activeTurnInfo.isOffline
-                        ? `Connect the runner via terminal: agentmesh start ${activeTurnInfo.driverId || 'agy'}`
+                        ? `Starting environment & waiting for runner connection (@${activeTurnInfo.driverId || 'agy'})...`
                         : 'Executing workspace commands, tests, and active persona logic.'}
                     </p>
                   </div>

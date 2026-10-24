@@ -1,4 +1,4 @@
-﻿// @vitest-environment jsdom
+// @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import App from '../App';
@@ -10,7 +10,6 @@ vi.mock('../services/api', () => ({
     verifyAuth: vi.fn().mockResolvedValue({ authenticated: true }),
     getStatus: vi.fn(),
     getCapabilities: vi.fn(),
-    browseFilesystem: vi.fn().mockResolvedValue({ currentPath: '/workspace', directories: [] }),
     getAgents: vi.fn(),
     getPersonas: vi.fn().mockResolvedValue([]),
     getSessions: vi.fn(),

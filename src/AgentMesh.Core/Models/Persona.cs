@@ -19,7 +19,6 @@ public class Persona
     public string? DefaultMode { get; set; }
     public string? DefaultTier { get; set; }
     public string? DefaultContextSize { get; set; }
-    public string? DefaultWorkingDirectory { get; set; }
     public int? MaxConcurrentJobs { get; set; }
     public TrustTier TrustTier { get; set; } = TrustTier.Intern;
 

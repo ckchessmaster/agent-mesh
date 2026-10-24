@@ -3,7 +3,6 @@ import type {
   AgentSession,
   AgentUsageResponse,
   DriverConfig,
-  FilesystemBrowseResponse,
   JobMessage,
   JobTask,
   AssignJobTaskResult,
@@ -65,7 +64,6 @@ const getHeaders = (): Record<string, string> => ({
 });
 
 export interface SessionControlOptions {
-  workingDirectory?: string;
   model?: string;
   effort?: string;
   mode?: string;
@@ -100,13 +98,6 @@ export const api = {
       body: JSON.stringify(req)
     });
     if (!res.ok) throw new Error(`Failed to test OpenAI server: ${res.statusText}`);
-    return res.json();
-  },
-
-  async browseFilesystem(path?: string): Promise<FilesystemBrowseResponse> {
-    const query = path ? `?path=${encodeURIComponent(path)}` : '';
-    const res = await apiFetch(`/api/system/filesystem${query}`, { headers: getHeaders() });
-    if (!res.ok) throw new Error(`Failed to browse directory: ${res.statusText}`);
     return res.json();
   },
 
@@ -146,7 +137,6 @@ export const api = {
     defaultMode?: string;
     defaultTier?: string;
     defaultContextSize?: string;
-    defaultWorkingDirectory?: string;
     maxConcurrentJobs?: number;
     trustTier?: number;
   }): Promise<Persona> {
@@ -171,7 +161,6 @@ export const api = {
       defaultMode?: string;
       defaultTier?: string;
       defaultContextSize?: string;
-      defaultWorkingDirectory?: string;
       maxConcurrentJobs?: number;
       trustTier?: number;
     }
@@ -212,7 +201,6 @@ export const api = {
       body: JSON.stringify({
         title,
         initialPrompt,
-        workingDirectory: options?.workingDirectory,
         model: options?.model,
         effort: options?.effort,
         mode: options?.mode,
@@ -374,7 +362,6 @@ export const api = {
       body: JSON.stringify({
         title,
         initialPrompt,
-        workingDirectory: options?.workingDirectory,
         model: options?.model,
         effort: options?.effort,
         mode: options?.mode,
@@ -417,7 +404,6 @@ export const api = {
         metadataJson: metadataJson || '{}',
         initialMessage,
         creatorAgentId,
-        workingDirectory: options?.workingDirectory,
         model: options?.model,
         effort: options?.effort,
         mode: options?.mode,
@@ -448,7 +434,6 @@ export const api = {
       tier?: string;
       contextSize?: string;
       mode?: string;
-      workingDirectory?: string;
     }
   ): Promise<AgentSession> {
     const res = await apiFetch(`/api/sessions/${id}`, {
@@ -558,7 +543,6 @@ export const api = {
       tier?: string;
       contextSize?: string;
       mode?: string;
-      workingDirectory?: string;
       attachments?: SessionAttachment[];
     }
   ): Promise<{ session: AgentSession; queue: QueuedPromptItem[]; dispatched: boolean }> {

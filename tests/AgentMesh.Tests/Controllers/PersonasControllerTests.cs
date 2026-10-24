@@ -115,8 +115,7 @@ public class PersonasControllerTests
             DefaultModel: "gemini-4-argon",
             DefaultEffort: "high",
             DefaultMode: "plan",
-            DefaultContextSize: "500k",
-            DefaultWorkingDirectory: "/workspace/sec"
+            DefaultContextSize: "500k"
         ));
 
         // Act - create session without explicit overrides so it inherits persona defaults
@@ -138,7 +137,6 @@ public class PersonasControllerTests
         doc.RootElement.GetProperty("effort").GetString().Should().Be("high");
         doc.RootElement.GetProperty("mode").GetString().Should().Be("plan");
         doc.RootElement.GetProperty("contextSize").GetString().Should().Be("500k");
-        doc.RootElement.GetProperty("workingDirectory").GetString().Should().Be("/workspace/sec");
         doc.RootElement.GetProperty("personaId").GetString().Should().Be("sec-auditor");
         doc.RootElement.GetProperty("personaName").GetString().Should().Be("Agy Security Auditor");
 

@@ -845,7 +845,7 @@ public class SessionsController(
                   ?? User?.FindFirst("AgentId")?.Value
                   ?? "agy";
 
-        var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : persona?.DefaultWorkingDirectory;
+        var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : null;
         var effectiveModel = !string.IsNullOrWhiteSpace(req.Model) ? req.Model : persona?.DefaultModel;
         var effectiveEffort = req.Effort != null ? req.Effort : persona?.DefaultEffort;
         var effectiveMode = !string.IsNullOrWhiteSpace(req.Mode) ? req.Mode : persona?.DefaultMode;
@@ -2711,7 +2711,6 @@ public class SessionsController(
                             ["personaName"] = nextPersona.Name,
                             ["personaRole"] = nextPersona.Role,
                             ["personaPrompt"] = nextPersona.PersonaPrompt,
-                            ["workingDirectory"] = nextPersona.DefaultWorkingDirectory,
                             ["model"] = nextPersona.DefaultModel,
                             ["effort"] = nextPersona.DefaultEffort,
                             ["mode"] = nextPersona.DefaultMode,
@@ -2769,7 +2768,6 @@ public class SessionsController(
                             personaPrompt = nextPersona.PersonaPrompt,
                             prompt = promptMsg.Content,
                             sender = promptMsg.SenderAgentId,
-                            workingDirectory = nextPersona.DefaultWorkingDirectory,
                             model = nextPersona.DefaultModel,
                             effort = nextPersona.DefaultEffort,
                             mode = nextPersona.DefaultMode,

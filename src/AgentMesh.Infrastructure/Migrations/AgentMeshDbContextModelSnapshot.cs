@@ -583,11 +583,6 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("default_tier");
 
-                    b.Property<string>("DefaultWorkingDirectory")
-                        .HasMaxLength(512)
-                        .HasColumnType("character varying(512)")
-                        .HasColumnName("default_working_directory");
-
                     b.Property<string>("DriverId")
                         .IsRequired()
                         .HasMaxLength(64)

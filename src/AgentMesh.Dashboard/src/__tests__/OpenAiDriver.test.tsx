@@ -34,7 +34,6 @@ vi.mock('../services/api', () => ({
         }
       }
     }),
-    browseFilesystem: vi.fn().mockResolvedValue({ currentPath: '/workspace', directories: [] }),
     getAgents: vi.fn().mockResolvedValue([]),
     getPersonas: vi.fn().mockResolvedValue([]),
     createPersona: vi.fn(),

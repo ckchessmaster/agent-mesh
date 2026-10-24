@@ -213,7 +213,6 @@ public record RemotePersonaDto(
     [property: JsonPropertyName("defaultEffort")] string? DefaultEffort = null,
     [property: JsonPropertyName("defaultMode")] string? DefaultMode = null,
     [property: JsonPropertyName("defaultTier")] string? DefaultTier = null,
-    [property: JsonPropertyName("defaultWorkingDirectory")] string? DefaultWorkingDirectory = null,
     [property: JsonPropertyName("trustTier")] int TrustTier = 1,
     [property: JsonPropertyName("sessionCount")] int SessionCount = 0,
     [property: JsonPropertyName("defaultContextSize")] string? DefaultContextSize = null,

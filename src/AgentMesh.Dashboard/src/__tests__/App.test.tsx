@@ -1,4 +1,4 @@
-﻿import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
@@ -45,14 +45,6 @@ vi.mock('../services/api', () => ({
           ]
         }
       }
-    }),
-    browseFilesystem: vi.fn().mockResolvedValue({
-      currentPath: '/workspace/agent-mesh',
-      parentPath: '/workspace',
-      directories: [
-        { name: 'src', path: '/workspace/agent-mesh/src' },
-        { name: 'docs', path: '/workspace/agent-mesh/docs' }
-      ]
     }),
     getAgents: vi.fn().mockResolvedValue([]),
     getPersonas: vi.fn().mockResolvedValue([]),
@@ -143,16 +135,6 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
   };
 
   const mockCaps: SystemCapabilitiesResponse = {
-    workspace: {
-      defaultSandboxPath: '~/.agentmesh/workspaces/<session-id>',
-      currentDirectory: '/workspace/agent-mesh',
-      userHome: '/home/testuser',
-      bookmarks: [
-        { label: 'Default Sandbox', path: '', description: 'Sandbox' },
-        { label: 'Current Project', path: '/workspace/agent-mesh', description: 'Project' },
-        { label: 'User Home', path: '/home/testuser', description: 'Home' }
-      ]
-    },
     agentRuntimes: {
       agy: {
         adapter: 'agy',
@@ -178,14 +160,6 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     vi.clearAllMocks();
     vi.mocked(api.getStatus).mockResolvedValue(mockHealthyStatus);
     vi.mocked(api.getCapabilities).mockResolvedValue(mockCaps);
-    vi.mocked(api.browseFilesystem).mockResolvedValue({
-      currentPath: '/workspace/agent-mesh',
-      parentPath: '/workspace',
-      directories: [
-        { name: 'src', path: '/workspace/agent-mesh/src' },
-        { name: 'docs', path: '/workspace/agent-mesh/docs' }
-      ]
-    });
     vi.mocked(api.getAgents).mockResolvedValue([]);
     vi.mocked(api.getPersonas).mockResolvedValue([]);
     vi.mocked(api.getSessions).mockResolvedValue([]);
@@ -382,13 +356,12 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       expect(screen.getByText('gemini-2.5-pro')).toBeInTheDocument();
       expect(screen.getByText('high')).toBeInTheDocument();
       expect(screen.getByText('plan')).toBeInTheDocument();
-      expect(screen.getByText('/home/user/workspace/proj')).toBeInTheDocument();
       expect(screen.getByText('2,850 tokens (4.2s)')).toBeInTheDocument();
       expect(screen.getByText('⚡ 2,850 tokens (4.2s)')).toBeInTheDocument();
     });
   });
 
-  it('supports directory preset chips, interactive folder picker modal, and dynamic model/effort/mode controls', async () => {
+  it('supports dynamic model, effort, and mode controls when creating a session', async () => {
     const mockAgents: Agent[] = [
       {
         id: 'agy-core',
@@ -424,12 +397,6 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     fireEvent.click(newSessionBtns[0]);
 
     expect(screen.getByText('Start New Session with Agy Lead Architect')).toBeInTheDocument();
-    expect(screen.getByText('Default Sandbox Workspace')).toBeInTheDocument();
-
-    // Check quick bookmarks are visible
-    expect(screen.getByText('⚡ Default Sandbox')).toBeInTheDocument();
-    expect(screen.getByText('Current Project')).toBeInTheDocument();
-    expect(screen.getByText('User Home')).toBeInTheDocument();
 
     // Model, Effort, and Mode inputs are selects
     const allSelects = screen.getAllByRole('combobox');
@@ -468,29 +435,6 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     // Select Mode
     fireEvent.change(modeDropdown, { target: { value: 'plan' } });
 
-    // Test quick preset bookmark click
-    fireEvent.click(screen.getByText('Current Project'));
-    expect(screen.getByText('/workspace/agent-mesh')).toBeInTheDocument();
-
-    // Test opening interactive Folder Picker modal
-    fireEvent.click(screen.getByRole('button', { name: /Browse.../i }));
-    expect(screen.getByRole('dialog', { name: 'Select Working Directory' })).toBeInTheDocument();
-    expect(api.browseFilesystem).toHaveBeenCalled();
-
-    // In modal, directories should be listed
-    await waitFor(() => {
-      expect(screen.getByText('docs')).toBeInTheDocument();
-      expect(screen.getByText('src')).toBeInTheDocument();
-    });
-
-    // Click "Select" next to "docs"
-    const selectDocsBtn = screen.getAllByRole('button', { name: 'Select' })[1];
-    fireEvent.click(selectDocsBtn);
-
-    // Modal closes and working directory updates to docs
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-    expect(screen.getByText('/workspace/agent-mesh/docs')).toBeInTheDocument();
-
     // Fill title and submit
     fireEvent.change(screen.getByPlaceholderText(/Refactor authentication middleware/i), {
       target: { value: 'Dynamic Session Test' }
@@ -504,7 +448,6 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
         'Dynamic Session Test',
         undefined,
         {
-          workingDirectory: '/workspace/agent-mesh/docs',
           model: 'gpt-oss-120b',
           effort: 'medium',
           mode: 'plan',
@@ -651,12 +594,6 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     };
 
     const mockCopilotCaps: SystemCapabilitiesResponse = {
-      workspace: {
-        defaultSandboxPath: '~/.agentmesh/workspaces/<session-id>',
-        currentDirectory: '/workspace/agent-mesh',
-        userHome: '/home/testuser',
-        bookmarks: []
-      },
       agentRuntimes: {
         copilot: {
           adapter: 'copilot',

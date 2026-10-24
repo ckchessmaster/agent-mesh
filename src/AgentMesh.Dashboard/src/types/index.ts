@@ -18,7 +18,6 @@ export interface Persona {
   defaultMode?: string | null;
   defaultTier?: string | null;
   defaultContextSize?: string | null;
-  defaultWorkingDirectory?: string | null;
   maxConcurrentJobs?: number | null;
   trustTier: number;
   sessionCount?: number;
@@ -150,19 +149,6 @@ export interface SystemStatusResponse {
   };
 }
 
-export interface DirectoryBookmark {
-  label: string;
-  path: string;
-  description: string;
-}
-
-export interface WorkspaceDefaults {
-  defaultSandboxPath: string;
-  currentDirectory: string;
-  userHome: string;
-  bookmarks: DirectoryBookmark[];
-}
-
 export interface ModeOption {
   id: string;
   label: string;
@@ -198,19 +184,7 @@ export interface RuntimeCapabilities {
 }
 
 export interface SystemCapabilitiesResponse {
-  workspace: WorkspaceDefaults;
   agentRuntimes: Record<string, RuntimeCapabilities>;
-}
-
-export interface DirectoryItem {
-  name: string;
-  path: string;
-}
-
-export interface FilesystemBrowseResponse {
-  currentPath: string;
-  parentPath: string | null;
-  directories: DirectoryItem[];
 }
 
 export interface QuotaBucket {
@@ -390,7 +364,6 @@ export interface QueuedPromptItem {
   tier?: string | null;
   contextSize?: string | null;
   mode?: string | null;
-  workingDirectory?: string | null;
   attachments?: SessionAttachment[] | null;
 }
 

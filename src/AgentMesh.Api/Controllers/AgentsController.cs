@@ -380,7 +380,7 @@ public class AgentsController(
             persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == normPersonaId);
         }
 
-        var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : persona?.DefaultWorkingDirectory;
+        var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : null;
         var effectiveModel = !string.IsNullOrWhiteSpace(req.Model) ? req.Model : persona?.DefaultModel;
         var effectiveEffort = req.Effort != null ? req.Effort : persona?.DefaultEffort;
         var effectiveMode = !string.IsNullOrWhiteSpace(req.Mode) ? req.Mode : persona?.DefaultMode;

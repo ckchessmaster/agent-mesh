@@ -9,17 +9,13 @@ public class SystemControllerTests
     private readonly SystemController _controller = new();
 
     [Fact]
-    public async Task GetCapabilities_ReturnsWorkspaceDefaults_AndAgentRuntimes()
+    public async Task GetCapabilities_ReturnsAgentRuntimes()
     {
         var actionResult = await _controller.GetCapabilities();
         var okResult = actionResult.Should().BeOfType<OkObjectResult>().Subject;
         var response = okResult.Value.Should().BeOfType<SystemCapabilitiesResponse>().Subject;
 
-        response.Workspace.Should().NotBeNull();
-        response.Workspace.DefaultSandboxPath.Should().Be("~/.agentmesh/workspaces/<session-id>");
-        response.Workspace.CurrentDirectory.Should().NotBeNullOrWhiteSpace();
-        response.Workspace.Bookmarks.Should().NotBeEmpty();
-
+        response.AgentRuntimes.Should().NotBeNull();
         response.AgentRuntimes.Should().ContainKey("agy");
         response.AgentRuntimes.Should().ContainKey("copilot");
         response.AgentRuntimes.Should().ContainKey("claude");
@@ -51,35 +47,6 @@ public class SystemControllerTests
         copilot.Models.Should().Contain(m => m.Id == "claude-sonnet-5.5");
         copilot.Tiers.Should().NotBeNull();
         copilot.Tiers!.Should().Contain(t => t.Id == "intelligence");
-    }
-
-    [Fact]
-    public void BrowseFilesystem_WithCurrentDirectory_ReturnsSubdirectories()
-    {
-        var currentDir = Directory.GetCurrentDirectory();
-        var actionResult = _controller.BrowseFilesystem(currentDir);
-
-        var okResult = actionResult.Should().BeOfType<OkObjectResult>().Subject;
-        var response = okResult.Value.Should().BeOfType<FilesystemBrowseResponse>().Subject;
-
-        response.CurrentPath.Should().Be(currentDir);
-        response.Directories.Should().NotBeNull();
-        // Should not contain hidden or bin/obj noise
-        response.Directories.Should().NotContain(d => d.Name.StartsWith("."));
-        response.Directories.Should().NotContain(d => d.Name.Equals("bin", StringComparison.OrdinalIgnoreCase));
-        response.Directories.Should().NotContain(d => d.Name.Equals("obj", StringComparison.OrdinalIgnoreCase));
-    }
-
-    [Fact]
-    public void BrowseFilesystem_WithInvalidDirectory_FallsBackToCurrentOrHome()
-    {
-        var actionResult = _controller.BrowseFilesystem("/path/that/does/not/exist/9999");
-
-        var okResult = actionResult.Should().BeOfType<OkObjectResult>().Subject;
-        var response = okResult.Value.Should().BeOfType<FilesystemBrowseResponse>().Subject;
-
-        response.CurrentPath.Should().NotBeNullOrWhiteSpace();
-        Directory.Exists(response.CurrentPath).Should().BeTrue();
     }
 
     [Fact]

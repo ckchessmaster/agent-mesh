@@ -16,22 +16,6 @@ public class SystemController : ControllerBase
     [HttpGet("capabilities")]
     public async Task<IActionResult> GetCapabilities([FromQuery] string? agentId = null)
     {
-        var currentDir = Environment.CurrentDirectory;
-        var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var projectsDir = Path.Combine(userHome, "projects");
-
-        var bookmarks = new List<DirectoryBookmarkDto>
-        {
-            new("Default Sandbox", "", "Dedicated isolated workspace under ~/.agentmesh/workspaces/"),
-            new("Current Project", currentDir, currentDir),
-            new("User Home", userHome, userHome)
-        };
-
-        if (Directory.Exists(projectsDir))
-        {
-            bookmarks.Add(new("Projects Directory", projectsDir, projectsDir));
-        }
-
         var agyModels = await GetAgyModelsAsync();
 
         var runtimes = new Dictionary<string, RuntimeCapabilitiesDto>(StringComparer.OrdinalIgnoreCase)
@@ -180,71 +164,7 @@ public class SystemController : ControllerBase
         };
 
         return Ok(new SystemCapabilitiesResponse(
-            Workspace: new WorkspaceDefaultsDto(
-                DefaultSandboxPath: "~/.agentmesh/workspaces/<session-id>",
-                CurrentDirectory: currentDir,
-                UserHome: userHome,
-                Bookmarks: bookmarks
-            ),
             AgentRuntimes: runtimes
-        ));
-    }
-
-    [HttpGet("filesystem")]
-    public IActionResult BrowseFilesystem([FromQuery] string? path = null)
-    {
-        var targetPath = !string.IsNullOrWhiteSpace(path)
-            ? Path.GetFullPath(path)
-            : Environment.CurrentDirectory;
-
-        if (!Directory.Exists(targetPath))
-        {
-            targetPath = Directory.Exists(Environment.CurrentDirectory)
-                ? Environment.CurrentDirectory
-                : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        }
-
-        string? parentPath = null;
-        try
-        {
-            var parent = Directory.GetParent(targetPath);
-            parentPath = parent?.FullName;
-        }
-        catch { }
-
-        var subDirs = new List<DirectoryItemDto>();
-        try
-        {
-            var dirInfo = new DirectoryInfo(targetPath);
-            foreach (var sub in dirInfo.GetDirectories())
-            {
-                // Skip hidden directories and build/package noise
-                if (sub.Name.StartsWith('.') ||
-                    sub.Name.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
-                    sub.Name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
-                    sub.Name.Equals("obj", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                subDirs.Add(new DirectoryItemDto(sub.Name, sub.FullName));
-            }
-        }
-        catch (UnauthorizedAccessException)
-        {
-            // Restricted access
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, new { error = $"Failed to read directory '{targetPath}': {ex.Message}" });
-        }
-
-        subDirs.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
-
-        return Ok(new FilesystemBrowseResponse(
-            CurrentPath: targetPath,
-            ParentPath: parentPath,
-            Directories: subDirs
         ));
     }
 
@@ -483,15 +403,6 @@ public class SystemController : ControllerBase
     }
 }
 
-public record DirectoryBookmarkDto(string Label, string Path, string Description);
-
-public record WorkspaceDefaultsDto(
-    string DefaultSandboxPath,
-    string CurrentDirectory,
-    string UserHome,
-    List<DirectoryBookmarkDto> Bookmarks
-);
-
 public record ModeOptionDto(string Id, string Label, string Description);
 
 public record TierOptionDto(string Id, string Label, string Description);
@@ -515,16 +426,7 @@ public record RuntimeCapabilitiesDto(
 );
 
 public record SystemCapabilitiesResponse(
-    WorkspaceDefaultsDto Workspace,
     Dictionary<string, RuntimeCapabilitiesDto> AgentRuntimes
-);
-
-public record DirectoryItemDto(string Name, string Path);
-
-public record FilesystemBrowseResponse(
-    string CurrentPath,
-    string? ParentPath,
-    List<DirectoryItemDto> Directories
 );
 
 public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null);

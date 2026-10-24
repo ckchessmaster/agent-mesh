@@ -93,13 +93,48 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var deploymentName = GetDeploymentName(personaId);
         var normPersonaId = personaId.Trim().ToLowerInvariant();
 
+        var currentConfigImage = _config["PersonaContainer:Image"] ?? _defaultImage;
+        var currentPullPolicy = _config["PersonaContainer:PullPolicy"];
+        var currentImagePullSecret = _config["PersonaContainer:ImagePullSecret"];
+
         try
         {
             var deployment = await _client.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, _namespace, cancellationToken: ct);
-            if ((deployment.Spec.Replicas ?? 0) == 0)
+            var runnerContainer = deployment.Spec?.Template?.Spec?.Containers?.FirstOrDefault(c => c.Name == "persona-runner");
+            var needsImageUpdate = runnerContainer != null && !string.Equals(runnerContainer.Image, currentConfigImage, StringComparison.OrdinalIgnoreCase);
+            var isScaledDown = (deployment.Spec?.Replicas ?? 0) == 0;
+
+            if (needsImageUpdate || isScaledDown)
             {
-                _logger.LogInformation("Scaling up existing deployment {Name} for @{PersonaId} to 1 replica", deploymentName, personaId);
-                var patchJson = JsonSerializer.Serialize(new { spec = new { replicas = 1 } });
+                _logger.LogInformation("Updating deployment {Name} for @{PersonaId}: Replicas={Replicas}, Image={Image} (was {OldImage})",
+                    deploymentName, personaId, 1, currentConfigImage, runnerContainer?.Image);
+
+                var containerPatch = new Dictionary<string, object>
+                {
+                    ["name"] = "persona-runner",
+                    ["image"] = currentConfigImage
+                };
+                if (!string.IsNullOrWhiteSpace(currentPullPolicy))
+                {
+                    containerPatch["imagePullPolicy"] = currentPullPolicy;
+                }
+
+                var patchDoc = new
+                {
+                    spec = new
+                    {
+                        replicas = 1,
+                        template = new
+                        {
+                            spec = new
+                            {
+                                containers = new[] { containerPatch }
+                            }
+                        }
+                    }
+                };
+
+                var patchJson = JsonSerializer.Serialize(patchDoc);
                 var patch = new V1Patch(patchJson, V1Patch.PatchType.MergePatch);
                 await _client.AppsV1.PatchNamespacedDeploymentAsync(patch, deploymentName, _namespace, cancellationToken: ct);
             }
@@ -110,7 +145,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             // Create deployment
         }
 
-        _logger.LogInformation("Creating new deployment {Name} for @{PersonaId} in namespace {Namespace}", deploymentName, personaId, _namespace);
+        _logger.LogInformation("Creating new deployment {Name} for @{PersonaId} in namespace {Namespace} with image {Image}", deploymentName, personaId, _namespace, currentConfigImage);
 
         var meshUrl = _config["Kubernetes:ApiUrl"] ??
                       _config["AGENTMESH_URL"] ??
@@ -150,12 +185,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     Metadata = new V1ObjectMeta { Labels = labels },
                     Spec = new V1PodSpec
                     {
+                        ImagePullSecrets = !string.IsNullOrWhiteSpace(currentImagePullSecret)
+                            ? new List<V1LocalObjectReference> { new() { Name = currentImagePullSecret } }
+                            : null,
                         Containers = new List<V1Container>
                         {
                             new()
                             {
                                 Name = "persona-runner",
-                                Image = _defaultImage,
+                                Image = currentConfigImage,
+                                ImagePullPolicy = !string.IsNullOrWhiteSpace(currentPullPolicy) ? currentPullPolicy : null,
                                 Env = env,
                                 EnvFrom = envFrom,
                                 VolumeMounts = new List<V1VolumeMount>

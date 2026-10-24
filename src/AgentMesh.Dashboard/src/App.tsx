@@ -16,14 +16,9 @@ import {
   ChevronRight,
   Activity,
   Cpu,
-  Folder,
-  FolderOpen,
-  ChevronUp,
   ChevronDown,
-  Home,
   X,
   Check,
-  RotateCcw,
   Zap,
   Sliders,
   BarChart2,
@@ -54,7 +49,6 @@ import type {
   AgentSession,
   AgentUsageResponse,
   AskQuestionItem,
-  FilesystemBrowseResponse,
   JobMessage,
   JobTask,
   ModelCapability,
@@ -273,7 +267,6 @@ export default function App() {
   const [personaDefaultMode, setPersonaDefaultMode] = useState('');
   const [personaDefaultTier, setPersonaDefaultTier] = useState('');
   const [personaDefaultContextSize, setPersonaDefaultContextSize] = useState('');
-  const [personaDefaultWorkDir, setPersonaDefaultWorkDir] = useState('');
   const [personaMaxConcurrentJobs, setPersonaMaxConcurrentJobs] = useState<string>('');
   const [inspectingPersonaEnv, setInspectingPersonaEnv] = useState<Persona | null>(null);
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
@@ -285,18 +278,11 @@ export default function App() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isActionPending, setIsActionPending] = useState<boolean>(false);
 
-  // Folder picker modal state
-  const [showFolderPicker, setShowFolderPicker] = useState<boolean>(false);
-  const [browseData, setBrowseData] = useState<FilesystemBrowseResponse | null>(null);
-  const [isBrowsing, setIsBrowsing] = useState<boolean>(false);
-  const [browseError, setBrowseError] = useState<string | null>(null);
-
   // Prompt & New Session state
   const [promptInput, setPromptInput] = useState('');
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [newSessionTitle, setNewSessionTitle] = useState('');
   const [newSessionPrompt, setNewSessionPrompt] = useState('');
-  const [newSessionWorkDir, setNewSessionWorkDir] = useState('');
   const [newSessionModel, setNewSessionModel] = useState('');
   const [newSessionEffort, setNewSessionEffort] = useState('');
   const [newSessionMode, setNewSessionMode] = useState('');
@@ -1319,25 +1305,6 @@ export default function App() {
     }
   };
 
-  const loadBrowseDirectory = useCallback(async (path?: string) => {
-    setIsBrowsing(true);
-    setBrowseError(null);
-    try {
-      const res = await api.browseFilesystem(path);
-      setBrowseData(res);
-    } catch (err) {
-      setBrowseError(err instanceof Error ? err.message : 'Failed to browse directory');
-    } finally {
-      setIsBrowsing(false);
-    }
-  }, []);
-
-  const openFolderPicker = useCallback(() => {
-    const initialPath = newSessionWorkDir || capabilities?.workspace?.currentDirectory || undefined;
-    loadBrowseDirectory(initialPath);
-    setShowFolderPicker(true);
-  }, [newSessionWorkDir, capabilities?.workspace?.currentDirectory, loadBrowseDirectory]);
-
   const selectedSession = sessions.find((s) => s.id === selectedSessionId) || null;
   const isSessionThinking = useMemo(() => {
     if (!selectedSession) return false;
@@ -1408,7 +1375,6 @@ export default function App() {
     setPersonaDefaultMode('');
     setPersonaDefaultTier('');
     setPersonaDefaultContextSize('');
-    setPersonaDefaultWorkDir('');
     setPersonaMaxConcurrentJobs('');
     setShowPersonaModal(true);
   }, [selectedAgentId, agents]);
@@ -1425,7 +1391,6 @@ export default function App() {
     setPersonaDefaultMode(persona.defaultMode || '');
     setPersonaDefaultTier(persona.defaultTier || '');
     setPersonaDefaultContextSize(persona.defaultContextSize || '');
-    setPersonaDefaultWorkDir(persona.defaultWorkingDirectory || '');
     setPersonaMaxConcurrentJobs(persona.maxConcurrentJobs ? String(persona.maxConcurrentJobs) : '');
     setShowPersonaModal(true);
   }, []);
@@ -1438,7 +1403,6 @@ export default function App() {
     setNewSessionMode(persona.defaultMode || '');
     setNewSessionTier(persona.defaultTier || '');
     setNewSessionContextSize(persona.defaultContextSize || '');
-    setNewSessionWorkDir(persona.defaultWorkingDirectory || '');
     setIsCreatingSession(true);
   }, []);
 
@@ -1459,7 +1423,6 @@ export default function App() {
           defaultMode: personaDefaultMode || '',
           defaultTier: personaDefaultTier || '',
           defaultContextSize: personaDefaultContextSize || '',
-          defaultWorkingDirectory: personaDefaultWorkDir || '',
           maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined
         });
         setShowPersonaModal(false);
@@ -1477,7 +1440,6 @@ export default function App() {
           defaultMode: personaDefaultMode || undefined,
           defaultTier: personaDefaultTier || undefined,
           defaultContextSize: personaDefaultContextSize || undefined,
-          defaultWorkingDirectory: personaDefaultWorkDir || undefined,
           maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined
         });
         setShowPersonaModal(false);
@@ -1799,7 +1761,6 @@ export default function App() {
     setIsActionPending(true);
     try {
       const options = {
-        workingDirectory: newSessionWorkDir.trim() || undefined,
         model: newSessionModel.trim() || undefined,
         effort: newSessionEffort.trim() || undefined,
         mode: newSessionMode.trim() || undefined,
@@ -1838,7 +1799,6 @@ export default function App() {
 
       setNewSessionTitle('');
       setNewSessionPrompt('');
-      setNewSessionWorkDir('');
       setNewSessionModel('');
       setNewSessionEffort('');
       setNewSessionMode('');
@@ -1862,7 +1822,6 @@ export default function App() {
     tier?: string;
     contextSize?: string;
     mode?: string;
-    workingDirectory?: string;
   }) => {
     if (!selectedSessionId) return;
     setIsActionPending(true);
@@ -2450,7 +2409,6 @@ export default function App() {
           effort: item.effort || item.Effort || null,
           tier: item.tier || item.Tier || null,
           mode: item.mode || item.Mode || null,
-          workingDirectory: item.workingDirectory || item.WorkingDirectory || null,
           attachments: Array.isArray(item.attachments || item.Attachments)
             ? (item.attachments || item.Attachments).map((att: any) => ({
                 id: att.id || att.Id || '',
@@ -3697,107 +3655,6 @@ export default function App() {
                   </div>
 
                   {/* Working Directory Selection */}
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <label className="block text-[11px] font-medium text-slate-400">
-                        Working Directory
-                      </label>
-                      {newSessionWorkDir && (
-                        <button
-                          type="button"
-                          onClick={() => setNewSessionWorkDir('')}
-                          className="text-[10px] text-sky-400 hover:text-sky-300 flex items-center gap-1 cursor-pointer"
-                        >
-                          <RotateCcw className="w-2.5 h-2.5" />
-                          <span>Reset to Sandbox</span>
-                        </button>
-                      )}
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <div
-                        onClick={openFolderPicker}
-                        className="flex-1 min-w-0 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-lg px-3 py-2 flex items-center gap-2.5 cursor-pointer transition group"
-                      >
-                        <div
-                          className={`p-1.5 rounded-md ${
-                            newSessionWorkDir
-                              ? 'bg-sky-500/10 text-sky-400'
-                              : 'bg-emerald-500/10 text-emerald-400'
-                          }`}
-                        >
-                          <Folder className="w-4 h-4" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-semibold text-white truncate">
-                              {newSessionWorkDir
-                                ? newSessionWorkDir.split(/[\\/]/).filter(Boolean).pop() || newSessionWorkDir
-                                : 'Default Sandbox Workspace'}
-                            </span>
-                            <span
-                              className={`text-[9px] font-mono px-1.5 py-0.2 rounded border ${
-                                newSessionWorkDir
-                                  ? 'bg-sky-500/10 text-sky-300 border-sky-500/20'
-                                  : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
-                              }`}
-                            >
-                              {newSessionWorkDir ? 'Custom Path' : 'Safe Isolated'}
-                            </span>
-                          </div>
-                          <p className="text-[10px] text-slate-400 font-mono truncate mt-0.5">
-                            {newSessionWorkDir || '~/.agentmesh/workspaces/<session-id>'}
-                          </p>
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={openFolderPicker}
-                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 hover:border-slate-600 text-xs font-medium flex items-center gap-1.5 transition shrink-0 cursor-pointer"
-                      >
-                        <FolderOpen className="w-3.5 h-3.5 text-sky-400" />
-                        <span>Browse...</span>
-                      </button>
-                    </div>
-
-                    {/* Quick Preset Bookmark Chips */}
-                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-                      <span className="text-[10px] text-slate-500 font-medium mr-1">Quick Select:</span>
-                      <button
-                        type="button"
-                        onClick={() => setNewSessionWorkDir('')}
-                        className={`text-[10px] font-mono px-2 py-0.5 rounded-md border transition cursor-pointer ${
-                          !newSessionWorkDir
-                            ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 font-semibold'
-                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200 hover:border-slate-700'
-                        }`}
-                      >
-                        ⚡ Default Sandbox
-                      </button>
-                      {capabilities?.workspace?.bookmarks
-                        ?.filter((b) => b.path)
-                        .map((bookmark) => {
-                          const isSelected = newSessionWorkDir === bookmark.path;
-                          return (
-                            <button
-                              key={bookmark.label}
-                              type="button"
-                              onClick={() => setNewSessionWorkDir(bookmark.path)}
-                              title={bookmark.path}
-                              className={`text-[10px] font-mono px-2 py-0.5 rounded-md border transition cursor-pointer ${
-                                isSelected
-                                  ? 'bg-sky-500/20 text-sky-300 border-sky-500/40 font-semibold'
-                                  : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200 hover:border-slate-700'
-                              }`}
-                            >
-                              {bookmark.label}
-                            </button>
-                          );
-                        })}
-                    </div>
-                  </div>
-
                   <div className={`grid ${availableTiers.length > 0 ? 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-5' : 'grid-cols-2 sm:grid-cols-4'} gap-2.5`}>
                     {/* Model Selection Dropdown */}
                     <div className="space-y-1">
@@ -3998,18 +3855,6 @@ export default function App() {
                     )}
                     <span className="text-slate-400">
                       Driver: <strong className="text-slate-200">@{selectedSession.driverId || selectedAgent?.id || selectedSession.creatorAgentId || 'agy'}</strong>
-                    </span>
-                    <span className="text-slate-600">·</span>
-                    <span
-                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/80 truncate max-w-xs"
-                      title={selectedSessionMetadata?.workingDirectory || `~/.agentmesh/workspaces/${selectedSession.id}`}
-                    >
-                      <Folder className="w-3 h-3 text-sky-400 shrink-0" />
-                      <span className="truncate">
-                        {selectedSessionMetadata?.workingDirectory
-                          ? selectedSessionMetadata.workingDirectory
-                          : `~/.agentmesh/workspaces/${selectedSession.id.slice(0, 8)}...`}
-                      </span>
                     </span>
 
                     {/* Backdrop to close inline popover */}
@@ -4923,15 +4768,12 @@ export default function App() {
                   selectedAgent?.status === 'offline' ? (
                     <div className="flex flex-col gap-1.5 px-4 py-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-xs text-amber-200 max-w-xl">
                       <div className="flex items-center gap-2 font-semibold text-amber-300">
-                        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-                        <span>Agent @{selectedAgent.id} is offline (waiting for CLI connection)</span>
+                        <RefreshCw className="w-4 h-4 text-amber-400 shrink-0 animate-spin" />
+                        <span>Starting environment & waiting for runner connection...</span>
                       </div>
                       <p className="text-slate-300 leading-relaxed">
-                        Connect the agent runner from your terminal to process this prompt:
+                        The isolated runner container for @{selectedAgent.id} is starting up automatically to process this prompt.
                       </p>
-                      <code className="bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 font-mono text-sky-300 select-all">
-                        agentmesh start {selectedAgent.id}
-                      </code>
                     </div>
                   ) : (
                     <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-indigo-950/20 border border-indigo-500/20 text-xs text-indigo-300 w-fit">
@@ -5317,231 +5159,6 @@ export default function App() {
           )}
         </main>
       </div>
-
-      {/* Interactive Folder Picker Modal */}
-      {showFolderPicker && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label="Select Working Directory"
-          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
-        >
-          <div className="max-w-2xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
-            {/* Header */}
-            <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
-                  <FolderOpen className="w-4 h-4" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-white">Select Working Directory</h3>
-                  <p className="text-xs text-slate-400">Browse host filesystem for isolated session execution</p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowFolderPicker(false)}
-                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Navigation & Breadcrumbs Bar */}
-            <div className="px-5 py-2.5 bg-slate-950/60 border-b border-slate-800/80 flex items-center gap-2 text-xs">
-              <button
-                type="button"
-                disabled={!browseData?.parentPath || isBrowsing}
-                onClick={() => browseData?.parentPath && loadBrowseDirectory(browseData.parentPath)}
-                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
-                title="Go up to parent folder"
-              >
-                <ChevronUp className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                disabled={isBrowsing}
-                onClick={() => capabilities?.workspace.userHome && loadBrowseDirectory(capabilities.workspace.userHome)}
-                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 transition cursor-pointer"
-                title="Go to User Home"
-              >
-                <Home className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                disabled={isBrowsing}
-                onClick={() => loadBrowseDirectory(browseData?.currentPath)}
-                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 transition cursor-pointer"
-                title="Refresh current folder"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isBrowsing ? 'animate-spin' : ''}`} />
-              </button>
-
-              <div className="h-4 w-px bg-slate-800 mx-1" />
-
-              {/* Breadcrumb Path */}
-              <div className="flex-1 min-w-0 flex items-center gap-1 overflow-x-auto font-mono text-[11px] text-slate-300 py-0.5">
-                {browseData?.currentPath ? (
-                  browseData.currentPath
-                    .split('/')
-                    .map((segment, idx, arr) => {
-                      if (!segment && idx === 0) {
-                        return (
-                          <button
-                            key="root"
-                            type="button"
-                            onClick={() => loadBrowseDirectory('/')}
-                            className="hover:text-sky-400 font-bold px-1 rounded hover:bg-slate-800/50 cursor-pointer"
-                          >
-                            /
-                          </button>
-                        );
-                      }
-                      if (!segment) return null;
-                      const subPath = arr.slice(0, idx + 1).join('/') || '/';
-                      const isLast = idx === arr.length - 1;
-                      return (
-                        <div key={subPath} className="flex items-center gap-1 shrink-0">
-                          <span className="text-slate-600">/</span>
-                          <button
-                            type="button"
-                            onClick={() => loadBrowseDirectory(subPath)}
-                            className={`px-1 py-0.5 rounded transition cursor-pointer ${
-                              isLast
-                                ? 'text-sky-400 font-bold bg-sky-950/40 border border-sky-500/30'
-                                : 'hover:text-white hover:bg-slate-800/60 text-slate-300'
-                            }`}
-                          >
-                            {segment}
-                          </button>
-                        </div>
-                      );
-                    })
-                ) : (
-                  <span className="text-slate-500 italic">Reading directory...</span>
-                )}
-              </div>
-            </div>
-
-            {/* Quick Preset Location Chips in Picker */}
-            {capabilities?.workspace?.bookmarks && (
-              <div className="px-5 py-2 bg-slate-900/50 border-b border-slate-800/50 flex flex-wrap items-center gap-1.5 text-[11px]">
-                <span className="text-slate-500 text-[10px] uppercase font-mono tracking-wider mr-1">Bookmarks:</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setNewSessionWorkDir('');
-                    setShowFolderPicker(false);
-                  }}
-                  className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 transition cursor-pointer"
-                >
-                  ⚡ Sandbox Default
-                </button>
-                {capabilities.workspace.bookmarks
-                  .filter((b) => b.path)
-                  .map((bookmark) => (
-                    <button
-                      key={bookmark.label}
-                      type="button"
-                      onClick={() => loadBrowseDirectory(bookmark.path)}
-                      className={`px-2 py-0.5 rounded border transition cursor-pointer ${
-                        browseData?.currentPath === bookmark.path
-                          ? 'bg-sky-500/20 text-sky-300 border-sky-500/40 font-semibold'
-                          : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
-                      }`}
-                    >
-                      {bookmark.label}
-                    </button>
-                  ))}
-              </div>
-            )}
-
-            {/* Directory Listing Body */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-1">
-              {isBrowsing ? (
-                <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
-                  <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
-                  <span>Loading directory contents...</span>
-                </div>
-              ) : browseError ? (
-                <div className="p-4 rounded-xl bg-rose-950/30 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
-                  <span>{browseError}</span>
-                  <button
-                    type="button"
-                    onClick={() => loadBrowseDirectory(capabilities?.workspace.currentDirectory)}
-                    className="px-2.5 py-1 rounded bg-rose-900/50 hover:bg-rose-900 text-rose-200 border border-rose-500/40 text-[11px] cursor-pointer"
-                  >
-                    Return to Project
-                  </button>
-                </div>
-              ) : browseData?.directories.length === 0 ? (
-                <div className="py-10 text-center text-slate-500 text-xs italic">
-                  No accessible subdirectories in this folder
-                </div>
-              ) : (
-                browseData?.directories.map((dir) => (
-                  <div
-                    key={dir.path}
-                    className="group flex items-center justify-between p-2 rounded-lg hover:bg-slate-800/60 border border-transparent hover:border-slate-800 transition"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => loadBrowseDirectory(dir.path)}
-                      className="flex-1 flex items-center gap-2.5 text-left text-xs text-slate-200 group-hover:text-sky-300 font-mono transition cursor-pointer"
-                    >
-                      <Folder className="w-4 h-4 text-sky-400 shrink-0" />
-                      <span className="truncate">{dir.name}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setNewSessionWorkDir(dir.path);
-                        setShowFolderPicker(false);
-                      }}
-                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white text-[11px] font-medium opacity-80 group-hover:opacity-100 transition cursor-pointer"
-                    >
-                      Select
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
-
-            {/* Footer */}
-            <div className="px-5 py-3 border-t border-slate-800 bg-slate-950 flex items-center justify-between shrink-0">
-              <div className="min-w-0 pr-3">
-                <span className="text-[10px] text-slate-500 uppercase font-mono block">Current Folder</span>
-                <p className="text-xs font-mono text-slate-300 truncate" title={browseData?.currentPath}>
-                  {browseData?.currentPath || 'None'}
-                </p>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setShowFolderPicker(false)}
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  disabled={!browseData?.currentPath}
-                  onClick={() => {
-                    if (browseData?.currentPath) {
-                      setNewSessionWorkDir(browseData.currentPath);
-                      setShowFolderPicker(false);
-                    }
-                  }}
-                  className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-sky-600 hover:bg-sky-500 text-white flex items-center gap-1.5 transition disabled:opacity-40 cursor-pointer"
-                >
-                  <Check className="w-3.5 h-3.5" />
-                  <span>Choose This Folder</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Agent Quota & Usage Details Modal */}
       {showUsageModal && selectedUsageAgent && (() => {
@@ -6068,17 +5685,6 @@ export default function App() {
                     <p className="text-[10px] text-slate-500">
                       Limit how many jobs this persona can actively execute turns in simultaneously. Additional turns will queue until a slot frees up.
                     </p>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="block text-[11px] text-slate-400">Default Working Directory (Optional)</label>
-                    <input
-                      type="text"
-                      placeholder="Leave empty for isolated sandbox (~/.agentmesh/workspaces/<session-id>)"
-                      value={personaDefaultWorkDir}
-                      onChange={(e) => setPersonaDefaultWorkDir(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white font-mono focus:outline-none focus:border-sky-500"
-                    />
                   </div>
                 </div>
               </div>

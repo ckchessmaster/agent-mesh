@@ -119,7 +119,6 @@ public class PersonasController(
             DefaultMode = NormalizeOptional(req.DefaultMode),
             DefaultTier = NormalizeOptional(req.DefaultTier),
             DefaultContextSize = NormalizeOptional(req.DefaultContextSize),
-            DefaultWorkingDirectory = NormalizeOptional(req.DefaultWorkingDirectory),
             MaxConcurrentJobs = req.MaxConcurrentJobs > 0 ? req.MaxConcurrentJobs : null,
             TrustTier = req.TrustTier,
             CreatedAt = DateTimeOffset.UtcNow,
@@ -194,11 +193,6 @@ public class PersonasController(
         if (req.DefaultContextSize != null)
         {
             persona.DefaultContextSize = NormalizeOptional(req.DefaultContextSize);
-        }
-
-        if (req.DefaultWorkingDirectory != null)
-        {
-            persona.DefaultWorkingDirectory = NormalizeOptional(req.DefaultWorkingDirectory);
         }
 
         if (req.MaxConcurrentJobs.HasValue)
@@ -431,7 +425,7 @@ public class PersonasController(
 
         var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory)
             ? req.WorkingDirectory
-            : persona.DefaultWorkingDirectory;
+            : null;
         var effectiveModel = !string.IsNullOrWhiteSpace(req.Model)
             ? req.Model
             : persona.DefaultModel;
@@ -616,7 +610,6 @@ public class PersonasController(
         p.DefaultEffort,
         p.DefaultMode,
         p.DefaultTier,
-        p.DefaultWorkingDirectory,
         (int)p.TrustTier,
         sessionCount,
         p.CreatedAt,
@@ -636,7 +629,6 @@ public record CreatePersonaRequest(
     string? DefaultEffort = null,
     string? DefaultMode = null,
     string? DefaultTier = null,
-    string? DefaultWorkingDirectory = null,
     TrustTier TrustTier = TrustTier.Intern,
     string? DefaultContextSize = null,
     int? MaxConcurrentJobs = null
@@ -651,7 +643,6 @@ public record UpdatePersonaRequest(
     string? DefaultEffort = null,
     string? DefaultMode = null,
     string? DefaultTier = null,
-    string? DefaultWorkingDirectory = null,
     TrustTier? TrustTier = null,
     string? DefaultContextSize = null,
     int? MaxConcurrentJobs = null
@@ -669,7 +660,6 @@ public record PersonaDto(
     string? DefaultEffort,
     string? DefaultMode,
     string? DefaultTier,
-    string? DefaultWorkingDirectory,
     int TrustTier,
     int SessionCount,
     DateTimeOffset CreatedAt,

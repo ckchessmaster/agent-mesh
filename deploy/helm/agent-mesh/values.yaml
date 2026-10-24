@@ -69,9 +69,11 @@ config:
     requireHttpsMetadata: true
   personaRunner:
     image:
-      repository: "ghcr.io/your-org/agentmesh-persona-runner"
+      repository: "ghcr.io/ckchessmaster/agentmesh-persona-runner"
       tag: "0.2.0"
       pullPolicy: IfNotPresent
+    # Name of an existing kubernetes.io/dockerconfigjson secret if the image is in a private registry
+    imagePullSecret: ""
     idleTimeoutMinutes: 30
 
 # Optional: In-cluster Dex OIDC Provider (turn on if you don't have an external corporate IdP)
