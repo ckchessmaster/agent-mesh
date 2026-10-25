@@ -238,6 +238,12 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     };
                 }
 
+                var annotations = new Dictionary<string, string>();
+                if (isFailed)
+                {
+                    annotations["kubectl.kubernetes.io/restartedAt"] = DateTimeOffset.UtcNow.ToString("o");
+                }
+
                 var patchDoc = new
                 {
                     spec = new
@@ -248,10 +254,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                             metadata = new
                             {
                                 labels = labels,
-                                annotations = new Dictionary<string, string>
-                                {
-                                    ["kubectl.kubernetes.io/restartedAt"] = DateTimeOffset.UtcNow.ToString("o")
-                                }
+                                annotations = annotations.Count > 0 ? annotations : null
                             },
                             spec = podSpecPatch
                         }
@@ -387,9 +390,13 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             using var reader = new StreamReader(stream);
             return await reader.ReadToEndAsync(ct);
         }
-        catch (k8s.Autorest.HttpOperationException ex) when ((int)ex.Response.StatusCode == 400)
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response?.StatusCode == System.Net.HttpStatusCode.BadRequest || (int?)ex.Response?.StatusCode == 400 || ex.Message.Contains("BadRequest"))
         {
-            return "[Pod Status: Initializing]\nContainer is waiting to start. Logs will stream automatically once ready.";
+            return "[Pod Status: Initializing]\nContainer is waiting to start (ContainerCreating). Logs will stream automatically once ready.";
+        }
+        catch (Exception ex) when (ex.Message.Contains("ContainerCreating") || ex.Message.Contains("waiting to start") || ex.Message.Contains("BadRequest"))
+        {
+            return "[Pod Status: Initializing]\nContainer is waiting to start (ContainerCreating). Logs will stream automatically once ready.";
         }
         catch (Exception ex)
         {
@@ -503,10 +510,19 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
         else
         {
+            var combinedErr = $"{binErr} {binOut}".Trim();
+            var isPclmul = combinedErr.Contains("pclmul", StringComparison.OrdinalIgnoreCase) ||
+                           combinedErr.Contains("Illegal instruction", StringComparison.OrdinalIgnoreCase) ||
+                           binExit == 132;
+
+            var errorDetails = isPclmul
+                ? "Processor is missing PCLMULQDQ instruction required by Google agy binary. In Proxmox VE, edit VM Hardware -> Processor -> Type and set to 'host' (then reboot VM). Alternatively, switch to Direct API Key mode."
+                : $"{driverId} binary check failed (exit {binExit}): {binErr}";
+
             steps.Add(new PersonaDriverVerificationStep(
                 "CLI Binary Check",
                 "failed",
-                $"{driverId} binary not found in container: {binErr}"));
+                errorDetails));
         }
 
         // 3. Authentication check
@@ -615,7 +631,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var existing) && !existing.IsCompleted)
         {
-            return new PersonaAuthStartResult(normPersonaId, "agy", "waiting_code", existing.AuthUrl, "Please open the Google authorization link, approve access, and paste the authorization code below.");
+            if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
+            {
+                return new PersonaAuthStartResult(normPersonaId, "agy", "waiting_code", existing.AuthUrl, "Please open the Google authorization link, approve access, and paste the authorization code below.");
+            }
+            _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
         }
 
         var pods = await _client.CoreV1.ListNamespacedPodAsync(
@@ -643,6 +663,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
             var stdInStream = demuxer.GetStream(ChannelIndex.StdIn, null);
             var stdOutStream = demuxer.GetStream(ChannelIndex.StdOut, null);
+            var stdErrStream = demuxer.GetStream(ChannelIndex.StdErr, null);
 
             var tcsUrl = new TaskCompletionSource<string>();
             var session = new ActiveK8sAuthSession(webSocket, demuxer, stdInStream, tcsUrl);
@@ -670,13 +691,41 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 }
             });
 
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var errReader = new StreamReader(stdErrStream, Encoding.UTF8);
+                    string? errLine;
+                    while ((errLine = await errReader.ReadLineAsync()) != null)
+                    {
+                        if (errLine.Contains("pclmul", StringComparison.OrdinalIgnoreCase) ||
+                            errLine.Contains("Illegal instruction", StringComparison.OrdinalIgnoreCase))
+                        {
+                            tcsUrl.TrySetException(new InvalidOperationException(
+                                "Google agy binary crashed: Processor missing PCLMULQDQ instruction. In Proxmox VE, edit VM Hardware -> Processor -> Type and set to 'host' (reboot VM). Alternatively, choose Direct API Key mode."));
+                            break;
+                        }
+                    }
+                }
+                catch { }
+            });
+
             var completed = await Task.WhenAny(tcsUrl.Task, Task.Delay(15000, ct));
             if (completed == tcsUrl.Task)
             {
+                if (tcsUrl.Task.IsFaulted)
+                {
+                    _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
+                    var ex = tcsUrl.Task.Exception?.InnerException ?? tcsUrl.Task.Exception;
+                    return new PersonaAuthStartResult(normPersonaId, "agy", "error", ErrorMessage: ex?.Message ?? "Failed to start Google OAuth flow.");
+                }
+
                 var authUrl = await tcsUrl.Task;
                 return new PersonaAuthStartResult(normPersonaId, "agy", "waiting_code", authUrl, "Click the link to sign in with your Google account, then paste the authorization code below.");
             }
 
+            _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
             return new PersonaAuthStartResult(normPersonaId, "agy", "error", ErrorMessage: "Timed out waiting for Google OAuth authorization link from container.");
         }
         catch (Exception ex)

@@ -6,6 +6,7 @@ using AgentMesh.Core.Models;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.EntityFrameworkCore;
 using Moq;
 using Xunit;
 
@@ -117,6 +118,7 @@ public class AgentMeshCliTests
     [Fact]
     public async Task AgentMeshHub_RegisterAgentRunner_FlipsStatusToOnline_AndOnDisconnectFlipsToOffline()
     {
+        AgentMeshHub.ClearConnections();
         var agentId = $"test-runner-{Guid.NewGuid():N}";
         using var db = TestDbContextFactory.Create();
         db.Agents.Add(new Agent { Id = agentId, Name = "Test Runner", Status = "offline" });
@@ -149,7 +151,8 @@ public class AgentMeshCliTests
 
         // Assert 2: Offline
         AgentMeshHub.IsAgentConnected(agentId).Should().BeFalse();
-        (await db.Agents.FindAsync(agentId))!.Status.Should().Be("offline");
+        (await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == agentId))!.Status.Should().Be("offline");
+        AgentMeshHub.ClearConnections();
     }
 
     [Fact]

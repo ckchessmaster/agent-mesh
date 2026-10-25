@@ -93,7 +93,17 @@ public class PersonaIdleReaperService : BackgroundService
                     .Select(s => (DateTimeOffset?)s.UpdatedAt)
                     .FirstOrDefaultAsync(ct);
 
-                var lastActivity = lastSessionActivity ?? status.StartedAt ?? status.LastActivityAt;
+                // Determine the most recent activity timestamp across container start, container ping, and session updates.
+                // Never use null-coalescing here because an older session timestamp must not override a recently started container!
+                var candidateTimes = new[] { status.StartedAt, status.LastActivityAt, lastSessionActivity };
+                var activeTimestamps = candidateTimes.Where(t => t.HasValue).Select(t => t!.Value).ToList();
+                var lastActivity = activeTimestamps.Count > 0 ? activeTimestamps.Max() : (DateTimeOffset?)null;
+
+                // Safety grace period: if the container started recently within the idle timeout window, do not reap
+                if (status.StartedAt.HasValue && (now - status.StartedAt.Value) < _idleTimeout)
+                {
+                    continue;
+                }
 
                 if (lastActivity.HasValue && now - lastActivity.Value > _idleTimeout)
                 {

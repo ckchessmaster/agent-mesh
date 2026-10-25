@@ -562,19 +562,35 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                     ))}
                   </div>
 
-                  {verifyResult.steps.some(s => s.status !== 'success' && s.name.includes('Auth')) && (
-                    <div className="p-3.5 rounded-xl bg-purple-950/40 border border-purple-800/40 flex items-center justify-between gap-3 text-xs">
+                  {verifyResult.steps.some(s => s.status !== 'success' && (s.name.includes('Auth') || s.name.includes('Binary'))) && (
+                    <div className="p-3.5 rounded-xl bg-purple-950/40 border border-purple-800/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
                       <div>
-                        <strong className="text-purple-200 block">Google AI Pro Login Required</strong>
-                        <p className="text-purple-300/80 text-[11px] mt-0.5">Authenticate with your Google account to enable unlimited reasoning turns for this persona.</p>
+                        <strong className="text-purple-200 block">Driver Authentication / Setup Required</strong>
+                        <p className="text-purple-300/80 text-[11px] mt-0.5">Authenticate via Google AI Pro OAuth or configure an API key directly.</p>
                       </div>
-                      <button
-                        onClick={handleStartAuth}
-                        className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs flex items-center gap-1.5 shrink-0 transition"
-                      >
-                        <KeyRound className="w-3.5 h-3.5" />
-                        <span>Authenticate</span>
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => {
+                            setAuthMode('oauth');
+                            setShowAuthWizard(true);
+                            handleStartAuth();
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs flex items-center gap-1.5 shrink-0 transition"
+                        >
+                          <KeyRound className="w-3.5 h-3.5" />
+                          <span>Google OAuth</span>
+                        </button>
+                        <button
+                          onClick={() => {
+                            setAuthMode('apikey');
+                            setShowAuthWizard(true);
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs flex items-center gap-1.5 shrink-0 transition border border-slate-700"
+                        >
+                          <KeyRound className="w-3.5 h-3.5" />
+                          <span>Direct API Key</span>
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -676,23 +692,56 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                 <div className="p-4 text-center text-slate-400 text-xs font-mono">
                   Initiating device-code OAuth flow inside container...
                 </div>
-              ) : authStartResult?.authUrl ? (
-                <div className="space-y-3">
-                  <p className="text-slate-300 leading-relaxed">
-                    Step 1: Click the button below to sign in with your Google account (which has Google AI Pro):
+              ) : (authStartResult?.status === 'error' || authStartResult?.errorMessage) ? (
+                <div className="p-3.5 rounded-xl bg-red-950/50 border border-red-500/40 space-y-2.5 text-xs">
+                  <div className="flex items-center gap-2 font-semibold text-red-300">
+                    <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                    <span>Google AI Pro OAuth Failed</span>
+                  </div>
+                  <p className="font-mono text-[11px] leading-relaxed break-words text-red-200 bg-red-950/60 p-2.5 rounded-lg border border-red-800/40">
+                    {authStartResult.errorMessage}
                   </p>
-                  <a
-                    href={authStartResult.authUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-medium text-xs transition"
-                  >
-                    <span>Authorize with Google</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      onClick={handleStartAuth}
+                      disabled={authStarting}
+                      className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition cursor-pointer"
+                    >
+                      Retry Google Sign-In
+                    </button>
+                    <button
+                      onClick={() => setAuthMode('apikey')}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition cursor-pointer border border-slate-700"
+                    >
+                      Switch to Direct API Key
+                    </button>
+                  </div>
+                </div>
+              ) : (authStartResult?.authUrl || authStartResult?.status === 'waiting_code' || authStartResult?.instructions?.includes('code')) ? (
+                <div className="space-y-3">
+                  {authStartResult?.authUrl ? (
+                    <>
+                      <p className="text-slate-300 leading-relaxed">
+                        Step 1: Click the button below to sign in with your Google account (which has Google AI Pro):
+                      </p>
+                      <a
+                        href={authStartResult.authUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-medium text-xs transition"
+                      >
+                        <span>Authorize with Google</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    </>
+                  ) : (
+                    <p className="text-slate-300 leading-relaxed">
+                      {authStartResult?.instructions || 'Please complete authorization in your browser and submit the verification code below:'}
+                    </p>
+                  )}
 
                   <p className="text-slate-300 leading-relaxed pt-1">
-                    Step 2: Paste the authorization code provided after login and click Submit:
+                    {authStartResult?.authUrl ? 'Step 2: ' : ''}Paste the authorization code provided after login and click Submit:
                   </p>
                   <div className="flex items-center gap-2">
                     <input
@@ -705,7 +754,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                     <button
                       onClick={handleSubmitAuthCode}
                       disabled={authSubmitting || !authCodeInput.trim()}
-                      className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs transition disabled:opacity-50 cursor-pointer"
+                      className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs transition disabled:opacity-50 cursor-pointer shrink-0"
                     >
                       {authSubmitting ? 'Verifying...' : 'Submit Code'}
                     </button>
@@ -713,7 +762,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <p className="text-slate-400">{authStartResult?.instructions || 'Driver is ready.'}</p>
+                  <p className="text-slate-400">{authStartResult?.instructions || 'Driver is ready. Click below to begin Google AI Pro OAuth login.'}</p>
                   <button
                     onClick={handleStartAuth}
                     disabled={authStarting}

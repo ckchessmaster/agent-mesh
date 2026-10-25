@@ -562,10 +562,19 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
         else
         {
+            var combinedErr = $"{binErr} {binOut}".Trim();
+            var isPclmul = combinedErr.Contains("pclmul", StringComparison.OrdinalIgnoreCase) ||
+                           combinedErr.Contains("Illegal instruction", StringComparison.OrdinalIgnoreCase) ||
+                           binExit == 132;
+
+            var errorDetails = isPclmul
+                ? "Processor is missing PCLMULQDQ instruction required by Google agy binary. In Proxmox VE, edit VM Hardware -> Processor -> Type and set to 'host' (then reboot VM). Alternatively, switch to Direct API Key mode."
+                : $"{driverId} binary check failed (exit {binExit}): {binErr}";
+
             steps.Add(new PersonaDriverVerificationStep(
                 "CLI Binary Check",
                 "failed",
-                $"{driverId} binary not found in container: {binErr}"));
+                errorDetails));
         }
 
         // 2. Authentication check
@@ -674,7 +683,11 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         if (_activeAuthSessions.TryGetValue(normPersonaId, out var existing) && !existing.Process.HasExited)
         {
-            return new PersonaAuthStartResult(normPersonaId, "agy", "waiting_code", existing.AuthUrl, "Please open the Google authorization link, approve access, and paste the authorization code below.");
+            if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
+            {
+                return new PersonaAuthStartResult(normPersonaId, "agy", "waiting_code", existing.AuthUrl, "Please open the Google authorization link, approve access, and paste the authorization code below.");
+            }
+            _activeAuthSessions.TryRemove(normPersonaId, out _);
         }
 
         var containerName = GetContainerName(normPersonaId);
