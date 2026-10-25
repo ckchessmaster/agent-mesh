@@ -12,6 +12,7 @@ using Xunit;
 
 namespace AgentMesh.Tests.Cli;
 
+[Collection("AgentMeshHub")]
 public class AgentMeshCliTests
 {
     [Fact]

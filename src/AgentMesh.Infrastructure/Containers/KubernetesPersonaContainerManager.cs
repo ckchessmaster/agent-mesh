@@ -661,7 +661,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var demuxer = new StreamDemuxer(webSocket);
             demuxer.Start();
 
-            var stdInStream = demuxer.GetStream(ChannelIndex.StdIn, null);
+            var stdInStream = demuxer.GetStream(ChannelIndex.StdIn, ChannelIndex.StdIn);
             var stdOutStream = demuxer.GetStream(ChannelIndex.StdOut, null);
             var stdErrStream = demuxer.GetStream(ChannelIndex.StdErr, null);
 
@@ -747,10 +747,20 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 await session.StdIn.WriteAsync(codeBytes, 0, codeBytes.Length, ct);
                 await session.StdIn.FlushAsync(ct);
 
-                await Task.Delay(4000, ct);
+                // Poll for token creation up to 10 seconds
+                string? tokenOut = null;
+                for (var i = 0; i < 10; i++)
+                {
+                    await Task.Delay(1000, ct);
+                    var (chkExit, outStr, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                    if (chkExit == 0 && !string.IsNullOrWhiteSpace(outStr))
+                    {
+                        tokenOut = outStr;
+                        break;
+                    }
+                }
 
-                var (chkExit, tokenOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
-                if (chkExit == 0 && !string.IsNullOrWhiteSpace(tokenOut))
+                if (!string.IsNullOrWhiteSpace(tokenOut))
                 {
                     await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
                     {
@@ -828,7 +838,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var demuxer = new StreamDemuxer(webSocket);
         demuxer.Start();
 
-        var stdIn = demuxer.GetStream(ChannelIndex.StdIn, null);
+        var stdIn = demuxer.GetStream(ChannelIndex.StdIn, ChannelIndex.StdIn);
         var stdOut = demuxer.GetStream(ChannelIndex.StdOut, null);
         var stdErr = demuxer.GetStream(ChannelIndex.StdErr, null);
 

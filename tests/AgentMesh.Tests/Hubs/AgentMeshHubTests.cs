@@ -7,6 +7,7 @@ using Xunit;
 
 namespace AgentMesh.Tests.Hubs;
 
+[Collection("AgentMeshHub")]
 public class AgentMeshHubTests
 {
     private readonly Mock<HubCallerContext> _mockContext;
