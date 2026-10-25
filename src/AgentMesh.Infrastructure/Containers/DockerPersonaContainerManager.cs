@@ -479,18 +479,23 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
             var hostAgyState = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity_state.pbtxt");
 
-            if (File.Exists(hostAgyToken))
+            // Check persona-specific cached oauth token
+            var personaNormId = containerName.Replace("agentmesh-persona-", "");
+            var personaOauthFile = Path.Combine(userHome, ".agentmesh", "tokens", $"{personaNormId}.oauth");
+            var sourceToken = File.Exists(personaOauthFile) ? personaOauthFile : (File.Exists(hostAgyToken) ? hostAgyToken : null);
+
+            if (!string.IsNullOrEmpty(sourceToken))
             {
                 var (chkExit, _, _) = await RunCliAsync(_detectedCli, $"exec {containerName} test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
                 if (chkExit != 0)
                 {
                     await RunCliAsync(_detectedCli, $"exec {containerName} mkdir -p /root/.gemini/antigravity-cli", ct);
-                    await RunCliAsync(_detectedCli, $"cp \"{hostAgyToken}\" {containerName}:/root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                    await RunCliAsync(_detectedCli, $"cp \"{sourceToken}\" {containerName}:/root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
                     if (File.Exists(hostAgyState))
                     {
                         await RunCliAsync(_detectedCli, $"cp \"{hostAgyState}\" {containerName}:/root/.gemini/antigravity-cli/antigravity_state.pbtxt", ct);
                     }
-                    _logger.LogInformation("Seeded host Google AI Pro credentials into container {Name}", containerName);
+                    _logger.LogInformation("Seeded Google AI Pro credentials into container {Name}", containerName);
                 }
             }
         }
@@ -817,9 +822,17 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 await session.Process.WaitForExitAsync(linkedCts.Token);
                 await session.DisposeAsync();
 
-                var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
-                if (chkExit == 0)
+                var (chkExit, outStr, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                if (chkExit == 0 && !string.IsNullOrWhiteSpace(outStr))
                 {
+                    try
+                    {
+                        var tokensDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "tokens");
+                        Directory.CreateDirectory(tokensDir);
+                        var oauthFile = Path.Combine(tokensDir, $"{normPersonaId}.oauth");
+                        File.WriteAllText(oauthFile, outStr.Trim());
+                    }
+                    catch { }
                     return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials!");
                 }
 

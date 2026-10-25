@@ -184,6 +184,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var currentTokenEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_TOKEN")?.Value;
             var hasWorkspaceMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/workspace") == true;
             var hasWorkspaceVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "workspace-storage") == true;
+            var hasCredsMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/etc/agentmesh-creds") == true;
+            var hasCredsVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "persona-creds-volume") == true;
 
             var isScaledDown = (deployment.Spec?.Replicas ?? 0) == 0;
             var needsImageUpdate = runnerContainer != null && !string.Equals(currentImage, currentConfigImage, StringComparison.OrdinalIgnoreCase);
@@ -192,7 +194,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                  !string.Equals(currentPersonaEnv, normPersonaId, StringComparison.OrdinalIgnoreCase) ||
                                  !string.Equals(currentUrlEnv, meshUrl, StringComparison.OrdinalIgnoreCase) ||
                                  !string.Equals(currentTokenEnv, agentToken, StringComparison.Ordinal);
-            var needsVolumeUpdate = !hasWorkspaceMount || !hasWorkspaceVolume;
+            var needsVolumeUpdate = !hasWorkspaceMount || !hasWorkspaceVolume || !hasCredsMount || !hasCredsVolume;
 
             // Query status to detect crashed/error pods that need a kick
             var currentStatus = await GetStatusAsync(personaId, ct);
@@ -212,9 +214,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     {
                         secretRef = new { name = ef.SecretRef?.Name, optional = ef.SecretRef?.Optional }
                     }).ToList(),
-                    ["volumeMounts"] = new[]
+                    ["volumeMounts"] = new object[]
                     {
-                        new { name = "workspace-storage", mountPath = "/workspace" }
+                        new { name = "workspace-storage", mountPath = "/workspace" },
+                        new { name = "persona-creds-volume", mountPath = "/etc/agentmesh-creds", readOnly = true }
                     }
                 };
 
@@ -226,9 +229,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 var podSpecPatch = new Dictionary<string, object>
                 {
                     ["containers"] = new[] { containerPatch },
-                    ["volumes"] = new[]
+                    ["volumes"] = new object[]
                     {
-                        new { name = "workspace-storage", emptyDir = new { } }
+                        new { name = "workspace-storage", emptyDir = new { } },
+                        new { name = "persona-creds-volume", secret = new { secretName = personaSecretName, optional = true } }
                     }
                 };
 
@@ -267,6 +271,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 var patch = new V1Patch(patchJson, V1Patch.PatchType.StrategicMergePatch);
                 await _client.AppsV1.PatchNamespacedDeploymentAsync(patch, deploymentName, _namespace, cancellationToken: ct);
             }
+            await SeedCredentialsFromSecretAsync(normPersonaId, ct);
             return;
         }
         catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
@@ -307,13 +312,15 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                 EnvFrom = envFrom,
                                 VolumeMounts = new List<V1VolumeMount>
                                 {
-                                    new() { MountPath = "/workspace", Name = "workspace-storage" }
+                                    new() { MountPath = "/workspace", Name = "workspace-storage" },
+                                    new() { MountPath = "/etc/agentmesh-creds", Name = "persona-creds-volume", ReadOnlyProperty = true }
                                 }
                             }
                         },
                         Volumes = new List<V1Volume>
                         {
-                            new() { Name = "workspace-storage", EmptyDir = new V1EmptyDirVolumeSource() }
+                            new() { Name = "workspace-storage", EmptyDir = new V1EmptyDirVolumeSource() },
+                            new() { Name = "persona-creds-volume", Secret = new V1SecretVolumeSource { SecretName = personaSecretName, Optional = true } }
                         }
                     }
                 }
@@ -322,6 +329,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         await _client.AppsV1.CreateNamespacedDeploymentAsync(newDeployment, _namespace, cancellationToken: ct);
         _logger.LogInformation("Deployment {Name} created successfully for @{PersonaId}", deploymentName, personaId);
+        await SeedCredentialsFromSecretAsync(normPersonaId, ct);
     }
 
     public async Task StopAsync(string personaId, CancellationToken ct = default)
@@ -528,12 +536,27 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
 
         // 3. Authentication check
+        await SeedCredentialsFromSecretAsync(normPersonaId, ct);
         if (driverId.StartsWith("agy"))
         {
             var (authExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
             var (keyExit, keyOut, _) = await ExecInContainerAsync(normPersonaId, "printenv GEMINI_API_KEY", ct);
             if (authExit == 0)
             {
+                try
+                {
+                    var (_, tokenContent, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                    if (!string.IsNullOrWhiteSpace(tokenContent))
+                    {
+                        await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
+                        {
+                            ["antigravity-oauth-token"] = Encoding.UTF8.GetBytes(tokenContent.Trim()),
+                            ["ANTIGRAVITY_OAUTH_TOKEN"] = Encoding.UTF8.GetBytes(tokenContent.Trim())
+                        }, ct);
+                    }
+                }
+                catch { }
+
                 steps.Add(new PersonaDriverVerificationStep(
                     "Authentication Check",
                     "success",
@@ -766,7 +789,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 {
                     await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
                     {
-                        ["antigravity-oauth-token"] = Encoding.UTF8.GetBytes(tokenOut.Trim())
+                        ["antigravity-oauth-token"] = Encoding.UTF8.GetBytes(tokenOut.Trim()),
+                        ["ANTIGRAVITY_OAUTH_TOKEN"] = Encoding.UTF8.GetBytes(tokenOut.Trim())
                     }, ct);
 
                     return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials and persisted in Kubernetes secret!");
@@ -1056,9 +1080,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var secret = await _client.CoreV1.ReadNamespacedSecretAsync(personaSecretName, _namespace, cancellationToken: ct);
             if (secret?.Data != null && secret.Data.TryGetValue("antigravity-oauth-token", out var tokenBytes))
             {
-                var tokenContent = Encoding.UTF8.GetString(tokenBytes);
-                var escaped = tokenContent.Replace("\"", "\\\"");
-                await ExecInContainerAsync(normPersonaId, $"mkdir -p /root/.gemini/antigravity-cli && echo \"{escaped}\" > /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                var base64 = Convert.ToBase64String(tokenBytes);
+                await ExecInContainerAsync(normPersonaId, $"mkdir -p /root/.gemini/antigravity-cli && echo '{base64}' | base64 -d > /root/.gemini/antigravity-cli/antigravity-oauth-token && chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
                 _logger.LogInformation("Seeded Google AI Pro OAuth token into pod for @{PersonaId}", normPersonaId);
             }
         }

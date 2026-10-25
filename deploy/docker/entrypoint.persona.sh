@@ -20,6 +20,17 @@ if [ -z "$AGENTMESH_PERSONA_ID" ] && [ -n "$1" ] && [[ "$1" != -* ]]; then
     shift
 fi
 
+# Restore Google AI Pro OAuth token if mounted from Secret volume or passed via environment
+if [ -f /etc/agentmesh-creds/antigravity-oauth-token ] && [ ! -s /root/.gemini/antigravity-cli/antigravity-oauth-token ]; then
+    mkdir -p /root/.gemini/antigravity-cli
+    cp /etc/agentmesh-creds/antigravity-oauth-token /root/.gemini/antigravity-cli/antigravity-oauth-token
+    chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token
+elif [ -n "$ANTIGRAVITY_OAUTH_TOKEN" ] && [ ! -s /root/.gemini/antigravity-cli/antigravity-oauth-token ]; then
+    mkdir -p /root/.gemini/antigravity-cli
+    echo "$ANTIGRAVITY_OAUTH_TOKEN" > /root/.gemini/antigravity-cli/antigravity-oauth-token
+    chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token
+fi
+
 # Ensure workspace directory exists and is marked safe for git operations
 mkdir -p /workspace
 cd /workspace
