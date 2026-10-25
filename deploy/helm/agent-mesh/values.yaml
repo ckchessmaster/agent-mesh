@@ -10,8 +10,8 @@ ingress:
 
 api:
   image:
-    repository: "ghcr.io/your-org/agent-mesh-api"
-    tag: "0.2.0"
+    repository: "ghcr.io/ckchessmaster/agent-mesh-api"
+    tag: "1.0.1"
     pullPolicy: IfNotPresent
   port: 5000
   resources:
@@ -24,8 +24,8 @@ api:
 
 worker:
   image:
-    repository: "ghcr.io/your-org/agent-mesh-worker"
-    tag: "0.2.0"
+    repository: "ghcr.io/ckchessmaster/agent-mesh-worker"
+    tag: "1.0.1"
     pullPolicy: IfNotPresent
   resources:
     limits:
@@ -38,8 +38,8 @@ worker:
 dashboard:
   replicas: 1
   image:
-    repository: "ghcr.io/your-org/agent-mesh-dashboard"
-    tag: "0.2.0"
+    repository: "ghcr.io/ckchessmaster/agent-mesh-dashboard"
+    tag: "1.0.1"
     pullPolicy: IfNotPresent
   resources:
     limits:
@@ -69,8 +69,8 @@ config:
     requireHttpsMetadata: true
   personaRunner:
     image:
-      repository: "ghcr.io/your-org/agent-mesh-persona-runner"
-      tag: "0.2.0"
+      repository: "ghcr.io/ckchessmaster/agent-mesh-persona-runner"
+      tag: "1.0.1"
       pullPolicy: IfNotPresent
     # Name of an existing kubernetes.io/dockerconfigjson secret if the image is in a private registry
     imagePullSecret: ""

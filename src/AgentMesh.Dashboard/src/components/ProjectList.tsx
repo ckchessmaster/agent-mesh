@@ -76,7 +76,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
       </div>
 
       {/* Projects List */}
-      <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+      <div className="flex-1 overflow-y-auto p-2 space-y-1.5 pb-24 sm:pb-2">
         {uniqueProjects.length === 0 ? (
           <div className="p-4 text-center text-slate-500 text-xs">
             No projects yet. Create your first project to collaborate with Personas.

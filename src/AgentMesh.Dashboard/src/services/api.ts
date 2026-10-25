@@ -274,6 +274,16 @@ export const api = {
     return res.json();
   },
 
+  async configurePersonaApiKey(personaId: string, apiKey: string, provider?: string): Promise<PersonaAuthSubmitResult> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/auth/apikey`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ apiKey, provider })
+    });
+    if (!res.ok) throw new Error(`Failed to configure API key: ${res.statusText}`);
+    return res.json();
+  },
+
   async getAgentUsage(agentId: string, refresh = false): Promise<AgentUsageResponse> {
     const url = `/api/agents/${encodeURIComponent(agentId)}/usage${refresh ? '?refresh=true' : ''}`;
     const res = await apiFetch(url, { headers: getHeaders() });

@@ -2723,7 +2723,7 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-3 space-y-4">
+              <div className="flex-1 overflow-y-auto p-3 space-y-4 pb-24 sm:pb-4">
                 {isLoading ? (
                   <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
                     <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
@@ -3181,7 +3181,7 @@ export default function App() {
               )}
 
               {/* Driver & Session List */}
-              <div className="flex-1 overflow-y-auto p-3 space-y-4">
+              <div className="flex-1 overflow-y-auto p-3 space-y-4 pb-24 sm:pb-4">
                 {isLoading ? (
                   <div className="py-12 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
                     <RefreshCw className="w-5 h-5 animate-spin text-sky-400" />
@@ -5888,10 +5888,10 @@ export default function App() {
         />
       )}
 
-      {/* Mobile Bottom Navigation Bar: visible on mobile when at list/master level */}
+      {/* Mobile Bottom Navigation Bar: fixed to bottom on mobile when at list/master level */}
       {isMobile && !isMobileDetailView && (
         <nav
-          className="border-t border-slate-800/80 bg-slate-900/90 backdrop-blur px-4 py-2 flex items-center justify-around shrink-0 z-30 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
+          className="fixed bottom-0 inset-x-0 border-t border-slate-800/80 bg-slate-900/95 backdrop-blur-md px-4 py-2 flex items-center justify-around shrink-0 z-40 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-lg"
           data-testid="mobile-bottom-nav"
         >
           <button

@@ -36,6 +36,12 @@ public record PersonaAuthSubmitResult(
     string? Message = null,
     string? ErrorMessage = null);
 
+public interface IPersonaTerminalSession : IAsyncDisposable
+{
+    ValueTask SendInputAsync(string data);
+    ValueTask ResizeAsync(int cols, int rows);
+}
+
 public interface IPersonaContainerManager
 {
     string RuntimeName { get; }
@@ -46,5 +52,13 @@ public interface IPersonaContainerManager
     Task<PersonaDriverVerificationResult> VerifyDriverAsync(string personaId, CancellationToken ct = default);
     Task<PersonaAuthStartResult> StartAuthAsync(string personaId, CancellationToken ct = default);
     Task<PersonaAuthSubmitResult> SubmitAuthCodeAsync(string personaId, string code, CancellationToken ct = default);
+    Task<PersonaAuthSubmitResult> ConfigureApiKeyAsync(string personaId, string apiKey, string? provider = null, CancellationToken ct = default);
     Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(string personaId, string command, CancellationToken ct = default);
+    Task<IPersonaTerminalSession> AttachTerminalAsync(
+        string personaId,
+        int cols,
+        int rows,
+        Func<string, Task> onOutput,
+        Func<int, Task> onClosed,
+        CancellationToken ct = default);
 }

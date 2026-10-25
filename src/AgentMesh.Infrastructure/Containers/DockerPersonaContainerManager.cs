@@ -772,6 +772,133 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: "No active authentication session found for this persona. Please click Authenticate Driver first.");
     }
 
+    public async Task<PersonaAuthSubmitResult> ConfigureApiKeyAsync(
+        string personaId,
+        string apiKey,
+        string? provider = null,
+        CancellationToken ct = default)
+    {
+        var normPersonaId = personaId.Trim().ToLowerInvariant();
+        await EnsureRunningAsync(normPersonaId, ct);
+
+        var keyName = (!string.IsNullOrWhiteSpace(provider) && provider.ToLowerInvariant().Contains("claude"))
+            ? "ANTHROPIC_API_KEY"
+            : "GEMINI_API_KEY";
+
+        var escapedKey = apiKey.Trim().Replace("\"", "\\\"");
+        await ExecInContainerAsync(normPersonaId, $"echo 'export {keyName}=\"{escapedKey}\"' >> /root/.bashrc", ct);
+        await ExecInContainerAsync(normPersonaId, $"echo 'export {keyName}=\"{escapedKey}\"' >> /root/.profile", ct);
+
+        return new PersonaAuthSubmitResult(normPersonaId, "authenticated", $"{keyName} successfully configured in persona environment!");
+    }
+
+    public async Task<IPersonaTerminalSession> AttachTerminalAsync(
+        string personaId,
+        int cols,
+        int rows,
+        Func<string, Task> onOutput,
+        Func<int, Task> onClosed,
+        CancellationToken ct = default)
+    {
+        var normPersonaId = personaId.Trim().ToLowerInvariant();
+        await EnsureRunningAsync(normPersonaId, ct);
+
+        var containerName = GetContainerName(normPersonaId);
+        var cli = _detectedCli ?? "docker";
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = cli,
+            ArgumentList = { "exec", "-i", "-e", $"COLUMNS={cols}", "-e", $"LINES={rows}", "-e", "TERM=xterm-256color", containerName, "/bin/bash" },
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        var proc = new Process { StartInfo = psi };
+        proc.Start();
+
+        var session = new DockerProcessTerminalSession(proc, proc.StandardInput);
+
+        _ = Task.Run(async () =>
+        {
+            var buffer = new char[1024];
+            try
+            {
+                while (!proc.HasExited)
+                {
+                    var read = await proc.StandardOutput.ReadAsync(buffer, 0, buffer.Length);
+                    if (read <= 0) break;
+                    var text = new string(buffer, 0, read);
+                    await onOutput(text);
+                }
+            }
+            catch { }
+            finally
+            {
+                await onOutput("\r\n\x1b[33mTerminal session closed.\x1b[0m\r\n");
+                await onClosed(proc.ExitCode);
+            }
+        });
+
+        _ = Task.Run(async () =>
+        {
+            var errBuffer = new char[1024];
+            try
+            {
+                while (!proc.HasExited)
+                {
+                    var read = await proc.StandardError.ReadAsync(errBuffer, 0, errBuffer.Length);
+                    if (read <= 0) break;
+                    var text = new string(errBuffer, 0, read);
+                    await onOutput(text);
+                }
+            }
+            catch { }
+        });
+
+        return session;
+    }
+
+    private sealed class DockerProcessTerminalSession(Process process, StreamWriter writer) : IPersonaTerminalSession
+    {
+        public async ValueTask SendInputAsync(string data)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    await writer.WriteAsync(data);
+                    await writer.FlushAsync();
+                }
+            }
+            catch { }
+        }
+
+        public async ValueTask ResizeAsync(int cols, int rows)
+        {
+            await ValueTask.CompletedTask;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(true);
+                }
+            }
+            catch { }
+            try { writer.Dispose(); } catch { }
+            try { process.Dispose(); } catch { }
+        }
+    }
+
     private async Task EnsureImageAvailableAsync(CancellationToken ct)
     {
         if (_dockerClient != null)

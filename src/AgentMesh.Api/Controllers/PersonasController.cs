@@ -469,6 +469,32 @@ public class PersonasController(
         return Ok(result);
     }
 
+    public record ConfigureApiKeyRequest(string ApiKey, string? Provider = null);
+
+    [HttpPost("{id}/environment/auth/apikey")]
+    public async Task<IActionResult> ConfigurePersonaApiKey(string id, [FromBody] ConfigureApiKeyRequest req, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(req.ApiKey))
+        {
+            return BadRequest(new { error = "API key is required." });
+        }
+
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        var result = await containerManager.ConfigureApiKeyAsync(normalizedId, req.ApiKey, req.Provider, ct);
+        return Ok(result);
+    }
+
     [HttpPost("{id}/sessions")]
     public async Task<IActionResult> CreatePersonaSession(string id, [FromBody] CreateAgentSessionRequest req)
     {

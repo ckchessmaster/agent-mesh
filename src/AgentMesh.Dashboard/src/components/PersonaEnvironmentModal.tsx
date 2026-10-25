@@ -45,12 +45,15 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
   const [verifying, setVerifying] = useState(false);
   const [verifyResult, setVerifyResult] = useState<PersonaDriverVerificationResult | null>(null);
 
-  // Device-code auth state
+  // Auth state (Dual-Mode: OAuth & API Key)
   const [showAuthWizard, setShowAuthWizard] = useState(false);
+  const [authMode, setAuthMode] = useState<'oauth' | 'apikey'>('oauth');
   const [authStarting, setAuthStarting] = useState(false);
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authStartResult, setAuthStartResult] = useState<PersonaAuthStartResult | null>(null);
   const [authCodeInput, setAuthCodeInput] = useState('');
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [apiKeySaving, setApiKeySaving] = useState(false);
   const [authSuccessMessage, setAuthSuccessMessage] = useState<string | null>(null);
 
   // Web Terminal state & refs
@@ -170,6 +173,28 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
     }
   };
 
+  const handleSaveApiKey = async () => {
+    if (!apiKeyInput.trim()) return;
+    try {
+      setApiKeySaving(true);
+      setError(null);
+      const res = await api.configurePersonaApiKey(persona.id, apiKeyInput.trim());
+      if (res.status === 'authenticated') {
+        setAuthSuccessMessage(res.message || 'API key successfully configured!');
+        setApiKeyInput('');
+        setShowAuthWizard(false);
+        await handleRunVerification();
+      } else {
+        setError(res.errorMessage || 'Failed to configure API key.');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+    } finally {
+      setApiKeySaving(false);
+    }
+  };
+
   // Setup Web Terminal when terminal tab is active
   useEffect(() => {
     if (activeTab !== 'terminal') {
@@ -258,7 +283,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
       <div className="bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl w-full max-w-3xl max-h-[92dvh] sm:max-h-[88vh] flex flex-col shadow-2xl text-slate-100 overflow-hidden">
         {/* Header */}
-        <div className="p-4 border-b border-slate-800/80 flex items-center justify-between bg-slate-900/50">
+        <div className="p-4 border-b border-slate-800/80 flex items-center justify-between bg-slate-900 shrink-0 sticky top-0 z-20">
           <div className="flex items-center gap-2.5">
             <div className="p-2 rounded-lg bg-sky-950/60 border border-sky-800/40 text-sky-400">
               <Box className="w-5 h-5" />
@@ -280,10 +305,10 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
         </div>
 
         {/* Tab Navigation */}
-        <div className="flex items-center gap-1 px-4 pt-2 border-b border-slate-800 bg-slate-950/40 text-xs">
+        <div className="flex items-center gap-1 px-4 pt-2 border-b border-slate-800 bg-slate-950/90 backdrop-blur text-xs shrink-0 sticky top-[65px] z-10 overflow-x-auto whitespace-nowrap">
           <button
             onClick={() => setActiveTab('overview')}
-            className={`px-3 py-2 border-b-2 font-medium flex items-center gap-1.5 transition ${
+            className={`px-3 py-2 border-b-2 font-medium flex items-center gap-1.5 transition shrink-0 ${
               activeTab === 'overview'
                 ? 'border-sky-500 text-sky-400 font-semibold'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -298,7 +323,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
               setActiveTab('verify');
               if (!verifyResult && !verifying) handleRunVerification();
             }}
-            className={`px-3 py-2 border-b-2 font-medium flex items-center gap-1.5 transition ${
+            className={`px-3 py-2 border-b-2 font-medium flex items-center gap-1.5 transition shrink-0 ${
               activeTab === 'verify'
                 ? 'border-sky-500 text-sky-400 font-semibold'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -321,7 +346,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
 
           <button
             onClick={() => setActiveTab('terminal')}
-            className={`px-3 py-2 border-b-2 font-medium flex items-center gap-1.5 transition ${
+            className={`px-3 py-2 border-b-2 font-medium flex items-center gap-1.5 transition shrink-0 ${
               activeTab === 'terminal'
                 ? 'border-sky-500 text-sky-400 font-semibold'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -596,7 +621,58 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                 </button>
               </div>
 
-              {authStarting ? (
+              {/* Auth Mode Toggle */}
+              <div className="flex items-center gap-1.5 border-b border-slate-800 pb-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('oauth');
+                    if (!authStartResult && !authStarting) handleStartAuth();
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
+                    authMode === 'oauth'
+                      ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40 font-semibold'
+                      : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                  }`}
+                >
+                  Google AI Pro OAuth (Browser Login)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthMode('apikey')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
+                    authMode === 'apikey'
+                      ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40 font-semibold'
+                      : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                  }`}
+                >
+                  Direct API Key
+                </button>
+              </div>
+
+              {authMode === 'apikey' ? (
+                <div className="space-y-3 pt-1">
+                  <p className="text-slate-300 leading-relaxed">
+                    Configure your API key directly from the UI. Credentials will be securely saved into the environment secret and injected into the container:
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="password"
+                      value={apiKeyInput}
+                      onChange={e => setApiKeyInput(e.target.value)}
+                      placeholder="Paste GEMINI_API_KEY or ANTHROPIC_API_KEY..."
+                      className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-purple-500"
+                    />
+                    <button
+                      onClick={handleSaveApiKey}
+                      disabled={apiKeySaving || !apiKeyInput.trim()}
+                      className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs transition disabled:opacity-50 cursor-pointer"
+                    >
+                      {apiKeySaving ? 'Saving...' : 'Save API Key'}
+                    </button>
+                  </div>
+                </div>
+              ) : authStarting ? (
                 <div className="p-4 text-center text-slate-400 text-xs font-mono">
                   Initiating device-code OAuth flow inside container...
                 </div>
@@ -629,14 +705,23 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                     <button
                       onClick={handleSubmitAuthCode}
                       disabled={authSubmitting || !authCodeInput.trim()}
-                      className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs transition disabled:opacity-50"
+                      className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs transition disabled:opacity-50 cursor-pointer"
                     >
                       {authSubmitting ? 'Verifying...' : 'Submit Code'}
                     </button>
                   </div>
                 </div>
               ) : (
-                <p className="text-slate-400">{authStartResult?.instructions || 'Driver is ready.'}</p>
+                <div className="space-y-3">
+                  <p className="text-slate-400">{authStartResult?.instructions || 'Driver is ready.'}</p>
+                  <button
+                    onClick={handleStartAuth}
+                    disabled={authStarting}
+                    className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition cursor-pointer"
+                  >
+                    Start Google Sign-In
+                  </button>
+                </div>
               )}
             </div>
           )}

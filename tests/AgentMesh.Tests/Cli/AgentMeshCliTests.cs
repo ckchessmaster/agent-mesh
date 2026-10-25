@@ -117,7 +117,6 @@ public class AgentMeshCliTests
     [Fact]
     public async Task AgentMeshHub_RegisterAgentRunner_FlipsStatusToOnline_AndOnDisconnectFlipsToOffline()
     {
-        AgentMeshHub.ClearConnections();
         var agentId = $"test-runner-{Guid.NewGuid():N}";
         using var db = TestDbContextFactory.Create();
         db.Agents.Add(new Agent { Id = agentId, Name = "Test Runner", Status = "offline" });
