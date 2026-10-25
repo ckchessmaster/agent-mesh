@@ -8,7 +8,10 @@ public record PersonaEnvironmentStatus(
     DateTimeOffset? StartedAt = null,
     DateTimeOffset? LastActivityAt = null,
     long? MemoryUsageBytes = null,
-    string? ErrorMessage = null);
+    string? ErrorMessage = null,
+    string? Image = null,
+    string? ConfiguredImage = null,
+    bool UpdateAvailable = false);
 
 public record PersonaDriverVerificationStep(
     string Name,
@@ -47,6 +50,7 @@ public interface IPersonaContainerManager
     string RuntimeName { get; }
     Task<PersonaEnvironmentStatus> GetStatusAsync(string personaId, CancellationToken ct = default);
     Task EnsureRunningAsync(string personaId, CancellationToken ct = default);
+    Task RestartAsync(string personaId, CancellationToken ct = default);
     Task StopAsync(string personaId, CancellationToken ct = default);
     Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default);
     Task<PersonaDriverVerificationResult> VerifyDriverAsync(string personaId, CancellationToken ct = default);

@@ -38,6 +38,9 @@ export interface PersonaEnvironmentStatus {
   lastActivityAt?: string | null;
   memoryUsageBytes?: number | null;
   errorMessage?: string | null;
+  image?: string | null;
+  configuredImage?: string | null;
+  updateAvailable?: boolean;
 }
 
 export interface PersonaDriverVerificationStep {

@@ -246,6 +246,15 @@ export const api = {
     return res.json();
   },
 
+  async restartPersonaEnvironment(personaId: string): Promise<PersonaEnvironmentStatus> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/restart`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to restart persona environment: ${res.statusText}`);
+    return res.json();
+  },
+
   async getPersonaEnvironmentLogs(personaId: string, tail = 100): Promise<{ logs: string }> {
     const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/logs?tail=${tail}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load persona environment logs: ${res.statusText}`);

@@ -419,6 +419,26 @@ public class PersonasController(
         return Ok(status);
     }
 
+    [HttpPost("{id}/environment/restart")]
+    public async Task<IActionResult> RestartPersonaEnvironment(string id, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        await containerManager.RestartAsync(normalizedId, ct);
+        var status = await containerManager.GetStatusAsync(normalizedId, ct);
+        return Ok(status);
+    }
+
     [HttpGet("{id}/environment/logs")]
     public async Task<IActionResult> GetPersonaEnvironmentLogs(string id, [FromQuery] int tail = 100, CancellationToken ct = default)
     {

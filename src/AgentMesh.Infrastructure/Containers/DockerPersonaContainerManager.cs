@@ -167,6 +167,9 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 var inspect = await _dockerClient.Containers.InspectContainerAsync(containerName, ct);
                 var isRunning = inspect.State.Running;
                 DateTimeOffset? startedAt = DateTimeOffset.TryParse(inspect.State.StartedAt, out var s) ? s : null;
+                var currentImage = inspect.Config?.Image ?? inspect.Image;
+                var updateAvailable = !string.IsNullOrWhiteSpace(currentImage) &&
+                                      !string.Equals(currentImage, _defaultImage, StringComparison.OrdinalIgnoreCase);
 
                 return new PersonaEnvironmentStatus(
                     PersonaId: personaId,
@@ -174,11 +177,14 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     Runtime: _runtimeName,
                     ContainerId: inspect.ID[..Math.Min(12, inspect.ID.Length)],
                     StartedAt: startedAt,
-                    LastActivityAt: DateTimeOffset.UtcNow);
+                    LastActivityAt: DateTimeOffset.UtcNow,
+                    Image: currentImage,
+                    ConfiguredImage: _defaultImage,
+                    UpdateAvailable: updateAvailable);
             }
             catch (DockerContainerNotFoundException)
             {
-                return new PersonaEnvironmentStatus(personaId, "stopped", _runtimeName);
+                return new PersonaEnvironmentStatus(personaId, "stopped", _runtimeName, ConfiguredImage: _defaultImage);
             }
             catch (Exception ex)
             {
@@ -205,20 +211,31 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                         var started = stateProp.TryGetProperty("StartedAt", out var sProp) &&
                                       DateTimeOffset.TryParse(sProp.GetString(), out var s) ? s : (DateTimeOffset?)null;
 
+                        string? currentImage = null;
+                        if (elem.TryGetProperty("Config", out var cfg) && cfg.TryGetProperty("Image", out var imgP))
+                        {
+                            currentImage = imgP.GetString();
+                        }
+                        var updateAvailable = !string.IsNullOrWhiteSpace(currentImage) &&
+                                              !string.Equals(currentImage, _defaultImage, StringComparison.OrdinalIgnoreCase);
+
                         return new PersonaEnvironmentStatus(
                             PersonaId: personaId,
                             Status: running ? "running" : "stopped",
                             Runtime: _runtimeName,
                             ContainerId: id != null ? id[..Math.Min(12, id.Length)] : null,
                             StartedAt: started,
-                            LastActivityAt: DateTimeOffset.UtcNow);
+                            LastActivityAt: DateTimeOffset.UtcNow,
+                            Image: currentImage,
+                            ConfiguredImage: _defaultImage,
+                            UpdateAvailable: updateAvailable);
                     }
                 }
                 catch { }
             }
         }
 
-        return new PersonaEnvironmentStatus(personaId, "stopped", _runtimeName);
+        return new PersonaEnvironmentStatus(personaId, "stopped", _runtimeName, ConfiguredImage: _defaultImage);
     }
 
     public async Task EnsureRunningAsync(string personaId, CancellationToken ct = default)
@@ -229,6 +246,13 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         if (status.Status == "running")
         {
+            if (status.UpdateAvailable)
+            {
+                _logger.LogInformation("Container for @{PersonaId} is running outdated image {Image} (configured: {Configured}). Recreating...",
+                    normPersonaId, status.Image, status.ConfiguredImage);
+                await RestartAsync(normPersonaId, ct);
+                return;
+            }
             await SeedHostCredentialsIfAvailableAsync(containerName, ct);
             return;
         }
@@ -315,10 +339,29 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 try
                 {
                     var inspect = await _dockerClient.Containers.InspectContainerAsync(containerName, ct);
-                    if (!inspect.State.Running)
+                    var existingImage = inspect.Config?.Image ?? inspect.Image;
+                    var isOutdated = !string.IsNullOrWhiteSpace(existingImage) &&
+                                     !string.Equals(existingImage, _defaultImage, StringComparison.OrdinalIgnoreCase);
+
+                    if (isOutdated)
+                    {
+                        _logger.LogInformation("Removing outdated container {Name} with image {Image} (configured: {Target})",
+                            containerName, existingImage, _defaultImage);
+                        if (inspect.State.Running)
+                        {
+                            try { await _dockerClient.Containers.StopContainerAsync(containerName, new ContainerStopParameters { WaitBeforeKillSeconds = 3 }, ct); } catch { }
+                        }
+                        await _dockerClient.Containers.RemoveContainerAsync(containerName, new ContainerRemoveParameters { Force = true }, ct);
+                    }
+                    else if (!inspect.State.Running)
                     {
                         _logger.LogInformation("Starting existing container {Name} for persona @{PersonaId}", containerName, normPersonaId);
                         await _dockerClient.Containers.StartContainerAsync(containerName, new ContainerStartParameters(), ct);
+                        await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+                        return;
+                    }
+                    else
+                    {
                         await SeedHostCredentialsIfAvailableAsync(containerName, ct);
                         return;
                     }
@@ -364,17 +407,40 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         if (_detectedCli != null)
         {
-            var (inspectExit, _, _) = await RunCliAsync(_detectedCli, $"inspect {containerName}", ct);
-            if (inspectExit == 0)
+            var (inspectExit, inspectJson, _) = await RunCliAsync(_detectedCli, $"inspect {containerName} --format json", ct);
+            if (inspectExit == 0 && !string.IsNullOrWhiteSpace(inspectJson))
             {
-                _logger.LogInformation("Starting existing container {Name} via {Cli} for @{PersonaId}", containerName, _detectedCli, normPersonaId);
-                var (startExit, _, startErr) = await RunCliAsync(_detectedCli, $"start {containerName}", ct);
-                if (startExit != 0)
+                string? existingImg = null;
+                try
                 {
-                    throw new InvalidOperationException($"Failed to start container {containerName}: {startErr}");
+                    using var doc = JsonDocument.Parse(inspectJson);
+                    var elem = doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0 ? doc.RootElement[0] : doc.RootElement;
+                    if (elem.TryGetProperty("Config", out var cfg) && cfg.TryGetProperty("Image", out var imgP))
+                    {
+                        existingImg = imgP.GetString();
+                    }
                 }
-                await SeedHostCredentialsIfAvailableAsync(containerName, ct);
-                return;
+                catch { }
+
+                var isOutdated = !string.IsNullOrWhiteSpace(existingImg) &&
+                                 !string.Equals(existingImg, _defaultImage, StringComparison.OrdinalIgnoreCase);
+
+                if (isOutdated)
+                {
+                    _logger.LogInformation("Removing outdated container {Name} ({Existing}) via {Cli}", containerName, existingImg, _detectedCli);
+                    await RunCliAsync(_detectedCli, $"rm -f {containerName}", ct);
+                }
+                else
+                {
+                    _logger.LogInformation("Starting existing container {Name} via {Cli} for @{PersonaId}", containerName, _detectedCli, normPersonaId);
+                    var (startExit, _, startErr) = await RunCliAsync(_detectedCli, $"start {containerName}", ct);
+                    if (startExit != 0)
+                    {
+                        throw new InvalidOperationException($"Failed to start container {containerName}: {startErr}");
+                    }
+                    await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+                    return;
+                }
             }
 
             var sb = new StringBuilder();
@@ -615,6 +681,38 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             await RunCliAsync(_detectedCli, $"stop -t 5 {containerName}", ct);
             _logger.LogInformation("Stopped container {Name} via {Cli} for persona @{PersonaId}", containerName, _detectedCli, personaId);
         }
+    }
+
+    public async Task RestartAsync(string personaId, CancellationToken ct = default)
+    {
+        var normPersonaId = personaId.Trim().ToLowerInvariant();
+        var containerName = GetContainerName(normPersonaId);
+        _logger.LogInformation("Restarting & recreating container {Name} for persona @{PersonaId}", containerName, normPersonaId);
+
+        if (_dockerClient != null)
+        {
+            try
+            {
+                try
+                {
+                    await _dockerClient.Containers.StopContainerAsync(containerName, new ContainerStopParameters { WaitBeforeKillSeconds = 3 }, ct);
+                }
+                catch { }
+
+                await _dockerClient.Containers.RemoveContainerAsync(containerName, new ContainerRemoveParameters { Force = true }, ct);
+            }
+            catch (DockerContainerNotFoundException) { }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Failed to remove container {Name} during restart: {Error}", containerName, ex.Message);
+            }
+        }
+        else if (_detectedCli != null)
+        {
+            await RunCliAsync(_detectedCli, $"rm -f {containerName}", ct);
+        }
+
+        await EnsureRunningAsync(normPersonaId, ct);
     }
 
     public async Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default)

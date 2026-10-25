@@ -315,6 +315,32 @@ public class PersonasControllerTests
     }
 
     [Fact]
+    public async Task RestartPersonaEnvironment_InvokesRestartAndReturnsStatus()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.RestartAsync("astra", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        mockManager.Setup(m => m.GetStatusAsync("astra", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("astra", "running", "kubernetes", "agentmesh-persona-astra", Image: "agentmesh-persona-runner:1.1.1", ConfiguredImage: "agentmesh-persona-runner:1.1.1", UpdateAvailable: false));
+
+        var controller = new PersonasController(db, _mockHubContext.Object, mockManager.Object);
+        await controller.CreatePersona(new CreatePersonaRequest("Astra", "gemini", "astra"));
+
+        // Act
+        var res = await controller.RestartPersonaEnvironment("astra", CancellationToken.None);
+
+        // Assert
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+        var status = ok.Value.Should().BeOfType<PersonaEnvironmentStatus>().Subject;
+        status.Status.Should().Be("running");
+        status.Image.Should().Be("agentmesh-persona-runner:1.1.1");
+        status.UpdateAvailable.Should().BeFalse();
+        mockManager.Verify(m => m.RestartAsync("astra", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
     public async Task GetPersonaEnvironmentLogs_ReturnsLogs()
     {
         // Arrange

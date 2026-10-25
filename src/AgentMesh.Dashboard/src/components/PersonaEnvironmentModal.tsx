@@ -117,6 +117,21 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
     }
   };
 
+  const handleRestart = async () => {
+    try {
+      setActionPending(true);
+      setError(null);
+      const res = await api.restartPersonaEnvironment(persona.id);
+      setStatus(res);
+      await fetchStatusAndLogs();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+    } finally {
+      setActionPending(false);
+    }
+  };
+
   const handleRunVerification = async () => {
     try {
       setVerifying(true);
@@ -376,8 +391,32 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
           {/* TAB 1: OVERVIEW */}
           {activeTab === 'overview' && (
             <div className="space-y-4">
+              {status?.updateAvailable && (
+                <div className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                    <div className="space-y-0.5">
+                      <div className="font-semibold text-amber-300">Runner Image Update Available</div>
+                      <div className="text-[11px] text-slate-300">
+                        Running: <code className="text-amber-300 font-mono bg-amber-950/60 px-1 py-0.5 rounded">{status.image || 'unknown'}</code>
+                        <span className="mx-1.5">➔</span>
+                        Target: <code className="text-emerald-300 font-mono bg-emerald-950/60 px-1 py-0.5 rounded">{status.configuredImage}</code>
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleRestart}
+                    disabled={actionPending}
+                    className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold whitespace-nowrap flex items-center gap-1.5 transition disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${actionPending ? 'animate-spin' : ''}`} />
+                    <span>Restart & Update</span>
+                  </button>
+                </div>
+              )}
+
               {/* Status Bar */}
-              <div className="grid grid-cols-3 gap-3 p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80">
                 <div>
                   <span className="text-[11px] text-slate-500 block uppercase font-mono">Status</span>
                   <div className="flex items-center gap-1.5 mt-0.5">
@@ -404,7 +443,21 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                 </div>
 
                 <div>
-                  <span className="text-[11px] text-slate-500 block uppercase font-mono">Container ID</span>
+                  <span className="text-[11px] text-slate-500 block uppercase font-mono">Image</span>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className="text-xs font-mono font-medium text-slate-300 truncate max-w-[150px]" title={status?.image || status?.configuredImage || 'default'}>
+                      {status?.image || status?.configuredImage || 'default'}
+                    </span>
+                    {status?.updateAvailable && (
+                      <span className="px-1.5 py-0.2 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 shrink-0">
+                        update
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-[11px] text-slate-500 block uppercase font-mono">Container / Pod ID</span>
                   <span className="text-xs font-mono font-medium text-slate-300 mt-0.5 block truncate" title={status?.containerId || 'None'}>
                     {status?.containerId || 'None'}
                   </span>
@@ -433,6 +486,16 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                       <span>Wake Environment</span>
                     </button>
                   )}
+
+                  <button
+                    onClick={handleRestart}
+                    disabled={actionPending}
+                    title="Restart container/deployment with the latest configured image"
+                    className="px-3.5 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/30 text-xs font-medium flex items-center gap-1.5 transition disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${actionPending ? 'animate-spin' : ''}`} />
+                    <span>{status?.updateAvailable ? 'Restart & Update' : 'Restart Environment'}</span>
+                  </button>
 
                   <button
                     onClick={() => {
