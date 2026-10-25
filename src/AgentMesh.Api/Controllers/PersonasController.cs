@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -16,7 +17,8 @@ namespace AgentMesh.Api.Controllers;
 public class PersonasController(
     AgentMeshDbContext db,
     IHubContext<AgentMeshHub>? hubContext = null,
-    AgentMesh.Core.Services.IPersonaContainerManager? containerManager = null) : ControllerBase
+    AgentMesh.Core.Services.IPersonaContainerManager? containerManager = null,
+    ICredentialEncryptionService? encryptionService = null) : ControllerBase
 {
     [HttpGet]
     [AllowAnonymous]
@@ -48,7 +50,7 @@ public class PersonasController(
         var dtos = personas.Select(p =>
         {
             drivers.TryGetValue(p.DriverId, out var driver);
-            return ToDto(p, driver, sessionCounts.GetValueOrDefault(p.Id, 0));
+            return ToDto(p, driver, sessionCounts.GetValueOrDefault(p.Id, 0), encryptionService);
         }).ToList();
 
         return Ok(dtos);
@@ -73,7 +75,7 @@ public class PersonasController(
             .FirstOrDefaultAsync(d => d.Id == persona.DriverId);
 
         var sessionCount = await db.AgentSessions.CountAsync(s => s.PersonaId == normalizedId);
-        return Ok(ToDto(persona, driver, sessionCount));
+        return Ok(ToDto(persona, driver, sessionCount, encryptionService));
     }
 
     [HttpPost]
@@ -107,6 +109,12 @@ public class PersonasController(
         var normalizedDriverId = req.DriverId.Trim().ToLowerInvariant();
         var driver = await EnsureDriverExistsAsync(normalizedDriverId);
 
+        string? encryptedToken = null;
+        if (!string.IsNullOrWhiteSpace(req.GitHubToken) && encryptionService != null)
+        {
+            encryptedToken = encryptionService.Encrypt(req.GitHubToken.Trim());
+        }
+
         var persona = new Persona
         {
             Id = normalizedId,
@@ -121,6 +129,9 @@ public class PersonasController(
             DefaultContextSize = NormalizeOptional(req.DefaultContextSize),
             MaxConcurrentJobs = req.MaxConcurrentJobs > 0 ? req.MaxConcurrentJobs : null,
             TrustTier = req.TrustTier,
+            GitHubTokenEncrypted = encryptedToken,
+            GitAuthorName = NormalizeOptional(req.GitAuthorName),
+            GitAuthorEmail = NormalizeOptional(req.GitAuthorEmail),
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
         };
@@ -128,7 +139,7 @@ public class PersonasController(
         db.Personas.Add(persona);
         await db.SaveChangesAsync();
 
-        var dto = ToDto(persona, driver, 0);
+        var dto = ToDto(persona, driver, 0, encryptionService);
         if (hubContext != null)
         {
             await hubContext.Clients.All.SendAsync("PersonaCreated", dto);
@@ -205,12 +216,34 @@ public class PersonasController(
             persona.TrustTier = req.TrustTier.Value;
         }
 
+        if (req.GitHubToken != null)
+        {
+            if (string.IsNullOrWhiteSpace(req.GitHubToken))
+            {
+                persona.GitHubTokenEncrypted = null;
+            }
+            else if (encryptionService != null)
+            {
+                persona.GitHubTokenEncrypted = encryptionService.Encrypt(req.GitHubToken.Trim());
+            }
+        }
+
+        if (req.GitAuthorName != null)
+        {
+            persona.GitAuthorName = NormalizeOptional(req.GitAuthorName);
+        }
+
+        if (req.GitAuthorEmail != null)
+        {
+            persona.GitAuthorEmail = NormalizeOptional(req.GitAuthorEmail);
+        }
+
         persona.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
         var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(d => d.Id == persona.DriverId);
         var sessionCount = await db.AgentSessions.CountAsync(s => s.PersonaId == normalizedId);
-        var dto = ToDto(persona, driver, sessionCount);
+        var dto = ToDto(persona, driver, sessionCount, encryptionService);
 
         if (hubContext != null)
         {
@@ -625,6 +658,8 @@ public class PersonasController(
                     personaName = persona.Name,
                     personaRole = persona.Role,
                     personaPrompt = persona.PersonaPrompt,
+                    gitAuthorName = persona.GitAuthorName,
+                    gitAuthorEmail = persona.GitAuthorEmail,
                     prompt = promptMsg.Content,
                     sender = promptMsg.SenderAgentId,
                     workingDirectory = workDir,
@@ -688,25 +723,43 @@ public class PersonasController(
     private static string? NormalizeOptional(string? val) =>
         string.IsNullOrWhiteSpace(val) ? null : val.Trim();
 
-    public static PersonaDto ToDto(Persona p, Agent? driver, int sessionCount) => new(
-        p.Id,
-        p.Name,
-        p.Role,
-        p.PersonaPrompt,
-        p.DriverId,
-        driver?.Name ?? p.DriverId,
-        driver?.Status ?? (AgentMeshHub.IsAgentConnected(p.DriverId) ? "online" : "offline"),
-        p.DefaultModel,
-        p.DefaultEffort,
-        p.DefaultMode,
-        p.DefaultTier,
-        (int)p.TrustTier,
-        sessionCount,
-        p.CreatedAt,
-        p.UpdatedAt,
-        p.DefaultContextSize,
-        p.MaxConcurrentJobs
-    );
+    public static PersonaDto ToDto(Persona p, Agent? driver, int sessionCount, ICredentialEncryptionService? encryption = null)
+    {
+        var hasToken = !string.IsNullOrWhiteSpace(p.GitHubTokenEncrypted);
+        string? preview = null;
+        if (hasToken && encryption != null)
+        {
+            var decrypted = encryption.Decrypt(p.GitHubTokenEncrypted!);
+            if (!string.IsNullOrWhiteSpace(decrypted))
+            {
+                preview = encryption.Mask(decrypted);
+            }
+        }
+
+        return new(
+            p.Id,
+            p.Name,
+            p.Role,
+            p.PersonaPrompt,
+            p.DriverId,
+            driver?.Name ?? p.DriverId,
+            driver?.Status ?? (AgentMeshHub.IsAgentConnected(p.DriverId) ? "online" : "offline"),
+            p.DefaultModel,
+            p.DefaultEffort,
+            p.DefaultMode,
+            p.DefaultTier,
+            (int)p.TrustTier,
+            sessionCount,
+            p.CreatedAt,
+            p.UpdatedAt,
+            p.DefaultContextSize,
+            p.MaxConcurrentJobs,
+            HasGitHubToken: hasToken,
+            GitHubTokenPreview: preview,
+            GitAuthorName: p.GitAuthorName,
+            GitAuthorEmail: p.GitAuthorEmail
+        );
+    }
 }
 
 public record CreatePersonaRequest(
@@ -721,7 +774,10 @@ public record CreatePersonaRequest(
     string? DefaultTier = null,
     TrustTier TrustTier = TrustTier.Intern,
     string? DefaultContextSize = null,
-    int? MaxConcurrentJobs = null
+    int? MaxConcurrentJobs = null,
+    string? GitHubToken = null,
+    string? GitAuthorName = null,
+    string? GitAuthorEmail = null
 );
 
 public record UpdatePersonaRequest(
@@ -735,7 +791,10 @@ public record UpdatePersonaRequest(
     string? DefaultTier = null,
     TrustTier? TrustTier = null,
     string? DefaultContextSize = null,
-    int? MaxConcurrentJobs = null
+    int? MaxConcurrentJobs = null,
+    string? GitHubToken = null,
+    string? GitAuthorName = null,
+    string? GitAuthorEmail = null
 );
 
 public record PersonaDto(
@@ -755,5 +814,9 @@ public record PersonaDto(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     string? DefaultContextSize = null,
-    int? MaxConcurrentJobs = null
+    int? MaxConcurrentJobs = null,
+    bool HasGitHubToken = false,
+    string? GitHubTokenPreview = null,
+    string? GitAuthorName = null,
+    string? GitAuthorEmail = null
 );

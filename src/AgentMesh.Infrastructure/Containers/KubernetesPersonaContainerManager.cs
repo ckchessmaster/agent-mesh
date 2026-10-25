@@ -141,6 +141,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
     {
         var deploymentName = GetDeploymentName(personaId);
         var normPersonaId = personaId.Trim().ToLowerInvariant();
+        var pvcName = GetPvcName(normPersonaId);
 
         var currentConfigImage = _config["PersonaContainer:Image"] ?? _defaultImage;
         var currentPullPolicy = _config["PersonaContainer:PullPolicy"];
@@ -156,6 +157,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             ["app.kubernetes.io/component"] = "persona-runner",
             ["agentmesh.io/persona-id"] = normPersonaId
         };
+
+        await EnsurePersistentVolumeClaimAsync(normPersonaId, labels, ct);
 
         var agentToken = await ProvisionAgentTokenAsync(normPersonaId, ct);
 
@@ -183,7 +186,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var currentUrlEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_URL")?.Value;
             var currentTokenEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_TOKEN")?.Value;
             var hasWorkspaceMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/workspace") == true;
-            var hasWorkspaceVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "workspace-storage") == true;
+            var workspaceVolume = deployment.Spec?.Template?.Spec?.Volumes?.FirstOrDefault(v => v.Name == "workspace-storage");
+            var hasWorkspacePvc = workspaceVolume?.PersistentVolumeClaim != null &&
+                                  string.Equals(workspaceVolume.PersistentVolumeClaim.ClaimName, pvcName, StringComparison.OrdinalIgnoreCase);
             var hasCredsMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/etc/agentmesh-creds") == true;
             var hasCredsVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "persona-creds-volume") == true;
 
@@ -194,7 +199,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                  !string.Equals(currentPersonaEnv, normPersonaId, StringComparison.OrdinalIgnoreCase) ||
                                  !string.Equals(currentUrlEnv, meshUrl, StringComparison.OrdinalIgnoreCase) ||
                                  !string.Equals(currentTokenEnv, agentToken, StringComparison.Ordinal);
-            var needsVolumeUpdate = !hasWorkspaceMount || !hasWorkspaceVolume || !hasCredsMount || !hasCredsVolume;
+            var needsVolumeUpdate = !hasWorkspaceMount || !hasWorkspacePvc || !hasCredsMount || !hasCredsVolume;
 
             // Query status to detect crashed/error pods that need a kick
             var currentStatus = await GetStatusAsync(personaId, ct);
@@ -231,7 +236,12 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     ["containers"] = new[] { containerPatch },
                     ["volumes"] = new object[]
                     {
-                        new { name = "workspace-storage", emptyDir = new { } },
+                        new Dictionary<string, object?>
+                        {
+                            ["name"] = "workspace-storage",
+                            ["persistentVolumeClaim"] = new { claimName = pvcName },
+                            ["emptyDir"] = null
+                        },
                         new { name = "persona-creds-volume", secret = new { secretName = personaSecretName, optional = true } }
                     }
                 };
@@ -255,6 +265,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     spec = new
                     {
                         replicas = 1,
+                        strategy = new { type = "Recreate" },
                         template = new
                         {
                             metadata = new
@@ -292,6 +303,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             Spec = new V1DeploymentSpec
             {
                 Replicas = 1,
+                Strategy = new V1DeploymentStrategy { Type = "Recreate" },
                 Selector = new V1LabelSelector { MatchLabels = labels },
                 Template = new V1PodTemplateSpec
                 {
@@ -319,7 +331,14 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         },
                         Volumes = new List<V1Volume>
                         {
-                            new() { Name = "workspace-storage", EmptyDir = new V1EmptyDirVolumeSource() },
+                            new()
+                            {
+                                Name = "workspace-storage",
+                                PersistentVolumeClaim = new V1PersistentVolumeClaimVolumeSource
+                                {
+                                    ClaimName = pvcName
+                                }
+                            },
                             new() { Name = "persona-creds-volume", Secret = new V1SecretVolumeSource { SecretName = personaSecretName, Optional = true } }
                         }
                     }
@@ -1084,12 +1103,124 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 await ExecInContainerAsync(normPersonaId, $"mkdir -p /root/.gemini/antigravity-cli && echo '{base64}' | base64 -d > /root/.gemini/antigravity-cli/antigravity-oauth-token && chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
                 _logger.LogInformation("Seeded Google AI Pro OAuth token into pod for @{PersonaId}", normPersonaId);
             }
+
+            await SyncPersonaGitHubCredentialsAsync(normPersonaId, ct);
         }
         catch { }
     }
 
-    private static string GetDeploymentName(string personaId) =>
+    private async Task SyncPersonaGitHubCredentialsAsync(string normPersonaId, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+            var encService = scope.ServiceProvider.GetService<ICredentialEncryptionService>();
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+            if (persona == null) return;
+
+            string? token = null;
+            if (!string.IsNullOrWhiteSpace(persona.GitHubTokenEncrypted) && encService != null)
+            {
+                token = encService.Decrypt(persona.GitHubTokenEncrypted);
+            }
+
+            var authorName = !string.IsNullOrWhiteSpace(persona.GitAuthorName) ? persona.GitAuthorName : persona.Name;
+            var authorEmail = !string.IsNullOrWhiteSpace(persona.GitAuthorEmail) ? persona.GitAuthorEmail : $"{normPersonaId}-bot@agentmesh.local";
+
+            var secretData = new Dictionary<string, byte[]>();
+            if (!string.IsNullOrWhiteSpace(token))
+            {
+                secretData["GITHUB_TOKEN"] = Encoding.UTF8.GetBytes(token);
+                secretData["GH_TOKEN"] = Encoding.UTF8.GetBytes(token);
+            }
+            if (!string.IsNullOrWhiteSpace(authorName))
+            {
+                secretData["GIT_AUTHOR_NAME"] = Encoding.UTF8.GetBytes(authorName);
+                secretData["GIT_COMMITTER_NAME"] = Encoding.UTF8.GetBytes(authorName);
+            }
+            if (!string.IsNullOrWhiteSpace(authorEmail))
+            {
+                secretData["GIT_AUTHOR_EMAIL"] = Encoding.UTF8.GetBytes(authorEmail);
+                secretData["GIT_COMMITTER_EMAIL"] = Encoding.UTF8.GetBytes(authorEmail);
+            }
+
+            if (secretData.Count > 0)
+            {
+                await UpsertPersonaSecretAsync(normPersonaId, secretData, ct);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not sync GitHub credentials to Kubernetes secret for @{PersonaId}: {Error}", normPersonaId, ex.Message);
+        }
+    }
+
+    public static string GetDeploymentName(string personaId) =>
         $"agentmesh-persona-{personaId.Trim().ToLowerInvariant()}";
+
+    public static string GetPvcName(string personaId) =>
+        $"agentmesh-persona-{personaId.Trim().ToLowerInvariant()}-workspace";
+
+    private async Task EnsurePersistentVolumeClaimAsync(string normPersonaId, IDictionary<string, string> labels, CancellationToken ct)
+    {
+        var pvcName = GetPvcName(normPersonaId);
+        try
+        {
+            await _client.CoreV1.ReadNamespacedPersistentVolumeClaimAsync(pvcName, _namespace, cancellationToken: ct);
+            return;
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            // PVC does not exist yet, proceed to create
+        }
+
+        var storageClassName = _config["PersonaContainer:StorageClassName"] ?? _config["Kubernetes:StorageClassName"];
+        var storageSize = _config["PersonaContainer:WorkspaceSize"] ?? _config["Kubernetes:WorkspaceSize"] ?? "10Gi";
+
+        var pvcLabels = new Dictionary<string, string>(labels)
+        {
+            ["agentmesh.io/persona-id"] = normPersonaId
+        };
+
+        var pvc = new V1PersistentVolumeClaim
+        {
+            Metadata = new V1ObjectMeta
+            {
+                Name = pvcName,
+                NamespaceProperty = _namespace,
+                Labels = pvcLabels
+            },
+            Spec = new V1PersistentVolumeClaimSpec
+            {
+                AccessModes = new List<string> { "ReadWriteOnce" },
+                Resources = new V1VolumeResourceRequirements
+                {
+                    Requests = new Dictionary<string, ResourceQuantity>
+                    {
+                        ["storage"] = new ResourceQuantity(storageSize)
+                    }
+                },
+                StorageClassName = !string.IsNullOrWhiteSpace(storageClassName) ? storageClassName : null
+            }
+        };
+
+        try
+        {
+            _logger.LogInformation("Creating PVC {PvcName} for @{PersonaId} in namespace {Namespace} (size: {Size}, storageClass: {Class})",
+                pvcName, normPersonaId, _namespace, storageSize, storageClassName ?? "<default>");
+            await _client.CoreV1.CreateNamespacedPersistentVolumeClaimAsync(pvc, _namespace, cancellationToken: ct);
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            // Already created concurrently
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create PVC {PvcName} for @{PersonaId} in namespace {Namespace}", pvcName, normPersonaId, _namespace);
+            throw;
+        }
+    }
 
     private sealed class KubernetesTerminalSession(WebSocket webSocket, StreamDemuxer demuxer, Stream stdIn) : IPersonaTerminalSession
     {

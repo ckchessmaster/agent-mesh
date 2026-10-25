@@ -75,6 +75,9 @@ config:
     # Name of an existing kubernetes.io/dockerconfigjson secret if the image is in a private registry
     imagePullSecret: ""
     idleTimeoutMinutes: 30
+    storage:
+      size: "10Gi"
+      storageClassName: ""
 
 # Optional: In-cluster Dex OIDC Provider (turn on if you don't have an external corporate IdP)
 dex:

@@ -49,6 +49,15 @@ public class PersonaConfiguration : IEntityTypeConfiguration<Persona>
 
         builder.Property(p => p.MaxConcurrentJobs);
 
+        builder.Property(p => p.GitHubTokenEncrypted)
+            .HasMaxLength(512);
+
+        builder.Property(p => p.GitAuthorName)
+            .HasMaxLength(128);
+
+        builder.Property(p => p.GitAuthorEmail)
+            .HasMaxLength(256);
+
         builder.Property(p => p.TrustTier)
             .HasDefaultValue(TrustTier.Intern)
             .IsRequired();

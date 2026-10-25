@@ -7,6 +7,7 @@ using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Storage;
 using AgentMesh.Infrastructure.Containers;
+using AgentMesh.Infrastructure.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -26,6 +27,7 @@ builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespa
 
 // Configure Authentication & Authorization
 builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();
+builder.Services.AddSingleton<ICredentialEncryptionService, AesCredentialEncryptionService>();
 builder.Services.AddHttpContextAccessor();
 
 var oidcAuthority = builder.Configuration["Oidc:Authority"] ?? "http://localhost:8085/dex";

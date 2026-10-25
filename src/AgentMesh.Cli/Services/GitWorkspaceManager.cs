@@ -50,7 +50,9 @@ public static class GitWorkspaceManager
         string personaId,
         string? personaName,
         string prompt,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        string? customAuthorName = null,
+        string? customAuthorEmail = null)
     {
         if (string.IsNullOrWhiteSpace(branchName) || !await IsGitRepositoryAsync(directory))
             return;
@@ -70,8 +72,13 @@ public static class GitWorkspaceManager
                 return;
             }
 
-            var authorName = !string.IsNullOrWhiteSpace(personaName) ? personaName : personaId;
-            var authorEmail = $"{personaId.ToLowerInvariant().Replace(' ', '-')}-bot@agentmesh.local";
+            var authorName = !string.IsNullOrWhiteSpace(customAuthorName)
+                ? customAuthorName.Trim()
+                : (!string.IsNullOrWhiteSpace(personaName) ? personaName : personaId);
+
+            var authorEmail = !string.IsNullOrWhiteSpace(customAuthorEmail)
+                ? customAuthorEmail.Trim()
+                : $"{personaId.ToLowerInvariant().Replace(' ', '-')}-bot@agentmesh.local";
 
             var summary = prompt.Trim().Split('\n')[0];
             if (summary.Length > 60) summary = summary[..60] + "...";
@@ -83,7 +90,7 @@ public static class GitWorkspaceManager
 
             if (commitCode == 0)
             {
-                log?.Invoke($"Committed turn changes to '{branchName}' by @{personaId}");
+                log?.Invoke($"Committed turn changes to '{branchName}' by @{personaId} ({authorName} <{authorEmail}>)");
             }
             else
             {

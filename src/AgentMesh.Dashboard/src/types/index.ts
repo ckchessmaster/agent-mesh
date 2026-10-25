@@ -21,6 +21,10 @@ export interface Persona {
   maxConcurrentJobs?: number | null;
   trustTier: number;
   sessionCount?: number;
+  hasGitHubToken?: boolean;
+  gitHubTokenPreview?: string | null;
+  gitAuthorName?: string | null;
+  gitAuthorEmail?: string | null;
   createdAt: string;
   updatedAt?: string;
 }

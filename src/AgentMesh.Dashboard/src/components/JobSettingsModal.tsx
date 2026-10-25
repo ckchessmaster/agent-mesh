@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, Sliders, Save, AlertCircle, Trash2, CheckCircle2 } from 'lucide-react';
+import { X, Sliders, Save, AlertCircle, Trash2 } from 'lucide-react';
 import type { Project, ProjectJob } from '../types';
 import { ProjectJobStatus } from '../types';
 
@@ -31,7 +31,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
   const [description, setDescription] = useState(job.description || '');
   const [gitBranch, setGitBranch] = useState(job.gitBranchName || '');
   const [priority, setPriority] = useState<number>(job.priority ?? 1);
-  const [status, setStatus] = useState<ProjectJobStatus>(job.status ?? ProjectJobStatus.Active);
+  const [status, setStatus] = useState<ProjectJobStatus>((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
   const [resultSummary, setResultSummary] = useState(job.resultSummary || '');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -44,7 +44,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
       setDescription(job.description || '');
       setGitBranch(job.gitBranchName || '');
       setPriority(job.priority ?? 1);
-      setStatus(job.status ?? ProjectJobStatus.Active);
+      setStatus((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
       setResultSummary(job.resultSummary || '');
       setConfirmDelete(false);
       setError(null);

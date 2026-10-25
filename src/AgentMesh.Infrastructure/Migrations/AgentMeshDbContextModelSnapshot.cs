@@ -589,6 +589,21 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("driver_id");
 
+                    b.Property<string>("GitAuthorEmail")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("git_author_email");
+
+                    b.Property<string>("GitAuthorName")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("git_author_name");
+
+                    b.Property<string>("GitHubTokenEncrypted")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("git_hub_token_encrypted");
+
                     b.Property<int?>("MaxConcurrentJobs")
                         .HasColumnType("integer")
                         .HasColumnName("max_concurrent_jobs");

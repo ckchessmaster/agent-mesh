@@ -354,4 +354,87 @@ public class PersonasControllerTests
         sRes.Should().BeOfType<CreatedAtActionResult>();
         mockManager.Verify(m => m.EnsureRunningAsync("backend-dev", It.IsAny<CancellationToken>()), Times.Once);
     }
+
+    [Fact]
+    public async Task CreatePersona_WithGitHubCredentials_EncryptsTokenAndExposesMaskedPreview()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var encService = new AgentMesh.Infrastructure.Services.AesCredentialEncryptionService(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("test-key-32-bytes-long-seed-1234")));
+        var controller = new PersonasController(db, encryptionService: encService);
+
+        var req = new CreatePersonaRequest(
+            Name: "Git Bot",
+            DriverId: "copilot",
+            Id: "git-bot",
+            GitHubToken: "ghp_TestSecretToken1234567890",
+            GitAuthorName: "Custom Bot Author",
+            GitAuthorEmail: "bot@custom.org"
+        );
+
+        // Act
+        var result = await controller.CreatePersona(req);
+
+        // Assert
+        var created = result.Should().BeOfType<CreatedAtActionResult>().Subject;
+        var dto = created.Value.Should().BeOfType<PersonaDto>().Subject;
+
+        dto.HasGitHubToken.Should().BeTrue();
+        dto.GitHubTokenPreview.Should().Be("ghp_...7890");
+        dto.GitAuthorName.Should().Be("Custom Bot Author");
+        dto.GitAuthorEmail.Should().Be("bot@custom.org");
+
+        // Verify database stores encrypted token (not plaintext)
+        var entity = await db.Personas.FindAsync("git-bot");
+        entity.Should().NotBeNull();
+        entity!.GitHubTokenEncrypted.Should().NotBeNullOrWhiteSpace();
+        entity.GitHubTokenEncrypted.Should().NotContain("ghp_TestSecretToken");
+
+        // Verify decryption retrieves original plaintext
+        var decrypted = encService.Decrypt(entity.GitHubTokenEncrypted!);
+        decrypted.Should().Be("ghp_TestSecretToken1234567890");
+    }
+
+    [Fact]
+    public async Task UpdatePersona_UpdatingAndClearingGitHubCredentials_WorksCorrectly()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var encService = new AgentMesh.Infrastructure.Services.AesCredentialEncryptionService(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("test-key-32-bytes-long-seed-1234")));
+        var controller = new PersonasController(db, encryptionService: encService);
+
+        await controller.CreatePersona(new CreatePersonaRequest(
+            Name: "Deployer",
+            DriverId: "agy",
+            Id: "deployer",
+            GitHubToken: "ghp_InitialToken11112222",
+            GitAuthorName: "Deployer Bot"
+        ));
+
+        // Act 1: Update token and email
+        var updateRes = await controller.UpdatePersona("deployer", new UpdatePersonaRequest(
+            GitHubToken: "ghp_UpdatedToken33334444",
+            GitAuthorEmail: "deployer@mesh.internal"
+        ));
+
+        var updatedDto = updateRes.Should().BeOfType<OkObjectResult>().Subject.Value.Should().BeOfType<PersonaDto>().Subject;
+        updatedDto.HasGitHubToken.Should().BeTrue();
+        updatedDto.GitHubTokenPreview.Should().Be("ghp_...4444");
+        updatedDto.GitAuthorName.Should().Be("Deployer Bot");
+        updatedDto.GitAuthorEmail.Should().Be("deployer@mesh.internal");
+
+        // Act 2: Clear token with empty string
+        var clearRes = await controller.UpdatePersona("deployer", new UpdatePersonaRequest(
+            GitHubToken: ""
+        ));
+
+        var clearedDto = clearRes.Should().BeOfType<OkObjectResult>().Subject.Value.Should().BeOfType<PersonaDto>().Subject;
+        clearedDto.HasGitHubToken.Should().BeFalse();
+        clearedDto.GitHubTokenPreview.Should().BeNull();
+
+        var entity = await db.Personas.FindAsync("deployer");
+        entity!.GitHubTokenEncrypted.Should().BeNull();
+    }
 }

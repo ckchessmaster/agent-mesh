@@ -95,6 +95,12 @@ public class PromptReceivedEvent
     [JsonPropertyName("gitBranch")]
     public string? GitBranch { get; set; }
 
+    [JsonPropertyName("gitAuthorName")]
+    public string? GitAuthorName { get; set; }
+
+    [JsonPropertyName("gitAuthorEmail")]
+    public string? GitAuthorEmail { get; set; }
+
     [JsonPropertyName("workspaceType")]
     public string? WorkspaceType { get; set; }
 

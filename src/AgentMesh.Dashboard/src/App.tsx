@@ -40,7 +40,8 @@ import {
   ZoomIn,
   FolderGit2,
   Maximize2,
-  Box
+  Box,
+  GitBranch
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -285,6 +286,10 @@ export default function App() {
   const [personaDefaultTier, setPersonaDefaultTier] = useState('');
   const [personaDefaultContextSize, setPersonaDefaultContextSize] = useState('');
   const [personaMaxConcurrentJobs, setPersonaMaxConcurrentJobs] = useState<string>('');
+  const [personaGitHubToken, setPersonaGitHubToken] = useState('');
+  const [personaGitAuthorName, setPersonaGitAuthorName] = useState('');
+  const [personaGitAuthorEmail, setPersonaGitAuthorEmail] = useState('');
+  const [clearPersonaGitHubToken, setClearPersonaGitHubToken] = useState(false);
   const [inspectingPersonaEnv, setInspectingPersonaEnv] = useState<Persona | null>(null);
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
@@ -1446,6 +1451,10 @@ export default function App() {
     setPersonaDefaultTier('');
     setPersonaDefaultContextSize('');
     setPersonaMaxConcurrentJobs('');
+    setPersonaGitHubToken('');
+    setPersonaGitAuthorName('');
+    setPersonaGitAuthorEmail('');
+    setClearPersonaGitHubToken(false);
     setShowPersonaModal(true);
   }, [selectedAgentId, agents]);
 
@@ -1462,6 +1471,10 @@ export default function App() {
     setPersonaDefaultTier(persona.defaultTier || '');
     setPersonaDefaultContextSize(persona.defaultContextSize || '');
     setPersonaMaxConcurrentJobs(persona.maxConcurrentJobs ? String(persona.maxConcurrentJobs) : '');
+    setPersonaGitHubToken('');
+    setPersonaGitAuthorName(persona.gitAuthorName || '');
+    setPersonaGitAuthorEmail(persona.gitAuthorEmail || '');
+    setClearPersonaGitHubToken(false);
     setShowPersonaModal(true);
   }, []);
 
@@ -1483,6 +1496,8 @@ export default function App() {
 
     setIsActionPending(true);
     try {
+      const tokenPayload = clearPersonaGitHubToken ? '' : (personaGitHubToken.trim() || undefined);
+
       if (editingPersona) {
         const updated = await api.updatePersona(editingPersona.id, {
           name: personaNameInput.trim(),
@@ -1494,7 +1509,10 @@ export default function App() {
           defaultMode: personaDefaultMode || '',
           defaultTier: personaDefaultTier || '',
           defaultContextSize: personaDefaultContextSize || '',
-          maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined
+          maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined,
+          gitHubToken: tokenPayload,
+          gitAuthorName: personaGitAuthorName.trim() || undefined,
+          gitAuthorEmail: personaGitAuthorEmail.trim() || undefined
         });
         setShowPersonaModal(false);
         await fetchAllData();
@@ -1511,7 +1529,10 @@ export default function App() {
           defaultMode: personaDefaultMode || undefined,
           defaultTier: personaDefaultTier || undefined,
           defaultContextSize: personaDefaultContextSize || undefined,
-          maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined
+          maxConcurrentJobs: personaMaxConcurrentJobs.trim() ? Number(personaMaxConcurrentJobs) : undefined,
+          gitHubToken: personaGitHubToken.trim() || undefined,
+          gitAuthorName: personaGitAuthorName.trim() || undefined,
+          gitAuthorEmail: personaGitAuthorEmail.trim() || undefined
         });
         setShowPersonaModal(false);
         hasUserSwitchedTabRef.current = true;
@@ -2861,6 +2882,12 @@ export default function App() {
                                     <span>Max {persona.maxConcurrentJobs} {persona.maxConcurrentJobs === 1 ? 'Job' : 'Jobs'}</span>
                                   </span>
                                 )}
+                                {persona.hasGitHubToken && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-slate-300" title={`GitHub authenticated: ${persona.gitHubTokenPreview || 'active'}${persona.gitAuthorEmail ? ` (${persona.gitAuthorEmail})` : ''}`}>
+                                    <GitBranch className="w-2.5 h-2.5 text-slate-300" />
+                                    <span>GitHub</span>
+                                  </span>
+                                )}
                               </div>
                             </div>
                           </div>
@@ -3618,7 +3645,7 @@ export default function App() {
                       onCancelQueuedTurns={(personaId) => handleCancelQueuedJobTurns(personaId, activeJ.id)}
                       onAnswerQuestion={handleJobQuestionAnswer}
                       onUpdateJob={handleUpdateJob}
-                      onDeleteJob={() => handleDeleteJob(activeJ.id, activeProj.id)}
+                      onDeleteJob={() => handleDeleteJob(activeJ.id)}
                       onEditProject={() => {
                         setEditingProject(activeProj);
                         setShowProjectModal(true);
@@ -5886,6 +5913,89 @@ export default function App() {
                     <p className="text-[10px] text-slate-500">
                       Limit how many jobs this persona can actively execute turns in simultaneously. Additional turns will queue until a slot frees up.
                     </p>
+                  </div>
+                </div>
+
+                {/* GitHub Credentials & Git Identity */}
+                <div className="pt-2 border-t border-slate-800 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                      <GitBranch className="w-3.5 h-3.5 text-slate-400" />
+                      <span>GitHub Credentials & Identity</span>
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      Isolated per persona for git pushes & CLI operations
+                    </span>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <label className="block text-[11px] text-slate-400">
+                        GitHub Personal Access Token (PAT)
+                      </label>
+                      {editingPersona?.hasGitHubToken && !clearPersonaGitHubToken && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 px-1.5 py-0.5 rounded">
+                            Active: {editingPersona.gitHubTokenPreview || 'Configured'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setClearPersonaGitHubToken(true)}
+                            className="text-[10px] text-rose-400 hover:text-rose-300 underline cursor-pointer"
+                          >
+                            Remove Token
+                          </button>
+                        </div>
+                      )}
+                      {clearPersonaGitHubToken && (
+                        <div className="flex items-center gap-1 text-[10px] text-rose-400">
+                          <span>Will be removed on save</span>
+                          <button
+                            type="button"
+                            onClick={() => setClearPersonaGitHubToken(false)}
+                            className="text-sky-400 hover:text-sky-300 underline ml-1 cursor-pointer"
+                          >
+                            Undo
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    <input
+                      type="password"
+                      placeholder={editingPersona?.hasGitHubToken && !clearPersonaGitHubToken ? 'Leave empty to keep existing token (or enter new token to update)' : 'ghp_... or github_pat_...'}
+                      value={personaGitHubToken}
+                      onChange={(e) => {
+                        setPersonaGitHubToken(e.target.value);
+                        if (clearPersonaGitHubToken) setClearPersonaGitHubToken(false);
+                      }}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white font-mono text-xs focus:outline-none focus:border-sky-500"
+                    />
+                    <p className="text-[10px] text-slate-500">
+                      Fine-grained or classic token with repository contents/pull requests permissions. Stored encrypted at rest.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div className="space-y-1">
+                      <label className="block text-[11px] text-slate-400">Git Author Name (Optional)</label>
+                      <input
+                        type="text"
+                        placeholder={personaNameInput || 'Defaults to persona name'}
+                        value={personaGitAuthorName}
+                        onChange={(e) => setPersonaGitAuthorName(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white text-xs focus:outline-none focus:border-sky-500"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-[11px] text-slate-400">Git Author Email (Optional)</label>
+                      <input
+                        type="email"
+                        placeholder={`${(personaIdInput || 'persona').toLowerCase()}-bot@agentmesh.local`}
+                        value={personaGitAuthorEmail}
+                        onChange={(e) => setPersonaGitAuthorEmail(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white text-xs font-mono focus:outline-none focus:border-sky-500"
+                      />
+                    </div>
                   </div>
                 </div>
               </div>

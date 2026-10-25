@@ -550,7 +550,9 @@ public class AgentRunnerInstance : IAsyncDisposable
                     ev.PersonaId ?? _preset.Id,
                     ev.PersonaName ?? _preset.Name,
                     ev.Prompt,
-                    msg => _onLog(_preset.Id, $"[git] {msg}"));
+                    msg => _onLog(_preset.Id, $"[git] {msg}"),
+                    customAuthorName: ev.GitAuthorName,
+                    customAuthorEmail: ev.GitAuthorEmail);
             }
 
             var convId = AgyAdapter.GetSessionConversationId(ev.SessionId);

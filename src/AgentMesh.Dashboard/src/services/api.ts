@@ -142,6 +142,9 @@ export const api = {
     defaultContextSize?: string;
     maxConcurrentJobs?: number;
     trustTier?: number;
+    gitHubToken?: string;
+    gitAuthorName?: string;
+    gitAuthorEmail?: string;
   }): Promise<Persona> {
     const res = await apiFetch('/api/personas', {
       method: 'POST',
@@ -166,6 +169,9 @@ export const api = {
       defaultContextSize?: string;
       maxConcurrentJobs?: number;
       trustTier?: number;
+      gitHubToken?: string;
+      gitAuthorName?: string;
+      gitAuthorEmail?: string;
     }
   ): Promise<Persona> {
     const res = await apiFetch(`/api/personas/${encodeURIComponent(id)}`, {

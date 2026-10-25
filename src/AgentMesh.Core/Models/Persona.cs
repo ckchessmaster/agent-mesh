@@ -22,6 +22,10 @@ public class Persona
     public int? MaxConcurrentJobs { get; set; }
     public TrustTier TrustTier { get; set; } = TrustTier.Intern;
 
+    public string? GitHubTokenEncrypted { get; set; }
+    public string? GitAuthorName { get; set; }
+    public string? GitAuthorEmail { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 

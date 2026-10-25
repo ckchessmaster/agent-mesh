@@ -36,6 +36,19 @@ mkdir -p /workspace
 cd /workspace
 git config --global --add safe.directory '*' 2>/dev/null || true
 
+# Configure GitHub CLI and git identity if provided
+if [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_TOKEN" ]; then
+    gh auth setup-git 2>/dev/null || true
+fi
+
+if [ -n "$GIT_AUTHOR_NAME" ]; then
+    git config --global user.name "$GIT_AUTHOR_NAME" 2>/dev/null || true
+fi
+
+if [ -n "$GIT_AUTHOR_EMAIL" ]; then
+    git config --global user.email "$GIT_AUTHOR_EMAIL" 2>/dev/null || true
+fi
+
 echo "=========================================================="
 echo " AgentMesh Dedicated Persona Environment"
 echo " Persona:   ${AGENTMESH_PERSONA_ID:-<undefined>}"

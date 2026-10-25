@@ -257,8 +257,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "ANTHROPIC_API_KEY",
-            "GEMINI_API_KEY",
-            "GITHUB_TOKEN"
+            "GEMINI_API_KEY"
         };
 
         foreach (var v in forwardedVars)
@@ -268,6 +267,45 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             {
                 envList.Add($"{v}={val}");
             }
+        }
+
+        // Resolve per-persona GitHub credentials & Git identity with strict isolation
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+            var encService = scope.ServiceProvider.GetService<ICredentialEncryptionService>();
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+            if (persona != null)
+            {
+                if (!string.IsNullOrWhiteSpace(persona.GitHubTokenEncrypted) && encService != null)
+                {
+                    var token = encService.Decrypt(persona.GitHubTokenEncrypted);
+                    if (!string.IsNullOrWhiteSpace(token))
+                    {
+                        envList.Add($"GITHUB_TOKEN={token}");
+                        envList.Add($"GH_TOKEN={token}");
+                    }
+                }
+
+                var authorName = !string.IsNullOrWhiteSpace(persona.GitAuthorName) ? persona.GitAuthorName : persona.Name;
+                if (!string.IsNullOrWhiteSpace(authorName))
+                {
+                    envList.Add($"GIT_AUTHOR_NAME={authorName}");
+                    envList.Add($"GIT_COMMITTER_NAME={authorName}");
+                }
+
+                var authorEmail = !string.IsNullOrWhiteSpace(persona.GitAuthorEmail) ? persona.GitAuthorEmail : $"{normPersonaId}-bot@agentmesh.local";
+                if (!string.IsNullOrWhiteSpace(authorEmail))
+                {
+                    envList.Add($"GIT_AUTHOR_EMAIL={authorEmail}");
+                    envList.Add($"GIT_COMMITTER_EMAIL={authorEmail}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Failed to resolve persona credentials for container {PersonaId}: {Error}", normPersonaId, ex.Message);
         }
 
         if (_dockerClient != null)
@@ -498,10 +536,55 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     _logger.LogInformation("Seeded Google AI Pro credentials into container {Name}", containerName);
                 }
             }
+
+            await SeedPersonaGitHubCredentialsAsync(containerName, personaNormId, ct);
         }
         catch (Exception ex)
         {
             _logger.LogWarning("Could not seed host credentials into container {Name}: {Error}", containerName, ex.Message);
+        }
+    }
+
+    private async Task SeedPersonaGitHubCredentialsAsync(string containerName, string normPersonaId, CancellationToken ct)
+    {
+        if (_detectedCli == null) return;
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+            var encService = scope.ServiceProvider.GetService<ICredentialEncryptionService>();
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+            if (persona == null) return;
+
+            string? token = null;
+            if (!string.IsNullOrWhiteSpace(persona.GitHubTokenEncrypted) && encService != null)
+            {
+                token = encService.Decrypt(persona.GitHubTokenEncrypted);
+            }
+
+            var authorName = !string.IsNullOrWhiteSpace(persona.GitAuthorName) ? persona.GitAuthorName : persona.Name;
+            var authorEmail = !string.IsNullOrWhiteSpace(persona.GitAuthorEmail) ? persona.GitAuthorEmail : $"{normPersonaId}-bot@agentmesh.local";
+
+            if (!string.IsNullOrWhiteSpace(token))
+            {
+                var escapedToken = token.Trim().Replace("\"", "\\\"").Replace("$", "\\$");
+                var escapedName = authorName.Trim().Replace("\"", "\\\"");
+                var escapedEmail = authorEmail.Trim().Replace("\"", "\\\"");
+
+                var setupCmd = $"mkdir -p /root/.config/gh && printf 'github.com:\\n  oauth_token: %s\\n  git_protocol: https\\n' \"{escapedToken}\" > /root/.config/gh/hosts.yml && chmod 600 /root/.config/gh/hosts.yml && git config --global user.name \"{escapedName}\" && git config --global user.email \"{escapedEmail}\" && (gh auth setup-git 2>/dev/null || true)";
+                await ExecInContainerAsync(normPersonaId, setupCmd, ct);
+                _logger.LogInformation("Seeded GitHub credentials and git config into container {Name} for @{PersonaId}", containerName, normPersonaId);
+            }
+            else
+            {
+                // Strict isolation: ensure no stale credentials exist
+                var clearCmd = "rm -f /root/.config/gh/hosts.yml && (git config --global --unset-all credential.helper 2>/dev/null || true)";
+                await ExecInContainerAsync(normPersonaId, clearCmd, ct);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not seed GitHub credentials into container {Name}: {Error}", containerName, ex.Message);
         }
     }
 
