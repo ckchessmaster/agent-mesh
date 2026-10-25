@@ -2801,15 +2801,13 @@ public class SessionsController(
             var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
             if (job == null) return;
 
-            var payload = questionMessage.StructuredPayloadJson ?? questionMessage.ToolArgsJson;
+            var payload = questionMessage.ToolArgsJson ?? questionMessage.StructuredPayloadJson;
             var alreadyPosted = await db.JobMessages.AnyAsync(m => m.JobId == jobId && m.TurnSessionId == session.Id && m.StructuredPayloadJson == payload);
             if (alreadyPosted) return;
 
             var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
 
-            var content = !string.IsNullOrWhiteSpace(questionMessage.Content) && questionMessage.Content != "Asking question"
-                ? questionMessage.Content
-                : "I have a question and need your input before proceeding:";
+            var (content, normalizedPayload) = ProcessJobTurnQuestionPayload(payload, questionMessage.Content);
 
             var jobMsg = new JobMessage
             {
@@ -2821,7 +2819,7 @@ public class SessionsController(
                 Content = content,
                 MentionsJson = "[]",
                 TurnSessionId = session.Id,
-                StructuredPayloadJson = payload,
+                StructuredPayloadJson = normalizedPayload,
                 CreatedAt = DateTimeOffset.UtcNow
             };
 
@@ -2843,8 +2841,120 @@ public class SessionsController(
             );
 
             await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
+            await hubContext.Clients.All.SendAsync("JobMessageCreated", msgDto);
         }
         catch { }
+    }
+
+    private static (string formattedContent, string normalizedPayload) ProcessJobTurnQuestionPayload(
+        string? rawPayload,
+        string? existingContent)
+    {
+        if (string.IsNullOrWhiteSpace(rawPayload))
+        {
+            return (
+                !string.IsNullOrWhiteSpace(existingContent) && existingContent != "Asking question"
+                    ? existingContent
+                    : "I have a question and need your input before proceeding:",
+                rawPayload ?? "{}"
+            );
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(rawPayload);
+            var root = doc.RootElement;
+            JsonElement questionsElem = default;
+
+            if (root.ValueKind == JsonValueKind.Object &&
+                (root.TryGetProperty("questions", out questionsElem) || root.TryGetProperty("Questions", out questionsElem)))
+            {
+                if (questionsElem.ValueKind == JsonValueKind.String)
+                {
+                    try
+                    {
+                        var innerDoc = JsonDocument.Parse(questionsElem.GetString()!);
+                        questionsElem = innerDoc.RootElement.Clone();
+                    }
+                    catch { }
+                }
+            }
+            else if (root.ValueKind == JsonValueKind.Array)
+            {
+                questionsElem = root;
+            }
+
+            var qList = new List<string>();
+            if (questionsElem.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var q in questionsElem.EnumerateArray())
+                {
+                    if (q.ValueKind == JsonValueKind.Object &&
+                        (q.TryGetProperty("question", out var qProp) || q.TryGetProperty("Question", out qProp)))
+                    {
+                        var qText = qProp.GetString()?.Trim();
+                        if (!string.IsNullOrWhiteSpace(qText))
+                        {
+                            var optionsText = new List<string>();
+                            if ((q.TryGetProperty("options", out var opts) || q.TryGetProperty("Options", out opts)) &&
+                                opts.ValueKind == JsonValueKind.Array)
+                            {
+                                foreach (var opt in opts.EnumerateArray())
+                                {
+                                    if (opt.ValueKind == JsonValueKind.String)
+                                    {
+                                        optionsText.Add(opt.GetString()!);
+                                    }
+                                    else if (opt.ValueKind == JsonValueKind.Object)
+                                    {
+                                        var optLabel = opt.TryGetProperty("label", out var l) ? l.GetString() :
+                                            opt.TryGetProperty("text", out var t) ? t.GetString() :
+                                            opt.TryGetProperty("value", out var v) ? v.GetString() : null;
+                                        if (!string.IsNullOrWhiteSpace(optLabel)) optionsText.Add(optLabel);
+                                    }
+                                }
+                            }
+
+                            if (optionsText.Count > 0)
+                            {
+                                qList.Add($"**{qText}**\n" + string.Join("\n", optionsText.Select(o => $"• {o}")));
+                            }
+                            else
+                            {
+                                qList.Add($"**{qText}**");
+                            }
+                        }
+                    }
+                }
+            }
+            else if (root.ValueKind == JsonValueKind.Object &&
+                     (root.TryGetProperty("question", out var singleQ) || root.TryGetProperty("Question", out singleQ)))
+            {
+                var qText = singleQ.GetString()?.Trim();
+                if (!string.IsNullOrWhiteSpace(qText)) qList.Add($"**{qText}**");
+            }
+
+            var formattedContent = !string.IsNullOrWhiteSpace(existingContent) && existingContent != "Asking question"
+                ? existingContent
+                : "I have a question and need your input before proceeding:";
+
+            if (qList.Count > 0)
+            {
+                formattedContent = $"I have a question and need your input before proceeding:\n\n" +
+                                   string.Join("\n\n", qList.Select((q, idx) => $"{idx + 1}. {q}"));
+            }
+
+            return (formattedContent, rawPayload);
+        }
+        catch
+        {
+            return (
+                !string.IsNullOrWhiteSpace(existingContent) && existingContent != "Asking question"
+                    ? existingContent
+                    : "I have a question and need your input before proceeding:",
+                rawPayload
+            );
+        }
     }
 }
 

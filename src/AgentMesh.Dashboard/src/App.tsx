@@ -315,6 +315,10 @@ export default function App() {
   // Driver runtime configuration modal (limits live in the capabilities blob)
   const [configAgent, setConfigAgent] = useState<Agent | null>(null);
   const [isSavingDriverConfig, setIsSavingDriverConfig] = useState(false);
+  const [confirmDeleteAgentId, setConfirmDeleteAgentId] = useState<string | null>(null);
+
+  // Clear mesh data confirmation state
+  const [showConfirmResetMesh, setShowConfirmResetMesh] = useState(false);
 
   // Active session inline control edit popover state
   const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | 'contextSize' | null>(null);
@@ -829,24 +833,68 @@ export default function App() {
     });
   };
 
+  const handleUpdateJob = async (updates: {
+    title?: string;
+    description?: string;
+    gitBranchName?: string;
+    priority?: number;
+    status?: ProjectJobStatus;
+    resultSummary?: string;
+  }) => {
+    if (!selectedJobId) return;
+    const updated = await api.updateProjectJob(selectedJobId, updates);
+    setJobsByProject((prev) => ({
+      ...prev,
+      [updated.projectId]: (prev[updated.projectId] || []).map((j) => (j.id === updated.id ? updated : j))
+    }));
+  };
+
+  const handleDeleteAgent = async (agentId: string) => {
+    setIsActionPending(true);
+    try {
+      await api.deleteAgent(agentId);
+      setAgents((prev) => prev.filter((a) => a.id !== agentId));
+      if (selectedAgentId === agentId) setSelectedAgentId(null);
+      setConfirmDeleteAgentId(null);
+      if (configAgent?.id === agentId) setConfigAgent(null);
+    } catch (err: any) {
+      setApiError(err?.message || 'Failed to delete driver');
+    } finally {
+      setIsActionPending(false);
+    }
+  };
+
   const handleJobQuestionAnswer = async (
     sessionIdOrTargetId: string,
     payload: { toolCallId: string; answers: QuestionAnswerPayload[]; answerSummary: string }
   ) => {
-    const matchingSession = sessions.find((s) => s.id === sessionIdOrTargetId);
-    if (matchingSession) {
-      await api.submitQuestionAnswer(matchingSession.id, {
+    let answered = false;
+    try {
+      await api.submitQuestionAnswer(sessionIdOrTargetId, {
         toolCallId: payload.toolCallId,
         answers: payload.answers
       });
-    } else {
-      if (selectedJobId) {
-        await api.postJobMessage(selectedJobId, {
-          content: `User answered question:\n${payload.answerSummary}\nPlease proceed with this answer.`,
-          senderType: 'user'
-        });
+      answered = true;
+    } catch {
+      const matchingSession = sessions.find((s) => s.id === sessionIdOrTargetId);
+      if (matchingSession) {
+        try {
+          await api.submitQuestionAnswer(matchingSession.id, {
+            toolCallId: payload.toolCallId,
+            answers: payload.answers
+          });
+          answered = true;
+        } catch {}
       }
     }
+
+    if (!answered && selectedJobId) {
+      await api.postJobMessage(selectedJobId, {
+        content: `User answered question:\n${payload.answerSummary}\nPlease proceed with this answer.`,
+        senderType: 'user'
+      });
+    }
+
     if (selectedJobId) {
       const msgs = await api.getJobMessages(selectedJobId);
       setJobMessages(msgs);
@@ -1266,11 +1314,13 @@ export default function App() {
     connection.on('ArtifactUpdated', handleArtifactUpdated);
     connection.on('AgentRegistered', handleSessionUpdated);
     connection.on('AgentUpdated', handleSessionUpdated);
+    connection.on('AgentDeleted', handleSessionUpdated);
     connection.on('PersonaCreated', handleSessionUpdated);
     connection.on('PersonaUpdated', handleSessionUpdated);
     connection.on('PersonaDeleted', handleSessionUpdated);
     connection.on('MeshReset', handleMeshReset);
     connection.on('JobMessageAdded', handleJobMessageAdded);
+    connection.on('JobMessageCreated', handleJobMessageAdded);
     connection.on('JobTaskUpdated', handleJobTaskUpdated);
     connection.on('JobCreated', handleJobCreated);
     connection.on('JobUpdated', handleJobUpdated);
@@ -1289,11 +1339,13 @@ export default function App() {
       connection.off('ArtifactUpdated', handleArtifactUpdated);
       connection.off('AgentRegistered', handleSessionUpdated);
       connection.off('AgentUpdated', handleSessionUpdated);
+      connection.off('AgentDeleted', handleSessionUpdated);
       connection.off('PersonaCreated', handleSessionUpdated);
       connection.off('PersonaUpdated', handleSessionUpdated);
       connection.off('PersonaDeleted', handleSessionUpdated);
       connection.off('MeshReset', handleMeshReset);
       connection.off('JobMessageAdded', handleJobMessageAdded);
+      connection.off('JobMessageCreated', handleJobMessageAdded);
       connection.off('JobTaskUpdated', handleJobTaskUpdated);
       connection.off('JobCreated', handleJobCreated);
       connection.off('JobUpdated', handleJobUpdated);
@@ -2620,22 +2672,6 @@ export default function App() {
 
         {/* Developer Controls & Auth */}
         <div className="flex items-center gap-2 shrink-0">
-          {!isMobile && (
-            <>
-              <button
-                onClick={handleResetMesh}
-                disabled={isActionPending}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 transition disabled:opacity-50 cursor-pointer"
-                title="Purge all agents, sessions, and events from PostgreSQL"
-              >
-                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                <span>Clear Mesh Data</span>
-              </button>
-
-              <div className="h-5 w-px bg-slate-800 mx-1" />
-            </>
-          )}
-
           <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs">
             <User className="w-3.5 h-3.5 text-sky-400 shrink-0" />
             <span className="font-mono text-slate-300 max-w-[90px] sm:max-w-[140px] truncate">{userEmail}</span>
@@ -3330,6 +3366,19 @@ export default function App() {
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
+                                setConfirmDeleteAgentId((cur) => cur === agent.id ? null : agent.id);
+                              }}
+                              className="p-1 rounded-md bg-slate-800 hover:bg-rose-950/60 text-slate-300 hover:text-rose-400 border border-transparent hover:border-rose-500/30 transition cursor-pointer"
+                              title={`Delete driver ${agent.name}`}
+                              aria-label={`Delete ${agent.name} driver`}
+                              data-testid={`delete-driver-btn-${agent.id}`}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
                                 setSelectedAgentId(agent.id);
                                 setIsCreatingSession(true);
                                 setIsMobileDetailView(true);
@@ -3341,6 +3390,35 @@ export default function App() {
                             </button>
                           </div>
                         </div>
+
+                        {/* Delete Driver Confirmation Inline Panel */}
+                        {confirmDeleteAgentId === agent.id && (
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            className="mx-3 mb-2 p-2 bg-rose-950/80 border border-rose-500/40 rounded-lg flex items-center justify-between text-xs text-rose-200"
+                            data-testid={`confirm-delete-driver-panel-${agent.id}`}
+                          >
+                            <span className="text-[11px] font-medium">Delete driver @{agent.id}?</span>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteAgentId(null)}
+                                className="px-2 py-0.5 text-[11px] text-slate-300 hover:text-white"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteAgent(agent.id)}
+                                disabled={isActionPending}
+                                className="px-2.5 py-0.5 text-[11px] bg-rose-600 hover:bg-rose-500 text-white font-bold rounded cursor-pointer"
+                                data-testid={`confirm-delete-driver-btn-${agent.id}`}
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        )}
 
                         {/* Driver's Sessions (across all associated Personas) */}
                         <div className="px-2 pb-2 space-y-1">
@@ -3450,16 +3528,52 @@ export default function App() {
                   <p className="text-[11px] text-slate-400 leading-relaxed">
                     Purge all agents, sessions, and events from PostgreSQL and reset the mesh state.
                   </p>
-                  <button
-                    type="button"
-                    onClick={handleResetMesh}
-                    disabled={isActionPending}
-                    className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 text-xs font-semibold flex items-center justify-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
-                    data-testid="danger-zone-clear-mesh-btn"
-                  >
-                    <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                    <span>Clear Mesh Data</span>
-                  </button>
+                  {!showConfirmResetMesh ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowConfirmResetMesh(true)}
+                      disabled={isActionPending}
+                      className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 text-xs font-semibold flex items-center justify-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
+                      data-testid="danger-zone-clear-mesh-btn"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                      <span>Clear Mesh Data</span>
+                    </button>
+                  ) : (
+                    <div
+                      className="p-3 rounded-xl bg-rose-950/80 border border-rose-500/40 text-xs text-rose-200 space-y-2.5"
+                      data-testid="danger-zone-confirm-reset-panel"
+                    >
+                      <div className="font-semibold text-rose-100 flex items-center gap-1.5">
+                        <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                        <span>Confirm Mesh Reset</span>
+                      </div>
+                      <p className="text-[11px] text-rose-200/90 leading-relaxed">
+                        Are you sure? This will permanently delete all mesh agents, personas, jobs, sessions, and events from PostgreSQL.
+                      </p>
+                      <div className="flex items-center justify-end gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => setShowConfirmResetMesh(false)}
+                          className="px-2.5 py-1 text-xs text-slate-300 hover:text-white"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setShowConfirmResetMesh(false);
+                            await handleResetMesh();
+                          }}
+                          disabled={isActionPending}
+                          className="px-3 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs shadow-sm transition cursor-pointer"
+                          data-testid="danger-zone-confirm-reset-btn"
+                        >
+                          Yes, Clear All
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </>
@@ -3503,6 +3617,8 @@ export default function App() {
                       onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}
                       onCancelQueuedTurns={(personaId) => handleCancelQueuedJobTurns(personaId, activeJ.id)}
                       onAnswerQuestion={handleJobQuestionAnswer}
+                      onUpdateJob={handleUpdateJob}
+                      onDeleteJob={() => handleDeleteJob(activeJ.id, activeProj.id)}
                       onEditProject={() => {
                         setEditingProject(activeProj);
                         setShowProjectModal(true);
@@ -5878,6 +5994,7 @@ export default function App() {
           saving={isSavingDriverConfig}
           onClose={() => setConfigAgent(null)}
           onSave={(patch) => handleSaveDriverConfig(configAgent.id, patch)}
+          onDelete={() => handleDeleteAgent(configAgent.id)}
         />
       )}
 

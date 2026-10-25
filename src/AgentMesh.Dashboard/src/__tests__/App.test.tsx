@@ -270,7 +270,7 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     });
   });
 
-  it('triggers resetMesh from Clear Mesh Data header button', async () => {
+  it('triggers resetMesh from sidebar Danger Zone with confirmation', async () => {
     vi.mocked(api.resetMesh).mockResolvedValue({
       status: 'reset',
       message: 'Purged'
@@ -278,11 +278,15 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
 
     render(<App />);
 
-    await waitFor(() => {
-      expect(screen.getByText('Clear Mesh Data')).toBeInTheDocument();
-    });
+    const driversTabBtn = await screen.findByRole('button', { name: /Drivers & Infrastructure/i });
+    fireEvent.click(driversTabBtn);
 
-    fireEvent.click(screen.getByText('Clear Mesh Data'));
+    const clearMeshBtn = await screen.findByTestId('danger-zone-clear-mesh-btn');
+    fireEvent.click(clearMeshBtn);
+
+    const confirmBtn = await screen.findByTestId('danger-zone-confirm-reset-btn');
+    fireEvent.click(confirmBtn);
+
     await waitFor(() => {
       expect(api.resetMesh).toHaveBeenCalledTimes(1);
     });

@@ -31,13 +31,53 @@ import {
   Clock,
   MessageSquareQuote,
   Play,
-  HelpCircle
+  HelpCircle,
+  Sliders
 } from 'lucide-react';
 import type { AgentSession, AskQuestionItem, JobMessage, JobTask, Persona, Project, ProjectJob, QuestionAnswerPayload, SessionAttachment } from '../types';
 import { ProjectJobStatus } from '../types';
 import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
 import { MarkdownMessage } from './MarkdownMessage';
 import { QuestionCard, parseTextQuestions } from './QuestionCard';
+import { JobSettingsModal } from './JobSettingsModal';
+
+export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem[] {
+  if (msg.senderType === 'user') return [];
+
+  if (msg.structuredPayloadJson) {
+    try {
+      let p = JSON.parse(msg.structuredPayloadJson);
+      if (typeof p === 'string') {
+        try { p = JSON.parse(p); } catch {}
+      }
+      if (p) {
+        if (Array.isArray(p.questions)) return p.questions as AskQuestionItem[];
+        if (Array.isArray(p.Questions)) return p.Questions as AskQuestionItem[];
+        if (typeof p.questions === 'string') {
+          try {
+            const inner = JSON.parse(p.questions);
+            if (Array.isArray(inner)) return inner;
+          } catch {}
+        }
+        if (p.question) {
+          return [{
+            question: p.question,
+            options: Array.isArray(p.options) ? p.options : [],
+            is_multi_select: !!p.is_multi_select
+          }];
+        }
+        if (Array.isArray(p) && p.length > 0 && (p[0].question || p[0].Question)) {
+          return p as AskQuestionItem[];
+        }
+        if (p.toolArgs && typeof p.toolArgs === 'object') {
+          if (Array.isArray(p.toolArgs.questions)) return p.toolArgs.questions;
+        }
+      }
+    } catch {}
+  }
+
+  return parseTextQuestions(msg.content);
+}
 import { api } from '../services/api';
 
 const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
@@ -190,6 +230,15 @@ interface JobCockpitProps {
   onOpenLightbox?: (item: { url: string; fileName: string; sizeBytes?: number }) => void;
   onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
   onEditProject?: () => void;
+  onUpdateJob?: (updates: {
+    title?: string;
+    description?: string;
+    gitBranchName?: string;
+    priority?: number;
+    status?: ProjectJobStatus;
+    resultSummary?: string;
+  }) => Promise<void>;
+  onDeleteJob?: () => Promise<void>;
   onStopTurn?: (sessionId: string) => Promise<void>;
   onCancelQueuedTurn?: (turnId: string) => Promise<void> | void;
   onCancelQueuedTurns?: (personaId: string) => Promise<void> | void;
@@ -220,6 +269,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onOpenLightbox,
   onUploadAttachments,
   onEditProject,
+  onUpdateJob,
+  onDeleteJob,
   onStopTurn,
   onCancelQueuedTurn,
   onCancelQueuedTurns,
@@ -229,6 +280,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskRequiresDiscussion, setNewTaskRequiresDiscussion] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [showJobSettingsModal, setShowJobSettingsModal] = useState(false);
   const [isAddingTask, setIsAddingTask] = useState(false);
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
@@ -335,16 +387,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         // Any question asked before this user message has already been replied to / superseded
         break;
       }
-      let qs: AskQuestionItem[] = [];
-      if (m.structuredPayloadJson) {
-        try {
-          const p = JSON.parse(m.structuredPayloadJson);
-          if (Array.isArray(p.questions) && p.questions.length > 0) qs = p.questions;
-        } catch {}
-      }
-      if (qs.length === 0) {
-        qs = parseTextQuestions(m.content);
-      }
+      const qs = extractQuestionsFromJobMessage(m);
       if (qs.length > 0) {
         const isAns = answeredQuestionIds.includes(m.id);
         if (!isAns) {
@@ -1097,6 +1140,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             )}
           </div>
 
+          {onUpdateJob && (
+            <button
+              type="button"
+              onClick={() => setShowJobSettingsModal(true)}
+              title="Edit Job Settings (Title, Priority, Status, Branch)"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border border-slate-800 bg-slate-950/80 text-slate-400 hover:text-sky-300 hover:border-slate-700 text-xs font-semibold transition cursor-pointer"
+              data-testid="cockpit-edit-job-btn"
+            >
+              <Sliders className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Settings</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => setShowTeamSidebar((prev) => !prev)}
@@ -1795,16 +1851,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                             )}
 
                             {(() => {
-                              const msgQuestions = (() => {
-                                if (isUser) return [];
-                                if (msg.structuredPayloadJson) {
-                                  try {
-                                    const p = JSON.parse(msg.structuredPayloadJson);
-                                    if (Array.isArray(p.questions) && p.questions.length > 0) return p.questions as AskQuestionItem[];
-                                  } catch {}
-                                }
-                                return parseTextQuestions(msg.content);
-                              })();
+                              const msgQuestions = isUser ? [] : extractQuestionsFromJobMessage(msg);
 
                               if (msgQuestions.length === 0) return null;
 
@@ -2554,6 +2601,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {showJobSettingsModal && (
+        <JobSettingsModal
+          isOpen={showJobSettingsModal}
+          onClose={() => setShowJobSettingsModal(false)}
+          project={project}
+          job={job}
+          onSave={async (updates) => {
+            if (onUpdateJob) await onUpdateJob(updates);
+          }}
+          onDelete={onDeleteJob}
+        />
       )}
     </div>
   );

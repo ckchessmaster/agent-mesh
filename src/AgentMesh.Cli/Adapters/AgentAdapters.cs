@@ -552,7 +552,44 @@ public class AgyAdapter : IAgentAdapter
         return max;
     }
 
-    public static TrajectoryEventPayload? CheckForAskQuestionToolCall(string transcriptPath, ref int lastProcessedStep)
+    public record AskQuestionDetection(TrajectoryEventPayload ToolCallEvent, string? PriorResponseContent)
+    {
+        public string EventType => ToolCallEvent.EventType;
+        public string? ToolName => ToolCallEvent.ToolName;
+        public string? Content => ToolCallEvent.Content;
+        public string? ToolArgsJson => ToolCallEvent.ToolArgsJson;
+    }
+
+    private static string? TryReadStepContentFromFullTranscript(string fullPath, int targetStepIndex)
+    {
+        if (!File.Exists(fullPath)) return null;
+        try
+        {
+            using var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(fs);
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    if (doc.RootElement.TryGetProperty("step_index", out var sProp) && sProp.GetInt32() == targetStepIndex)
+                    {
+                        if (doc.RootElement.TryGetProperty("content", out var cProp) && cProp.ValueKind == JsonValueKind.String)
+                        {
+                            return cProp.GetString();
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    public static AskQuestionDetection? CheckForAskQuestionToolCall(string transcriptPath, ref int lastProcessedStep)
     {
         if (!File.Exists(transcriptPath)) return null;
 
@@ -600,13 +637,40 @@ public class AgyAdapter : IAgentAdapter
                                                 }
                                             }
                                         }
-                                        return new TrajectoryEventPayload
+
+                                        string? priorContent = null;
+                                        if (root.TryGetProperty("content", out var cProp) && cProp.ValueKind == JsonValueKind.String)
                                         {
-                                            EventType = "tool_call",
-                                            ToolName = "ask_question",
-                                            Content = summary,
-                                            ToolArgsJson = argsJson
-                                        };
+                                            priorContent = cProp.GetString();
+                                        }
+
+                                        if (root.TryGetProperty("truncated_fields", out var tfProp) && tfProp.ValueKind == JsonValueKind.Array)
+                                        {
+                                            foreach (var tf in tfProp.EnumerateArray())
+                                            {
+                                                if (tf.GetString() == "content")
+                                                {
+                                                    var fullPath = transcriptPath.Replace("transcript.jsonl", "transcript_full.jsonl");
+                                                    var fullContent = TryReadStepContentFromFullTranscript(fullPath, stepIdx);
+                                                    if (!string.IsNullOrWhiteSpace(fullContent))
+                                                    {
+                                                        priorContent = fullContent;
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        return new AskQuestionDetection(
+                                            new TrajectoryEventPayload
+                                            {
+                                                EventType = "tool_call",
+                                                ToolName = "ask_question",
+                                                Content = summary,
+                                                ToolArgsJson = argsJson
+                                            },
+                                            priorContent
+                                        );
                                     }
                                 }
                             }
@@ -800,7 +864,20 @@ public class AgyAdapter : IAgentAdapter
                             var askQ = CheckForAskQuestionToolCall(transcriptFile, ref lastTranscriptStep);
                             if (askQ != null)
                             {
-                                await onEvent(askQ);
+                                var priorText = askQ.PriorResponseContent;
+                                if (string.IsNullOrWhiteSpace(priorText) && streamedResponseBuilder.Length > 0)
+                                {
+                                    priorText = streamedResponseBuilder.ToString().Trim();
+                                }
+                                if (!string.IsNullOrWhiteSpace(priorText))
+                                {
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "response",
+                                        Content = priorText
+                                    });
+                                }
+                                await onEvent(askQ.ToolCallEvent);
                                 AgentAdapterFactory.KillProcessTree(proc);
                                 return;
                             }
@@ -970,7 +1047,20 @@ public class AgyAdapter : IAgentAdapter
                 var askQ = CheckForAskQuestionToolCall(transcriptFile, ref lastTranscriptStep);
                 if (askQ != null)
                 {
-                    await onEvent(askQ);
+                    var priorText = askQ.PriorResponseContent;
+                    if (string.IsNullOrWhiteSpace(priorText) && streamedResponseBuilder.Length > 0)
+                    {
+                        priorText = streamedResponseBuilder.ToString().Trim();
+                    }
+                    if (!string.IsNullOrWhiteSpace(priorText))
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = priorText
+                        });
+                    }
+                    await onEvent(askQ.ToolCallEvent);
                     AgentAdapterFactory.KillProcessTree(proc);
                     return;
                 }

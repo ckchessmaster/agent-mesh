@@ -36,6 +36,17 @@ public class AgentMeshHub(AgentMeshDbContext? db = null) : Hub
         ConnectionPersonas.Clear();
     }
 
+    public static void UnregisterAgent(string agentId)
+    {
+        if (string.IsNullOrWhiteSpace(agentId)) return;
+        var normalized = agentId.Trim().ToLowerInvariant();
+        var keysToRemove = ConnectionAgents.Where(kvp => kvp.Value == normalized).Select(kvp => kvp.Key).ToList();
+        foreach (var key in keysToRemove)
+        {
+            ConnectionAgents.TryRemove(key, out _);
+        }
+    }
+
     public async Task JoinSession(string sessionId)
     {
         await Groups.AddToGroupAsync(Context.ConnectionId, $"session-{sessionId}");

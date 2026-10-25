@@ -255,7 +255,7 @@ public class AgentMeshCliTests
         {
             var line1 = "{\"step_index\": 0, \"type\": \"USER_INPUT\"}";
             var line2 = """
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "ask_question", "args": {"questions": "[{\"question\":\"Which db?\",\"options\":[\"Postgres\",\"SQLite\"],\"is_multi_select\":false}]", "toolSummary": "Database choice"}}]}
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Here is an explanation of the differences between Kernel TUN and Userspace Proxy.", "tool_calls": [{"name": "ask_question", "args": {"questions": "[{\"question\":\"Which db?\",\"options\":[\"Postgres\",\"SQLite\"],\"is_multi_select\":false}]", "toolSummary": "Database choice"}}]}
             """;
             File.WriteAllLines(tempFile, new[] { line1, line2 });
 
@@ -267,6 +267,7 @@ public class AgentMeshCliTests
             payload.ToolName.Should().Be("ask_question");
             payload.Content.Should().Be("Database choice");
             payload.ToolArgsJson.Should().Contain("Which db?");
+            payload.PriorResponseContent.Should().Be("Here is an explanation of the differences between Kernel TUN and Userspace Proxy.");
             lastStep.Should().Be(1);
 
             // Re-checking should not re-detect the same step

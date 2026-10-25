@@ -276,6 +276,49 @@ public class AgentsController(
         return Ok(DriverCapabilities.Parse(agent.CapabilitiesJson));
     }
 
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> DeleteAgent(string id)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Agent '{id}' not found." });
+        }
+
+        var boundPersonas = await db.Personas.Where(p => p.DriverId == normalizedId).ToListAsync();
+        if (boundPersonas.Count > 0)
+        {
+            var names = string.Join(", ", boundPersonas.Select(p => $"@{p.Id} ({p.Name})"));
+            return BadRequest(new { error = $"Cannot delete driver '{normalizedId}' because it is assigned to {boundPersonas.Count} persona(s): {names}. Reassign those personas to another driver first." });
+        }
+
+        var agentJobs = await db.AgentJobs.Where(j => j.RequestedByAgentId == normalizedId).ToListAsync();
+        if (agentJobs.Count > 0)
+        {
+            db.AgentJobs.RemoveRange(agentJobs);
+        }
+
+        var sessions = await db.AgentSessions.Where(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId).ToListAsync();
+        foreach (var session in sessions)
+        {
+            if (session.DriverId == normalizedId) session.DriverId = null;
+            if (session.CreatorAgentId == normalizedId) session.CreatorAgentId = null;
+        }
+
+        db.Agents.Remove(agent);
+        await db.SaveChangesAsync();
+
+        AgentMeshHub.UnregisterAgent(normalizedId);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("AgentDeleted", new { id = normalizedId });
+        }
+
+        return NoContent();
+    }
+
     [HttpGet("{id}/personas")]
     [AllowAnonymous]
     public async Task<IActionResult> GetDriverPersonas(string id)

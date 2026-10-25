@@ -332,6 +332,21 @@ export const api = {
     return res.json();
   },
 
+  async deleteAgent(id: string): Promise<void> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const b = await res.json();
+        if (b?.error) errMsg = b.error;
+      } catch {}
+      throw new Error(errMsg);
+    }
+  },
+
   /**
    * Patch-style update. Send only changed fields — the server merges, so omitted fields keep
    * their stored values. An empty apiKey means "leave the stored key alone".
@@ -782,6 +797,7 @@ export const api = {
   async updateProjectJob(id: string, req: {
     title?: string;
     description?: string;
+    gitBranchName?: string;
     status?: number;
     resultSummary?: string;
     priority?: number;

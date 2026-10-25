@@ -235,6 +235,9 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     const clearMeshBtn = await screen.findByTestId('danger-zone-clear-mesh-btn');
     fireEvent.click(clearMeshBtn);
 
+    const confirmBtn = await screen.findByTestId('danger-zone-confirm-reset-btn');
+    fireEvent.click(confirmBtn);
+
     await waitFor(() => {
       expect(api.resetMesh).toHaveBeenCalled();
     });

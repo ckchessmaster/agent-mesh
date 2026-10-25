@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { X, Save, Info, KeyRound, AlertTriangle } from 'lucide-react';
+import { X, Save, Info, KeyRound, AlertTriangle, Trash2 } from 'lucide-react';
 import type { Agent, DriverConfig } from '../types';
 
 interface DriverConfigModalProps {
@@ -17,6 +17,7 @@ interface DriverConfigModalProps {
     retryDelayMilliseconds?: number;
     maxSteps?: number;
   }) => Promise<void>;
+  onDelete?: () => Promise<void>;
 }
 
 /**
@@ -48,9 +49,12 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   initialConfig,
   saving,
   onClose,
-  onSave
+  onSave,
+  onDelete
 }) => {
   const config = initialConfig ?? agent.config ?? {};
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   const isOpenAiDriver = useMemo(() => {
     if (config.adapter) return config.adapter.toLowerCase() === 'openai';
@@ -357,6 +361,56 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
             >
               <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
               <span>{error}</span>
+            </div>
+          )}
+
+          {onDelete && (
+            <div className="pt-3 border-t border-slate-800 flex items-center justify-between">
+              <div>
+                <span className="text-[11px] font-semibold text-rose-400 block">Danger Zone</span>
+                <span className="text-[10px] text-slate-500">Permanently delete this driver registration</span>
+              </div>
+              {!confirmDelete ? (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(true)}
+                  className="px-2.5 py-1 rounded bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 text-xs font-medium flex items-center gap-1 transition cursor-pointer"
+                  data-testid="driver-modal-delete-btn"
+                >
+                  <Trash2 className="w-3 h-3 text-rose-400" />
+                  <span>Delete Driver</span>
+                </button>
+              ) : (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-rose-300 font-medium">Are you sure?</span>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(false)}
+                    className="px-2 py-0.5 text-xs text-slate-400 hover:text-slate-200"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isDeleting}
+                    onClick={async () => {
+                      setIsDeleting(true);
+                      setError(null);
+                      try {
+                        await onDelete();
+                        onClose();
+                      } catch (err: any) {
+                        setError(err?.message || 'Failed to delete driver');
+                        setIsDeleting(false);
+                      }
+                    }}
+                    className="px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs transition cursor-pointer"
+                    data-testid="driver-modal-confirm-delete-btn"
+                  >
+                    {isDeleting ? 'Deleting...' : 'Confirm'}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

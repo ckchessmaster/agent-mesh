@@ -56,6 +56,7 @@ public record CreateProjectJobRequest(
 public record UpdateProjectJobRequest(
     string? Title = null,
     string? Description = null,
+    string? GitBranchName = null,
     ProjectJobStatus? Status = null,
     string? ResultSummary = null,
     ProjectJobPriority? Priority = null
@@ -267,6 +268,7 @@ public class ProjectJobsController(
 
         if (!string.IsNullOrWhiteSpace(req.Title)) job.Title = req.Title.Trim();
         if (req.Description != null) job.Description = req.Description.Trim();
+        if (!string.IsNullOrWhiteSpace(req.GitBranchName)) job.GitBranchName = req.GitBranchName.Trim();
         if (req.Status.HasValue) job.Status = req.Status.Value;
         if (req.Priority.HasValue) job.Priority = req.Priority.Value;
         if (req.ResultSummary != null) job.ResultSummary = req.ResultSummary.Trim();

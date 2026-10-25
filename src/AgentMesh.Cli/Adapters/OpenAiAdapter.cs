@@ -683,6 +683,14 @@ public class OpenAiAdapter : IAgentAdapter
                     {
                         askedQuestion = true;
                         responseEmitted = true;
+                        if (!string.IsNullOrWhiteSpace(finalContent))
+                        {
+                            await onEvent(new TrajectoryEventPayload
+                            {
+                                EventType = "response",
+                                Content = finalContent
+                            });
+                        }
                         await onEvent(new TrajectoryEventPayload
                         {
                             EventType = "tool_call",
