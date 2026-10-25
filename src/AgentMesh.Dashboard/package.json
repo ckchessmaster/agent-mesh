@@ -1,7 +1,7 @@
 {
   "name": "agentmesh-dashboard",
   "private": true,
-  "version": "0.2.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "start": "vite",
@@ -13,6 +13,8 @@
   },
   "dependencies": {
     "@microsoft/signalr": "^10.0.11",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "clsx": "^2.1.1",
     "lucide-react": "^1.55.0",
     "mermaid": "^12.2.0",

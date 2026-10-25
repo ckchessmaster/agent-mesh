@@ -8,6 +8,9 @@ import type {
   AssignJobTaskResult,
   Persona,
   PersonaEnvironmentStatus,
+  PersonaDriverVerificationResult,
+  PersonaAuthStartResult,
+  PersonaAuthSubmitResult,
   Project,
   ProjectJob,
   ProjectPersonaSummary,
@@ -240,6 +243,34 @@ export const api = {
   async getPersonaEnvironmentLogs(personaId: string, tail = 100): Promise<{ logs: string }> {
     const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/logs?tail=${tail}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load persona environment logs: ${res.statusText}`);
+    return res.json();
+  },
+
+  async verifyPersonaDriver(personaId: string): Promise<PersonaDriverVerificationResult> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/verify`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to verify persona driver: ${res.statusText}`);
+    return res.json();
+  },
+
+  async startPersonaAuth(personaId: string): Promise<PersonaAuthStartResult> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/auth/start`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to initiate driver login: ${res.statusText}`);
+    return res.json();
+  },
+
+  async submitPersonaAuthCode(personaId: string, code: string): Promise<PersonaAuthSubmitResult> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/auth/submit`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ code })
+    });
+    if (!res.ok) throw new Error(`Failed to submit driver auth code: ${res.statusText}`);
     return res.json();
   },
 

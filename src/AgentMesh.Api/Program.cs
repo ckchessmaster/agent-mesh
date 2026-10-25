@@ -146,6 +146,7 @@ app.UseAuthorization();
 app.MapDefaultEndpoints();
 app.MapControllers();
 app.MapHub<AgentMeshHub>("/hubs/agent-mesh");
+app.MapHub<TerminalHub>("/hubs/terminal");
 app.MapMcp("/mcp");
 
 app.MapGet("/", () => Results.Ok(new { Service = "AgentMesh API", Status = "Online", Version = "1.0.0" }));

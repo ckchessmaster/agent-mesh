@@ -405,6 +405,70 @@ public class PersonasController(
         return Ok(new { logs });
     }
 
+    [HttpPost("{id}/environment/verify")]
+    public async Task<IActionResult> VerifyPersonaDriver(string id, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        var result = await containerManager.VerifyDriverAsync(normalizedId, ct);
+        return Ok(result);
+    }
+
+    [HttpPost("{id}/environment/auth/start")]
+    public async Task<IActionResult> StartPersonaAuth(string id, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        var result = await containerManager.StartAuthAsync(normalizedId, ct);
+        return Ok(result);
+    }
+
+    public record SubmitAuthCodeRequest(string Code);
+
+    [HttpPost("{id}/environment/auth/submit")]
+    public async Task<IActionResult> SubmitPersonaAuthCode(string id, [FromBody] SubmitAuthCodeRequest req, CancellationToken ct)
+    {
+        var normalizedId = id.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(req.Code))
+        {
+            return BadRequest(new { error = "Authorization code is required." });
+        }
+
+        var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        var result = await containerManager.SubmitAuthCodeAsync(normalizedId, req.Code, ct);
+        return Ok(result);
+    }
+
     [HttpPost("{id}/sessions")]
     public async Task<IActionResult> CreatePersonaSession(string id, [FromBody] CreateAgentSessionRequest req)
     {

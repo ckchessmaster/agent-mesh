@@ -14,6 +14,7 @@ import {
   Wrench,
   MessageSquare,
   ChevronRight,
+  ChevronLeft,
   Activity,
   Cpu,
   ChevronDown,
@@ -247,6 +248,22 @@ export default function App() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [jobsByProject, setJobsByProject] = useState<Record<string, ProjectJob[]>>({});
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 768 : false
+  );
+  const [isMobileDetailView, setIsMobileDetailView] = useState(false);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobile(window.innerWidth < 768);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  const handleMobileBack = useCallback(() => {
+    setIsMobileDetailView(false);
+  }, []);
   const [jobMessages, setJobMessages] = useState<JobMessage[]>([]);
   const [jobTasks, setJobTasks] = useState<JobTask[]>([]);
   const [showProjectModal, setShowProjectModal] = useState(false);
@@ -716,6 +733,7 @@ export default function App() {
   const handleSelectJob = (projectId: string, jobId: string) => {
     setSelectedProjectId(projectId);
     setSelectedJobId(jobId);
+    setIsMobileDetailView(true);
   };
 
   useEffect(() => {
@@ -1404,6 +1422,7 @@ export default function App() {
     setNewSessionTier(persona.defaultTier || '');
     setNewSessionContextSize(persona.defaultContextSize || '');
     setIsCreatingSession(true);
+    setIsMobileDetailView(true);
   }, []);
 
   const handleSavePersona = async (e: React.FormEvent) => {
@@ -2482,16 +2501,32 @@ export default function App() {
   }, [sessionModelCap, currentRuntimeCaps]);
 
   return (
-    <div className="min-h-screen h-screen bg-slate-950 text-slate-100 flex flex-col font-sans overflow-hidden">
+    <div className="min-h-screen h-screen h-[100dvh] bg-slate-950 text-slate-100 flex flex-col font-sans overflow-hidden">
       {/* Top Bar */}
-      <header className="h-14 border-b border-slate-800/80 bg-slate-900/70 backdrop-blur px-5 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+      <header className="h-14 border-b border-slate-800/80 bg-slate-900/70 backdrop-blur px-3 sm:px-5 flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+          {/* Mobile Back Button (only shown in mobile detail view) */}
+          {isMobile && isMobileDetailView && (
+            <button
+              type="button"
+              onClick={handleMobileBack}
+              className="flex items-center gap-1 text-xs text-sky-400 font-semibold px-2 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60 hover:bg-slate-700 transition cursor-pointer shrink-0"
+              data-testid="mobile-back-button"
+              title="Return to list"
+            >
+              <ChevronLeft className="w-4 h-4" />
+              <span className="truncate max-w-[80px]">
+                {activeTab === 'projects' ? 'Projects' : activeTab === 'personas' ? 'Personas' : 'Back'}
+              </span>
+            </button>
+          )}
+
+          <div className="w-8 h-8 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400 shrink-0">
             <Cpu className="w-4 h-4" />
           </div>
-          <div className="flex items-center gap-2.5">
-            <h1 className="text-base font-bold tracking-tight text-white">AgentMesh</h1>
-            <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+          <div className="flex items-center gap-2 min-w-0">
+            <h1 className="text-base font-bold tracking-tight text-white truncate">AgentMesh</h1>
+            <span className="hidden sm:inline-block text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700 shrink-0">
               Session Cockpit MVP
             </span>
           </div>
@@ -2517,84 +2552,93 @@ export default function App() {
             )}
           </div>
 
-          {/* Top-level Navigation Tabs: Projects vs Personas vs Drivers */}
-          <div className="flex items-center gap-1 ml-4 bg-slate-950/80 border border-slate-800 rounded-xl p-1">
-            <button
-              type="button"
-              onClick={() => {
-                hasUserSwitchedTabRef.current = true;
-                setActiveTab('projects');
-              }}
-              className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
-                activeTab === 'projects'
-                  ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
-              }`}
-            >
-              <FolderGit2 className="w-3.5 h-3.5" />
-              <span>Projects & Jobs</span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
-                {projects.length}
-              </span>
-            </button>
+          {/* Top-level Navigation Tabs: Desktop Only */}
+          {!isMobile && (
+            <div className="flex items-center gap-1 ml-4 bg-slate-950/80 border border-slate-800 rounded-xl p-1">
+              <button
+                type="button"
+                onClick={() => {
+                  hasUserSwitchedTabRef.current = true;
+                  setActiveTab('projects');
+                  setIsMobileDetailView(false);
+                }}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                  activeTab === 'projects'
+                    ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                }`}
+              >
+                <FolderGit2 className="w-3.5 h-3.5" />
+                <span>Projects & Jobs</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                  {projects.length}
+                </span>
+              </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                hasUserSwitchedTabRef.current = true;
-                setActiveTab('personas');
-              }}
-              className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
-                activeTab === 'personas'
-                  ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
-              }`}
-            >
-              <Users className="w-3.5 h-3.5" />
-              <span>Personas & Sessions</span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
-                {personas.length}
-              </span>
-            </button>
+              <button
+                type="button"
+                onClick={() => {
+                  hasUserSwitchedTabRef.current = true;
+                  setActiveTab('personas');
+                  setIsMobileDetailView(false);
+                }}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                  activeTab === 'personas'
+                    ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                }`}
+              >
+                <Users className="w-3.5 h-3.5" />
+                <span>Personas & Sessions</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                  {personas.length}
+                </span>
+              </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                hasUserSwitchedTabRef.current = true;
-                setActiveTab('drivers');
-              }}
-              className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
-                activeTab === 'drivers'
-                  ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200 border border-transparent'
-              }`}
-            >
-              <Cpu className="w-3.5 h-3.5" />
-              <span>Drivers & Infrastructure</span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
-                {agents.length}
-              </span>
-            </button>
-          </div>
+              <button
+                type="button"
+                onClick={() => {
+                  hasUserSwitchedTabRef.current = true;
+                  setActiveTab('drivers');
+                  setIsMobileDetailView(false);
+                }}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                  activeTab === 'drivers'
+                    ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                }`}
+              >
+                <Cpu className="w-3.5 h-3.5" />
+                <span>Drivers & Infrastructure</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                  {agents.length}
+                </span>
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Developer Controls & Auth */}
-        <div className="flex items-center gap-2.5">
-          <button
-            onClick={handleResetMesh}
-            disabled={isActionPending}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 transition disabled:opacity-50 cursor-pointer"
-            title="Purge all agents, sessions, and events from PostgreSQL"
-          >
-            <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-            <span>Clear Mesh Data</span>
-          </button>
+        <div className="flex items-center gap-2 shrink-0">
+          {!isMobile && (
+            <>
+              <button
+                onClick={handleResetMesh}
+                disabled={isActionPending}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 transition disabled:opacity-50 cursor-pointer"
+                title="Purge all agents, sessions, and events from PostgreSQL"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                <span>Clear Mesh Data</span>
+              </button>
 
-          <div className="h-5 w-px bg-slate-800 mx-1" />
+              <div className="h-5 w-px bg-slate-800 mx-1" />
+            </>
+          )}
 
-          <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs">
-            <User className="w-3.5 h-3.5 text-sky-400" />
-            <span className="font-mono text-slate-300">{userEmail}</span>
+          <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs">
+            <User className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+            <span className="font-mono text-slate-300 max-w-[90px] sm:max-w-[140px] truncate">{userEmail}</span>
             {auth?.signoutRedirect && (
               <button
                 onClick={() => auth.signoutRedirect()}
@@ -2631,7 +2675,11 @@ export default function App() {
       {/* Main Split View */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left Sidebar: Projects, Personas or Drivers & Their Sessions */}
-        <aside className="w-80 border-r border-slate-800/80 bg-slate-900/40 flex flex-col shrink-0">
+        <aside
+          className={`${
+            isMobile && isMobileDetailView ? 'hidden' : isMobile ? 'w-full' : 'w-80'
+          } border-r border-slate-800/80 bg-slate-900/40 flex flex-col shrink-0`}
+        >
           {activeTab === 'projects' ? (
             <ProjectList
               projects={projects}
@@ -2873,6 +2921,7 @@ export default function App() {
                                       setSelectedAgentId(session.driverId || session.creatorAgentId || persona.driverId);
                                       setSelectedSessionId(session.id);
                                       setIsCreatingSession(false);
+                                      setIsMobileDetailView(true);
                                     }}
                                     className={`group w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
                                       isSelected
@@ -3254,7 +3303,7 @@ export default function App() {
                                       ? `${Math.round(usage.providerQuota.primaryRemainingFraction * 100)}% quota`
                                       : 'Quota'}
                                     {' · '}
-                                    {usage.lifetimeTokens.totalTokens > 0
+                                    {usage.lifetimeTokens?.totalTokens && usage.lifetimeTokens.totalTokens > 0
                                       ? `${(usage.lifetimeTokens.totalTokens / 1000).toFixed(1)}k tokens`
                                       : '0 tokens'}
                                   </span>
@@ -3283,6 +3332,7 @@ export default function App() {
                                 e.stopPropagation();
                                 setSelectedAgentId(agent.id);
                                 setIsCreatingSession(true);
+                                setIsMobileDetailView(true);
                               }}
                               className="p-1 rounded-md bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition cursor-pointer"
                               title={`New Session with ${agent.name}`}
@@ -3313,6 +3363,7 @@ export default function App() {
                                       }
                                       setSelectedSessionId(session.id);
                                       setIsCreatingSession(false);
+                                      setIsMobileDetailView(true);
                                     }}
                                     className={`group w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
                                       isSelected
@@ -3389,13 +3440,38 @@ export default function App() {
                     );
                   })
                 )}
+
+                {/* Danger Zone: Administrative maintenance */}
+                <div className="mt-6 pt-4 border-t border-slate-800/80 px-2 space-y-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-rose-400">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    <span>Danger Zone</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Purge all agents, sessions, and events from PostgreSQL and reset the mesh state.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleResetMesh}
+                    disabled={isActionPending}
+                    className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 text-rose-300 border border-rose-500/30 text-xs font-semibold flex items-center justify-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
+                    data-testid="danger-zone-clear-mesh-btn"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                    <span>Clear Mesh Data</span>
+                  </button>
+                </div>
               </div>
             </>
           )}
         </aside>
 
         {/* Right Main Panel: Active Session Trajectory or New Session Composer */}
-        <main className="flex-1 flex flex-col bg-slate-950 overflow-hidden">
+        <main
+          className={`${
+            isMobile && !isMobileDetailView ? 'hidden' : 'flex-1 flex'
+          } flex-col bg-slate-950 overflow-hidden`}
+        >
           {activeTab === 'projects' ? (
             (() => {
               const activeProj = projects.find((p) => p.id === selectedProjectId) || projects[0] || null;
@@ -3436,6 +3512,7 @@ export default function App() {
                         setIsCreatingSession(false);
                         setActiveTab('personas');
                         setSelectedSessionId(sessionId);
+                        setIsMobileDetailView(true);
                         const existing = sessions.find((s) => s.id === sessionId);
                         if (existing) {
                           if (existing.personaId) setSelectedPersonaId(existing.personaId);
@@ -5070,8 +5147,8 @@ export default function App() {
               </form>
             </div>
 
-            {/* Resizable Split Divider */}
-            {showArtifactsPanel && (
+            {/* Resizable Split Divider: Desktop Only */}
+            {showArtifactsPanel && !isMobile && (
               <div
                 onMouseDown={() => setIsResizingArtifacts(true)}
                 className="w-1.5 hover:w-2 bg-slate-800 hover:bg-indigo-500 transition-colors cursor-col-resize select-none shrink-0"
@@ -5079,11 +5156,16 @@ export default function App() {
               />
             )}
 
-            {/* Right: Resizable Artifacts Split Panel */}
+            {/* Right: Artifacts Split Panel (Desktop) or Full-screen Slide-Over Drawer (Mobile) */}
             {showArtifactsPanel && (
               <div
-                style={{ width: `${artifactPanelWidth}px` }}
-                className="shrink-0 flex flex-col min-h-0 bg-slate-950 border-l border-slate-800 overflow-hidden"
+                style={isMobile ? undefined : { width: `${artifactPanelWidth}px` }}
+                className={
+                  isMobile
+                    ? 'fixed inset-0 z-50 bg-slate-950 flex flex-col'
+                    : 'flex shrink-0 flex-col min-h-0 bg-slate-950 border-l border-slate-800 overflow-hidden'
+                }
+                data-testid="artifact-panel-container"
               >
                 <ArtifactViewer
                   artifacts={artifacts}
@@ -5130,7 +5212,10 @@ export default function App() {
                   </button>
                 ) : selectedAgent ? (
                   <button
-                    onClick={() => setIsCreatingSession(true)}
+                    onClick={() => {
+                      setIsCreatingSession(true);
+                      setIsMobileDetailView(true);
+                    }}
                     className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs flex items-center gap-2 transition cursor-pointer"
                   >
                     <Plus className="w-4 h-4" />
@@ -5168,9 +5253,9 @@ export default function App() {
             role="dialog"
             aria-modal="true"
             aria-label="Agent Quota and Usage Details"
-            className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+            className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
           >
-            <div className="max-w-2xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
+            <div className="max-w-2xl w-full bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[90dvh] sm:max-h-[85vh] overflow-hidden">
               {/* Header */}
               <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
                 <div className="flex items-center gap-2.5">
@@ -5445,11 +5530,11 @@ export default function App() {
             role="dialog"
             aria-modal="true"
             aria-label={editingPersona ? 'Edit Persona' : 'Create Persona'}
-            className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+            className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
           >
             <form
               onSubmit={handleSavePersona}
-              className="max-w-xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col max-h-[90vh] overflow-hidden"
+              className="max-w-xl w-full bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[90dvh] sm:max-h-[90vh] overflow-hidden"
             >
               {/* Header */}
               <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
@@ -5719,7 +5804,7 @@ export default function App() {
           aria-label={`Image preview: ${lightboxAttachment.fileName}`}
           data-testid="attachment-lightbox"
           onClick={() => setLightboxAttachment(null)}
-          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-6"
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-2 sm:p-6"
         >
           <div
             onClick={(e) => e.stopPropagation()}
@@ -5801,6 +5886,65 @@ export default function App() {
           persona={inspectingPersonaEnv}
           onClose={() => setInspectingPersonaEnv(null)}
         />
+      )}
+
+      {/* Mobile Bottom Navigation Bar: visible on mobile when at list/master level */}
+      {isMobile && !isMobileDetailView && (
+        <nav
+          className="border-t border-slate-800/80 bg-slate-900/90 backdrop-blur px-4 py-2 flex items-center justify-around shrink-0 z-30 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
+          data-testid="mobile-bottom-nav"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              hasUserSwitchedTabRef.current = true;
+              setActiveTab('projects');
+              setIsMobileDetailView(false);
+            }}
+            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+              activeTab === 'projects'
+                ? 'text-sky-400 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <FolderGit2 className="w-5 h-5" />
+            <span className="text-[10px]">Projects</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              hasUserSwitchedTabRef.current = true;
+              setActiveTab('personas');
+              setIsMobileDetailView(false);
+            }}
+            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+              activeTab === 'personas'
+                ? 'text-sky-400 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Users className="w-5 h-5" />
+            <span className="text-[10px]">Personas</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              hasUserSwitchedTabRef.current = true;
+              setActiveTab('drivers');
+              setIsMobileDetailView(false);
+            }}
+            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+              activeTab === 'drivers'
+                ? 'text-sky-400 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Cpu className="w-5 h-5" />
+            <span className="text-[10px]">Drivers</span>
+          </button>
+        </nav>
       )}
     </div>
   );

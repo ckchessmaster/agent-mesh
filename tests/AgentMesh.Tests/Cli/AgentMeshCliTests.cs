@@ -118,12 +118,13 @@ public class AgentMeshCliTests
     public async Task AgentMeshHub_RegisterAgentRunner_FlipsStatusToOnline_AndOnDisconnectFlipsToOffline()
     {
         AgentMeshHub.ClearConnections();
+        var agentId = $"test-runner-{Guid.NewGuid():N}";
         using var db = TestDbContextFactory.Create();
-        db.Agents.Add(new Agent { Id = "test-runner", Name = "Test Runner", Status = "offline" });
+        db.Agents.Add(new Agent { Id = agentId, Name = "Test Runner", Status = "offline" });
         await db.SaveChangesAsync();
 
         var mockContext = new Mock<HubCallerContext>();
-        mockContext.Setup(c => c.ConnectionId).Returns("conn-1");
+        mockContext.Setup(c => c.ConnectionId).Returns($"conn-{Guid.NewGuid():N}");
 
         var mockGroups = new Mock<IGroupManager>();
         var mockClients = new Mock<IHubCallerClients>();
@@ -138,18 +139,18 @@ public class AgentMeshCliTests
         };
 
         // Act 1: Connect
-        await hub.RegisterAgentRunner("test-runner");
+        await hub.RegisterAgentRunner(agentId);
 
         // Assert 1: Online
-        AgentMeshHub.IsAgentConnected("test-runner").Should().BeTrue();
-        (await db.Agents.FindAsync("test-runner"))!.Status.Should().Be("online");
+        AgentMeshHub.IsAgentConnected(agentId).Should().BeTrue();
+        (await db.Agents.FindAsync(agentId))!.Status.Should().Be("online");
 
         // Act 2: Disconnect
         await hub.OnDisconnectedAsync(null);
 
         // Assert 2: Offline
-        AgentMeshHub.IsAgentConnected("test-runner").Should().BeFalse();
-        (await db.Agents.FindAsync("test-runner"))!.Status.Should().Be("offline");
+        AgentMeshHub.IsAgentConnected(agentId).Should().BeFalse();
+        (await db.Agents.FindAsync(agentId))!.Status.Should().Be("offline");
     }
 
     [Fact]

@@ -237,7 +237,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [isArchiving, setIsArchiving] = useState(false);
 
   // Task checklist presentation state
-  const [isTasksExpanded, setIsTasksExpanded] = useState(true);
+  const [isTasksExpanded, setIsTasksExpanded] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 768 : true
+  );
   const [taskFilter, setTaskFilter] = useState<'all' | 'pending' | 'completed'>('pending');
 
   // Attachment & Drag-Drop State
@@ -274,7 +276,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     startIndex: -1
   });
   const [mentionHighlightedIndex, setMentionHighlightedIndex] = useState(0);
-  const [showTeamSidebar, setShowTeamSidebar] = useState(true);
+  const [showTeamSidebar, setShowTeamSidebar] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 768 : true
+  );
 
   // Question answering state
   const [submittingQuestionId, setSubmittingQuestionId] = useState<string | null>(null);
@@ -1007,13 +1011,13 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       )}
 
       {/* Header Bar */}
-      <div className="px-6 py-4 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-sm flex items-center justify-between gap-4 shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="w-9 h-9 rounded-xl bg-sky-500/15 text-sky-400 border border-sky-500/30 flex items-center justify-center shrink-0">
+      <div className="px-3 sm:px-6 py-2.5 sm:py-4 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-sm flex items-center justify-between gap-2.5 sm:gap-4 shrink-0">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+          <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-sky-500/15 text-sky-400 border border-sky-500/30 flex items-center justify-center shrink-0">
             <Briefcase className="w-4 h-4" />
           </div>
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
               <span className="text-[11px] font-mono px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 font-medium">
                 {project.name}
               </span>
@@ -1068,7 +1072,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         </div>
 
         {/* Assigned Personas & Actions */}
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-2 sm:gap-3 shrink-0">
           <div className="hidden lg:flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl">
             <span className="text-[11px] font-semibold text-slate-400 mr-1">Team:</span>
             {project.assignedPersonas?.map((p) => (
@@ -1221,7 +1225,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       </div>
 
       {/* Redesigned Task Checklist */}
-      <div className="px-6 py-3 border-b border-slate-800/60 bg-slate-900/50">
+      <div className="px-3 sm:px-6 py-2 sm:py-3 border-b border-slate-800/60 bg-slate-900/50">
         {/* Task Header & Progress Bar */}
         <div className="flex items-center justify-between gap-4 mb-2">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -1667,7 +1671,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             ref={messagesContainerRef}
             onScroll={handleMessagesScroll}
             data-testid="job-messages-container"
-            className="flex-1 overflow-y-auto p-6 space-y-4 relative"
+            className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-3 sm:space-y-4 relative"
           >
             {messages.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-500">
@@ -1960,7 +1964,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       )}
 
       {/* Prompt Composer & Mention Bar */}
-      <div className="p-4 border-t border-slate-800/80 bg-slate-900/80 backdrop-blur-sm shrink-0">
+      <div className="p-3 sm:p-4 border-t border-slate-800/80 bg-slate-900/80 backdrop-blur-sm shrink-0 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         {/* Attachment Error Banner */}
         {attachmentError && (
           <div className="mb-2.5 px-3 py-2 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-2">
@@ -2149,22 +2153,39 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
       {/* Team & Activity Sidebar */}
       {showTeamSidebar && (
-        <aside
-          className="w-80 border-l border-slate-800/80 bg-slate-950/70 backdrop-blur-sm flex flex-col shrink-0 overflow-y-auto"
-          data-testid="job-team-sidebar"
-        >
-          {/* Sidebar Header */}
-          <div className="p-4 border-b border-slate-800/80 flex items-center justify-between shrink-0 bg-slate-900/40">
-            <div className="flex items-center gap-2">
-              <Users className="w-4 h-4 text-sky-400" />
-              <h3 className="text-xs font-bold text-slate-100 uppercase tracking-wider">
-                Team & Activity
-              </h3>
+        <>
+          {/* Mobile Backdrop Overlay */}
+          <div
+            className="md:hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-xs"
+            onClick={() => setShowTeamSidebar(false)}
+            data-testid="job-team-sidebar-backdrop"
+          />
+          <aside
+            className="fixed inset-y-0 right-0 z-50 w-full sm:w-80 max-w-[85vw] border-l border-slate-800 bg-slate-950 shadow-2xl flex flex-col overflow-y-auto md:static md:z-auto md:w-80 md:shadow-none"
+            data-testid="job-team-sidebar"
+          >
+            {/* Sidebar Header */}
+            <div className="p-4 border-b border-slate-800/80 flex items-center justify-between shrink-0 bg-slate-900/40">
+              <div className="flex items-center gap-2">
+                <Users className="w-4 h-4 text-sky-400" />
+                <h3 className="text-xs font-bold text-slate-100 uppercase tracking-wider">
+                  Team & Activity
+                </h3>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
+                  {teamMembers.length} {teamMembers.length === 1 ? 'member' : 'members'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowTeamSidebar(false)}
+                  className="md:hidden p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                  title="Close Team & Activity Sidebar"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
-            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
-              {teamMembers.length} {teamMembers.length === 1 ? 'member' : 'members'}
-            </span>
-          </div>
 
           <div className="p-4 space-y-4 flex-1">
             {/* Active Turn Real-Time Feedback Card (inside sidebar) */}
@@ -2474,7 +2495,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             </div>
           </div>
         </aside>
-      )}
+      </>
+    )}
     </div>
 
       {/* Internal Fullscreen Image Lightbox Modal fallback */}
@@ -2485,7 +2507,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           aria-label={`Image preview: ${internalLightbox.fileName}`}
           data-testid="job-attachment-lightbox"
           onClick={() => setInternalLightbox(null)}
-          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-6"
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-2 sm:p-6"
         >
           <div
             onClick={(e) => e.stopPropagation()}

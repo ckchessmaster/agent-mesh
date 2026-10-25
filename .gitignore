@@ -62,3 +62,6 @@ nunit-*.xml
 
 # Node / Frontend
 node_modules/
+
+# Local staged docker binaries
+deploy/docker/bin/

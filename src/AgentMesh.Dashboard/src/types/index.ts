@@ -36,6 +36,36 @@ export interface PersonaEnvironmentStatus {
   errorMessage?: string | null;
 }
 
+export interface PersonaDriverVerificationStep {
+  name: string;
+  status: 'pending' | 'success' | 'failed' | 'warning';
+  details: string;
+}
+
+export interface PersonaDriverVerificationResult {
+  personaId: string;
+  driverId: string;
+  overallStatus: 'passed' | 'failed' | 'warning';
+  steps: PersonaDriverVerificationStep[];
+  errorMessage?: string | null;
+}
+
+export interface PersonaAuthStartResult {
+  personaId: string;
+  driverId: string;
+  status: 'ready' | 'waiting_code' | 'already_authenticated' | 'error';
+  authUrl?: string | null;
+  instructions?: string | null;
+  errorMessage?: string | null;
+}
+
+export interface PersonaAuthSubmitResult {
+  personaId: string;
+  status: 'authenticated' | 'failed';
+  message?: string | null;
+  errorMessage?: string | null;
+}
+
 /**
  * Parsed driver runtime config, as returned by GET /api/agents/{id}/config and mirrored on
  * Agent.config. The API never sends the API key itself — only whether one is stored.

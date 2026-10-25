@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -e
 
+export PATH="/usr/local/bin:/root/.local/bin:$PATH"
+
+# Allow direct shell execution when invoked with bash or sh
+if [ "$1" = "bash" ] || [ "$1" = "sh" ] || [ "$1" = "/bin/bash" ] || [ "$1" = "/bin/sh" ]; then
+    exec "$@"
+fi
+
 # Configure defaults
 export AGENTMESH_URL="${AGENTMESH_URL:-http://host.docker.internal:5000}"
 export AGENTMESH_TOKEN="${AGENTMESH_TOKEN:-}"

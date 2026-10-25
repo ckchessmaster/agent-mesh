@@ -1,9 +1,9 @@
 <Project>
   <PropertyGroup>
-    <Version Condition="'$(Version)' == ''">0.2.0</Version>
-    <AssemblyVersion Condition="'$(AssemblyVersion)' == ''">0.2.0.0</AssemblyVersion>
-    <FileVersion Condition="'$(FileVersion)' == ''">0.2.0.0</FileVersion>
-    <InformationalVersion Condition="'$(InformationalVersion)' == ''">0.2.0</InformationalVersion>
+    <Version Condition="'$(Version)' == ''">1.0.0</Version>
+    <AssemblyVersion Condition="'$(AssemblyVersion)' == ''">1.0.0.0</AssemblyVersion>
+    <FileVersion Condition="'$(FileVersion)' == ''">1.0.0.0</FileVersion>
+    <InformationalVersion Condition="'$(InformationalVersion)' == ''">1.0.0</InformationalVersion>
     <Authors>Christopher Kingdon</Authors>
     <Company>Christopher Kingdon</Company>
     <Product>AgentMesh</Product>

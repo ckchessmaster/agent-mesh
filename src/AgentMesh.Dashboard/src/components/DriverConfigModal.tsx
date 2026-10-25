@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { X, Save, Info, KeyRound, AlertTriangle } from 'lucide-react';
 import type { Agent, DriverConfig } from '../types';
 
@@ -167,12 +167,12 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       role="dialog"
       aria-modal="true"
       aria-label={`Configure driver ${agent.name}`}
-      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="max-w-lg w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
+      <div className="max-w-lg w-full bg-slate-900 border border-slate-800 rounded-t-2xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[90dvh] sm:max-h-[85vh] overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between shrink-0">
           <div>
             <h3 className="text-sm font-bold text-white flex items-center gap-2">

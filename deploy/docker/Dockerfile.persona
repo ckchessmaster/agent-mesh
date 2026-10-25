@@ -20,13 +20,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Node.js 22 LTS and pnpm
-RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g pnpm \
+# 2. Install GitHub CLI (gh)
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Build AgentMesh CLI binary
+# 3. Install Node.js 22 LTS, pnpm, and Claude Code CLI
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm @anthropic-ai/claude-code \
+    && rm -rf /var/lib/apt/lists/*
+
+# 4. Pre-bake agy (Antigravity CLI) if staged in deploy/docker/bin
+COPY deploy/docker/bin/agy* /usr/local/bin/
+RUN if [ -f /usr/local/bin/agy ]; then chmod +x /usr/local/bin/agy; fi
+
+# 5. Build AgentMesh CLI binary
 WORKDIR /src
 COPY . .
 RUN dotnet publish src/AgentMesh.Cli/AgentMesh.Cli.csproj \
@@ -40,8 +52,10 @@ RUN dotnet publish src/AgentMesh.Cli/AgentMesh.Cli.csproj \
     && chmod +x /usr/local/bin/agentmesh \
     && rm -rf /src
 
-# 4. Prepare workspace & entrypoint
-RUN mkdir -p /workspace && git config --global --add safe.directory '*'
+# 6. Prepare workspace, home config dirs & entrypoint
+RUN mkdir -p /workspace /root/.gemini/antigravity-cli /root/.claude /root/.config \
+    && git config --global --add safe.directory '*'
+
 
 COPY deploy/docker/entrypoint.persona.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
