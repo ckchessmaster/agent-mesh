@@ -11,7 +11,8 @@ ingress:
 api:
   image:
     repository: "ghcr.io/ckchessmaster/agent-mesh-api"
-    tag: "1.0.5"
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: ""
     pullPolicy: IfNotPresent
   port: 5000
   resources:
@@ -25,7 +26,8 @@ api:
 worker:
   image:
     repository: "ghcr.io/ckchessmaster/agent-mesh-worker"
-    tag: "1.0.5"
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: ""
     pullPolicy: IfNotPresent
   resources:
     limits:
@@ -39,7 +41,8 @@ dashboard:
   replicas: 1
   image:
     repository: "ghcr.io/ckchessmaster/agent-mesh-dashboard"
-    tag: "1.0.5"
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: ""
     pullPolicy: IfNotPresent
   resources:
     limits:
@@ -70,7 +73,8 @@ config:
   personaRunner:
     image:
       repository: "ghcr.io/ckchessmaster/agent-mesh-persona-runner"
-      tag: "1.0.5"
+      # Overrides the image tag whose default is the chart appVersion.
+      tag: ""
       pullPolicy: IfNotPresent
     # Name of an existing kubernetes.io/dockerconfigjson secret if the image is in a private registry
     imagePullSecret: ""

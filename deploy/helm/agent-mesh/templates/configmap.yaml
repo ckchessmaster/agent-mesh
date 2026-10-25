@@ -20,7 +20,7 @@ data:
   Oidc__ClientId: {{ .Values.config.oidc.clientId | quote }}
   Oidc__RequireHttpsMetadata: {{ .Values.config.oidc.requireHttpsMetadata | quote }}
   PersonaContainer__Runtime: "kubernetes"
-  PersonaContainer__Image: "{{ .Values.config.personaRunner.image.repository }}:{{ .Values.config.personaRunner.image.tag }}"
+  PersonaContainer__Image: "{{ .Values.config.personaRunner.image.repository }}:{{ .Values.config.personaRunner.image.tag | default .Chart.AppVersion }}"
   PersonaContainer__PullPolicy: {{ .Values.config.personaRunner.image.pullPolicy | default "IfNotPresent" | quote }}
 {{- if .Values.config.personaRunner.imagePullSecret }}
   PersonaContainer__ImagePullSecret: {{ .Values.config.personaRunner.imagePullSecret | quote }}
