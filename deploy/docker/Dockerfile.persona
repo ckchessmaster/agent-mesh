@@ -34,9 +34,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && npm install -g pnpm @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/*
 
-# 4. Pre-bake agy (Antigravity CLI) if staged in deploy/docker/bin
-COPY deploy/docker/bin/agy* /usr/local/bin/
-RUN if [ -f /usr/local/bin/agy ]; then chmod +x /usr/local/bin/agy; fi
+# 4. Install Antigravity CLI (agy)
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+    && chmod +x /usr/local/bin/agy
 
 # 5. Build AgentMesh CLI binary
 WORKDIR /src
