@@ -181,6 +181,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var currentPull = runnerContainer?.ImagePullPolicy;
             var currentPersonaEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_PERSONA_ID")?.Value;
             var currentUrlEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_URL")?.Value;
+            var currentTokenEnv = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_TOKEN")?.Value;
             var hasWorkspaceMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/workspace") == true;
             var hasWorkspaceVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "workspace-storage") == true;
 
@@ -189,7 +190,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var needsPullPolicyUpdate = !string.IsNullOrWhiteSpace(currentPullPolicy) && !string.Equals(currentPull, currentPullPolicy, StringComparison.OrdinalIgnoreCase);
             var needsEnvUpdate = runnerContainer == null ||
                                  !string.Equals(currentPersonaEnv, normPersonaId, StringComparison.OrdinalIgnoreCase) ||
-                                 !string.Equals(currentUrlEnv, meshUrl, StringComparison.OrdinalIgnoreCase);
+                                 !string.Equals(currentUrlEnv, meshUrl, StringComparison.OrdinalIgnoreCase) ||
+                                 !string.Equals(currentTokenEnv, agentToken, StringComparison.Ordinal);
             var needsVolumeUpdate = !hasWorkspaceMount || !hasWorkspaceVolume;
 
             // Query status to detect crashed/error pods that need a kick
@@ -921,41 +923,79 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
     private async Task<string> ProvisionAgentTokenAsync(string personaId, CancellationToken ct)
     {
+        var normPersonaId = personaId.Trim().TrimStart('@').ToLowerInvariant();
+        var personaSecretName = $"agentmesh-persona-{normPersonaId}-creds";
+        var deploymentName = GetDeploymentName(normPersonaId);
+
         try
         {
             using var scope = _serviceProvider.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
             var apiKeyService = scope.ServiceProvider.GetRequiredService<IApiKeyService>();
 
-            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == personaId, ct);
-            var driverId = (!string.IsNullOrWhiteSpace(persona?.DriverId) ? persona.DriverId : personaId).Trim().ToLowerInvariant();
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+            var rawDriverId = !string.IsNullOrWhiteSpace(persona?.DriverId) ? persona.DriverId : normPersonaId;
+            var driverId = rawDriverId.Trim().TrimStart('@').ToLowerInvariant();
 
-            var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == driverId, ct);
+            // 1. Check if token already exists in Secret
+            string? existingToken = null;
+            try
+            {
+                var secret = await _client.CoreV1.ReadNamespacedSecretAsync(personaSecretName, _namespace, cancellationToken: ct);
+                if (secret?.Data != null && secret.Data.TryGetValue("agentmesh-token", out var tokenBytes))
+                {
+                    existingToken = Encoding.UTF8.GetString(tokenBytes).Trim();
+                }
+            }
+            catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+            }
+
+            // 2. If Secret doesn't have it, check if the running deployment has AGENTMESH_TOKEN in its container env
+            if (string.IsNullOrWhiteSpace(existingToken))
+            {
+                try
+                {
+                    var deployment = await _client.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, _namespace, cancellationToken: ct);
+                    var runnerContainer = deployment.Spec?.Template?.Spec?.Containers?.FirstOrDefault(c => c.Name == "persona-runner");
+                    var deploymentToken = runnerContainer?.Env?.FirstOrDefault(e => e.Name == "AGENTMESH_TOKEN")?.Value;
+                    if (!string.IsNullOrWhiteSpace(deploymentToken) && deploymentToken.StartsWith("mesh_tok_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        existingToken = deploymentToken.Trim();
+                    }
+                }
+                catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                }
+            }
+
+            // 3. If an existing token was found, reuse and sync it in database and secret
+            if (!string.IsNullOrWhiteSpace(existingToken))
+            {
+                var existingHash = apiKeyService.HashToken(existingToken);
+                await SyncAgentTokenHashAsync(db, driverId, normPersonaId, persona?.Name, persona?.Role, existingHash, ct);
+
+                await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
+                {
+                    ["agentmesh-token"] = Encoding.UTF8.GetBytes(existingToken)
+                }, ct);
+
+                _logger.LogInformation("Reused existing AgentMesh API token for persona @{PersonaId} (driver @{DriverId})", normPersonaId, driverId);
+                return existingToken;
+            }
+
+            // 4. Generate new token only when no existing token exists
             var rawToken = apiKeyService.GenerateToken();
             var hashed = apiKeyService.HashToken(rawToken);
 
-            if (agent != null)
-            {
-                agent.ApiKeyHash = hashed;
-                agent.UpdatedAt = DateTimeOffset.UtcNow;
-            }
-            else
-            {
-                agent = new Agent
-                {
-                    Id = driverId,
-                    Name = persona?.Name ?? driverId,
-                    Role = persona?.Role ?? "Autonomous AI Persona",
-                    Status = "offline",
-                    ApiKeyHash = hashed,
-                    CreatedAt = DateTimeOffset.UtcNow,
-                    UpdatedAt = DateTimeOffset.UtcNow
-                };
-                db.Agents.Add(agent);
-            }
+            await SyncAgentTokenHashAsync(db, driverId, normPersonaId, persona?.Name, persona?.Role, hashed, ct);
 
-            await db.SaveChangesAsync(ct);
-            _logger.LogInformation("Provisioned dedicated AgentMesh API token for persona @{PersonaId} (driver @{DriverId})", personaId, driverId);
+            await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
+            {
+                ["agentmesh-token"] = Encoding.UTF8.GetBytes(rawToken)
+            }, ct);
+
+            _logger.LogInformation("Provisioned dedicated AgentMesh API token for persona @{PersonaId} (driver @{DriverId})", normPersonaId, driverId);
             return rawToken;
         }
         catch (Exception ex)
@@ -963,6 +1003,49 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             _logger.LogWarning("Failed to provision dedicated persona token: {Error}. Falling back to config master token.", ex.Message);
             return _config["AGENTMESH_TOKEN"] ?? _config["Auth:StaticApiKey"] ?? "mesh-default-secret-key";
         }
+    }
+
+    private static async Task SyncAgentTokenHashAsync(
+        AgentMeshDbContext db,
+        string driverId,
+        string personaId,
+        string? personaName,
+        string? personaRole,
+        string hash,
+        CancellationToken ct)
+    {
+        var targetIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { driverId, personaId };
+        var agents = await db.Agents.Where(a => targetIds.Contains(a.Id)).ToListAsync(ct);
+
+        foreach (var id in targetIds)
+        {
+            var agent = agents.FirstOrDefault(a => string.Equals(a.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (agent != null)
+            {
+                if (agent.ApiKeyHash != hash)
+                {
+                    agent.ApiKeyHash = hash;
+                    agent.UpdatedAt = DateTimeOffset.UtcNow;
+                }
+            }
+            else
+            {
+                var name = (id == personaId ? personaName : null) ?? id;
+                var role = (id == personaId ? personaRole : null) ?? "Autonomous Driver";
+                db.Agents.Add(new Agent
+                {
+                    Id = id,
+                    Name = name,
+                    Role = role,
+                    Status = "offline",
+                    ApiKeyHash = hash,
+                    CreatedAt = DateTimeOffset.UtcNow,
+                    UpdatedAt = DateTimeOffset.UtcNow
+                });
+            }
+        }
+
+        await db.SaveChangesAsync(ct);
     }
 
     private async Task SeedCredentialsFromSecretAsync(string normPersonaId, CancellationToken ct)

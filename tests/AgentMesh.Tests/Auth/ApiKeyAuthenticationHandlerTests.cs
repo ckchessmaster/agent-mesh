@@ -116,6 +116,46 @@ public class ApiKeyAuthenticationHandlerTests
         result.Principal.Should().NotBeNull();
         result.Principal!.FindFirst("AgentId")?.Value.Should().Be("agy");
         result.Principal!.Identity?.Name.Should().Be("Antigravity CLI");
+        result.Principal!.IsInRole("Agent").Should().BeTrue();
+        result.Principal!.IsInRole("Driver").Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task AuthenticateAsync_WithAgentMeshTokenConfig_Succeeds()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var clusterToken = "mesh_tok_cluster_master_999";
+        var configWithAgentMeshToken = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["AGENTMESH_TOKEN"] = clusterToken
+            })
+            .Build();
+
+        var context = new DefaultHttpContext();
+        context.Request.Headers["Authorization"] = $"Bearer {clusterToken}";
+        context.Request.Headers["X-Agent-Id"] = "astra-driver";
+
+        var handler = new ApiKeyAuthenticationHandler(
+            _optionsMonitor,
+            NullLoggerFactory.Instance,
+            UrlEncoder.Default,
+            db,
+            _apiKeyService,
+            configWithAgentMeshToken);
+
+        await handler.InitializeAsync(_scheme, context);
+
+        // Act
+        var result = await handler.AuthenticateAsync();
+
+        // Assert
+        result.Succeeded.Should().BeTrue();
+        result.Principal.Should().NotBeNull();
+        result.Principal!.FindFirst("AgentId")?.Value.Should().Be("astra-driver");
+        result.Principal!.IsInRole("Admin").Should().BeTrue();
+        result.Principal!.IsInRole("Agent").Should().BeTrue();
     }
 
     [Fact]

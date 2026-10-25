@@ -899,7 +899,7 @@ public class AgentProcessManager : IAsyncDisposable
 
         var driverId = (!string.IsNullOrWhiteSpace(customDriver)
             ? customDriver
-            : remotePersona?.DriverId ?? "openai").Trim().ToLowerInvariant();
+            : remotePersona?.DriverId ?? "openai").Trim().TrimStart('@').ToLowerInvariant();
 
         RemoteAgentDto? remoteDriver = null;
         try

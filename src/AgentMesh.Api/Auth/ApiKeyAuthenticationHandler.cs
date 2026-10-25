@@ -51,8 +51,13 @@ public class ApiKeyAuthenticationHandler(
         }
 
         // 2. Check Master Dev Key for backwards compatibility / local developer access
-        var masterKey = configuration["Auth:StaticApiKey"] ?? "mesh-default-secret-key";
-        if (providedKey == masterKey)
+        var staticApiKey = configuration["Auth:StaticApiKey"];
+        var agentMeshToken = configuration["AGENTMESH_TOKEN"];
+        var isMasterKey = (!string.IsNullOrEmpty(staticApiKey) && string.Equals(providedKey, staticApiKey, StringComparison.Ordinal)) ||
+                          (!string.IsNullOrEmpty(agentMeshToken) && string.Equals(providedKey, agentMeshToken, StringComparison.Ordinal)) ||
+                          (string.IsNullOrEmpty(staticApiKey) && string.IsNullOrEmpty(agentMeshToken) && string.Equals(providedKey, "mesh-default-secret-key", StringComparison.Ordinal));
+
+        if (isMasterKey)
         {
             var devAgentId = Request.Headers.TryGetValue("X-Agent-Id", out var idHeader)
                 ? idHeader.ToString()
@@ -67,7 +72,9 @@ public class ApiKeyAuthenticationHandler(
                 new Claim(ClaimTypes.Name, devAgent?.Name ?? devAgentId),
                 new Claim("AgentId", devAgentId),
                 new Claim("TrustTier", devTrustTier),
-                new Claim("IsMasterKey", "true")
+                new Claim("IsMasterKey", "true"),
+                new Claim(ClaimTypes.Role, "Admin"),
+                new Claim(ClaimTypes.Role, "Agent")
             };
 
             var devIdentity = new ClaimsIdentity(devClaims, Scheme.Name);
@@ -91,7 +98,9 @@ public class ApiKeyAuthenticationHandler(
             new Claim(ClaimTypes.Name, agent.Name),
             new Claim("AgentId", agent.Id),
             new Claim("TrustTier", ((int)agent.TrustTier).ToString()),
-            new Claim("RuntimeType", agent.RuntimeType.ToString())
+            new Claim("RuntimeType", agent.RuntimeType.ToString()),
+            new Claim(ClaimTypes.Role, "Agent"),
+            new Claim(ClaimTypes.Role, "Driver")
         };
 
         var identity = new ClaimsIdentity(claims, Scheme.Name);

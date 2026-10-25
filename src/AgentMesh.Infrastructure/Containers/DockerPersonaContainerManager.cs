@@ -373,41 +373,51 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
     private async Task<string> ProvisionAgentTokenAsync(string personaId, CancellationToken ct)
     {
+        var normPersonaId = personaId.Trim().TrimStart('@').ToLowerInvariant();
+        var tokensDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "tokens");
+        var tokenFile = Path.Combine(tokensDir, $"{normPersonaId}.token");
+
         try
         {
             using var scope = _serviceProvider.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
             var apiKeyService = scope.ServiceProvider.GetRequiredService<IApiKeyService>();
 
-            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == personaId, ct);
-            var driverId = (!string.IsNullOrWhiteSpace(persona?.DriverId) ? persona.DriverId : personaId).Trim().ToLowerInvariant();
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+            var rawDriverId = !string.IsNullOrWhiteSpace(persona?.DriverId) ? persona.DriverId : normPersonaId;
+            var driverId = rawDriverId.Trim().TrimStart('@').ToLowerInvariant();
 
-            var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == driverId, ct);
+            string? existingToken = null;
+            if (File.Exists(tokenFile))
+            {
+                try
+                {
+                    existingToken = File.ReadAllText(tokenFile).Trim();
+                }
+                catch { }
+            }
+
+            if (!string.IsNullOrWhiteSpace(existingToken))
+            {
+                var existingHash = apiKeyService.HashToken(existingToken);
+                await SyncAgentTokenHashAsync(db, driverId, normPersonaId, persona?.Name, persona?.Role, existingHash, ct);
+                _logger.LogInformation("Reused existing AgentMesh API token for persona @{PersonaId} (driver @{DriverId})", normPersonaId, driverId);
+                return existingToken;
+            }
+
             var rawToken = apiKeyService.GenerateToken();
             var hashed = apiKeyService.HashToken(rawToken);
 
-            if (agent != null)
-            {
-                agent.ApiKeyHash = hashed;
-                agent.UpdatedAt = DateTimeOffset.UtcNow;
-            }
-            else
-            {
-                agent = new Agent
-                {
-                    Id = driverId,
-                    Name = persona?.Name ?? driverId,
-                    Role = persona?.Role ?? "Autonomous AI Persona",
-                    Status = "offline",
-                    ApiKeyHash = hashed,
-                    CreatedAt = DateTimeOffset.UtcNow,
-                    UpdatedAt = DateTimeOffset.UtcNow
-                };
-                db.Agents.Add(agent);
-            }
+            await SyncAgentTokenHashAsync(db, driverId, normPersonaId, persona?.Name, persona?.Role, hashed, ct);
 
-            await db.SaveChangesAsync(ct);
-            _logger.LogInformation("Provisioned dedicated AgentMesh API token for persona @{PersonaId} (driver @{DriverId})", personaId, driverId);
+            try
+            {
+                Directory.CreateDirectory(tokensDir);
+                File.WriteAllText(tokenFile, rawToken);
+            }
+            catch { }
+
+            _logger.LogInformation("Provisioned dedicated AgentMesh API token for persona @{PersonaId} (driver @{DriverId})", normPersonaId, driverId);
             return rawToken;
         }
         catch (Exception ex)
@@ -415,6 +425,49 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             _logger.LogWarning("Failed to provision dedicated persona token: {Error}. Falling back to config master token.", ex.Message);
             return _config["AGENTMESH_TOKEN"] ?? _config["Auth:StaticApiKey"] ?? "mesh-default-secret-key";
         }
+    }
+
+    private static async Task SyncAgentTokenHashAsync(
+        AgentMeshDbContext db,
+        string driverId,
+        string personaId,
+        string? personaName,
+        string? personaRole,
+        string hash,
+        CancellationToken ct)
+    {
+        var targetIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { driverId, personaId };
+        var agents = await db.Agents.Where(a => targetIds.Contains(a.Id)).ToListAsync(ct);
+
+        foreach (var id in targetIds)
+        {
+            var agent = agents.FirstOrDefault(a => string.Equals(a.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (agent != null)
+            {
+                if (agent.ApiKeyHash != hash)
+                {
+                    agent.ApiKeyHash = hash;
+                    agent.UpdatedAt = DateTimeOffset.UtcNow;
+                }
+            }
+            else
+            {
+                var name = (id == personaId ? personaName : null) ?? id;
+                var role = (id == personaId ? personaRole : null) ?? "Autonomous Driver";
+                db.Agents.Add(new Agent
+                {
+                    Id = id,
+                    Name = name,
+                    Role = role,
+                    Status = "offline",
+                    ApiKeyHash = hash,
+                    CreatedAt = DateTimeOffset.UtcNow,
+                    UpdatedAt = DateTimeOffset.UtcNow
+                });
+            }
+        }
+
+        await db.SaveChangesAsync(ct);
     }
 
     private async Task SeedHostCredentialsIfAvailableAsync(string containerName, CancellationToken ct)
