@@ -553,6 +553,20 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                               />
                               <span>Userspace Mode (no NET_ADMIN / /dev/net/tun required)</span>
                             </label>
+
+                            <div>
+                              <label className={labelClass} htmlFor="sidecar-extra-args">
+                                Extra Arguments (optional)
+                              </label>
+                              <input
+                                id="sidecar-extra-args"
+                                type="text"
+                                value={sidecarExtraArgs}
+                                onChange={(e) => setSidecarExtraArgs(e.target.value)}
+                                placeholder="--accept-routes"
+                                className={`${fieldClass} font-mono`}
+                              />
+                            </div>
                           </div>
                         ) : (
                           <div className="space-y-2 pt-1">
