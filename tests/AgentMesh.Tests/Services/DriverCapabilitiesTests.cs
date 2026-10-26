@@ -249,4 +249,88 @@ public class DriverCapabilitiesTests
         sidecarObj.GetProperty("hostname").GetString().Should().Be("mesh-qwen-updated");
         sidecarObj.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret-12345");
     }
+
+    [Fact]
+    public void Merge_UpdatesSidecarAuthKey_WhenIncomingHasNewNonEmptyKey()
+    {
+        var existing = """
+        {
+          "adapter": "openai",
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "tskey-old-key",
+            "hostname": "mesh-qwen"
+          }
+        }
+        """;
+
+        var patch = """
+        {
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "tskey-new-key",
+            "hostname": "mesh-qwen"
+          }
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        merged.Should().NotBeNull();
+
+        var parsed = System.Text.Json.JsonDocument.Parse(merged!);
+        var sidecarObj = parsed.RootElement.GetProperty("sidecar");
+        sidecarObj.GetProperty("authKey").GetString().Should().Be("tskey-new-key");
+    }
+
+    [Fact]
+    public void Parse_CustomSidecarConfig_PreservesCustomSettings()
+    {
+        var json = """
+        {
+          "adapter": "custom",
+          "sidecar": {
+            "enabled": true,
+            "type": "custom",
+            "image": "my-vpn:v1",
+            "command": "/vpn-entrypoint.sh",
+            "arguments": ["--connect", "--daemon"]
+          }
+        }
+        """;
+
+        var cfg = DriverCapabilities.Parse(json);
+        cfg.Sidecar.Should().NotBeNull();
+        cfg.Sidecar!.Enabled.Should().BeTrue();
+        cfg.Sidecar.Type.Should().Be("custom");
+        cfg.Sidecar.Image.Should().Be("my-vpn:v1");
+        cfg.Sidecar.Command.Should().Be("/vpn-entrypoint.sh");
+        cfg.Sidecar.Arguments.Should().ContainInOrder("--connect", "--daemon");
+        cfg.HasSidecarAuthKey.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Merge_CreatesSidecar_WhenExistingHadNoSidecar()
+    {
+        var existing = """{"adapter":"openai","endpoint":"http://remote:8000"}""";
+        var patch = """
+        {
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "tskey-fresh",
+            "hostname": "mesh-probe"
+          }
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        merged.Should().NotBeNull();
+
+        var parsed = System.Text.Json.JsonDocument.Parse(merged!);
+        var sidecarObj = parsed.RootElement.GetProperty("sidecar");
+        sidecarObj.GetProperty("enabled").GetBoolean().Should().BeTrue();
+        sidecarObj.GetProperty("authKey").GetString().Should().Be("tskey-fresh");
+    }
 }

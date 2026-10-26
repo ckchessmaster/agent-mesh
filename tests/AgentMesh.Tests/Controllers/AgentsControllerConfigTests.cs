@@ -1,4 +1,4 @@
-﻿using AgentMesh.Api.Controllers;
+using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
@@ -308,5 +308,41 @@ public class AgentsControllerConfigTests
         var stored = db.Agents.Single(a => a.Id == "brand-new").CapabilitiesJson;
         using var doc = JsonDocument.Parse(stored);
         doc.RootElement.GetProperty("maxSteps").GetInt32().Should().Be(7);
+    }
+
+    [Fact]
+    public async Task UpdateDriverConfig_WithSidecar_PersistsAndReturnsMaskedSidecarConfig()
+    {
+        var (controller, db) = Arrange(FullOpenAiCaps);
+
+        var sidecarReq = new DriverSidecarConfig
+        {
+            Enabled = true,
+            Type = "tailscale",
+            AuthKey = "tskey-auth-secret-test",
+            Hostname = "mesh-private-llm",
+            UserspaceMode = false,
+            ExtraArgs = "--accept-routes"
+        };
+
+        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+            Sidecar: sidecarReq
+        ));
+
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        var view = okResult.Value.Should().BeOfType<DriverCapabilitiesView>().Subject;
+
+        view.Sidecar.Should().NotBeNull();
+        view.Sidecar!.Enabled.Should().BeTrue();
+        view.Sidecar.Type.Should().Be("tailscale");
+        view.Sidecar.Hostname.Should().Be("mesh-private-llm");
+        view.Sidecar.AuthKey.Should().BeNull("secret authKey must be masked on returned view");
+        view.HasSidecarAuthKey.Should().BeTrue();
+
+        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        using var doc = JsonDocument.Parse(stored);
+        var sc = doc.RootElement.GetProperty("sidecar");
+        sc.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret-test");
+        sc.GetProperty("hostname").GetString().Should().Be("mesh-private-llm");
     }
 }

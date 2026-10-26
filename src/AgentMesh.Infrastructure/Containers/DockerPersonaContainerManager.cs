@@ -243,6 +243,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         var normPersonaId = personaId.Trim().ToLowerInvariant();
         var status = await GetStatusAsync(normPersonaId, ct);
         var containerName = GetContainerName(normPersonaId);
+        var sidecarConfig = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
 
         if (status.Status == "running")
         {
@@ -254,6 +255,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 return;
             }
             await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+            await EnsureSidecarRunningAsync(normPersonaId, containerName, sidecarConfig, ct);
             return;
         }
 
@@ -275,6 +277,13 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             $"AGENTMESH_TOKEN={agentToken}",
             $"AGENTMESH_PERSONA_ID={normPersonaId}"
         };
+
+        if (sidecarConfig != null && sidecarConfig.Enabled)
+        {
+            envList.Add("SIDECAR_ENABLED=true");
+            envList.Add($"SIDECAR_TYPE={sidecarConfig.Type}");
+            envList.Add($"SIDECAR_USERSPACE={(sidecarConfig.UserspaceMode ? "true" : "false")}");
+        }
 
         var forwardedVars = new[]
         {
@@ -358,11 +367,13 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                         _logger.LogInformation("Starting existing container {Name} for persona @{PersonaId}", containerName, normPersonaId);
                         await _dockerClient.Containers.StartContainerAsync(containerName, new ContainerStartParameters(), ct);
                         await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+                        await EnsureSidecarRunningAsync(normPersonaId, containerName, sidecarConfig, ct);
                         return;
                     }
                     else
                     {
                         await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+                        await EnsureSidecarRunningAsync(normPersonaId, containerName, sidecarConfig, ct);
                         return;
                     }
                 }
@@ -397,6 +408,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 await _dockerClient.Containers.StartContainerAsync(createRes.ID, new ContainerStartParameters(), ct);
                 _logger.LogInformation("Container {Name} ({ID}) started successfully for @{PersonaId}", containerName, createRes.ID[..12], normPersonaId);
                 await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+                await EnsureSidecarRunningAsync(normPersonaId, containerName, sidecarConfig, ct);
                 return;
             }
             catch (Exception ex)
@@ -439,6 +451,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                         throw new InvalidOperationException($"Failed to start container {containerName}: {startErr}");
                     }
                     await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+                    await EnsureSidecarRunningAsync(normPersonaId, containerName, sidecarConfig, ct);
                     return;
                 }
             }
@@ -469,6 +482,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             }
             _logger.LogInformation("Container {Name} launched successfully via {Cli}", containerName, _detectedCli);
             await SeedHostCredentialsIfAvailableAsync(containerName, ct);
+            await EnsureSidecarRunningAsync(normPersonaId, containerName, sidecarConfig, ct);
             return;
         }
 
@@ -656,12 +670,15 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
     public async Task StopAsync(string personaId, CancellationToken ct = default)
     {
-        var containerName = GetContainerName(personaId);
+        var normPersonaId = personaId.Trim().ToLowerInvariant();
+        var containerName = GetContainerName(normPersonaId);
+        var sidecarName = $"{containerName}-sidecar";
 
         if (_dockerClient != null)
         {
             try
             {
+                try { await _dockerClient.Containers.StopContainerAsync(sidecarName, new ContainerStopParameters { WaitBeforeKillSeconds = 2 }, ct); } catch { }
                 await _dockerClient.Containers.StopContainerAsync(containerName, new ContainerStopParameters { WaitBeforeKillSeconds = 5 }, ct);
                 _logger.LogInformation("Stopped container {Name} for persona @{PersonaId}", containerName, personaId);
                 return;
@@ -678,6 +695,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         if (_detectedCli != null)
         {
+            try { await RunCliAsync(_detectedCli, $"stop -t 2 {sidecarName}", ct); } catch { }
             await RunCliAsync(_detectedCli, $"stop -t 5 {containerName}", ct);
             _logger.LogInformation("Stopped container {Name} via {Cli} for persona @{PersonaId}", containerName, _detectedCli, personaId);
         }
@@ -687,12 +705,16 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
     {
         var normPersonaId = personaId.Trim().ToLowerInvariant();
         var containerName = GetContainerName(normPersonaId);
+        var sidecarName = $"{containerName}-sidecar";
         _logger.LogInformation("Restarting & recreating container {Name} for persona @{PersonaId}", containerName, normPersonaId);
 
         if (_dockerClient != null)
         {
             try
             {
+                try { await _dockerClient.Containers.StopContainerAsync(sidecarName, new ContainerStopParameters { WaitBeforeKillSeconds = 2 }, ct); } catch { }
+                try { await _dockerClient.Containers.RemoveContainerAsync(sidecarName, new ContainerRemoveParameters { Force = true }, ct); } catch { }
+
                 try
                 {
                     await _dockerClient.Containers.StopContainerAsync(containerName, new ContainerStopParameters { WaitBeforeKillSeconds = 3 }, ct);
@@ -709,6 +731,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
         else if (_detectedCli != null)
         {
+            try { await RunCliAsync(_detectedCli, $"rm -f {sidecarName}", ct); } catch { }
             await RunCliAsync(_detectedCli, $"rm -f {containerName}", ct);
         }
 
@@ -1413,6 +1436,203 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
         catch { }
         return null;
+    }
+
+    private async Task<DriverSidecarConfig?> GetPersonaSidecarConfigAsync(string normPersonaId, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+            if (persona == null) return null;
+            var driverId = !string.IsNullOrWhiteSpace(persona.DriverId) ? persona.DriverId.Trim().TrimStart('@').ToLowerInvariant() : null;
+            if (string.IsNullOrWhiteSpace(driverId)) return null;
+
+            var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
+            if (agent == null || string.IsNullOrWhiteSpace(agent.CapabilitiesJson)) return null;
+
+            using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
+            if (doc.RootElement.TryGetProperty("sidecar", out var sc) && sc.ValueKind == JsonValueKind.Object)
+            {
+                return JsonSerializer.Deserialize<DriverSidecarConfig>(sc.GetRawText());
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Failed to resolve driver sidecar config for persona @{PersonaId}: {Error}", normPersonaId, ex.Message);
+        }
+        return null;
+    }
+
+    private async Task EnsureSidecarRunningAsync(
+        string normPersonaId,
+        string runnerContainerName,
+        DriverSidecarConfig? sidecar,
+        CancellationToken ct)
+    {
+        var sidecarContainerName = $"{runnerContainerName}-sidecar";
+
+        if (sidecar == null || !sidecar.Enabled)
+        {
+            if (_dockerClient != null)
+            {
+                try
+                {
+                    await _dockerClient.Containers.StopContainerAsync(sidecarContainerName, new ContainerStopParameters { WaitBeforeKillSeconds = 2 }, ct);
+                    await _dockerClient.Containers.RemoveContainerAsync(sidecarContainerName, new ContainerRemoveParameters { Force = true }, ct);
+                }
+                catch { }
+            }
+            else if (_detectedCli != null)
+            {
+                try { await RunCliAsync(_detectedCli, $"rm -f {sidecarContainerName}", ct); } catch { }
+            }
+            return;
+        }
+
+        var isTailscale = string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase);
+        var sidecarImage = !string.IsNullOrWhiteSpace(sidecar.Image) ? sidecar.Image :
+            isTailscale ? "tailscale/tailscale:v1.78.1" : "alpine:latest";
+
+        var sidecarEnv = new List<string>();
+        if (isTailscale)
+        {
+            var hostname = !string.IsNullOrWhiteSpace(sidecar.Hostname) ? sidecar.Hostname : $"mesh-{normPersonaId}";
+            var extraArgsSb = new StringBuilder($"--ephemeral --hostname={hostname}");
+            if (!string.IsNullOrWhiteSpace(sidecar.Tags))
+            {
+                extraArgsSb.Append($" --advertise-tags={sidecar.Tags}");
+            }
+            if (!string.IsNullOrWhiteSpace(sidecar.ExtraArgs))
+            {
+                extraArgsSb.Append($" {sidecar.ExtraArgs}");
+            }
+
+            sidecarEnv.Add($"TS_EXTRA_ARGS={extraArgsSb.ToString().Trim()}");
+            sidecarEnv.Add($"TS_USERSPACE={(sidecar.UserspaceMode ? "true" : "false")}");
+            if (!string.IsNullOrWhiteSpace(sidecar.AuthKey))
+            {
+                sidecarEnv.Add($"TS_AUTHKEY={sidecar.AuthKey}");
+            }
+        }
+        else if (sidecar.EnvironmentVariables != null)
+        {
+            foreach (var (k, v) in sidecar.EnvironmentVariables)
+            {
+                sidecarEnv.Add($"{k}={v}");
+            }
+        }
+
+        if (_dockerClient != null)
+        {
+            try
+            {
+                try
+                {
+                    var inspect = await _dockerClient.Containers.InspectContainerAsync(sidecarContainerName, ct);
+                    if (!inspect.State.Running)
+                    {
+                        await _dockerClient.Containers.StartContainerAsync(sidecarContainerName, new ContainerStartParameters(), ct);
+                    }
+                    return;
+                }
+                catch (DockerContainerNotFoundException) { }
+
+                var binds = new List<string>();
+                var capAdd = new List<string>();
+                if (isTailscale && !sidecar.UserspaceMode)
+                {
+                    capAdd.Add("NET_ADMIN");
+                    binds.Add("/dev/net/tun:/dev/net/tun");
+                }
+
+                var createParams = new CreateContainerParameters
+                {
+                    Image = sidecarImage,
+                    Name = sidecarContainerName,
+                    Env = sidecarEnv,
+                    Cmd = !string.IsNullOrWhiteSpace(sidecar.Command) ? new List<string> { sidecar.Command } : sidecar.Arguments,
+                    HostConfig = new HostConfig
+                    {
+                        NetworkMode = $"container:{runnerContainerName}",
+                        CapAdd = capAdd.Count > 0 ? capAdd : null,
+                        Binds = binds.Count > 0 ? binds : null,
+                        RestartPolicy = new RestartPolicy { Name = RestartPolicyKind.No }
+                    }
+                };
+
+                var res = await _dockerClient.Containers.CreateContainerAsync(createParams, ct);
+                await _dockerClient.Containers.StartContainerAsync(res.ID, new ContainerStartParameters(), ct);
+                _logger.LogInformation("Sidecar container {Name} started for @{PersonaId}", sidecarContainerName, normPersonaId);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("DockerClient sidecar launch failed, falling back to CLI: {Error}", ex.Message);
+            }
+        }
+
+        if (_detectedCli != null)
+        {
+            var (inspectExit, _, _) = await RunCliAsync(_detectedCli, $"inspect {sidecarContainerName}", ct);
+            if (inspectExit == 0)
+            {
+                await RunCliAsync(_detectedCli, $"start {sidecarContainerName}", ct);
+                return;
+            }
+
+            var sb = new StringBuilder($"run -d --name {sidecarContainerName} --net=container:{runnerContainerName} ");
+            if (isTailscale)
+            {
+                if (!sidecar.UserspaceMode)
+                {
+                    sb.Append("--cap-add=NET_ADMIN --device=/dev/net/tun ");
+                }
+                foreach (var e in sidecarEnv)
+                {
+                    var parts = e.Split('=', 2);
+                    if (parts.Length == 2)
+                    {
+                        sb.Append($"-e \"{parts[0]}={parts[1].Replace("\"", "\\\"")}\" ");
+                    }
+                }
+            }
+            else
+            {
+                foreach (var e in sidecarEnv)
+                {
+                    var parts = e.Split('=', 2);
+                    if (parts.Length == 2)
+                    {
+                        sb.Append($"-e \"{parts[0]}={parts[1].Replace("\"", "\\\"")}\" ");
+                    }
+                }
+            }
+
+            sb.Append(sidecarImage);
+            if (!string.IsNullOrWhiteSpace(sidecar.Command))
+            {
+                sb.Append($" {sidecar.Command}");
+            }
+            if (sidecar.Arguments != null)
+            {
+                foreach (var a in sidecar.Arguments)
+                {
+                    sb.Append($" \"{a.Replace("\"", "\\\"")}\"");
+                }
+            }
+
+            var (runExit, _, runErr) = await RunCliAsync(_detectedCli, sb.ToString(), ct);
+            if (runExit != 0)
+            {
+                _logger.LogWarning("Failed to launch sidecar container via {Cli}: {Error}", _detectedCli, runErr);
+            }
+            else
+            {
+                _logger.LogInformation("Sidecar container {Name} launched via {Cli} for @{PersonaId}", sidecarContainerName, _detectedCli, normPersonaId);
+            }
+        }
     }
 
     private sealed class ActiveAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl) : IAsyncDisposable
