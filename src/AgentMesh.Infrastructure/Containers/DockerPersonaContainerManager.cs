@@ -1398,7 +1398,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                         sb.Append($"-e \"TS_AUTHKEY={sidecar.AuthKey}\" ");
                     }
                     sb.Append($"-e \"TS_KUBE_SECRET=\" ");
-                    sb.Append($"-e \"TS_EXTRA_ARGS=--ephemeral --hostname=mesh-probe\" ");
+                    sb.Append($"-e \"TS_EXTRA_ARGS=--hostname=mesh-probe\" ");
                     sb.Append($"-e \"TS_USERSPACE={(sidecar.UserspaceMode ? "true" : "false")}\" ");
                     if (sidecar.EnvironmentVariables != null)
                     {
@@ -1519,7 +1519,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         if (isTailscale)
         {
             var hostname = !string.IsNullOrWhiteSpace(sidecar.Hostname) ? sidecar.Hostname : $"mesh-{normPersonaId}";
-            var extraArgsSb = new StringBuilder($"--ephemeral --hostname={hostname}");
+            var extraArgsSb = new StringBuilder($"--hostname={hostname}");
             if (!string.IsNullOrWhiteSpace(sidecar.Tags))
             {
                 extraArgsSb.Append($" --advertise-tags={sidecar.Tags}");

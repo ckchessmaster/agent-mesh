@@ -62,7 +62,7 @@ public class KubernetesPersonaContainerManagerTests
 
         var extraArgsVar = container.Env.FirstOrDefault(e => e.Name == "TS_EXTRA_ARGS");
         extraArgsVar.Should().NotBeNull();
-        extraArgsVar!.Value.Should().Contain("--ephemeral");
+        extraArgsVar!.Value.Should().NotContain("--ephemeral");
         extraArgsVar.Value.Should().Contain("--hostname=mesh-astra");
     }
 
