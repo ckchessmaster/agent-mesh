@@ -286,6 +286,18 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             env.Add(new V1EnvVar { Name = "SIDECAR_ENABLED", Value = "true" });
             env.Add(new V1EnvVar { Name = "SIDECAR_TYPE", Value = sidecarConfig.Type });
             env.Add(new V1EnvVar { Name = "SIDECAR_USERSPACE", Value = sidecarConfig.UserspaceMode ? "true" : "false" });
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionSetup))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_SETUP", Value = sidecarConfig.CompanionSetup });
+            }
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionCommand))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_COMMAND", Value = sidecarConfig.CompanionCommand });
+            }
+            if (sidecarConfig.CompanionPort.HasValue && sidecarConfig.CompanionPort.Value > 0)
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_PORT", Value = sidecarConfig.CompanionPort.Value.ToString() });
+            }
         }
         var sidecarContainer = sidecarConfig != null ? BuildSidecarContainer(sidecarConfig, normPersonaId) : null;
 
@@ -560,6 +572,18 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             env.Add(new V1EnvVar { Name = "SIDECAR_ENABLED", Value = "true" });
             env.Add(new V1EnvVar { Name = "SIDECAR_TYPE", Value = sidecarConfig.Type });
             env.Add(new V1EnvVar { Name = "SIDECAR_USERSPACE", Value = sidecarConfig.UserspaceMode ? "true" : "false" });
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionSetup))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_SETUP", Value = sidecarConfig.CompanionSetup });
+            }
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionCommand))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_COMMAND", Value = sidecarConfig.CompanionCommand });
+            }
+            if (sidecarConfig.CompanionPort.HasValue && sidecarConfig.CompanionPort.Value > 0)
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_PORT", Value = sidecarConfig.CompanionPort.Value.ToString() });
+            }
         }
         var sidecarContainer = sidecarConfig != null ? BuildSidecarContainer(sidecarConfig, normPersonaId) : null;
 
@@ -1774,7 +1798,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         return null;
     }
 
-    private static V1Container? BuildSidecarContainer(DriverSidecarConfig sidecar, string normPersonaId)
+    public static V1Container? BuildSidecarContainer(DriverSidecarConfig sidecar, string normPersonaId)
     {
         if (!sidecar.Enabled) return null;
 
@@ -1813,6 +1837,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         var tsEnv = new List<V1EnvVar>
         {
+            // Explicitly disable Kubernetes Secret storage so containerboot runs in ephemeral mode
+            // without requiring cluster RBAC permissions on secrets or events.
+            new() { Name = "TS_KUBE_SECRET", Value = "" },
             new() { Name = "TS_EXTRA_ARGS", Value = extraArgsSb.ToString().Trim() },
             new() { Name = "TS_USERSPACE", Value = sidecar.UserspaceMode ? "true" : "false" }
         };
@@ -1838,6 +1865,15 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             tsEnv.Add(new V1EnvVar { Name = "TS_AUTHKEY", Value = sidecar.AuthKey });
         }
 
+        if (sidecar.EnvironmentVariables != null)
+        {
+            foreach (var (k, v) in sidecar.EnvironmentVariables)
+            {
+                tsEnv.RemoveAll(e => string.Equals(e.Name, k, StringComparison.OrdinalIgnoreCase));
+                tsEnv.Add(new V1EnvVar { Name = k, Value = v });
+            }
+        }
+
         var sidecarContainer = new V1Container
         {
             Name = "driver-sidecar",
@@ -1860,7 +1896,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         return sidecarContainer;
     }
 
-    private static V1Volume BuildTunVolume()
+    public static V1Volume BuildTunVolume()
     {
         return new V1Volume
         {
@@ -1873,7 +1909,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         };
     }
 
-    private static object BuildSidecarPatchObject(V1Container sidecarContainer)
+    public static object BuildSidecarPatchObject(V1Container sidecarContainer)
     {
         var scEnv = sidecarContainer.Env?.Select(e => new
         {

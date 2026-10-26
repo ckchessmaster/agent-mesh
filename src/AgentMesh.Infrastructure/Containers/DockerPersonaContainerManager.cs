@@ -283,6 +283,18 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             envList.Add("SIDECAR_ENABLED=true");
             envList.Add($"SIDECAR_TYPE={sidecarConfig.Type}");
             envList.Add($"SIDECAR_USERSPACE={(sidecarConfig.UserspaceMode ? "true" : "false")}");
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionSetup))
+            {
+                envList.Add($"COMPANION_SETUP={sidecarConfig.CompanionSetup}");
+            }
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionCommand))
+            {
+                envList.Add($"COMPANION_COMMAND={sidecarConfig.CompanionCommand}");
+            }
+            if (sidecarConfig.CompanionPort.HasValue && sidecarConfig.CompanionPort.Value > 0)
+            {
+                envList.Add($"COMPANION_PORT={sidecarConfig.CompanionPort.Value}");
+            }
         }
 
         var forwardedVars = new[]
@@ -1385,8 +1397,16 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     {
                         sb.Append($"-e \"TS_AUTHKEY={sidecar.AuthKey}\" ");
                     }
+                    sb.Append($"-e \"TS_KUBE_SECRET=\" ");
                     sb.Append($"-e \"TS_EXTRA_ARGS=--ephemeral --hostname=mesh-probe\" ");
                     sb.Append($"-e \"TS_USERSPACE={(sidecar.UserspaceMode ? "true" : "false")}\" ");
+                    if (sidecar.EnvironmentVariables != null)
+                    {
+                        foreach (var (k, v) in sidecar.EnvironmentVariables)
+                        {
+                            sb.Append($"-e \"{k}={v}\" ");
+                        }
+                    }
                 }
                 sb.Append(sidecarImage);
                 await RunCliAsync(_detectedCli, sb.ToString(), ct);
@@ -1509,11 +1529,21 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 extraArgsSb.Append($" {sidecar.ExtraArgs}");
             }
 
+            sidecarEnv.Add("TS_KUBE_SECRET=");
             sidecarEnv.Add($"TS_EXTRA_ARGS={extraArgsSb.ToString().Trim()}");
             sidecarEnv.Add($"TS_USERSPACE={(sidecar.UserspaceMode ? "true" : "false")}");
             if (!string.IsNullOrWhiteSpace(sidecar.AuthKey))
             {
                 sidecarEnv.Add($"TS_AUTHKEY={sidecar.AuthKey}");
+            }
+
+            if (sidecar.EnvironmentVariables != null)
+            {
+                foreach (var (k, v) in sidecar.EnvironmentVariables)
+                {
+                    sidecarEnv.RemoveAll(e => e.StartsWith($"{k}=", StringComparison.OrdinalIgnoreCase));
+                    sidecarEnv.Add($"{k}={v}");
+                }
             }
         }
         else if (sidecar.EnvironmentVariables != null)

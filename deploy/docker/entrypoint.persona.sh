@@ -66,6 +66,63 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
     fi
 fi
 
+# Ensure persistent workspace state directories exist
+mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
+
+# Symlink ~/.config to workspace state so any tool using standard XDG paths persists state
+if [ ! -L /root/.config ]; then
+    mkdir -p /root/.config
+    cp -rn /root/.config/* /workspace/.agentmesh/state/.config/ 2>/dev/null || true
+    rm -rf /root/.config
+    ln -s /workspace/.agentmesh/state/.config /root/.config
+fi
+
+# Symlink ~/.aip to workspace state so aip credentials survive container restarts
+if [ ! -L /root/.aip ]; then
+    mkdir -p /root/.aip
+    cp -rn /root/.aip/* /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
+    rm -rf /root/.aip
+    ln -s /workspace/.agentmesh/state/.aip /root/.aip
+fi
+
+# Run companion setup script if configured (e.g. install aip helper)
+if [ -n "$COMPANION_SETUP" ]; then
+    echo "Executing companion setup script..."
+    eval "$COMPANION_SETUP" || echo "Warning: Companion setup exited with code $?"
+fi
+
+# Start companion background daemon if configured (e.g. aip proxy)
+if [ -n "$COMPANION_COMMAND" ]; then
+    echo "Starting companion daemon: $COMPANION_COMMAND"
+    eval "$COMPANION_COMMAND" &
+    COMPANION_PID=$!
+fi
+
+# Await companion daemon readiness port if configured
+if [ -n "$COMPANION_PORT" ]; then
+    echo "Waiting for companion daemon on port $COMPANION_PORT..."
+    PORT_READY=0
+    for i in {1..30}; do
+        if timeout 1 bash -c "</dev/tcp/127.0.0.1/$COMPANION_PORT" >/dev/null 2>&1 || \
+           curl -s "http://127.0.0.1:$COMPANION_PORT/" >/dev/null 2>&1; then
+            echo "Companion daemon ready on port $COMPANION_PORT."
+            PORT_READY=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$PORT_READY" -ne 1 ]; then
+        echo "Warning: Companion daemon did not respond on port $COMPANION_PORT within 30s. Proceeding..."
+    fi
+fi
+
+cleanup() {
+    if [ -n "$COMPANION_PID" ] && kill -0 "$COMPANION_PID" 2>/dev/null; then
+        kill "$COMPANION_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
 echo "=========================================================="
 echo " AgentMesh Dedicated Persona Environment"
 echo " Persona:   ${AGENTMESH_PERSONA_ID:-<undefined>}"
