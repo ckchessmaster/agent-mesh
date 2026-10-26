@@ -54,7 +54,7 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
     echo "Connectivity sidecar detected. Waiting for network readiness..."
     READY=0
     for i in {1..30}; do
-        if ip addr show tailscale0 >/dev/null 2>&1 || [ "$SIDECAR_USERSPACE" = "true" ]; then
+        if [ -d /sys/class/net/tailscale0 ] || grep -q "tailscale0:" /proc/net/dev 2>/dev/null || (command -v ip >/dev/null 2>&1 && ip addr show tailscale0 >/dev/null 2>&1) || [ "$SIDECAR_USERSPACE" = "true" ]; then
             echo "Connectivity sidecar network interface ready."
             READY=1
             break
@@ -63,6 +63,18 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
     done
     if [ "$READY" -ne 1 ]; then
         echo "Warning: Connectivity sidecar did not establish tailscale0 interface within 30s. Proceeding..."
+    fi
+
+    # When running Tailscale in tun mode, ensure MagicDNS (100.100.100.100) is configured in /etc/resolv.conf
+    if [ -d /sys/class/net/tailscale0 ] || grep -q "tailscale0:" /proc/net/dev 2>/dev/null || (command -v ip >/dev/null 2>&1 && ip addr show tailscale0 >/dev/null 2>&1); then
+        if ! grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+            CURRENT_RESOLV=$(cat /etc/resolv.conf 2>/dev/null || true)
+            {
+                echo "nameserver 100.100.100.100"
+                echo "$CURRENT_RESOLV"
+            } > /etc/resolv.conf 2>/dev/null || true
+            echo "Configured Tailscale MagicDNS resolver (100.100.100.100) in /etc/resolv.conf."
+        fi
     fi
 fi
 

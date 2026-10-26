@@ -1442,6 +1442,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     sb.Append($"-e \"TS_KUBE_SECRET=\" ");
                     sb.Append($"-e \"TS_EXTRA_ARGS=--hostname=mesh-probe\" ");
                     sb.Append($"-e \"TS_USERSPACE={(sidecar.UserspaceMode ? "true" : "false")}\" ");
+                    sb.Append($"-e \"TS_ACCEPT_DNS=true\" ");
                     if (sidecar.EnvironmentVariables != null)
                     {
                         foreach (var (k, v) in sidecar.EnvironmentVariables)
@@ -1578,6 +1579,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             sidecarEnv.Add("TS_KUBE_SECRET=");
             sidecarEnv.Add($"TS_EXTRA_ARGS={extraArgsSb.ToString().Trim()}");
             sidecarEnv.Add($"TS_USERSPACE={(sidecar.UserspaceMode ? "true" : "false")}");
+            sidecarEnv.Add("TS_ACCEPT_DNS=true");
             if (!string.IsNullOrWhiteSpace(sidecar.AuthKey))
             {
                 sidecarEnv.Add($"TS_AUTHKEY={sidecar.AuthKey}");

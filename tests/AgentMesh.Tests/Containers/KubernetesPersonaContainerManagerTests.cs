@@ -64,6 +64,10 @@ public class KubernetesPersonaContainerManagerTests
         extraArgsVar.Should().NotBeNull();
         extraArgsVar!.Value.Should().NotContain("--ephemeral");
         extraArgsVar.Value.Should().Contain("--hostname=mesh-astra");
+
+        var acceptDnsVar = container.Env.FirstOrDefault(e => e.Name == "TS_ACCEPT_DNS");
+        acceptDnsVar.Should().NotBeNull();
+        acceptDnsVar!.Value.Should().Be("true");
     }
 
     [Fact]

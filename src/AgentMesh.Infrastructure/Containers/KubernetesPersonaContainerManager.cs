@@ -1705,14 +1705,19 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 ? $"curl -s -f -m 10 -H 'Authorization: Bearer {apiKey.Trim()}' {modelsUrl}"
                 : $"curl -s -f -m 10 {modelsUrl}";
 
+            var probeScript = sidecar is { Enabled: true, UserspaceMode: false } && string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase)
+                ? $"for i in $(seq 1 30); do if [ -d /sys/class/net/tailscale0 ] || grep -q 'tailscale0:' /proc/net/dev 2>/dev/null; then if ! grep -q '100.100.100.100' /etc/resolv.conf 2>/dev/null; then R=$(cat /etc/resolv.conf 2>/dev/null); {{ echo 'nameserver 100.100.100.100'; echo \"$R\"; }} > /etc/resolv.conf 2>/dev/null || true; fi; break; fi; sleep 1; done; sleep 2 && {curlCmd} || exit 1"
+                : $"sleep 3 && {curlCmd} || exit 1";
+
             var probeContainer = new V1Container
             {
                 Name = "probe-runner",
                 Image = "curlimages/curl:latest",
+                SecurityContext = new V1SecurityContext { RunAsUser = 0 },
                 Command = new List<string> { "sh", "-c" },
                 Args = new List<string>
                 {
-                    $"sleep 3 && {curlCmd} || exit 1"
+                    probeScript
                 }
             };
 
@@ -1894,7 +1899,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             // without requiring cluster RBAC permissions on secrets or events.
             new() { Name = "TS_KUBE_SECRET", Value = "" },
             new() { Name = "TS_EXTRA_ARGS", Value = extraArgsSb.ToString().Trim() },
-            new() { Name = "TS_USERSPACE", Value = sidecar.UserspaceMode ? "true" : "false" }
+            new() { Name = "TS_USERSPACE", Value = sidecar.UserspaceMode ? "true" : "false" },
+            new() { Name = "TS_ACCEPT_DNS", Value = "true" }
         };
 
         if (!string.IsNullOrWhiteSpace(sidecar.SecretRefName))
