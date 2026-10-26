@@ -1,6 +1,10 @@
 using AgentMesh.Api.Controllers;
+using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
+using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Mvc;
+using Moq;
 
 namespace AgentMesh.Tests.Controllers;
 
@@ -67,5 +71,92 @@ public class SystemControllerTests
         var res = okResult.Value.Should().BeOfType<TestOpenAiServerResponse>().Subject;
         res.Success.Should().BeFalse();
         res.Error.Should().NotBeNullOrWhiteSpace();
+    }
+
+    [Fact]
+    public async Task TestOpenAiServer_WithSidecarEnabled_DelegatesToContainerManager()
+    {
+        var mockManager = new Mock<IPersonaContainerManager>();
+        var sidecar = new DriverSidecarConfig
+        {
+            Enabled = true,
+            Type = "tailscale",
+            AuthKey = "tskey-12345"
+        };
+
+        mockManager.Setup(m => m.TestDriverEndpointAsync(
+                "http://private-llm.mesh:8000/v1",
+                "secret-api-key",
+                sidecar,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DriverEndpointTestResult(
+                Success: true,
+                StatusCode: 200,
+                ResponseBody: """{"data":[{"id":"qwen3-coder"}]}""",
+                ErrorMessage: null,
+                AvailableModels: new List<string> { "qwen3-coder" }));
+
+        var req = new TestOpenAiServerRequest(
+            Endpoint: "http://private-llm.mesh:8000/v1",
+            ApiKey: "secret-api-key",
+            Sidecar: sidecar);
+
+        var actionResult = await _controller.TestOpenAiServer(req, db: null, containerManager: mockManager.Object);
+        var okResult = actionResult.Should().BeOfType<OkObjectResult>().Subject;
+        var res = okResult.Value.Should().BeOfType<TestOpenAiServerResponse>().Subject;
+
+        res.Success.Should().BeTrue();
+        res.Models.Should().ContainSingle(m => m.Id == "qwen3-coder");
+        mockManager.VerifyAll();
+    }
+
+    [Fact]
+    public async Task TestOpenAiServer_WithSidecarAndAgentId_ResolvesStoredSecrets()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Agents.Add(new Agent
+        {
+            Id = "private-driver",
+            Name = "Private Driver",
+            Role = "Autonomous Agent",
+            Status = "online",
+            CapabilitiesJson = """
+            {
+              "apiKey": "db-api-key",
+              "sidecar": {
+                "enabled": true,
+                "type": "tailscale",
+                "authKey": "db-tailscale-key"
+              }
+            }
+            """
+        });
+        await db.SaveChangesAsync();
+
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.TestDriverEndpointAsync(
+                "http://100.64.0.1:8000/v1",
+                "db-api-key",
+                It.Is<DriverSidecarConfig>(sc => sc.AuthKey == "db-tailscale-key"),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DriverEndpointTestResult(
+                Success: true,
+                StatusCode: 200,
+                AvailableModels: new List<string> { "deepseek-coder" }));
+
+        // Request has empty ApiKey and empty AuthKey, but passes AgentId
+        var req = new TestOpenAiServerRequest(
+            Endpoint: "http://100.64.0.1:8000/v1",
+            ApiKey: "",
+            Sidecar: new DriverSidecarConfig { Enabled = true, Type = "tailscale", AuthKey = "" },
+            AgentId: "private-driver");
+
+        var actionResult = await _controller.TestOpenAiServer(req, db: db, containerManager: mockManager.Object);
+        var okResult = actionResult.Should().BeOfType<OkObjectResult>().Subject;
+        var res = okResult.Value.Should().BeOfType<TestOpenAiServerResponse>().Subject;
+
+        res.Success.Should().BeTrue();
+        res.Models.Should().ContainSingle(m => m.Id == "deepseek-coder");
+        mockManager.VerifyAll();
     }
 }

@@ -123,7 +123,8 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       const res = await api.testOpenAiServer({
         endpoint: endpoint.trim(),
         apiKey: apiKey.trim() || undefined,
-        sidecar: activeSidecar
+        sidecar: activeSidecar,
+        agentId: agent.id
       });
 
       if (res.success) {

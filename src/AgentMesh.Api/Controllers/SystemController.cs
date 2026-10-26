@@ -3,8 +3,10 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace AgentMesh.Api.Controllers;
 
@@ -173,6 +175,7 @@ public class SystemController : ControllerBase
     [HttpPost("drivers/test-openai")]
     public async Task<IActionResult> TestOpenAiServer(
         [FromBody] TestOpenAiServerRequest req,
+        [FromServices] AgentMeshDbContext? db = null,
         [FromServices] IPersonaContainerManager? containerManager = null,
         CancellationToken ct = default)
     {
@@ -181,11 +184,44 @@ public class SystemController : ControllerBase
             return BadRequest(new TestOpenAiServerResponse(false, "Endpoint URL is required.", new()));
         }
 
-        if (req.Sidecar != null && req.Sidecar.Enabled && containerManager != null)
+        var effectiveApiKey = req.ApiKey;
+        var effectiveSidecar = req.Sidecar;
+
+        if (db != null && !string.IsNullOrWhiteSpace(req.AgentId))
         {
             try
             {
-                var sidecarResult = await containerManager.TestDriverEndpointAsync(req.Endpoint, req.ApiKey, req.Sidecar, ct);
+                var normalizedId = req.AgentId.Trim().TrimStart('@').ToLowerInvariant();
+                var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+                if (agent != null && !string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(agent.CapabilitiesJson);
+                    if (string.IsNullOrWhiteSpace(effectiveApiKey) &&
+                        doc.RootElement.TryGetProperty("apiKey", out var keyProp) &&
+                        keyProp.ValueKind == System.Text.Json.JsonValueKind.String)
+                    {
+                        effectiveApiKey = keyProp.GetString();
+                    }
+
+                    if (effectiveSidecar != null && effectiveSidecar.Enabled &&
+                        string.IsNullOrWhiteSpace(effectiveSidecar.AuthKey) &&
+                        doc.RootElement.TryGetProperty("sidecar", out var scProp) &&
+                        scProp.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                        scProp.TryGetProperty("authKey", out var scKeyProp) &&
+                        scKeyProp.ValueKind == System.Text.Json.JsonValueKind.String)
+                    {
+                        effectiveSidecar.AuthKey = scKeyProp.GetString();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (effectiveSidecar != null && effectiveSidecar.Enabled && containerManager != null)
+        {
+            try
+            {
+                var sidecarResult = await containerManager.TestDriverEndpointAsync(req.Endpoint, effectiveApiKey, effectiveSidecar, ct);
                 if (!sidecarResult.Success)
                 {
                     return Ok(new TestOpenAiServerResponse(false, sidecarResult.ErrorMessage ?? "Sidecar endpoint test failed.", new()));
@@ -212,12 +248,12 @@ public class SystemController : ControllerBase
                 : $"{baseEndpoint}/models";
 
             using var httpReq = new HttpRequestMessage(HttpMethod.Get, modelsUrl);
-            if (!string.IsNullOrWhiteSpace(req.ApiKey))
+            if (!string.IsNullOrWhiteSpace(effectiveApiKey))
             {
-                httpReq.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", req.ApiKey.Trim());
+                httpReq.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", effectiveApiKey.Trim());
             }
 
-            using var res = await client.SendAsync(httpReq);
+            using var res = await client.SendAsync(httpReq, ct);
             if (!res.IsSuccessStatusCode)
             {
                 return Ok(new TestOpenAiServerResponse(false, $"Server returned HTTP {(int)res.StatusCode} ({res.ReasonPhrase})", new()));
@@ -456,7 +492,7 @@ public record SystemCapabilitiesResponse(
     Dictionary<string, RuntimeCapabilitiesDto> AgentRuntimes
 );
 
-public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null, DriverSidecarConfig? Sidecar = null);
+public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null, DriverSidecarConfig? Sidecar = null, string? AgentId = null);
 
 public record OpenAiModelItemDto(string Id, string Name);
 

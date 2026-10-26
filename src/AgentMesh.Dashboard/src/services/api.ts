@@ -95,7 +95,7 @@ export const api = {
     return res.json();
   },
 
-  async testOpenAiServer(req: { endpoint: string; apiKey?: string; sidecar?: DriverSidecarConfig | null }): Promise<{ success: boolean; error?: string; models: { id: string; name: string }[] }> {
+  async testOpenAiServer(req: { endpoint: string; apiKey?: string; sidecar?: DriverSidecarConfig | null; agentId?: string }): Promise<{ success: boolean; error?: string; models: { id: string; name: string }[] }> {
     const res = await apiFetch('/api/system/drivers/test-openai', {
       method: 'POST',
       headers: getHeaders(),
