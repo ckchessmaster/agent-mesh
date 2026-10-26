@@ -69,19 +69,20 @@ fi
 # Ensure persistent workspace state directories exist
 mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
 
-# Symlink ~/.aip and ~/.config/aip to workspace state so credentials survive container restarts
+# Symlink ~/.config to workspace state so any tool using standard XDG paths persists state
+if [ ! -L /root/.config ]; then
+    mkdir -p /root/.config
+    cp -rn /root/.config/* /workspace/.agentmesh/state/.config/ 2>/dev/null || true
+    rm -rf /root/.config
+    ln -s /workspace/.agentmesh/state/.config /root/.config
+fi
+
+# Symlink ~/.aip to workspace state so aip credentials survive container restarts
 if [ ! -L /root/.aip ]; then
     mkdir -p /root/.aip
     cp -rn /root/.aip/* /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
     rm -rf /root/.aip
     ln -s /workspace/.agentmesh/state/.aip /root/.aip
-fi
-
-if [ ! -L /root/.config/aip ]; then
-    mkdir -p /root/.config /workspace/.agentmesh/state/.config/aip
-    cp -rn /root/.config/aip/* /workspace/.agentmesh/state/.config/aip/ 2>/dev/null || true
-    rm -rf /root/.config/aip
-    ln -s /workspace/.agentmesh/state/.config/aip /root/.config/aip
 fi
 
 # Run companion setup script if configured (e.g. install aip helper)
