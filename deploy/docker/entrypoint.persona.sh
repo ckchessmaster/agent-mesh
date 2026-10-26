@@ -49,6 +49,23 @@ if [ -n "$GIT_AUTHOR_EMAIL" ]; then
     git config --global user.email "$GIT_AUTHOR_EMAIL" 2>/dev/null || true
 fi
 
+# Wait for connectivity sidecar if configured
+if [ "$SIDECAR_ENABLED" = "true" ]; then
+    echo "Connectivity sidecar detected. Waiting for network readiness..."
+    READY=0
+    for i in {1..30}; do
+        if ip addr show tailscale0 >/dev/null 2>&1 || [ "$SIDECAR_USERSPACE" = "true" ]; then
+            echo "Connectivity sidecar network interface ready."
+            READY=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$READY" -ne 1 ]; then
+        echo "Warning: Connectivity sidecar did not establish tailscale0 interface within 30s. Proceeding..."
+    fi
+fi
+
 echo "=========================================================="
 echo " AgentMesh Dedicated Persona Environment"
 echo " Persona:   ${AGENTMESH_PERSONA_ID:-<undefined>}"

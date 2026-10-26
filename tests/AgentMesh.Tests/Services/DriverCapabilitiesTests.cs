@@ -1,4 +1,4 @@
-﻿using AgentMesh.Api.Services;
+using AgentMesh.Api.Services;
 using FluentAssertions;
 using System.Text.Json;
 using Xunit;
@@ -186,5 +186,67 @@ public class DriverCapabilitiesTests
         // The dashboard writes `defaultModel`; older CLI blobs may omit it entirely.
         DriverCapabilities.Parse("""{"defaultModel":"m1"}""").DefaultModel.Should().Be("m1");
         DriverCapabilities.Parse("""{"adapter":"openai"}""").DefaultModel.Should().BeNull();
+    }
+
+    [Fact]
+    public void Parse_SidecarConfig_MasksAuthKeyAndSetsHasSidecarAuthKey()
+    {
+        var json = """
+        {
+          "adapter": "openai",
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "tskey-auth-secret-12345",
+            "hostname": "mesh-qwen",
+            "userspaceMode": true
+          }
+        }
+        """;
+
+        var cfg = DriverCapabilities.Parse(json);
+
+        cfg.Sidecar.Should().NotBeNull();
+        cfg.Sidecar!.Enabled.Should().BeTrue();
+        cfg.Sidecar.Type.Should().Be("tailscale");
+        cfg.Sidecar.Hostname.Should().Be("mesh-qwen");
+        cfg.Sidecar.UserspaceMode.Should().BeTrue();
+        cfg.Sidecar.AuthKey.Should().BeNull("sensitive auth key must be masked on dashboard view");
+        cfg.HasSidecarAuthKey.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Merge_PreservesExistingSidecarAuthKey_WhenIncomingOmitsOrBlank()
+    {
+        var existing = """
+        {
+          "adapter": "openai",
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "tskey-auth-secret-12345",
+            "hostname": "mesh-qwen"
+          }
+        }
+        """;
+
+        var patch = """
+        {
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "",
+            "hostname": "mesh-qwen-updated"
+          }
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        merged.Should().NotBeNull();
+
+        var parsed = System.Text.Json.JsonDocument.Parse(merged!);
+        var sidecarObj = parsed.RootElement.GetProperty("sidecar");
+        sidecarObj.GetProperty("hostname").GetString().Should().Be("mesh-qwen-updated");
+        sidecarObj.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret-12345");
     }
 }

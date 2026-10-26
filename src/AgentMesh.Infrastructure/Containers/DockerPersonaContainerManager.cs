@@ -1303,6 +1303,118 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         return (proc.ExitCode, stdout.Trim(), stderr.Trim());
     }
 
+    public async Task<DriverEndpointTestResult> TestDriverEndpointAsync(
+        string endpoint,
+        string? apiKey,
+        DriverSidecarConfig? sidecar,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint))
+        {
+            return new DriverEndpointTestResult(false, 400, null, "Endpoint URL is required.");
+        }
+
+        var baseEndpoint = endpoint.Trim().TrimEnd('/');
+        var modelsUrl = baseEndpoint.EndsWith("/models", StringComparison.OrdinalIgnoreCase)
+            ? baseEndpoint
+            : $"{baseEndpoint}/models";
+
+        // If sidecar is not enabled, perform direct HTTP probe
+        if (sidecar == null || !sidecar.Enabled)
+        {
+            try
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+                using var req = new HttpRequestMessage(HttpMethod.Get, modelsUrl);
+                if (!string.IsNullOrWhiteSpace(apiKey))
+                {
+                    req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey.Trim());
+                }
+
+                using var res = await client.SendAsync(req, ct);
+                var body = await res.Content.ReadAsStringAsync(ct);
+                var models = ParseModelsFromBody(body);
+                return new DriverEndpointTestResult(res.IsSuccessStatusCode, (int)res.StatusCode, body, res.IsSuccessStatusCode ? null : $"HTTP {(int)res.StatusCode}: {res.ReasonPhrase}", models);
+            }
+            catch (Exception ex)
+            {
+                return new DriverEndpointTestResult(false, 0, null, $"Connection failed: {ex.Message}");
+            }
+        }
+
+        // With docker/cli runtime
+        if (!string.IsNullOrWhiteSpace(_detectedCli))
+        {
+            var sidecarName = $"mesh-test-sidecar-{Guid.NewGuid():N}"[..24];
+            try
+            {
+                var sidecarImage = !string.IsNullOrWhiteSpace(sidecar.Image) ? sidecar.Image :
+                    string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase) ? "tailscale/tailscale:v1.78.1" : "alpine:latest";
+
+                var sb = new StringBuilder($"run -d --name {sidecarName} --rm ");
+                if (string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!sidecar.UserspaceMode)
+                    {
+                        sb.Append("--cap-add=NET_ADMIN --device=/dev/net/tun ");
+                    }
+                    if (!string.IsNullOrWhiteSpace(sidecar.AuthKey))
+                    {
+                        sb.Append($"-e \"TS_AUTHKEY={sidecar.AuthKey}\" ");
+                    }
+                    sb.Append($"-e \"TS_EXTRA_ARGS=--ephemeral --hostname=mesh-probe\" ");
+                    sb.Append($"-e \"TS_USERSPACE={(sidecar.UserspaceMode ? "true" : "false")}\" ");
+                }
+                sb.Append(sidecarImage);
+                await RunCliAsync(_detectedCli, sb.ToString(), ct);
+
+                var curlCmd = !string.IsNullOrWhiteSpace(apiKey)
+                    ? $"curl -s -f -m 10 -H 'Authorization: Bearer {apiKey.Trim()}' {modelsUrl}"
+                    : $"curl -s -f -m 10 {modelsUrl}";
+
+                var probeArgs = $"run --rm --net=container:{sidecarName} curlimages/curl:latest sh -c \"sleep 3 && {curlCmd}\"";
+                var (probeExit, probeOut, probeErr) = await RunCliAsync(_detectedCli, probeArgs, ct);
+                var success = probeExit == 0;
+                var models = ParseModelsFromBody(probeOut);
+                return new DriverEndpointTestResult(success, success ? 200 : 500, probeOut, success ? null : probeErr, models);
+            }
+            catch (Exception ex)
+            {
+                return new DriverEndpointTestResult(false, 0, null, $"Docker sidecar probe failed: {ex.Message}");
+            }
+            finally
+            {
+                try { await RunCliAsync(_detectedCli, $"rm -f {sidecarName}", CancellationToken.None); } catch { }
+            }
+        }
+
+        return new DriverEndpointTestResult(false, 0, null, "No container runtime available for sidecar probe.");
+    }
+
+    private static List<string>? ParseModelsFromBody(string? body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("data", out var dataArr) && dataArr.ValueKind == JsonValueKind.Array)
+            {
+                var list = new List<string>();
+                foreach (var el in dataArr.EnumerateArray())
+                {
+                    if (el.TryGetProperty("id", out var idProp))
+                    {
+                        var id = idProp.GetString();
+                        if (!string.IsNullOrWhiteSpace(id)) list.Add(id);
+                    }
+                }
+                return list;
+            }
+        }
+        catch { }
+        return null;
+    }
+
     private sealed class ActiveAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl) : IAsyncDisposable
     {
         public Process Process { get; } = process;
