@@ -1825,7 +1825,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         var hostname = !string.IsNullOrWhiteSpace(sidecar.Hostname) ? sidecar.Hostname : $"mesh-{normPersonaId}";
         var extraArgsSb = new StringBuilder();
-        extraArgsSb.Append($"--ephemeral --hostname={hostname}");
+        extraArgsSb.Append($"--hostname={hostname}");
         if (!string.IsNullOrWhiteSpace(sidecar.Tags))
         {
             extraArgsSb.Append($" --advertise-tags={sidecar.Tags}");
