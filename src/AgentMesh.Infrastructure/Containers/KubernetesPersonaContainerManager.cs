@@ -286,6 +286,18 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             env.Add(new V1EnvVar { Name = "SIDECAR_ENABLED", Value = "true" });
             env.Add(new V1EnvVar { Name = "SIDECAR_TYPE", Value = sidecarConfig.Type });
             env.Add(new V1EnvVar { Name = "SIDECAR_USERSPACE", Value = sidecarConfig.UserspaceMode ? "true" : "false" });
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionSetup))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_SETUP", Value = sidecarConfig.CompanionSetup });
+            }
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionCommand))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_COMMAND", Value = sidecarConfig.CompanionCommand });
+            }
+            if (sidecarConfig.CompanionPort.HasValue && sidecarConfig.CompanionPort.Value > 0)
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_PORT", Value = sidecarConfig.CompanionPort.Value.ToString() });
+            }
         }
         var sidecarContainer = sidecarConfig != null ? BuildSidecarContainer(sidecarConfig, normPersonaId) : null;
 
@@ -560,6 +572,18 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             env.Add(new V1EnvVar { Name = "SIDECAR_ENABLED", Value = "true" });
             env.Add(new V1EnvVar { Name = "SIDECAR_TYPE", Value = sidecarConfig.Type });
             env.Add(new V1EnvVar { Name = "SIDECAR_USERSPACE", Value = sidecarConfig.UserspaceMode ? "true" : "false" });
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionSetup))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_SETUP", Value = sidecarConfig.CompanionSetup });
+            }
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionCommand))
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_COMMAND", Value = sidecarConfig.CompanionCommand });
+            }
+            if (sidecarConfig.CompanionPort.HasValue && sidecarConfig.CompanionPort.Value > 0)
+            {
+                env.Add(new V1EnvVar { Name = "COMPANION_PORT", Value = sidecarConfig.CompanionPort.Value.ToString() });
+            }
         }
         var sidecarContainer = sidecarConfig != null ? BuildSidecarContainer(sidecarConfig, normPersonaId) : null;
 

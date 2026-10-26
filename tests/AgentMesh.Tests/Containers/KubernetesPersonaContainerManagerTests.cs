@@ -174,4 +174,21 @@ public class KubernetesPersonaContainerManagerTests
         container.Args.Should().ContainSingle(a => a == "--verbose");
         container.Env.Should().ContainSingle(e => e.Name == "WG_PORT" && e.Value == "51820");
     }
+
+    [Fact]
+    public void DriverSidecarConfig_PreservesCompanionSettings()
+    {
+        var sidecar = new DriverSidecarConfig
+        {
+            Enabled = true,
+            Type = "tailscale",
+            CompanionSetup = "which aip >/dev/null 2>&1 || curl -fsSL https://fire.taild419e9.ts.net:12443/cli/install.sh | sh",
+            CompanionCommand = "aip proxy",
+            CompanionPort = 11435
+        };
+
+        sidecar.CompanionSetup.Should().Be("which aip >/dev/null 2>&1 || curl -fsSL https://fire.taild419e9.ts.net:12443/cli/install.sh | sh");
+        sidecar.CompanionCommand.Should().Be("aip proxy");
+        sidecar.CompanionPort.Should().Be(11435);
+    }
 }

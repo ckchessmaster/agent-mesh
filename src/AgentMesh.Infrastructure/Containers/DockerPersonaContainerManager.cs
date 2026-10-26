@@ -283,6 +283,18 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             envList.Add("SIDECAR_ENABLED=true");
             envList.Add($"SIDECAR_TYPE={sidecarConfig.Type}");
             envList.Add($"SIDECAR_USERSPACE={(sidecarConfig.UserspaceMode ? "true" : "false")}");
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionSetup))
+            {
+                envList.Add($"COMPANION_SETUP={sidecarConfig.CompanionSetup}");
+            }
+            if (!string.IsNullOrWhiteSpace(sidecarConfig.CompanionCommand))
+            {
+                envList.Add($"COMPANION_COMMAND={sidecarConfig.CompanionCommand}");
+            }
+            if (sidecarConfig.CompanionPort.HasValue && sidecarConfig.CompanionPort.Value > 0)
+            {
+                envList.Add($"COMPANION_PORT={sidecarConfig.CompanionPort.Value}");
+            }
         }
 
         var forwardedVars = new[]

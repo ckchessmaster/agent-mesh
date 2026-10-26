@@ -333,4 +333,41 @@ public class DriverCapabilitiesTests
         sidecarObj.GetProperty("enabled").GetBoolean().Should().BeTrue();
         sidecarObj.GetProperty("authKey").GetString().Should().Be("tskey-fresh");
     }
+
+    [Fact]
+    public void ParseAndMerge_PreservesCompanionDaemonSettings()
+    {
+        var existing = """
+        {
+          "adapter": "openai",
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "companionSetup": "curl -fsSL https://fire.taild419e9.ts.net:12443/cli/install.sh | sh",
+            "companionCommand": "aip proxy",
+            "companionPort": 11435
+          }
+        }
+        """;
+
+        var parsed = DriverCapabilities.Parse(existing);
+        parsed.Sidecar.Should().NotBeNull();
+        parsed.Sidecar!.CompanionSetup.Should().Be("curl -fsSL https://fire.taild419e9.ts.net:12443/cli/install.sh | sh");
+        parsed.Sidecar.CompanionCommand.Should().Be("aip proxy");
+        parsed.Sidecar.CompanionPort.Should().Be(11435);
+
+        var patch = """
+        {
+          "sidecar": {
+            "companionPort": 11436
+          }
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        var mergedParsed = DriverCapabilities.Parse(merged);
+        mergedParsed.Sidecar!.CompanionSetup.Should().Be("curl -fsSL https://fire.taild419e9.ts.net:12443/cli/install.sh | sh");
+        mergedParsed.Sidecar.CompanionCommand.Should().Be("aip proxy");
+        mergedParsed.Sidecar.CompanionPort.Should().Be(11436);
+    }
 }

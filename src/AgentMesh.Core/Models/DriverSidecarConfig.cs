@@ -44,4 +44,14 @@ public class DriverSidecarConfig
 
     [JsonPropertyName("environmentVariables")]
     public Dictionary<string, string>? EnvironmentVariables { get; set; }
+
+    // Companion proxy / daemon settings
+    [JsonPropertyName("companionSetup")]
+    public string? CompanionSetup { get; set; }
+
+    [JsonPropertyName("companionCommand")]
+    public string? CompanionCommand { get; set; }
+
+    [JsonPropertyName("companionPort")]
+    public int? CompanionPort { get; set; }
 }

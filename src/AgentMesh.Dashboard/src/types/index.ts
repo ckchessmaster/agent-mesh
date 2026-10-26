@@ -87,6 +87,9 @@ export interface DriverSidecarConfig {
   command?: string | null;
   arguments?: string[] | null;
   environmentVariables?: Record<string, string> | null;
+  companionSetup?: string | null;
+  companionCommand?: string | null;
+  companionPort?: number | null;
 }
 
 /**

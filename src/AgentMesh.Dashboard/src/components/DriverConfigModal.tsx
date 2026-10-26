@@ -92,6 +92,10 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [sidecarExtraArgs, setSidecarExtraArgs] = useState(config.sidecar?.extraArgs ?? '');
   const [sidecarImage, setSidecarImage] = useState(config.sidecar?.image ?? '');
   const [sidecarCommand, setSidecarCommand] = useState(config.sidecar?.command ?? '');
+  const [companionSetup, setCompanionSetup] = useState(config.sidecar?.companionSetup ?? '');
+  const [companionCommand, setCompanionCommand] = useState(config.sidecar?.companionCommand ?? '');
+  const [companionPort, setCompanionPort] = useState(config.sidecar?.companionPort ? String(config.sidecar.companionPort) : '');
+  const [companionExpanded, setCompanionExpanded] = useState(Boolean(config.sidecar?.companionCommand || config.sidecar?.companionSetup));
   const [sidecarExpanded, setSidecarExpanded] = useState(Boolean(config.sidecar?.enabled));
   const [isTestingEndpoint, setIsTestingEndpoint] = useState(false);
   const [endpointTestResult, setEndpointTestResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -116,7 +120,10 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
             userspaceMode: sidecarUserspace,
             extraArgs: sidecarExtraArgs.trim() || undefined,
             image: sidecarImage.trim() || undefined,
-            command: sidecarCommand.trim() || undefined
+            command: sidecarCommand.trim() || undefined,
+            companionSetup: companionSetup.trim() || undefined,
+            companionCommand: companionCommand.trim() || undefined,
+            companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined
           }
         : null;
 
@@ -224,7 +231,10 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         sidecarUserspace !== (config.sidecar?.userspaceMode ?? false) ||
         sidecarExtraArgs.trim() !== (config.sidecar?.extraArgs ?? '') ||
         sidecarImage.trim() !== (config.sidecar?.image ?? '') ||
-        sidecarCommand.trim() !== (config.sidecar?.command ?? '')
+        sidecarCommand.trim() !== (config.sidecar?.command ?? '') ||
+        companionSetup.trim() !== (config.sidecar?.companionSetup ?? '') ||
+        companionCommand.trim() !== (config.sidecar?.companionCommand ?? '') ||
+        (companionPort.trim() ? Number(companionPort.trim()) : undefined) !== (config.sidecar?.companionPort ?? undefined)
       ) {
         patch.sidecar = {
           enabled: sidecarEnabled,
@@ -235,7 +245,10 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
           userspaceMode: sidecarUserspace,
           extraArgs: sidecarExtraArgs.trim() || undefined,
           image: sidecarImage.trim() || undefined,
-          command: sidecarCommand.trim() || undefined
+          command: sidecarCommand.trim() || undefined,
+          companionSetup: companionSetup.trim() || undefined,
+          companionCommand: companionCommand.trim() || undefined,
+          companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined
         };
       }
     }
@@ -599,6 +612,74 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                             </div>
                           </div>
                         )}
+
+                        <div className="pt-2 border-t border-slate-800/80">
+                          <button
+                            type="button"
+                            onClick={() => setCompanionExpanded(!companionExpanded)}
+                            className="flex items-center justify-between w-full text-left py-1 text-slate-400 hover:text-slate-200 transition cursor-pointer"
+                          >
+                            <span className="text-[11px] font-medium text-slate-300">Companion Proxy &amp; Daemon (e.g. AIP Proxy / Token Refresh)</span>
+                            {companionExpanded ? <ChevronDown className="w-3 h-3 text-slate-400" /> : <ChevronRight className="w-3 h-3 text-slate-400" />}
+                          </button>
+
+                          {companionExpanded && (
+                            <div className="mt-2 space-y-2.5 pl-2 border-l border-slate-800">
+                              <div>
+                                <label className={labelClass} htmlFor="companion-setup">
+                                  Companion Setup Script (optional)
+                                </label>
+                                <input
+                                  id="companion-setup"
+                                  type="text"
+                                  value={companionSetup}
+                                  onChange={(e) => setCompanionSetup(e.target.value)}
+                                  placeholder="which aip >/dev/null 2>&1 || curl -fsSL https://.../install.sh | sh"
+                                  className={`${fieldClass} font-mono`}
+                                />
+                                <p className="text-[10px] text-slate-500 mt-1">
+                                  Runs synchronously on boot before starting daemons.
+                                </p>
+                              </div>
+                              <div className="grid grid-cols-3 gap-2">
+                                <div className="col-span-2">
+                                  <label className={labelClass} htmlFor="companion-cmd">
+                                    Companion Daemon Command (optional)
+                                  </label>
+                                  <input
+                                    id="companion-cmd"
+                                    type="text"
+                                    value={companionCommand}
+                                    onChange={(e) => setCompanionCommand(e.target.value)}
+                                    placeholder="aip proxy"
+                                    className={`${fieldClass} font-mono`}
+                                  />
+                                  <p className="text-[10px] text-slate-500 mt-1">
+                                    Background proxy/auth process.
+                                  </p>
+                                </div>
+                                <div>
+                                  <label className={labelClass} htmlFor="companion-port">
+                                    Ready Port (optional)
+                                  </label>
+                                  <input
+                                    id="companion-port"
+                                    type="number"
+                                    min={1}
+                                    max={65535}
+                                    value={companionPort}
+                                    onChange={(e) => setCompanionPort(e.target.value)}
+                                    placeholder="11435"
+                                    className={`${fieldClass} font-mono`}
+                                  />
+                                  <p className="text-[10px] text-slate-500 mt-1">
+                                    TCP port to await.
+                                  </p>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       </>
                     )}
                   </div>
