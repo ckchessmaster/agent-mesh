@@ -1,5 +1,6 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using AgentMesh.Core.Models;
 
 namespace AgentMesh.Api.Services;
 
@@ -7,7 +8,7 @@ namespace AgentMesh.Api.Services;
 /// A driver's capability blob, read out of the shape the dashboard needs.
 /// </summary>
 /// <remarks>
-/// Deliberately does not carry the API key. The blob stores it in plaintext at rest today; the
+/// Deliberately does not carry the API key or raw sidecar auth key. The blob stores it in plaintext at rest today; the
 /// dashboard only ever needs to know whether one is set so it can offer "leave unchanged".
 /// Surfacing the value here would put a secret into the browser bundle and the React tree.
 /// </remarks>
@@ -20,10 +21,12 @@ public record DriverCapabilitiesView(
     int? RetryDelayMilliseconds,
     int? MaxSteps,
     IReadOnlyList<string> Capabilities,
-    bool HasApiKey)
+    bool HasApiKey,
+    DriverSidecarConfig? Sidecar = null,
+    bool HasSidecarAuthKey = false)
 {
     public static readonly DriverCapabilitiesView Empty =
-        new(null, null, null, null, null, null, null, Array.Empty<string>(), false);
+        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false);
 }
 
 /// <summary>
@@ -90,6 +93,26 @@ public static class DriverCapabilities
         foreach (var (key, value) in incomingObj.AsObject())
         {
             if (value is null) continue; // absent, not cleared
+
+            if (key.Equals("sidecar", StringComparison.OrdinalIgnoreCase) &&
+                value is JsonObject incomingSidecar &&
+                existingObj[key] is JsonObject existingSidecar)
+            {
+                var mergedSidecar = existingSidecar.DeepClone().AsObject();
+                foreach (var (sKey, sVal) in incomingSidecar)
+                {
+                    if (sVal is null) continue;
+                    if (sKey.Equals("authKey", StringComparison.OrdinalIgnoreCase) &&
+                        string.IsNullOrWhiteSpace(sVal.GetValue<string?>()))
+                    {
+                        continue;
+                    }
+                    mergedSidecar[sKey] = sVal.DeepClone();
+                }
+                existingObj[key] = mergedSidecar;
+                continue;
+            }
+
             existingObj[key] = value.DeepClone();
         }
 
@@ -139,6 +162,22 @@ public static class DriverCapabilities
             ? ReadStringArray(capsArray)
             : Array.Empty<string>();
 
+        DriverSidecarConfig? sidecar = null;
+        var hasSidecarAuthKey = false;
+        if (obj.TryGetPropertyValue("sidecar", out var sidecarNode) && sidecarNode is JsonObject sidecarObj)
+        {
+            try
+            {
+                sidecar = JsonSerializer.Deserialize<DriverSidecarConfig>(sidecarObj.ToJsonString());
+                if (sidecar != null)
+                {
+                    hasSidecarAuthKey = !string.IsNullOrWhiteSpace(sidecar.AuthKey);
+                    sidecar.AuthKey = null; // Redact sensitive auth key from dashboard view
+                }
+            }
+            catch { }
+        }
+
         return new DriverCapabilitiesView(
             Adapter: ReadString(obj, "adapter"),
             Endpoint: ReadString(obj, "endpoint"),
@@ -148,7 +187,9 @@ public static class DriverCapabilities
             RetryDelayMilliseconds: ReadInt(obj, "retryDelayMilliseconds"),
             MaxSteps: ReadInt(obj, "maxSteps"),
             Capabilities: capabilities,
-            HasApiKey: !string.IsNullOrWhiteSpace(ReadString(obj, "apiKey")));
+            HasApiKey: !string.IsNullOrWhiteSpace(ReadString(obj, "apiKey")),
+            Sidecar: sidecar,
+            HasSidecarAuthKey: hasSidecarAuthKey);
     }
 
     private static IReadOnlyList<string> ReadStringArray(JsonArray array)

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { X, Save, Info, KeyRound, AlertTriangle, Trash2 } from 'lucide-react';
-import type { Agent, DriverConfig } from '../types';
+import { X, Save, Info, KeyRound, AlertTriangle, Trash2, Network, ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
+import type { Agent, DriverConfig, DriverSidecarConfig } from '../types';
+import { api } from '../services/api';
 
 interface DriverConfigModalProps {
   agent: Agent;
@@ -16,6 +17,7 @@ interface DriverConfigModalProps {
     maxRetries?: number;
     retryDelayMilliseconds?: number;
     maxSteps?: number;
+    sidecar?: DriverSidecarConfig;
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
 }
@@ -80,7 +82,70 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       ? ''
       : String(config.retryDelayMilliseconds)
   );
+
+  const [sidecarEnabled, setSidecarEnabled] = useState(config.sidecar?.enabled ?? false);
+  const [sidecarType, setSidecarType] = useState<'tailscale' | 'custom'>(config.sidecar?.type ?? 'tailscale');
+  const [sidecarAuthKey, setSidecarAuthKey] = useState('');
+  const [sidecarHostname, setSidecarHostname] = useState(config.sidecar?.hostname ?? '');
+  const [sidecarTags, setSidecarTags] = useState(config.sidecar?.tags ?? '');
+  const [sidecarUserspace, setSidecarUserspace] = useState(config.sidecar?.userspaceMode ?? false);
+  const [sidecarExtraArgs, setSidecarExtraArgs] = useState(config.sidecar?.extraArgs ?? '');
+  const [sidecarImage, setSidecarImage] = useState(config.sidecar?.image ?? '');
+  const [sidecarCommand, setSidecarCommand] = useState(config.sidecar?.command ?? '');
+  const [sidecarExpanded, setSidecarExpanded] = useState(Boolean(config.sidecar?.enabled));
+  const [isTestingEndpoint, setIsTestingEndpoint] = useState(false);
+  const [endpointTestResult, setEndpointTestResult] = useState<{ success: boolean; message: string } | null>(null);
+
   const [error, setError] = useState<string | null>(null);
+
+  const handleTestConnection = async () => {
+    if (!endpoint.trim()) {
+      setError('Endpoint URL is required to test connection.');
+      return;
+    }
+    setIsTestingEndpoint(true);
+    setEndpointTestResult(null);
+    try {
+      const activeSidecar: DriverSidecarConfig | null = sidecarEnabled
+        ? {
+            enabled: true,
+            type: sidecarType,
+            authKey: sidecarAuthKey.trim() || undefined,
+            hostname: sidecarHostname.trim() || undefined,
+            tags: sidecarTags.trim() || undefined,
+            userspaceMode: sidecarUserspace,
+            extraArgs: sidecarExtraArgs.trim() || undefined,
+            image: sidecarImage.trim() || undefined,
+            command: sidecarCommand.trim() || undefined
+          }
+        : null;
+
+      const res = await api.testOpenAiServer({
+        endpoint: endpoint.trim(),
+        apiKey: apiKey.trim() || undefined,
+        sidecar: activeSidecar
+      });
+
+      if (res.success) {
+        setEndpointTestResult({
+          success: true,
+          message: `Connected successfully! Found ${res.models?.length ?? 0} model(s).`
+        });
+      } else {
+        setEndpointTestResult({
+          success: false,
+          message: res.error || 'Connection failed.'
+        });
+      }
+    } catch (err: any) {
+      setEndpointTestResult({
+        success: false,
+        message: err?.message || 'Connection failed.'
+      });
+    } finally {
+      setIsTestingEndpoint(false);
+    }
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -147,6 +212,30 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         // delay blank explicitly means "keep using exponential backoff".
         if (parsed.state === 'empty' || parsed.value === effective) continue;
         (patch as Record<string, number>)[key] = parsed.value as number;
+      }
+
+      if (
+        sidecarEnabled !== (config.sidecar?.enabled ?? false) ||
+        sidecarType !== (config.sidecar?.type ?? 'tailscale') ||
+        sidecarAuthKey.trim() ||
+        sidecarHostname.trim() !== (config.sidecar?.hostname ?? '') ||
+        sidecarTags.trim() !== (config.sidecar?.tags ?? '') ||
+        sidecarUserspace !== (config.sidecar?.userspaceMode ?? false) ||
+        sidecarExtraArgs.trim() !== (config.sidecar?.extraArgs ?? '') ||
+        sidecarImage.trim() !== (config.sidecar?.image ?? '') ||
+        sidecarCommand.trim() !== (config.sidecar?.command ?? '')
+      ) {
+        patch.sidecar = {
+          enabled: sidecarEnabled,
+          type: sidecarType,
+          authKey: sidecarAuthKey.trim() || undefined,
+          hostname: sidecarHostname.trim() || undefined,
+          tags: sidecarTags.trim() || undefined,
+          userspaceMode: sidecarUserspace,
+          extraArgs: sidecarExtraArgs.trim() || undefined,
+          image: sidecarImage.trim() || undefined,
+          command: sidecarCommand.trim() || undefined
+        };
       }
     }
 
@@ -222,6 +311,22 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                   placeholder="http://localhost:11434/v1"
                   className={`${fieldClass} font-mono`}
                 />
+                <div className="flex items-center justify-between mt-1">
+                  <button
+                    type="button"
+                    disabled={isTestingEndpoint || !endpoint.trim()}
+                    onClick={handleTestConnection}
+                    className="text-[11px] font-medium text-sky-400 hover:text-sky-300 disabled:opacity-50 flex items-center gap-1 cursor-pointer"
+                  >
+                    {isTestingEndpoint ? <Loader2 className="w-3 h-3 animate-spin" /> : <Network className="w-3 h-3" />}
+                    <span>{isTestingEndpoint ? 'Testing reachability...' : 'Test Connection'}</span>
+                  </button>
+                  {endpointTestResult && (
+                    <span className={`text-[10px] ${endpointTestResult.success ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {endpointTestResult.message}
+                    </span>
+                  )}
+                </div>
               </div>
 
               <div>
@@ -332,6 +437,171 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                     </p>
                   </div>
                 </div>
+              </div>
+
+              <div className="pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setSidecarExpanded(!sidecarExpanded)}
+                  className="flex items-center justify-between w-full text-left py-1 text-slate-300 hover:text-white transition cursor-pointer"
+                >
+                  <div className="flex items-center gap-2">
+                    <Network className="w-3.5 h-3.5 text-sky-400" />
+                    <span className="text-xs font-semibold">Private Network & Sidecar (Tailscale / VPN)</span>
+                    {sidecarEnabled && (
+                      <span className="px-1.5 py-0.2 rounded bg-sky-950/80 border border-sky-600/40 text-[9px] font-mono text-sky-300">
+                        active
+                      </span>
+                    )}
+                  </div>
+                  {sidecarExpanded ? <ChevronDown className="w-3.5 h-3.5 text-slate-400" /> : <ChevronRight className="w-3.5 h-3.5 text-slate-400" />}
+                </button>
+
+                {sidecarExpanded && (
+                  <div className="mt-3 space-y-3 p-3 rounded-lg bg-slate-950/60 border border-slate-800">
+                    <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={sidecarEnabled}
+                        onChange={(e) => setSidecarEnabled(e.target.checked)}
+                        className="rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
+                      />
+                      <span>Enable Network Sidecar Container</span>
+                    </label>
+
+                    {sidecarEnabled && (
+                      <>
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="sidecarType"
+                              value="tailscale"
+                              checked={sidecarType === 'tailscale'}
+                              onChange={() => setSidecarType('tailscale')}
+                              className="text-sky-500"
+                            />
+                            <span>Tailscale</span>
+                          </label>
+                          <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="sidecarType"
+                              value="custom"
+                              checked={sidecarType === 'custom'}
+                              onChange={() => setSidecarType('custom')}
+                              className="text-sky-500"
+                            />
+                            <span>Custom Container</span>
+                          </label>
+                        </div>
+
+                        {sidecarType === 'tailscale' ? (
+                          <div className="space-y-2.5 pt-1">
+                            <div>
+                              <label className={labelClass} htmlFor="sidecar-authkey">
+                                Tailscale Auth Key
+                              </label>
+                              <div className="relative">
+                                <KeyRound className="w-3.5 h-3.5 text-slate-500 absolute left-2 top-1/2 -translate-y-1/2" />
+                                <input
+                                  id="sidecar-authkey"
+                                  type="password"
+                                  value={sidecarAuthKey}
+                                  onChange={(e) => setSidecarAuthKey(e.target.value)}
+                                  placeholder={config.hasSidecarAuthKey ? '•••••••••••• (stored — leave blank to keep)' : 'tskey-auth-...'}
+                                  className={`${fieldClass} pl-7 font-mono`}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2">
+                              <div>
+                                <label className={labelClass} htmlFor="sidecar-hostname">
+                                  Node Hostname (optional)
+                                </label>
+                                <input
+                                  id="sidecar-hostname"
+                                  type="text"
+                                  value={sidecarHostname}
+                                  onChange={(e) => setSidecarHostname(e.target.value)}
+                                  placeholder={`mesh-${agent.id}`}
+                                  className={`${fieldClass} font-mono`}
+                                />
+                              </div>
+                              <div>
+                                <label className={labelClass} htmlFor="sidecar-tags">
+                                  Advertise Tags (optional)
+                                </label>
+                                <input
+                                  id="sidecar-tags"
+                                  type="text"
+                                  value={sidecarTags}
+                                  onChange={(e) => setSidecarTags(e.target.value)}
+                                  placeholder="tag:agentmesh"
+                                  className={`${fieldClass} font-mono`}
+                                />
+                              </div>
+                            </div>
+
+                            <label className="flex items-center gap-2 text-[11px] text-slate-400 cursor-pointer pt-1">
+                              <input
+                                type="checkbox"
+                                checked={sidecarUserspace}
+                                onChange={(e) => setSidecarUserspace(e.target.checked)}
+                                className="rounded border-slate-700 bg-slate-900 text-sky-500"
+                              />
+                              <span>Userspace Mode (no NET_ADMIN / /dev/net/tun required)</span>
+                            </label>
+
+                            <div>
+                              <label className={labelClass} htmlFor="sidecar-extra-args">
+                                Extra Arguments (optional)
+                              </label>
+                              <input
+                                id="sidecar-extra-args"
+                                type="text"
+                                value={sidecarExtraArgs}
+                                onChange={(e) => setSidecarExtraArgs(e.target.value)}
+                                placeholder="--accept-routes"
+                                className={`${fieldClass} font-mono`}
+                              />
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="space-y-2 pt-1">
+                            <div>
+                              <label className={labelClass} htmlFor="sidecar-image">
+                                Sidecar Image
+                              </label>
+                              <input
+                                id="sidecar-image"
+                                type="text"
+                                value={sidecarImage}
+                                onChange={(e) => setSidecarImage(e.target.value)}
+                                placeholder="alpine:latest"
+                                className={`${fieldClass} font-mono`}
+                              />
+                            </div>
+                            <div>
+                              <label className={labelClass} htmlFor="sidecar-cmd">
+                                Command (optional)
+                              </label>
+                              <input
+                                id="sidecar-cmd"
+                                type="text"
+                                value={sidecarCommand}
+                                onChange={(e) => setSidecarCommand(e.target.value)}
+                                placeholder="e.g. /entrypoint.sh"
+                                className={`${fieldClass} font-mono`}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             </>
           )}

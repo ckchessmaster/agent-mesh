@@ -165,6 +165,14 @@ public class ConfigStore
                     {
                         preset.MaxSteps = msVal;
                     }
+                    if (root.TryGetProperty("sidecar", out var sc) && sc.ValueKind == JsonValueKind.Object)
+                    {
+                        try
+                        {
+                            preset.Sidecar = JsonSerializer.Deserialize<AgentMesh.Core.Models.DriverSidecarConfig>(sc.GetRawText());
+                        }
+                        catch { }
+                    }
                 }
             }
             catch { }

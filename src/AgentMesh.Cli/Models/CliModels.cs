@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using AgentMesh.Core.Models;
 
 namespace AgentMesh.Cli.Models;
 
@@ -34,6 +35,7 @@ public class AgentPresetConfig
     public int? MaxRetries { get; set; }
     public int? RetryDelayMilliseconds { get; set; }
     public int? MaxSteps { get; set; }
+    public DriverSidecarConfig? Sidecar { get; set; }
 }
 
 public class PromptReceivedEvent

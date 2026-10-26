@@ -280,6 +280,15 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var personaSecretName = $"agentmesh-persona-{normPersonaId}-creds";
         envFrom.Add(new V1EnvFromSource { SecretRef = new V1SecretEnvSource { Name = personaSecretName, Optional = true } });
 
+        var sidecarConfig = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
+        if (sidecarConfig != null && sidecarConfig.Enabled)
+        {
+            env.Add(new V1EnvVar { Name = "SIDECAR_ENABLED", Value = "true" });
+            env.Add(new V1EnvVar { Name = "SIDECAR_TYPE", Value = sidecarConfig.Type });
+            env.Add(new V1EnvVar { Name = "SIDECAR_USERSPACE", Value = sidecarConfig.UserspaceMode ? "true" : "false" });
+        }
+        var sidecarContainer = sidecarConfig != null ? BuildSidecarContainer(sidecarConfig, normPersonaId) : null;
+
         try
         {
             var deployment = await _client.AppsV1.ReadNamespacedDeploymentAsync(deploymentName, _namespace, cancellationToken: ct);
@@ -295,6 +304,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                   string.Equals(workspaceVolume.PersistentVolumeClaim.ClaimName, pvcName, StringComparison.OrdinalIgnoreCase);
             var hasCredsMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/etc/agentmesh-creds") == true;
             var hasCredsVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "persona-creds-volume") == true;
+            var hasSidecarContainer = deployment.Spec?.Template?.Spec?.Containers?.Any(c => c.Name == "driver-sidecar") == true;
+            var needsSidecarUpdate = (sidecarContainer != null) != hasSidecarContainer;
 
             var isScaledDown = (deployment.Spec?.Replicas ?? 0) == 0;
             var needsImageUpdate = runnerContainer != null && !string.Equals(currentImage, currentConfigImage, StringComparison.OrdinalIgnoreCase);
@@ -309,10 +320,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var currentStatus = await GetStatusAsync(personaId, ct);
             var isFailed = currentStatus.Status == "error";
 
-            if (isScaledDown || needsImageUpdate || needsPullPolicyUpdate || needsEnvUpdate || needsVolumeUpdate || isFailed)
+            if (isScaledDown || needsImageUpdate || needsPullPolicyUpdate || needsEnvUpdate || needsVolumeUpdate || isFailed || needsSidecarUpdate)
             {
-                _logger.LogInformation("Updating deployment {Name} for @{PersonaId}: Replicas=1, Image={Image} (was {OldImage}), EnvUpdated={EnvUpdated}, IsFailed={IsFailed}",
-                    deploymentName, personaId, currentConfigImage, currentImage, needsEnvUpdate, isFailed);
+                _logger.LogInformation("Updating deployment {Name} for @{PersonaId}: Replicas=1, Image={Image} (was {OldImage}), EnvUpdated={EnvUpdated}, IsFailed={IsFailed}, NeedsSidecar={NeedsSidecar}",
+                    deploymentName, personaId, currentConfigImage, currentImage, needsEnvUpdate, isFailed, needsSidecarUpdate);
 
                 var containerPatch = new Dictionary<string, object>
                 {
@@ -335,19 +346,31 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     containerPatch["imagePullPolicy"] = currentPullPolicy;
                 }
 
+                var containersPatchList = new List<object> { containerPatch };
+                if (sidecarContainer != null)
+                {
+                    containersPatchList.Add(BuildSidecarPatchObject(sidecarContainer));
+                }
+
+                var volumesPatchList = new List<object>
+                {
+                    new Dictionary<string, object?>
+                    {
+                        ["name"] = "workspace-storage",
+                        ["persistentVolumeClaim"] = new { claimName = pvcName },
+                        ["emptyDir"] = null
+                    },
+                    new { name = "persona-creds-volume", secret = new { secretName = personaSecretName, optional = true } }
+                };
+                if (sidecarConfig is { Enabled: true, UserspaceMode: false } && !string.Equals(sidecarConfig.Type, "custom", StringComparison.OrdinalIgnoreCase))
+                {
+                    volumesPatchList.Add(new { name = "tun-dev", hostPath = new { path = "/dev/net/tun", type = "CharDevice" } });
+                }
+
                 var podSpecPatch = new Dictionary<string, object>
                 {
-                    ["containers"] = new[] { containerPatch },
-                    ["volumes"] = new object[]
-                    {
-                        new Dictionary<string, object?>
-                        {
-                            ["name"] = "workspace-storage",
-                            ["persistentVolumeClaim"] = new { claimName = pvcName },
-                            ["emptyDir"] = null
-                        },
-                        new { name = "persona-creds-volume", secret = new { secretName = personaSecretName, optional = true } }
-                    }
+                    ["containers"] = containersPatchList.ToArray(),
+                    ["volumes"] = volumesPatchList.ToArray()
                 };
 
                 if (!string.IsNullOrWhiteSpace(currentImagePullSecret))
@@ -397,6 +420,44 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         _logger.LogInformation("Creating new deployment {Name} for @{PersonaId} in namespace {Namespace} with image {Image}", deploymentName, personaId, _namespace, currentConfigImage);
 
+        var containersList = new List<V1Container>
+        {
+            new()
+            {
+                Name = "persona-runner",
+                Image = currentConfigImage,
+                ImagePullPolicy = !string.IsNullOrWhiteSpace(currentPullPolicy) ? currentPullPolicy : null,
+                Env = env,
+                EnvFrom = envFrom,
+                VolumeMounts = new List<V1VolumeMount>
+                {
+                    new() { MountPath = "/workspace", Name = "workspace-storage" },
+                    new() { MountPath = "/etc/agentmesh-creds", Name = "persona-creds-volume", ReadOnlyProperty = true }
+                }
+            }
+        };
+        if (sidecarContainer != null)
+        {
+            containersList.Add(sidecarContainer);
+        }
+
+        var volumesList = new List<V1Volume>
+        {
+            new()
+            {
+                Name = "workspace-storage",
+                PersistentVolumeClaim = new V1PersistentVolumeClaimVolumeSource
+                {
+                    ClaimName = pvcName
+                }
+            },
+            new() { Name = "persona-creds-volume", Secret = new V1SecretVolumeSource { SecretName = personaSecretName, Optional = true } }
+        };
+        if (sidecarConfig is { Enabled: true, UserspaceMode: false } && !string.Equals(sidecarConfig.Type, "custom", StringComparison.OrdinalIgnoreCase))
+        {
+            volumesList.Add(BuildTunVolume());
+        }
+
         var newDeployment = new V1Deployment
         {
             Metadata = new V1ObjectMeta
@@ -418,34 +479,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         ImagePullSecrets = !string.IsNullOrWhiteSpace(currentImagePullSecret)
                             ? new List<V1LocalObjectReference> { new() { Name = currentImagePullSecret } }
                             : null,
-                        Containers = new List<V1Container>
-                        {
-                            new()
-                            {
-                                Name = "persona-runner",
-                                Image = currentConfigImage,
-                                ImagePullPolicy = !string.IsNullOrWhiteSpace(currentPullPolicy) ? currentPullPolicy : null,
-                                Env = env,
-                                EnvFrom = envFrom,
-                                VolumeMounts = new List<V1VolumeMount>
-                                {
-                                    new() { MountPath = "/workspace", Name = "workspace-storage" },
-                                    new() { MountPath = "/etc/agentmesh-creds", Name = "persona-creds-volume", ReadOnlyProperty = true }
-                                }
-                            }
-                        },
-                        Volumes = new List<V1Volume>
-                        {
-                            new()
-                            {
-                                Name = "workspace-storage",
-                                PersistentVolumeClaim = new V1PersistentVolumeClaimVolumeSource
-                                {
-                                    ClaimName = pvcName
-                                }
-                            },
-                            new() { Name = "persona-creds-volume", Secret = new V1SecretVolumeSource { SecretName = personaSecretName, Optional = true } }
-                        }
+                        Containers = containersList,
+                        Volumes = volumesList
                     }
                 }
             }
@@ -519,6 +554,15 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var personaSecretName = $"agentmesh-persona-{normPersonaId}-creds";
         envFrom.Add(new V1EnvFromSource { SecretRef = new V1SecretEnvSource { Name = personaSecretName, Optional = true } });
 
+        var sidecarConfig = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
+        if (sidecarConfig != null && sidecarConfig.Enabled)
+        {
+            env.Add(new V1EnvVar { Name = "SIDECAR_ENABLED", Value = "true" });
+            env.Add(new V1EnvVar { Name = "SIDECAR_TYPE", Value = sidecarConfig.Type });
+            env.Add(new V1EnvVar { Name = "SIDECAR_USERSPACE", Value = sidecarConfig.UserspaceMode ? "true" : "false" });
+        }
+        var sidecarContainer = sidecarConfig != null ? BuildSidecarContainer(sidecarConfig, normPersonaId) : null;
+
         var containerPatch = new Dictionary<string, object>
         {
             ["name"] = "persona-runner",
@@ -540,19 +584,31 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             containerPatch["imagePullPolicy"] = targetPullPolicy;
         }
 
+        var containersPatchList = new List<object> { containerPatch };
+        if (sidecarContainer != null)
+        {
+            containersPatchList.Add(BuildSidecarPatchObject(sidecarContainer));
+        }
+
+        var volumesPatchList = new List<object>
+        {
+            new Dictionary<string, object?>
+            {
+                ["name"] = "workspace-storage",
+                ["persistentVolumeClaim"] = new { claimName = pvcName },
+                ["emptyDir"] = null
+            },
+            new { name = "persona-creds-volume", secret = new { secretName = personaSecretName, optional = true } }
+        };
+        if (sidecarConfig is { Enabled: true, UserspaceMode: false } && !string.Equals(sidecarConfig.Type, "custom", StringComparison.OrdinalIgnoreCase))
+        {
+            volumesPatchList.Add(new { name = "tun-dev", hostPath = new { path = "/dev/net/tun", type = "CharDevice" } });
+        }
+
         var podSpecPatch = new Dictionary<string, object>
         {
-            ["containers"] = new[] { containerPatch },
-            ["volumes"] = new object[]
-            {
-                new Dictionary<string, object?>
-                {
-                    ["name"] = "workspace-storage",
-                    ["persistentVolumeClaim"] = new { claimName = pvcName },
-                    ["emptyDir"] = null
-                },
-                new { name = "persona-creds-volume", secret = new { secretName = personaSecretName, optional = true } }
-            }
+            ["containers"] = containersPatchList.ToArray(),
+            ["volumes"] = volumesPatchList.ToArray()
         };
 
         if (!string.IsNullOrWhiteSpace(targetPullSecret))
@@ -751,6 +807,44 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         else
         {
             steps.Add(new PersonaDriverVerificationStep("Kubernetes Pod Status", "failed", "Pod is not responding to exec"));
+        }
+
+        // Sidecar connectivity check if configured
+        var sidecar = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
+        if (sidecar != null && sidecar.Enabled)
+        {
+            if (string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase))
+            {
+                var (tsExit, tsOut, tsErr) = await ExecInContainerAsync(normPersonaId, "ip addr show tailscale0", ct);
+                if (tsExit == 0)
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Sidecar Connectivity",
+                        "success",
+                        "Tailscale network interface (tailscale0) is active"));
+                }
+                else if (sidecar.UserspaceMode)
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Sidecar Connectivity",
+                        "success",
+                        "Tailscale sidecar is configured in userspace mode"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Sidecar Connectivity",
+                        "warning",
+                        "Tailscale sidecar is starting up or tailscale0 interface is not yet ready"));
+                }
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Sidecar Connectivity",
+                    "success",
+                    $"Custom connectivity sidecar configured ({sidecar.Image ?? "custom"})"));
+            }
         }
 
         // 2. Binary presence check
@@ -1488,6 +1582,336 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             catch { }
             try { webSocket.Dispose(); } catch { }
         }
+    }
+
+    public async Task<DriverEndpointTestResult> TestDriverEndpointAsync(
+        string endpoint,
+        string? apiKey,
+        DriverSidecarConfig? sidecar,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint))
+        {
+            return new DriverEndpointTestResult(false, 400, null, "Endpoint URL is required.");
+        }
+
+        var baseEndpoint = endpoint.Trim().TrimEnd('/');
+        var modelsUrl = baseEndpoint.EndsWith("/models", StringComparison.OrdinalIgnoreCase)
+            ? baseEndpoint
+            : $"{baseEndpoint}/models";
+
+        // Direct HTTP probe if no sidecar
+        if (sidecar == null || !sidecar.Enabled)
+        {
+            try
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+                using var req = new HttpRequestMessage(HttpMethod.Get, modelsUrl);
+                if (!string.IsNullOrWhiteSpace(apiKey))
+                {
+                    req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey.Trim());
+                }
+
+                using var res = await client.SendAsync(req, ct);
+                var body = await res.Content.ReadAsStringAsync(ct);
+                var models = ParseModelsFromBody(body);
+                return new DriverEndpointTestResult(res.IsSuccessStatusCode, (int)res.StatusCode, body, res.IsSuccessStatusCode ? null : $"HTTP {(int)res.StatusCode}: {res.ReasonPhrase}", models);
+            }
+            catch (Exception ex)
+            {
+                return new DriverEndpointTestResult(false, 0, null, $"Connection failed: {ex.Message}");
+            }
+        }
+
+        // Ephemeral Pod probe with the sidecar container
+        var testPodName = $"mesh-test-probe-{Guid.NewGuid():N}"[..32];
+        try
+        {
+            var sidecarContainer = BuildSidecarContainer(sidecar, "probe");
+            var curlCmd = !string.IsNullOrWhiteSpace(apiKey)
+                ? $"curl -s -f -m 10 -H 'Authorization: Bearer {apiKey.Trim()}' {modelsUrl}"
+                : $"curl -s -f -m 10 {modelsUrl}";
+
+            var probeContainer = new V1Container
+            {
+                Name = "probe-runner",
+                Image = "curlimages/curl:latest",
+                Command = new List<string> { "sh", "-c" },
+                Args = new List<string>
+                {
+                    $"sleep 3 && {curlCmd} || exit 1"
+                }
+            };
+
+            var containers = new List<V1Container> { probeContainer };
+            if (sidecarContainer != null)
+            {
+                containers.Add(sidecarContainer);
+            }
+
+            var volumes = new List<V1Volume>();
+            if (sidecar is { Enabled: true, UserspaceMode: false } && !string.Equals(sidecar.Type, "custom", StringComparison.OrdinalIgnoreCase))
+            {
+                volumes.Add(BuildTunVolume());
+            }
+
+            var pod = new V1Pod
+            {
+                Metadata = new V1ObjectMeta
+                {
+                    Name = testPodName,
+                    NamespaceProperty = _namespace,
+                    Labels = new Dictionary<string, string>
+                    {
+                        ["app.kubernetes.io/name"] = "sidecar-probe",
+                        ["agentmesh.io/ephemeral-test"] = "true"
+                    }
+                },
+                Spec = new V1PodSpec
+                {
+                    RestartPolicy = "Never",
+                    Containers = containers,
+                    Volumes = volumes.Count > 0 ? volumes : null
+                }
+            };
+
+            await _client.CoreV1.CreateNamespacedPodAsync(pod, _namespace, cancellationToken: ct);
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(25));
+
+            string? responseOutput = null;
+            var success = false;
+            var statusCode = 0;
+
+            while (!cts.IsCancellationRequested)
+            {
+                var livePod = await _client.CoreV1.ReadNamespacedPodStatusAsync(testPodName, _namespace, cancellationToken: cts.Token);
+                var probeState = livePod.Status?.ContainerStatuses?.FirstOrDefault(c => c.Name == "probe-runner")?.State;
+                if (probeState?.Terminated != null)
+                {
+                    var exitCode = probeState.Terminated.ExitCode;
+                    try
+                    {
+                        using var logStream = await _client.CoreV1.ReadNamespacedPodLogAsync(testPodName, _namespace, container: "probe-runner", cancellationToken: cts.Token);
+                        using var reader = new StreamReader(logStream);
+                        responseOutput = await reader.ReadToEndAsync(cts.Token);
+                    }
+                    catch { }
+
+                    success = (exitCode == 0);
+                    statusCode = success ? 200 : 500;
+                    break;
+                }
+                await Task.Delay(1000, cts.Token);
+            }
+
+            var models = responseOutput != null ? ParseModelsFromBody(responseOutput) : null;
+            return new DriverEndpointTestResult(success, statusCode, responseOutput, success ? null : "Probe timed out or failed to reach private LLM via sidecar.", models);
+        }
+        catch (Exception ex)
+        {
+            return new DriverEndpointTestResult(false, 0, null, $"Sidecar probe failed: {ex.Message}");
+        }
+        finally
+        {
+            try
+            {
+                await _client.CoreV1.DeleteNamespacedPodAsync(testPodName, _namespace, cancellationToken: CancellationToken.None);
+            }
+            catch { }
+        }
+    }
+
+    private static List<string>? ParseModelsFromBody(string? body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("data", out var dataArr) && dataArr.ValueKind == JsonValueKind.Array)
+            {
+                var list = new List<string>();
+                foreach (var el in dataArr.EnumerateArray())
+                {
+                    if (el.TryGetProperty("id", out var idProp))
+                    {
+                        var id = idProp.GetString();
+                        if (!string.IsNullOrWhiteSpace(id)) list.Add(id);
+                    }
+                }
+                return list;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private async Task<DriverSidecarConfig?> GetPersonaSidecarConfigAsync(string normPersonaId, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+            var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+            if (persona == null) return null;
+            var driverId = !string.IsNullOrWhiteSpace(persona.DriverId) ? persona.DriverId.Trim().TrimStart('@').ToLowerInvariant() : null;
+            if (string.IsNullOrWhiteSpace(driverId)) return null;
+
+            var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
+            if (agent == null || string.IsNullOrWhiteSpace(agent.CapabilitiesJson)) return null;
+
+            using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
+            if (doc.RootElement.TryGetProperty("sidecar", out var sc) && sc.ValueKind == JsonValueKind.Object)
+            {
+                return JsonSerializer.Deserialize<DriverSidecarConfig>(sc.GetRawText());
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Failed to resolve driver sidecar config for persona @{PersonaId}: {Error}", normPersonaId, ex.Message);
+        }
+        return null;
+    }
+
+    private static V1Container? BuildSidecarContainer(DriverSidecarConfig sidecar, string normPersonaId)
+    {
+        if (!sidecar.Enabled) return null;
+
+        if (string.Equals(sidecar.Type, "custom", StringComparison.OrdinalIgnoreCase))
+        {
+            var customEnv = new List<V1EnvVar>();
+            if (sidecar.EnvironmentVariables != null)
+            {
+                foreach (var (k, v) in sidecar.EnvironmentVariables)
+                {
+                    customEnv.Add(new V1EnvVar { Name = k, Value = v });
+                }
+            }
+
+            return new V1Container
+            {
+                Name = "driver-sidecar",
+                Image = !string.IsNullOrWhiteSpace(sidecar.Image) ? sidecar.Image : "alpine:latest",
+                Command = !string.IsNullOrWhiteSpace(sidecar.Command) ? new List<string> { sidecar.Command } : null,
+                Args = sidecar.Arguments,
+                Env = customEnv.Count > 0 ? customEnv : null
+            };
+        }
+
+        var hostname = !string.IsNullOrWhiteSpace(sidecar.Hostname) ? sidecar.Hostname : $"mesh-{normPersonaId}";
+        var extraArgsSb = new StringBuilder();
+        extraArgsSb.Append($"--ephemeral --hostname={hostname}");
+        if (!string.IsNullOrWhiteSpace(sidecar.Tags))
+        {
+            extraArgsSb.Append($" --advertise-tags={sidecar.Tags}");
+        }
+        if (!string.IsNullOrWhiteSpace(sidecar.ExtraArgs))
+        {
+            extraArgsSb.Append($" {sidecar.ExtraArgs}");
+        }
+
+        var tsEnv = new List<V1EnvVar>
+        {
+            new() { Name = "TS_EXTRA_ARGS", Value = extraArgsSb.ToString().Trim() },
+            new() { Name = "TS_USERSPACE", Value = sidecar.UserspaceMode ? "true" : "false" }
+        };
+
+        if (!string.IsNullOrWhiteSpace(sidecar.SecretRefName))
+        {
+            tsEnv.Add(new V1EnvVar
+            {
+                Name = "TS_AUTHKEY",
+                ValueFrom = new V1EnvVarSource
+                {
+                    SecretKeyRef = new V1SecretKeySelector
+                    {
+                        Name = sidecar.SecretRefName,
+                        Key = !string.IsNullOrWhiteSpace(sidecar.SecretRefKey) ? sidecar.SecretRefKey : "TS_AUTHKEY",
+                        Optional = true
+                    }
+                }
+            });
+        }
+        else if (!string.IsNullOrWhiteSpace(sidecar.AuthKey))
+        {
+            tsEnv.Add(new V1EnvVar { Name = "TS_AUTHKEY", Value = sidecar.AuthKey });
+        }
+
+        var sidecarContainer = new V1Container
+        {
+            Name = "driver-sidecar",
+            Image = !string.IsNullOrWhiteSpace(sidecar.Image) ? sidecar.Image : "tailscale/tailscale:v1.78.1",
+            Env = tsEnv
+        };
+
+        if (!sidecar.UserspaceMode)
+        {
+            sidecarContainer.SecurityContext = new V1SecurityContext
+            {
+                Capabilities = new V1Capabilities { Add = new List<string> { "NET_ADMIN" } }
+            };
+            sidecarContainer.VolumeMounts = new List<V1VolumeMount>
+            {
+                new() { Name = "tun-dev", MountPath = "/dev/net/tun" }
+            };
+        }
+
+        return sidecarContainer;
+    }
+
+    private static V1Volume BuildTunVolume()
+    {
+        return new V1Volume
+        {
+            Name = "tun-dev",
+            HostPath = new V1HostPathVolumeSource
+            {
+                Path = "/dev/net/tun",
+                Type = "CharDevice"
+            }
+        };
+    }
+
+    private static object BuildSidecarPatchObject(V1Container sidecarContainer)
+    {
+        var scEnv = sidecarContainer.Env?.Select(e => new
+        {
+            name = e.Name,
+            value = e.Value,
+            valueFrom = e.ValueFrom != null ? new
+            {
+                secretKeyRef = e.ValueFrom.SecretKeyRef != null ? new
+                {
+                    name = e.ValueFrom.SecretKeyRef.Name,
+                    key = e.ValueFrom.SecretKeyRef.Key,
+                    optional = e.ValueFrom.SecretKeyRef.Optional
+                } : null
+            } : null
+        }).ToList();
+
+        var scMounts = sidecarContainer.VolumeMounts?.Select(vm => new
+        {
+            name = vm.Name,
+            mountPath = vm.MountPath
+        }).ToList();
+
+        return new Dictionary<string, object?>
+        {
+            ["name"] = sidecarContainer.Name,
+            ["image"] = sidecarContainer.Image,
+            ["command"] = sidecarContainer.Command,
+            ["args"] = sidecarContainer.Args,
+            ["env"] = scEnv,
+            ["volumeMounts"] = scMounts,
+            ["securityContext"] = sidecarContainer.SecurityContext != null ? new
+            {
+                capabilities = sidecarContainer.SecurityContext.Capabilities != null ? new
+                {
+                    add = sidecarContainer.SecurityContext.Capabilities.Add
+                } : null
+            } : null
+        };
     }
 
     private sealed class ActiveK8sAuthSession(WebSocket webSocket, StreamDemuxer demuxer, Stream stdIn, TaskCompletionSource<string> tcs) : IAsyncDisposable

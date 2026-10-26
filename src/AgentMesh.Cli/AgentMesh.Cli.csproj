@@ -14,4 +14,8 @@
     <PackageReference Include="Spectre.Console" Version="0.50.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\AgentMesh.Core\AgentMesh.Core.csproj" />
+  </ItemGroup>
+
 </Project>

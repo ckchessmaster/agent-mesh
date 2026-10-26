@@ -73,6 +73,22 @@ export interface PersonaAuthSubmitResult {
   errorMessage?: string | null;
 }
 
+export interface DriverSidecarConfig {
+  enabled: boolean;
+  type: 'tailscale' | 'custom';
+  authKey?: string | null;
+  secretRefName?: string | null;
+  secretRefKey?: string | null;
+  hostname?: string | null;
+  tags?: string | null;
+  userspaceMode?: boolean;
+  extraArgs?: string | null;
+  image?: string | null;
+  command?: string | null;
+  arguments?: string[] | null;
+  environmentVariables?: Record<string, string> | null;
+}
+
 /**
  * Parsed driver runtime config, as returned by GET /api/agents/{id}/config and mirrored on
  * Agent.config. The API never sends the API key itself — only whether one is stored.
@@ -87,6 +103,8 @@ export interface DriverConfig {
   maxSteps?: number | null;
   capabilities?: string[];
   hasApiKey?: boolean;
+  sidecar?: DriverSidecarConfig | null;
+  hasSidecarAuthKey?: boolean;
 }
 
 export interface Agent {

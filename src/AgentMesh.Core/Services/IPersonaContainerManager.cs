@@ -1,3 +1,5 @@
+using AgentMesh.Core.Models;
+
 namespace AgentMesh.Core.Services;
 
 public record PersonaEnvironmentStatus(
@@ -39,6 +41,13 @@ public record PersonaAuthSubmitResult(
     string? Message = null,
     string? ErrorMessage = null);
 
+public record DriverEndpointTestResult(
+    bool Success,
+    int StatusCode,
+    string? ResponseBody = null,
+    string? ErrorMessage = null,
+    List<string>? AvailableModels = null);
+
 public interface IPersonaTerminalSession : IAsyncDisposable
 {
     ValueTask SendInputAsync(string data);
@@ -64,5 +73,10 @@ public interface IPersonaContainerManager
         int rows,
         Func<string, Task> onOutput,
         Func<int, Task> onClosed,
+        CancellationToken ct = default);
+    Task<DriverEndpointTestResult> TestDriverEndpointAsync(
+        string endpoint,
+        string? apiKey,
+        DriverSidecarConfig? sidecar,
         CancellationToken ct = default);
 }

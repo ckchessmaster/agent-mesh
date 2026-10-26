@@ -90,6 +90,7 @@ public class MeshClient
                 ["maxRetries"] = preset.MaxRetries,
                 ["retryDelayMilliseconds"] = preset.RetryDelayMilliseconds,
                 ["maxSteps"] = preset.MaxSteps,
+                ["sidecar"] = preset.Sidecar,
                 ["capabilities"] = preset.Capabilities
             };
             return JsonSerializer.Serialize(caps);

@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -169,11 +171,36 @@ public class SystemController : ControllerBase
     }
 
     [HttpPost("drivers/test-openai")]
-    public async Task<IActionResult> TestOpenAiServer([FromBody] TestOpenAiServerRequest req)
+    public async Task<IActionResult> TestOpenAiServer(
+        [FromBody] TestOpenAiServerRequest req,
+        [FromServices] IPersonaContainerManager? containerManager = null,
+        CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(req.Endpoint))
         {
             return BadRequest(new TestOpenAiServerResponse(false, "Endpoint URL is required.", new()));
+        }
+
+        if (req.Sidecar != null && req.Sidecar.Enabled && containerManager != null)
+        {
+            try
+            {
+                var sidecarResult = await containerManager.TestDriverEndpointAsync(req.Endpoint, req.ApiKey, req.Sidecar, ct);
+                if (!sidecarResult.Success)
+                {
+                    return Ok(new TestOpenAiServerResponse(false, sidecarResult.ErrorMessage ?? "Sidecar endpoint test failed.", new()));
+                }
+
+                var modelsList = sidecarResult.AvailableModels?
+                    .Select(m => new OpenAiModelItemDto(m, m))
+                    .ToList() ?? new();
+
+                return Ok(new TestOpenAiServerResponse(true, null, modelsList));
+            }
+            catch (Exception ex)
+            {
+                return Ok(new TestOpenAiServerResponse(false, $"Sidecar connection test failed: {ex.Message}", new()));
+            }
         }
 
         try
@@ -429,7 +456,7 @@ public record SystemCapabilitiesResponse(
     Dictionary<string, RuntimeCapabilitiesDto> AgentRuntimes
 );
 
-public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null);
+public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null, DriverSidecarConfig? Sidecar = null);
 
 public record OpenAiModelItemDto(string Id, string Name);
 
