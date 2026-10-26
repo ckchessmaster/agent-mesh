@@ -14,7 +14,7 @@ rules:
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "pods/exec"]
+    resources: ["pods", "pods/status", "pods/log", "pods/exec"]
     verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]

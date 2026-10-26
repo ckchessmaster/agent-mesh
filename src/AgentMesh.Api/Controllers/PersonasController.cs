@@ -440,7 +440,11 @@ public class PersonasController(
     }
 
     [HttpGet("{id}/environment/logs")]
-    public async Task<IActionResult> GetPersonaEnvironmentLogs(string id, [FromQuery] int tail = 100, CancellationToken ct = default)
+    public async Task<IActionResult> GetPersonaEnvironmentLogs(
+        string id,
+        [FromQuery] int tail = 100,
+        [FromQuery] string? container = null,
+        CancellationToken ct = default)
     {
         var normalizedId = id.Trim().ToLowerInvariant();
         var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
@@ -454,9 +458,15 @@ public class PersonasController(
             return Ok(new { logs = "Container manager is not available." });
         }
 
-        var logs = await containerManager.GetLogsAsync(normalizedId, Math.Clamp(tail, 10, 1000), ct);
+        var logs = !string.IsNullOrWhiteSpace(container)
+            ? await containerManager.GetLogsAsync(normalizedId, Math.Clamp(tail, 10, 1000), container, ct)
+            : await containerManager.GetLogsAsync(normalizedId, Math.Clamp(tail, 10, 1000), ct);
         return Ok(new { logs });
     }
+
+    [NonAction]
+    public Task<IActionResult> GetPersonaEnvironmentLogs(string id, int tail, CancellationToken ct)
+        => GetPersonaEnvironmentLogs(id, tail, null, ct);
 
     [HttpPost("{id}/environment/verify")]
     public async Task<IActionResult> VerifyPersonaDriver(string id, CancellationToken ct)

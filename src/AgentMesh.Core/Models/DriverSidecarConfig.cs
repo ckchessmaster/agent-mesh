@@ -54,4 +54,21 @@ public class DriverSidecarConfig
 
     [JsonPropertyName("companionPort")]
     public int? CompanionPort { get; set; }
+
+    /// <summary>
+    /// Sanitizes extra arguments for Tailscale CLI. Tailscale `tailscale up` does not support `--ephemeral`
+    /// as a command line flag (ephemerality is configured on the Tailscale auth key itself or OAuth credentials).
+    /// </summary>
+    public static string CleanTailscaleExtraArgs(string? extraArgs)
+    {
+        if (string.IsNullOrWhiteSpace(extraArgs)) return string.Empty;
+        var tokens = extraArgs.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var filtered = tokens.Where(t =>
+            !string.Equals(t, "--ephemeral", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(t, "-ephemeral", StringComparison.OrdinalIgnoreCase) &&
+            !t.StartsWith("--ephemeral=", StringComparison.OrdinalIgnoreCase) &&
+            !t.StartsWith("-ephemeral=", StringComparison.OrdinalIgnoreCase)
+        );
+        return string.Join(" ", filtered);
+    }
 }

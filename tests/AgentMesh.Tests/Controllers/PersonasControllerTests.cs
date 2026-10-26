@@ -362,6 +362,27 @@ public class PersonasControllerTests
     }
 
     [Fact]
+    public async Task GetPersonaEnvironmentLogs_WithContainerSpecified_PassesContainerToManager()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var mockManager = new Mock<IPersonaContainerManager>();
+        mockManager.Setup(m => m.GetLogsAsync("architect", 50, "driver-sidecar", It.IsAny<CancellationToken>()))
+            .ReturnsAsync("Tailscale starting up...");
+
+        var controller = new PersonasController(db, _mockHubContext.Object, mockManager.Object);
+        await controller.CreatePersona(new CreatePersonaRequest("Architect", "agy", "architect"));
+
+        // Act
+        var res = await controller.GetPersonaEnvironmentLogs("architect", 50, "driver-sidecar", CancellationToken.None);
+
+        // Assert
+        var ok = res.Should().BeOfType<OkObjectResult>().Subject;
+        var json = JsonSerializer.Serialize(ok.Value);
+        json.Should().Contain("Tailscale starting up...");
+    }
+
+    [Fact]
     public async Task CreatePersonaSession_WithInitialPrompt_AutoWakesEnvironment()
     {
         // Arrange

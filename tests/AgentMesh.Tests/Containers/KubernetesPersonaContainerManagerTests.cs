@@ -191,4 +191,41 @@ public class KubernetesPersonaContainerManagerTests
         sidecar.CompanionCommand.Should().Be("aip proxy");
         sidecar.CompanionPort.Should().Be(11435);
     }
+
+    [Theory]
+    [InlineData("--ephemeral", "")]
+    [InlineData("-ephemeral", "")]
+    [InlineData("--ephemeral=true", "")]
+    [InlineData("-ephemeral=false", "")]
+    [InlineData("--ephemeral --accept-routes", "--accept-routes")]
+    [InlineData("--accept-routes -ephemeral --advertise-exit-node", "--accept-routes --advertise-exit-node")]
+    [InlineData("--hostname=test --ephemeral --ssh", "--hostname=test --ssh")]
+    [InlineData(null, "")]
+    [InlineData("   ", "")]
+    public void CleanTailscaleExtraArgs_StripsEphemeralFlags(string? input, string expected)
+    {
+        var result = DriverSidecarConfig.CleanTailscaleExtraArgs(input);
+        result.Should().Be(expected);
+    }
+
+    [Fact]
+    public void BuildSidecarContainer_WhenExtraArgsContainsEphemeral_SanitizesIt()
+    {
+        var sidecar = new DriverSidecarConfig
+        {
+            Enabled = true,
+            Type = "tailscale",
+            Hostname = "mesh-test",
+            ExtraArgs = "--ephemeral --accept-routes"
+        };
+
+        var container = KubernetesPersonaContainerManager.BuildSidecarContainer(sidecar, "test");
+        container.Should().NotBeNull();
+
+        var extraArgsVar = container!.Env.FirstOrDefault(e => e.Name == "TS_EXTRA_ARGS");
+        extraArgsVar.Should().NotBeNull();
+        extraArgsVar!.Value.Should().NotContain("--ephemeral");
+        extraArgsVar.Value.Should().Contain("--hostname=mesh-test");
+        extraArgsVar.Value.Should().Contain("--accept-routes");
+    }
 }

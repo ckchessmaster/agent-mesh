@@ -750,9 +750,16 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         await EnsureRunningAsync(normPersonaId, ct);
     }
 
-    public async Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default)
+    public Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default)
+        => GetLogsAsync(personaId, tailLines, null, ct);
+
+    public async Task<string> GetLogsAsync(string personaId, int tailLines = 100, string? container = null, CancellationToken ct = default)
     {
-        var containerName = GetContainerName(personaId);
+        var normPersonaId = personaId.Trim().ToLowerInvariant();
+        var baseContainerName = GetContainerName(normPersonaId);
+        var containerName = string.Equals(container, "driver-sidecar", StringComparison.OrdinalIgnoreCase)
+            ? $"{baseContainerName}-sidecar"
+            : baseContainerName;
 
         if (_dockerClient != null)
         {
@@ -767,7 +774,26 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
                 using var stream = await _dockerClient.Containers.GetContainerLogsAsync(containerName, false, logParams, ct);
                 var (stdout, stderr) = await stream.ReadOutputToEndAsync(ct);
-                return !string.IsNullOrWhiteSpace(stdout) ? stdout : stderr;
+                var logs = !string.IsNullOrWhiteSpace(stdout) ? stdout : stderr;
+
+                if (string.IsNullOrWhiteSpace(container))
+                {
+                    try
+                    {
+                        var sidecarName = $"{baseContainerName}-sidecar";
+                        var scInspect = await _dockerClient.Containers.InspectContainerAsync(sidecarName, ct);
+                        if (!scInspect.State.Running && (scInspect.State.ExitCode != 0 || scInspect.State.Dead || scInspect.State.OOMKilled))
+                        {
+                            using var scStream = await _dockerClient.Containers.GetContainerLogsAsync(sidecarName, false, new ContainerLogsParameters { ShowStdout = true, ShowStderr = true, Tail = "30" }, ct);
+                            var (scOut, scErr) = await scStream.ReadOutputToEndAsync(ct);
+                            var scLogs = !string.IsNullOrWhiteSpace(scOut) ? scOut : scErr;
+                            logs += $"\n\n--- [driver-sidecar Diagnostics (ExitCode: {scInspect.State.ExitCode})] ---\n{scLogs}";
+                        }
+                    }
+                    catch { }
+                }
+
+                return logs;
             }
             catch (Exception ex)
             {
@@ -778,11 +804,27 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         if (_detectedCli != null)
         {
             var (exitCode, stdout, stderr) = await RunCliAsync(_detectedCli, $"logs --tail {tailLines} {containerName}", ct);
-            if (exitCode == 0)
+            var logs = exitCode == 0 ? stdout : (!string.IsNullOrWhiteSpace(stderr) ? stderr : stdout);
+
+            if (string.IsNullOrWhiteSpace(container))
             {
-                return stdout;
+                try
+                {
+                    var sidecarName = $"{baseContainerName}-sidecar";
+                    var (scExit, scOut, scErr) = await RunCliAsync(_detectedCli, $"logs --tail 30 {sidecarName}", ct);
+                    if (!string.IsNullOrWhiteSpace(scOut) || !string.IsNullOrWhiteSpace(scErr))
+                    {
+                        var scLogs = !string.IsNullOrWhiteSpace(scOut) ? scOut : scErr;
+                        if (scLogs.Contains("error", StringComparison.OrdinalIgnoreCase) || scLogs.Contains("failed", StringComparison.OrdinalIgnoreCase))
+                        {
+                            logs += $"\n\n--- [driver-sidecar Diagnostics] ---\n{scLogs}";
+                        }
+                    }
+                }
+                catch { }
             }
-            return !string.IsNullOrWhiteSpace(stderr) ? stderr : stdout;
+
+            return logs;
         }
 
         return "No container logs available.";
@@ -1526,7 +1568,11 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             }
             if (!string.IsNullOrWhiteSpace(sidecar.ExtraArgs))
             {
-                extraArgsSb.Append($" {sidecar.ExtraArgs}");
+                var cleanArgs = DriverSidecarConfig.CleanTailscaleExtraArgs(sidecar.ExtraArgs);
+                if (!string.IsNullOrWhiteSpace(cleanArgs))
+                {
+                    extraArgsSb.Append($" {cleanArgs}");
+                }
             }
 
             sidecarEnv.Add("TS_KUBE_SECRET=");
@@ -1561,11 +1607,28 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 try
                 {
                     var inspect = await _dockerClient.Containers.InspectContainerAsync(sidecarContainerName, ct);
-                    if (!inspect.State.Running)
+                    var currentEnv = inspect.Config?.Env ?? new List<string>();
+                    var envMatches = sidecarEnv.All(e => currentEnv.Contains(e));
+                    var imageMatches = string.Equals(inspect.Config?.Image, sidecarImage, StringComparison.OrdinalIgnoreCase);
+
+                    if (!imageMatches || !envMatches)
                     {
-                        await _dockerClient.Containers.StartContainerAsync(sidecarContainerName, new ContainerStartParameters(), ct);
+                        _logger.LogInformation("Sidecar container {Name} configuration changed. Recreating...", sidecarContainerName);
+                        try
+                        {
+                            await _dockerClient.Containers.StopContainerAsync(sidecarContainerName, new ContainerStopParameters { WaitBeforeKillSeconds = 2 }, ct);
+                            await _dockerClient.Containers.RemoveContainerAsync(sidecarContainerName, new ContainerRemoveParameters { Force = true }, ct);
+                        }
+                        catch { }
                     }
-                    return;
+                    else
+                    {
+                        if (!inspect.State.Running)
+                        {
+                            await _dockerClient.Containers.StartContainerAsync(sidecarContainerName, new ContainerStartParameters(), ct);
+                        }
+                        return;
+                    }
                 }
                 catch (DockerContainerNotFoundException) { }
 

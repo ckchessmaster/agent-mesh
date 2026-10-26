@@ -316,8 +316,29 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                   string.Equals(workspaceVolume.PersistentVolumeClaim.ClaimName, pvcName, StringComparison.OrdinalIgnoreCase);
             var hasCredsMount = runnerContainer?.VolumeMounts?.Any(vm => vm.MountPath == "/etc/agentmesh-creds") == true;
             var hasCredsVolume = deployment.Spec?.Template?.Spec?.Volumes?.Any(v => v.Name == "persona-creds-volume") == true;
-            var hasSidecarContainer = deployment.Spec?.Template?.Spec?.Containers?.Any(c => c.Name == "driver-sidecar") == true;
+            var currentSidecarContainer = deployment.Spec?.Template?.Spec?.Containers?.FirstOrDefault(c => c.Name == "driver-sidecar");
+            var hasSidecarContainer = currentSidecarContainer != null;
             var needsSidecarUpdate = (sidecarContainer != null) != hasSidecarContainer;
+            if (!needsSidecarUpdate && sidecarContainer != null && currentSidecarContainer != null)
+            {
+                if (!string.Equals(currentSidecarContainer.Image, sidecarContainer.Image, StringComparison.OrdinalIgnoreCase))
+                {
+                    needsSidecarUpdate = true;
+                }
+                else
+                {
+                    var currentEnv = currentSidecarContainer.Env?.ToDictionary(e => e.Name, e => e.Value ?? "", StringComparer.OrdinalIgnoreCase)
+                                     ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    var desiredEnv = sidecarContainer.Env?.ToDictionary(e => e.Name, e => e.Value ?? "", StringComparer.OrdinalIgnoreCase)
+                                     ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                    if (currentEnv.Count != desiredEnv.Count ||
+                        desiredEnv.Any(kv => !currentEnv.TryGetValue(kv.Key, out var cv) || cv != kv.Value))
+                    {
+                        needsSidecarUpdate = true;
+                    }
+                }
+            }
 
             var isScaledDown = (deployment.Spec?.Replicas ?? 0) == 0;
             var needsImageUpdate = runnerContainer != null && !string.Equals(currentImage, currentConfigImage, StringComparison.OrdinalIgnoreCase);
@@ -394,7 +415,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 }
 
                 var annotations = new Dictionary<string, string>();
-                if (isFailed || needsImageUpdate)
+                if (isFailed || needsImageUpdate || needsSidecarUpdate)
                 {
                     annotations["kubectl.kubernetes.io/restartedAt"] = DateTimeOffset.UtcNow.ToString("o");
                     await CleanupFailedPodsAsync(normPersonaId, ct);
@@ -683,7 +704,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         await EnsureRunningAsync(personaId, ct);
     }
 
-    public async Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default)
+    public Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default)
+        => GetLogsAsync(personaId, tailLines, null, ct);
+
+    public async Task<string> GetLogsAsync(string personaId, int tailLines = 100, string? container = null, CancellationToken ct = default)
     {
         var normPersonaId = personaId.Trim().ToLowerInvariant();
 
@@ -705,30 +729,55 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 return "No pods found for persona.";
             }
 
-            var runnerStatus = pod.Status?.ContainerStatuses?.FirstOrDefault(c => c.Name == "persona-runner")
-                               ?? pod.Status?.ContainerStatuses?.FirstOrDefault();
+            var targetContainer = !string.IsNullOrWhiteSpace(container) ? container.Trim() : "persona-runner";
+            var containerStatus = pod.Status?.ContainerStatuses?.FirstOrDefault(c => c.Name == targetContainer)
+                                  ?? pod.Status?.ContainerStatuses?.FirstOrDefault();
 
-            if (runnerStatus?.State?.Waiting != null)
+            if (containerStatus?.State?.Waiting != null)
             {
-                var reason = runnerStatus.State.Waiting.Reason ?? "Initializing";
-                var msg = runnerStatus.State.Waiting.Message;
+                var reason = containerStatus.State.Waiting.Reason ?? "Initializing";
+                var msg = containerStatus.State.Waiting.Message;
                 if (reason is "ImagePullBackOff" or "ErrImagePull" or "CrashLoopBackOff" or "Error")
                 {
-                    return $"[Pod Status: Error]\nContainer failed to start: {reason}\n{msg}";
+                    return $"[Pod Status: Error]\nContainer '{targetContainer}' failed to start: {reason}\n{msg}";
                 }
 
-                return $"[Pod Status: Initializing]\nPersona container is starting up ({reason})...\nLogs will appear automatically as soon as the container is running.";
+                return $"[Pod Status: Initializing]\nContainer '{targetContainer}' is starting up ({reason})...\nLogs will appear automatically as soon as the container is running.";
             }
 
             using var stream = await _client.CoreV1.ReadNamespacedPodLogAsync(
                 pod.Metadata.Name,
                 _namespace,
-                container: "persona-runner",
+                container: targetContainer,
                 tailLines: tailLines,
                 cancellationToken: ct);
 
             using var reader = new StreamReader(stream);
-            return await reader.ReadToEndAsync(ct);
+            var logs = await reader.ReadToEndAsync(ct);
+
+            // If querying runner logs and sidecar is crashing or failing, append sidecar logs for diagnostics
+            if (string.IsNullOrWhiteSpace(container))
+            {
+                var sidecarStatus = pod.Status?.ContainerStatuses?.FirstOrDefault(c => c.Name == "driver-sidecar");
+                if (sidecarStatus?.State?.Waiting != null && sidecarStatus.State.Waiting.Reason is "CrashLoopBackOff" or "Error")
+                {
+                    try
+                    {
+                        using var scStream = await _client.CoreV1.ReadNamespacedPodLogAsync(
+                            pod.Metadata.Name,
+                            _namespace,
+                            container: "driver-sidecar",
+                            tailLines: 30,
+                            cancellationToken: ct);
+                        using var scReader = new StreamReader(scStream);
+                        var scLogs = await scReader.ReadToEndAsync(ct);
+                        logs += $"\n\n--- [driver-sidecar Diagnostics ({sidecarStatus.State.Waiting.Reason})] ---\n{scLogs}";
+                    }
+                    catch { }
+                }
+            }
+
+            return logs;
         }
         catch (k8s.Autorest.HttpOperationException ex) when (ex.Response?.StatusCode == System.Net.HttpStatusCode.BadRequest || (int?)ex.Response?.StatusCode == 400 || ex.Message.Contains("BadRequest"))
         {
@@ -1832,7 +1881,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
         if (!string.IsNullOrWhiteSpace(sidecar.ExtraArgs))
         {
-            extraArgsSb.Append($" {sidecar.ExtraArgs}");
+            var cleanArgs = DriverSidecarConfig.CleanTailscaleExtraArgs(sidecar.ExtraArgs);
+            if (!string.IsNullOrWhiteSpace(cleanArgs))
+            {
+                extraArgsSb.Append($" {cleanArgs}");
+            }
         }
 
         var tsEnv = new List<V1EnvVar>

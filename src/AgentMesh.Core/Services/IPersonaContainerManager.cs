@@ -61,7 +61,9 @@ public interface IPersonaContainerManager
     Task EnsureRunningAsync(string personaId, CancellationToken ct = default);
     Task RestartAsync(string personaId, CancellationToken ct = default);
     Task StopAsync(string personaId, CancellationToken ct = default);
-    Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default);
+    Task<string> GetLogsAsync(string personaId, int tailLines = 100, CancellationToken ct = default)
+        => GetLogsAsync(personaId, tailLines, null, ct);
+    Task<string> GetLogsAsync(string personaId, int tailLines, string? container, CancellationToken ct = default);
     Task<PersonaDriverVerificationResult> VerifyDriverAsync(string personaId, CancellationToken ct = default);
     Task<PersonaAuthStartResult> StartAuthAsync(string personaId, CancellationToken ct = default);
     Task<PersonaAuthSubmitResult> SubmitAuthCodeAsync(string personaId, string code, CancellationToken ct = default);
