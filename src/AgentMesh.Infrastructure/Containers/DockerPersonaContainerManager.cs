@@ -720,6 +720,13 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         var sidecarName = $"{containerName}-sidecar";
         _logger.LogInformation("Restarting & recreating container {Name} for persona @{PersonaId}", containerName, normPersonaId);
 
+        // Persist current state from container to workspace volume before recreating container
+        try
+        {
+            await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+        }
+        catch { }
+
         if (_dockerClient != null)
         {
             try
@@ -941,24 +948,46 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     $"Companion binary '{binName}' not found in container PATH or /root/.local/bin"));
             }
 
-            var (daemonExit, daemonOut, _) = await ExecInContainerAsync(
-                normPersonaId,
-                $"pgrep -f '{binName}' >/dev/null 2>&1 || ps aux | grep -v grep | grep -q '{binName}'",
-                ct);
+            // Persist current state
+            try
+            {
+                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+            }
+            catch { }
+
+            var daemonCheckCmd = sidecar?.CompanionPort.HasValue == true && sidecar.CompanionPort.Value > 0
+                ? $"(timeout 1 bash -c '</dev/tcp/127.0.0.1/{sidecar.CompanionPort.Value}' 2>/dev/null || curl -s -m 1 http://127.0.0.1:{sidecar.CompanionPort.Value}/ >/dev/null 2>&1) || pgrep -x '{binName}' >/dev/null 2>&1 || pidof '{binName}' >/dev/null 2>&1"
+                : $"pgrep -x '{binName}' >/dev/null 2>&1 || pidof '{binName}' >/dev/null 2>&1";
+
+            var (daemonExit, _, _) = await ExecInContainerAsync(normPersonaId, daemonCheckCmd, ct);
+
+            // If not running, attempt to kickstart it in background and check again
+            if (daemonExit != 0 && !string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
+            {
+                await ExecInContainerAsync(
+                    normPersonaId,
+                    $"nohup {sidecar.CompanionCommand} >/tmp/companion-daemon.log 2>&1 &",
+                    ct);
+                await Task.Delay(1000, ct);
+                (daemonExit, _, _) = await ExecInContainerAsync(normPersonaId, daemonCheckCmd, ct);
+            }
 
             if (daemonExit == 0)
             {
+                var detail = sidecar?.CompanionPort.HasValue == true
+                    ? $"Companion daemon '{binName}' is active (port {sidecar.CompanionPort.Value})"
+                    : $"Companion daemon '{binName}' is running";
                 steps.Add(new PersonaDriverVerificationStep(
                     "Companion Daemon",
                     "success",
-                    $"Companion daemon '{binName}' is running"));
+                    detail));
             }
             else
             {
                 steps.Add(new PersonaDriverVerificationStep(
                     "Companion Daemon",
                     "failed",
-                    $"Companion daemon '{sidecar?.CompanionCommand}' is not running in container"));
+                    $"Companion daemon '{sidecar?.CompanionCommand}' is not running in container. Ensure credentials exist or log in via terminal."));
             }
         }
 
@@ -1391,13 +1420,16 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 }
 
                 await Task.Delay(1000);
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null)", CancellationToken.None);
+                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", CancellationToken.None);
                 if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
                 {
                     var compBin = Path.GetFileName(sidecar.CompanionCommand.Trim().Split(' ')[0]);
                     if (!string.IsNullOrWhiteSpace(compBin))
                     {
-                        await ExecInContainerAsync(normPersonaId, $"pgrep -f '{compBin}' >/dev/null 2>&1 || (nohup {sidecar.CompanionCommand} >/dev/null 2>&1 &)", CancellationToken.None);
+                        var checkCmd = sidecar.CompanionPort.HasValue && sidecar.CompanionPort.Value > 0
+                            ? $"(timeout 1 bash -c '</dev/tcp/127.0.0.1/{sidecar.CompanionPort.Value}' 2>/dev/null || curl -s -m 1 http://127.0.0.1:{sidecar.CompanionPort.Value}/ >/dev/null 2>&1) || pgrep -x '{compBin}' >/dev/null 2>&1 || pidof '{compBin}' >/dev/null 2>&1"
+                            : $"pgrep -x '{compBin}' >/dev/null 2>&1 || pidof '{compBin}' >/dev/null 2>&1";
+                        await ExecInContainerAsync(normPersonaId, $"{checkCmd} || (nohup {sidecar.CompanionCommand} >/tmp/companion-daemon.log 2>&1 &)", CancellationToken.None);
                     }
                 }
             }
@@ -1441,13 +1473,16 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, authCheckCmd, ct);
             if (chkExit == 0)
             {
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null)", ct);
+                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
                 if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
                 {
                     var compBin = Path.GetFileName(sidecar.CompanionCommand.Trim().Split(' ')[0]);
                     if (!string.IsNullOrWhiteSpace(compBin))
                     {
-                        await ExecInContainerAsync(normPersonaId, $"pgrep -f '{compBin}' >/dev/null 2>&1 || (nohup {sidecar.CompanionCommand} >/dev/null 2>&1 &)", ct);
+                        var checkCmd = sidecar.CompanionPort.HasValue && sidecar.CompanionPort.Value > 0
+                            ? $"(timeout 1 bash -c '</dev/tcp/127.0.0.1/{sidecar.CompanionPort.Value}' 2>/dev/null || curl -s -m 1 http://127.0.0.1:{sidecar.CompanionPort.Value}/ >/dev/null 2>&1) || pgrep -x '{compBin}' >/dev/null 2>&1 || pidof '{compBin}' >/dev/null 2>&1"
+                            : $"pgrep -x '{compBin}' >/dev/null 2>&1 || pidof '{compBin}' >/dev/null 2>&1";
+                        await ExecInContainerAsync(normPersonaId, $"{checkCmd} || (nohup {sidecar.CompanionCommand} >/tmp/companion-daemon.log 2>&1 &)", ct);
                     }
                 }
                 return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication confirmed and credentials persisted to workspace!");
@@ -1582,6 +1617,24 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             catch { }
             finally
             {
+                try
+                {
+                    await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", CancellationToken.None);
+                    var sidecarCfg = await GetPersonaSidecarConfigAsync(normPersonaId, CancellationToken.None);
+                    if (!string.IsNullOrWhiteSpace(sidecarCfg?.CompanionCommand))
+                    {
+                        var compBin = Path.GetFileName(sidecarCfg.CompanionCommand.Trim().Split(' ')[0]);
+                        if (!string.IsNullOrWhiteSpace(compBin))
+                        {
+                            var checkCmd = sidecarCfg.CompanionPort.HasValue && sidecarCfg.CompanionPort.Value > 0
+                                ? $"(timeout 1 bash -c '</dev/tcp/127.0.0.1/{sidecarCfg.CompanionPort.Value}' 2>/dev/null || curl -s -m 1 http://127.0.0.1:{sidecarCfg.CompanionPort.Value}/ >/dev/null 2>&1) || pgrep -x '{compBin}' >/dev/null 2>&1 || pidof '{compBin}' >/dev/null 2>&1"
+                                : $"pgrep -x '{compBin}' >/dev/null 2>&1 || pidof '{compBin}' >/dev/null 2>&1";
+                            await ExecInContainerAsync(normPersonaId, $"{checkCmd} || (nohup {sidecarCfg.CompanionCommand} >/tmp/companion-daemon.log 2>&1 &)", CancellationToken.None);
+                        }
+                    }
+                }
+                catch { }
+
                 await onOutput("\r\n\x1b[33mTerminal session closed.\x1b[0m\r\n");
                 await onClosed(proc.ExitCode);
             }

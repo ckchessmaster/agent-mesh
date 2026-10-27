@@ -459,10 +459,14 @@ public class OpenAiAdapter : IAgentAdapter
                     }
 
                     var errorMsg = $"Failed to connect to OpenAI-compatible endpoint ({chatUrl}): {ex.Message}";
+                    var isLocal = endpoint.Contains("localhost") || endpoint.Contains("127.0.0.1");
+                    var extraHint = isLocal
+                        ? "\n\n💡 If using a driver companion daemon or local proxy (such as `aip proxy`), ensure the companion daemon is active and signed in (`aip login`). You can test and kickstart it via 'Verify Driver' or the interactive terminal in the Persona Environment modal."
+                        : "";
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "response",
-                        Content = $"❌ {errorMsg}\n\nPlease verify that your server is running and accessible at `{endpoint}`."
+                        Content = $"❌ {errorMsg}\n\nPlease verify that your server is running and accessible at `{endpoint}`.{extraHint}"
                     });
                     return;
                 }

@@ -137,22 +137,32 @@ if [ -n "$COMPANION_SETUP" ]; then
     sync_persona_state
 fi
 
-# Start companion background daemon if configured (e.g. token refresh or proxy)
+# Start background periodic state synchronization worker
+(
+    while true; do
+        sleep 10
+        sync_persona_state 2>/dev/null || true
+    done
+) &
+SYNC_PID=$!
+
+# Start companion background daemon supervisor if configured (e.g. token refresh or proxy)
 if [ -n "$COMPANION_COMMAND" ]; then
-    echo "Starting companion daemon: $COMPANION_COMMAND"
-    eval "$COMPANION_COMMAND" &
+    echo "Starting companion daemon supervisor: $COMPANION_COMMAND"
+    (
+        while true; do
+            eval "$COMPANION_COMMAND" || true
+            sleep 2
+        done
+    ) &
     COMPANION_PID=$!
-    sleep 1
-    if ! kill -0 "$COMPANION_PID" 2>/dev/null; then
-        echo "Warning: Companion daemon process exited immediately."
-    fi
 fi
 
 # Await companion daemon readiness port if configured
 if [ -n "$COMPANION_PORT" ]; then
     echo "Waiting for companion daemon on port $COMPANION_PORT..."
     PORT_READY=0
-    for i in {1..30}; do
+    for i in {1..15}; do
         if timeout 1 bash -c "</dev/tcp/127.0.0.1/$COMPANION_PORT" >/dev/null 2>&1 || \
            curl -s "http://127.0.0.1:$COMPANION_PORT/" >/dev/null 2>&1; then
             echo "Companion daemon ready on port $COMPANION_PORT."
@@ -162,17 +172,25 @@ if [ -n "$COMPANION_PORT" ]; then
         sleep 1
     done
     if [ "$PORT_READY" -ne 1 ]; then
-        echo "Warning: Companion daemon did not respond on port $COMPANION_PORT within 30s. Proceeding..."
+        echo "Warning: Companion daemon did not respond on port $COMPANION_PORT within 15s. Proceeding in background..."
     fi
 fi
 
 cleanup() {
+    echo "Persisting persona state before termination..."
     sync_persona_state
     if [ -n "$COMPANION_PID" ] && kill -0 "$COMPANION_PID" 2>/dev/null; then
         kill "$COMPANION_PID" 2>/dev/null || true
     fi
+    if [ -n "$SYNC_PID" ] && kill -0 "$SYNC_PID" 2>/dev/null; then
+        kill "$SYNC_PID" 2>/dev/null || true
+    fi
+    if [ -n "$RUNNER_PID" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
+        kill -TERM "$RUNNER_PID" 2>/dev/null || true
+        wait "$RUNNER_PID" 2>/dev/null || true
+    fi
 }
-trap cleanup EXIT
+trap cleanup EXIT SIGTERM SIGINT
 
 echo "=========================================================="
 echo " AgentMesh Dedicated Persona Environment"
@@ -202,4 +220,6 @@ if [ -n "$AGENTMESH_MODEL" ]; then
     ARGS+=(--model "$AGENTMESH_MODEL")
 fi
 
-exec agentmesh "${ARGS[@]}" "$@"
+agentmesh "${ARGS[@]}" "$@" &
+RUNNER_PID=$!
+wait "$RUNNER_PID"
