@@ -161,6 +161,9 @@ public class StopExecutionEvent
     [JsonPropertyName("agentId")]
     public string? AgentId { get; set; }
 
+    [JsonPropertyName("personaId")]
+    public string? PersonaId { get; set; }
+
     [JsonPropertyName("reason")]
     public string? Reason { get; set; }
 }

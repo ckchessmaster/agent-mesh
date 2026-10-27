@@ -667,12 +667,25 @@ public class OpenAiAdapterTests
             result.Should().Contain("[Image file: 'mock_ui.png'");
             result.Should().Contain("format: PNG");
             result.Should().Contain("cannot be read as plain text");
+            result.Should().Contain("Do NOT attempt to install OCR packages");
             result.Should().NotContain("\0");
         }
         finally
         {
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_RethrowsOperationCanceledException()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var args = JsonSerializer.Serialize(new { command = "sleep 10" });
+        var act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, "/workspace", cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
     }
 
     [Fact]

@@ -183,7 +183,7 @@ public class AgentRunnerInstance : IAsyncDisposable
 
         _hubConnection.On<StopExecutionEvent>("StopExecution", (ev) =>
         {
-            HandleStopExecution(ev.SessionId, ev.AgentId);
+            HandleStopExecution(ev.SessionId, ev.AgentId, ev.PersonaId);
         });
 
         _hubConnection.On<JsonElement>("StopExecution", (elem) =>
@@ -192,8 +192,9 @@ public class AgentRunnerInstance : IAsyncDisposable
             {
                 var sidStr = GetJsonPropString(elem, "sessionId");
                 var targetAgent = GetJsonPropString(elem, "agentId");
+                var targetPersona = GetJsonPropString(elem, "personaId");
                 Guid? parsedSid = (sidStr != null && Guid.TryParse(sidStr, out var s)) ? s : null;
-                HandleStopExecution(parsedSid, targetAgent);
+                HandleStopExecution(parsedSid, targetAgent, targetPersona);
             }
             catch { }
         });
@@ -359,7 +360,7 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
     }
 
-    private void HandleStopExecution(Guid? parsedSid, string? targetAgent)
+    private void HandleStopExecution(Guid? parsedSid, string? targetAgent, string? targetPersona = null)
     {
         var targetSid = parsedSid ?? State.ActiveSessionId;
         if (targetSid.HasValue)
@@ -368,13 +369,16 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
 
         var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
+        var matchesPersona = !string.IsNullOrWhiteSpace(_preset.PersonaId) &&
+                             !string.IsNullOrWhiteSpace(targetPersona) &&
+                             string.Equals(targetPersona.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase);
         var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) ||
-                           string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase) ||
-                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent, _preset.PersonaId, StringComparison.OrdinalIgnoreCase));
+                           string.Equals(targetAgent.Trim().TrimStart('@'), _preset.Id?.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase) ||
+                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase));
 
-        if (matchesSession || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
+        if (matchesSession || matchesPersona || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
         {
-            _onLog(_preset.Id, $"🛑 StopExecution received for session {targetSid?.ToString()[..8] ?? "unknown"}. Aborting active turn immediately.");
+            _onLog(_preset.Id ?? string.Empty, $"🛑 StopExecution received for session {targetSid?.ToString()[..8] ?? "unknown"}. Aborting active turn immediately.");
             try
             {
                 _activeTurnCts?.Cancel();

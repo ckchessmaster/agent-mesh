@@ -716,6 +716,7 @@ public class OpenAiAdapter : IAgentAdapter
                     });
 
                     var toolResult = await ExecuteToolLocallyAsync(toolName, toolArgs, cwd, ct);
+                    ct.ThrowIfCancellationRequested();
 
                     await onEvent(new TrajectoryEventPayload
                     {
@@ -999,9 +1000,10 @@ public class OpenAiAdapter : IAgentAdapter
         sb.AppendLine("[Autonomous Tool Usage Guidelines]");
         sb.AppendLine("You have access to autonomous tools to execute shell commands, read files, write files, and edit files in the workspace.");
         sb.AppendLine("- Use `run_command` to inspect the project, run tests, execute builds, and check git status.");
-        sb.AppendLine("- Use `read_file` to inspect code files.");
+        sb.AppendLine("- Use `read_file` to inspect code and text files.");
         sb.AppendLine("- Use `write_file` or `edit_file` to implement solutions.");
         sb.AppendLine("- When you need user clarification or critical architectural decisions, call `ask_question`.");
+        sb.AppendLine("- Vision / Image Limitation: You operate in a text-based environment without multimodal vision tools. If the user attaches an image or asks about visual assets, do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands. Instead, immediately inform the user or call `ask_question` to request the relevant text, error messages, or visual details directly.");
         sb.AppendLine("- Be concise and lead with working code and clear implementation.");
 
         return sb.ToString();
@@ -1224,7 +1226,7 @@ public class OpenAiAdapter : IAgentAdapter
                         var fi = new FileInfo(fullPath);
                         if (ImageExtensions.Contains(ext) && !string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
                         {
-                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text.]";
+                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text. You operate in a text-based runtime without multimodal vision tools. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands. Instead, immediately inform the user that you cannot visually inspect images and ask for text descriptions, logs, or relevant details.]";
                         }
                         return $"[Binary file: '{path}' ({fi.Length:N0} bytes). This is a binary file and cannot be read as plain text.]";
                     }
@@ -1291,6 +1293,10 @@ public class OpenAiAdapter : IAgentAdapter
                 default:
                     return $"Error: Unknown tool '{toolName}'.";
             }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {

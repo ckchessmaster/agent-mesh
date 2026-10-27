@@ -265,18 +265,20 @@ public class SessionsController(
         // 1. Halt any running execution
         if (hubContext != null)
         {
-            await hubContext.Clients.All.SendAsync("StopExecution", new
+            var stopPayload = new
             {
                 sessionId = session.Id,
-                agentId = effectiveDriverId
-            });
+                agentId = effectiveDriverId,
+                personaId = session.PersonaId
+            };
+            await hubContext.Clients.All.SendAsync("StopExecution", stopPayload);
             if (!string.IsNullOrWhiteSpace(effectiveDriverId))
             {
-                await hubContext.Clients.Group($"agent-{effectiveDriverId}").SendAsync("StopExecution", new
-                {
-                    sessionId = session.Id,
-                    agentId = effectiveDriverId
-                });
+                await hubContext.Clients.Group($"agent-{effectiveDriverId.Trim().ToLowerInvariant()}").SendAsync("StopExecution", stopPayload);
+            }
+            if (!string.IsNullOrWhiteSpace(session.PersonaId))
+            {
+                await hubContext.Clients.Group($"persona-{session.PersonaId.Trim().ToLowerInvariant()}").SendAsync("StopExecution", stopPayload);
             }
         }
 
@@ -803,28 +805,25 @@ public class SessionsController(
         await hubContext.Clients.Group($"session-{session.Id}").SendAsync("ReceiveMessage", auditDto);
         await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
 
-        await hubContext.Clients.Group($"session-{session.Id}").SendAsync("StopExecution", new
+        var stopPayload = new
         {
             sessionId = session.Id,
             agentId = session.CreatorAgentId,
+            personaId = session.PersonaId,
             reason = "Interrupted by incoming prompt"
-        });
+        };
+        await hubContext.Clients.Group($"session-{session.Id}").SendAsync("StopExecution", stopPayload);
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
             var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            await hubContext.Clients.Group(targetGroup).SendAsync("StopExecution", new
-            {
-                sessionId = session.Id,
-                agentId = session.CreatorAgentId,
-                reason = "Interrupted by incoming prompt"
-            });
+            await hubContext.Clients.Group(targetGroup).SendAsync("StopExecution", stopPayload);
         }
-        await hubContext.Clients.All.SendAsync("StopExecution", new
+        if (!string.IsNullOrWhiteSpace(session.PersonaId))
         {
-            sessionId = session.Id,
-            agentId = session.CreatorAgentId,
-            reason = "Interrupted by incoming prompt"
-        });
+            var targetPersonaGroup = $"persona-{session.PersonaId.Trim().ToLowerInvariant()}";
+            await hubContext.Clients.Group(targetPersonaGroup).SendAsync("StopExecution", stopPayload);
+        }
+        await hubContext.Clients.All.SendAsync("StopExecution", stopPayload);
     }
 
     [HttpPost]
@@ -1516,30 +1515,27 @@ public class SessionsController(
         await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue = emptyQueue });
         await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue = emptyQueue });
 
-        await hubContext.Clients.Group($"session-{id}").SendAsync("StopExecution", new
+        var stopPayload = new
         {
             sessionId = id,
             agentId = session.CreatorAgentId,
+            personaId = session.PersonaId,
             reason = "Operator clicked stop"
-        });
+        };
+        await hubContext.Clients.Group($"session-{id}").SendAsync("StopExecution", stopPayload);
 
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
             var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            await hubContext.Clients.Group(targetGroup).SendAsync("StopExecution", new
-            {
-                sessionId = id,
-                agentId = session.CreatorAgentId,
-                reason = "Operator clicked stop"
-            });
+            await hubContext.Clients.Group(targetGroup).SendAsync("StopExecution", stopPayload);
+        }
+        if (!string.IsNullOrWhiteSpace(session.PersonaId))
+        {
+            var targetPersonaGroup = $"persona-{session.PersonaId.Trim().ToLowerInvariant()}";
+            await hubContext.Clients.Group(targetPersonaGroup).SendAsync("StopExecution", stopPayload);
         }
 
-        await hubContext.Clients.All.SendAsync("StopExecution", new
-        {
-            sessionId = id,
-            agentId = session.CreatorAgentId,
-            reason = "Operator clicked stop"
-        });
+        await hubContext.Clients.All.SendAsync("StopExecution", stopPayload);
 
         await hubContext.Clients.All.SendAsync("SessionUpdated", session);
 

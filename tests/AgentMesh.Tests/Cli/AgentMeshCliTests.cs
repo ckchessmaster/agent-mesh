@@ -226,6 +226,26 @@ public class AgentMeshCliTests
     }
 
     [Fact]
+    public void StopExecutionEvent_DeserializesPersonaIdAndSessionId()
+    {
+        var json = """
+        {
+            "sessionId": "a0000000-0000-0000-0000-000000000001",
+            "agentId": "spence-ai",
+            "personaId": "rook",
+            "reason": "Operator clicked stop"
+        }
+        """;
+
+        var ev = System.Text.Json.JsonSerializer.Deserialize<StopExecutionEvent>(json);
+        ev.Should().NotBeNull();
+        ev!.SessionId.Should().Be(Guid.Parse("a0000000-0000-0000-0000-000000000001"));
+        ev.AgentId.Should().Be("spence-ai");
+        ev.PersonaId.Should().Be("rook");
+        ev.Reason.Should().Be("Operator clicked stop");
+    }
+
+    [Fact]
     public void AgyAdapter_GetMaxTranscriptStep_CalculatesHighestStepIndex()
     {
         var tempFile = Path.Combine(Path.GetTempPath(), $"transcript-test-{Guid.NewGuid()}.jsonl");
