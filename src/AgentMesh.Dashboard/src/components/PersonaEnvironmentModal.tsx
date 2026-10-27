@@ -816,6 +816,16 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                     >
                       Switch to Direct API Key
                     </button>
+                    <button
+                      onClick={() => {
+                        setShowAuthWizard(false);
+                        setActiveTab('terminal');
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition cursor-pointer border border-slate-700 flex items-center gap-1.5"
+                    >
+                      <TerminalIcon className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Open Interactive Terminal</span>
+                    </button>
                   </div>
                 </div>
               ) : (authStartResult?.authUrl || authStartResult?.status === 'waiting_code' || authStartResult?.instructions?.includes('code')) ? (

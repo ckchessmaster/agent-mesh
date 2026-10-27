@@ -79,14 +79,20 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
 fi
 
 # Ensure persistent workspace state directories exist with restricted permissions
-mkdir -p /workspace/.agentmesh/state/.config
+mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
 chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
-chmod 700 /workspace/.agentmesh/state/.config 2>/dev/null || true
+chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip 2>/dev/null || true
 
-# If ~/.config was previously created as a symlink, remove it so credential managers have real directories
+# Ensure ~/.bashrc exports PATH for all interactive shells
+if ! grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null; then
+    echo 'export PATH="/root/.local/bin:/usr/local/bin:$PATH"' >> /root/.bashrc
+fi
+
+# If ~/.config or ~/.aip was previously created as a symlink, remove it so credential managers have real directories
 if [ -L /root/.config ]; then rm -f /root/.config; fi
-mkdir -p /root/.config
-chmod 700 /root/.config 2>/dev/null || true
+if [ -L /root/.aip ]; then rm -f /root/.aip; fi
+mkdir -p /root/.config /root/.aip
+chmod 700 /root/.config /root/.aip 2>/dev/null || true
 
 # Restore persistent state from workspace volume into local directories
 if [ -d /workspace/.agentmesh/state ]; then
@@ -106,6 +112,10 @@ sync_persona_state() {
     mkdir -p /workspace/.agentmesh/state/.config
     if [ -d /root/.config ]; then
         cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
+    fi
+    if [ -d /root/.aip ]; then
+        mkdir -p /workspace/.agentmesh/state/.aip
+        cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
     fi
     # Also synchronize all existing state directories in /workspace/.agentmesh/state
     if [ -d /workspace/.agentmesh/state ]; then

@@ -270,7 +270,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             new() { Name = "AGENTMESH_URL", Value = meshUrl },
             new() { Name = "AGENTMESH_TOKEN", Value = agentToken },
-            new() { Name = "AGENTMESH_PERSONA_ID", Value = normPersonaId }
+            new() { Name = "AGENTMESH_PERSONA_ID", Value = normPersonaId },
+            new() { Name = "TERM", Value = "xterm-256color" }
         };
 
         var envFrom = new List<V1EnvFromSource>();
@@ -577,7 +578,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             new() { Name = "AGENTMESH_URL", Value = meshUrl },
             new() { Name = "AGENTMESH_TOKEN", Value = agentToken },
-            new() { Name = "AGENTMESH_PERSONA_ID", Value = normPersonaId }
+            new() { Name = "AGENTMESH_PERSONA_ID", Value = normPersonaId },
+            new() { Name = "TERM", Value = "xterm-256color" }
         };
 
         var envFrom = new List<V1EnvFromSource>();
@@ -820,11 +822,13 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var stdOutBuilder = new StringBuilder();
             var stdErrBuilder = new StringBuilder();
 
+            var wrappedCommand = $"export PATH=\"/root/.local/bin:/usr/local/bin:$PATH\"; {command}";
+
             var exitCode = await _client.NamespacedPodExecAsync(
                 name: pod.Metadata.Name,
                 @namespace: _namespace,
                 container: "persona-runner",
-                command: new[] { "sh", "-c", command },
+                command: new[] { "/bin/bash", "-c", wrappedCommand },
                 tty: false,
                 action: async (stdIn, stdOut, stdError) =>
                 {
@@ -1399,7 +1403,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             string[] authCmd;
             if (!string.IsNullOrWhiteSpace(loginCmd))
             {
-                authCmd = new[] { "/bin/bash", "-c", loginCmd };
+                authCmd = new[] { "/bin/bash", "-c", $"export PATH=\"/root/.local/bin:/usr/local/bin:$PATH\"; {loginCmd}" };
             }
             else if (driverId.StartsWith("agy") || adapterType == "agy")
             {
@@ -1430,25 +1434,30 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 cancellationToken: ct);
 
             var demuxer = new StreamDemuxer(webSocket);
-            demuxer.Start();
-
             var stdInStream = demuxer.GetStream(null, ChannelIndex.StdIn);
             var stdOutStream = demuxer.GetStream(ChannelIndex.StdOut, null);
             var stdErrStream = demuxer.GetStream(ChannelIndex.StdErr, null);
+            var errorStream = demuxer.GetStream(ChannelIndex.Error, null);
+            demuxer.Start();
 
             var tcsUrl = new TaskCompletionSource<string>();
             var session = new ActiveK8sAuthSession(webSocket, demuxer, stdInStream, tcsUrl);
             _activeK8sAuthSessions[normPersonaId] = session;
 
+            var capturedOutput = new StringBuilder();
+
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    using var reader = new StreamReader(stdOutStream, Encoding.UTF8);
-                    string? line;
-                    while ((line = await reader.ReadLineAsync()) != null)
+                    var buf = new byte[2048];
+                    while (webSocket.State == WebSocketState.Open)
                     {
-                        var match = Regex.Match(line, @"https?://[^\s""'>]+");
+                        var read = await stdOutStream.ReadAsync(buf, 0, buf.Length, CancellationToken.None);
+                        if (read <= 0) break;
+                        var chunk = Encoding.UTF8.GetString(buf, 0, read);
+                        capturedOutput.Append(chunk);
+                        var match = Regex.Match(capturedOutput.ToString(), @"https?://[^\s""'>]+");
                         if (match.Success)
                         {
                             session.AuthUrl = match.Value;
@@ -1466,6 +1475,15 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                             await ExecInContainerAsync(normPersonaId, $"pgrep -f '{compBin}' >/dev/null 2>&1 || (nohup {sidecar.CompanionCommand} >/dev/null 2>&1 &)", CancellationToken.None);
                         }
                     }
+
+                    if (!tcsUrl.Task.IsCompleted)
+                    {
+                        var trimmed = capturedOutput.ToString().Trim();
+                        if (!string.IsNullOrWhiteSpace(trimmed))
+                        {
+                            tcsUrl.TrySetException(new InvalidOperationException($"Login command exited without an authorization link. Output: {trimmed}"));
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1477,17 +1495,40 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             {
                 try
                 {
-                    using var errReader = new StreamReader(stdErrStream, Encoding.UTF8);
-                    string? errLine;
-                    while ((errLine = await errReader.ReadLineAsync()) != null)
+                    var errBuf = new byte[2048];
+                    while (webSocket.State == WebSocketState.Open)
                     {
-                        if (errLine.Contains("pclmul", StringComparison.OrdinalIgnoreCase) ||
-                            errLine.Contains("Illegal instruction", StringComparison.OrdinalIgnoreCase))
+                        var read = await stdErrStream.ReadAsync(errBuf, 0, errBuf.Length, CancellationToken.None);
+                        if (read <= 0) break;
+                        var chunk = Encoding.UTF8.GetString(errBuf, 0, read);
+                        capturedOutput.Append(chunk);
+                        if (chunk.Contains("pclmul", StringComparison.OrdinalIgnoreCase) ||
+                            chunk.Contains("Illegal instruction", StringComparison.OrdinalIgnoreCase))
                         {
                             tcsUrl.TrySetException(new InvalidOperationException(
                                 "Google agy binary crashed: Processor missing PCLMULQDQ instruction. In Proxmox VE, edit VM Hardware -> Processor -> Type and set to 'host' (reboot VM). Alternatively, choose Direct API Key mode."));
                             break;
                         }
+                        var match = Regex.Match(capturedOutput.ToString(), @"https?://[^\s""'>]+");
+                        if (match.Success)
+                        {
+                            session.AuthUrl = match.Value;
+                            tcsUrl.TrySetResult(match.Value);
+                        }
+                    }
+                }
+                catch { }
+            });
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var reader = new StreamReader(errorStream, Encoding.UTF8);
+                    var err = await reader.ReadToEndAsync();
+                    if (!string.IsNullOrWhiteSpace(err))
+                    {
+                        capturedOutput.Append(err);
                     }
                 }
                 catch { }
@@ -1511,7 +1552,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
 
             _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
-            return new PersonaAuthStartResult(normPersonaId, driverId, "error", ErrorMessage: "Timed out waiting for authorization link from container.");
+            var timeoutOutput = capturedOutput.Length > 0 ? $" Output: {capturedOutput.ToString().Trim()}" : "";
+            return new PersonaAuthStartResult(normPersonaId, driverId, "error", ErrorMessage: $"Timed out waiting for authorization link from container.{timeoutOutput}");
         }
         catch (Exception ex)
         {
@@ -1692,7 +1734,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var webSocket = await _client.WebSocketNamespacedPodExecAsync(
             name: pod.Metadata.Name,
             @namespace: _namespace,
-            command: new[] { "/usr/bin/env", "TERM=xterm-256color", "/bin/bash", "-i" },
+            command: new[] { "/bin/bash", "-il" },
             container: "persona-runner",
             stdin: true,
             stdout: true,
@@ -1701,28 +1743,22 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             cancellationToken: ct);
 
         var demuxer = new StreamDemuxer(webSocket);
-        demuxer.Start();
-
         var stdIn = demuxer.GetStream(null, ChannelIndex.StdIn);
         var resizeStream = demuxer.GetStream(null, ChannelIndex.Resize);
         var stdOut = demuxer.GetStream(ChannelIndex.StdOut, null);
         var stdErr = demuxer.GetStream(ChannelIndex.StdErr, null);
+        var errorStream = demuxer.GetStream(ChannelIndex.Error, null);
+        demuxer.Start();
+
+        var writeLock = new SemaphoreSlim(1, 1);
+        var session = new KubernetesTerminalSession(webSocket, demuxer, stdIn, resizeStream, writeLock);
 
         // Send initial resize dimensions so PTY has correct cols/rows
-        try
-        {
-            var resizeMsg = $"{{\"Width\":{cols},\"Height\":{rows}}}";
-            var resizeBytes = Encoding.UTF8.GetBytes(resizeMsg);
-            await resizeStream.WriteAsync(resizeBytes, 0, resizeBytes.Length, ct);
-            await resizeStream.FlushAsync(ct);
-        }
-        catch { }
-
-        var session = new KubernetesTerminalSession(webSocket, demuxer, stdIn, resizeStream);
+        await session.ResizeAsync(cols, rows);
 
         _ = Task.Run(async () =>
         {
-            var buffer = new byte[2048];
+            var buffer = new byte[4096];
             try
             {
                 while (webSocket.State == WebSocketState.Open)
@@ -1743,7 +1779,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         _ = Task.Run(async () =>
         {
-            var errBuffer = new byte[2048];
+            var errBuffer = new byte[4096];
             try
             {
                 while (webSocket.State == WebSocketState.Open)
@@ -1752,6 +1788,20 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     if (read <= 0) break;
                     var text = Encoding.UTF8.GetString(errBuffer, 0, read);
                     await onOutput(text);
+                }
+            }
+            catch { }
+        });
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var reader = new StreamReader(errorStream, Encoding.UTF8);
+                var errContent = await reader.ReadToEndAsync();
+                if (!string.IsNullOrWhiteSpace(errContent))
+                {
+                    _logger.LogWarning("Terminal pod exec error stream: {Error}", errContent);
                 }
             }
             catch { }
@@ -2053,7 +2103,12 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
     }
 
-    private sealed class KubernetesTerminalSession(WebSocket webSocket, StreamDemuxer demuxer, Stream stdIn, Stream resizeStream) : IPersonaTerminalSession
+    private sealed class KubernetesTerminalSession(
+        WebSocket webSocket,
+        StreamDemuxer demuxer,
+        Stream stdIn,
+        Stream resizeStream,
+        SemaphoreSlim writeLock) : IPersonaTerminalSession
     {
         public async ValueTask SendInputAsync(string data)
         {
@@ -2062,8 +2117,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 if (webSocket.State == WebSocketState.Open)
                 {
                     var bytes = Encoding.UTF8.GetBytes(data);
-                    await stdIn.WriteAsync(bytes, 0, bytes.Length);
-                    await stdIn.FlushAsync();
+                    await writeLock.WaitAsync();
+                    try
+                    {
+                        await stdIn.WriteAsync(bytes, 0, bytes.Length);
+                        await stdIn.FlushAsync();
+                    }
+                    finally
+                    {
+                        writeLock.Release();
+                    }
                 }
             }
             catch { }
@@ -2075,10 +2138,18 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             {
                 if (webSocket.State == WebSocketState.Open && resizeStream != null)
                 {
-                    var resizeMsg = $"{{\"Width\":{cols},\"Height\":{rows}}}";
+                    var resizeMsg = $"{{\"Width\":{cols},\"Height\":{rows},\"width\":{cols},\"height\":{rows}}}";
                     var bytes = Encoding.UTF8.GetBytes(resizeMsg);
-                    await resizeStream.WriteAsync(bytes, 0, bytes.Length);
-                    await resizeStream.FlushAsync();
+                    await writeLock.WaitAsync();
+                    try
+                    {
+                        await resizeStream.WriteAsync(bytes, 0, bytes.Length);
+                        await resizeStream.FlushAsync();
+                    }
+                    finally
+                    {
+                        writeLock.Release();
+                    }
                 }
             }
             catch { }
@@ -2087,7 +2158,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         public async ValueTask DisposeAsync()
         {
             try { stdIn.Dispose(); } catch { }
-            try { resizeStream.Dispose(); } catch { }
+            try { resizeStream?.Dispose(); } catch { }
             try { demuxer.Dispose(); } catch { }
             try
             {
@@ -2098,6 +2169,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
             catch { }
             try { webSocket.Dispose(); } catch { }
+            writeLock.Dispose();
         }
     }
 

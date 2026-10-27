@@ -838,7 +838,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         var containerName = GetContainerName(personaId);
         var cli = _detectedCli ?? "docker";
         var escaped = command.Replace("\"", "\\\"");
-        return await RunCliAsync(cli, $"exec {containerName} sh -c \"{escaped}\"", ct);
+        return await RunCliAsync(cli, $"exec {containerName} /bin/bash -c \"export PATH=\\\"/root/.local/bin:/usr/local/bin:$PATH\\\"; {escaped}\"", ct);
     }
 
     public async Task<PersonaDriverVerificationResult> VerifyDriverAsync(string personaId, CancellationToken ct = default)
@@ -1347,7 +1347,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         {
             psi.ArgumentList.Add("/bin/bash");
             psi.ArgumentList.Add("-c");
-            psi.ArgumentList.Add(loginCmd);
+            psi.ArgumentList.Add($"export PATH=\"/root/.local/bin:/usr/local/bin:$PATH\"; {loginCmd}");
         }
         else if (driverId.StartsWith("agy") || adapterType == "agy")
         {
