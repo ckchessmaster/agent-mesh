@@ -355,7 +355,7 @@ public class AgentsController(
 
     [HttpGet("{id}/sessions")]
     [AllowAnonymous]
-    public async Task<IActionResult> GetAgentSessions(string id)
+    public async Task<IActionResult> GetAgentSessions(string id, [FromQuery] int? take = null, [FromQuery] int? skip = null)
     {
         var normalizedId = id.Trim().ToLowerInvariant();
         var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId);
@@ -363,10 +363,28 @@ public class AgentsController(
             .AsNoTracking()
             .ToDictionaryAsync(p => p.Id, p => p.Name, StringComparer.OrdinalIgnoreCase);
 
-        var rawSessions = await db.AgentSessions
+        IQueryable<AgentSession> filtered = db.AgentSessions
             .AsNoTracking()
-            .Where(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId)
-            .OrderByDescending(s => s.UpdatedAt)
+            .Where(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId);
+
+        // Mirrors the persona card contract: an exact owner-scoped total (the global /api/sessions
+        // window is capped at 100 rows) plus an opt-in page. The CLI polls this un-paged.
+        // Counted off the unordered queryable so the aggregate carries no sort node.
+        var totalCount = await filtered.CountAsync();
+
+        IQueryable<AgentSession> sessionQuery = filtered.OrderByDescending(s => s.UpdatedAt);
+        // ControllerContext.HttpContext is null for direct (non-HTTP) action invocation.
+        if (ControllerContext.HttpContext is { } httpContext)
+        {
+            httpContext.Response.Headers["X-Total-Count"] = totalCount.ToString();
+        }
+
+        if (take is > 0)
+        {
+            sessionQuery = sessionQuery.Skip(Math.Max(0, skip ?? 0)).Take(take.Value);
+        }
+
+        var rawSessions = await sessionQuery
             .Select(s => new
             {
                 s.Id,

@@ -18,6 +18,7 @@ import type {
   QueuedPromptItem,
   SessionAttachment,
   SessionMessage,
+  SessionPage,
   SessionArtifact,
   StagedJob,
   SubmitAnswerRequest,
@@ -46,6 +47,18 @@ const apiFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<R
     }
   }
   return res;
+};
+
+/**
+ * Reads the owner-scoped session total the API echoes in `X-Total-Count`. Returns null when the
+ * header is absent or unparseable (older API build, or a proxy that strips it) so callers can fall
+ * back to whatever rows they already hold instead of showing a bogus count.
+ */
+const readTotalCount = (res: Response): number | null => {
+  const raw = res.headers.get('X-Total-Count') ?? res.headers.get('x-total-count');
+  if (!raw) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 };
 
 const getAuthHeadersOnly = (): Record<string, string> => {
@@ -193,10 +206,24 @@ export const api = {
     return res.json();
   },
 
-  async getPersonaSessions(personaId: string): Promise<AgentSession[]> {
-    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/sessions`, { headers: getHeaders() });
+  /**
+   * Owner-scoped session page plus the server's exact total for that owner. The global
+   * `GET /api/sessions` window is capped, so this is the only way the sidebar can truthfully say
+   * "Show all (N)" and actually reach the older rows. `total` is null when the header is missing
+   * (older API, or a proxy that strips it) and callers must then fall back to what they hold.
+   *
+   * Omitting `take` returns the owner's entire history, which is what card expansion asks for.
+   */
+  async getPersonaSessionsPage(personaId: string, take?: number, skip?: number): Promise<SessionPage> {
+    const params = new URLSearchParams();
+    if (take && take > 0) params.append('take', String(take));
+    if (skip && skip > 0) params.append('skip', String(skip));
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/sessions${query}`, {
+      headers: getHeaders()
+    });
     if (!res.ok) throw new Error(`Failed to load persona sessions: ${res.statusText}`);
-    return res.json();
+    return { items: await res.json(), total: readTotalCount(res) };
   },
 
   async createPersonaSession(
@@ -419,10 +446,17 @@ export const api = {
     return res.json();
   },
 
-  async getAgentSessions(agentId: string): Promise<AgentSession[]> {
-    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/sessions`, { headers: getHeaders() });
+  /** Driver-card counterpart of `getPersonaSessionsPage`. See that method for the contract. */
+  async getAgentSessionsPage(agentId: string, take?: number, skip?: number): Promise<SessionPage> {
+    const params = new URLSearchParams();
+    if (take && take > 0) params.append('take', String(take));
+    if (skip && skip > 0) params.append('skip', String(skip));
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/sessions${query}`, {
+      headers: getHeaders()
+    });
     if (!res.ok) throw new Error(`Failed to load agent sessions: ${res.statusText}`);
-    return res.json();
+    return { items: await res.json(), total: readTotalCount(res) };
   },
 
   async createAgentSession(

@@ -174,6 +174,16 @@ export interface AgentSession {
 
 export type SessionEventType = 'prompt' | 'thought' | 'tool_call' | 'tool_result' | 'response' | string;
 
+/**
+ * One page of a persona's or driver's session history, plus the server's exact total for that owner.
+ * `total` is null when the API did not send `X-Total-Count` (older build, stripped by a proxy), and
+ * callers must then fall back to the rows they already hold.
+ */
+export interface SessionPage {
+  items: AgentSession[];
+  total: number | null;
+}
+
 export interface SessionMessage {
   id: string;
   sessionId: string;
