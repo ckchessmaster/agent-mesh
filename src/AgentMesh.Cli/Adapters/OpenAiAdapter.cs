@@ -131,6 +131,20 @@ public class OpenAiAdapter : IAgentAdapter
     public static int EstimateMessageTokens(OpenAiMessage message)
     {
         var charCount = (message.Role?.Length ?? 0) + (message.Content?.Length ?? 0);
+        if (message.ContentParts != null && message.ContentParts.Count > 0)
+        {
+            foreach (var part in message.ContentParts)
+            {
+                if (part is OpenAiTextContentPart textPart && !string.IsNullOrEmpty(textPart.Text))
+                {
+                    charCount += textPart.Text.Length;
+                }
+                else
+                {
+                    charCount += 3600; // ~1000 tokens per image input
+                }
+            }
+        }
         if (message.ToolCalls != null)
         {
             foreach (var tc in message.ToolCalls)
@@ -339,7 +353,74 @@ public class OpenAiAdapter : IAgentAdapter
             ? promptEvent.Prompt
             : $"{attachedBlock}{promptEvent.Prompt}";
 
-        history.Add(new OpenAiMessage { Role = "user", Content = fullUserPrompt });
+        var imageParts = new List<object>();
+        if (promptEvent.Attachments != null && promptEvent.Attachments.Count > 0)
+        {
+            foreach (var att in promptEvent.Attachments)
+            {
+                var filePath = att.LocalFilePath;
+                if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+                {
+                    var attachDir = Path.Combine(cwd, ".agentmesh", "attachments");
+                    if (Directory.Exists(attachDir))
+                    {
+                        var safeName = Path.GetFileName(att.FileName);
+                        var candidate = Directory.GetFiles(attachDir, $"*{safeName}*").FirstOrDefault();
+                        if (candidate != null && File.Exists(candidate)) filePath = candidate;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(filePath) && File.Exists(filePath))
+                {
+                    var ext = Path.GetExtension(filePath).ToLowerInvariant();
+                    if (ext is ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp")
+                    {
+                        var mime = ext switch
+                        {
+                            ".png" => "image/png",
+                            ".jpg" or ".jpeg" => "image/jpeg",
+                            ".gif" => "image/gif",
+                            ".webp" => "image/webp",
+                            _ => "image/png"
+                        };
+                        try
+                        {
+                            var bytes = File.ReadAllBytes(filePath);
+                            var base64 = Convert.ToBase64String(bytes);
+                            imageParts.Add(new OpenAiImageUrlContentPart
+                            {
+                                Type = "image_url",
+                                ImageUrl = new OpenAiImageUrl
+                                {
+                                    Url = $"data:{mime};base64,{base64}"
+                                }
+                            });
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+
+        if (imageParts.Count > 0)
+        {
+            var contentParts = new List<object>
+            {
+                new OpenAiTextContentPart { Type = "text", Text = fullUserPrompt }
+            };
+            contentParts.AddRange(imageParts);
+
+            history.Add(new OpenAiMessage
+            {
+                Role = "user",
+                Content = fullUserPrompt,
+                ContentParts = contentParts
+            });
+        }
+        else
+        {
+            history.Add(new OpenAiMessage { Role = "user", Content = fullUserPrompt });
+        }
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
         var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
@@ -1003,7 +1084,7 @@ public class OpenAiAdapter : IAgentAdapter
         sb.AppendLine("- Use `read_file` to inspect code and text files.");
         sb.AppendLine("- Use `write_file` or `edit_file` to implement solutions.");
         sb.AppendLine("- When you need user clarification or critical architectural decisions, call `ask_question`.");
-        sb.AppendLine("- Vision / Image Limitation: You operate in a text-based environment without multimodal vision tools. If the user attaches an image or asks about visual assets, do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands. Instead, immediately inform the user or call `ask_question` to request the relevant text, error messages, or visual details directly.");
+        sb.AppendLine("- Vision / Image Handling: Attached image files are provided directly to your multimodal visual input when supported. You can inspect, analyze, and describe them visually. However, binary image files on disk cannot be read as plain text via `read_file`. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands.");
         sb.AppendLine("- Be concise and lead with working code and clear implementation.");
 
         return sb.ToString();
@@ -1226,7 +1307,7 @@ public class OpenAiAdapter : IAgentAdapter
                         var fi = new FileInfo(fullPath);
                         if (ImageExtensions.Contains(ext) && !string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
                         {
-                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text. You operate in a text-based runtime without multimodal vision tools. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands. Instead, immediately inform the user that you cannot visually inspect images and ask for text descriptions, logs, or relevant details.]";
+                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text. Attached images are already provided directly to your multimodal visual context in the prompt. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands. If you need details about an unattached image, ask the user to attach or describe it.]";
                         }
                         return $"[Binary file: '{path}' ({fi.Length:N0} bytes). This is a binary file and cannot be read as plain text.]";
                     }
@@ -1420,6 +1501,9 @@ public class OpenAiMessage
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Content { get; set; }
 
+    [JsonIgnore]
+    public List<object>? ContentParts { get; set; }
+
     [JsonPropertyName("tool_call_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ToolCallId { get; set; }
@@ -1431,7 +1515,14 @@ public class OpenAiMessage
     public object ToSerializableObject()
     {
         var dict = new Dictionary<string, object?> { ["role"] = Role };
-        if (Content != null) dict["content"] = Content;
+        if (ContentParts != null && ContentParts.Count > 0)
+        {
+            dict["content"] = ContentParts;
+        }
+        else if (Content != null)
+        {
+            dict["content"] = Content;
+        }
         if (!string.IsNullOrEmpty(ToolCallId)) dict["tool_call_id"] = ToolCallId;
         if (ToolCalls != null && ToolCalls.Count > 0)
         {
@@ -1448,6 +1539,30 @@ public class OpenAiMessage
         }
         return dict;
     }
+}
+
+public class OpenAiTextContentPart
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "text";
+
+    [JsonPropertyName("text")]
+    public string Text { get; set; } = string.Empty;
+}
+
+public class OpenAiImageUrlContentPart
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "image_url";
+
+    [JsonPropertyName("image_url")]
+    public OpenAiImageUrl ImageUrl { get; set; } = new();
+}
+
+public class OpenAiImageUrl
+{
+    [JsonPropertyName("url")]
+    public string Url { get; set; } = string.Empty;
 }
 
 public class OpenAiToolCall

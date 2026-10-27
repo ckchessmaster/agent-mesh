@@ -273,7 +273,7 @@ public static class AgentAdapterFactory
 
         var sb = new StringBuilder();
         sb.AppendLine("[Attached Files in Workspace]");
-        sb.AppendLine("The user attached the following file(s) to this message. They have been staged into the workspace (text files can be inspected using `read_file`). Note: Binary and image attachments cannot be visually inspected by text-based models—do not attempt to script OCR or decode image binaries; ask the user for details if needed:");
+        sb.AppendLine("The user attached the following file(s) to this message. They have been staged into the workspace (text files can be inspected using `read_file`, and image attachments are also provided directly to multimodal vision models as visual inputs). Note: If running on a text-only model without vision, do not attempt to script OCR or decode image binaries; ask the user for details if needed:");
         foreach (var att in attachments)
         {
             var path = !string.IsNullOrWhiteSpace(att.LocalFilePath)

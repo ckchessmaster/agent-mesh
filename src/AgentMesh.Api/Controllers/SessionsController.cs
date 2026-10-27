@@ -944,6 +944,10 @@ public class SessionsController(
                 createdAt = initialMsg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            if (!string.IsNullOrWhiteSpace(personaId))
+            {
+                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+            }
             await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
 
@@ -1289,6 +1293,10 @@ public class SessionsController(
                 createdAt = message.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            if (!string.IsNullOrWhiteSpace(personaId))
+            {
+                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+            }
             await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
         else if (eventType == "response")
@@ -1304,6 +1312,7 @@ public class SessionsController(
                     var nextPrompt = queue[0];
                     queue.RemoveAt(0);
                     session.MetadataJson = UpdatePromptQueueMetadata(session.MetadataJson, queue);
+                    session.MetadataJson = ClearStopMetadata(session.MetadataJson);
 
                     var nextMsg = new SessionMessage
                     {
@@ -1367,6 +1376,10 @@ public class SessionsController(
                             createdAt = nextMsg.CreatedAt
                         };
                         await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                        if (!string.IsNullOrWhiteSpace(personaId))
+                        {
+                            await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+                        }
                         await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
                     }
                 }
@@ -1642,6 +1655,8 @@ public class SessionsController(
                 await TriggerStopInternalAsync(session);
             }
 
+            session.MetadataJson = ClearStopMetadata(session.MetadataJson);
+
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
             var msg = new SessionMessage
@@ -1690,6 +1705,10 @@ public class SessionsController(
                     createdAt = msg.CreatedAt
                 };
                 await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                if (!string.IsNullOrWhiteSpace(personaId))
+                {
+                    await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+                }
                 await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
             }
 
@@ -1699,6 +1718,8 @@ public class SessionsController(
         // If session is idle and queue is empty, dispatch immediately
         if (session.Status != "thinking" && queue.Count == 0)
         {
+            session.MetadataJson = ClearStopMetadata(session.MetadataJson);
+
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
             var msg = new SessionMessage
@@ -1747,6 +1768,10 @@ public class SessionsController(
                     createdAt = msg.CreatedAt
                 };
                 await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+                if (!string.IsNullOrWhiteSpace(personaId))
+                {
+                    await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+                }
                 await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
             }
 
@@ -1827,6 +1852,8 @@ public class SessionsController(
             await TriggerStopInternalAsync(session);
         }
 
+        session.MetadataJson = ClearStopMetadata(session.MetadataJson);
+
         var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
         var contextSize = ExtractSessionContextSize(session.MetadataJson);
         var structuredPayloadJson = MergeAttachmentsIntoStructuredPayload(null, item.Attachments);
@@ -1879,6 +1906,10 @@ public class SessionsController(
                 createdAt = msg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            if (!string.IsNullOrWhiteSpace(personaId))
+            {
+                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+            }
             await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
 
@@ -2058,6 +2089,10 @@ public class SessionsController(
                 createdAt = promptMsg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
+            if (!string.IsNullOrWhiteSpace(personaId))
+            {
+                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+            }
             await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
         }
 

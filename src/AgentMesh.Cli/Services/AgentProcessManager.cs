@@ -183,7 +183,7 @@ public class AgentRunnerInstance : IAsyncDisposable
 
         _hubConnection.On<StopExecutionEvent>("StopExecution", (ev) =>
         {
-            HandleStopExecution(ev.SessionId, ev.AgentId, ev.PersonaId);
+            HandleStopExecution(ev.SessionId, ev.AgentId, ev.PersonaId, ev.Reason);
         });
 
         _hubConnection.On<JsonElement>("StopExecution", (elem) =>
@@ -193,8 +193,9 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var sidStr = GetJsonPropString(elem, "sessionId");
                 var targetAgent = GetJsonPropString(elem, "agentId");
                 var targetPersona = GetJsonPropString(elem, "personaId");
+                var reason = GetJsonPropString(elem, "reason");
                 Guid? parsedSid = (sidStr != null && Guid.TryParse(sidStr, out var s)) ? s : null;
-                HandleStopExecution(parsedSid, targetAgent, targetPersona);
+                HandleStopExecution(parsedSid, targetAgent, targetPersona, reason);
             }
             catch { }
         });
@@ -360,12 +361,20 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
     }
 
-    private void HandleStopExecution(Guid? parsedSid, string? targetAgent, string? targetPersona = null)
+    private void HandleStopExecution(Guid? parsedSid, string? targetAgent, string? targetPersona = null, string? reason = null)
     {
         var targetSid = parsedSid ?? State.ActiveSessionId;
+        var isInterrupt = reason?.Contains("Interrupted", StringComparison.OrdinalIgnoreCase) == true;
         if (targetSid.HasValue)
         {
-            _stoppedSessions[targetSid.Value] = DateTimeOffset.UtcNow;
+            if (isInterrupt)
+            {
+                _stoppedSessions.TryRemove(targetSid.Value, out _);
+            }
+            else
+            {
+                _stoppedSessions[targetSid.Value] = DateTimeOffset.UtcNow;
+            }
         }
 
         var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
