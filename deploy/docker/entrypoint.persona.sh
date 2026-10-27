@@ -82,27 +82,41 @@ fi
 mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
 chmod 700 /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config 2>/dev/null || true
 
-# Symlink ~/.config to workspace state so any tool using standard XDG paths persists state
-if [ ! -L /root/.config ]; then
-    mkdir -p /root/.config
-    cp -rn /root/.config/* /workspace/.agentmesh/state/.config/ 2>/dev/null || true
-    rm -rf /root/.config
-    ln -s /workspace/.agentmesh/state/.config /root/.config
-fi
+# If ~/.aip or ~/.config were previously created as symlinks, remove the symlinks so credential
+# managers that forbid symlinks (e.g. aip / Go credential store) have secure real directories.
+if [ -L /root/.aip ]; then rm -f /root/.aip; fi
+if [ -L /root/.config ]; then rm -f /root/.config; fi
 
-# Symlink ~/.aip to workspace state so aip credentials survive container restarts
-if [ ! -L /root/.aip ]; then
-    mkdir -p /root/.aip
-    cp -rn /root/.aip/* /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
-    rm -rf /root/.aip
-    ln -s /workspace/.agentmesh/state/.aip /root/.aip
+# Create local directories with strict 700 permissions
+mkdir -p /root/.config /root/.aip
+chmod 700 /root/.aip /root/.config 2>/dev/null || true
+
+# Restore state from workspace volume into local directories
+if [ -d /workspace/.agentmesh/state/.aip ]; then
+    cp -a /workspace/.agentmesh/state/.aip/. /root/.aip/ 2>/dev/null || true
 fi
-chmod -R 700 /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config 2>/dev/null || true
+if [ -d /workspace/.agentmesh/state/.config ]; then
+    cp -a /workspace/.agentmesh/state/.config/. /root/.config/ 2>/dev/null || true
+fi
+chmod 700 /root/.aip /root/.config 2>/dev/null || true
+
+# Helper to synchronize state back to workspace volume
+sync_persona_state() {
+    mkdir -p /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config
+    if [ -d /root/.aip ]; then
+        cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
+    fi
+    if [ -d /root/.config ]; then
+        cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
+    fi
+    chmod 700 /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config 2>/dev/null || true
+}
 
 # Run companion setup script if configured (e.g. install aip helper)
 if [ -n "$COMPANION_SETUP" ]; then
     echo "Executing companion setup script..."
     eval "$COMPANION_SETUP" || echo "Warning: Companion setup exited with code $?"
+    sync_persona_state
 fi
 
 # Start companion background daemon if configured (e.g. aip proxy)
@@ -110,6 +124,10 @@ if [ -n "$COMPANION_COMMAND" ]; then
     echo "Starting companion daemon: $COMPANION_COMMAND"
     eval "$COMPANION_COMMAND" &
     COMPANION_PID=$!
+    sleep 1
+    if ! kill -0 "$COMPANION_PID" 2>/dev/null; then
+        echo "Warning: Companion daemon process exited immediately."
+    fi
 fi
 
 # Await companion daemon readiness port if configured
@@ -131,6 +149,7 @@ if [ -n "$COMPANION_PORT" ]; then
 fi
 
 cleanup() {
+    sync_persona_state
     if [ -n "$COMPANION_PID" ] && kill -0 "$COMPANION_PID" 2>/dev/null; then
         kill "$COMPANION_PID" 2>/dev/null || true
     fi

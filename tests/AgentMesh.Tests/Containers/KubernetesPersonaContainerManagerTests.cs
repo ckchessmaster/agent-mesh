@@ -232,4 +232,38 @@ public class KubernetesPersonaContainerManagerTests
         extraArgsVar.Value.Should().Contain("--hostname=mesh-test");
         extraArgsVar.Value.Should().Contain("--accept-routes");
     }
+
+    [Fact]
+    public void ParseModelsFromBody_WhenGivenValidOpenAiJson_ExtractsModelIds()
+    {
+        var json = """
+        {
+          "object": "list",
+          "data": [
+            { "id": "qwen3.8-flash-next", "object": "model" },
+            { "id": "llama-3.3-70b", "object": "model" }
+          ]
+        }
+        """;
+
+        var models = KubernetesPersonaContainerManager.ParseModelsFromBody(json);
+
+        models.Should().NotBeNull();
+        models.Should().HaveCount(2);
+        models.Should().Contain("qwen3.8-flash-next");
+        models.Should().Contain("llama-3.3-70b");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("not a json")]
+    [InlineData("{}")]
+    [InlineData("{\"data\": \"not an array\"}")]
+    public void ParseModelsFromBody_WhenInvalidOrEmpty_ReturnsNull(string? input)
+    {
+        var models = KubernetesPersonaContainerManager.ParseModelsFromBody(input);
+        models.Should().BeNull();
+    }
 }

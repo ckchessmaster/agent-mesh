@@ -878,6 +878,12 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
 
         string driverId = "agy";
+        string adapterType = "agy";
+        string? endpoint = null;
+        string? defaultModel = null;
+        bool hasApiKey = false;
+        DriverSidecarConfig? sidecar = null;
+
         try
         {
             using var scope = _serviceProvider.CreateScope();
@@ -886,9 +892,52 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             if (!string.IsNullOrWhiteSpace(p?.DriverId))
             {
                 driverId = p.DriverId.Trim().ToLowerInvariant();
+                var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
+                if (agent != null && !string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
+                        var root = doc.RootElement;
+                        if (root.TryGetProperty("adapter", out var aProp) && aProp.ValueKind == JsonValueKind.String)
+                        {
+                            var aStr = aProp.GetString();
+                            if (!string.IsNullOrWhiteSpace(aStr)) adapterType = aStr.Trim().ToLowerInvariant();
+                        }
+                        else if (driverId.StartsWith("claude")) adapterType = "claude";
+                        else if (driverId.StartsWith("copilot")) adapterType = "copilot";
+                        else if (driverId.StartsWith("openai")) adapterType = "openai";
+
+                        if (root.TryGetProperty("endpoint", out var eProp) && eProp.ValueKind == JsonValueKind.String)
+                        {
+                            endpoint = eProp.GetString()?.Trim();
+                        }
+                        if (root.TryGetProperty("defaultModel", out var mProp) && mProp.ValueKind == JsonValueKind.String)
+                        {
+                            defaultModel = mProp.GetString()?.Trim();
+                        }
+                        if (root.TryGetProperty("apiKey", out var kProp) && kProp.ValueKind == JsonValueKind.String)
+                        {
+                            hasApiKey = !string.IsNullOrWhiteSpace(kProp.GetString());
+                        }
+                        if (root.TryGetProperty("sidecar", out var scProp) && scProp.ValueKind == JsonValueKind.Object)
+                        {
+                            sidecar = JsonSerializer.Deserialize<DriverSidecarConfig>(scProp.GetRawText());
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning("Failed to parse driver capabilities for {DriverId}: {Error}", driverId, ex.Message);
+                    }
+                }
             }
         }
         catch { }
+
+        if (sidecar == null)
+        {
+            sidecar = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
+        }
 
         var steps = new List<PersonaDriverVerificationStep>();
 
@@ -903,8 +952,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             steps.Add(new PersonaDriverVerificationStep("Kubernetes Pod Status", "failed", "Pod is not responding to exec"));
         }
 
-        // Sidecar connectivity check if configured
-        var sidecar = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
+        // 2. Sidecar connectivity check if configured
         if (sidecar != null && sidecar.Enabled)
         {
             if (string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase))
@@ -941,11 +989,86 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
         }
 
-        // 2. Binary presence check
-        string checkCmd = driverId.StartsWith("claude") ? "claude --version" :
-                          driverId.StartsWith("copilot") ? "gh --version" :
-                          driverId.StartsWith("openai") ? "echo 'OpenAI API Adapter'" :
-                          "agy --version";
+        // 3. Companion binary & daemon check (if companion command configured)
+        string? companionBin = null;
+        if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
+        {
+            var cmdTokens = sidecar.CompanionCommand.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (cmdTokens.Length > 0)
+            {
+                companionBin = cmdTokens[0];
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(companionBin))
+        {
+            var binName = Path.GetFileName(companionBin);
+            var (binFindExit, binFindOut, _) = await ExecInContainerAsync(
+                normPersonaId,
+                $"command -v {companionBin} 2>/dev/null || which {companionBin} 2>/dev/null || test -x /root/.local/bin/{binName} && echo /root/.local/bin/{binName}",
+                ct);
+
+            if (binFindExit == 0 && !string.IsNullOrWhiteSpace(binFindOut))
+            {
+                var foundPath = binFindOut.Split('\n')[0].Trim();
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Companion Binary",
+                    "success",
+                    $"Companion binary '{binName}' detected ({foundPath})"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Companion Binary",
+                    "failed",
+                    $"Companion binary '{binName}' not found in container PATH or /root/.local/bin"));
+            }
+
+            var (daemonExit, daemonOut, _) = await ExecInContainerAsync(
+                normPersonaId,
+                $"pgrep -f '{binName}' >/dev/null 2>&1 || ps aux | grep -v grep | grep -q '{binName}'",
+                ct);
+
+            if (daemonExit == 0)
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Companion Daemon",
+                    "success",
+                    $"Companion daemon '{binName}' is running"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Companion Daemon",
+                    "failed",
+                    $"Companion daemon '{sidecar?.CompanionCommand}' is not running in container"));
+            }
+        }
+
+        // 4. CLI Binary Check
+        string checkCmd;
+        if (adapterType == "claude" || driverId.StartsWith("claude"))
+        {
+            checkCmd = "claude --version";
+        }
+        else if (adapterType == "copilot" || driverId.StartsWith("copilot"))
+        {
+            checkCmd = "gh --version";
+        }
+        else if (adapterType == "openai")
+        {
+            checkCmd = !string.IsNullOrWhiteSpace(companionBin)
+                ? $"command -v {companionBin} 2>/dev/null || test -x /root/.local/bin/{Path.GetFileName(companionBin)}"
+                : "echo 'OpenAI API Adapter'";
+        }
+        else if (driverId.StartsWith("agy") || adapterType == "agy")
+        {
+            checkCmd = "agy --version";
+        }
+        else
+        {
+            checkCmd = $"command -v {driverId} --version 2>/dev/null || echo '{driverId} active'";
+        }
 
         var (binExit, binOut, binErr) = await ExecInContainerAsync(normPersonaId, checkCmd, ct);
         if (binExit == 0)
@@ -954,7 +1077,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             steps.Add(new PersonaDriverVerificationStep(
                 "CLI Binary Check",
                 "success",
-                $"{driverId} binary detected in container ({ver})"));
+                $"{driverId} ({adapterType}) binary check passed ({ver})"));
         }
         else
         {
@@ -973,9 +1096,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 errorDetails));
         }
 
-        // 3. Authentication check
+        // 5. Authentication check
         await SeedCredentialsFromSecretAsync(normPersonaId, ct);
-        if (driverId.StartsWith("agy"))
+        if (driverId.StartsWith("agy") || adapterType == "agy")
         {
             var (authExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
             var (keyExit, keyOut, _) = await ExecInContainerAsync(normPersonaId, "printenv GEMINI_API_KEY", ct);
@@ -1015,7 +1138,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     "Not authenticated with Google AI Pro. Click 'Authenticate Driver' or enter an API key in the UI."));
             }
         }
-        else if (driverId.StartsWith("claude"))
+        else if (driverId.StartsWith("claude") || adapterType == "claude")
         {
             var (keyExit, keyOut, _) = await ExecInContainerAsync(normPersonaId, "printenv ANTHROPIC_API_KEY", ct);
             var (authExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -d /root/.claude", ct);
@@ -1028,12 +1151,44 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "No Claude credentials found."));
             }
         }
+        else if (adapterType == "openai")
+        {
+            var (keyExit, keyOut, _) = await ExecInContainerAsync(normPersonaId, "printenv OPENAI_API_KEY", ct);
+            var hasEnvKey = (keyExit == 0 && !string.IsNullOrWhiteSpace(keyOut));
+
+            if (!string.IsNullOrWhiteSpace(companionBin) && companionBin.Contains("aip"))
+            {
+                var (aipExit, aipOut, aipErr) = await ExecInContainerAsync(normPersonaId, "command -v aip >/dev/null 2>&1 && aip status 2>&1 || /root/.local/bin/aip status 2>&1", ct);
+                var combinedAip = $"{aipOut} {aipErr}".Trim();
+                if (aipExit == 0 && !combinedAip.Contains("signed out", StringComparison.OrdinalIgnoreCase) && !combinedAip.Contains("run aip login", StringComparison.OrdinalIgnoreCase))
+                {
+                    var firstLine = combinedAip.Split('\n')[0].Trim();
+                    steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", $"aip companion authenticated ({firstLine})"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "aip companion is not signed in. Run 'aip login' or authenticate the driver in the UI."));
+                }
+            }
+            else if (hasApiKey || hasEnvKey)
+            {
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", "OpenAI API key configured"));
+            }
+            else if (!string.IsNullOrWhiteSpace(endpoint) && (endpoint.Contains("localhost") || endpoint.Contains("127.0.0.1")))
+            {
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", "Local proxy adapter active (no API key required)"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "No OpenAI API key configured. Enter an API key in the UI if required by endpoint."));
+            }
+        }
         else
         {
-            steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", "Driver adapter active"));
+            steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", $"Driver adapter active ({adapterType})"));
         }
 
-        // 4. Mesh API Connectivity & Token Check
+        // 6. Mesh API Connectivity & Token Check
         var (curlExit, curlOut, curlErr) = await ExecInContainerAsync(normPersonaId, "curl -s -f -H \"Authorization: Bearer $AGENTMESH_TOKEN\" $AGENTMESH_URL/api/status", ct);
         if (curlExit == 0)
         {
@@ -1050,27 +1205,132 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 $"API connectivity test failed (exit {curlExit}): {(!string.IsNullOrWhiteSpace(curlErr) ? curlErr : curlOut)}"));
         }
 
-        // 5. Dry-run prompt test
+        // 7. Driver Endpoint Reachability Check (for HTTP endpoints)
+        if (!string.IsNullOrWhiteSpace(endpoint))
+        {
+            var baseEndpoint = endpoint.TrimEnd('/');
+            var modelsUrl = baseEndpoint.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)
+                ? $"{baseEndpoint}/models"
+                : $"{baseEndpoint}/v1/models";
+
+            var (epExit, epOut, epErr) = await ExecInContainerAsync(
+                normPersonaId,
+                $"curl -s -m 5 -o /dev/null -w \"HTTP_CODE:%{{http_code}}\" \"{modelsUrl}\" 2>&1 || curl -s -m 5 -o /dev/null -w \"HTTP_CODE:%{{http_code}}\" \"{baseEndpoint}\" 2>&1",
+                ct);
+
+            var epCombined = $"{epOut} {epErr}".Trim();
+            if (epCombined.Contains("HTTP_CODE:200") || epCombined.Contains("HTTP_CODE:204"))
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Driver Endpoint Reachability",
+                    "success",
+                    $"Endpoint responded successfully at {endpoint} (HTTP 200)"));
+            }
+            else if (epCombined.Contains("HTTP_CODE:401") || epCombined.Contains("HTTP_CODE:403"))
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Driver Endpoint Reachability",
+                    "warning",
+                    $"Endpoint reached at {endpoint} but rejected authentication (HTTP 401/403)"));
+            }
+            else if (epCombined.Contains("Connection refused", StringComparison.OrdinalIgnoreCase))
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Driver Endpoint Reachability",
+                    "failed",
+                    $"Connection refused: Failed to connect to {endpoint}"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Driver Endpoint Reachability",
+                    "failed",
+                    $"Unable to reach endpoint at {endpoint}: {epCombined}"));
+            }
+        }
+
+        // 8. Dry-run prompt test
         if (steps.All(s => s.Status != "failed"))
         {
-            var dryRunCmd = driverId.StartsWith("agy") ? "timeout 15 agy -p \"hello\"" :
-                            driverId.StartsWith("claude") ? "timeout 15 claude -p \"hello\"" :
-                            "echo 'OK'";
-            var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(normPersonaId, dryRunCmd, ct);
-            if (dryExit == 0)
+            if (driverId.StartsWith("agy") || adapterType == "agy")
             {
-                var summary = !string.IsNullOrWhiteSpace(dryOut) ? dryOut.Split('\n')[0].Trim() : "completed";
-                steps.Add(new PersonaDriverVerificationStep(
-                    "Dry-Run Prompt Test",
-                    "success",
-                    $"Driver executed test prompt successfully: {summary}"));
+                var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(normPersonaId, "timeout 15 agy -p \"hello\"", ct);
+                if (dryExit == 0)
+                {
+                    var summary = !string.IsNullOrWhiteSpace(dryOut) ? dryOut.Split('\n')[0].Trim() : "completed";
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "success",
+                        $"Driver executed test prompt successfully: {summary}"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "warning",
+                        $"Dry-run prompt exited with code {dryExit}: {(!string.IsNullOrWhiteSpace(dryErr) ? dryErr : dryOut)}"));
+                }
+            }
+            else if (driverId.StartsWith("claude") || adapterType == "claude")
+            {
+                var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(normPersonaId, "timeout 15 claude -p \"hello\"", ct);
+                if (dryExit == 0)
+                {
+                    var summary = !string.IsNullOrWhiteSpace(dryOut) ? dryOut.Split('\n')[0].Trim() : "completed";
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "success",
+                        $"Driver executed test prompt successfully: {summary}"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "warning",
+                        $"Dry-run prompt exited with code {dryExit}: {(!string.IsNullOrWhiteSpace(dryErr) ? dryErr : dryOut)}"));
+                }
+            }
+            else if (adapterType == "openai" && !string.IsNullOrWhiteSpace(endpoint))
+            {
+                var baseEndpoint = endpoint.TrimEnd('/');
+                var modelsUrl = baseEndpoint.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)
+                    ? $"{baseEndpoint}/models"
+                    : $"{baseEndpoint}/v1/models";
+
+                var (mExit, mOut, mErr) = await ExecInContainerAsync(normPersonaId, $"curl -s -m 10 -H \"Authorization: Bearer $OPENAI_API_KEY\" \"{modelsUrl}\"", ct);
+                if (mExit == 0 && !string.IsNullOrWhiteSpace(mOut) && mOut.Contains("\"data\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    var modelList = ParseModelsFromBody(mOut);
+                    var modelNames = modelList != null && modelList.Count > 0 ? string.Join(", ", modelList.Take(5)) : "active";
+                    if (!string.IsNullOrWhiteSpace(defaultModel) && modelList != null && modelList.Contains(defaultModel))
+                    {
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Dry-Run Prompt Test",
+                            "success",
+                            $"Endpoint active with configured model '{defaultModel}' ({modelList.Count} models available)"));
+                    }
+                    else
+                    {
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Dry-Run Prompt Test",
+                            "success",
+                            $"Endpoint active. Models available: {modelNames}"));
+                    }
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "warning",
+                        $"Endpoint models check returned code {mExit}: {(!string.IsNullOrWhiteSpace(mErr) ? mErr : mOut)}"));
+                }
             }
             else
             {
                 steps.Add(new PersonaDriverVerificationStep(
                     "Dry-Run Prompt Test",
-                    "warning",
-                    $"Dry-run prompt exited with code {dryExit}: {(!string.IsNullOrWhiteSpace(dryErr) ? dryErr : dryOut)}"));
+                    "success",
+                    $"Driver adapter '{adapterType}' initialized"));
             }
         }
 
@@ -1102,18 +1362,51 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             await Task.Delay(1000, ct);
         }
 
-        // Check if already authenticated
-        var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
-        if (chkExit == 0)
+        string driverId = "agy";
+        try
         {
-            return new PersonaAuthStartResult(normPersonaId, "agy", "already_authenticated", Instructions: "Driver is already authenticated with Google AI Pro.");
+            using var scope = _serviceProvider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+            var p = await db.Personas.AsNoTracking().FirstOrDefaultAsync(x => x.Id == normPersonaId, ct);
+            if (!string.IsNullOrWhiteSpace(p?.DriverId))
+            {
+                driverId = p.DriverId.Trim().ToLowerInvariant();
+            }
+        }
+        catch { }
+
+        var sidecar = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
+        var isAip = (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand) && sidecar.CompanionCommand.Contains("aip")) ||
+                    (!string.IsNullOrWhiteSpace(sidecar?.CompanionSetup) && sidecar.CompanionSetup.Contains("aip")) ||
+                    driverId.Contains("aip") || driverId.Contains("spence");
+
+        // Check if already authenticated
+        if (isAip)
+        {
+            var (chkExit, chkOut, _) = await ExecInContainerAsync(normPersonaId, "command -v aip >/dev/null 2>&1 && aip status 2>&1 || /root/.local/bin/aip status 2>&1", ct);
+            if (chkExit == 0 && !chkOut.Contains("signed out", StringComparison.OrdinalIgnoreCase) && !chkOut.Contains("run aip login", StringComparison.OrdinalIgnoreCase))
+            {
+                var summary = !string.IsNullOrWhiteSpace(chkOut) ? chkOut.Split('\n')[0].Trim() : "authenticated";
+                return new PersonaAuthStartResult(normPersonaId, driverId, "already_authenticated", Instructions: $"Driver is already authenticated with ai-platform ({summary}).");
+            }
+        }
+        else
+        {
+            var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+            if (chkExit == 0)
+            {
+                return new PersonaAuthStartResult(normPersonaId, driverId, "already_authenticated", Instructions: "Driver is already authenticated with Google AI Pro.");
+            }
         }
 
         if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var existing) && !existing.IsCompleted)
         {
             if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
             {
-                return new PersonaAuthStartResult(normPersonaId, "agy", "waiting_code", existing.AuthUrl, "Please open the Google authorization link, approve access, and paste the authorization code below.");
+                var promptMsg = isAip
+                    ? "Please open the authorization link in your browser to approve device access. Once approved, the companion proxy will start automatically."
+                    : "Please open the Google authorization link, approve access, and paste the authorization code below.";
+                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", existing.AuthUrl, promptMsg);
             }
             _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
         }
@@ -1129,15 +1422,19 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             .FirstOrDefault();
         if (pod == null)
         {
-            return new PersonaAuthStartResult(normPersonaId, "agy", "error", ErrorMessage: "Persona runner pod is not active yet.");
+            return new PersonaAuthStartResult(normPersonaId, driverId, "error", ErrorMessage: "Persona runner pod is not active yet.");
         }
 
         try
         {
+            var authCmd = isAip
+                ? new[] { "/bin/bash", "-c", "command -v aip >/dev/null 2>&1 && aip login || /root/.local/bin/aip login" }
+                : new[] { "agy", "-p", "auth" };
+
             var webSocket = await _client.WebSocketNamespacedPodExecAsync(
                 name: pod.Metadata.Name,
                 @namespace: _namespace,
-                command: new[] { "agy", "-p", "auth" },
+                command: authCmd,
                 container: "persona-runner",
                 stdin: true,
                 stdout: true,
@@ -1164,11 +1461,24 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     string? line;
                     while ((line = await reader.ReadLineAsync()) != null)
                     {
-                        var match = Regex.Match(line, @"https://accounts\.google\.com/o/oauth2/auth[^\s]+");
+                        var match = isAip
+                            ? Regex.Match(line, @"https://[^\s]+")
+                            : Regex.Match(line, @"https://accounts\.google\.com/o/oauth2/auth[^\s]+");
+
                         if (match.Success)
                         {
                             session.AuthUrl = match.Value;
                             tcsUrl.TrySetResult(match.Value);
+                        }
+                    }
+
+                    if (isAip)
+                    {
+                        await Task.Delay(1000);
+                        await ExecInContainerAsync(normPersonaId, "mkdir -p /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null; cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null", CancellationToken.None);
+                        if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
+                        {
+                            await ExecInContainerAsync(normPersonaId, $"pgrep -f 'aip' >/dev/null 2>&1 || (nohup {sidecar.CompanionCommand} >/dev/null 2>&1 &)", CancellationToken.None);
                         }
                     }
                 }
@@ -1209,22 +1519,43 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 }
 
                 var authUrl = await tcsUrl.Task;
-                return new PersonaAuthStartResult(normPersonaId, "agy", "waiting_code", authUrl, "Click the link to sign in with your Google account, then paste the authorization code below.");
+                var promptMsg = isAip
+                    ? "Please open the authorization link in your browser to approve device access. Once approved, the companion proxy will start automatically."
+                    : "Click the link to sign in with your Google account, then paste the authorization code below.";
+                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", authUrl, promptMsg);
             }
 
             _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
-            return new PersonaAuthStartResult(normPersonaId, "agy", "error", ErrorMessage: "Timed out waiting for Google OAuth authorization link from container.");
+            return new PersonaAuthStartResult(normPersonaId, driverId, "error", ErrorMessage: isAip ? "Timed out waiting for device authorization link from container." : "Timed out waiting for Google OAuth authorization link from container.");
         }
         catch (Exception ex)
         {
             _logger.LogWarning("Failed to start K8s auth session: {Error}", ex.Message);
-            return new PersonaAuthStartResult(normPersonaId, "agy", "error", ErrorMessage: ex.Message);
+            return new PersonaAuthStartResult(normPersonaId, driverId, "error", ErrorMessage: ex.Message);
         }
     }
 
     public async Task<PersonaAuthSubmitResult> SubmitAuthCodeAsync(string personaId, string code, CancellationToken ct = default)
     {
         var normPersonaId = personaId.Trim().ToLowerInvariant();
+
+        var sidecar = await GetPersonaSidecarConfigAsync(normPersonaId, ct);
+        var isAip = (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand) && sidecar.CompanionCommand.Contains("aip")) ||
+                    (!string.IsNullOrWhiteSpace(sidecar?.CompanionSetup) && sidecar.CompanionSetup.Contains("aip"));
+
+        if (isAip)
+        {
+            var (aipExit, aipOut, _) = await ExecInContainerAsync(normPersonaId, "command -v aip >/dev/null 2>&1 && aip status 2>&1 || /root/.local/bin/aip status 2>&1", ct);
+            if (aipExit == 0 && !aipOut.Contains("signed out", StringComparison.OrdinalIgnoreCase) && !aipOut.Contains("run aip login", StringComparison.OrdinalIgnoreCase))
+            {
+                await ExecInContainerAsync(normPersonaId, "mkdir -p /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null; cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null", ct);
+                if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
+                {
+                    await ExecInContainerAsync(normPersonaId, $"pgrep -f 'aip' >/dev/null 2>&1 || (nohup {sidecar.CompanionCommand} >/dev/null 2>&1 &)", ct);
+                }
+                return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "ai-platform login confirmed and credentials persisted to workspace!");
+            }
+        }
 
         if (_activeK8sAuthSessions.TryRemove(normPersonaId, out var session))
         {
@@ -1295,9 +1626,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             await Task.Delay(1000, ct);
         }
 
-        var keyName = (!string.IsNullOrWhiteSpace(provider) && provider.ToLowerInvariant().Contains("claude"))
+        var keyName = (!string.IsNullOrWhiteSpace(provider) && (provider.ToLowerInvariant().Contains("claude") || provider.ToLowerInvariant().Contains("anthropic")))
             ? "ANTHROPIC_API_KEY"
-            : "GEMINI_API_KEY";
+            : (!string.IsNullOrWhiteSpace(provider) && provider.ToLowerInvariant().Contains("gemini"))
+            ? "GEMINI_API_KEY"
+            : "OPENAI_API_KEY";
 
         await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
         {
@@ -1887,7 +2220,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
     }
 
-    private static List<string>? ParseModelsFromBody(string? body)
+    public static List<string>? ParseModelsFromBody(string? body)
     {
         if (string.IsNullOrWhiteSpace(body)) return null;
         try
