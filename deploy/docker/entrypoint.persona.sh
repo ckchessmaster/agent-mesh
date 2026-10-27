@@ -79,47 +79,55 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
 fi
 
 # Ensure persistent workspace state directories exist with restricted permissions
-mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
-chmod 700 /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config 2>/dev/null || true
+mkdir -p /workspace/.agentmesh/state/.config
+chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
+chmod 700 /workspace/.agentmesh/state/.config 2>/dev/null || true
 
-# If ~/.aip or ~/.config were previously created as symlinks, remove the symlinks so credential
-# managers that forbid symlinks (e.g. aip / Go credential store) have secure real directories.
-if [ -L /root/.aip ]; then rm -f /root/.aip; fi
+# If ~/.config was previously created as a symlink, remove it so credential managers have real directories
 if [ -L /root/.config ]; then rm -f /root/.config; fi
+mkdir -p /root/.config
+chmod 700 /root/.config 2>/dev/null || true
 
-# Create local directories with strict 700 permissions
-mkdir -p /root/.config /root/.aip
-chmod 700 /root/.aip /root/.config 2>/dev/null || true
-
-# Restore state from workspace volume into local directories
-if [ -d /workspace/.agentmesh/state/.aip ]; then
-    cp -a /workspace/.agentmesh/state/.aip/. /root/.aip/ 2>/dev/null || true
+# Restore persistent state from workspace volume into local directories
+if [ -d /workspace/.agentmesh/state ]; then
+    for sdir in /workspace/.agentmesh/state/.*; do
+        bname=$(basename "$sdir")
+        if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ]; then
+            if [ -L "/root/$bname" ]; then rm -f "/root/$bname"; fi
+            mkdir -p "/root/$bname"
+            cp -a "$sdir/." "/root/$bname/" 2>/dev/null || true
+            chmod 700 "/root/$bname" 2>/dev/null || true
+        fi
+    done
 fi
-if [ -d /workspace/.agentmesh/state/.config ]; then
-    cp -a /workspace/.agentmesh/state/.config/. /root/.config/ 2>/dev/null || true
-fi
-chmod 700 /root/.aip /root/.config 2>/dev/null || true
 
 # Helper to synchronize state back to workspace volume
 sync_persona_state() {
-    mkdir -p /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config
-    if [ -d /root/.aip ]; then
-        cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
-    fi
+    mkdir -p /workspace/.agentmesh/state/.config
     if [ -d /root/.config ]; then
         cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
     fi
-    chmod 700 /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config 2>/dev/null || true
+    # Also synchronize all existing state directories in /workspace/.agentmesh/state
+    if [ -d /workspace/.agentmesh/state ]; then
+        for sdir in /workspace/.agentmesh/state/.*; do
+            bname=$(basename "$sdir")
+            if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ] && [ -d "/root/$bname" ]; then
+                cp -a "/root/$bname/." "$sdir/" 2>/dev/null || true
+                chmod 700 "$sdir" 2>/dev/null || true
+            fi
+        done
+    fi
+    chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
 }
 
-# Run companion setup script if configured (e.g. install aip helper)
+# Run companion setup script if configured (e.g. install helper CLI)
 if [ -n "$COMPANION_SETUP" ]; then
     echo "Executing companion setup script..."
     eval "$COMPANION_SETUP" || echo "Warning: Companion setup exited with code $?"
     sync_persona_state
 fi
 
-# Start companion background daemon if configured (e.g. aip proxy)
+# Start companion background daemon if configured (e.g. token refresh or proxy)
 if [ -n "$COMPANION_COMMAND" ]; then
     echo "Starting companion daemon: $COMPANION_COMMAND"
     eval "$COMPANION_COMMAND" &

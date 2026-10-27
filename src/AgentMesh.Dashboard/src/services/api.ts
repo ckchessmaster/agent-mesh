@@ -380,6 +380,8 @@ export const api = {
       maxSteps?: number;
       capabilities?: string[];
       sidecar?: DriverSidecarConfig;
+      loginCommand?: string;
+      authCheckCommand?: string;
     }
   ): Promise<DriverConfig> {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/config`, {

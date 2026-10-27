@@ -253,6 +253,8 @@ public class AgentsController(
         if (!string.IsNullOrWhiteSpace(req.ApiKey)) patch["apiKey"] = req.ApiKey;
 
         if (req.Adapter is not null) patch["adapter"] = req.Adapter;
+        if (req.LoginCommand is not null) patch["loginCommand"] = req.LoginCommand;
+        if (req.AuthCheckCommand is not null) patch["authCheckCommand"] = req.AuthCheckCommand;
         if (req.Sidecar is not null) patch["sidecar"] = JsonSerializer.SerializeToNode(req.Sidecar);
 
         if (patch.Count == 0)
@@ -873,7 +875,9 @@ public record UpdateDriverConfigRequest(
     int? RetryDelayMilliseconds = null,
     int? MaxSteps = null,
     List<string>? Capabilities = null,
-    DriverSidecarConfig? Sidecar = null
+    DriverSidecarConfig? Sidecar = null,
+    string? LoginCommand = null,
+    string? AuthCheckCommand = null
 );
 
 public record CreateAgentSessionRequest(

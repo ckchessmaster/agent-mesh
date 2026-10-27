@@ -35,6 +35,8 @@ public class AgentPresetConfig
     public int? MaxRetries { get; set; }
     public int? RetryDelayMilliseconds { get; set; }
     public int? MaxSteps { get; set; }
+    public string? LoginCommand { get; set; }
+    public string? AuthCheckCommand { get; set; }
     public DriverSidecarConfig? Sidecar { get; set; }
 }
 

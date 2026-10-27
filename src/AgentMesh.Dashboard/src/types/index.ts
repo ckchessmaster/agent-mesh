@@ -60,7 +60,7 @@ export interface PersonaDriverVerificationResult {
 export interface PersonaAuthStartResult {
   personaId: string;
   driverId: string;
-  status: 'ready' | 'waiting_code' | 'already_authenticated' | 'error';
+  status: 'ready' | 'waiting_code' | 'already_authenticated' | 'apikey_required' | 'error';
   authUrl?: string | null;
   instructions?: string | null;
   errorMessage?: string | null;
@@ -90,6 +90,8 @@ export interface DriverSidecarConfig {
   companionSetup?: string | null;
   companionCommand?: string | null;
   companionPort?: number | null;
+  loginCommand?: string | null;
+  authCheckCommand?: string | null;
 }
 
 /**
@@ -108,6 +110,8 @@ export interface DriverConfig {
   hasApiKey?: boolean;
   sidecar?: DriverSidecarConfig | null;
   hasSidecarAuthKey?: boolean;
+  loginCommand?: string | null;
+  authCheckCommand?: string | null;
 }
 
 export interface Agent {

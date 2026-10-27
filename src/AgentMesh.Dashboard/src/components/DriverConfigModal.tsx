@@ -18,6 +18,8 @@ interface DriverConfigModalProps {
     retryDelayMilliseconds?: number;
     maxSteps?: number;
     sidecar?: DriverSidecarConfig;
+    loginCommand?: string;
+    authCheckCommand?: string;
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
 }
@@ -95,7 +97,9 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [companionSetup, setCompanionSetup] = useState(config.sidecar?.companionSetup ?? '');
   const [companionCommand, setCompanionCommand] = useState(config.sidecar?.companionCommand ?? '');
   const [companionPort, setCompanionPort] = useState(config.sidecar?.companionPort ? String(config.sidecar.companionPort) : '');
-  const [companionExpanded, setCompanionExpanded] = useState(Boolean(config.sidecar?.companionCommand || config.sidecar?.companionSetup));
+  const [loginCommand, setLoginCommand] = useState(config.loginCommand ?? config.sidecar?.loginCommand ?? '');
+  const [authCheckCommand, setAuthCheckCommand] = useState(config.authCheckCommand ?? config.sidecar?.authCheckCommand ?? '');
+  const [companionExpanded, setCompanionExpanded] = useState(Boolean(config.sidecar?.companionCommand || config.sidecar?.companionSetup || config.loginCommand || config.sidecar?.loginCommand));
   const [sidecarExpanded, setSidecarExpanded] = useState(Boolean(config.sidecar?.enabled));
   const [isTestingEndpoint, setIsTestingEndpoint] = useState(false);
   const [endpointTestResult, setEndpointTestResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -123,7 +127,9 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
             command: sidecarCommand.trim() || undefined,
             companionSetup: companionSetup.trim() || undefined,
             companionCommand: companionCommand.trim() || undefined,
-            companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined
+            companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined,
+            loginCommand: loginCommand.trim() || undefined,
+            authCheckCommand: authCheckCommand.trim() || undefined
           }
         : null;
 
@@ -234,7 +240,9 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         sidecarCommand.trim() !== (config.sidecar?.command ?? '') ||
         companionSetup.trim() !== (config.sidecar?.companionSetup ?? '') ||
         companionCommand.trim() !== (config.sidecar?.companionCommand ?? '') ||
-        (companionPort.trim() ? Number(companionPort.trim()) : undefined) !== (config.sidecar?.companionPort ?? undefined)
+        (companionPort.trim() ? Number(companionPort.trim()) : undefined) !== (config.sidecar?.companionPort ?? undefined) ||
+        loginCommand.trim() !== (config.sidecar?.loginCommand ?? '') ||
+        authCheckCommand.trim() !== (config.sidecar?.authCheckCommand ?? '')
       ) {
         patch.sidecar = {
           enabled: sidecarEnabled,
@@ -248,8 +256,17 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
           command: sidecarCommand.trim() || undefined,
           companionSetup: companionSetup.trim() || undefined,
           companionCommand: companionCommand.trim() || undefined,
-          companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined
+          companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined,
+          loginCommand: loginCommand.trim() || undefined,
+          authCheckCommand: authCheckCommand.trim() || undefined
         };
+      }
+
+      if (loginCommand.trim() !== (config.loginCommand ?? '')) {
+        patch.loginCommand = loginCommand.trim();
+      }
+      if (authCheckCommand.trim() !== (config.authCheckCommand ?? '')) {
+        patch.authCheckCommand = authCheckCommand.trim();
       }
     }
 
@@ -619,7 +636,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                             onClick={() => setCompanionExpanded(!companionExpanded)}
                             className="flex items-center justify-between w-full text-left py-1 text-slate-400 hover:text-slate-200 transition cursor-pointer"
                           >
-                            <span className="text-[11px] font-medium text-slate-300">Companion Proxy &amp; Daemon (e.g. AIP Proxy / Token Refresh)</span>
+                            <span className="text-[11px] font-medium text-slate-300">Companion Proxy, Daemon &amp; Login CLI</span>
                             {companionExpanded ? <ChevronDown className="w-3 h-3 text-slate-400" /> : <ChevronRight className="w-3 h-3 text-slate-400" />}
                           </button>
 
@@ -634,7 +651,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                                   type="text"
                                   value={companionSetup}
                                   onChange={(e) => setCompanionSetup(e.target.value)}
-                                  placeholder="which aip >/dev/null 2>&1 || curl -fsSL https://.../install.sh | sh"
+                                  placeholder="which my-cli >/dev/null 2>&1 || curl -fsSL https://.../install.sh | sh"
                                   className={`${fieldClass} font-mono`}
                                 />
                                 <p className="text-[10px] text-slate-500 mt-1">
@@ -651,7 +668,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                                     type="text"
                                     value={companionCommand}
                                     onChange={(e) => setCompanionCommand(e.target.value)}
-                                    placeholder="aip proxy"
+                                    placeholder="my-proxy --port 11435"
                                     className={`${fieldClass} font-mono`}
                                   />
                                   <p className="text-[10px] text-slate-500 mt-1">
@@ -676,6 +693,38 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                                     TCP port to await.
                                   </p>
                                 </div>
+                              </div>
+                              <div>
+                                <label className={labelClass} htmlFor="companion-login-cmd">
+                                  Driver Login Command (optional)
+                                </label>
+                                <input
+                                  id="companion-login-cmd"
+                                  type="text"
+                                  value={loginCommand}
+                                  onChange={(e) => setLoginCommand(e.target.value)}
+                                  placeholder="my-cli login or /root/login.sh"
+                                  className={`${fieldClass} font-mono`}
+                                />
+                                <p className="text-[10px] text-slate-500 mt-1">
+                                  Command executed in container when clicking &quot;Authenticate Driver&quot;. Authorization URLs detected in output will be presented to the user.
+                                </p>
+                              </div>
+                              <div>
+                                <label className={labelClass} htmlFor="companion-auth-check-cmd">
+                                  Auth Check Command (optional)
+                                </label>
+                                <input
+                                  id="companion-auth-check-cmd"
+                                  type="text"
+                                  value={authCheckCommand}
+                                  onChange={(e) => setAuthCheckCommand(e.target.value)}
+                                  placeholder="my-cli status or test -f ~/.config/token"
+                                  className={`${fieldClass} font-mono`}
+                                />
+                                <p className="text-[10px] text-slate-500 mt-1">
+                                  Command executed in container to check if the driver or companion is already authenticated.
+                                </p>
                               </div>
                             </div>
                           )}

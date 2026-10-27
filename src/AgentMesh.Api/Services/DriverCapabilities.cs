@@ -23,10 +23,12 @@ public record DriverCapabilitiesView(
     IReadOnlyList<string> Capabilities,
     bool HasApiKey,
     DriverSidecarConfig? Sidecar = null,
-    bool HasSidecarAuthKey = false)
+    bool HasSidecarAuthKey = false,
+    string? LoginCommand = null,
+    string? AuthCheckCommand = null)
 {
     public static readonly DriverCapabilitiesView Empty =
-        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false);
+        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null);
 }
 
 /// <summary>
@@ -189,7 +191,9 @@ public static class DriverCapabilities
             Capabilities: capabilities,
             HasApiKey: !string.IsNullOrWhiteSpace(ReadString(obj, "apiKey")),
             Sidecar: sidecar,
-            HasSidecarAuthKey: hasSidecarAuthKey);
+            HasSidecarAuthKey: hasSidecarAuthKey,
+            LoginCommand: ReadString(obj, "loginCommand") ?? sidecar?.LoginCommand,
+            AuthCheckCommand: ReadString(obj, "authCheckCommand") ?? sidecar?.AuthCheckCommand);
     }
 
     private static IReadOnlyList<string> ReadStringArray(JsonArray array)
