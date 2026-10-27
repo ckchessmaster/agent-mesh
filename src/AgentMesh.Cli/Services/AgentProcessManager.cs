@@ -715,7 +715,12 @@ public class AgentRunnerInstance : IAsyncDisposable
             {
                 downloaded = true;
             }
-            else if (!string.IsNullOrWhiteSpace(att.Id))
+            else if (!string.IsNullOrWhiteSpace(att.DownloadUrl))
+            {
+                downloaded = await meshClient.DownloadAttachmentFromUrlAsync(att.DownloadUrl, targetPath, ct);
+            }
+
+            if (!downloaded && !string.IsNullOrWhiteSpace(att.Id))
             {
                 downloaded = await meshClient.DownloadSessionAttachmentAsync(ev.SessionId, att.Id, targetPath, ct);
             }

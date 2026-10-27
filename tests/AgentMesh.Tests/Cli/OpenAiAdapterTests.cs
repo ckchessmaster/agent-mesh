@@ -649,6 +649,76 @@ public class OpenAiAdapterTests
         }
     }
 
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_ReadFile_OnImageFile_ReturnsImageIndicatorWithoutBinaryGarbage()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_img_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var imagePath = Path.Combine(tempDir, "mock_ui.png");
+            // Standard PNG header bytes with null bytes
+            var pngBytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52 };
+            await File.WriteAllBytesAsync(imagePath, pngBytes);
+
+            var args = JsonSerializer.Serialize(new { path = "mock_ui.png" });
+            var result = await OpenAiAdapter.ExecuteToolLocallyAsync("read_file", args, tempDir, CancellationToken.None);
+
+            result.Should().Contain("[Image file: 'mock_ui.png'");
+            result.Should().Contain("format: PNG");
+            result.Should().Contain("cannot be read as plain text");
+            result.Should().NotContain("\0");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_ReadFile_OnBinaryFile_ReturnsBinaryIndicatorWithoutNullBytes()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_bin_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var binPath = Path.Combine(tempDir, "binary.dat");
+            var binBytes = new byte[] { 0x01, 0x02, 0x00, 0x03, 0x04, 0x00, 0x05 };
+            await File.WriteAllBytesAsync(binPath, binBytes);
+
+            var args = JsonSerializer.Serialize(new { path = "binary.dat" });
+            var result = await OpenAiAdapter.ExecuteToolLocallyAsync("read_file", args, tempDir, CancellationToken.None);
+
+            result.Should().Contain("[Binary file: 'binary.dat'");
+            result.Should().Contain("cannot be read as plain text");
+            result.Should().NotContain("\0");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_ToolResultSanitizesNullBytes()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_null_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            // Execute a bash echo with null byte
+            var args = JsonSerializer.Serialize(new { command = "printf 'hello\\x00world\\n'" });
+            var result = await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, tempDir, CancellationToken.None);
+
+            result.Should().Contain("helloworld");
+            result.Should().NotContain("\0");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

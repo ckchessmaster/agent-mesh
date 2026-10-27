@@ -1769,7 +1769,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var webSocket = await _client.WebSocketNamespacedPodExecAsync(
             name: pod.Metadata.Name,
             @namespace: _namespace,
-            command: new[] { "/bin/bash", "-il" },
+            command: new[] { "/bin/bash" },
             container: "persona-runner",
             stdin: true,
             stdout: true,
@@ -1778,18 +1778,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             cancellationToken: ct);
 
         var demuxer = new StreamDemuxer(webSocket);
-        var stdIn = demuxer.GetStream(null, ChannelIndex.StdIn);
-        var resizeStream = demuxer.GetStream(null, ChannelIndex.Resize);
         var stdOut = demuxer.GetStream(ChannelIndex.StdOut, null);
         var stdErr = demuxer.GetStream(ChannelIndex.StdErr, null);
         var errorStream = demuxer.GetStream(ChannelIndex.Error, null);
         demuxer.Start();
 
         var writeLock = new SemaphoreSlim(1, 1);
-        var session = new KubernetesTerminalSession(webSocket, demuxer, stdIn, resizeStream, writeLock);
+        var session = new KubernetesTerminalSession(webSocket, demuxer, writeLock, _logger);
 
         // Send initial resize dimensions so PTY has correct cols/rows
-        await session.ResizeAsync(cols, rows);
+        await session.ResizeAsync(cols > 0 ? cols : 80, rows > 0 ? rows : 24);
 
         _ = Task.Run(async () =>
         {
@@ -1804,7 +1802,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     await onOutput(text);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Terminal stdout stream ended for persona @{PersonaId}", normPersonaId);
+            }
             finally
             {
                 try
@@ -1843,7 +1844,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     await onOutput(text);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Terminal stderr stream ended for persona @{PersonaId}", normPersonaId);
+            }
         });
 
         _ = Task.Run(async () =>
@@ -2159,9 +2163,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
     private sealed class KubernetesTerminalSession(
         WebSocket webSocket,
         StreamDemuxer demuxer,
-        Stream stdIn,
-        Stream resizeStream,
-        SemaphoreSlim writeLock) : IPersonaTerminalSession
+        SemaphoreSlim writeLock,
+        ILogger logger) : IPersonaTerminalSession
     {
         public async ValueTask SendInputAsync(string data)
         {
@@ -2173,8 +2176,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     await writeLock.WaitAsync();
                     try
                     {
-                        await stdIn.WriteAsync(bytes, 0, bytes.Length);
-                        await stdIn.FlushAsync();
+                        await demuxer.Write(ChannelIndex.StdIn, bytes, 0, bytes.Length, CancellationToken.None);
                     }
                     finally
                     {
@@ -2182,22 +2184,24 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "Failed to send input to terminal session");
+            }
         }
 
         public async ValueTask ResizeAsync(int cols, int rows)
         {
             try
             {
-                if (webSocket.State == WebSocketState.Open && resizeStream != null)
+                if (webSocket.State == WebSocketState.Open)
                 {
-                    var resizeMsg = $"{{\"Width\":{cols},\"Height\":{rows},\"width\":{cols},\"height\":{rows}}}";
+                    var resizeMsg = $"{{\"Width\":{cols},\"Height\":{rows}}}";
                     var bytes = Encoding.UTF8.GetBytes(resizeMsg);
                     await writeLock.WaitAsync();
                     try
                     {
-                        await resizeStream.WriteAsync(bytes, 0, bytes.Length);
-                        await resizeStream.FlushAsync();
+                        await demuxer.Write(ChannelIndex.Resize, bytes, 0, bytes.Length, CancellationToken.None);
                     }
                     finally
                     {
@@ -2205,13 +2209,14 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "Failed to resize terminal session");
+            }
         }
 
         public async ValueTask DisposeAsync()
         {
-            try { stdIn.Dispose(); } catch { }
-            try { resizeStream?.Dispose(); } catch { }
             try { demuxer.Dispose(); } catch { }
             try
             {
