@@ -807,10 +807,14 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
                 cancellationToken: ct);
 
-            var pod = pods.Items.OrderByDescending(p => p.Metadata.CreationTimestamp).FirstOrDefault();
+            var pod = pods.Items
+                .Where(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running")
+                .OrderByDescending(p => p.Metadata.CreationTimestamp)
+                .FirstOrDefault();
+
             if (pod == null)
             {
-                return (-1, "", "No pod found for persona.");
+                return (-1, "", "No running pod found for persona.");
             }
 
             var stdOutBuilder = new StringBuilder();
@@ -856,6 +860,23 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var normPersonaId = personaId.Trim().ToLowerInvariant();
         await EnsureRunningAsync(normPersonaId, ct);
 
+        // Wait up to 15 seconds for a running pod if a rollout or restart was just triggered
+        for (var i = 0; i < 15; i++)
+        {
+            try
+            {
+                var checkPods = await _client.CoreV1.ListNamespacedPodAsync(
+                    _namespace,
+                    labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
+                    cancellationToken: ct);
+
+                var isRunning = checkPods.Items.Any(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running");
+                if (isRunning) break;
+            }
+            catch { }
+            await Task.Delay(1000, ct);
+        }
+
         string driverId = "agy";
         try
         {
@@ -888,7 +909,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             if (string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase))
             {
-                var (tsExit, tsOut, tsErr) = await ExecInContainerAsync(normPersonaId, "ip addr show tailscale0", ct);
+                var (tsExit, tsOut, tsErr) = await ExecInContainerAsync(normPersonaId, "test -d /sys/class/net/tailscale0 || grep -q 'tailscale0:' /proc/net/dev || (command -v ip >/dev/null 2>&1 && ip addr show tailscale0)", ct);
                 if (tsExit == 0)
                 {
                     steps.Add(new PersonaDriverVerificationStep(
@@ -1064,6 +1085,23 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var normPersonaId = personaId.Trim().ToLowerInvariant();
         await EnsureRunningAsync(normPersonaId, ct);
 
+        // Wait up to 15 seconds for a running pod if a rollout or restart was just triggered
+        for (var i = 0; i < 15; i++)
+        {
+            try
+            {
+                var checkPods = await _client.CoreV1.ListNamespacedPodAsync(
+                    _namespace,
+                    labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
+                    cancellationToken: ct);
+
+                var isRunning = checkPods.Items.Any(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running");
+                if (isRunning) break;
+            }
+            catch { }
+            await Task.Delay(1000, ct);
+        }
+
         // Check if already authenticated
         var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
         if (chkExit == 0)
@@ -1085,7 +1123,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
             cancellationToken: ct);
 
-        var pod = pods.Items.OrderByDescending(p => p.Metadata.CreationTimestamp).FirstOrDefault();
+        var pod = pods.Items
+            .Where(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running")
+            .OrderByDescending(p => p.Metadata.CreationTimestamp)
+            .FirstOrDefault();
         if (pod == null)
         {
             return new PersonaAuthStartResult(normPersonaId, "agy", "error", ErrorMessage: "Persona runner pod is not active yet.");
@@ -1098,6 +1139,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 @namespace: _namespace,
                 command: new[] { "agy", "-p", "auth" },
                 container: "persona-runner",
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                tty: true,
                 cancellationToken: ct);
 
             var demuxer = new StreamDemuxer(webSocket);
@@ -1233,6 +1278,23 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var normPersonaId = personaId.Trim().ToLowerInvariant();
         await EnsureRunningAsync(normPersonaId, ct);
 
+        // Wait up to 15 seconds for a running pod if a rollout or restart was just triggered
+        for (var i = 0; i < 15; i++)
+        {
+            try
+            {
+                var checkPods = await _client.CoreV1.ListNamespacedPodAsync(
+                    _namespace,
+                    labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
+                    cancellationToken: ct);
+
+                var isRunning = checkPods.Items.Any(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running");
+                if (isRunning) break;
+            }
+            catch { }
+            await Task.Delay(1000, ct);
+        }
+
         var keyName = (!string.IsNullOrWhiteSpace(provider) && provider.ToLowerInvariant().Contains("claude"))
             ? "ANTHROPIC_API_KEY"
             : "GEMINI_API_KEY";
@@ -1260,12 +1322,32 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var normPersonaId = personaId.Trim().ToLowerInvariant();
         await EnsureRunningAsync(normPersonaId, ct);
 
+        // Wait up to 15 seconds for a running pod if a rollout or restart was just triggered
+        for (var i = 0; i < 15; i++)
+        {
+            try
+            {
+                var checkPods = await _client.CoreV1.ListNamespacedPodAsync(
+                    _namespace,
+                    labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
+                    cancellationToken: ct);
+
+                var isRunning = checkPods.Items.Any(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running");
+                if (isRunning) break;
+            }
+            catch { }
+            await Task.Delay(1000, ct);
+        }
+
         var pods = await _client.CoreV1.ListNamespacedPodAsync(
             _namespace,
             labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
             cancellationToken: ct);
 
-        var pod = pods.Items.OrderByDescending(p => p.Metadata.CreationTimestamp).FirstOrDefault();
+        var pod = pods.Items
+            .Where(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running")
+            .OrderByDescending(p => p.Metadata.CreationTimestamp)
+            .FirstOrDefault();
         if (pod == null)
         {
             throw new InvalidOperationException($"No running pod found for persona @{personaId}.");
@@ -1276,6 +1358,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             @namespace: _namespace,
             command: new[] { "/bin/bash" },
             container: "persona-runner",
+            stdin: true,
+            stdout: true,
+            stderr: true,
+            tty: true,
             cancellationToken: ct);
 
         var demuxer = new StreamDemuxer(webSocket);

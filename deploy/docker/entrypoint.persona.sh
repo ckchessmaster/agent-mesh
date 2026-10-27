@@ -78,8 +78,9 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
     fi
 fi
 
-# Ensure persistent workspace state directories exist
+# Ensure persistent workspace state directories exist with restricted permissions
 mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
+chmod 700 /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config 2>/dev/null || true
 
 # Symlink ~/.config to workspace state so any tool using standard XDG paths persists state
 if [ ! -L /root/.config ]; then
@@ -96,6 +97,7 @@ if [ ! -L /root/.aip ]; then
     rm -rf /root/.aip
     ln -s /workspace/.agentmesh/state/.aip /root/.aip
 fi
+chmod -R 700 /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.config 2>/dev/null || true
 
 # Run companion setup script if configured (e.g. install aip helper)
 if [ -n "$COMPANION_SETUP" ]; then
