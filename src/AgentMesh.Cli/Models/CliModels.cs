@@ -111,6 +111,9 @@ public class PromptReceivedEvent
     [JsonPropertyName("attachments")]
     public List<AttachmentItem>? Attachments { get; set; }
 
+    [JsonPropertyName("conversationId")]
+    public string? ConversationId { get; set; }
+
     [JsonPropertyName("createdAt")]
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

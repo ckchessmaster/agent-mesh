@@ -723,7 +723,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         // Persist current state from container to workspace volume before recreating container
         try
         {
-            await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+            await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
         }
         catch { }
 
@@ -951,7 +951,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             // Persist current state
             try
             {
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+                await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
             }
             catch { }
 
@@ -1420,7 +1420,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 }
 
                 await Task.Delay(1000);
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", CancellationToken.None);
+                await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, CancellationToken.None);
                 if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
                 {
                     var compBin = Path.GetFileName(sidecar.CompanionCommand.Trim().Split(' ')[0]);
@@ -1473,7 +1473,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, authCheckCmd, ct);
             if (chkExit == 0)
             {
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+                await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
                 if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
                 {
                     var compBin = Path.GetFileName(sidecar.CompanionCommand.Trim().Split(' ')[0]);
@@ -1502,7 +1502,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 await session.Process.WaitForExitAsync(linkedCts.Token);
                 await session.DisposeAsync();
 
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null)", ct);
+                await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
 
                 if (!string.IsNullOrWhiteSpace(authCheckCmd))
                 {
@@ -1619,7 +1619,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             {
                 try
                 {
-                    await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", CancellationToken.None);
+                    await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, CancellationToken.None);
                     var sidecarCfg = await GetPersonaSidecarConfigAsync(normPersonaId, CancellationToken.None);
                     if (!string.IsNullOrWhiteSpace(sidecarCfg?.CompanionCommand))
                     {

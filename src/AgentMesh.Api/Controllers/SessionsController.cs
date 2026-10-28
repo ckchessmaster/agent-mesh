@@ -330,7 +330,8 @@ public class SessionsController(
         string? personaName = null,
         string? personaRole = null,
         string? personaPrompt = null,
-        string? contextSize = null)
+        string? contextSize = null,
+        string? conversationId = null)
     {
         var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrWhiteSpace(existingJson))
@@ -360,6 +361,7 @@ public class SessionsController(
             if (string.IsNullOrWhiteSpace(contextSize)) dict.Remove("contextSize");
             else dict["contextSize"] = contextSize.Trim();
         }
+        if (!string.IsNullOrWhiteSpace(conversationId)) dict["conversationId"] = conversationId.Trim();
         if (!string.IsNullOrWhiteSpace(personaId)) dict["personaId"] = personaId.Trim();
         if (!string.IsNullOrWhiteSpace(personaName)) dict["personaName"] = personaName.Trim();
         if (!string.IsNullOrWhiteSpace(personaRole)) dict["personaRole"] = personaRole.Trim();
@@ -436,19 +438,42 @@ public class SessionsController(
         }
     }
 
+    public static string? ExtractSessionConversationId(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(metadataJson);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("conversationId", out var ci) && ci.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                var val = ci.GetString();
+                if (!string.IsNullOrWhiteSpace(val)) return val;
+            }
+            if (root.TryGetProperty("conversation_id", out var ci2) && ci2.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                var val = ci2.GetString();
+                if (!string.IsNullOrWhiteSpace(val)) return val;
+            }
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public static string AccumulateUsageMetadata(string? metadataJson, string? structuredPayloadJson)
     {
         if (string.IsNullOrWhiteSpace(structuredPayloadJson)) return metadataJson ?? "{}";
         try
         {
             using var payloadDoc = System.Text.Json.JsonDocument.Parse(structuredPayloadJson);
-            if (!payloadDoc.RootElement.TryGetProperty("usage", out var usageElem)) return metadataJson ?? "{}";
+            var root = payloadDoc.RootElement;
+            var hasUsage = root.TryGetProperty("usage", out var usageElem);
+            var hasConv = root.TryGetProperty("conversationId", out var convElem) || root.TryGetProperty("conversation_id", out convElem);
 
-            var input = usageElem.TryGetProperty("inputTokens", out var ip) ? ip.GetInt64() : 0;
-            var output = usageElem.TryGetProperty("outputTokens", out var op) ? op.GetInt64() : 0;
-            var thinking = usageElem.TryGetProperty("thinkingTokens", out var tp) ? tp.GetInt64() : 0;
-            var total = usageElem.TryGetProperty("totalTokens", out var totp) ? totp.GetInt64() : (input + output);
-            var duration = usageElem.TryGetProperty("durationSeconds", out var dp) ? dp.GetDouble() : 0.0;
+            if (!hasUsage && !hasConv) return metadataJson ?? "{}";
 
             var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             if (!string.IsNullOrWhiteSpace(metadataJson))
@@ -460,26 +485,44 @@ public class SessionsController(
                 }
             }
 
-            long existingInput = 0, existingOutput = 0, existingThinking = 0, existingTotal = 0;
-            double existingDuration = 0.0;
-
-            if (dict.TryGetValue("cumulativeUsage", out var existingUsageObj) && existingUsageObj is System.Text.Json.JsonElement existingElem)
+            if (hasConv && convElem.ValueKind == System.Text.Json.JsonValueKind.String)
             {
-                if (existingElem.TryGetProperty("inputTokens", out var ei)) existingInput = ei.GetInt64();
-                if (existingElem.TryGetProperty("outputTokens", out var eo)) existingOutput = eo.GetInt64();
-                if (existingElem.TryGetProperty("thinkingTokens", out var et)) existingThinking = et.GetInt64();
-                if (existingElem.TryGetProperty("totalTokens", out var etot)) existingTotal = etot.GetInt64();
-                if (existingElem.TryGetProperty("totalDurationSeconds", out var ed)) existingDuration = ed.GetDouble();
+                var cid = convElem.GetString();
+                if (!string.IsNullOrWhiteSpace(cid))
+                {
+                    dict["conversationId"] = cid.Trim();
+                }
             }
 
-            dict["cumulativeUsage"] = new
+            if (hasUsage)
             {
-                inputTokens = existingInput + input,
-                outputTokens = existingOutput + output,
-                thinkingTokens = existingThinking + thinking,
-                totalTokens = existingTotal + total,
-                totalDurationSeconds = existingDuration + duration
-            };
+                var input = usageElem.TryGetProperty("inputTokens", out var ip) ? ip.GetInt64() : 0;
+                var output = usageElem.TryGetProperty("outputTokens", out var op) ? op.GetInt64() : 0;
+                var thinking = usageElem.TryGetProperty("thinkingTokens", out var tp) ? tp.GetInt64() : 0;
+                var total = usageElem.TryGetProperty("totalTokens", out var totp) ? totp.GetInt64() : (input + output);
+                var duration = usageElem.TryGetProperty("durationSeconds", out var dp) ? dp.GetDouble() : 0.0;
+
+                long existingInput = 0, existingOutput = 0, existingThinking = 0, existingTotal = 0;
+                double existingDuration = 0.0;
+
+                if (dict.TryGetValue("cumulativeUsage", out var existingUsageObj) && existingUsageObj is System.Text.Json.JsonElement existingElem)
+                {
+                    if (existingElem.TryGetProperty("inputTokens", out var ei)) existingInput = ei.GetInt64();
+                    if (existingElem.TryGetProperty("outputTokens", out var eo)) existingOutput = eo.GetInt64();
+                    if (existingElem.TryGetProperty("thinkingTokens", out var et)) existingThinking = et.GetInt64();
+                    if (existingElem.TryGetProperty("totalTokens", out var etot)) existingTotal = etot.GetInt64();
+                    if (existingElem.TryGetProperty("totalDurationSeconds", out var ed)) existingDuration = ed.GetDouble();
+                }
+
+                dict["cumulativeUsage"] = new
+                {
+                    inputTokens = existingInput + input,
+                    outputTokens = existingOutput + output,
+                    thinkingTokens = existingThinking + thinking,
+                    totalTokens = existingTotal + total,
+                    totalDurationSeconds = existingDuration + duration
+                };
+            }
 
             return System.Text.Json.JsonSerializer.Serialize(dict);
         }
@@ -942,6 +985,7 @@ public class SessionsController(
                 tier = tier,
                 contextSize = contextSize,
                 attachments = req.Attachments,
+                conversationId = ExtractSessionConversationId(session.MetadataJson),
                 createdAt = initialMsg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1287,6 +1331,7 @@ public class SessionsController(
                 tier = tier,
                 contextSize = contextSize,
                 attachments = messageAttachments.Count > 0 ? messageAttachments : null,
+                conversationId = ExtractSessionConversationId(session.MetadataJson),
                 createdAt = message.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1365,6 +1410,7 @@ public class SessionsController(
                             tier = nextPrompt.Tier ?? tier,
                             contextSize = nextPrompt.ContextSize ?? contextSize,
                             attachments = nextPrompt.Attachments,
+                            conversationId = ExtractSessionConversationId(session.MetadataJson),
                             createdAt = nextMsg.CreatedAt
                         };
                         await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1414,7 +1460,7 @@ public class SessionsController(
         var (oldWorkDir, oldModel, oldEffort, oldMode, oldTier) = ExtractSessionSettings(session.MetadataJson);
         var oldContextSize = ExtractSessionContextSize(session.MetadataJson);
 
-        if (req.MetadataJson != null || req.Model != null || req.Effort != null || req.Tier != null || req.Mode != null || req.WorkingDirectory != null || req.ContextSize != null)
+        if (req.MetadataJson != null || req.Model != null || req.Effort != null || req.Tier != null || req.Mode != null || req.WorkingDirectory != null || req.ContextSize != null || req.ConversationId != null)
         {
             session.MetadataJson = MergeSessionMetadata(
                 req.MetadataJson ?? session.MetadataJson,
@@ -1423,7 +1469,8 @@ public class SessionsController(
                 req.Effort,
                 req.Mode,
                 req.Tier,
-                contextSize: req.ContextSize
+                contextSize: req.ContextSize,
+                conversationId: req.ConversationId
             );
         }
 
@@ -1691,6 +1738,7 @@ public class SessionsController(
                     tier = req.Tier ?? tier,
                     contextSize = req.ContextSize ?? contextSize,
                     attachments = req.Attachments,
+                    conversationId = ExtractSessionConversationId(session.MetadataJson),
                     createdAt = msg.CreatedAt
                 };
                 await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1748,6 +1796,7 @@ public class SessionsController(
                     tier = req.Tier ?? tier,
                     contextSize = req.ContextSize ?? contextSize,
                     attachments = req.Attachments,
+                    conversationId = ExtractSessionConversationId(session.MetadataJson),
                     createdAt = msg.CreatedAt
                 };
                 await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -1880,6 +1929,7 @@ public class SessionsController(
                 tier = item.Tier ?? tier,
                 contextSize = item.ContextSize ?? contextSize,
                 attachments = item.Attachments,
+                conversationId = ExtractSessionConversationId(session.MetadataJson),
                 createdAt = msg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -2059,6 +2109,7 @@ public class SessionsController(
                 mode = mode,
                 tier = tier,
                 contextSize = contextSize,
+                conversationId = ExtractSessionConversationId(session.MetadataJson),
                 createdAt = promptMsg.CreatedAt
             };
             await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
@@ -2782,6 +2833,7 @@ public class SessionsController(
                             jobId = job.Id,
                             projectId = project.Id,
                             gitBranch = job.GitBranchName,
+                            conversationId = ExtractSessionConversationId(session.MetadataJson),
                             createdAt = promptMsg.CreatedAt
                         };
 
@@ -3002,7 +3054,8 @@ public record UpdateSessionRequest(
     string? Tier = null,
     string? Mode = null,
     string? WorkingDirectory = null,
-    string? ContextSize = null
+    string? ContextSize = null,
+    string? ConversationId = null
 );
 
 public record SessionSummaryDto(

@@ -148,6 +148,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var projectId = GetJsonPropString(elem, "projectId");
                 var gitBranch = GetJsonPropString(elem, "gitBranch");
                 var workspaceType = GetJsonPropString(elem, "workspaceType");
+                var conversationId = GetJsonPropString(elem, "conversationId") ?? GetJsonPropString(elem, "conversation_id");
                 var attachments = ExtractJsonAttachments(elem);
 
                 await HandlePromptAsync(new PromptReceivedEvent
@@ -172,6 +173,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                     GitBranch = gitBranch,
                     WorkspaceType = workspaceType,
                     Attachments = attachments,
+                    ConversationId = conversationId,
                     CreatedAt = DateTimeOffset.UtcNow
                 }, _cts.Token);
             }
@@ -452,6 +454,11 @@ public class AgentRunnerInstance : IAsyncDisposable
             State.ActiveSessionId = ev.SessionId;
             State.LastActivityAt = DateTimeOffset.UtcNow;
             _onStateChanged();
+
+            if (!string.IsNullOrWhiteSpace(ev.ConversationId))
+            {
+                AgyAdapter.SetSessionConversationId(ev.SessionId, ev.ConversationId);
+            }
 
             // Resolve working directory: explicit working directory or persistent sandbox workspace
             var effectiveWorkDir = !string.IsNullOrWhiteSpace(ev.WorkingDirectory)

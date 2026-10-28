@@ -79,20 +79,22 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
 fi
 
 # Ensure persistent workspace state directories exist with restricted permissions
-mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
+mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude
 chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
-chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip 2>/dev/null || true
+chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude 2>/dev/null || true
 
 # Ensure ~/.bashrc exports PATH for all interactive shells
 if ! grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null; then
     echo 'export PATH="/root/.local/bin:/usr/local/bin:$PATH"' >> /root/.bashrc
 fi
 
-# If ~/.config or ~/.aip was previously created as a symlink, remove it so credential managers have real directories
+# If ~/.config, ~/.aip, ~/.gemini, or ~/.claude was previously created as a symlink, remove it so credential managers have real directories
 if [ -L /root/.config ]; then rm -f /root/.config; fi
 if [ -L /root/.aip ]; then rm -f /root/.aip; fi
-mkdir -p /root/.config /root/.aip
-chmod 700 /root/.config /root/.aip 2>/dev/null || true
+if [ -L /root/.gemini ]; then rm -f /root/.gemini; fi
+if [ -L /root/.claude ]; then rm -f /root/.claude; fi
+mkdir -p /root/.config /root/.aip /root/.gemini /root/.claude
+chmod 700 /root/.config /root/.aip /root/.gemini /root/.claude 2>/dev/null || true
 
 # Restore persistent state from workspace volume into local directories
 if [ -d /workspace/.agentmesh/state ]; then
@@ -107,6 +109,17 @@ if [ -d /workspace/.agentmesh/state ]; then
     done
 fi
 
+# Ensure Google AI Pro OAuth token is in place if mounted from Secret volume or passed via environment
+if [ -f /etc/agentmesh-creds/antigravity-oauth-token ] && [ ! -s /root/.gemini/antigravity-cli/antigravity-oauth-token ]; then
+    mkdir -p /root/.gemini/antigravity-cli
+    cp /etc/agentmesh-creds/antigravity-oauth-token /root/.gemini/antigravity-cli/antigravity-oauth-token
+    chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token
+elif [ -n "$ANTIGRAVITY_OAUTH_TOKEN" ] && [ ! -s /root/.gemini/antigravity-cli/antigravity-oauth-token ]; then
+    mkdir -p /root/.gemini/antigravity-cli
+    echo "$ANTIGRAVITY_OAUTH_TOKEN" > /root/.gemini/antigravity-cli/antigravity-oauth-token
+    chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token
+fi
+
 # Helper to synchronize state back to workspace volume
 sync_persona_state() {
     mkdir -p /workspace/.agentmesh/state/.config
@@ -116,6 +129,14 @@ sync_persona_state() {
     if [ -d /root/.aip ]; then
         mkdir -p /workspace/.agentmesh/state/.aip
         cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
+    fi
+    if [ -d /root/.gemini ]; then
+        mkdir -p /workspace/.agentmesh/state/.gemini
+        cp -a /root/.gemini/. /workspace/.agentmesh/state/.gemini/ 2>/dev/null || true
+    fi
+    if [ -d /root/.claude ]; then
+        mkdir -p /workspace/.agentmesh/state/.claude
+        cp -a /root/.claude/. /workspace/.agentmesh/state/.claude/ 2>/dev/null || true
     fi
     # Also synchronize all existing state directories in /workspace/.agentmesh/state
     if [ -d /workspace/.agentmesh/state ]; then
@@ -178,16 +199,16 @@ fi
 
 cleanup() {
     echo "Persisting persona state before termination..."
+    if [ -n "$RUNNER_PID" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
+        kill -TERM "$RUNNER_PID" 2>/dev/null || true
+        wait "$RUNNER_PID" 2>/dev/null || true
+    fi
     sync_persona_state
     if [ -n "$COMPANION_PID" ] && kill -0 "$COMPANION_PID" 2>/dev/null; then
         kill "$COMPANION_PID" 2>/dev/null || true
     fi
     if [ -n "$SYNC_PID" ] && kill -0 "$SYNC_PID" 2>/dev/null; then
         kill "$SYNC_PID" 2>/dev/null || true
-    fi
-    if [ -n "$RUNNER_PID" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
-        kill -TERM "$RUNNER_PID" 2>/dev/null || true
-        wait "$RUNNER_PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT SIGTERM SIGINT
