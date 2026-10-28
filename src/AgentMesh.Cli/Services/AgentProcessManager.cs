@@ -58,6 +58,8 @@ public class AgentRunnerInstance : IAsyncDisposable
             Name = preset.Name,
             Role = preset.Role,
             AdapterType = preset.AdapterType,
+            PersonaId = preset.PersonaId,
+            PersonaName = preset.PersonaName,
             State = RunnerConnectionState.Offline
         };
     }
@@ -148,6 +150,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var projectId = GetJsonPropString(elem, "projectId");
                 var gitBranch = GetJsonPropString(elem, "gitBranch");
                 var workspaceType = GetJsonPropString(elem, "workspaceType");
+                var conversationId = GetJsonPropString(elem, "conversationId") ?? GetJsonPropString(elem, "conversation_id");
                 var attachments = ExtractJsonAttachments(elem);
 
                 await HandlePromptAsync(new PromptReceivedEvent
@@ -172,6 +175,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                     GitBranch = gitBranch,
                     WorkspaceType = workspaceType,
                     Attachments = attachments,
+                    ConversationId = conversationId,
                     CreatedAt = DateTimeOffset.UtcNow
                 }, _cts.Token);
             }
@@ -452,6 +456,11 @@ public class AgentRunnerInstance : IAsyncDisposable
             State.ActiveSessionId = ev.SessionId;
             State.LastActivityAt = DateTimeOffset.UtcNow;
             _onStateChanged();
+
+            if (!string.IsNullOrWhiteSpace(ev.ConversationId))
+            {
+                AgyAdapter.SetSessionConversationId(ev.SessionId, ev.ConversationId);
+            }
 
             // Resolve working directory: explicit working directory or persistent sandbox workspace
             var effectiveWorkDir = !string.IsNullOrWhiteSpace(ev.WorkingDirectory)
@@ -924,8 +933,11 @@ public class AgentProcessManager : IAsyncDisposable
         preset.PersonaId = normalizedPersonaId;
         preset.PersonaName = remotePersona?.Name ?? normalizedPersonaId;
         preset.PersonaPrompt = remotePersona?.PersonaPrompt ?? "";
-        preset.Name = $"{remotePersona?.Name ?? normalizedPersonaId} (@{driverId})";
-        preset.Role = remotePersona?.Role ?? preset.Role;
+
+        // The persona is the *character*, the driver is the *runtime*. Registration pushes
+        // preset.Id/Name/Role onto the driver row, so the persona's identity must stay on the
+        // Persona* fields above and never leak into the preset's own name/role.
+        DriverIdentity.ApplyTo(preset, driverId, remoteDriver, remotePersona?.Role);
 
         if (!string.IsNullOrWhiteSpace(customCommand)) preset.Command = customCommand;
         if (!string.IsNullOrWhiteSpace(customModel)) preset.DefaultModel = customModel;

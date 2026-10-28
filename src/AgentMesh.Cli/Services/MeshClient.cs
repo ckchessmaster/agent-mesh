@@ -223,6 +223,7 @@ public class MeshClient
                 {
                     personaName = topPname.GetString();
                 }
+                string? conversationId = null;
                 if (sElem.TryGetProperty("metadataJson", out var metaProp) && !string.IsNullOrWhiteSpace(metaProp.GetString()))
                 {
                     try
@@ -233,6 +234,8 @@ public class MeshClient
                         if (mRoot.TryGetProperty("model", out var m)) model = m.GetString();
                         if (mRoot.TryGetProperty("effort", out var ef)) effort = ef.GetString();
                         if (mRoot.TryGetProperty("mode", out var md)) mode = md.GetString();
+                        if (mRoot.TryGetProperty("conversationId", out var ci)) conversationId = ci.GetString();
+                        else if (mRoot.TryGetProperty("conversation_id", out var ci2)) conversationId = ci2.GetString();
                         if (mRoot.TryGetProperty("personaId", out var pid)) personaId ??= pid.GetString();
                         if (mRoot.TryGetProperty("personaName", out var pn)) personaName ??= pn.GetString();
                         if (mRoot.TryGetProperty("personaRole", out var pr)) personaRole = pr.GetString();
@@ -308,6 +311,7 @@ public class MeshClient
                         GitBranch = gitBranch,
                         WorkspaceType = workspaceType,
                         Attachments = attachments,
+                        ConversationId = conversationId,
                         CreatedAt = createdAt
                     });
                 }
@@ -353,6 +357,7 @@ public class MeshClient
                 {
                     personaName = topPname.GetString();
                 }
+                string? conversationId = null;
                 if (sElem.TryGetProperty("metadataJson", out var metaProp) && !string.IsNullOrWhiteSpace(metaProp.GetString()))
                 {
                     try
@@ -363,6 +368,8 @@ public class MeshClient
                         if (mRoot.TryGetProperty("model", out var m)) model = m.GetString();
                         if (mRoot.TryGetProperty("effort", out var ef)) effort = ef.GetString();
                         if (mRoot.TryGetProperty("mode", out var md)) mode = md.GetString();
+                        if (mRoot.TryGetProperty("conversationId", out var ci)) conversationId = ci.GetString();
+                        else if (mRoot.TryGetProperty("conversation_id", out var ci2)) conversationId = ci2.GetString();
                         if (mRoot.TryGetProperty("personaId", out var pid)) pId ??= pid.GetString();
                         if (mRoot.TryGetProperty("personaName", out var pn)) personaName ??= pn.GetString();
                         if (mRoot.TryGetProperty("personaRole", out var pr)) personaRole = pr.GetString();
@@ -438,6 +445,7 @@ public class MeshClient
                         GitBranch = gitBranch,
                         WorkspaceType = workspaceType,
                         Attachments = attachments,
+                        ConversationId = conversationId,
                         CreatedAt = createdAt
                     });
                 }

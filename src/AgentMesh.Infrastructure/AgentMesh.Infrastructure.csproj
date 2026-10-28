@@ -5,6 +5,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The persona container managers stamp runner-identity markers on agent rows; unit tests
+         exercise that write path directly instead of via a live Docker/K8s host. -->
+    <InternalsVisibleTo Include="AgentMesh.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="AWSSDK.S3" Version="4.0.104.2" />
     <PackageReference Include="Docker.DotNet" Version="3.125.15" />
     <PackageReference Include="EFCore.NamingConventions" Version="10.0.1" />

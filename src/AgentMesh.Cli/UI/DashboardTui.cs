@@ -167,10 +167,17 @@ public class DashboardTui
                         ? $"[grey]{s.LastActivityAt.Value.ToLocalTime():HH:mm:ss}[/]"
                         : $"[dim]{Markup.Escape(s.Role)}[/]";
 
+                // A persona runner registers against its driver, but the operator cares which
+                // character it is running, so label the row with the persona and note the driver.
+                var runnerId = string.IsNullOrWhiteSpace(s.PersonaId) ? s.Id : s.PersonaId;
+                var runnerName = string.IsNullOrWhiteSpace(s.PersonaName)
+                    ? s.Name
+                    : $"{s.PersonaName} (on @{s.Id})";
+
                 table.AddRow(
                     selector,
-                    isSelected ? $"[bold skyblue1]@{Markup.Escape(s.Id)}[/]" : $"[white]@{Markup.Escape(s.Id)}[/]",
-                    Markup.Escape(s.Name),
+                    isSelected ? $"[bold skyblue1]@{Markup.Escape(runnerId)}[/]" : $"[white]@{Markup.Escape(runnerId)}[/]",
+                    Markup.Escape(runnerName),
                     $"[cyan]{Markup.Escape(s.AdapterType)}[/]",
                     statusMarkup,
                     s.PromptsHandled.ToString(),

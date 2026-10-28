@@ -44,6 +44,14 @@ import {
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
 import { useAuth } from './auth/AuthProvider';
+import {
+  QUOTA_DOT_CLASS,
+  QUOTA_TEXT_CLASS,
+  describeReset,
+  describeUsageChip,
+  relativeTime,
+  summarizeQuota
+} from './utils/driverUsage';
 import type {
   Agent,
   AgentSession,
@@ -568,12 +576,18 @@ export default function App() {
   const handleOpenUsageModal = async (agent: Agent) => {
     setSelectedUsageAgent(agent);
     setShowUsageModal(true);
+
+    // Opening the panel shows whatever the API already has (it TTL-caches provider readings).
+    // A forced re-probe shells out to the driver CLI and can take seconds, so it is reserved
+    // for the explicit refresh button.
+    if (agentUsages[agent.id]) return;
+
     setIsRefreshingUsage(true);
     try {
-      const u = await api.getAgentUsage(agent.id, true);
+      const u = await api.getAgentUsage(agent.id, false);
       setAgentUsages((prev) => ({ ...prev, [agent.id]: u }));
     } catch (err) {
-      console.error('Failed to load fresh agent usage:', err);
+      console.error('Failed to load agent usage:', err);
     } finally {
       setIsRefreshingUsage(false);
     }
@@ -648,19 +662,19 @@ export default function App() {
         });
       }
 
-      // Fetch usage stats & quotas in parallel for all agents
-      const usages: Record<string, AgentUsageResponse> = {};
-      await Promise.all(
+      // Usage/quota fan-out is intentionally NOT awaited: reading a driver's provider quota can
+      // shell out to a CLI that takes seconds to answer, and the dashboard used to block first
+      // paint on all of them. Each chip fills in as its own reading lands.
+      void Promise.allSettled(
         agentsRes.map(async (agent) => {
           try {
             const u = await api.getAgentUsage(agent.id);
-            usages[agent.id] = u;
+            setAgentUsages((prev) => ({ ...prev, [agent.id]: u }));
           } catch {
             // Usage might not be available yet or endpoint error
           }
         })
       );
-      setAgentUsages(usages);
 
       // Auto-select first persona, agent & session if none selected
       setSelectedPersonaId((prevPersona) => {
@@ -3259,7 +3273,7 @@ export default function App() {
                                 </span>
                               </div>
                               <div className="text-[11px] font-mono text-slate-400 truncate">
-                                @{agent.id} · {agent.role || 'Driver'}
+                                @{agent.id}
                               </div>
                               {driverPersonas.length > 0 && (
                                 <div className="flex flex-wrap items-center gap-1 mt-1.5">
@@ -3275,37 +3289,26 @@ export default function App() {
                                   ))}
                                 </div>
                               )}
-                              {usage && (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleOpenUsageModal(agent);
-                                  }}
-                                  className="mt-1.5 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-950/70 hover:bg-slate-800 text-[10px] font-mono text-slate-300 border border-slate-800 hover:border-slate-700 transition cursor-pointer max-w-full"
-                                  title="Click to view full quota and lifetime token usage"
-                                >
-                                  <span
-                                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                                      usage.providerQuota
-                                        ? usage.providerQuota.primaryRemainingFraction > 0.3
-                                          ? 'bg-emerald-400'
-                                          : 'bg-rose-400'
-                                        : 'bg-sky-400'
-                                    }`}
-                                  />
-                                  <span className="truncate">
-                                    {usage.providerQuota
-                                      ? `${Math.round(usage.providerQuota.primaryRemainingFraction * 100)}% quota`
-                                      : 'Quota'}
-                                    {' · '}
-                                    {usage.lifetimeTokens?.totalTokens && usage.lifetimeTokens.totalTokens > 0
-                                      ? `${(usage.lifetimeTokens.totalTokens / 1000).toFixed(1)}k tokens`
-                                      : '0 tokens'}
-                                  </span>
-                                  <BarChart2 className="w-2.5 h-2.5 text-slate-500 hover:text-sky-400 ml-1 shrink-0" />
-                                </button>
-                              )}
+                              {usage && (() => {
+                                const chip = describeUsageChip(usage);
+                                return (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleOpenUsageModal(agent);
+                                    }}
+                                    className="mt-1.5 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-950/70 hover:bg-slate-800 text-[10px] font-mono text-slate-300 border border-slate-800 hover:border-slate-700 transition cursor-pointer max-w-full"
+                                    title={chip.title}
+                                  >
+                                    <span
+                                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${QUOTA_DOT_CLASS[chip.tone]}`}
+                                    />
+                                    <span className="truncate">{chip.text}</span>
+                                    <BarChart2 className="w-2.5 h-2.5 text-slate-500 hover:text-sky-400 ml-1 shrink-0" />
+                                  </button>
+                                );
+                              })()}
                             </div>
                           </div>
 
@@ -5253,6 +5256,7 @@ export default function App() {
       {/* Agent Quota & Usage Details Modal */}
       {showUsageModal && selectedUsageAgent && (() => {
         const usage = agentUsages[selectedUsageAgent.id];
+        const quotaSummary = summarizeQuota(usage?.providerQuota);
         return (
           <div
             role="dialog"
@@ -5340,130 +5344,150 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Real-time Provider Quota Meters */}
+                {/* Provider Quota Meters - rendered only from a real provider reading */}
                 <div>
                   <div className="flex items-center justify-between mb-2.5">
                     <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider font-mono">
                       Provider Quota & Rate Limits
                     </span>
                     {usage?.providerQuota && (
-                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30">
+                      <span
+                        className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30"
+                        title={quotaSummary.detail}
+                      >
                         {usage.providerQuota.provider.toUpperCase()} · {usage.providerQuota.planName}
+                        {usage.providerQuota.observedAt
+                          ? ` · read ${relativeTime(usage.providerQuota.observedAt)}`
+                          : ''}
                       </span>
                     )}
                   </div>
 
-                  {usage?.providerQuota ? (
-                    <div className="space-y-4 bg-slate-950/60 border border-slate-800 rounded-xl p-4">
-                      {/* Primary Overall Meter */}
-                      <div>
-                        <div className="flex items-center justify-between text-xs font-mono mb-1.5">
-                          <span className="text-slate-300 font-semibold">Primary Quota Availability</span>
-                          <span
-                            className={`font-bold ${
-                              usage.providerQuota.primaryRemainingFraction > 0.4
-                                ? 'text-emerald-400'
-                                : usage.providerQuota.primaryRemainingFraction > 0.15
-                                ? 'text-amber-400'
-                                : 'text-rose-400'
-                            }`}
-                          >
-                            {(usage.providerQuota.primaryRemainingFraction * 100).toFixed(1)}% Remaining
-                          </span>
+                  {quotaSummary.available && usage?.providerQuota ? (() => {
+                    const remainingPct = (quotaSummary.remainingFraction ?? 0) * 100;
+                    return (
+                      <div className="space-y-4 bg-slate-950/60 border border-slate-800 rounded-xl p-4">
+                        {/* Primary Overall Meter */}
+                        <div>
+                          <div className="flex items-center justify-between text-xs font-mono mb-1.5">
+                            <span className="text-slate-300 font-semibold">Primary Quota Availability</span>
+                            <span className={`font-bold ${QUOTA_TEXT_CLASS[quotaSummary.tone]}`}>
+                              {remainingPct.toFixed(1)}% Remaining
+                            </span>
+                          </div>
+                          <div className="h-2.5 w-full bg-slate-800 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full transition-all duration-500 ${
+                                quotaSummary.tone === 'healthy'
+                                  ? 'bg-emerald-500'
+                                  : quotaSummary.tone === 'warning'
+                                  ? 'bg-amber-500'
+                                  : 'bg-rose-500'
+                              }`}
+                              style={{ width: `${Math.min(100, Math.max(0, remainingPct))}%` }}
+                            />
+                          </div>
                         </div>
-                        <div className="h-2.5 w-full bg-slate-800 rounded-full overflow-hidden">
-                          <div
-                            className={`h-full rounded-full transition-all duration-500 ${
-                              usage.providerQuota.primaryRemainingFraction > 0.4
-                                ? 'bg-emerald-500'
-                                : usage.providerQuota.primaryRemainingFraction > 0.15
-                                ? 'bg-amber-500'
-                                : 'bg-rose-500'
-                            }`}
-                            style={{
-                              width: `${Math.min(100, Math.max(0, usage.providerQuota.primaryRemainingFraction * 100))}%`
-                            }}
-                          />
-                        </div>
-                      </div>
 
-                      {/* Quota Groups & Individual Buckets */}
-                      <div className="space-y-3 pt-2 border-t border-slate-800/80">
-                        {usage.providerQuota.groups.map((group) => (
-                          <div key={group.name} className="space-y-2">
-                            <div className="text-[11px] font-mono text-slate-400 font-medium">
-                              {group.name}
-                            </div>
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                              {group.buckets.map((bucket) => {
-                                const pct = Math.round(bucket.remainingFraction * 100);
-                                return (
-                                  <div
-                                    key={bucket.id}
-                                    className="bg-slate-900/90 border border-slate-800 rounded-lg p-2.5 space-y-1.5"
-                                  >
-                                    <div className="flex items-center justify-between text-xs font-mono">
-                                      <span className="font-semibold text-slate-200 truncate" title={bucket.id}>
-                                        {bucket.name || bucket.id}
-                                      </span>
-                                      {bucket.window && (
-                                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700 shrink-0">
-                                          {bucket.window}
+                        {/* Quota Groups & Individual Buckets */}
+                        <div className="space-y-3 pt-2 border-t border-slate-800/80">
+                          {usage!.providerQuota!.groups.map((group) => (
+                            <div key={group.name} className="space-y-2">
+                              <div className="text-[11px] font-mono text-slate-400 font-medium">
+                                {group.name}
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                {group.buckets.map((bucket) => {
+                                  const pct = Math.round(bucket.remainingFraction * 100);
+                                  const reset = describeReset(bucket.resetTime);
+                                  return (
+                                    <div
+                                      key={bucket.id}
+                                      className="bg-slate-900/90 border border-slate-800 rounded-lg p-2.5 space-y-1.5"
+                                    >
+                                      <div className="flex items-center justify-between text-xs font-mono">
+                                        <span className="font-semibold text-slate-200 truncate" title={bucket.id}>
+                                          {bucket.name || bucket.id}
                                         </span>
-                                      )}
-                                    </div>
-                                    <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
-                                      <span>Remaining</span>
-                                      <span
-                                        className={`font-semibold ${
-                                          pct > 40
-                                            ? 'text-emerald-400'
-                                            : pct > 15
-                                            ? 'text-amber-400'
-                                            : 'text-rose-400'
-                                        }`}
-                                      >
-                                        {(bucket.remainingFraction * 100).toFixed(1)}%
-                                      </span>
-                                    </div>
-                                    <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
-                                      <div
-                                        className={`h-full rounded-full transition-all duration-300 ${
-                                          pct > 40
-                                            ? 'bg-emerald-500'
-                                            : pct > 15
-                                            ? 'bg-amber-500'
-                                            : 'bg-rose-500'
-                                        }`}
-                                        style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
-                                      />
-                                    </div>
-                                    {bucket.resetTime && (
-                                      <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1 pt-0.5 truncate">
-                                        <Clock className="w-2.5 h-2.5 shrink-0" />
-                                        <span className="truncate">
-                                          Resets {new Date(bucket.resetTime).toLocaleDateString()} {new Date(bucket.resetTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                        {bucket.window && (
+                                          <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700 shrink-0">
+                                            {bucket.window}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                                        <span>Remaining</span>
+                                        <span className={`font-semibold ${QUOTA_TEXT_CLASS[
+                                          pct > 40 ? 'healthy' : pct > 15 ? 'warning' : 'critical'
+                                        ]}`}>
+                                          {pct}%
                                         </span>
                                       </div>
-                                    )}
-                                  </div>
-                                );
-                              })}
+                                      <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full rounded-full transition-all duration-300 ${
+                                            pct > 40
+                                              ? 'bg-emerald-500'
+                                              : pct > 15
+                                              ? 'bg-amber-500'
+                                              : 'bg-rose-500'
+                                          }`}
+                                          style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+                                        />
+                                      </div>
+                                      {reset && (
+                                        <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1 pt-0.5 truncate">
+                                          <Clock className="w-2.5 h-2.5 shrink-0" />
+                                          <span className="truncate">{reset}</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
                             </div>
+                          ))}
+                        </div>
+
+                        {usage!.providerQuota!.source && (
+                          <div className="text-[10px] font-mono text-slate-500 pt-1 border-t border-slate-800/80">
+                            Source: <span className="text-slate-400">{usage!.providerQuota!.source}</span>
                           </div>
-                        ))}
+                        )}
                       </div>
-                    </div>
-                  ) : (
+                    );
+                  })() : (
                     <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 text-slate-400 text-xs space-y-1.5">
-                      <div className="flex items-center gap-2 text-slate-300 font-semibold">
-                        <Cpu className="w-4 h-4 text-sky-400" />
-                        <span>Local Mesh Token Tracking Active</span>
-                      </div>
-                      <p className="leading-relaxed">
-                        Real-time provider quota introspection is supported for Antigravity CLI (<code className="text-sky-300">agy</code>) via <code className="text-sky-300">/usage</code>.
-                        For this agent runtime, token metrics are aggregated from session execution events.
-                      </p>
+                      {isRefreshingUsage ? (
+                        <>
+                          <div className="flex items-center gap-2 text-slate-300 font-semibold">
+                            <RefreshCw className="w-4 h-4 animate-spin text-sky-400" />
+                            <span>Reading provider quota…</span>
+                          </div>
+                          <p className="leading-relaxed">
+                            Quota introspection shells out to the driver CLI, which can take a few
+                            seconds to answer.
+                          </p>
+                        </>
+                      ) : (
+                        <>
+                          <div className="flex items-center gap-2 text-slate-300 font-semibold">
+                            <Cpu className="w-4 h-4 text-slate-400" />
+                            <span>No provider quota reported</span>
+                          </div>
+                          <p className="leading-relaxed">
+                            This driver did not return any quota windows, so nothing is shown here.
+                            Use the refresh control to ask the provider again. The token figures
+                            above are still real: they are aggregated from this mesh's own session
+                            execution records.
+                          </p>
+                          <p className="leading-relaxed text-slate-500">
+                            Quota introspection currently reads the Antigravity CLI (<code className="text-sky-300">agy</code>) via
+                            <code className="text-sky-300"> -p /usage --output-format json</code>, and requires the CLI to be
+                            installed and signed in on the API host.
+                          </p>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>

@@ -1,6 +1,3 @@
-using System.Collections.Concurrent;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Security.Claims;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -24,8 +21,11 @@ namespace AgentMesh.Api.Controllers;
 public class AgentsController(
     AgentMeshDbContext db,
     IApiKeyService apiKeyService,
-    IHubContext<AgentMeshHub>? hubContext = null) : ControllerBase
+    IHubContext<AgentMeshHub>? hubContext = null,
+    IDriverQuotaProbe? quotaProbe = null) : ControllerBase
 {
+    private IDriverQuotaProbe QuotaProbe => quotaProbe ?? NullDriverQuotaProbe.Instance;
+
     [HttpPost("register")]
     [AllowAnonymous]
     public async Task<IActionResult> RegisterAgent([FromBody] RegisterAgentRequest req)
@@ -50,7 +50,7 @@ public class AgentsController(
         {
             Id = normalizedId,
             Name = req.Name.Trim(),
-            Role = req.Role ?? "Autonomous Agent",
+            Role = string.IsNullOrWhiteSpace(req.Role) ? AgentKind.DriverRole : req.Role.Trim(),
             Status = req.Status ?? (AgentMeshHub.IsAgentConnected(normalizedId) ? "online" : "offline"),
             RuntimeType = req.RuntimeType,
             TrustTier = req.TrustTier,
@@ -148,12 +148,22 @@ public class AgentsController(
 
     [HttpGet]
     [AllowAnonymous]
-    public async Task<IActionResult> GetAgents()
+    public async Task<IActionResult> GetAgents([FromQuery] bool includeRunnerIdentities = false)
     {
         var agents = await db.Agents
             .AsNoTracking()
             .OrderBy(a => a.Name)
             .ToListAsync();
+
+        var personaOwners = await GetPersonaDriverMapAsync();
+
+        // Persona runner identities are rows that exist only so a persona's bearer token can be
+        // authenticated (see AgentKind). Listing them here is what made every driver appear twice
+        // on the drivers tab, wearing the persona's name and role.
+        // They stay reachable by id via GET /api/agents/{id} and by token, so auth is unaffected.
+        var drivers = includeRunnerIdentities
+            ? agents
+            : agents.Where(a => !AgentKind.IsPersonaRunnerIdentity(a, personaOwners)).ToList();
 
         var sessionCounts = await db.AgentSessions
             .AsNoTracking()
@@ -174,7 +184,7 @@ public class AgentsController(
                 g => g.Select(p => new DriverPersonaSummaryDto(p.Id, p.Name, p.Role, p.DefaultModel)).ToList(),
                 StringComparer.OrdinalIgnoreCase);
 
-        var dtos = agents
+        var dtos = drivers
             .Select(a => ToDto(
                 a,
                 sessionCounts.GetValueOrDefault(a.Id, 0),
@@ -182,6 +192,26 @@ public class AgentsController(
             .ToList();
 
         return Ok(dtos);
+    }
+
+    /// <summary>Persona id -> owning driver id. Used to recognise legacy runner-identity rows.</summary>
+    private async Task<Dictionary<string, string>> GetPersonaDriverMapAsync()
+    {
+        var rows = await db.Personas
+            .AsNoTracking()
+            .Select(p => new { p.Id, p.DriverId })
+            .ToListAsync();
+
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in rows)
+        {
+            if (!string.IsNullOrWhiteSpace(row.Id) && !string.IsNullOrWhiteSpace(row.DriverId))
+            {
+                map[row.Id.Trim().ToLowerInvariant()] = row.DriverId.Trim().ToLowerInvariant();
+            }
+        }
+
+        return map;
     }
 
     [HttpGet("{id}")]
@@ -625,211 +655,42 @@ public class AgentsController(
         ));
     }
 
-    private static readonly ConcurrentDictionary<string, (DateTimeOffset CachedAt, ProviderQuotaDto Quota)> QuotaCache = new();
-
-    private static async Task<ProviderQuotaDto?> GetAgentProviderQuotaAsync(Agent agent, bool refresh = false)
+    private async Task<ProviderQuotaDto?> GetAgentProviderQuotaAsync(Agent agent, bool refresh)
     {
-        var id = agent.Id.ToLowerInvariant();
-        var isAgy = id == "agy" || id.Contains("agy") || id.Contains("antigravity");
-        var isCopilot = id == "copilot" || id.Contains("copilot");
+        var caps = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var request = new DriverQuotaProbeRequest(
+            DriverId: agent.Id,
+            RuntimeType: agent.RuntimeType,
+            Adapter: caps?.Adapter,
+            Endpoint: caps?.Endpoint,
+            // `refresh=true` is an explicit user action, so it bypasses the probe's TTL cache.
+            ForceRefresh: refresh);
 
-        if (isAgy)
-        {
-            if (!refresh &&
-                QuotaCache.TryGetValue("agy", out var cached) &&
-                DateTimeOffset.UtcNow - cached.CachedAt < TimeSpan.FromSeconds(60))
-            {
-                return cached.Quota;
-            }
+        var reading = await QuotaProbe.ProbeAsync(request, HttpContext?.RequestAborted ?? CancellationToken.None);
+        return reading == null ? null : ToDto(reading);
 
-            var agyPath = ResolveExecutablePath("agy");
-            if (agyPath != null)
-            {
-                try
-                {
-                    using var proc = new Process
-                    {
-                        StartInfo = new ProcessStartInfo
-                        {
-                            FileName = agyPath,
-                            ArgumentList = { "-p", "/usage", "--output-format", "json" },
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            UseShellExecute = false,
-                            CreateNoWindow = true
-                        }
-                    };
-
-                    proc.Start();
-                    var outputTask = proc.StandardOutput.ReadToEndAsync();
-                    var errorTask = proc.StandardError.ReadToEndAsync();
-                    var exitTask = proc.WaitForExitAsync();
-                    if (await Task.WhenAny(exitTask, Task.Delay(8000)) == exitTask)
-                    {
-                        var stdOut = await outputTask;
-                        if (!string.IsNullOrWhiteSpace(stdOut))
-                        {
-                            var parsed = ParseAgyUsageJson(stdOut);
-                            if (parsed != null)
-                            {
-                                QuotaCache["agy"] = (DateTimeOffset.UtcNow, parsed);
-                                return parsed;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        try { proc.Kill(true); } catch { }
-                    }
-                }
-                catch { }
-            }
-
-            // Fallback default mock if binary not callable
-            var defaultAgyQuota = new ProviderQuotaDto(
-                Provider: "Google Antigravity",
-                PlanName: "Pro Tier",
-                PrimaryRemainingFraction: 0.88,
-                Groups: new List<QuotaGroupDto>
-                {
-                    new("Gemini Models", "Gemini Flash & Gemini Pro", new List<QuotaBucketDto>
-                    {
-                        new("gemini-weekly", "Weekly Limit Remaining", "Refreshes weekly", "weekly", 0.88, DateTimeOffset.UtcNow.AddDays(6).ToString("u")),
-                        new("gemini-5h", "Five Hour Limit Remaining", "Refreshes every 5 hours", "5h", 0.90, DateTimeOffset.UtcNow.AddHours(3).ToString("u"))
-                    }),
-                    new("Claude & GPT Models", "Claude Opus, Sonnet & GPT-OSS", new List<QuotaBucketDto>
-                    {
-                        new("3p-weekly", "Weekly Limit Remaining", "Shared 3rd-party weekly limit", "weekly", 1.0, DateTimeOffset.UtcNow.AddDays(7).ToString("u")),
-                        new("3p-5h", "Five Hour Limit Remaining", "Shared 3rd-party 5-hour limit", "5h", 1.0, DateTimeOffset.UtcNow.AddHours(5).ToString("u"))
-                    }),
-                    new("Gemini 4 Argon", "Argon Weekly Allowance", new List<QuotaBucketDto>
-                    {
-                        new("gemini-argon-wtu-weekly", "Gemini 4 Argon Weekly Limit", "Dedicated Argon capacity", "weekly", 0.20, DateTimeOffset.UtcNow.AddDays(6).ToString("u"))
-                    })
-                }
-            );
-            return defaultAgyQuota;
-        }
-
-        if (isCopilot)
-        {
-            return new ProviderQuotaDto(
-                Provider: "GitHub Copilot",
-                PlanName: "Copilot Free / Pro",
-                PrimaryRemainingFraction: 1.0,
-                Groups: new List<QuotaGroupDto>
-                {
-                    new("AI Credits & Completions", "Monthly Model Access Allowance", new List<QuotaBucketDto>
-                    {
-                        new("copilot-credits", "Monthly AI Credits", "Active subscription quota", "monthly", 1.0, DateTimeOffset.UtcNow.AddDays(14).ToString("u")),
-                        new("copilot-autopilot", "Autopilot Continuation Cap", "Default 5 continues per turn", "turn", 1.0, null)
-                    })
-                }
-            );
-        }
-
-        return null;
+        static ProviderQuotaDto ToDto(DriverQuotaReading reading) => new(
+            Provider: reading.Provider,
+            PlanName: reading.PlanName,
+            PrimaryRemainingFraction: reading.PrimaryRemainingFraction,
+            Groups: reading.Groups
+                .Select(g => new QuotaGroupDto(
+                    g.Name,
+                    g.Description,
+                    g.Buckets
+                        .Select(b => new QuotaBucketDto(
+                            b.Id,
+                            b.Name,
+                            b.Description,
+                            b.Window,
+                            b.RemainingFraction,
+                            b.ResetsAt?.ToString("u")))
+                        .ToList()))
+                .ToList(),
+            Source: reading.Source,
+            ObservedAt: reading.ObservedAt);
     }
 
-    private static ProviderQuotaDto? ParseAgyUsageJson(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("command", out var cmdProp) ||
-                !cmdProp.TryGetProperty("data", out var dataProp) ||
-                !dataProp.TryGetProperty("groups", out var groupsElem))
-            {
-                return null;
-            }
-
-            var groups = new List<QuotaGroupDto>();
-            double? primaryRemaining = null;
-
-            foreach (var g in groupsElem.EnumerateArray())
-            {
-                var gName = g.TryGetProperty("name", out var gn) ? gn.GetString() ?? "" : "";
-                var gDesc = g.TryGetProperty("description", out var gd) ? gd.GetString() : null;
-                var buckets = new List<QuotaBucketDto>();
-
-                if (g.TryGetProperty("buckets", out var bucketsElem))
-                {
-                    foreach (var b in bucketsElem.EnumerateArray())
-                    {
-                        var bId = b.TryGetProperty("id", out var bi) ? bi.GetString() ?? "" : "";
-                        var bName = b.TryGetProperty("name", out var bn) ? bn.GetString() ?? "" : "";
-                        var bDesc = b.TryGetProperty("description", out var bd) ? bd.GetString() : null;
-                        var bWindow = b.TryGetProperty("window", out var bw) ? bw.GetString() : null;
-                        var bFrac = b.TryGetProperty("remaining_fraction", out var bf) ? bf.GetDouble() : 1.0;
-                        var bReset = b.TryGetProperty("reset_time", out var br) ? br.GetString() : null;
-
-                        if (bId == "gemini-weekly" || (primaryRemaining == null && bWindow == "weekly"))
-                        {
-                            primaryRemaining = bFrac;
-                        }
-
-                        buckets.Add(new QuotaBucketDto(bId, bName, bDesc, bWindow, bFrac, bReset));
-                    }
-                }
-
-                groups.Add(new QuotaGroupDto(gName, gDesc, buckets));
-            }
-
-            if (primaryRemaining == null && groups.Count > 0 && groups[0].Buckets.Count > 0)
-            {
-                primaryRemaining = groups[0].Buckets[0].RemainingFraction;
-            }
-
-            return new ProviderQuotaDto(
-                Provider: "Google Antigravity",
-                PlanName: "Pro Tier",
-                PrimaryRemainingFraction: primaryRemaining ?? 1.0,
-                Groups: groups
-            );
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static string? ResolveExecutablePath(string command)
-    {
-        if (string.IsNullOrWhiteSpace(command)) return null;
-        if (System.IO.File.Exists(command)) return Path.GetFullPath(command);
-
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var candidateDirs = new List<string>();
-
-        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        candidateDirs.AddRange(pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries));
-
-        if (!string.IsNullOrWhiteSpace(home))
-        {
-            candidateDirs.Add(Path.Combine(home, ".local", "bin"));
-            candidateDirs.Add(Path.Combine(home, ".gemini", "antigravity-cli", "bin"));
-        }
-
-        var extensions = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? new[] { "", ".exe", ".cmd", ".bat", ".ps1" }
-            : new[] { "" };
-
-        foreach (var dir in candidateDirs)
-        {
-            foreach (var ext in extensions)
-            {
-                try
-                {
-                    var fullPath = Path.Combine(dir, command + ext);
-                    if (System.IO.File.Exists(fullPath)) return fullPath;
-                }
-                catch { }
-            }
-        }
-
-        return null;
-    }
 
     private static AgentDto ToDto(Agent a, int sessionCount, List<DriverPersonaSummaryDto>? personas = null)
     {
@@ -948,7 +809,11 @@ public record ProviderQuotaDto(
     string Provider,
     string PlanName,
     double PrimaryRemainingFraction,
-    List<QuotaGroupDto> Groups
+    List<QuotaGroupDto> Groups,
+    /// <summary>Which introspection channel produced this reading, e.g. "agy:/usage".</summary>
+    string? Source = null,
+    /// <summary>When the reading was taken, so the UI can age it instead of implying liveness.</summary>
+    DateTimeOffset? ObservedAt = null
 );
 
 public record LifetimeTokensDto(

@@ -279,6 +279,10 @@ export interface ProviderQuotaInfo {
   planName: string;
   primaryRemainingFraction: number;
   groups: QuotaGroup[];
+  /** Which introspection channel produced this reading, e.g. "agy:/usage". */
+  source?: string | null;
+  /** When the reading was taken, so the UI can age it instead of implying live data. */
+  observedAt?: string | null;
 }
 
 export interface LifetimeTokens {

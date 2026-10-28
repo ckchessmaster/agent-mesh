@@ -429,10 +429,141 @@ public static class AgentAdapterFactory
 public class AgyAdapter : IAgentAdapter
 {
     private static readonly ConcurrentDictionary<Guid, string> SessionConversations = new();
+    private static readonly object MappingLock = new();
 
     public static string? GetSessionConversationId(Guid sessionId)
     {
-        return SessionConversations.TryGetValue(sessionId, out var convId) ? convId : null;
+        if (sessionId == Guid.Empty) return null;
+        if (SessionConversations.TryGetValue(sessionId, out var convId) && !string.IsNullOrWhiteSpace(convId))
+        {
+            return convId;
+        }
+
+        LoadPersistedSessionConversations();
+
+        return SessionConversations.TryGetValue(sessionId, out convId) && !string.IsNullOrWhiteSpace(convId) ? convId : null;
+    }
+
+    public static void SetSessionConversationId(Guid sessionId, string convId)
+    {
+        if (sessionId == Guid.Empty || string.IsNullOrWhiteSpace(convId)) return;
+        SessionConversations[sessionId] = convId.Trim();
+        PersistSessionConversations();
+    }
+
+    private static List<string> GetCandidateMappingFilePaths()
+    {
+        var list = new List<string>();
+        if (Directory.Exists("/workspace"))
+        {
+            list.Add("/workspace/.agentmesh/session_conversations.json");
+        }
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrWhiteSpace(userProfile))
+        {
+            list.Add(Path.Combine(userProfile, ".agentmesh", "session_conversations.json"));
+        }
+        return list;
+    }
+
+    private static void LoadPersistedSessionConversations()
+    {
+        lock (MappingLock)
+        {
+            var paths = GetCandidateMappingFilePaths();
+            foreach (var path in paths)
+            {
+                if (!File.Exists(path)) continue;
+                try
+                {
+                    var json = File.ReadAllText(path);
+                    if (string.IsNullOrWhiteSpace(json)) continue;
+                    var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+                    if (dict == null) continue;
+                    foreach (var (k, v) in dict)
+                    {
+                        if (Guid.TryParse(k, out var sid) && !string.IsNullOrWhiteSpace(v))
+                        {
+                            SessionConversations.TryAdd(sid, v.Trim());
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+    }
+
+    private static void PersistSessionConversations()
+    {
+        lock (MappingLock)
+        {
+            try
+            {
+                var dict = SessionConversations.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value);
+                var json = JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true });
+                var paths = GetCandidateMappingFilePaths();
+                foreach (var path in paths)
+                {
+                    try
+                    {
+                        var dir = Path.GetDirectoryName(path);
+                        if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                        {
+                            Directory.CreateDirectory(dir);
+                        }
+                        var tempFile = path + ".tmp";
+                        File.WriteAllText(tempFile, json);
+                        File.Move(tempFile, path, overwrite: true);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+    }
+
+    public static void EnsureBrainRestoredFromWorkspaceState(string convId)
+    {
+        if (string.IsNullOrWhiteSpace(convId)) return;
+        try
+        {
+            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var brainTarget = Path.Combine(userHome, ".gemini", "antigravity-cli", "brain", convId);
+            var brainBackup = Path.Combine("/workspace", ".agentmesh", "state", ".gemini", "antigravity-cli", "brain", convId);
+
+            if (!Directory.Exists(brainTarget) && Directory.Exists(brainBackup))
+            {
+                CopyDirectoryRecursive(brainBackup, brainTarget);
+            }
+
+            var dbTarget = Path.Combine(userHome, ".gemini", "antigravity-cli", "conversation_summaries.db");
+            var dbBackup = Path.Combine("/workspace", ".agentmesh", "state", ".gemini", "antigravity-cli", "conversation_summaries.db");
+            if (!File.Exists(dbTarget) && File.Exists(dbBackup))
+            {
+                var targetDir = Path.GetDirectoryName(dbTarget);
+                if (!string.IsNullOrWhiteSpace(targetDir) && !Directory.Exists(targetDir))
+                {
+                    Directory.CreateDirectory(targetDir);
+                }
+                File.Copy(dbBackup, dbTarget, overwrite: true);
+            }
+        }
+        catch { }
+    }
+
+    private static void CopyDirectoryRecursive(string sourceDir, string targetDir)
+    {
+        Directory.CreateDirectory(targetDir);
+        foreach (var file in Directory.GetFiles(sourceDir))
+        {
+            var dest = Path.Combine(targetDir, Path.GetFileName(file));
+            File.Copy(file, dest, overwrite: true);
+        }
+        foreach (var dir in Directory.GetDirectories(sourceDir))
+        {
+            var dest = Path.Combine(targetDir, Path.GetFileName(dir));
+            CopyDirectoryRecursive(dir, dest);
+        }
     }
 
     private static readonly HashSet<string> SupportedBrainArtifactExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -704,12 +835,22 @@ public class AgyAdapter : IAgentAdapter
         };
 
         string? activeConvId = null;
-        if (SessionConversations.TryGetValue(promptEvent.SessionId, out var existingConvId) &&
-            !string.IsNullOrWhiteSpace(existingConvId))
+        if (!string.IsNullOrWhiteSpace(promptEvent.ConversationId))
+        {
+            activeConvId = promptEvent.ConversationId.Trim();
+            SetSessionConversationId(promptEvent.SessionId, activeConvId);
+        }
+        else if (GetSessionConversationId(promptEvent.SessionId) is string existingConvId &&
+                 !string.IsNullOrWhiteSpace(existingConvId))
         {
             activeConvId = existingConvId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(activeConvId))
+        {
+            EnsureBrainRestoredFromWorkspaceState(activeConvId);
             psi.ArgumentList.Add("--conversation");
-            psi.ArgumentList.Add(existingConvId);
+            psi.ArgumentList.Add(activeConvId);
         }
 
         string? resolvedModel = null;
@@ -847,7 +988,7 @@ public class AgyAdapter : IAgentAdapter
                             if (!string.IsNullOrWhiteSpace(convId))
                             {
                                 activeConvId = convId;
-                                SessionConversations[promptEvent.SessionId] = convId;
+                                SetSessionConversationId(promptEvent.SessionId, convId);
                                 transcriptFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "antigravity-cli", "brain", convId, ".system_generated", "logs", "transcript.jsonl");
                                 if (lastTranscriptStep < 0)
                                 {
@@ -1007,6 +1148,7 @@ public class AgyAdapter : IAgentAdapter
                                 effort = promptEvent.Effort,
                                 mode = promptEvent.Mode,
                                 contextSize = promptEvent.ContextSize,
+                                conversationId = activeConvId,
                                 usage = new
                                 {
                                     inputTokens = lastInputTokens,
@@ -1098,6 +1240,7 @@ public class AgyAdapter : IAgentAdapter
                         effort = promptEvent.Effort,
                         mode = promptEvent.Mode,
                         contextSize = promptEvent.ContextSize,
+                        conversationId = activeConvId,
                         usage = new
                         {
                             inputTokens = lastInputTokens,
