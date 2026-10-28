@@ -28,6 +28,12 @@ builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespa
 // Configure Authentication & Authorization
 builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();
 builder.Services.AddSingleton<ICredentialEncryptionService, AesCredentialEncryptionService>();
+
+// Driver quota introspection. Singleton so the probes' TTL caches survive across requests:
+// the dashboard fans these out over every driver on load, and each probe shells out to a
+// provider CLI that takes seconds to answer.
+builder.Services.AddSingleton<AgyDriverQuotaProbe>();
+builder.Services.AddSingleton<IDriverQuotaProbe>(sp => sp.GetRequiredService<AgyDriverQuotaProbe>());
 builder.Services.AddHttpContextAccessor();
 
 var oidcAuthority = builder.Configuration["Oidc:Authority"] ?? "http://localhost:8085/dex";

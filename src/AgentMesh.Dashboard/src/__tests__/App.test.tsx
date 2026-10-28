@@ -510,11 +510,11 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/88% quota · 18.4k tokens/i)).toBeInTheDocument();
+      expect(screen.getByText(/88% quota left · 18.4k tokens/i)).toBeInTheDocument();
     });
 
     // Click the quota pill
-    fireEvent.click(screen.getByText(/88% quota · 18.4k tokens/i));
+    fireEvent.click(screen.getByText(/88% quota left · 18.4k tokens/i));
 
     // Verify modal is open
     await waitFor(() => {
@@ -528,6 +528,53 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     // Close modal
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(screen.queryByRole('dialog', { name: 'Agent Quota and Usage Details' })).not.toBeInTheDocument();
+  });
+
+  it('shows an explicit "quota n/a" chip instead of invented numbers when the driver reports no quota', async () => {
+    const mockAgent: Agent = {
+      id: 'copilot',
+      name: 'GitHub Copilot CLI',
+      role: 'Driver',
+      status: 'online',
+      runtimeType: 'CliAgy',
+      trustTier: 4,
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getAgentUsage).mockResolvedValue({
+      agentId: 'copilot',
+      agentName: 'GitHub Copilot CLI',
+      sessionCount: 3,
+      lifetimeTokens: {
+        inputTokens: 5000,
+        outputTokens: 2000,
+        thinkingTokens: 0,
+        totalTokens: 7000,
+        totalDurationSeconds: 9.5
+      },
+      // The API returns null whenever the provider could not be read.
+      providerQuota: null
+    });
+
+    render(<App />);
+
+    // The chip must say the quota is unavailable, and must still show the real token count.
+    await waitFor(() => {
+      expect(screen.getByText(/quota n\/a · 7\.0k tokens/i)).toBeInTheDocument();
+    });
+
+    // No percentage may be invented for a driver that reported nothing.
+    expect(screen.queryByText(/%\s*quota/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText(/quota n\/a · 7\.0k tokens/i));
+
+    await waitFor(() => {
+      expect(screen.getByRole('dialog', { name: 'Agent Quota and Usage Details' })).toBeInTheDocument();
+      expect(screen.getByText('No provider quota reported')).toBeInTheDocument();
+      // Real, mesh-tracked tokens remain visible.
+      expect(screen.getByText('7,000')).toBeInTheDocument();
+    });
   });
 
   it('allows changing model and effort mid-flight from active session header', async () => {

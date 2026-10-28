@@ -7,6 +7,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Unit tests drive the quota probe's parser and its injected CLI runner directly, which
+         keeps real provider round-trips (and a signed-in `agy`) out of the test suite. -->
+    <InternalsVisibleTo Include="AgentMesh.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Aspire.Npgsql.EntityFrameworkCore.PostgreSQL" Version="13.6.1" />
     <PackageReference Include="Aspire.StackExchange.Redis" Version="13.6.1" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.13" />
