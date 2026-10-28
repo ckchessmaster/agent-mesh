@@ -491,6 +491,50 @@ public class SessionsController(
         }
     }
 
+    public static string SyncConversationMetadata(string? metadataJson, string? structuredPayloadJson)
+    {
+        if (string.IsNullOrWhiteSpace(structuredPayloadJson)) return metadataJson ?? "{}";
+        try
+        {
+            using var payloadDoc = JsonDocument.Parse(structuredPayloadJson);
+            if (payloadDoc.RootElement.TryGetProperty("conversationId", out var convElem) && convElem.ValueKind == JsonValueKind.String)
+            {
+                var convId = convElem.GetString();
+                if (!string.IsNullOrWhiteSpace(convId))
+                {
+                    var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                    if (!string.IsNullOrWhiteSpace(metadataJson))
+                    {
+                        var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(metadataJson);
+                        if (parsed != null)
+                        {
+                            foreach (var (k, v) in parsed) dict[k] = v;
+                        }
+                    }
+                    dict["conversationId"] = convId;
+                    return JsonSerializer.Serialize(dict);
+                }
+            }
+        }
+        catch { }
+        return metadataJson ?? "{}";
+    }
+
+    public static string? ExtractConversationId(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(metadataJson);
+            if (doc.RootElement.TryGetProperty("conversationId", out var prop) && prop.ValueKind == JsonValueKind.String)
+            {
+                return prop.GetString();
+            }
+        }
+        catch { }
+        return null;
+    }
+
     public static List<QueuedPromptDto> ExtractPromptQueue(string? metadataJson)
     {
         if (string.IsNullOrWhiteSpace(metadataJson)) return new();
@@ -1221,6 +1265,7 @@ public class SessionsController(
         if (!string.IsNullOrWhiteSpace(mergedStructuredPayload))
         {
             session.MetadataJson = AccumulateUsageMetadata(session.MetadataJson, mergedStructuredPayload);
+            session.MetadataJson = SyncConversationMetadata(session.MetadataJson, mergedStructuredPayload);
         }
 
         db.SessionMessages.Add(message);
@@ -1274,6 +1319,7 @@ public class SessionsController(
             var promptPayload = new
             {
                 sessionId = id,
+                conversationId = ExtractConversationId(session.MetadataJson),
                 messageId = message.Id,
                 agentId = message.TargetAgentId.Trim().ToLowerInvariant(),
                 driverId = message.TargetAgentId.Trim().ToLowerInvariant(),
@@ -1515,6 +1561,7 @@ public class SessionsController(
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.SessionMessages.Add(auditMsg);
+        session.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
         if (!string.IsNullOrWhiteSpace(session.PersonaId))
@@ -1525,6 +1572,7 @@ public class SessionsController(
         var auditDto = ToMessageDto(auditMsg);
         await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", auditDto);
         await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
+        await hubContext.Clients.All.SendAsync("SessionUpdated", session);
         await hubContext.Clients.Group($"session-{id}").SendAsync("QueueUpdated", new { sessionId = id, queue = emptyQueue });
         await hubContext.Clients.All.SendAsync("QueueUpdated", new { sessionId = id, queue = emptyQueue });
 
@@ -1575,6 +1623,7 @@ public class SessionsController(
             CreatedAt = DateTimeOffset.UtcNow
         };
         db.SessionMessages.Add(auditMsg);
+        session.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
         if (!string.IsNullOrWhiteSpace(session.PersonaId))
@@ -1585,6 +1634,7 @@ public class SessionsController(
         var auditDto = ToMessageDto(auditMsg);
         await hubContext.Clients.Group($"session-{id}").SendAsync("ReceiveMessage", auditDto);
         await hubContext.Clients.All.SendAsync("ReceiveMessage", auditDto);
+        await hubContext.Clients.All.SendAsync("SessionUpdated", session);
 
         await hubContext.Clients.Group($"session-{id}").SendAsync("StopCommand", new
         {

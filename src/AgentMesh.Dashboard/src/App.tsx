@@ -2305,6 +2305,7 @@ export default function App() {
     try {
       await api.stopCommand(selectedSessionId, commandId);
       await fetchSessionEvents(selectedSessionId);
+      await fetchAllData();
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Failed to stop command');
     } finally {

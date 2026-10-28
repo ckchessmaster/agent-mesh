@@ -45,6 +45,9 @@ public class PromptReceivedEvent
     [JsonPropertyName("sessionId")]
     public Guid SessionId { get; set; }
 
+    [JsonPropertyName("conversationId")]
+    public string? ConversationId { get; set; }
+
     [JsonPropertyName("messageId")]
     public Guid MessageId { get; set; }
 

@@ -796,7 +796,8 @@ public class OpenAiAdapter : IAgentAdapter
                         ToolArgsJson = toolArgs
                     });
 
-                    var toolResult = await ExecuteToolLocallyAsync(toolName, toolArgs, cwd, ct);
+                    var toolTimeout = ResolveTimeoutSeconds(preset);
+                    var toolResult = await ExecuteToolLocallyAsync(toolName, toolArgs, cwd, ct, toolTimeout, promptEvent.SessionId, callId);
                     ct.ThrowIfCancellationRequested();
 
                     await onEvent(new TrajectoryEventPayload
@@ -865,7 +866,8 @@ public class OpenAiAdapter : IAgentAdapter
                     ToolArgsJson = fbArgs
                 });
 
-                var toolResult = await ExecuteToolLocallyAsync(fbName, fbArgs ?? "{}", cwd, ct);
+                var toolTimeout = ResolveTimeoutSeconds(preset);
+                var toolResult = await ExecuteToolLocallyAsync(fbName, fbArgs ?? "{}", cwd, ct, toolTimeout, promptEvent.SessionId, "fallback-command");
 
                 await onEvent(new TrajectoryEventPayload
                 {
@@ -1251,14 +1253,28 @@ public class OpenAiAdapter : IAgentAdapter
         return false;
     }
 
-    public static async Task<string> ExecuteToolLocallyAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
+    public static async Task<string> ExecuteToolLocallyAsync(
+        string toolName,
+        string argsJson,
+        string cwd,
+        CancellationToken ct,
+        int? timeoutSeconds = null,
+        Guid? sessionId = null,
+        string? commandId = null)
     {
-        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct);
+        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId);
         var truncated = TruncateToolResult(rawResult);
         return truncated.IndexOf('\0') >= 0 ? truncated.Replace("\0", string.Empty) : truncated;
     }
 
-    private static async Task<string> ExecuteToolLocallyRawAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
+    private static async Task<string> ExecuteToolLocallyRawAsync(
+        string toolName,
+        string argsJson,
+        string cwd,
+        CancellationToken ct,
+        int? timeoutSeconds = null,
+        Guid? sessionId = null,
+        string? commandId = null)
     {
         try
         {
@@ -1284,7 +1300,17 @@ public class OpenAiAdapter : IAgentAdapter
                         Directory.CreateDirectory(effectiveDir);
                     }
 
-                    var (exitCode, stdout, stderr) = await AgentAdapterFactory.RunShellCommandAsync(cmd, effectiveDir, ct);
+                    var timeout = timeoutSeconds.HasValue && timeoutSeconds.Value > 0
+                        ? TimeSpan.FromSeconds(timeoutSeconds.Value)
+                        : TimeSpan.FromSeconds(180);
+
+                    var (exitCode, stdout, stderr) = await AgentAdapterFactory.RunShellCommandAsync(
+                        cmd,
+                        effectiveDir,
+                        ct,
+                        timeout,
+                        sessionId,
+                        commandId);
                     var sb = new StringBuilder();
                     if (!string.IsNullOrWhiteSpace(stdout)) sb.AppendLine(stdout);
                     if (!string.IsNullOrWhiteSpace(stderr)) sb.AppendLine(stderr);

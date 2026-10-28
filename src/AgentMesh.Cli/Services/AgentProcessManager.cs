@@ -150,9 +150,14 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var workspaceType = GetJsonPropString(elem, "workspaceType");
                 var attachments = ExtractJsonAttachments(elem);
 
+                var convId = GetJsonPropString(elem, "conversationId");
+                var createdStr = GetJsonPropString(elem, "createdAt");
+                var createdAt = createdStr != null && DateTimeOffset.TryParse(createdStr, out var cdt) ? cdt : DateTimeOffset.UtcNow;
+
                 await HandlePromptAsync(new PromptReceivedEvent
                 {
                     SessionId = sessionId,
+                    ConversationId = convId,
                     MessageId = messageId,
                     AgentId = _preset.Id ?? string.Empty,
                     DriverId = _preset.Id,
@@ -172,7 +177,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                     GitBranch = gitBranch,
                     WorkspaceType = workspaceType,
                     Attachments = attachments,
-                    CreatedAt = DateTimeOffset.UtcNow
+                    CreatedAt = createdAt
                 }, _cts.Token);
             }
             catch
@@ -399,25 +404,38 @@ public class AgentRunnerInstance : IAsyncDisposable
     private void HandleStopCommand(Guid? parsedSid, string? cmdId, string? targetAgent)
     {
         var targetSid = parsedSid ?? State.ActiveSessionId;
-        if (targetSid.HasValue)
-        {
-            _stoppedSessions[targetSid.Value] = DateTimeOffset.UtcNow;
-        }
+        if (!targetSid.HasValue) return;
 
         var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
         var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) ||
-                           string.Equals(targetAgent, _preset.Id, StringComparison.OrdinalIgnoreCase) ||
-                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent, _preset.PersonaId, StringComparison.OrdinalIgnoreCase));
+                           string.Equals(targetAgent.Trim().TrimStart('@'), _preset.Id?.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase) ||
+                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase));
 
-        if (matchesSession || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
+        if (!matchesSession && !matchesAgent && targetSid != State.ActiveSessionId) return;
+
+        _onLog(_preset.Id ?? string.Empty, $"🛑 StopCommand received for command '{cmdId}' in session {targetSid.Value.ToString()[..8]}.");
+
+        // 1. Try granular command termination first (for local tool executions)
+        if (ActiveCommandRegistry.TryStopCommand(targetSid.Value, cmdId))
         {
-            _onLog(_preset.Id, $"🛑 StopCommand received for command '{cmdId}' in session {targetSid?.ToString()[..8] ?? "unknown"}. Aborting active turn immediately.");
-            try
-            {
-                _activeTurnCts?.Cancel();
-            }
-            catch { }
+            _onLog(_preset.Id ?? string.Empty, $"Subprocess for command '{cmdId}' terminated. Tool will return aborted status to model.");
+            return;
         }
+
+        // 2. Try killing child process of agy (if agy is running a shell command)
+        if (ActiveAgyProcessRegistry.TryKillChildren(targetSid.Value))
+        {
+            _onLog(_preset.Id ?? string.Empty, $"Child processes of agy runner terminated. Model will receive command abort.");
+            return;
+        }
+
+        // 3. Fallback: abort the active turn if granular kill couldn't locate a separate child process
+        _onLog(_preset.Id ?? string.Empty, $"No active child command found to kill granularly. Aborting active turn.");
+        try
+        {
+            _activeTurnCts?.Cancel();
+        }
+        catch { }
     }
 
     private async Task HandlePromptAsync(PromptReceivedEvent ev, CancellationToken ct)
@@ -429,8 +447,15 @@ public class AgentRunnerInstance : IAsyncDisposable
 
         if (_stoppedSessions.TryGetValue(ev.SessionId, out var stoppedTime) && ev.CreatedAt <= stoppedTime)
         {
-            _onLog(_preset.Id, $"🛑 Discarding prompt for stopped session {ev.SessionId.ToString()[..8]} received before stop: \"{Truncate(ev.Prompt, 50)}\"");
-            return;
+            if (State.ActiveSessionId == ev.SessionId)
+            {
+                _onLog(_preset.Id, $"🛑 Discarding prompt for stopped session {ev.SessionId.ToString()[..8]} received before stop: \"{Truncate(ev.Prompt, 50)}\"");
+                return;
+            }
+            else
+            {
+                _stoppedSessions.TryRemove(ev.SessionId, out _);
+            }
         }
 
         try
@@ -592,6 +617,24 @@ public class AgentRunnerInstance : IAsyncDisposable
             State.LastActivityAt = DateTimeOffset.UtcNow;
             _onStateChanged();
             _onLog(_preset.Id, $"🛑 Execution halted for session [{ev.SessionId.ToString()[..8]}].");
+
+            try
+            {
+                await _meshClient.PostTrajectoryEventAsync(
+                    ev.SessionId,
+                    _preset.Id,
+                    _agentToken,
+                    new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = $"🛑 Turn execution halted by operator for agent `@{_preset.Id}`."
+                    },
+                    CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _onLog(_preset.Id, $"Could not emit halt trajectory event: {ex.Message}");
+            }
         }
         catch (Exception ex)
         {
@@ -628,6 +671,7 @@ public class AgentRunnerInstance : IAsyncDisposable
             {
                 _activeTurnCts = null;
             }
+            _stoppedSessions.TryRemove(ev.SessionId, out _);
             _turnLock.Release();
         }
     }

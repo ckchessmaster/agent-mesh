@@ -214,7 +214,7 @@ public class MeshClient
 
                 string? workDir = null, model = null, effort = null, mode = null;
                 string? personaId = null, personaName = null, personaRole = null, personaPrompt = null;
-                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null;
+                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null, conversationId = null;
                 if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
                 {
                     personaId = topPid.GetString();
@@ -241,6 +241,7 @@ public class MeshClient
                         if (mRoot.TryGetProperty("projectId", out var projid)) projectId = projid.GetString();
                         if (mRoot.TryGetProperty("gitBranch", out var gb)) gitBranch = gb.GetString();
                         if (mRoot.TryGetProperty("workspaceType", out var wt)) workspaceType = wt.GetString();
+                        if (mRoot.TryGetProperty("conversationId", out var cid)) conversationId = cid.GetString();
                     }
                     catch { }
                 }
@@ -290,6 +291,7 @@ public class MeshClient
                     pending.Add(new PromptReceivedEvent
                     {
                         SessionId = sessionId,
+                        ConversationId = conversationId,
                         MessageId = msgId,
                         AgentId = agentId,
                         DriverId = agentId,
@@ -342,7 +344,7 @@ public class MeshClient
 
                 string? workDir = null, model = null, effort = null, mode = null;
                 string? pId = personaId, personaName = null, personaRole = null, personaPrompt = null;
-                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null;
+                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null, conversationId = null;
                 string? driverId = sElem.TryGetProperty("driverId", out var didProp) ? didProp.GetString() : null;
 
                 if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
@@ -371,6 +373,7 @@ public class MeshClient
                         if (mRoot.TryGetProperty("projectId", out var projid)) projectId = projid.GetString();
                         if (mRoot.TryGetProperty("gitBranch", out var gb)) gitBranch = gb.GetString();
                         if (mRoot.TryGetProperty("workspaceType", out var wt)) workspaceType = wt.GetString();
+                        if (mRoot.TryGetProperty("conversationId", out var cid)) conversationId = cid.GetString();
                     }
                     catch { }
                 }
@@ -420,6 +423,7 @@ public class MeshClient
                     pending.Add(new PromptReceivedEvent
                     {
                         SessionId = sessionId,
+                        ConversationId = conversationId,
                         MessageId = msgId,
                         AgentId = driverId ?? personaId,
                         DriverId = driverId,

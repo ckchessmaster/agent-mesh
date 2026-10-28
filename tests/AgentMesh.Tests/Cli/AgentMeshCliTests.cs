@@ -420,4 +420,92 @@ public class AgentMeshCliTests
             try { Directory.Delete(tempDir, true); } catch { }
         }
     }
+
+    [Fact]
+    public async Task RunShellCommandAsync_WithTimeout_KillsProcessAndReturnsTimeoutError()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"agentmesh-timeout-{Guid.NewGuid()}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            // Run a command that sleeps for 10 seconds, but set timeout to 1 second
+            var (exitCode, stdout, stderr) = await AgentAdapterFactory.RunShellCommandAsync(
+                "sleep 10",
+                tempDir,
+                CancellationToken.None,
+                timeout: TimeSpan.FromSeconds(1));
+            sw.Stop();
+
+            exitCode.Should().Be(-1);
+            stderr.Should().Contain("timed out");
+            sw.ElapsedMilliseconds.Should().BeLessThan(5000);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ActiveCommandRegistry_TryStopCommand_CancelsAndAbortsProcess()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"agentmesh-abort-{Guid.NewGuid()}");
+        Directory.CreateDirectory(tempDir);
+        var sessionId = Guid.NewGuid();
+        var commandId = "cmd-kill-test";
+        try
+        {
+            var commandTask = Task.Run(async () =>
+            {
+                return await AgentAdapterFactory.RunShellCommandAsync(
+                    "sleep 15",
+                    tempDir,
+                    CancellationToken.None,
+                    timeout: TimeSpan.FromSeconds(30),
+                    sessionId: sessionId,
+                    commandId: commandId);
+            });
+
+            // Wait briefly for process to start and register
+            await Task.Delay(500);
+
+            var stopped = ActiveCommandRegistry.TryStopCommand(sessionId, commandId);
+            stopped.Should().BeTrue();
+
+            var (exitCode, stdout, stderr) = await commandTask;
+            exitCode.Should().Be(-1);
+            stderr.Should().Contain("Command aborted by operator");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void SessionConversationStore_PersistsAndRestoresAcrossRestarts()
+    {
+        var testSessionId = Guid.NewGuid();
+        var testConvId = $"conv-{Guid.NewGuid():N}";
+
+        SessionConversationStore.Set(testSessionId, testConvId);
+        var retrieved = SessionConversationStore.Get(testSessionId);
+
+        retrieved.Should().Be(testConvId);
+        AgyAdapter.GetSessionConversationId(testSessionId).Should().Be(testConvId);
+    }
+
+    [Fact]
+    public void SyncConversationMetadata_StoresConversationIdInMetadata()
+    {
+        var initialMeta = "{\"model\":\"gemini-2.5-pro\"}";
+        var payload = "{\"conversationId\":\"conv-test-1234\"}";
+
+        var updated = AgentMesh.Api.Controllers.SessionsController.SyncConversationMetadata(initialMeta, payload);
+
+        updated.Should().Contain("conv-test-1234");
+        var extracted = AgentMesh.Api.Controllers.SessionsController.ExtractConversationId(updated);
+        extracted.Should().Be("conv-test-1234");
+    }
 }

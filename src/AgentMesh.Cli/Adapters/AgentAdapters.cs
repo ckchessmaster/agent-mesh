@@ -215,7 +215,10 @@ public static class AgentAdapterFactory
     public static async Task<(int ExitCode, string StdOut, string StdErr)> RunShellCommandAsync(
         string command,
         string workingDirectory,
-        CancellationToken ct)
+        CancellationToken ct,
+        TimeSpan? timeout = null,
+        Guid? sessionId = null,
+        string? commandId = null)
     {
         var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         var psi = new ProcessStartInfo
@@ -240,25 +243,55 @@ public static class AgentAdapterFactory
         }
 
         using var proc = new Process { StartInfo = psi };
-        using var reg = ct.Register(() => KillProcessTree(proc));
+        using var cmdCts = new CancellationTokenSource();
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, cmdCts.Token);
+        var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(180);
+
+        IDisposable? regDisposable = null;
+        if (sessionId.HasValue)
+        {
+            regDisposable = ActiveCommandRegistry.Register(sessionId.Value, commandId, proc, cmdCts);
+        }
+
+        using var reg = linkedCts.Token.Register(() => KillProcessTree(proc));
         proc.Start();
 
         try
         {
-            var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
-            var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
+            var stdOutTask = proc.StandardOutput.ReadToEndAsync(linkedCts.Token);
+            var stdErrTask = proc.StandardError.ReadToEndAsync(linkedCts.Token);
 
-            await proc.WaitForExitAsync(ct);
+            var waitTask = proc.WaitForExitAsync(linkedCts.Token);
+            var timeoutTask = Task.Delay(effectiveTimeout, CancellationToken.None);
+
+            var finished = await Task.WhenAny(waitTask, timeoutTask);
+            linkedCts.Token.ThrowIfCancellationRequested();
+
+            if (finished == timeoutTask && !proc.HasExited)
+            {
+                KillProcessTree(proc);
+                return (-1, string.Empty, $"Error: Command execution timed out after {effectiveTimeout.TotalSeconds:F0}s.");
+            }
+
+            await waitTask;
             var stdOut = await stdOutTask;
             var stdErr = await stdErrTask;
 
-            ct.ThrowIfCancellationRequested();
+            linkedCts.Token.ThrowIfCancellationRequested();
             return (proc.ExitCode, stdOut.Trim(), stdErr.Trim());
         }
         catch (OperationCanceledException)
         {
             KillProcessTree(proc);
+            if (cmdCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                return (-1, string.Empty, "🛑 Command aborted by operator.");
+            }
             throw;
+        }
+        finally
+        {
+            regDisposable?.Dispose();
         }
     }
 
@@ -426,13 +459,190 @@ public static class AgentAdapterFactory
     }
 }
 
+public record CommandExecutionHandle(
+    Guid SessionId,
+    string? CommandId,
+    Process Process,
+    CancellationTokenSource Cts,
+    DateTimeOffset StartedAt);
+
+public static class ActiveCommandRegistry
+{
+    private static readonly ConcurrentDictionary<string, CommandExecutionHandle> ActiveCommands = new();
+
+    public static IDisposable Register(Guid sessionId, string? commandId, Process proc, CancellationTokenSource cts)
+    {
+        var handle = new CommandExecutionHandle(sessionId, commandId, proc, cts, DateTimeOffset.UtcNow);
+        var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
+        ActiveCommands[key] = handle;
+        ActiveCommands[$"{sessionId}:current"] = handle;
+
+        return new RegistrationDisposable(() =>
+        {
+            ActiveCommands.TryRemove(key, out _);
+            ActiveCommands.TryRemove($"{sessionId}:current", out _);
+        });
+    }
+
+    public static bool TryStopCommand(Guid sessionId, string? commandId = null)
+    {
+        CommandExecutionHandle? handle = null;
+        if (!string.IsNullOrWhiteSpace(commandId) && ActiveCommands.TryGetValue($"{sessionId}:{commandId}", out handle))
+        {
+        }
+        else if (ActiveCommands.TryGetValue($"{sessionId}:current", out handle))
+        {
+        }
+
+        if (handle != null)
+        {
+            try
+            {
+                handle.Cts?.Cancel();
+            }
+            catch { }
+
+            if (handle.Process != null)
+            {
+                AgentAdapterFactory.KillProcessTree(handle.Process);
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    private sealed class RegistrationDisposable(Action onDispose) : IDisposable
+    {
+        private Action? _onDispose = onDispose;
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _onDispose, null)?.Invoke();
+        }
+    }
+}
+
+public static class ActiveAgyProcessRegistry
+{
+    private static readonly ConcurrentDictionary<Guid, Process> Processes = new();
+
+    public static IDisposable Register(Guid sessionId, Process proc)
+    {
+        Processes[sessionId] = proc;
+        return new RegistrationDisposable(() => Processes.TryRemove(sessionId, out _));
+    }
+
+    public static bool TryKillChildren(Guid sessionId)
+    {
+        if (Processes.TryGetValue(sessionId, out var proc) && !proc.HasExited)
+        {
+            var pid = 0;
+            try { pid = proc.Id; } catch { }
+            if (pid > 0 && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                try
+                {
+                    using var pkill = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "pkill",
+                        ArgumentList = { "-TERM", "-P", pid.ToString() },
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    });
+                    pkill?.WaitForExit(500);
+                    return true;
+                }
+                catch { }
+            }
+        }
+        return false;
+    }
+
+    private sealed class RegistrationDisposable(Action onDispose) : IDisposable
+    {
+        private Action? _onDispose = onDispose;
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _onDispose, null)?.Invoke();
+        }
+    }
+}
+
+public static class SessionConversationStore
+{
+    private static readonly ConcurrentDictionary<Guid, string> Cache = new();
+    private static readonly string CacheFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".agentmesh",
+        "session_conversations.json");
+    private static readonly object FileLock = new();
+
+    static SessionConversationStore()
+    {
+        LoadFromDisk();
+    }
+
+    private static void LoadFromDisk()
+    {
+        try
+        {
+            if (File.Exists(CacheFilePath))
+            {
+                var json = File.ReadAllText(CacheFilePath);
+                var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+                if (dict != null)
+                {
+                    foreach (var (k, v) in dict)
+                    {
+                        if (Guid.TryParse(k, out var sid) && !string.IsNullOrWhiteSpace(v))
+                        {
+                            Cache[sid] = v;
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private static void SaveToDisk()
+    {
+        try
+        {
+            lock (FileLock)
+            {
+                var dir = Path.GetDirectoryName(CacheFilePath);
+                if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                var dict = Cache.ToDictionary(kvp => kvp.Key.ToString(), kvp => kvp.Value);
+                File.WriteAllText(CacheFilePath, JsonSerializer.Serialize(dict));
+            }
+        }
+        catch { }
+    }
+
+    public static string? Get(Guid sessionId)
+    {
+        return Cache.TryGetValue(sessionId, out var convId) ? convId : null;
+    }
+
+    public static void Set(Guid sessionId, string convId)
+    {
+        if (string.IsNullOrWhiteSpace(convId)) return;
+        Cache[sessionId] = convId;
+        SaveToDisk();
+    }
+}
+
 public class AgyAdapter : IAgentAdapter
 {
     private static readonly ConcurrentDictionary<Guid, string> SessionConversations = new();
 
     public static string? GetSessionConversationId(Guid sessionId)
     {
-        return SessionConversations.TryGetValue(sessionId, out var convId) ? convId : null;
+        return SessionConversationStore.Get(sessionId) ?? (SessionConversations.TryGetValue(sessionId, out var convId) ? convId : null);
     }
 
     private static readonly HashSet<string> SupportedBrainArtifactExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -704,8 +914,11 @@ public class AgyAdapter : IAgentAdapter
         };
 
         string? activeConvId = null;
-        if (SessionConversations.TryGetValue(promptEvent.SessionId, out var existingConvId) &&
-            !string.IsNullOrWhiteSpace(existingConvId))
+        var existingConvId = !string.IsNullOrWhiteSpace(promptEvent.ConversationId)
+            ? promptEvent.ConversationId
+            : GetSessionConversationId(promptEvent.SessionId);
+
+        if (!string.IsNullOrWhiteSpace(existingConvId))
         {
             activeConvId = existingConvId;
             psi.ArgumentList.Add("--conversation");
@@ -796,6 +1009,7 @@ public class AgyAdapter : IAgentAdapter
         var lastTranscriptStep = transcriptFile != null ? GetMaxTranscriptStep(transcriptFile) : -1;
 
         using var proc = new Process { StartInfo = psi };
+        using var agyReg = ActiveAgyProcessRegistry.Register(promptEvent.SessionId, proc);
         proc.Start();
         using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
 
@@ -848,11 +1062,22 @@ public class AgyAdapter : IAgentAdapter
                             {
                                 activeConvId = convId;
                                 SessionConversations[promptEvent.SessionId] = convId;
+                                SessionConversationStore.Set(promptEvent.SessionId, convId);
                                 transcriptFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "antigravity-cli", "brain", convId, ".system_generated", "logs", "transcript.jsonl");
                                 if (lastTranscriptStep < 0)
                                 {
                                     lastTranscriptStep = GetMaxTranscriptStep(transcriptFile);
                                 }
+                                try
+                                {
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "system",
+                                        Content = $"Conversation initialized ({convId[..Math.Min(8, convId.Length)]}...)",
+                                        StructuredPayloadJson = JsonSerializer.Serialize(new { conversationId = convId })
+                                    });
+                                }
+                                catch { }
                             }
                         }
                     }
