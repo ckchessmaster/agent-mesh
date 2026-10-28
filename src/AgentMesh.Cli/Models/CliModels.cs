@@ -1,4 +1,4 @@
-﻿using System.Text.Json.Serialization;
+using System.Text.Json.Serialization;
 using AgentMesh.Core.Models;
 
 namespace AgentMesh.Cli.Models;
