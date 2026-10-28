@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react';
 import {
   GitBranch,
   CheckCircle2,
@@ -419,6 +419,156 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [isScrolledUp, setIsScrolledUp] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // --- Chat transcript "stick to bottom" ---------------------------------------------
+  // The old rule was one effect keyed on `messages` that wrote scrollTop = scrollHeight
+  // unless the operator had scrolled up. It missed the mobile case the bug report is about:
+  // App.tsx keeps this panel inside `<main class="hidden">` while the phone is showing the
+  // master list (App.tsx:3475), so the transcript mounts with `display: none`. A hidden
+  // element reports 0 for every layout metric, so the pin is spent as a silent no-op that
+  // *looks* like it succeeded, and tapping into the job afterwards leaves the operator
+  // staring at the top of history. Nothing re-pins, because `messages` never changed again.
+  //
+  // One function decides, from four distinct reasons to pin:
+  //   * forced — the transcript just mounted, the operator asked, or we could never get a
+  //              measurement for the content currently on screen. Pin unconditionally.
+  //   * owner  — a different job is on screen: the operator navigated here to read the
+  //              newest message, and any "scrolled up" carried over from the previous job
+  //              is stale.
+  //   * new    — this transcript gained messages while the operator was following it.
+  //   * grew   — the DOM got taller without a React render (late image decode, mermaid
+  //              resolving to SVG, markdown hydrating). Only the observers can see that,
+  //              so only they may ask for it.
+  //
+  // A scrollHeight read forces layout, so it happens only when we are about to write
+  // scrollTop or are explicitly checking for growth — never on an ordinary render.
+  const forceChatPinRef = useRef(true);
+  const pinnedChatOwnerRef = useRef<string | null>(null);
+  const pinnedChatContentRef = useRef<string | null>(null);
+  const pinnedChatHeightRef = useRef(-1);
+  const chatObserversCleanupRef = useRef<(() => void) | null>(null);
+  const syncChatScrollRef = useRef<(options: { allowGrowthPin: boolean }) => void>(() => {});
+
+  const chatContentKey = `${messages.length}|${messages[messages.length - 1]?.id ?? ''}`;
+
+  const syncChatScroll = useCallback(
+    ({ allowGrowthPin }: { allowGrowthPin: boolean }) => {
+      const container = messagesContainerRef.current;
+      if (!container) {
+        // Transcript unmounted (operator went back to the master list). Invalidate the
+        // cache so remounting counts as a fresh pin even if the content is identical.
+        pinnedChatHeightRef.current = -1;
+        return;
+      }
+
+      // `display: none` collapses clientHeight to 0. Writing scrollTop there is a no-op,
+      // so bail *without* recording the content as pinned: that leaves the next measurable
+      // pass — the moment the panel is un-hidden — still holding a reason to pin.
+      if (container.clientHeight === 0) {
+        pinnedChatHeightRef.current = -1;
+        return;
+      }
+
+      const following = !userScrolledUpRef.current;
+      // A different job on screen means the newest message is what they came for.
+      const ownerChanged = pinnedChatOwnerRef.current !== job.id;
+      const contentChanged = pinnedChatContentRef.current !== chatContentKey;
+
+      let shouldPin =
+        forceChatPinRef.current || ownerChanged || (following && contentChanged);
+      if (!shouldPin && allowGrowthPin && following) {
+        shouldPin = container.scrollHeight !== pinnedChatHeightRef.current;
+      }
+      if (!shouldPin) return;
+
+      forceChatPinRef.current = false;
+      // Assigning scrollTop (rather than scrollIntoView) keeps the scroll on this
+      // container instead of dragging ancestor scrollables around.
+      container.scrollTop = container.scrollHeight;
+      pinnedChatHeightRef.current = container.scrollHeight;
+      pinnedChatOwnerRef.current = job.id;
+      pinnedChatContentRef.current = chatContentKey;
+
+      if (ownerChanged) {
+        // Opening a different job clears any "scrolled up" inherited from the previous
+        // one, so live turns on this job are followed again.
+        userScrolledUpRef.current = false;
+        setIsScrolledUp(false);
+      }
+    },
+    [job.id, chatContentKey]
+  );
+
+  // Assigned during render: the ref callback below runs synchronously during commit,
+  // before passive effects, and needs the current values immediately.
+  syncChatScrollRef.current = syncChatScroll;
+
+  // Runs before paint on renders that can change what is on screen, so the top of a
+  // newly opened job is never flashed. Keyed on the transcript rather than running every
+  // render: growth without a React render is the observers' job.
+  useLayoutEffect(() => {
+    syncChatScroll({ allowGrowthPin: false });
+  }, [syncChatScroll]);
+
+  // Container ref callback: mounting is itself a reason to pin, and it is the only place
+  // that learns when the observed node comes and goes.
+  const handleChatContainerRef = useCallback((node: HTMLDivElement | null) => {
+    messagesContainerRef.current = node;
+    chatObserversCleanupRef.current?.();
+    chatObserversCleanupRef.current = null;
+    if (!node) {
+      pinnedChatHeightRef.current = -1;
+      return;
+    }
+
+    forceChatPinRef.current = true;
+    syncChatScrollRef.current({ allowGrowthPin: false });
+
+    const cleanup: Array<() => void> = [];
+
+    // Un-hiding the mobile master-list -> detail transition gives this node a box for the
+    // first time; the on-screen keyboard also changes clientHeight without any React
+    // render. Both are invisible to effects and to `scroll`, so observe the box itself.
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() =>
+        syncChatScrollRef.current({ allowGrowthPin: true })
+      );
+      observer.observe(node);
+      cleanup.push(() => observer.disconnect());
+    }
+
+    // Content can grow without a React render: streamed DOM, lazily decoded images,
+    // async mermaid SVG injection. Re-pin while the operator is still following.
+    if (typeof MutationObserver !== 'undefined') {
+      const observer = new MutationObserver(() =>
+        syncChatScrollRef.current({ allowGrowthPin: true })
+      );
+      observer.observe(node, { childList: true, subtree: true });
+      cleanup.push(() => observer.disconnect());
+    }
+
+    // An <img> changing intrinsic size on decode does not touch the DOM tree.
+    const handleMediaLoad = (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target && target.tagName === 'IMG') {
+        syncChatScrollRef.current({ allowGrowthPin: true });
+      }
+    };
+    node.addEventListener('load', handleMediaLoad, true);
+    cleanup.push(() => node.removeEventListener('load', handleMediaLoad, true));
+
+    chatObserversCleanupRef.current = () => {
+      cleanup.forEach((fn) => fn());
+      chatObserversCleanupRef.current = null;
+    };
+  }, []);
+
+  // A viewport resize moves the bottom without firing a scroll event on the container.
+  useEffect(() => {
+    const handleWindowResize = () => syncChatScrollRef.current({ allowGrowthPin: true });
+    window.addEventListener('resize', handleWindowResize);
+    return () => window.removeEventListener('resize', handleWindowResize);
+  }, []);
+
   // Auto-scroll management: track user manual scrolling vs automatic tracking
   const handleMessagesScroll = () => {
     if (!messagesContainerRef.current) return;
@@ -436,19 +586,32 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const scrollToBottom = (instant = false) => {
     userScrolledUpRef.current = false;
     setIsScrolledUp(false);
-    if (messagesContainerRef.current) {
-      if (instant) {
-        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
-      } else if (typeof messagesContainerRef.current.scrollTo === 'function') {
-        messagesContainerRef.current.scrollTo({
-          top: messagesContainerRef.current.scrollHeight,
-          behavior: 'smooth'
-        });
-      } else {
-        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+
+    const container = messagesContainerRef.current;
+    if (!container) {
+      forceChatPinRef.current = true;
+      syncChatScrollRef.current({ allowGrowthPin: false });
+      if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
+        messagesEndRef.current.scrollIntoView({ behavior: instant ? 'auto' : 'smooth' });
       }
-    } else if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
-      messagesEndRef.current.scrollIntoView({ behavior: instant ? 'auto' : 'smooth' });
+      return;
+    }
+
+    // A hidden panel has no box to scroll, so let the shared pin logic own the write and
+    // skip the animation: there is nothing to animate until the panel is un-hidden.
+    if (container.clientHeight === 0 || instant) {
+      forceChatPinRef.current = true;
+      syncChatScrollRef.current({ allowGrowthPin: false });
+      return;
+    }
+
+    // Smooth is an animation toward the current bottom, so the target is captured before
+    // the pin runs. The pin lands the container exactly there, then the animation plays.
+    const target = container.scrollHeight;
+    forceChatPinRef.current = true;
+    syncChatScrollRef.current({ allowGrowthPin: false });
+    if (typeof container.scrollTo === 'function') {
+      container.scrollTo({ top: target, behavior: 'smooth' });
     }
   };
 
@@ -524,16 +687,12 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     return uniqueTasks;
   }, [uniqueTasks, taskFilter]);
 
-  // Keep pinned to bottom when messages arrive, unless user has deliberately scrolled up
-  useEffect(() => {
-    if (userScrolledUpRef.current) return;
-    if (messagesContainerRef.current) {
-      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
-      setIsScrolledUp(false);
-    } else if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
-      messagesEndRef.current.scrollIntoView({ behavior: 'auto' });
-    }
-  }, [messages, activeTurnInfo]);
+  // A turn starting or stopping adds a live status block to the transcript without
+  // changing the message list, so it is treated as growth rather than new content.
+  // Keyed on activeTurnInfo (a memo) instead of running every render.
+  useLayoutEffect(() => {
+    syncChatScroll({ allowGrowthPin: true });
+  }, [syncChatScroll, activeTurnInfo]);
 
   // Team members list: priority given to project's assigned personas, fallback to all personas
   const teamMembers: MentionableMember[] = useMemo(() => {
@@ -1724,7 +1883,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         <div className="flex-1 flex flex-col min-h-0 relative">
           {/* Live Chat Message Feed */}
           <div
-            ref={messagesContainerRef}
+            ref={handleChatContainerRef}
             onScroll={handleMessagesScroll}
             data-testid="job-messages-container"
             className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-3 sm:space-y-4 relative"
