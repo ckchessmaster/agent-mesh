@@ -680,13 +680,29 @@ public class OpenAiAdapterTests
     [Fact]
     public async Task ExecuteToolLocallyAsync_RethrowsOperationCanceledException()
     {
-        using var cts = new CancellationTokenSource();
-        cts.Cancel();
+        // Was hardcoded to "/workspace", which only exists inside a persona
+        // container running as root. On a CI runner (non-root, repo checked out
+        // under /home/runner) that path neither exists nor can be created, so
+        // the tool's Directory.CreateDirectory threw UnauthorizedAccessException
+        // and the generic catch turned it into a "Tool execution error" *string*
+        // instead of propagating cancellation. The test passed locally and failed
+        // in CI. A temp dir keeps it hermetic.
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
 
-        var args = JsonSerializer.Serialize(new { command = "sleep 10" });
-        var act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, "/workspace", cts.Token);
+            var args = JsonSerializer.Serialize(new { command = "sleep 10" });
+            var act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, tempDir, cts.Token);
 
-        await act.Should().ThrowAsync<OperationCanceledException>();
+            await act.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
     }
 
     [Fact]
