@@ -385,6 +385,7 @@ export default function App() {
     sizeBytes?: number;
   } | null>(null);
   const chatFileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatComposerRef = useRef<HTMLTextAreaElement | null>(null);
   const newSessionFileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Auto-scroll toggle state (persisted in localStorage, default ON)
@@ -2155,7 +2156,24 @@ export default function App() {
     }
   };
 
-  const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  // The composer is a <textarea> so Shift+Enter can insert a real newline; an
+  // <input type=text> silently strips "\n", which is why multi-line drafting was
+  // impossible here. It therefore has no implicit form submission to lean on, so
+  // Enter must send explicitly (see handlePromptKeyDown) and grow with the draft.
+  useLayoutEffect(() => {
+    const el = chatComposerRef.current;
+    if (!el) return;
+    // Guard the zero measurement: this panel lives inside a `display:none`
+    // container while the mobile master list is showing, and a hidden element
+    // reports scrollHeight 0. Writing that through would collapse the composer
+    // to 0px permanently, because nothing re-runs the effect when it un-hides.
+    el.style.height = 'auto';
+    if (el.scrollHeight > 0) {
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    }
+  }, [promptInput, selectedSessionId]);
+
+  const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (slashPaletteOpen) {
       const cleanQuery = (promptInput.startsWith('/') || promptInput.startsWith('\\'))
         ? promptInput.slice(1).trim().toLowerCase()
@@ -2194,6 +2212,21 @@ export default function App() {
         }
       }
     }
+
+    // Plain Enter sends; Shift+Enter falls through to the textarea's native
+    // newline insertion. Mirrors the project-chat composer (JobCockpit:957).
+    // Required now that the composer is a <textarea>: unlike the old
+    // <input>, it has no implicit form submission, so without this branch
+    // Enter would only ever insert a newline and the composer could not send.
+    //
+    // The composition check restores behaviour implicit form submission gave
+    // us for free: browsers do not submit a form while an IME composition is
+    // open, so Enter-to-accept a CJK candidate never sent a half-finished
+    // prompt. keyCode 229 is how Firefox reports the same state.
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+      e.preventDefault();
+      void handleSendPrompt();
+    }
   };
 
   const readyStagedAttachments = useMemo(
@@ -2203,8 +2236,8 @@ export default function App() {
 
   const canSendPrompt = Boolean(promptInput.trim() || readyStagedAttachments.length > 0);
 
-  const handleSendPrompt = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSendPrompt = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     if (!selectedSessionId || !canSendPrompt) return;
 
     const text = promptInput.trim();
@@ -5161,12 +5194,13 @@ export default function App() {
                       onClose={() => setSlashPaletteOpen(false)}
                     />
 
-                    <input
-                      type="text"
+                    <textarea
+                      ref={chatComposerRef}
+                      rows={1}
                       placeholder={
                         isSessionThinking
-                          ? `Add instruction to queue for ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
-                          : `Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands)...`
+                          ? `Add instruction to queue for ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands) · Shift+Enter adds a new line...`
+                          : `Send instruction to ${selectedAgent?.name || selectedSession.creatorAgentId || 'agent'} (or type / for commands) · Shift+Enter adds a new line...`
                       }
                       value={promptInput}
                       onChange={(e) => handlePromptChange(e.target.value)}
@@ -5177,7 +5211,7 @@ export default function App() {
                         }
                       }}
                       onKeyDown={handlePromptKeyDown}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 resize-none overflow-y-auto max-h-40 leading-relaxed"
                     />
                   </div>
 
