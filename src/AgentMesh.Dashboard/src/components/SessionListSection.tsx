@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronUp, MessageSquare, RefreshCw, Trash2 } from 'lucide-react';
 import { api } from '../services/api';
 import type { AgentSession } from '../types';
@@ -71,21 +71,34 @@ export function SessionListSection({
 
   const baseSorted = sortSessionsByRecency(sessions);
 
-  // Guards against a slow response landing after the operator already collapsed the card (or the
-  // owner changed underneath us), which would otherwise populate a list nobody is looking at.
-  const requestIdRef = useRef(0);
-  useEffect(() => {
-    requestIdRef.current += 1;
-    return () => {
-      requestIdRef.current += 1;
-    };
-  }, [ownerKind, ownerId]);
-
   // Auto-collapse when the owner's row set changes (a turn was created, a session deleted): the
   // cached page is then provably incomplete, and the operator should land back on "most recent N"
   // rather than a stale expansion. Keyed on ids, NOT on order: `updatedAt` ticks every few seconds
   // while a job runs, so an order-based signature would collapse the card mid-read.
   const signature = rowSignature(baseSorted);
+
+  // Guards against a slow response landing after the operator already collapsed the card (or the
+  // owner changed underneath us), which would otherwise populate a list nobody is looking at.
+  //
+  // Keyed on `signature` as well as the owner, because a row-set change collapses the card through
+  // the render-phase branch below and that path used to leave a request in flight. `total` prefers
+  // `expandedTotal` over `serverTotal`, so an abandoned page counted before a mass delete kept
+  // advertising the old history: "Show all (35)" over a persona that now has 6 sessions. That is the
+  // regression pinned by SessionListAutoCollapse.test.tsx.
+  //
+  // A layout effect, deliberately not a render-phase write: refs must not be written during render
+  // (oxlint's react(refs) rule flags it), and the write would be lost if React discarded a
+  // concurrent render, invalidating a live request without collapsing anything and leaving the card
+  // spinning. Commit-time is also what keeps the ordering right against a promise continuation in a
+  // real browser, where a resolved microtask can run before a scheduled passive effect. Note that
+  // the test suite cannot tell those two apart: RTL's act() flushes passive effects synchronously,
+  // so the layout choice is verified by reasoning and by the lint rule, not by a failing test.
+  // No unmount bump: after unmount there is no card left to update.
+  const requestIdRef = useRef(0);
+  useLayoutEffect(() => {
+    requestIdRef.current += 1;
+  }, [ownerKind, ownerId, signature]);
+
   const [prevSignature, setPrevSignature] = useState(signature);
   if (prevSignature !== signature) {
     setPrevSignature(signature);
