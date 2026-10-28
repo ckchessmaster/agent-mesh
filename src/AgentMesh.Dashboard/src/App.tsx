@@ -3273,7 +3273,7 @@ export default function App() {
                                 </span>
                               </div>
                               <div className="text-[11px] font-mono text-slate-400 truncate">
-                                @{agent.id} · {agent.role || 'Driver'}
+                                @{agent.id}
                               </div>
                               {driverPersonas.length > 0 && (
                                 <div className="flex flex-wrap items-center gap-1 mt-1.5">

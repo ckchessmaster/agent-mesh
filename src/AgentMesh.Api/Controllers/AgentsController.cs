@@ -50,7 +50,7 @@ public class AgentsController(
         {
             Id = normalizedId,
             Name = req.Name.Trim(),
-            Role = req.Role ?? "Autonomous Agent",
+            Role = string.IsNullOrWhiteSpace(req.Role) ? AgentKind.DriverRole : req.Role.Trim(),
             Status = req.Status ?? (AgentMeshHub.IsAgentConnected(normalizedId) ? "online" : "offline"),
             RuntimeType = req.RuntimeType,
             TrustTier = req.TrustTier,
@@ -148,12 +148,22 @@ public class AgentsController(
 
     [HttpGet]
     [AllowAnonymous]
-    public async Task<IActionResult> GetAgents()
+    public async Task<IActionResult> GetAgents([FromQuery] bool includeRunnerIdentities = false)
     {
         var agents = await db.Agents
             .AsNoTracking()
             .OrderBy(a => a.Name)
             .ToListAsync();
+
+        var personaOwners = await GetPersonaDriverMapAsync();
+
+        // Persona runner identities are rows that exist only so a persona's bearer token can be
+        // authenticated (see AgentKind). Listing them here is what made every driver appear twice
+        // on the drivers tab, wearing the persona's name and role.
+        // They stay reachable by id via GET /api/agents/{id} and by token, so auth is unaffected.
+        var drivers = includeRunnerIdentities
+            ? agents
+            : agents.Where(a => !AgentKind.IsPersonaRunnerIdentity(a, personaOwners)).ToList();
 
         var sessionCounts = await db.AgentSessions
             .AsNoTracking()
@@ -174,7 +184,7 @@ public class AgentsController(
                 g => g.Select(p => new DriverPersonaSummaryDto(p.Id, p.Name, p.Role, p.DefaultModel)).ToList(),
                 StringComparer.OrdinalIgnoreCase);
 
-        var dtos = agents
+        var dtos = drivers
             .Select(a => ToDto(
                 a,
                 sessionCounts.GetValueOrDefault(a.Id, 0),
@@ -182,6 +192,26 @@ public class AgentsController(
             .ToList();
 
         return Ok(dtos);
+    }
+
+    /// <summary>Persona id -> owning driver id. Used to recognise legacy runner-identity rows.</summary>
+    private async Task<Dictionary<string, string>> GetPersonaDriverMapAsync()
+    {
+        var rows = await db.Personas
+            .AsNoTracking()
+            .Select(p => new { p.Id, p.DriverId })
+            .ToListAsync();
+
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in rows)
+        {
+            if (!string.IsNullOrWhiteSpace(row.Id) && !string.IsNullOrWhiteSpace(row.DriverId))
+            {
+                map[row.Id.Trim().ToLowerInvariant()] = row.DriverId.Trim().ToLowerInvariant();
+            }
+        }
+
+        return map;
     }
 
     [HttpGet("{id}")]

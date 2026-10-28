@@ -192,6 +192,15 @@ public class AgentRuntimeState
     public string Name { get; set; } = string.Empty;
     public string Role { get; set; } = string.Empty;
     public string AdapterType { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Set when this runner hosts a persona. The runner still registers against its *driver*
+    /// (see <see cref="Id"/>); this is display metadata so the TUI can label the runner with the
+    /// character it is actually running instead of showing a second copy of the driver.
+    /// </summary>
+    public string? PersonaId { get; set; }
+    public string? PersonaName { get; set; }
+
     public RunnerConnectionState State { get; set; } = RunnerConnectionState.Offline;
     public Guid? ActiveSessionId { get; set; }
     public int PromptsHandled { get; set; }

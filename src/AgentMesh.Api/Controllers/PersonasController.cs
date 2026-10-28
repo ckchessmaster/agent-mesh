@@ -734,19 +734,22 @@ public class PersonasController(
         var existing = await db.Agents.FirstOrDefaultAsync(a => a.Id == driverId);
         if (existing != null) return existing;
 
-        var (name, role) = driverId switch
+        // A driver is a runtime, not a character: it must not inherit the persona's role, and the
+        // drivers card already renders `@{id}` next to the name, so a `$"Driver {driverId}"` name
+        // reads as "Driver agy" under "@agy".
+        var name = driverId switch
         {
-            "agy" => ("Antigravity CLI", "Autonomous Codebase Driver"),
-            "copilot" => ("GitHub Copilot CLI", "Shell & Git Driver"),
-            "claude" => ("Claude Code CLI", "Anthropic Terminal Driver"),
-            _ => ($"Driver {driverId}", "Autonomous Driver")
+            "agy" => "Antigravity CLI",
+            "copilot" => "GitHub Copilot CLI",
+            "claude" => "Claude Code CLI",
+            _ => driverId
         };
 
         var driver = new Agent
         {
             Id = driverId,
             Name = name,
-            Role = role,
+            Role = AgentKind.DriverRole,
             Status = AgentMeshHub.IsAgentConnected(driverId) ? "online" : "offline",
             RuntimeType = RuntimeType.CliAgy,
             TrustTier = TrustTier.Intern,

@@ -577,6 +577,30 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     });
   });
 
+  it('does not render a persona-style role line on driver cards', async () => {
+    vi.mocked(api.getAgents).mockResolvedValue([
+      {
+        id: 'agy',
+        name: 'Antigravity CLI',
+        role: 'Autonomous Codebase Driver',
+        status: 'online',
+        runtimeType: 'CliAgy',
+        trustTier: 4,
+        createdAt: new Date().toISOString()
+      }
+    ]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Antigravity CLI')).toBeInTheDocument();
+    });
+
+    // The card shows @id only; `role` is a persona concept and used to leak onto drivers.
+    expect(screen.getByText('@agy')).toBeInTheDocument();
+    expect(screen.queryByText(/Autonomous Codebase Driver/)).not.toBeInTheDocument();
+  });
+
   it('allows changing model and effort mid-flight from active session header', async () => {
     const mockAgent: Agent = {
       id: 'agy-core',

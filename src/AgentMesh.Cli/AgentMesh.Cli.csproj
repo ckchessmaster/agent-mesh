@@ -18,4 +18,10 @@
     <ProjectReference Include="..\AgentMesh.Core\AgentMesh.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- DriverIdentity.ResolveName/ResolveRole are pure identity decisions; unit tests pin them
+         without standing up a mesh connection. -->
+    <InternalsVisibleTo Include="AgentMesh.Tests" />
+  </ItemGroup>
+
 </Project>

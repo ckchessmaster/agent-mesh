@@ -1986,7 +1986,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
     }
 
-    private static async Task SyncAgentTokenHashAsync(
+    internal static async Task SyncAgentTokenHashAsync(
         AgentMeshDbContext db,
         string driverId,
         string personaId,
@@ -2000,6 +2000,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         foreach (var id in targetIds)
         {
+            var isRunnerIdentity = !string.Equals(id, driverId, StringComparison.OrdinalIgnoreCase);
             var agent = agents.FirstOrDefault(a => string.Equals(a.Id, id, StringComparison.OrdinalIgnoreCase));
             if (agent != null)
             {
@@ -2008,18 +2009,31 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     agent.ApiKeyHash = hash;
                     agent.UpdatedAt = DateTimeOffset.UtcNow;
                 }
+
+                // Backfill the marker on rows that predate it so the drivers tab can hide them.
+                if (isRunnerIdentity && !AgentKind.HasRunnerMarker(agent.CapabilitiesJson))
+                {
+                    agent.CapabilitiesJson = AgentKind.BuildRunnerIdentityCapabilities(
+                        personaId, driverId, agent.CapabilitiesJson);
+                    agent.UpdatedAt = DateTimeOffset.UtcNow;
+                }
             }
             else
             {
-                var name = (id == personaId ? personaName : null) ?? id;
-                var role = (id == personaId ? personaRole : null) ?? "Autonomous Driver";
+                // The persona row exists purely so its bearer token has something to authenticate
+                // against (ApiKeyAuthenticationHandler matches on agents.api_key_hash). It is NOT a
+                // driver: tagging it keeps it out of the drivers tab, which otherwise showed every
+                // driver twice - once as the driver, once as a persona-named clone.
                 db.Agents.Add(new Agent
                 {
                     Id = id,
-                    Name = name,
-                    Role = role,
+                    Name = isRunnerIdentity ? (personaName ?? id) : id,
+                    Role = isRunnerIdentity ? (personaRole ?? "Persona") : AgentKind.DriverRole,
                     Status = "offline",
                     ApiKeyHash = hash,
+                    CapabilitiesJson = isRunnerIdentity
+                        ? AgentKind.BuildRunnerIdentityCapabilities(personaId, driverId, null)
+                        : "[]",
                     CreatedAt = DateTimeOffset.UtcNow,
                     UpdatedAt = DateTimeOffset.UtcNow
                 });
