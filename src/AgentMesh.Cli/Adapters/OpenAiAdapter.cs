@@ -30,14 +30,79 @@ public class OpenAiAdapter : IAgentAdapter
         HttpClientInstance = DefaultHttpClient;
     }
 
+    public static Func<Guid, string, string, Task>? CommandOutputBroadcaster { get; set; }
+
+    public static string HistoryDirectoryPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".agentmesh",
+        "openai_histories");
+    private static readonly object HistoryDiskLock = new();
+
+    public static void SaveHistoryToDisk(Guid sessionId, List<OpenAiMessage> history)
+    {
+        try
+        {
+            lock (HistoryDiskLock)
+            {
+                if (!Directory.Exists(HistoryDirectoryPath)) Directory.CreateDirectory(HistoryDirectoryPath);
+                var filePath = Path.Combine(HistoryDirectoryPath, $"{sessionId}.json");
+                var json = JsonSerializer.Serialize(history);
+                File.WriteAllText(filePath, json);
+            }
+        }
+        catch { }
+    }
+
+    public static List<OpenAiMessage>? LoadHistoryFromDisk(Guid sessionId)
+    {
+        try
+        {
+            lock (HistoryDiskLock)
+            {
+                var filePath = Path.Combine(HistoryDirectoryPath, $"{sessionId}.json");
+                if (File.Exists(filePath))
+                {
+                    var json = File.ReadAllText(filePath);
+                    return JsonSerializer.Deserialize<List<OpenAiMessage>>(json);
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    public static void DeleteHistoryFromDisk(Guid sessionId)
+    {
+        try
+        {
+            lock (HistoryDiskLock)
+            {
+                var filePath = Path.Combine(HistoryDirectoryPath, $"{sessionId}.json");
+                if (File.Exists(filePath)) File.Delete(filePath);
+            }
+        }
+        catch { }
+    }
+
     public static void ClearSessionHistory(Guid sessionId)
     {
         SessionHistories.TryRemove(sessionId, out _);
+        DeleteHistoryFromDisk(sessionId);
     }
 
     public static List<OpenAiMessage>? GetSessionHistory(Guid sessionId)
     {
-        return SessionHistories.TryGetValue(sessionId, out var history) ? history : null;
+        if (SessionHistories.TryGetValue(sessionId, out var history))
+            return history;
+
+        var loaded = LoadHistoryFromDisk(sessionId);
+        if (loaded != null)
+        {
+            SessionHistories[sessionId] = loaded;
+            return loaded;
+        }
+
+        return null;
     }
 
     public static int ResolveTimeoutSeconds(AgentPresetConfig preset)
@@ -131,6 +196,20 @@ public class OpenAiAdapter : IAgentAdapter
     public static int EstimateMessageTokens(OpenAiMessage message)
     {
         var charCount = (message.Role?.Length ?? 0) + (message.Content?.Length ?? 0);
+        if (message.ContentParts != null && message.ContentParts.Count > 0)
+        {
+            foreach (var part in message.ContentParts)
+            {
+                if (part is OpenAiTextContentPart textPart && !string.IsNullOrEmpty(textPart.Text))
+                {
+                    charCount += textPart.Text.Length;
+                }
+                else
+                {
+                    charCount += 3600; // ~1000 tokens per image input
+                }
+            }
+        }
         if (message.ToolCalls != null)
         {
             foreach (var tc in message.ToolCalls)
@@ -327,11 +406,12 @@ public class OpenAiAdapter : IAgentAdapter
         });
 
         // Initialize or retrieve session history
-        var history = SessionHistories.GetOrAdd(promptEvent.SessionId, _ => new List<OpenAiMessage>());
+        var history = SessionHistories.GetOrAdd(promptEvent.SessionId, sid => LoadHistoryFromDisk(sid) ?? new List<OpenAiMessage>());
         if (history.Count == 0)
         {
             var systemPrompt = BuildSystemPrompt(preset, promptEvent, cwd);
             history.Add(new OpenAiMessage { Role = "system", Content = systemPrompt });
+            SaveHistoryToDisk(promptEvent.SessionId, history);
         }
 
         var attachedBlock = AgentAdapterFactory.FormatAttachedFilesBlock(promptEvent.Attachments);
@@ -339,7 +419,75 @@ public class OpenAiAdapter : IAgentAdapter
             ? promptEvent.Prompt
             : $"{attachedBlock}{promptEvent.Prompt}";
 
-        history.Add(new OpenAiMessage { Role = "user", Content = fullUserPrompt });
+        var imageParts = new List<object>();
+        if (promptEvent.Attachments != null && promptEvent.Attachments.Count > 0)
+        {
+            foreach (var att in promptEvent.Attachments)
+            {
+                var filePath = att.LocalFilePath;
+                if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+                {
+                    var attachDir = Path.Combine(cwd, ".agentmesh", "attachments");
+                    if (Directory.Exists(attachDir))
+                    {
+                        var safeName = Path.GetFileName(att.FileName);
+                        var candidate = Directory.GetFiles(attachDir, $"*{safeName}*").FirstOrDefault();
+                        if (candidate != null && File.Exists(candidate)) filePath = candidate;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(filePath) && File.Exists(filePath))
+                {
+                    var ext = Path.GetExtension(filePath).ToLowerInvariant();
+                    if (ext is ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp")
+                    {
+                        var mime = ext switch
+                        {
+                            ".png" => "image/png",
+                            ".jpg" or ".jpeg" => "image/jpeg",
+                            ".gif" => "image/gif",
+                            ".webp" => "image/webp",
+                            _ => "image/png"
+                        };
+                        try
+                        {
+                            var bytes = File.ReadAllBytes(filePath);
+                            var base64 = Convert.ToBase64String(bytes);
+                            imageParts.Add(new OpenAiImageUrlContentPart
+                            {
+                                Type = "image_url",
+                                ImageUrl = new OpenAiImageUrl
+                                {
+                                    Url = $"data:{mime};base64,{base64}"
+                                }
+                            });
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+
+        if (imageParts.Count > 0)
+        {
+            var contentParts = new List<object>
+            {
+                new OpenAiTextContentPart { Type = "text", Text = fullUserPrompt }
+            };
+            contentParts.AddRange(imageParts);
+
+            history.Add(new OpenAiMessage
+            {
+                Role = "user",
+                Content = fullUserPrompt,
+                ContentParts = contentParts
+            });
+        }
+        else
+        {
+            history.Add(new OpenAiMessage { Role = "user", Content = fullUserPrompt });
+        }
+        SaveHistoryToDisk(promptEvent.SessionId, history);
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
         var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
@@ -715,7 +863,23 @@ public class OpenAiAdapter : IAgentAdapter
                         ToolArgsJson = toolArgs
                     });
 
-                    var toolResult = await ExecuteToolLocallyAsync(toolName, toolArgs, cwd, ct);
+                    var toolTimeout = ResolveTimeoutSeconds(preset);
+                    var toolResult = await ExecuteToolLocallyAsync(
+                        toolName,
+                        toolArgs,
+                        cwd,
+                        ct,
+                        toolTimeout,
+                        promptEvent.SessionId,
+                        callId,
+                        onOutputChunk: async (chunk) =>
+                        {
+                            if (CommandOutputBroadcaster != null)
+                            {
+                                try { await CommandOutputBroadcaster(promptEvent.SessionId, callId, chunk); } catch { }
+                            }
+                        });
+                    ct.ThrowIfCancellationRequested();
 
                     await onEvent(new TrajectoryEventPayload
                     {
@@ -751,6 +915,7 @@ public class OpenAiAdapter : IAgentAdapter
                         Content = output
                     });
                 }
+                SaveHistoryToDisk(promptEvent.SessionId, history);
 
                 // Continue loop for next turn with tool results
                 continue;
@@ -783,7 +948,22 @@ public class OpenAiAdapter : IAgentAdapter
                     ToolArgsJson = fbArgs
                 });
 
-                var toolResult = await ExecuteToolLocallyAsync(fbName, fbArgs ?? "{}", cwd, ct);
+                var toolTimeout = ResolveTimeoutSeconds(preset);
+                var toolResult = await ExecuteToolLocallyAsync(
+                    fbName,
+                    fbArgs ?? "{}",
+                    cwd,
+                    ct,
+                    toolTimeout,
+                    promptEvent.SessionId,
+                    "fallback-command",
+                    onOutputChunk: async (chunk) =>
+                    {
+                        if (CommandOutputBroadcaster != null)
+                        {
+                            try { await CommandOutputBroadcaster(promptEvent.SessionId, "fallback-command", chunk); } catch { }
+                        }
+                    });
 
                 await onEvent(new TrajectoryEventPayload
                 {
@@ -795,6 +975,7 @@ public class OpenAiAdapter : IAgentAdapter
 
                 history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
                 history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
+                SaveHistoryToDisk(promptEvent.SessionId, history);
                 continue;
             }
 
@@ -955,6 +1136,7 @@ public class OpenAiAdapter : IAgentAdapter
             }
 
             history.Add(new OpenAiMessage { Role = "assistant", Content = finalMsg });
+            SaveHistoryToDisk(promptEvent.SessionId, history);
 
             await onEvent(new TrajectoryEventPayload
             {
@@ -999,9 +1181,10 @@ public class OpenAiAdapter : IAgentAdapter
         sb.AppendLine("[Autonomous Tool Usage Guidelines]");
         sb.AppendLine("You have access to autonomous tools to execute shell commands, read files, write files, and edit files in the workspace.");
         sb.AppendLine("- Use `run_command` to inspect the project, run tests, execute builds, and check git status.");
-        sb.AppendLine("- Use `read_file` to inspect code files.");
+        sb.AppendLine("- Use `read_file` to inspect code and text files.");
         sb.AppendLine("- Use `write_file` or `edit_file` to implement solutions.");
         sb.AppendLine("- When you need user clarification or critical architectural decisions, call `ask_question`.");
+        sb.AppendLine("- Vision / Image Handling: Attached image files are provided directly to your multimodal visual input when supported. You can inspect, analyze, and describe them visually. However, binary image files on disk cannot be read as plain text via `read_file`. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands.");
         sb.AppendLine("- Be concise and lead with working code and clear implementation.");
 
         return sb.ToString();
@@ -1168,14 +1351,30 @@ public class OpenAiAdapter : IAgentAdapter
         return false;
     }
 
-    public static async Task<string> ExecuteToolLocallyAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
+    public static async Task<string> ExecuteToolLocallyAsync(
+        string toolName,
+        string argsJson,
+        string cwd,
+        CancellationToken ct,
+        int? timeoutSeconds = null,
+        Guid? sessionId = null,
+        string? commandId = null,
+        Func<string, Task>? onOutputChunk = null)
     {
-        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct);
+        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId, onOutputChunk);
         var truncated = TruncateToolResult(rawResult);
         return truncated.IndexOf('\0') >= 0 ? truncated.Replace("\0", string.Empty) : truncated;
     }
 
-    private static async Task<string> ExecuteToolLocallyRawAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
+    private static async Task<string> ExecuteToolLocallyRawAsync(
+        string toolName,
+        string argsJson,
+        string cwd,
+        CancellationToken ct,
+        int? timeoutSeconds = null,
+        Guid? sessionId = null,
+        string? commandId = null,
+        Func<string, Task>? onOutputChunk = null)
     {
         try
         {
@@ -1201,7 +1400,18 @@ public class OpenAiAdapter : IAgentAdapter
                         Directory.CreateDirectory(effectiveDir);
                     }
 
-                    var (exitCode, stdout, stderr) = await AgentAdapterFactory.RunShellCommandAsync(cmd, effectiveDir, ct);
+                    var timeout = timeoutSeconds.HasValue && timeoutSeconds.Value > 0
+                        ? TimeSpan.FromSeconds(timeoutSeconds.Value)
+                        : TimeSpan.FromSeconds(180);
+
+                    var (exitCode, stdout, stderr) = await AgentAdapterFactory.RunShellCommandAsync(
+                        cmd,
+                        effectiveDir,
+                        ct,
+                        timeout,
+                        sessionId,
+                        commandId,
+                        onOutputChunk);
                     var sb = new StringBuilder();
                     if (!string.IsNullOrWhiteSpace(stdout)) sb.AppendLine(stdout);
                     if (!string.IsNullOrWhiteSpace(stderr)) sb.AppendLine(stderr);
@@ -1224,7 +1434,7 @@ public class OpenAiAdapter : IAgentAdapter
                         var fi = new FileInfo(fullPath);
                         if (ImageExtensions.Contains(ext) && !string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
                         {
-                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text.]";
+                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text. Attached images are already provided directly to your multimodal visual context in the prompt. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands. If you need details about an unattached image, ask the user to attach or describe it.]";
                         }
                         return $"[Binary file: '{path}' ({fi.Length:N0} bytes). This is a binary file and cannot be read as plain text.]";
                     }
@@ -1291,6 +1501,10 @@ public class OpenAiAdapter : IAgentAdapter
                 default:
                     return $"Error: Unknown tool '{toolName}'.";
             }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -1414,6 +1628,9 @@ public class OpenAiMessage
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Content { get; set; }
 
+    [JsonIgnore]
+    public List<object>? ContentParts { get; set; }
+
     [JsonPropertyName("tool_call_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ToolCallId { get; set; }
@@ -1425,7 +1642,14 @@ public class OpenAiMessage
     public object ToSerializableObject()
     {
         var dict = new Dictionary<string, object?> { ["role"] = Role };
-        if (Content != null) dict["content"] = Content;
+        if (ContentParts != null && ContentParts.Count > 0)
+        {
+            dict["content"] = ContentParts;
+        }
+        else if (Content != null)
+        {
+            dict["content"] = Content;
+        }
         if (!string.IsNullOrEmpty(ToolCallId)) dict["tool_call_id"] = ToolCallId;
         if (ToolCalls != null && ToolCalls.Count > 0)
         {
@@ -1442,6 +1666,30 @@ public class OpenAiMessage
         }
         return dict;
     }
+}
+
+public class OpenAiTextContentPart
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "text";
+
+    [JsonPropertyName("text")]
+    public string Text { get; set; } = string.Empty;
+}
+
+public class OpenAiImageUrlContentPart
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "image_url";
+
+    [JsonPropertyName("image_url")]
+    public OpenAiImageUrl ImageUrl { get; set; } = new();
+}
+
+public class OpenAiImageUrl
+{
+    [JsonPropertyName("url")]
+    public string Url { get; set; } = string.Empty;
 }
 
 public class OpenAiToolCall

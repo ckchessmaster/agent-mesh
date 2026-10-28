@@ -1,4 +1,4 @@
-using AgentMesh.Api.Hubs;
+﻿using AgentMesh.Api.Hubs;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
@@ -223,6 +223,26 @@ public class AgentMeshCliTests
         ev.Model.Should().Be("gemini-2.5-pro");
         ev.Effort.Should().Be("max");
         ev.Mode.Should().Be("auto");
+    }
+
+    [Fact]
+    public void StopExecutionEvent_DeserializesPersonaIdAndSessionId()
+    {
+        var json = """
+        {
+            "sessionId": "a0000000-0000-0000-0000-000000000001",
+            "agentId": "spence-ai",
+            "personaId": "rook",
+            "reason": "Operator clicked stop"
+        }
+        """;
+
+        var ev = System.Text.Json.JsonSerializer.Deserialize<StopExecutionEvent>(json);
+        ev.Should().NotBeNull();
+        ev!.SessionId.Should().Be(Guid.Parse("a0000000-0000-0000-0000-000000000001"));
+        ev.AgentId.Should().Be("spence-ai");
+        ev.PersonaId.Should().Be("rook");
+        ev.Reason.Should().Be("Operator clicked stop");
     }
 
     [Fact]
@@ -495,5 +515,87 @@ public class AgentMeshCliTests
         cmd.Should().Contain(".claude");
         cmd.Should().Contain(".config");
         cmd.Should().Contain(".aip");
+    }
+
+    [Fact]
+    public async Task RunShellCommandAsync_WithTimeout_KillsProcessAndReturnsTimeoutError()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"agentmesh-timeout-{Guid.NewGuid()}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            // Run a command that sleeps for 10 seconds, but set timeout to 1 second
+            var (exitCode, stdout, stderr) = await AgentAdapterFactory.RunShellCommandAsync(
+                "sleep 10",
+                tempDir,
+                CancellationToken.None,
+                timeout: TimeSpan.FromSeconds(1));
+            sw.Stop();
+
+            exitCode.Should().Be(-1);
+            stderr.Should().Contain("timed out");
+            sw.ElapsedMilliseconds.Should().BeLessThan(5000);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ActiveCommandRegistry_TryStopCommand_CancelsAndAbortsProcess()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"agentmesh-abort-{Guid.NewGuid()}");
+        Directory.CreateDirectory(tempDir);
+        var sessionId = Guid.NewGuid();
+        var commandId = "cmd-kill-test";
+        try
+        {
+            var commandTask = Task.Run(async () =>
+            {
+                return await AgentAdapterFactory.RunShellCommandAsync(
+                    "sleep 15",
+                    tempDir,
+                    CancellationToken.None,
+                    timeout: TimeSpan.FromSeconds(30),
+                    sessionId: sessionId,
+                    commandId: commandId);
+            });
+
+            // Wait briefly for process to start and register
+            await Task.Delay(500);
+
+            var stopped = ActiveCommandRegistry.TryStopCommand(sessionId, commandId);
+            stopped.Should().BeTrue();
+
+            var (exitCode, stdout, stderr) = await commandTask;
+            exitCode.Should().Be(-1);
+            stderr.Should().Contain("Command aborted by operator");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    // NOTE (reconciliation): the v1.2.15 lineage's `SessionConversationStore_PersistsAndRestoresAcrossRestarts`
+    // was dropped along with the store it tested. Both lineages independently solved "keep the
+    // agy conversation id across a container restart"; main's `AgyAdapter` store is the superset
+    // (dual-path incl. the persisted /workspace volume, atomic temp-file writes, Guid.Empty and
+    // blank-value guards) and is already covered by
+    // `AgyAdapter_PersistsAndRestores_SessionConversationMapping` above.
+
+    [Fact]
+    public void SyncConversationMetadata_StoresConversationIdInMetadata()
+    {
+        var initialMeta = "{\"model\":\"gemini-2.5-pro\"}";
+        var payload = "{\"conversationId\":\"conv-test-1234\"}";
+
+        var updated = AgentMesh.Api.Controllers.SessionsController.SyncConversationMetadata(initialMeta, payload);
+
+        updated.Should().Contain("conv-test-1234");
+        var extracted = AgentMesh.Api.Controllers.SessionsController.ExtractConversationId(updated);
+        extracted.Should().Be("conv-test-1234");
     }
 }
