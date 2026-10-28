@@ -400,4 +400,100 @@ public class AgentMeshCliTests
             try { Directory.Delete(tempDir, true); } catch { }
         }
     }
+
+    [Fact]
+    public void AgyAdapter_PersistsAndRestores_SessionConversationMapping()
+    {
+        var sessionId = Guid.NewGuid();
+        var convId = $"conv-{Guid.NewGuid():N}";
+
+        AgyAdapter.SetSessionConversationId(sessionId, convId);
+
+        // Verification 1: In-memory retrieval works
+        AgyAdapter.GetSessionConversationId(sessionId).Should().Be(convId);
+
+        // Verification 2: Check persistent disk file exists
+        var candidatePaths = new[]
+        {
+            "/workspace/.agentmesh/session_conversations.json",
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "session_conversations.json")
+        };
+
+        var foundFile = candidatePaths.FirstOrDefault(File.Exists);
+        foundFile.Should().NotBeNull("Session conversations mapping file must be persisted to disk.");
+
+        var content = File.ReadAllText(foundFile!);
+        content.Should().Contain(sessionId.ToString());
+        content.Should().Contain(convId);
+
+        // Verification 3: Direct reload simulated across container restart
+        var reloadedId = AgyAdapter.GetSessionConversationId(sessionId);
+        reloadedId.Should().Be(convId);
+    }
+
+    [Fact]
+    public void PromptReceivedEvent_DeserializesConversationId()
+    {
+        var json = """
+        {
+            "sessionId": "a0000000-0000-0000-0000-000000000001",
+            "messageId": "b0000000-0000-0000-0000-000000000002",
+            "agentId": "agy",
+            "prompt": "Continue previous task",
+            "conversationId": "conv-resume-12345"
+        }
+        """;
+
+        var ev = System.Text.Json.JsonSerializer.Deserialize<PromptReceivedEvent>(json);
+        ev.Should().NotBeNull();
+        ev!.ConversationId.Should().Be("conv-resume-12345");
+    }
+
+    [Fact]
+    public void SessionsController_ExtractsSessionConversationId()
+    {
+        var metadataWithCamel = """{"workingDirectory":"/workspace","conversationId":"conv-camel-999"}""";
+        var metadataWithSnake = """{"workingDirectory":"/workspace","conversation_id":"conv-snake-888"}""";
+        var metadataWithout = """{"workingDirectory":"/workspace"}""";
+
+        AgentMesh.Api.Controllers.SessionsController.ExtractSessionConversationId(metadataWithCamel).Should().Be("conv-camel-999");
+        AgentMesh.Api.Controllers.SessionsController.ExtractSessionConversationId(metadataWithSnake).Should().Be("conv-snake-888");
+        AgentMesh.Api.Controllers.SessionsController.ExtractSessionConversationId(metadataWithout).Should().BeNull();
+        AgentMesh.Api.Controllers.SessionsController.ExtractSessionConversationId(null).Should().BeNull();
+    }
+
+    [Fact]
+    public void SessionsController_AccumulateUsageMetadata_PreservesConversationId()
+    {
+        var initialMeta = """{"workingDirectory":"/workspace"}""";
+        var payloadWithConvAndUsage = """
+        {
+            "conversationId": "conv-live-turn-1",
+            "usage": {
+                "inputTokens": 100,
+                "outputTokens": 50,
+                "thinkingTokens": 20,
+                "totalTokens": 170,
+                "durationSeconds": 1.5
+            }
+        }
+        """;
+
+        var merged = AgentMesh.Api.Controllers.SessionsController.AccumulateUsageMetadata(initialMeta, payloadWithConvAndUsage);
+        merged.Should().Contain("\"conversationId\":\"conv-live-turn-1\"");
+        merged.Should().Contain("\"totalTokens\":170");
+
+        var extractedConv = AgentMesh.Api.Controllers.SessionsController.ExtractSessionConversationId(merged);
+        extractedConv.Should().Be("conv-live-turn-1");
+    }
+
+    [Fact]
+    public void PersonaContainerExtensions_SyncPersonaStateCommand_IncludesGeminiAndClaude()
+    {
+        var cmd = AgentMesh.Infrastructure.Containers.PersonaContainerExtensions.SyncPersonaStateCommand;
+        cmd.Should().Contain(".gemini");
+        cmd.Should().Contain(".claude");
+        cmd.Should().Contain(".config");
+        cmd.Should().Contain(".aip");
+    }
 }

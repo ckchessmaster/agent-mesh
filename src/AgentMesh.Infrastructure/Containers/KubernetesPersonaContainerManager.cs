@@ -557,7 +557,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         // Persist current state from container to workspace volume before recreating pod
         try
         {
-            await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+            await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
         }
         catch { }
 
@@ -986,7 +986,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             // Persist current state
             try
             {
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+                await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
             }
             catch { }
 
@@ -1495,7 +1495,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     }
 
                     await Task.Delay(1000);
-                    await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", CancellationToken.None);
+                    await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, CancellationToken.None);
                     if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
                     {
                         var compBin = Path.GetFileName(sidecar.CompanionCommand.Trim().Split(' ')[0]);
@@ -1606,7 +1606,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, authCheckCmd, ct);
             if (chkExit == 0)
             {
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", ct);
+                await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
                 if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
                 {
                     var compBin = Path.GetFileName(sidecar.CompanionCommand.Trim().Split(' ')[0]);
@@ -1640,7 +1640,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         var (recheckExit, _, _) = await ExecInContainerAsync(normPersonaId, authCheckCmd, ct);
                         if (recheckExit == 0)
                         {
-                            await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null)", ct);
+                            await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
                             return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication completed successfully!");
                         }
                     }
@@ -1658,7 +1658,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     }
                 }
 
-                await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null)", ct);
+                await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
 
                 if (!string.IsNullOrWhiteSpace(authCheckCmd))
                 {
@@ -1810,7 +1810,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             {
                 try
                 {
-                    await ExecInContainerAsync(normPersonaId, "sync_persona_state 2>/dev/null || (mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip && cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null && cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null)", CancellationToken.None);
+                    await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, CancellationToken.None);
                     var sidecarCfg = await GetPersonaSidecarConfigAsync(normPersonaId, CancellationToken.None);
                     if (!string.IsNullOrWhiteSpace(sidecarCfg?.CompanionCommand))
                     {
