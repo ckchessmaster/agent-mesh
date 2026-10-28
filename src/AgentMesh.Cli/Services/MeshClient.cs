@@ -214,7 +214,7 @@ public class MeshClient
 
                 string? workDir = null, model = null, effort = null, mode = null;
                 string? personaId = null, personaName = null, personaRole = null, personaPrompt = null;
-                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null;
+                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null, conversationId = null;
                 if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
                 {
                     personaId = topPid.GetString();
@@ -223,7 +223,6 @@ public class MeshClient
                 {
                     personaName = topPname.GetString();
                 }
-                string? conversationId = null;
                 if (sElem.TryGetProperty("metadataJson", out var metaProp) && !string.IsNullOrWhiteSpace(metaProp.GetString()))
                 {
                     try
@@ -293,6 +292,7 @@ public class MeshClient
                     pending.Add(new PromptReceivedEvent
                     {
                         SessionId = sessionId,
+                        ConversationId = conversationId,
                         MessageId = msgId,
                         AgentId = agentId,
                         DriverId = agentId,
@@ -311,7 +311,6 @@ public class MeshClient
                         GitBranch = gitBranch,
                         WorkspaceType = workspaceType,
                         Attachments = attachments,
-                        ConversationId = conversationId,
                         CreatedAt = createdAt
                     });
                 }
@@ -346,7 +345,7 @@ public class MeshClient
 
                 string? workDir = null, model = null, effort = null, mode = null;
                 string? pId = personaId, personaName = null, personaRole = null, personaPrompt = null;
-                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null;
+                string? jobId = null, projectId = null, gitBranch = null, workspaceType = null, conversationId = null;
                 string? driverId = sElem.TryGetProperty("driverId", out var didProp) ? didProp.GetString() : null;
 
                 if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
@@ -357,7 +356,6 @@ public class MeshClient
                 {
                     personaName = topPname.GetString();
                 }
-                string? conversationId = null;
                 if (sElem.TryGetProperty("metadataJson", out var metaProp) && !string.IsNullOrWhiteSpace(metaProp.GetString()))
                 {
                     try
@@ -427,6 +425,7 @@ public class MeshClient
                     pending.Add(new PromptReceivedEvent
                     {
                         SessionId = sessionId,
+                        ConversationId = conversationId,
                         MessageId = msgId,
                         AgentId = driverId ?? personaId,
                         DriverId = driverId,
@@ -445,7 +444,6 @@ public class MeshClient
                         GitBranch = gitBranch,
                         WorkspaceType = workspaceType,
                         Attachments = attachments,
-                        ConversationId = conversationId,
                         CreatedAt = createdAt
                     });
                 }

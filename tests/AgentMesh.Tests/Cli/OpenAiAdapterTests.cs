@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
@@ -667,7 +668,36 @@ public class OpenAiAdapterTests
             result.Should().Contain("[Image file: 'mock_ui.png'");
             result.Should().Contain("format: PNG");
             result.Should().Contain("cannot be read as plain text");
+            result.Should().Contain("Do NOT attempt to install OCR packages");
             result.Should().NotContain("\0");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_RethrowsOperationCanceledException()
+    {
+        // Was hardcoded to "/workspace", which only exists inside a persona
+        // container running as root. On a CI runner (non-root, repo checked out
+        // under /home/runner) that path neither exists nor can be created, so
+        // the tool's Directory.CreateDirectory threw UnauthorizedAccessException
+        // and the generic catch turned it into a "Tool execution error" *string*
+        // instead of propagating cancellation. The test passed locally and failed
+        // in CI. A temp dir keeps it hermetic.
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { command = "sleep 10" });
+            var act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, tempDir, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
         }
         finally
         {
@@ -717,6 +747,162 @@ public class OpenAiAdapterTests
         {
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
+    }
+
+    [Fact]
+    public void OpenAiMessage_ToSerializableObject_SerializesMultimodalContentParts()
+    {
+        var msg = new OpenAiMessage
+        {
+            Role = "user",
+            Content = "Look at this screenshot",
+            ContentParts = new List<object>
+            {
+                new OpenAiTextContentPart { Type = "text", Text = "Look at this screenshot" },
+                new OpenAiImageUrlContentPart
+                {
+                    Type = "image_url",
+                    ImageUrl = new OpenAiImageUrl { Url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+                }
+            }
+        };
+
+        var serialized = JsonSerializer.Serialize(msg.ToSerializableObject());
+        serialized.Should().Contain("\"role\":\"user\"");
+        serialized.Should().Contain("\"type\":\"text\"");
+        serialized.Should().Contain("\"type\":\"image_url\"");
+        serialized.Should().Contain("\"url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==\"");
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WithImageAttachment_IncludesMultimodalImageContentPart()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_mm_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        var sessionId = Guid.NewGuid();
+        string? capturedBody = null;
+
+        var handler = new MockHttpMessageHandler(req =>
+        {
+            capturedBody = req.Content?.ReadAsStringAsync().GetAwaiter().GetResult();
+            var sse = "data: {\"choices\":[{\"delta\":{\"content\":\"I see the image clearly.\"}}]}\n\ndata: [DONE]\n\n";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        });
+
+        OpenAiAdapter.SetHttpClientForTest(new HttpClient(handler));
+        try
+        {
+            var imagePath = Path.Combine(tempDir, "sample.png");
+            var pngBytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52 };
+            await File.WriteAllBytesAsync(imagePath, pngBytes);
+
+            var adapter = new OpenAiAdapter();
+            var preset = new AgentPresetConfig
+            {
+                Id = "spence-ai",
+                Name = "Spence Private AI",
+                AdapterType = "openai",
+                Endpoint = "http://127.0.0.1:11435/v1",
+                DefaultModel = "qwen3.8-flash-next"
+            };
+
+            var promptEv = new PromptReceivedEvent
+            {
+                SessionId = sessionId,
+                MessageId = Guid.NewGuid(),
+                AgentId = "spence-ai",
+                Prompt = "What is in this image?",
+                Sender = "operator",
+                WorkingDirectory = tempDir,
+                Attachments = new List<AttachmentItem>
+                {
+                    new AttachmentItem
+                    {
+                        Id = "att1",
+                        FileName = "sample.png",
+                        ContentType = "image/png",
+                        SizeBytes = pngBytes.Length,
+                        LocalFilePath = imagePath
+                    }
+                }
+            };
+
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev => { events.Add(ev); return Task.CompletedTask; }, CancellationToken.None);
+
+            capturedBody.Should().NotBeNull();
+            capturedBody.Should().Contain("\"type\":\"image_url\"");
+            capturedBody.Should().Contain("data:image/png;base64,");
+            events.Should().Contain(e => e.Content.Contains("I see the image clearly."));
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public void OpenAiAdapter_HistoryDiskPersistence_RoundTripsAcrossRestarts()
+    {
+        var sessionId = Guid.NewGuid();
+        var tempHistoryDir = Path.Combine(Path.GetTempPath(), $"openai-hist-{Guid.NewGuid()}");
+        var origDir = OpenAiAdapter.HistoryDirectoryPath;
+        OpenAiAdapter.HistoryDirectoryPath = tempHistoryDir;
+
+        try
+        {
+            var initialHistory = new List<OpenAiMessage>
+            {
+                new OpenAiMessage { Role = "system", Content = "You are a senior tech lead." },
+                new OpenAiMessage { Role = "user", Content = "Inspect the codebase." },
+                new OpenAiMessage { Role = "assistant", Content = "Inspected." }
+            };
+
+            OpenAiAdapter.SaveHistoryToDisk(sessionId, initialHistory);
+
+            // Simulate full memory wipe / CLI process restart
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+
+            // Re-save to disk for restoration test
+            OpenAiAdapter.SaveHistoryToDisk(sessionId, initialHistory);
+
+            var restored = OpenAiAdapter.GetSessionHistory(sessionId);
+            restored.Should().NotBeNull();
+            restored.Should().HaveCount(3);
+            restored![0].Content.Should().Be("You are a senior tech lead.");
+            restored[1].Content.Should().Be("Inspect the codebase.");
+            restored[2].Content.Should().Be("Inspected.");
+        }
+        finally
+        {
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+            OpenAiAdapter.HistoryDirectoryPath = origDir;
+            if (Directory.Exists(tempHistoryDir)) Directory.Delete(tempHistoryDir, true);
+        }
+    }
+
+    [Fact]
+    public void ActiveCommandRegistry_AppendAndGetLiveOutput_TracksRunningOutput()
+    {
+        var sessionId = Guid.NewGuid();
+        var commandId = "cmd-live-test";
+        using var proc = new Process();
+        using var cts = new CancellationTokenSource();
+
+        using var reg = ActiveCommandRegistry.Register(sessionId, commandId, proc, cts);
+
+        ActiveCommandRegistry.AppendOutput(sessionId, commandId, "Compiling project...\n");
+        ActiveCommandRegistry.AppendOutput(sessionId, commandId, "Build succeeded.\n");
+
+        var liveOutput = ActiveCommandRegistry.GetLiveOutput(sessionId, commandId);
+        liveOutput.Should().NotBeNull();
+        liveOutput.Should().Contain("Compiling project...");
+        liveOutput.Should().Contain("Build succeeded.");
     }
 
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler

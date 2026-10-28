@@ -45,6 +45,9 @@ public class PromptReceivedEvent
     [JsonPropertyName("sessionId")]
     public Guid SessionId { get; set; }
 
+    [JsonPropertyName("conversationId")]
+    public string? ConversationId { get; set; }
+
     [JsonPropertyName("messageId")]
     public Guid MessageId { get; set; }
 
@@ -111,8 +114,9 @@ public class PromptReceivedEvent
     [JsonPropertyName("attachments")]
     public List<AttachmentItem>? Attachments { get; set; }
 
-    [JsonPropertyName("conversationId")]
-    public string? ConversationId { get; set; }
+    // NOTE: `ConversationId` is declared once above (next to `SessionId`). Both the main and the
+    // v1.2.13-v1.2.15 lineages independently added this same property during the divergence; the
+    // reconciliation keeps a single declaration.
 
     [JsonPropertyName("createdAt")]
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -163,6 +167,9 @@ public class StopExecutionEvent
 
     [JsonPropertyName("agentId")]
     public string? AgentId { get; set; }
+
+    [JsonPropertyName("personaId")]
+    public string? PersonaId { get; set; }
 
     [JsonPropertyName("reason")]
     public string? Reason { get; set; }

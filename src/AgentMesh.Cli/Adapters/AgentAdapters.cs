@@ -215,7 +215,11 @@ public static class AgentAdapterFactory
     public static async Task<(int ExitCode, string StdOut, string StdErr)> RunShellCommandAsync(
         string command,
         string workingDirectory,
-        CancellationToken ct)
+        CancellationToken ct,
+        TimeSpan? timeout = null,
+        Guid? sessionId = null,
+        string? commandId = null,
+        Func<string, Task>? onOutputChunk = null)
     {
         var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         var psi = new ProcessStartInfo
@@ -240,25 +244,88 @@ public static class AgentAdapterFactory
         }
 
         using var proc = new Process { StartInfo = psi };
-        using var reg = ct.Register(() => KillProcessTree(proc));
+        using var cmdCts = new CancellationTokenSource();
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, cmdCts.Token);
+        var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(180);
+
+        IDisposable? regDisposable = null;
+        if (sessionId.HasValue)
+        {
+            regDisposable = ActiveCommandRegistry.Register(sessionId.Value, commandId, proc, cmdCts);
+        }
+
+        using var reg = linkedCts.Token.Register(() => KillProcessTree(proc));
         proc.Start();
 
         try
         {
-            var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
-            var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
+            var stdOutSb = new StringBuilder();
+            var stdErrSb = new StringBuilder();
 
-            await proc.WaitForExitAsync(ct);
-            var stdOut = await stdOutTask;
-            var stdErr = await stdErrTask;
+            async Task ReadStreamAsync(StreamReader reader, StringBuilder sb)
+            {
+                var buffer = new char[2048];
+                while (!linkedCts.Token.IsCancellationRequested)
+                {
+                    int read;
+                    try
+                    {
+                        read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), linkedCts.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    if (read <= 0) break;
+                    var chunk = new string(buffer, 0, read);
+                    lock (sb)
+                    {
+                        sb.Append(chunk);
+                    }
+                    if (sessionId.HasValue)
+                    {
+                        ActiveCommandRegistry.AppendOutput(sessionId.Value, commandId, chunk);
+                    }
+                    if (onOutputChunk != null)
+                    {
+                        try { await onOutputChunk(chunk); } catch { }
+                    }
+                }
+            }
 
-            ct.ThrowIfCancellationRequested();
-            return (proc.ExitCode, stdOut.Trim(), stdErr.Trim());
+            var stdOutTask = ReadStreamAsync(proc.StandardOutput, stdOutSb);
+            var stdErrTask = ReadStreamAsync(proc.StandardError, stdErrSb);
+
+            var waitTask = proc.WaitForExitAsync(linkedCts.Token);
+            var timeoutTask = Task.Delay(effectiveTimeout, CancellationToken.None);
+
+            var finished = await Task.WhenAny(waitTask, timeoutTask);
+            linkedCts.Token.ThrowIfCancellationRequested();
+
+            if (finished == timeoutTask && !proc.HasExited)
+            {
+                KillProcessTree(proc);
+                return (-1, string.Empty, $"Error: Command execution timed out after {effectiveTimeout.TotalSeconds:F0}s.");
+            }
+
+            await waitTask;
+            await Task.WhenAll(stdOutTask, stdErrTask);
+
+            linkedCts.Token.ThrowIfCancellationRequested();
+            return (proc.ExitCode, stdOutSb.ToString().Trim(), stdErrSb.ToString().Trim());
         }
         catch (OperationCanceledException)
         {
             KillProcessTree(proc);
+            if (cmdCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                return (-1, string.Empty, "🛑 Command aborted by operator.");
+            }
             throw;
+        }
+        finally
+        {
+            regDisposable?.Dispose();
         }
     }
 
@@ -273,7 +340,7 @@ public static class AgentAdapterFactory
 
         var sb = new StringBuilder();
         sb.AppendLine("[Attached Files in Workspace]");
-        sb.AppendLine("The user attached the following file(s) to this message. They have been staged into the workspace (text files can be inspected using `read_file`, and binary/image attachments can be accessed at their staged path):");
+        sb.AppendLine("The user attached the following file(s) to this message. They have been staged into the workspace (text files can be inspected using `read_file`, and image attachments are also provided directly to multimodal vision models as visual inputs). Note: If running on a text-only model without vision, do not attempt to script OCR or decode image binaries; ask the user for details if needed:");
         foreach (var att in attachments)
         {
             var path = !string.IsNullOrWhiteSpace(att.LocalFilePath)
@@ -423,6 +490,147 @@ public static class AgentAdapterFactory
         }
 
         return questions;
+    }
+}
+
+public record CommandExecutionHandle(
+    Guid SessionId,
+    string? CommandId,
+    Process Process,
+    CancellationTokenSource Cts,
+    DateTimeOffset StartedAt,
+    StringBuilder? LiveOutput = null);
+
+public static class ActiveCommandRegistry
+{
+    private static readonly ConcurrentDictionary<string, CommandExecutionHandle> ActiveCommands = new();
+
+    public static IDisposable Register(Guid sessionId, string? commandId, Process proc, CancellationTokenSource cts)
+    {
+        var outputSb = new StringBuilder();
+        var handle = new CommandExecutionHandle(sessionId, commandId, proc, cts, DateTimeOffset.UtcNow, outputSb);
+        var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
+        ActiveCommands[key] = handle;
+        ActiveCommands[$"{sessionId}:current"] = handle;
+
+        return new RegistrationDisposable(() =>
+        {
+            ActiveCommands.TryRemove(key, out _);
+            ActiveCommands.TryRemove($"{sessionId}:current", out _);
+        });
+    }
+
+    public static void AppendOutput(Guid sessionId, string? commandId, string chunk)
+    {
+        if (string.IsNullOrEmpty(chunk)) return;
+        var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
+        if (ActiveCommands.TryGetValue(key, out var handle) && handle.LiveOutput != null)
+        {
+            lock (handle.LiveOutput)
+            {
+                handle.LiveOutput.Append(chunk);
+                if (handle.LiveOutput.Length > 200_000)
+                {
+                    handle.LiveOutput.Remove(0, 50_000);
+                }
+            }
+        }
+    }
+
+    public static string? GetLiveOutput(Guid sessionId, string? commandId = null)
+    {
+        var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
+        if (ActiveCommands.TryGetValue(key, out var handle) && handle.LiveOutput != null)
+        {
+            lock (handle.LiveOutput)
+            {
+                return handle.LiveOutput.ToString();
+            }
+        }
+        return null;
+    }
+
+    public static bool TryStopCommand(Guid sessionId, string? commandId = null)
+    {
+        CommandExecutionHandle? handle = null;
+        if (!string.IsNullOrWhiteSpace(commandId) && ActiveCommands.TryGetValue($"{sessionId}:{commandId}", out handle))
+        {
+        }
+        else if (ActiveCommands.TryGetValue($"{sessionId}:current", out handle))
+        {
+        }
+
+        if (handle != null)
+        {
+            try
+            {
+                handle.Cts?.Cancel();
+            }
+            catch { }
+
+            if (handle.Process != null)
+            {
+                AgentAdapterFactory.KillProcessTree(handle.Process);
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    private sealed class RegistrationDisposable(Action onDispose) : IDisposable
+    {
+        private Action? _onDispose = onDispose;
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _onDispose, null)?.Invoke();
+        }
+    }
+}
+
+public static class ActiveAgyProcessRegistry
+{
+    private static readonly ConcurrentDictionary<Guid, Process> Processes = new();
+
+    public static IDisposable Register(Guid sessionId, Process proc)
+    {
+        Processes[sessionId] = proc;
+        return new RegistrationDisposable(() => Processes.TryRemove(sessionId, out _));
+    }
+
+    public static bool TryKillChildren(Guid sessionId)
+    {
+        if (Processes.TryGetValue(sessionId, out var proc) && !proc.HasExited)
+        {
+            var pid = 0;
+            try { pid = proc.Id; } catch { }
+            if (pid > 0 && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                try
+                {
+                    using var pkill = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "pkill",
+                        ArgumentList = { "-TERM", "-P", pid.ToString() },
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    });
+                    pkill?.WaitForExit(500);
+                    return true;
+                }
+                catch { }
+            }
+        }
+        return false;
+    }
+
+    private sealed class RegistrationDisposable(Action onDispose) : IDisposable
+    {
+        private Action? _onDispose = onDispose;
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _onDispose, null)?.Invoke();
+        }
     }
 }
 
@@ -937,6 +1145,7 @@ public class AgyAdapter : IAgentAdapter
         var lastTranscriptStep = transcriptFile != null ? GetMaxTranscriptStep(transcriptFile) : -1;
 
         using var proc = new Process { StartInfo = psi };
+        using var agyReg = ActiveAgyProcessRegistry.Register(promptEvent.SessionId, proc);
         proc.Start();
         using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
 
@@ -994,6 +1203,16 @@ public class AgyAdapter : IAgentAdapter
                                 {
                                     lastTranscriptStep = GetMaxTranscriptStep(transcriptFile);
                                 }
+                                try
+                                {
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "system",
+                                        Content = $"Conversation initialized ({convId[..Math.Min(8, convId.Length)]}...)",
+                                        StructuredPayloadJson = JsonSerializer.Serialize(new { conversationId = convId })
+                                    });
+                                }
+                                catch { }
                             }
                         }
                     }

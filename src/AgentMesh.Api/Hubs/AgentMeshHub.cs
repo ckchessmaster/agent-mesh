@@ -57,6 +57,20 @@ public class AgentMeshHub(AgentMeshDbContext? db = null) : Hub
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"session-{sessionId}");
     }
 
+    public async Task ReportCommandOutput(string sessionId, string commandId, string output)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        var payload = new
+        {
+            sessionId,
+            commandId,
+            output = output ?? string.Empty,
+            timestamp = DateTimeOffset.UtcNow
+        };
+        await Clients.Group($"session-{sessionId}").SendAsync("CommandOutput", payload);
+        await Clients.All.SendAsync("CommandOutput", payload);
+    }
+
     public async Task RegisterPersonaRunner(string personaId, string? driverId = null)
     {
         if (string.IsNullOrWhiteSpace(personaId)) return;
