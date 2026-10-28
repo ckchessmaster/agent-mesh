@@ -1001,7 +1001,7 @@ public class SessionsController(
     [HttpGet("{id:guid}/messages")]
     [HttpGet("{id:guid}/events")]
     [AllowAnonymous]
-    public async Task<IActionResult> GetMessages(Guid id)
+    public async Task<IActionResult> GetMessages(Guid id, [FromQuery] int? limit = null)
     {
         var sessionExists = await db.AgentSessions.AnyAsync(s => s.Id == id);
         if (!sessionExists)
@@ -1009,12 +1009,14 @@ public class SessionsController(
             return NotFound(new { error = $"Session '{id}' not found." });
         }
 
-        var messages = await db.SessionMessages
+        var query = db.SessionMessages
             .AsNoTracking()
             .Where(m => m.SessionId == id)
-            .OrderBy(m => m.CreatedAt)
-            .Take(500)
-            .ToListAsync();
+            .OrderBy(m => m.CreatedAt);
+
+        var messages = limit.HasValue && limit.Value > 0
+            ? await query.Take(limit.Value).ToListAsync()
+            : await query.ToListAsync();
 
         return Ok(messages.Select(ToMessageDto).ToList());
     }
@@ -1662,6 +1664,23 @@ public class SessionsController(
         });
 
         return Ok(new { status = "stopped", commandId });
+    }
+
+    [HttpPost("{id:guid}/commands/{commandId}/output")]
+    [AllowAnonymous]
+    public async Task<IActionResult> PostCommandOutput(Guid id, string commandId, [FromBody] PostCommandOutputRequest req)
+    {
+        var output = req.Output ?? string.Empty;
+        var payload = new
+        {
+            sessionId = id.ToString(),
+            commandId,
+            output,
+            timestamp = DateTimeOffset.UtcNow
+        };
+        await hubContext.Clients.Group($"session-{id}").SendAsync("CommandOutput", payload);
+        await hubContext.Clients.All.SendAsync("CommandOutput", payload);
+        return Ok(new { status = "ok" });
     }
 
     [HttpPost("{id:guid}/queue")]
@@ -3202,6 +3221,10 @@ public record SessionAttachmentDto(
     [property: JsonPropertyName("s3Key")] string S3Key,
     [property: JsonPropertyName("downloadUrl")] string DownloadUrl,
     [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt
+);
+
+public record PostCommandOutputRequest(
+    [property: JsonPropertyName("output")] string? Output = null
 );
 
 

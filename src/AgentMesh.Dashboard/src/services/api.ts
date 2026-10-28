@@ -520,8 +520,9 @@ export const api = {
     return res.json();
   },
 
-  async getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
-    const res = await apiFetch(`/api/sessions/${sessionId}/events`, { headers: getHeaders() });
+  async getSessionMessages(sessionId: string, limit?: number): Promise<SessionMessage[]> {
+    const url = limit ? `/api/sessions/${sessionId}/events?limit=${limit}` : `/api/sessions/${sessionId}/events`;
+    const res = await apiFetch(url, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load session events: ${res.statusText}`);
     return res.json();
   },

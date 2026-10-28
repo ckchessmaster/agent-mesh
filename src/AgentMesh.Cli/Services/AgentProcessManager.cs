@@ -312,6 +312,18 @@ public class AgentRunnerInstance : IAsyncDisposable
         _onStateChanged();
         _onLog(_preset.Id, $"ONLINE & listening for prompts (adapter: {_preset.AdapterType})");
 
+        OpenAiAdapter.CommandOutputBroadcaster = async (sessionId, commandId, chunk) =>
+        {
+            if (_hubConnection != null && _hubConnection.State == HubConnectionState.Connected)
+            {
+                try
+                {
+                    await _hubConnection.InvokeAsync("ReportCommandOutput", sessionId.ToString(), commandId, chunk);
+                }
+                catch { }
+            }
+        };
+
         // Process any prompts that were queued while this agent was offline
         await CheckAndProcessPendingPromptsAsync(_cts.Token);
 

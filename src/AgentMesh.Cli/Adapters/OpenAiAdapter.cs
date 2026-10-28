@@ -30,14 +30,79 @@ public class OpenAiAdapter : IAgentAdapter
         HttpClientInstance = DefaultHttpClient;
     }
 
+    public static Func<Guid, string, string, Task>? CommandOutputBroadcaster { get; set; }
+
+    public static string HistoryDirectoryPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".agentmesh",
+        "openai_histories");
+    private static readonly object HistoryDiskLock = new();
+
+    public static void SaveHistoryToDisk(Guid sessionId, List<OpenAiMessage> history)
+    {
+        try
+        {
+            lock (HistoryDiskLock)
+            {
+                if (!Directory.Exists(HistoryDirectoryPath)) Directory.CreateDirectory(HistoryDirectoryPath);
+                var filePath = Path.Combine(HistoryDirectoryPath, $"{sessionId}.json");
+                var json = JsonSerializer.Serialize(history);
+                File.WriteAllText(filePath, json);
+            }
+        }
+        catch { }
+    }
+
+    public static List<OpenAiMessage>? LoadHistoryFromDisk(Guid sessionId)
+    {
+        try
+        {
+            lock (HistoryDiskLock)
+            {
+                var filePath = Path.Combine(HistoryDirectoryPath, $"{sessionId}.json");
+                if (File.Exists(filePath))
+                {
+                    var json = File.ReadAllText(filePath);
+                    return JsonSerializer.Deserialize<List<OpenAiMessage>>(json);
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    public static void DeleteHistoryFromDisk(Guid sessionId)
+    {
+        try
+        {
+            lock (HistoryDiskLock)
+            {
+                var filePath = Path.Combine(HistoryDirectoryPath, $"{sessionId}.json");
+                if (File.Exists(filePath)) File.Delete(filePath);
+            }
+        }
+        catch { }
+    }
+
     public static void ClearSessionHistory(Guid sessionId)
     {
         SessionHistories.TryRemove(sessionId, out _);
+        DeleteHistoryFromDisk(sessionId);
     }
 
     public static List<OpenAiMessage>? GetSessionHistory(Guid sessionId)
     {
-        return SessionHistories.TryGetValue(sessionId, out var history) ? history : null;
+        if (SessionHistories.TryGetValue(sessionId, out var history))
+            return history;
+
+        var loaded = LoadHistoryFromDisk(sessionId);
+        if (loaded != null)
+        {
+            SessionHistories[sessionId] = loaded;
+            return loaded;
+        }
+
+        return null;
     }
 
     public static int ResolveTimeoutSeconds(AgentPresetConfig preset)
@@ -341,11 +406,12 @@ public class OpenAiAdapter : IAgentAdapter
         });
 
         // Initialize or retrieve session history
-        var history = SessionHistories.GetOrAdd(promptEvent.SessionId, _ => new List<OpenAiMessage>());
+        var history = SessionHistories.GetOrAdd(promptEvent.SessionId, sid => LoadHistoryFromDisk(sid) ?? new List<OpenAiMessage>());
         if (history.Count == 0)
         {
             var systemPrompt = BuildSystemPrompt(preset, promptEvent, cwd);
             history.Add(new OpenAiMessage { Role = "system", Content = systemPrompt });
+            SaveHistoryToDisk(promptEvent.SessionId, history);
         }
 
         var attachedBlock = AgentAdapterFactory.FormatAttachedFilesBlock(promptEvent.Attachments);
@@ -421,6 +487,7 @@ public class OpenAiAdapter : IAgentAdapter
         {
             history.Add(new OpenAiMessage { Role = "user", Content = fullUserPrompt });
         }
+        SaveHistoryToDisk(promptEvent.SessionId, history);
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
         var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
@@ -797,7 +864,21 @@ public class OpenAiAdapter : IAgentAdapter
                     });
 
                     var toolTimeout = ResolveTimeoutSeconds(preset);
-                    var toolResult = await ExecuteToolLocallyAsync(toolName, toolArgs, cwd, ct, toolTimeout, promptEvent.SessionId, callId);
+                    var toolResult = await ExecuteToolLocallyAsync(
+                        toolName,
+                        toolArgs,
+                        cwd,
+                        ct,
+                        toolTimeout,
+                        promptEvent.SessionId,
+                        callId,
+                        onOutputChunk: async (chunk) =>
+                        {
+                            if (CommandOutputBroadcaster != null)
+                            {
+                                try { await CommandOutputBroadcaster(promptEvent.SessionId, callId, chunk); } catch { }
+                            }
+                        });
                     ct.ThrowIfCancellationRequested();
 
                     await onEvent(new TrajectoryEventPayload
@@ -834,6 +915,7 @@ public class OpenAiAdapter : IAgentAdapter
                         Content = output
                     });
                 }
+                SaveHistoryToDisk(promptEvent.SessionId, history);
 
                 // Continue loop for next turn with tool results
                 continue;
@@ -867,7 +949,21 @@ public class OpenAiAdapter : IAgentAdapter
                 });
 
                 var toolTimeout = ResolveTimeoutSeconds(preset);
-                var toolResult = await ExecuteToolLocallyAsync(fbName, fbArgs ?? "{}", cwd, ct, toolTimeout, promptEvent.SessionId, "fallback-command");
+                var toolResult = await ExecuteToolLocallyAsync(
+                    fbName,
+                    fbArgs ?? "{}",
+                    cwd,
+                    ct,
+                    toolTimeout,
+                    promptEvent.SessionId,
+                    "fallback-command",
+                    onOutputChunk: async (chunk) =>
+                    {
+                        if (CommandOutputBroadcaster != null)
+                        {
+                            try { await CommandOutputBroadcaster(promptEvent.SessionId, "fallback-command", chunk); } catch { }
+                        }
+                    });
 
                 await onEvent(new TrajectoryEventPayload
                 {
@@ -879,6 +975,7 @@ public class OpenAiAdapter : IAgentAdapter
 
                 history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
                 history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
+                SaveHistoryToDisk(promptEvent.SessionId, history);
                 continue;
             }
 
@@ -1039,6 +1136,7 @@ public class OpenAiAdapter : IAgentAdapter
             }
 
             history.Add(new OpenAiMessage { Role = "assistant", Content = finalMsg });
+            SaveHistoryToDisk(promptEvent.SessionId, history);
 
             await onEvent(new TrajectoryEventPayload
             {
@@ -1260,9 +1358,10 @@ public class OpenAiAdapter : IAgentAdapter
         CancellationToken ct,
         int? timeoutSeconds = null,
         Guid? sessionId = null,
-        string? commandId = null)
+        string? commandId = null,
+        Func<string, Task>? onOutputChunk = null)
     {
-        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId);
+        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId, onOutputChunk);
         var truncated = TruncateToolResult(rawResult);
         return truncated.IndexOf('\0') >= 0 ? truncated.Replace("\0", string.Empty) : truncated;
     }
@@ -1274,7 +1373,8 @@ public class OpenAiAdapter : IAgentAdapter
         CancellationToken ct,
         int? timeoutSeconds = null,
         Guid? sessionId = null,
-        string? commandId = null)
+        string? commandId = null,
+        Func<string, Task>? onOutputChunk = null)
     {
         try
         {
@@ -1310,7 +1410,8 @@ public class OpenAiAdapter : IAgentAdapter
                         ct,
                         timeout,
                         sessionId,
-                        commandId);
+                        commandId,
+                        onOutputChunk);
                     var sb = new StringBuilder();
                     if (!string.IsNullOrWhiteSpace(stdout)) sb.AppendLine(stdout);
                     if (!string.IsNullOrWhiteSpace(stderr)) sb.AppendLine(stderr);

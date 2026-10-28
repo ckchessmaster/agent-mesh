@@ -218,7 +218,8 @@ public static class AgentAdapterFactory
         CancellationToken ct,
         TimeSpan? timeout = null,
         Guid? sessionId = null,
-        string? commandId = null)
+        string? commandId = null,
+        Func<string, Task>? onOutputChunk = null)
     {
         var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         var psi = new ProcessStartInfo
@@ -258,8 +259,42 @@ public static class AgentAdapterFactory
 
         try
         {
-            var stdOutTask = proc.StandardOutput.ReadToEndAsync(linkedCts.Token);
-            var stdErrTask = proc.StandardError.ReadToEndAsync(linkedCts.Token);
+            var stdOutSb = new StringBuilder();
+            var stdErrSb = new StringBuilder();
+
+            async Task ReadStreamAsync(StreamReader reader, StringBuilder sb)
+            {
+                var buffer = new char[2048];
+                while (!linkedCts.Token.IsCancellationRequested)
+                {
+                    int read;
+                    try
+                    {
+                        read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), linkedCts.Token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    if (read <= 0) break;
+                    var chunk = new string(buffer, 0, read);
+                    lock (sb)
+                    {
+                        sb.Append(chunk);
+                    }
+                    if (sessionId.HasValue)
+                    {
+                        ActiveCommandRegistry.AppendOutput(sessionId.Value, commandId, chunk);
+                    }
+                    if (onOutputChunk != null)
+                    {
+                        try { await onOutputChunk(chunk); } catch { }
+                    }
+                }
+            }
+
+            var stdOutTask = ReadStreamAsync(proc.StandardOutput, stdOutSb);
+            var stdErrTask = ReadStreamAsync(proc.StandardError, stdErrSb);
 
             var waitTask = proc.WaitForExitAsync(linkedCts.Token);
             var timeoutTask = Task.Delay(effectiveTimeout, CancellationToken.None);
@@ -274,11 +309,10 @@ public static class AgentAdapterFactory
             }
 
             await waitTask;
-            var stdOut = await stdOutTask;
-            var stdErr = await stdErrTask;
+            await Task.WhenAll(stdOutTask, stdErrTask);
 
             linkedCts.Token.ThrowIfCancellationRequested();
-            return (proc.ExitCode, stdOut.Trim(), stdErr.Trim());
+            return (proc.ExitCode, stdOutSb.ToString().Trim(), stdErrSb.ToString().Trim());
         }
         catch (OperationCanceledException)
         {
@@ -464,7 +498,8 @@ public record CommandExecutionHandle(
     string? CommandId,
     Process Process,
     CancellationTokenSource Cts,
-    DateTimeOffset StartedAt);
+    DateTimeOffset StartedAt,
+    StringBuilder? LiveOutput = null);
 
 public static class ActiveCommandRegistry
 {
@@ -472,7 +507,8 @@ public static class ActiveCommandRegistry
 
     public static IDisposable Register(Guid sessionId, string? commandId, Process proc, CancellationTokenSource cts)
     {
-        var handle = new CommandExecutionHandle(sessionId, commandId, proc, cts, DateTimeOffset.UtcNow);
+        var outputSb = new StringBuilder();
+        var handle = new CommandExecutionHandle(sessionId, commandId, proc, cts, DateTimeOffset.UtcNow, outputSb);
         var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
         ActiveCommands[key] = handle;
         ActiveCommands[$"{sessionId}:current"] = handle;
@@ -482,6 +518,36 @@ public static class ActiveCommandRegistry
             ActiveCommands.TryRemove(key, out _);
             ActiveCommands.TryRemove($"{sessionId}:current", out _);
         });
+    }
+
+    public static void AppendOutput(Guid sessionId, string? commandId, string chunk)
+    {
+        if (string.IsNullOrEmpty(chunk)) return;
+        var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
+        if (ActiveCommands.TryGetValue(key, out var handle) && handle.LiveOutput != null)
+        {
+            lock (handle.LiveOutput)
+            {
+                handle.LiveOutput.Append(chunk);
+                if (handle.LiveOutput.Length > 200_000)
+                {
+                    handle.LiveOutput.Remove(0, 50_000);
+                }
+            }
+        }
+    }
+
+    public static string? GetLiveOutput(Guid sessionId, string? commandId = null)
+    {
+        var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
+        if (ActiveCommands.TryGetValue(key, out var handle) && handle.LiveOutput != null)
+        {
+            lock (handle.LiveOutput)
+            {
+                return handle.LiveOutput.ToString();
+            }
+        }
+        return null;
     }
 
     public static bool TryStopCommand(Guid sessionId, string? commandId = null)

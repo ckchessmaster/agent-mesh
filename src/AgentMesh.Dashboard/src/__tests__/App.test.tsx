@@ -849,6 +849,83 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     expect(api.stopCommand).toHaveBeenCalledWith('session-cmd-1', 'msg-cmd-1');
   });
 
+  it('toggles live command output viewer and renders tool_result output with copy action', async () => {
+    const mockAgent: Agent = {
+      id: 'agy-cmd',
+      name: 'Agy Command Agent',
+      status: 'busy',
+      runtimeType: 1,
+      trustTier: 1,
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-cmd-output-1',
+      title: 'Command Output Session',
+      status: 'thinking',
+      metadataJson: JSON.stringify({}),
+      creatorAgentId: 'agy-cmd',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    const mockToolResultMessage: SessionMessage = {
+      id: 'msg-cmd-result',
+      sessionId: 'session-cmd-output-1',
+      senderAgentId: 'agy-cmd',
+      eventType: 'tool_result',
+      toolName: 'run_command',
+      content: 'Completed run_command',
+      toolResultJson: 'Tests passed: 15 passed, 0 failed',
+      createdAt: new Date(Date.now() - 5000).toISOString()
+    };
+
+    const mockToolCallMessage: SessionMessage = {
+      id: 'msg-cmd-active',
+      sessionId: 'session-cmd-output-1',
+      senderAgentId: 'agy-cmd',
+      eventType: 'tool_call',
+      toolName: 'run_command',
+      content: 'Running command: vitest run',
+      toolArgsJson: JSON.stringify({ CommandLine: 'vitest run' }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([mockToolResultMessage, mockToolCallMessage]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Command Output Session').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Command Output Session')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Running command:')).toBeInTheDocument();
+      expect(screen.getByText('vitest run')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /View command output/i })).toBeInTheDocument();
+    });
+
+    // Check completed tool_result rendered openly
+    expect(screen.getByText('run_command →')).toBeInTheDocument();
+    expect(screen.getByText('Completed run_command')).toBeInTheDocument();
+    expect(screen.getByText('Tests passed: 15 passed, 0 failed')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /Copy/i }).length).toBeGreaterThan(0);
+
+    // Toggle live output viewer drawer
+    fireEvent.click(screen.getByRole('button', { name: /View command output/i }));
+    expect(screen.getByText('Live Command Output')).toBeInTheDocument();
+    expect(screen.getByText('Executing command... (waiting for output)')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Hide command output/i })).toBeInTheDocument();
+
+    // Toggle close
+    fireEvent.click(screen.getByRole('button', { name: /Hide command output/i }));
+    expect(screen.queryByText('Live Command Output')).not.toBeInTheDocument();
+  });
+
   it('renders interactive question card for ask_question tool call and allows submitting answers', async () => {
     const mockAgent: Agent = {
       id: 'agy-qa',

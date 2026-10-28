@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
@@ -827,6 +828,65 @@ public class OpenAiAdapterTests
             OpenAiAdapter.ClearSessionHistory(sessionId);
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
+    }
+
+    [Fact]
+    public void OpenAiAdapter_HistoryDiskPersistence_RoundTripsAcrossRestarts()
+    {
+        var sessionId = Guid.NewGuid();
+        var tempHistoryDir = Path.Combine(Path.GetTempPath(), $"openai-hist-{Guid.NewGuid()}");
+        var origDir = OpenAiAdapter.HistoryDirectoryPath;
+        OpenAiAdapter.HistoryDirectoryPath = tempHistoryDir;
+
+        try
+        {
+            var initialHistory = new List<OpenAiMessage>
+            {
+                new OpenAiMessage { Role = "system", Content = "You are a senior tech lead." },
+                new OpenAiMessage { Role = "user", Content = "Inspect the codebase." },
+                new OpenAiMessage { Role = "assistant", Content = "Inspected." }
+            };
+
+            OpenAiAdapter.SaveHistoryToDisk(sessionId, initialHistory);
+
+            // Simulate full memory wipe / CLI process restart
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+
+            // Re-save to disk for restoration test
+            OpenAiAdapter.SaveHistoryToDisk(sessionId, initialHistory);
+
+            var restored = OpenAiAdapter.GetSessionHistory(sessionId);
+            restored.Should().NotBeNull();
+            restored.Should().HaveCount(3);
+            restored![0].Content.Should().Be("You are a senior tech lead.");
+            restored[1].Content.Should().Be("Inspect the codebase.");
+            restored[2].Content.Should().Be("Inspected.");
+        }
+        finally
+        {
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+            OpenAiAdapter.HistoryDirectoryPath = origDir;
+            if (Directory.Exists(tempHistoryDir)) Directory.Delete(tempHistoryDir, true);
+        }
+    }
+
+    [Fact]
+    public void ActiveCommandRegistry_AppendAndGetLiveOutput_TracksRunningOutput()
+    {
+        var sessionId = Guid.NewGuid();
+        var commandId = "cmd-live-test";
+        using var proc = new Process();
+        using var cts = new CancellationTokenSource();
+
+        using var reg = ActiveCommandRegistry.Register(sessionId, commandId, proc, cts);
+
+        ActiveCommandRegistry.AppendOutput(sessionId, commandId, "Compiling project...\n");
+        ActiveCommandRegistry.AppendOutput(sessionId, commandId, "Build succeeded.\n");
+
+        var liveOutput = ActiveCommandRegistry.GetLiveOutput(sessionId, commandId);
+        liveOutput.Should().NotBeNull();
+        liveOutput.Should().Contain("Compiling project...");
+        liveOutput.Should().Contain("Build succeeded.");
     }
 
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler

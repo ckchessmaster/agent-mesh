@@ -144,6 +144,97 @@ public class SessionsControllerTests
     }
 
     [Fact]
+    public async Task GetMessages_WithMoreThan500Messages_ReturnsAllMessagesWithoutTruncation()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var sessionId = Guid.NewGuid();
+        var session = new AgentSession { Id = sessionId, Title = "Large Session" };
+        db.AgentSessions.Add(session);
+
+        var messages = new List<SessionMessage>();
+        var baseTime = DateTimeOffset.UtcNow.AddHours(-1);
+        for (int i = 0; i < 550; i++)
+        {
+            messages.Add(new SessionMessage
+            {
+                Id = Guid.NewGuid(),
+                SessionId = sessionId,
+                SenderAgentId = i % 2 == 0 ? "operator" : "astra",
+                Content = $"Message index {i}",
+                CreatedAt = baseTime.AddSeconds(i)
+            });
+        }
+        db.SessionMessages.AddRange(messages);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var result = await controller.GetMessages(sessionId);
+
+        // Assert - All 550 messages must be returned so recent history never disappears
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        var msgs = okResult.Value.Should().BeAssignableTo<IEnumerable<SessionMessageDto>>().Subject.ToList();
+        msgs.Should().HaveCount(550);
+        msgs.First().Content.Should().Be("Message index 0");
+        msgs.Last().Content.Should().Be("Message index 549");
+    }
+
+    [Fact]
+    public async Task GetMessages_WithExplicitLimit_ReturnsRequestedLimit()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var sessionId = Guid.NewGuid();
+        var session = new AgentSession { Id = sessionId, Title = "Session With Limit" };
+        db.AgentSessions.Add(session);
+
+        var messages = new List<SessionMessage>();
+        var baseTime = DateTimeOffset.UtcNow.AddMinutes(-10);
+        for (int i = 0; i < 50; i++)
+        {
+            messages.Add(new SessionMessage
+            {
+                Id = Guid.NewGuid(),
+                SessionId = sessionId,
+                SenderAgentId = "astra",
+                Content = $"Msg {i}",
+                CreatedAt = baseTime.AddSeconds(i)
+            });
+        }
+        db.SessionMessages.AddRange(messages);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var result = await controller.GetMessages(sessionId, limit: 15);
+
+        // Assert
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        var msgs = okResult.Value.Should().BeAssignableTo<IEnumerable<SessionMessageDto>>().Subject.ToList();
+        msgs.Should().HaveCount(15);
+    }
+
+    [Fact]
+    public async Task PostCommandOutput_BroadcastsToHubAndReturnsOk()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var sessionId = Guid.NewGuid();
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act
+        var result = await controller.PostCommandOutput(sessionId, "cmd-123", new PostCommandOutputRequest("running test line 1\n"));
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+        _mockClients.Verify(c => c.Group($"session-{sessionId}"), Times.Once);
+        _mockClients.Verify(c => c.All, Times.Once);
+    }
+
+    [Fact]
     public void MergeAndExtractSessionSettings_HandlesExplicitSettings_Correctly()
     {
         var merged = SessionsController.MergeSessionMetadata(
