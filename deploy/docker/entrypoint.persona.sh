@@ -78,35 +78,83 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
     fi
 fi
 
-# Ensure persistent workspace state directories exist
+# Ensure persistent workspace state directories exist with restricted permissions
 mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip
+chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
+chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip 2>/dev/null || true
 
-# Symlink ~/.config to workspace state so any tool using standard XDG paths persists state
-if [ ! -L /root/.config ]; then
-    mkdir -p /root/.config
-    cp -rn /root/.config/* /workspace/.agentmesh/state/.config/ 2>/dev/null || true
-    rm -rf /root/.config
-    ln -s /workspace/.agentmesh/state/.config /root/.config
+# Ensure ~/.bashrc exports PATH for all interactive shells
+if ! grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null; then
+    echo 'export PATH="/root/.local/bin:/usr/local/bin:$PATH"' >> /root/.bashrc
 fi
 
-# Symlink ~/.aip to workspace state so aip credentials survive container restarts
-if [ ! -L /root/.aip ]; then
-    mkdir -p /root/.aip
-    cp -rn /root/.aip/* /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
-    rm -rf /root/.aip
-    ln -s /workspace/.agentmesh/state/.aip /root/.aip
+# If ~/.config or ~/.aip was previously created as a symlink, remove it so credential managers have real directories
+if [ -L /root/.config ]; then rm -f /root/.config; fi
+if [ -L /root/.aip ]; then rm -f /root/.aip; fi
+mkdir -p /root/.config /root/.aip
+chmod 700 /root/.config /root/.aip 2>/dev/null || true
+
+# Restore persistent state from workspace volume into local directories
+if [ -d /workspace/.agentmesh/state ]; then
+    for sdir in /workspace/.agentmesh/state/.*; do
+        bname=$(basename "$sdir")
+        if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ]; then
+            if [ -L "/root/$bname" ]; then rm -f "/root/$bname"; fi
+            mkdir -p "/root/$bname"
+            cp -a "$sdir/." "/root/$bname/" 2>/dev/null || true
+            chmod 700 "/root/$bname" 2>/dev/null || true
+        fi
+    done
 fi
 
-# Run companion setup script if configured (e.g. install aip helper)
+# Helper to synchronize state back to workspace volume
+sync_persona_state() {
+    mkdir -p /workspace/.agentmesh/state/.config
+    if [ -d /root/.config ]; then
+        cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
+    fi
+    if [ -d /root/.aip ]; then
+        mkdir -p /workspace/.agentmesh/state/.aip
+        cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
+    fi
+    # Also synchronize all existing state directories in /workspace/.agentmesh/state
+    if [ -d /workspace/.agentmesh/state ]; then
+        for sdir in /workspace/.agentmesh/state/.*; do
+            bname=$(basename "$sdir")
+            if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ] && [ -d "/root/$bname" ]; then
+                cp -a "/root/$bname/." "$sdir/" 2>/dev/null || true
+                chmod 700 "$sdir" 2>/dev/null || true
+            fi
+        done
+    fi
+    chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
+}
+
+# Run companion setup script if configured (e.g. install helper CLI)
 if [ -n "$COMPANION_SETUP" ]; then
     echo "Executing companion setup script..."
     eval "$COMPANION_SETUP" || echo "Warning: Companion setup exited with code $?"
+    sync_persona_state
 fi
 
-# Start companion background daemon if configured (e.g. aip proxy)
+# Start background periodic state synchronization worker
+(
+    while true; do
+        sleep 10
+        sync_persona_state 2>/dev/null || true
+    done
+) &
+SYNC_PID=$!
+
+# Start companion background daemon supervisor if configured (e.g. token refresh or proxy)
 if [ -n "$COMPANION_COMMAND" ]; then
-    echo "Starting companion daemon: $COMPANION_COMMAND"
-    eval "$COMPANION_COMMAND" &
+    echo "Starting companion daemon supervisor: $COMPANION_COMMAND"
+    (
+        while true; do
+            eval "$COMPANION_COMMAND" || true
+            sleep 2
+        done
+    ) &
     COMPANION_PID=$!
 fi
 
@@ -114,7 +162,7 @@ fi
 if [ -n "$COMPANION_PORT" ]; then
     echo "Waiting for companion daemon on port $COMPANION_PORT..."
     PORT_READY=0
-    for i in {1..30}; do
+    for i in {1..15}; do
         if timeout 1 bash -c "</dev/tcp/127.0.0.1/$COMPANION_PORT" >/dev/null 2>&1 || \
            curl -s "http://127.0.0.1:$COMPANION_PORT/" >/dev/null 2>&1; then
             echo "Companion daemon ready on port $COMPANION_PORT."
@@ -124,16 +172,25 @@ if [ -n "$COMPANION_PORT" ]; then
         sleep 1
     done
     if [ "$PORT_READY" -ne 1 ]; then
-        echo "Warning: Companion daemon did not respond on port $COMPANION_PORT within 30s. Proceeding..."
+        echo "Warning: Companion daemon did not respond on port $COMPANION_PORT within 15s. Proceeding in background..."
     fi
 fi
 
 cleanup() {
+    echo "Persisting persona state before termination..."
+    sync_persona_state
     if [ -n "$COMPANION_PID" ] && kill -0 "$COMPANION_PID" 2>/dev/null; then
         kill "$COMPANION_PID" 2>/dev/null || true
     fi
+    if [ -n "$SYNC_PID" ] && kill -0 "$SYNC_PID" 2>/dev/null; then
+        kill "$SYNC_PID" 2>/dev/null || true
+    fi
+    if [ -n "$RUNNER_PID" ] && kill -0 "$RUNNER_PID" 2>/dev/null; then
+        kill -TERM "$RUNNER_PID" 2>/dev/null || true
+        wait "$RUNNER_PID" 2>/dev/null || true
+    fi
 }
-trap cleanup EXIT
+trap cleanup EXIT SIGTERM SIGINT
 
 echo "=========================================================="
 echo " AgentMesh Dedicated Persona Environment"
@@ -163,4 +220,6 @@ if [ -n "$AGENTMESH_MODEL" ]; then
     ARGS+=(--model "$AGENTMESH_MODEL")
 fi
 
-exec agentmesh "${ARGS[@]}" "$@"
+agentmesh "${ARGS[@]}" "$@" &
+RUNNER_PID=$!
+wait "$RUNNER_PID"

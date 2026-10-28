@@ -12,8 +12,6 @@ import {
   LogOut,
   User,
   Wrench,
-  MessageSquare,
-  ChevronRight,
   ChevronLeft,
   Activity,
   Cpu,
@@ -77,6 +75,8 @@ import { getOptionLabel, getOptionDescription } from './components/QuestionCard'
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { DriverConfigModal } from './components/DriverConfigModal';
 import { PersonaEnvironmentModal } from './components/PersonaEnvironmentModal';
+import { SessionListSection } from './components/SessionListSection';
+import { sortSessionsByRecency } from './utils/sessionDisplay';
 
 interface StagedAttachmentItem {
   localId: string;
@@ -2812,9 +2812,9 @@ export default function App() {
                   </div>
                 ) : (
                   personas.map((persona) => {
-                    const personaSessions = sessions
-                      .filter((s) => s.personaId === persona.id)
-                      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+                    // Ordered by the shared recency comparator so the auto-selected row below is
+                    // always the same row the bounded preview puts on top.
+                    const personaSessions = sortSessionsByRecency(sessions.filter((s) => s.personaId === persona.id));
                     const isPersonaSelected = selectedPersona?.id === persona.id;
                     const linkedDriver = agents.find((a) => a.id === persona.driverId);
                     const driverStatus = linkedDriver?.status || persona.driverStatus || 'offline';
@@ -2965,93 +2965,26 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Persona's Sessions */}
-                        <div className="px-2 pb-2 space-y-1">
-                          {personaSessions.length === 0 ? (
-                            <div className="px-2 py-1.5 text-[11px] text-slate-500 italic">
-                              No sessions yet
-                            </div>
-                          ) : (
-                            personaSessions.map((session) => {
-                              const isSelected = session.id === selectedSessionId && !isCreatingSession;
-                              const isThinking = session.status === 'thinking';
-
-                              return (
-                                <div key={session.id} className="space-y-1">
-                                  <div
-                                    onClick={() => {
-                                      setSelectedPersonaId(persona.id);
-                                      setSelectedAgentId(session.driverId || session.creatorAgentId || persona.driverId);
-                                      setSelectedSessionId(session.id);
-                                      setIsCreatingSession(false);
-                                      setIsMobileDetailView(true);
-                                    }}
-                                    className={`group w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
-                                      isSelected
-                                        ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 font-medium'
-                                        : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200 border border-transparent'
-                                    }`}
-                                  >
-                                    <div className="flex items-center gap-2 min-w-0 flex-1">
-                                      {session.status === 'waiting_for_input' ? (
-                                        <span className="w-2.5 h-2.5 rounded-full bg-amber-400 border border-amber-300 animate-ping shrink-0" title="Human input required" />
-                                      ) : isThinking ? (
-                                        <RefreshCw className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
-                                      ) : (
-                                        <MessageSquare className="w-3 h-3 text-slate-500 shrink-0" />
-                                      )}
-                                      <span className="truncate">{session.title}</span>
-                                    </div>
-
-                                    <div className="flex items-center gap-1 shrink-0">
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setDeletingSessionId(session.id);
-                                        }}
-                                        className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition cursor-pointer"
-                                        title={`Delete session ${session.title}`}
-                                      >
-                                        <Trash2 className="w-3 h-3" />
-                                      </button>
-                                      <ChevronRight className="w-3 h-3 opacity-50 shrink-0 group-hover:opacity-100" />
-                                    </div>
-                                  </div>
-
-                                  {/* Delete Confirmation Inline Banner */}
-                                  {deletingSessionId === session.id && (
-                                    <div className="p-2 rounded-lg bg-rose-950/70 border border-rose-500/40 text-[11px] text-rose-200 space-y-1.5">
-                                      <p className="truncate">Delete <strong>{session.title}</strong>?</p>
-                                      <div className="flex justify-end gap-1.5">
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setDeletingSessionId(null);
-                                          }}
-                                          className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
-                                        >
-                                          Cancel
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteSession(session.id);
-                                          }}
-                                          className="px-2.5 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-semibold cursor-pointer"
-                                        >
-                                          Confirm Delete
-                                        </button>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })
-                          )}
-                        </div>
+                        {/* Persona's Sessions (bounded: preview + lazy "Show all") */}
+                        <SessionListSection
+                          ownerKind="persona"
+                          ownerId={persona.id}
+                          sessions={personaSessions}
+                          serverTotal={persona.sessionCount}
+                          selectedSessionId={selectedSessionId}
+                          isCreatingSession={isCreatingSession}
+                          deletingSessionId={deletingSessionId}
+                          onSelectSession={(session) => {
+                            setSelectedPersonaId(persona.id);
+                            setSelectedAgentId(session.driverId || session.creatorAgentId || persona.driverId);
+                            setSelectedSessionId(session.id);
+                            setIsCreatingSession(false);
+                            setIsMobileDetailView(true);
+                          }}
+                          onRequestDelete={setDeletingSessionId}
+                          onCancelDelete={() => setDeletingSessionId(null)}
+                          onConfirmDelete={handleDeleteSession}
+                        />
                       </div>
                     );
                   })
@@ -3270,9 +3203,9 @@ export default function App() {
                   </div>
                 ) : (
                   agents.map((agent) => {
-                    const agentSessions = sessions
-                      .filter((s) => s.driverId === agent.id || s.creatorAgentId === agent.id)
-                      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+                    const agentSessions = sortSessionsByRecency(
+                      sessions.filter((s) => s.driverId === agent.id || s.creatorAgentId === agent.id)
+                    );
                     const driverPersonas = personas.filter((p) => p.driverId === agent.id);
                     const isAgentSelected = selectedAgent?.id === agent.id;
                     const isOffline = agent.status === 'offline';
@@ -3447,100 +3380,29 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Driver's Sessions (across all associated Personas) */}
-                        <div className="px-2 pb-2 space-y-1">
-                          {agentSessions.length === 0 ? (
-                            <div className="px-2 py-1.5 text-[11px] text-slate-500 italic">
-                              No sessions yet
-                            </div>
-                          ) : (
-                            agentSessions.map((session) => {
-                              const isSelected = session.id === selectedSessionId && !isCreatingSession;
-                              const isThinking = session.status === 'thinking';
-
-                              return (
-                                <div key={session.id} className="space-y-1">
-                                  <div
-                                    onClick={() => {
-                                      setSelectedAgentId(agent.id);
-                                      if (session.personaId) {
-                                        setSelectedPersonaId(session.personaId);
-                                      }
-                                      setSelectedSessionId(session.id);
-                                      setIsCreatingSession(false);
-                                      setIsMobileDetailView(true);
-                                    }}
-                                    className={`group w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between gap-2 transition cursor-pointer ${
-                                      isSelected
-                                        ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 font-medium'
-                                        : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200 border border-transparent'
-                                    }`}
-                                  >
-                                    <div className="flex items-center gap-2 min-w-0 flex-1">
-                                      {session.status === 'waiting_for_input' ? (
-                                        <span className="w-2.5 h-2.5 rounded-full bg-amber-400 border border-amber-300 animate-ping shrink-0" title="Human input required" />
-                                      ) : isThinking ? (
-                                        <RefreshCw className="w-3 h-3 text-amber-400 animate-spin shrink-0" />
-                                      ) : (
-                                        <MessageSquare className="w-3 h-3 text-slate-500 shrink-0" />
-                                      )}
-                                      <span className="truncate">{session.title}</span>
-                                      {session.personaId && (
-                                        <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 shrink-0">
-                                          @{session.personaId}
-                                        </span>
-                                      )}
-                                    </div>
-
-                                    <div className="flex items-center gap-1 shrink-0">
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setDeletingSessionId(session.id);
-                                        }}
-                                        className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition cursor-pointer"
-                                        title={`Delete session ${session.title}`}
-                                      >
-                                        <Trash2 className="w-3 h-3" />
-                                      </button>
-                                      <ChevronRight className="w-3 h-3 opacity-50 shrink-0 group-hover:opacity-100" />
-                                    </div>
-                                  </div>
-
-                                  {/* Delete Confirmation Inline Banner */}
-                                  {deletingSessionId === session.id && (
-                                    <div className="p-2 rounded-lg bg-rose-950/70 border border-rose-500/40 text-[11px] text-rose-200 space-y-1.5">
-                                      <p className="truncate">Delete <strong>{session.title}</strong>?</p>
-                                      <div className="flex justify-end gap-1.5">
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setDeletingSessionId(null);
-                                          }}
-                                          className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
-                                        >
-                                          Cancel
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteSession(session.id);
-                                          }}
-                                          className="px-2.5 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-semibold cursor-pointer"
-                                        >
-                                          Confirm Delete
-                                        </button>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })
-                          )}
-                        </div>
+                        {/* Driver's Sessions (bounded: preview + lazy "Show all") */}
+                        <SessionListSection
+                          ownerKind="driver"
+                          ownerId={agent.id}
+                          sessions={agentSessions}
+                          serverTotal={agent.sessionCount}
+                          selectedSessionId={selectedSessionId}
+                          isCreatingSession={isCreatingSession}
+                          deletingSessionId={deletingSessionId}
+                          showPersonaBadge
+                          onSelectSession={(session) => {
+                            setSelectedAgentId(agent.id);
+                            if (session.personaId) {
+                              setSelectedPersonaId(session.personaId);
+                            }
+                            setSelectedSessionId(session.id);
+                            setIsCreatingSession(false);
+                            setIsMobileDetailView(true);
+                          }}
+                          onRequestDelete={setDeletingSessionId}
+                          onCancelDelete={() => setDeletingSessionId(null)}
+                          onConfirmDelete={handleDeleteSession}
+                        />
                       </div>
                     );
                   })

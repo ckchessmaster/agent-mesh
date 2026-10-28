@@ -117,6 +117,9 @@ builder.Services.AddCors(options =>
         policy.SetIsOriginAllowed(_ => true)
               .AllowAnyHeader()
               .AllowAnyMethod()
+              // The dashboard reads the owner-scoped session total off X-Total-Count when it expands
+              // a persona/driver session list; cross-origin fetches can't see it unless it's exposed.
+              .WithExposedHeaders("X-Total-Count")
               .AllowCredentials();
     });
 });

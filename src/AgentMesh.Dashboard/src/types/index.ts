@@ -60,7 +60,7 @@ export interface PersonaDriverVerificationResult {
 export interface PersonaAuthStartResult {
   personaId: string;
   driverId: string;
-  status: 'ready' | 'waiting_code' | 'already_authenticated' | 'error';
+  status: 'ready' | 'waiting_code' | 'already_authenticated' | 'apikey_required' | 'error';
   authUrl?: string | null;
   instructions?: string | null;
   errorMessage?: string | null;
@@ -90,6 +90,8 @@ export interface DriverSidecarConfig {
   companionSetup?: string | null;
   companionCommand?: string | null;
   companionPort?: number | null;
+  loginCommand?: string | null;
+  authCheckCommand?: string | null;
 }
 
 /**
@@ -108,6 +110,8 @@ export interface DriverConfig {
   hasApiKey?: boolean;
   sidecar?: DriverSidecarConfig | null;
   hasSidecarAuthKey?: boolean;
+  loginCommand?: string | null;
+  authCheckCommand?: string | null;
 }
 
 export interface Agent {
@@ -169,6 +173,16 @@ export interface AgentSession {
 }
 
 export type SessionEventType = 'prompt' | 'thought' | 'tool_call' | 'tool_result' | 'response' | string;
+
+/**
+ * One page of a persona's or driver's session history, plus the server's exact total for that owner.
+ * `total` is null when the API did not send `X-Total-Count` (older build, stripped by a proxy), and
+ * callers must then fall back to the rows they already hold.
+ */
+export interface SessionPage {
+  items: AgentSession[];
+  total: number | null;
+}
 
 export interface SessionMessage {
   id: string;

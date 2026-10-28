@@ -305,7 +305,7 @@ public class PersonasController(
 
     [HttpGet("{id}/sessions")]
     [AllowAnonymous]
-    public async Task<IActionResult> GetPersonaSessions(string id)
+    public async Task<IActionResult> GetPersonaSessions(string id, [FromQuery] int? take = null, [FromQuery] int? skip = null)
     {
         var normalizedId = id.Trim().ToLowerInvariant();
         var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId);
@@ -318,10 +318,29 @@ public class PersonasController(
             .AsNoTracking()
             .ToDictionaryAsync(d => d.Id, d => d.Name, StringComparer.OrdinalIgnoreCase);
 
-        var sessions = await db.AgentSessions
+        IQueryable<AgentSession> filtered = db.AgentSessions
             .AsNoTracking()
-            .Where(s => s.PersonaId == normalizedId)
-            .OrderByDescending(s => s.UpdatedAt)
+            .Where(s => s.PersonaId == normalizedId);
+
+        // The dashboard's persona card collapses its session list and lazily expands it, so it needs
+        // the owner's true total (the global /api/sessions window is capped) plus a page-sized slice.
+        // Paging is opt-in: the CLI polls this endpoint un-paged and must keep receiving everything.
+        // Counted off the unordered queryable so the aggregate carries no sort node.
+        var totalCount = await filtered.CountAsync();
+
+        IQueryable<AgentSession> sessionQuery = filtered.OrderByDescending(s => s.UpdatedAt);
+        // ControllerContext.HttpContext is null for direct (non-HTTP) action invocation.
+        if (ControllerContext.HttpContext is { } httpContext)
+        {
+            httpContext.Response.Headers["X-Total-Count"] = totalCount.ToString();
+        }
+
+        if (take is > 0)
+        {
+            sessionQuery = sessionQuery.Skip(Math.Max(0, skip ?? 0)).Take(take.Value);
+        }
+
+        var sessions = await sessionQuery
             .Select(s => new
             {
                 s.Id,

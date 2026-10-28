@@ -273,7 +273,7 @@ public static class AgentAdapterFactory
 
         var sb = new StringBuilder();
         sb.AppendLine("[Attached Files in Workspace]");
-        sb.AppendLine("The user attached the following file(s) to this message. They have been staged into the workspace so you can inspect them directly using your file/image reader tool (e.g. `read_file`):");
+        sb.AppendLine("The user attached the following file(s) to this message. They have been staged into the workspace (text files can be inspected using `read_file`, and binary/image attachments can be accessed at their staged path):");
         foreach (var att in attachments)
         {
             var path = !string.IsNullOrWhiteSpace(att.LocalFilePath)

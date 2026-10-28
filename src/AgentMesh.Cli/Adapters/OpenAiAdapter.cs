@@ -459,10 +459,14 @@ public class OpenAiAdapter : IAgentAdapter
                     }
 
                     var errorMsg = $"Failed to connect to OpenAI-compatible endpoint ({chatUrl}): {ex.Message}";
+                    var isLocal = endpoint.Contains("localhost") || endpoint.Contains("127.0.0.1");
+                    var extraHint = isLocal
+                        ? "\n\n💡 If using a driver companion daemon or local proxy (such as `aip proxy`), ensure the companion daemon is active and signed in (`aip login`). You can test and kickstart it via 'Verify Driver' or the interactive terminal in the Persona Environment modal."
+                        : "";
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "response",
-                        Content = $"❌ {errorMsg}\n\nPlease verify that your server is running and accessible at `{endpoint}`."
+                        Content = $"❌ {errorMsg}\n\nPlease verify that your server is running and accessible at `{endpoint}`.{extraHint}"
                     });
                     return;
                 }
@@ -1120,10 +1124,55 @@ public class OpenAiAdapter : IAgentAdapter
         };
     }
 
+    private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff", ".tif", ".svg"
+    };
+
+    private static readonly HashSet<string> BinaryExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff", ".tif",
+        ".pdf", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".bz2", ".xz",
+        ".exe", ".dll", ".so", ".dylib", ".bin", ".iso", ".dmg",
+        ".mp3", ".mp4", ".wav", ".ogg", ".avi", ".mov", ".webm", ".mkv",
+        ".wasm", ".pyc", ".class", ".o", ".obj"
+    };
+
+    private static async Task<bool> IsBinaryFileAsync(string filePath, CancellationToken ct)
+    {
+        var ext = Path.GetExtension(filePath);
+        if (BinaryExtensions.Contains(ext))
+        {
+            return true;
+        }
+
+        try
+        {
+            const int bufferSize = 8192;
+            var buffer = new byte[bufferSize];
+            await using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, useAsync: true);
+            var bytesRead = await stream.ReadAsync(buffer.AsMemory(0, bufferSize), ct);
+            for (var i = 0; i < bytesRead; i++)
+            {
+                if (buffer[i] == 0)
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // If checking fails, proceed to normal read
+        }
+
+        return false;
+    }
+
     public static async Task<string> ExecuteToolLocallyAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
     {
         var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct);
-        return TruncateToolResult(rawResult);
+        var truncated = TruncateToolResult(rawResult);
+        return truncated.IndexOf('\0') >= 0 ? truncated.Replace("\0", string.Empty) : truncated;
     }
 
     private static async Task<string> ExecuteToolLocallyRawAsync(string toolName, string argsJson, string cwd, CancellationToken ct)
@@ -1168,6 +1217,17 @@ public class OpenAiAdapter : IAgentAdapter
 
                     var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(cwd, path);
                     if (!File.Exists(fullPath)) return $"Error: File '{path}' does not exist.";
+
+                    if (await IsBinaryFileAsync(fullPath, ct))
+                    {
+                        var ext = Path.GetExtension(fullPath);
+                        var fi = new FileInfo(fullPath);
+                        if (ImageExtensions.Contains(ext) && !string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text.]";
+                        }
+                        return $"[Binary file: '{path}' ({fi.Length:N0} bytes). This is a binary file and cannot be read as plain text.]";
+                    }
 
                     var lines = await File.ReadAllLinesAsync(fullPath, ct);
                     int startLine = GetPropertyInt(root, "startLine", "StartLine") ?? 1;

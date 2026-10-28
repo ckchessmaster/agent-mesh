@@ -680,6 +680,12 @@ public class SessionsController(
         return sb.ToString();
     }
 
+    public static string? SanitizeForDatabase(string? input)
+    {
+        if (string.IsNullOrEmpty(input)) return input;
+        return input.IndexOf('\0') >= 0 ? input.Replace("\0", string.Empty) : input;
+    }
+
     public static DateTimeOffset? ExtractStoppedAt(string? metadataJson)
     {
         if (string.IsNullOrWhiteSpace(metadataJson)) return null;
@@ -1196,14 +1202,14 @@ public class SessionsController(
         var message = new SessionMessage
         {
             SessionId = id,
-            SenderAgentId = senderId,
-            TargetAgentId = req.TargetAgentId ?? session.CreatorAgentId,
-            EventType = eventType,
-            Content = effectiveContent,
-            ToolName = req.ToolName,
-            ToolArgsJson = req.ToolArgsJson,
-            ToolResultJson = req.ToolResultJson,
-            StructuredPayloadJson = mergedStructuredPayload,
+            SenderAgentId = SanitizeForDatabase(senderId) ?? string.Empty,
+            TargetAgentId = SanitizeForDatabase(req.TargetAgentId ?? session.CreatorAgentId),
+            EventType = SanitizeForDatabase(eventType) ?? "response",
+            Content = SanitizeForDatabase(effectiveContent) ?? string.Empty,
+            ToolName = SanitizeForDatabase(req.ToolName),
+            ToolArgsJson = SanitizeForDatabase(req.ToolArgsJson),
+            ToolResultJson = SanitizeForDatabase(req.ToolResultJson),
+            StructuredPayloadJson = SanitizeForDatabase(mergedStructuredPayload),
             CreatedAt = DateTimeOffset.UtcNow
         };
 

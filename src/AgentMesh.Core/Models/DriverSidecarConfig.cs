@@ -55,6 +55,13 @@ public class DriverSidecarConfig
     [JsonPropertyName("companionPort")]
     public int? CompanionPort { get; set; }
 
+    // Custom driver authentication / login commands
+    [JsonPropertyName("loginCommand")]
+    public string? LoginCommand { get; set; }
+
+    [JsonPropertyName("authCheckCommand")]
+    public string? AuthCheckCommand { get; set; }
+
     /// <summary>
     /// Sanitizes extra arguments for Tailscale CLI. Tailscale `tailscale up` does not support `--ephemeral`
     /// as a command line flag (ephemerality is configured on the Tailscale auth key itself or OAuth credentials).

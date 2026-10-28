@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Box,
   Play,
@@ -40,6 +40,24 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
   const [loading, setLoading] = useState(true);
   const [actionPending, setActionPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const driverType = useMemo(() => {
+    const raw = (persona.driverId || '').toLowerCase().trim();
+    if (raw.includes('claude') || raw.includes('anthropic')) return 'claude';
+    if (raw.includes('copilot') || raw.includes('github')) return 'copilot';
+    if (raw.includes('openai') || raw.includes('ollama') || raw.includes('vllm')) return 'openai';
+    if (raw.includes('agy') || raw.includes('gemini') || raw.includes('google')) return 'agy';
+    return 'generic';
+  }, [persona.driverId]);
+
+  const driverDisplayName = useMemo(() => {
+    if (persona.driverName && !persona.driverName.startsWith('@')) return persona.driverName;
+    if (driverType === 'claude') return 'Claude Code (Anthropic)';
+    if (driverType === 'copilot') return 'GitHub Copilot';
+    if (driverType === 'openai') return 'OpenAI Compatible';
+    if (driverType === 'agy') return 'Google AI Pro (Gemini)';
+    return persona.driverId ? `@${persona.driverId}` : 'Driver';
+  }, [persona.driverName, persona.driverId, driverType]);
 
   // Verification state
   const [verifying, setVerifying] = useState(false);
@@ -156,7 +174,9 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
       const res = await api.startPersonaAuth(persona.id);
       setAuthStartResult(res);
       if (res.status === 'already_authenticated') {
-        setAuthSuccessMessage('Driver is already authenticated with Google AI Pro.');
+        setAuthSuccessMessage(res.instructions || `Driver is already authenticated with ${driverDisplayName}.`);
+      } else if (res.status === 'apikey_required') {
+        setAuthMode('apikey');
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -173,7 +193,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
       setError(null);
       const res = await api.submitPersonaAuthCode(persona.id, authCodeInput.trim());
       if (res.status === 'authenticated') {
-        setAuthSuccessMessage(res.message || 'Successfully authenticated Google AI Pro credentials!');
+        setAuthSuccessMessage(res.message || `Successfully authenticated ${driverDisplayName} credentials!`);
         setAuthCodeInput('');
         setAuthStartResult(null);
         await handleRunVerification();
@@ -242,6 +262,8 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
     term.loadAddon(fitAddon);
     term.open(terminalContainerRef.current);
     fitAddon.fit();
+    term.focus();
+    setTimeout(() => term.focus(), 80);
 
     xtermRef.current = term;
     fitAddonRef.current = fitAddon;
@@ -263,13 +285,16 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
     hub.start().then(async () => {
       setTerminalConnected(true);
       await hub.invoke('Attach', persona.id, term.cols, term.rows);
+      term.focus();
     }).catch(err => {
       term.writeln(`\r\n\x1b[31mFailed to connect to terminal hub: ${err}\x1b[0m\r\n`);
     });
 
     const onDataDisposable = term.onData(data => {
       if (hub.state === signalR.HubConnectionState.Connected) {
-        hub.invoke('Input', data);
+        hub.invoke('Input', data).catch(err => {
+          console.warn('Terminal input dispatch error:', err);
+        });
       }
     });
 
@@ -629,7 +654,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                     <div className="p-3.5 rounded-xl bg-purple-950/40 border border-purple-800/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
                       <div>
                         <strong className="text-purple-200 block">Driver Authentication / Setup Required</strong>
-                        <p className="text-purple-300/80 text-[11px] mt-0.5">Authenticate via Google AI Pro OAuth or configure an API key directly.</p>
+                        <p className="text-purple-300/80 text-[11px] mt-0.5">Authenticate via {driverDisplayName} interactive login or configure an API key directly.</p>
                       </div>
                       <div className="flex items-center gap-2">
                         <button
@@ -638,17 +663,17 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                             setShowAuthWizard(true);
                             handleStartAuth();
                           }}
-                          className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs flex items-center gap-1.5 shrink-0 transition"
+                          className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs flex items-center gap-1.5 shrink-0 transition cursor-pointer"
                         >
                           <KeyRound className="w-3.5 h-3.5" />
-                          <span>Google OAuth</span>
+                          <span>Interactive Login</span>
                         </button>
                         <button
                           onClick={() => {
                             setAuthMode('apikey');
                             setShowAuthWizard(true);
                           }}
-                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs flex items-center gap-1.5 shrink-0 transition border border-slate-700"
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs flex items-center gap-1.5 shrink-0 transition border border-slate-700 cursor-pointer"
                         >
                           <KeyRound className="w-3.5 h-3.5" />
                           <span>Direct API Key</span>
@@ -679,7 +704,8 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
               </div>
               <div
                 ref={terminalContainerRef}
-                className="p-3 rounded-xl bg-slate-950 border border-slate-800/80 h-80 overflow-hidden"
+                onClick={() => xtermRef.current?.focus()}
+                className="p-3 rounded-xl bg-slate-950 border border-slate-800/80 h-80 overflow-hidden cursor-text"
               />
             </div>
           )}
@@ -690,11 +716,11 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
               <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
                 <div className="flex items-center gap-2 text-purple-300 font-semibold">
                   <KeyRound className="w-4 h-4 text-purple-400" />
-                  <span>Google AI Pro Authentication Wizard</span>
+                  <span>{driverDisplayName} Authentication Wizard</span>
                 </div>
                 <button
                   onClick={() => setShowAuthWizard(false)}
-                  className="p-1 rounded text-slate-400 hover:text-white transition"
+                  className="p-1 rounded text-slate-400 hover:text-white transition cursor-pointer"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -714,7 +740,13 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                       : 'text-slate-400 hover:text-slate-200 border border-transparent'
                   }`}
                 >
-                  Google AI Pro OAuth (Browser Login)
+                  {driverType === 'agy'
+                    ? 'Google AI Pro OAuth'
+                    : driverType === 'copilot'
+                    ? 'GitHub Device Login'
+                    : driverType === 'claude'
+                    ? 'Claude CLI Login'
+                    : 'Browser / CLI Login'}
                 </button>
                 <button
                   type="button"
@@ -732,14 +764,20 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
               {authMode === 'apikey' ? (
                 <div className="space-y-3 pt-1">
                   <p className="text-slate-300 leading-relaxed">
-                    Configure your API key directly from the UI. Credentials will be securely saved into the environment secret and injected into the container:
+                    Configure your API key directly from the UI. Credentials will be securely saved into the persona environment secret and injected into the container:
                   </p>
                   <div className="flex items-center gap-2">
                     <input
                       type="password"
                       value={apiKeyInput}
                       onChange={e => setApiKeyInput(e.target.value)}
-                      placeholder="Paste GEMINI_API_KEY or ANTHROPIC_API_KEY..."
+                      placeholder={
+                        driverType === 'claude'
+                          ? 'Paste ANTHROPIC_API_KEY...'
+                          : driverType === 'agy'
+                          ? 'Paste GEMINI_API_KEY...'
+                          : 'Paste OPENAI_API_KEY...'
+                      }
                       className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-purple-500"
                     />
                     <button
@@ -753,13 +791,13 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                 </div>
               ) : authStarting ? (
                 <div className="p-4 text-center text-slate-400 text-xs font-mono">
-                  Initiating device-code OAuth flow inside container...
+                  Initiating driver authorization session inside container...
                 </div>
               ) : (authStartResult?.status === 'error' || authStartResult?.errorMessage) ? (
                 <div className="p-3.5 rounded-xl bg-red-950/50 border border-red-500/40 space-y-2.5 text-xs">
                   <div className="flex items-center gap-2 font-semibold text-red-300">
                     <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
-                    <span>Google AI Pro OAuth Failed</span>
+                    <span>{driverDisplayName} Authentication Failed</span>
                   </div>
                   <p className="font-mono text-[11px] leading-relaxed break-words text-red-200 bg-red-950/60 p-2.5 rounded-lg border border-red-800/40">
                     {authStartResult.errorMessage}
@@ -770,13 +808,23 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                       disabled={authStarting}
                       className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition cursor-pointer"
                     >
-                      Retry Google Sign-In
+                      Retry Login Session
                     </button>
                     <button
                       onClick={() => setAuthMode('apikey')}
                       className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition cursor-pointer border border-slate-700"
                     >
                       Switch to Direct API Key
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowAuthWizard(false);
+                        setActiveTab('terminal');
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition cursor-pointer border border-slate-700 flex items-center gap-1.5"
+                    >
+                      <TerminalIcon className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Open Interactive Terminal</span>
                     </button>
                   </div>
                 </div>
@@ -785,7 +833,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                   {authStartResult?.authUrl ? (
                     <>
                       <p className="text-slate-300 leading-relaxed">
-                        Step 1: Click the button below to sign in with your Google account (which has Google AI Pro):
+                        Step 1: Open the link below in your browser to approve authorization:
                       </p>
                       <a
                         href={authStartResult.authUrl}
@@ -793,7 +841,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-medium text-xs transition"
                       >
-                        <span>Authorize with Google</span>
+                        <span>Authorize in Browser</span>
                         <ExternalLink className="w-3.5 h-3.5" />
                       </a>
                     </>
@@ -811,7 +859,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                       type="text"
                       value={authCodeInput}
                       onChange={e => setAuthCodeInput(e.target.value)}
-                      placeholder="Paste authorization code here (e.g. 4/0AY0...)"
+                      placeholder="Paste authorization code here..."
                       className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-sky-500"
                     />
                     <button
@@ -825,13 +873,13 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <p className="text-slate-400">{authStartResult?.instructions || 'Driver is ready. Click below to begin Google AI Pro OAuth login.'}</p>
+                  <p className="text-slate-400">{authStartResult?.instructions || `Driver is ready. Click below to begin ${driverDisplayName} login.`}</p>
                   <button
                     onClick={handleStartAuth}
                     disabled={authStarting}
                     className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition cursor-pointer"
                   >
-                    Start Google Sign-In
+                    Start Login Session
                   </button>
                 </div>
               )}

@@ -1061,6 +1061,63 @@ public class SessionsControllerTests
         aMsg.Content.Should().Contain("Which DB? -> A: PG");
         aMsg.TurnSessionId.Should().Be(session.Id);
     }
+
+    [Fact]
+    public async Task PostMessage_WithNullBytesInToolResultOrContent_StripsNullBytesAndPersistsSuccessfully()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession { Id = Guid.NewGuid(), Title = "Sanitize Session", Status = "thinking" };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        // Act: post event with null bytes in multiple string fields
+        var req = new PostMessageRequest(
+            Content: "Output\0content\0test",
+            SenderAgentId: "rook",
+            TargetAgentId: "operator",
+            EventType: "tool_result",
+            ToolName: "read_file\0",
+            ToolArgsJson: "{\"path\":\0\"test.png\"}",
+            ToolResultJson: "Binary\0Data\0Line1\nLine2"
+        );
+
+        var result = await controller.PostMessage(session.Id, req);
+
+        // Assert
+        result.Should().BeOfType<CreatedAtActionResult>();
+        var msg = db.SessionMessages.FirstOrDefault(m => m.SessionId == session.Id && m.EventType == "tool_result");
+        msg.Should().NotBeNull();
+        msg!.Content.Should().Be("Outputcontenttest");
+        msg.ToolName.Should().Be("read_file");
+        msg.ToolArgsJson.Should().Be("{\"path\":\"test.png\"}");
+        msg.ToolResultJson.Should().Be("BinaryDataLine1\nLine2");
+        msg.ToolResultJson.Should().NotContain("\0");
+    }
+
+    [Fact]
+    public async Task AgentMeshDbContext_SanitizesNullBytes_OnAnyEntityStringProperty()
+    {
+        using var db = TestDbContextFactory.Create();
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Corrupt\0Title\0WithNulls",
+            MetadataJson = "{\"key\": \"val\0ue\"}"
+        };
+
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var saved = await db.AgentSessions.FindAsync(session.Id);
+        saved.Should().NotBeNull();
+        saved!.Title.Should().Be("CorruptTitleWithNulls");
+        saved.MetadataJson.Should().Be("{\"key\": \"value\"}");
+        saved.Title.Should().NotContain("\0");
+        saved.MetadataJson.Should().NotContain("\0");
+    }
 }
 
 

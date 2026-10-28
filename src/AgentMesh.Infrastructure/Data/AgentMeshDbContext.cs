@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Models;
+using AgentMesh.Core.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace AgentMesh.Infrastructure.Data;
@@ -31,5 +31,38 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     {
         base.OnModelCreating(modelBuilder);
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(AgentMeshDbContext).Assembly);
+    }
+
+    public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        SanitizeStrings();
+        return base.SaveChangesAsync(cancellationToken);
+    }
+
+    public override int SaveChanges()
+    {
+        SanitizeStrings();
+        return base.SaveChanges();
+    }
+
+    private void SanitizeStrings()
+    {
+        foreach (var entry in ChangeTracker.Entries())
+        {
+            if (entry.State is EntityState.Added or EntityState.Modified)
+            {
+                foreach (var prop in entry.CurrentValues.Properties)
+                {
+                    if (prop.ClrType == typeof(string))
+                    {
+                        var val = entry.CurrentValues[prop] as string;
+                        if (val != null && val.IndexOf('\0') >= 0)
+                        {
+                            entry.CurrentValues[prop] = val.Replace("\0", string.Empty);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -181,11 +181,11 @@ public class MeshClient
         {
             senderAgentId = agentId,
             eventType = ev.EventType,
-            content = ev.Content,
+            content = ev.Content?.Replace("\0", string.Empty) ?? string.Empty,
             toolName = ev.ToolName,
-            toolArgsJson = ev.ToolArgsJson,
-            toolResultJson = ev.ToolResultJson,
-            structuredPayloadJson = ev.StructuredPayloadJson,
+            toolArgsJson = ev.ToolArgsJson?.Replace("\0", string.Empty),
+            toolResultJson = ev.ToolResultJson?.Replace("\0", string.Empty),
+            structuredPayloadJson = ev.StructuredPayloadJson?.Replace("\0", string.Empty),
             createdAt = ev.CreatedAt
         });
 
@@ -454,6 +454,36 @@ public class MeshClient
         {
             var token = _config.MasterToken;
             using var req = CreateRequest(HttpMethod.Get, $"api/sessions/{sessionId}/attachments/{Uri.EscapeDataString(attachmentId)}/content", token);
+            using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!res.IsSuccessStatusCode)
+            {
+                return false;
+            }
+
+            var dir = Path.GetDirectoryName(destinationFilePath);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            await using var netStream = await res.Content.ReadAsStreamAsync(ct);
+            await using var fileStream = new FileStream(destinationFilePath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            await netStream.CopyToAsync(fileStream, ct);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public virtual async Task<bool> DownloadAttachmentFromUrlAsync(string downloadUrl, string destinationFilePath, CancellationToken ct = default)
+    {
+        try
+        {
+            var token = _config.MasterToken;
+            var cleanUrl = downloadUrl.TrimStart('/');
+            using var req = CreateRequest(HttpMethod.Get, cleanUrl, token);
             using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
             if (!res.IsSuccessStatusCode)
             {
