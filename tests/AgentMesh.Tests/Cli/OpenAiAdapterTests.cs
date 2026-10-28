@@ -706,6 +706,31 @@ public class OpenAiAdapterTests
     }
 
     [Fact]
+    public async Task ExecuteToolLocallyAsync_AlreadyCancelled_DoesNotCreateWorkingDirectory()
+    {
+        // Pins the ordering fix: cancellation is honoured before any filesystem
+        // side effect, so an aborted prompt cannot leave stray workspace dirs,
+        // and an uncreatable cwd cannot mask cancellation as a string.
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_nocreate_" + Guid.NewGuid().ToString("N")[..8]);
+        var nested = Path.Combine(tempDir, "deep", "deeper");
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { command = "echo hi", workingDirectory = nested });
+            var act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, tempDir, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
+            Directory.Exists(nested).Should().BeFalse("a cancelled prompt must not create directories");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
     public async Task ExecuteToolLocallyAsync_ReadFile_OnBinaryFile_ReturnsBinaryIndicatorWithoutNullBytes()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_bin_test_" + Guid.NewGuid().ToString("N")[..8]);

@@ -1395,6 +1395,15 @@ public class OpenAiAdapter : IAgentAdapter
                         ? (Path.IsPathRooted(workDir) ? workDir : Path.Combine(cwd, workDir))
                         : cwd;
 
+                    // Honour cancellation before touching the filesystem. Creating a
+                    // directory is a side effect, and doing it for an already-cancelled
+                    // prompt leaves stray workspace dirs behind. It also closes a hole
+                    // that survives the rethrow below: if the directory cannot be
+                    // created, mkdir throws UnauthorizedAccessException, which the
+                    // generic catch turns into a "Tool execution error" *string* -
+                    // masking cancellation in exactly that combination.
+                    ct.ThrowIfCancellationRequested();
+
                     if (!Directory.Exists(effectiveDir))
                     {
                         Directory.CreateDirectory(effectiveDir);
