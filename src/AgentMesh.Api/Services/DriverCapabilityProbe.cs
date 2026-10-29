@@ -31,6 +31,39 @@ public enum CapabilitySourceKind
     Unavailable
 }
 
+/// <summary>
+/// The literal the dashboard switches on for a source kind.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Written out rather than produced with <c>ToString().ToLowerInvariant()</c>, which was the
+/// original implementation and was wrong for every multi-word member: <c>StaticPreset</c> became
+/// <c>"staticpreset"</c> and <c>UserOverride</c> became <c>"useroverride"</c>. Neither string is in
+/// the UI's <c>CapabilitySource</c> union, so <c>normalizeSource</c> fell through to
+/// <c>'unavailable'</c>. The picker itself kept working - the dashboard branches on list length, not
+/// on source - but the caption under it read "Model list unavailable", contradicting the populated
+/// select above it. Silent, and confined to the two sources that are not the happy path, which is
+/// why pinning a single wire value did not catch it.
+/// </para>
+/// <para>
+/// The switch is exhaustive with no discard arm on purpose. Adding a member to
+/// <see cref="CapabilitySourceKind"/> then produces compiler warning CS8524 here rather than
+/// silently degrading to a wrong label at runtime. That is a warning, not an error - this repo does
+/// not set TreatWarningsAsErrors - so the hard guard is <c>CapabilitiesWireFormatTests</c>, which
+/// enumerates every member and asserts its wire value is present in the TypeScript union.
+/// </para>
+/// </remarks>
+public static class CapabilitySourceKindExtensions
+{
+    public static string ToWireValue(this CapabilitySourceKind source) => source switch
+    {
+        CapabilitySourceKind.Probed => "probed",
+        CapabilitySourceKind.StaticPreset => "static_preset",
+        CapabilitySourceKind.UserOverride => "user_override",
+        CapabilitySourceKind.Unavailable => "unavailable"
+    };
+}
+
 /// <summary>A model the driver can run, with the options that model actually accepts.</summary>
 /// <param name="Efforts">
 /// Effort values to offer. Only values the adapter will forward verbatim belong here - see

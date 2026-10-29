@@ -369,7 +369,7 @@ public class SystemController(
             // The driver's own reading wins; the baseline only supplies modes/tiers, which are
             // adapter-level interaction concepts rather than per-install facts.
             Models: reading.Models.Select(ToModelDto).ToList(),
-            ModelSource: reading.ModelSource.ToString().ToLowerInvariant(),
+            ModelSource: reading.ModelSource.ToWireValue(),
             ObservedAt: reading.ObservedAt,
             SupportsContextSelection: reading.SupportsContextSelection,
             ContextSizes: reading.SupportsContextSelection
@@ -417,8 +417,12 @@ public record ModelCapabilityDto(
 /// does nothing.
 /// </param>
 /// <param name="ModelSource">
-/// <c>probed</c> | <c>static_preset</c> | <c>user_override</c> | <c>unavailable</c>. The UI labels
-/// the picker with it so a bundled guess is never presented as a driver answer.
+/// One of the literals produced by <see cref="CapabilitySourceKindExtensions.ToWireValue"/> -
+/// <c>probed</c>, <c>static_preset</c>, <c>user_override</c> or <c>unavailable</c>. The UI labels the
+/// picker with it so a bundled guess is never presented as a driver answer. The list is stated here
+/// for readability only; <c>CapabilitySourceKindValues_AreExactlyTheUnionTheDashboardDeclares</c> is
+/// what keeps it in step with the dashboard's union, and it was the absence of that check that let
+/// <c>static_preset</c> ship as <c>"staticpreset"</c>.
 /// </param>
 public record RuntimeCapabilitiesDto(
     string Adapter,

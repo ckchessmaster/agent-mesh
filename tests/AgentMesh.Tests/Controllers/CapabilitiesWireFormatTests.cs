@@ -267,6 +267,116 @@ public class CapabilitiesWireFormatTests : IClassFixture<WebApplicationFactory<A
         return JsonDocument.Parse(json);
     }
 
+    [Theory]
+    [InlineData(CapabilitySourceKind.Probed, "probed")]
+    [InlineData(CapabilitySourceKind.StaticPreset, "static_preset")]
+    [InlineData(CapabilitySourceKind.UserOverride, "user_override")]
+    [InlineData(CapabilitySourceKind.Unavailable, "unavailable")]
+    public async Task Capabilities_EverySourceKindSerializesToTheLiteralTheUiSwitchesOn(
+        CapabilitySourceKind kind,
+        string expected)
+    {
+        // The previous version of this file pinned only "probed", which left the multi-word members
+        // untested and broken: the DTO was produced with `ToString().ToLowerInvariant()`, so
+        // StaticPreset became "staticpreset" and UserOverride became "useroverride". Neither is in
+        // the UI's union, so normalizeSource fell through to 'unavailable'. The model list still
+        // rendered - App.tsx branches on list length, not on source - but the caption beneath it
+        // read "Model list unavailable", contradicting the picker above it. Silent, and confined to
+        // the two sources that are not the happy path, which is why one pinned value passed.
+        _probe.Reading = new DriverCapabilityReading(
+            Adapter: "agy",
+            Models: new[] { new DriverModelCapability("m", "M", Array.Empty<string>()) },
+            ModelSource: kind,
+            ObservedAt: DateTimeOffset.UtcNow,
+            SupportsContextSelection: false);
+
+        using var doc = await GetAsync();
+
+        Drivers(doc)[0].GetProperty("modelSource").GetString().Should().Be(expected);
+    }
+
+    [Fact]
+    public void CapabilitySourceKindValues_AreExactlyTheUnionTheDashboardDeclares()
+    {
+        // The test above pins each member's literal. This one closes the other direction, which is
+        // how a new CapabilitySourceKind on the server would be lost: if the dashboard's union does
+        // not know the value, normalizeSource falls through to 'unavailable' and the caption under a
+        // real model list claims there is none. No C# test can see that on its own, because the C#
+        // side is self-consistent.
+        //
+        // Reading the TypeScript from disk rather than restating it here is deliberate. A hardcoded
+        // expected-set in C# is a second copy of the contract and drifts exactly like the code it
+        // guards. If this test ever becomes awkward because CI does not check out the dashboard, the
+        // right fix is a generated contract file, not deleting the assertion.
+        var union = ReadDashboardUnion();
+
+        var csharp = Enum.GetValues<CapabilitySourceKind>()
+            .Select(v => v.ToWireValue())
+            .ToList();
+
+        csharp.Should().OnlyHaveUniqueItems("two members sharing a wire value would be indistinguishable in the UI");
+
+        foreach (var value in csharp)
+        {
+            union.Should().Contain(value,
+                $"normalizeSource falls through to 'unavailable' for anything outside its union, so " +
+                $"'{value}' would render a real model list under a 'Model list unavailable' caption");
+        }
+
+        foreach (var value in union)
+        {
+            csharp.Should().Contain(value,
+                $"the dashboard handles '{value}' but the API can no longer produce it - dead branch");
+        }
+    }
+
+    [Fact]
+    public void CapabilitySourceKindValues_RoundTripThroughTheWireMapping()
+    {
+        // ToWireValue is the only sanctioned conversion. Guarding against a future edit that
+        // reintroduces ToString().ToLowerInvariant(), which was the original bug.
+        var controller = File.ReadAllText(FindRepoFile("src/AgentMesh.Api/Controllers/SystemController.cs"));
+
+        controller.Should().NotContain("ModelSource.ToString().ToLowerInvariant()",
+            "multi-word members lowercase to staticpreset/useroverride, which are not in the UI union");
+        controller.Should().Contain("ModelSource.ToWireValue()");
+    }
+
+    /// <summary>
+    /// The members of the `CapabilitySource` union in utils/driverCapabilities.ts.
+    /// </summary>
+    private static List<string> ReadDashboardUnion()
+    {
+        var source = File.ReadAllText(
+            FindRepoFile("src/AgentMesh.Dashboard/src/utils/driverCapabilities.ts"));
+
+        var declaration = System.Text.RegularExpressions.Regex.Match(
+            source,
+            "export type CapabilitySource =[^;]+;",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+
+        declaration.Success.Should().BeTrue(
+            "the dashboard must declare the CapabilitySource union this endpoint's modelSource is matched against");
+
+        return System.Text.RegularExpressions.Regex.Matches(declaration.Value, "'([^']+)'")
+            .Select(m => m.Groups[1].Value)
+            .ToList();
+    }
+
+    private static string FindRepoFile(string relativePath)
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.slnx")))
+        {
+            dir = dir.Parent;
+        }
+
+        var full = Path.Combine(dir?.FullName ??
+            throw new InvalidOperationException("repo root not found"), relativePath);
+
+        return File.Exists(full) ? full : throw new FileNotFoundException($"could not locate {relativePath}", full);
+    }
+
     private static JsonElement Root(JsonDocument doc) => doc.RootElement;
 
     private static JsonElement[] Drivers(JsonDocument doc)
