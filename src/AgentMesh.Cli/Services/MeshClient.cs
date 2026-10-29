@@ -389,7 +389,7 @@ public class MeshClient
                 if (!sElem.TryGetProperty("id", out var idProp) || !Guid.TryParse(idProp.GetString(), out var sessionId))
                     continue;
 
-                string? workDir = null, model = null, effort = null, mode = null;
+                string? workDir = null, model = null, effort = null, mode = null, contextSize = null;
                 string? personaId = null, personaName = null, personaRole = null, personaPrompt = null;
                 string? jobId = null, projectId = null, gitBranch = null, workspaceType = null, conversationId = null;
                 if (sElem.TryGetProperty("personaId", out var topPid) && topPid.ValueKind == JsonValueKind.String)
@@ -410,6 +410,7 @@ public class MeshClient
                         if (mRoot.TryGetProperty("model", out var m)) model = m.GetString();
                         if (mRoot.TryGetProperty("effort", out var ef)) effort = ef.GetString();
                         if (mRoot.TryGetProperty("mode", out var md)) mode = md.GetString();
+                        if (mRoot.TryGetProperty("contextSize", out var cs)) contextSize = cs.GetString();
                         if (mRoot.TryGetProperty("conversationId", out var ci)) conversationId = ci.GetString();
                         else if (mRoot.TryGetProperty("conversation_id", out var ci2)) conversationId = ci2.GetString();
                         if (mRoot.TryGetProperty("personaId", out var pid)) personaId ??= pid.GetString();
@@ -483,6 +484,7 @@ public class MeshClient
                         Model = model,
                         Effort = effort,
                         Mode = mode,
+                        ContextSize = contextSize,
                         JobId = jobId,
                         ProjectId = projectId,
                         GitBranch = gitBranch,
@@ -520,7 +522,7 @@ public class MeshClient
                 if (!sElem.TryGetProperty("id", out var idProp) || !Guid.TryParse(idProp.GetString(), out var sessionId))
                     continue;
 
-                string? workDir = null, model = null, effort = null, mode = null;
+                string? workDir = null, model = null, effort = null, mode = null, contextSize = null;
                 string? pId = personaId, personaName = null, personaRole = null, personaPrompt = null;
                 string? jobId = null, projectId = null, gitBranch = null, workspaceType = null, conversationId = null;
                 string? driverId = sElem.TryGetProperty("driverId", out var didProp) ? didProp.GetString() : null;
@@ -543,6 +545,7 @@ public class MeshClient
                         if (mRoot.TryGetProperty("model", out var m)) model = m.GetString();
                         if (mRoot.TryGetProperty("effort", out var ef)) effort = ef.GetString();
                         if (mRoot.TryGetProperty("mode", out var md)) mode = md.GetString();
+                        if (mRoot.TryGetProperty("contextSize", out var cs)) contextSize = cs.GetString();
                         if (mRoot.TryGetProperty("conversationId", out var ci)) conversationId = ci.GetString();
                         else if (mRoot.TryGetProperty("conversation_id", out var ci2)) conversationId = ci2.GetString();
                         if (mRoot.TryGetProperty("personaId", out var pid)) pId ??= pid.GetString();
@@ -616,6 +619,7 @@ public class MeshClient
                         Model = model,
                         Effort = effort,
                         Mode = mode,
+                        ContextSize = contextSize,
                         JobId = jobId,
                         ProjectId = projectId,
                         GitBranch = gitBranch,

@@ -143,6 +143,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var effort = GetJsonPropString(elem, "effort");
                 var mode = GetJsonPropString(elem, "mode");
                 var tier = GetJsonPropString(elem, "tier");
+                var contextSize = GetJsonPropString(elem, "contextSize");
                 var personaName = GetJsonPropString(elem, "personaName");
                 var personaRole = GetJsonPropString(elem, "personaRole");
                 var personaPrompt = GetJsonPropString(elem, "personaPrompt");
@@ -173,6 +174,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                     Effort = effort,
                     Mode = mode,
                     Tier = tier,
+                    ContextSize = contextSize,
                     JobId = jobId,
                     ProjectId = projectId,
                     GitBranch = gitBranch,

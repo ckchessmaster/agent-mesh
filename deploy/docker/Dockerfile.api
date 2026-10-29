@@ -3,6 +3,7 @@ WORKDIR /src
 COPY . .
 RUN dotnet restore src/AgentMesh.Api/AgentMesh.Api.csproj
 RUN dotnet publish src/AgentMesh.Api/AgentMesh.Api.csproj -c Release -o /app/publish
+RUN dotnet publish src/AgentMesh.Cli/AgentMesh.Cli.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o /app/cli-publish
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 ENV DEBIAN_FRONTEND=noninteractive
@@ -30,6 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY --from=build /app/publish .
+COPY --from=build /app/cli-publish/agentmesh /usr/local/bin/agentmesh
+RUN chmod +x /usr/local/bin/agentmesh
 ENV ASPNETCORE_URLS=http://+:5000
 EXPOSE 5000
 ENTRYPOINT ["dotnet", "AgentMesh.Api.dll"]

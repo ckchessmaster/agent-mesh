@@ -683,6 +683,24 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             }
 
             await SeedPersonaGitHubCredentialsAsync(containerName, personaNormId, ct);
+
+            // Sync updated agentmesh CLI binary from host if available so existing containers run the latest version
+            try
+            {
+                var repoRoot = FindRepoRoot();
+                var hostAgentMeshCandidates = new[]
+                {
+                    Path.Combine(repoRoot, "dist", "cli", "linux-x64", "agentmesh"),
+                    "/usr/local/bin/agentmesh"
+                };
+                var hostAgentMesh = hostAgentMeshCandidates.FirstOrDefault(File.Exists);
+                if (!string.IsNullOrEmpty(hostAgentMesh))
+                {
+                    await RunCliAsync(_detectedCli, $"cp \"{hostAgentMesh}\" {containerName}:/usr/local/bin/agentmesh.new", ct);
+                    await RunCliAsync(_detectedCli, $"exec {containerName} /bin/bash -c \"chmod +x /usr/local/bin/agentmesh.new && mv -f /usr/local/bin/agentmesh.new /usr/local/bin/agentmesh\"", ct);
+                }
+            }
+            catch { }
         }
         catch (Exception ex)
         {
@@ -984,6 +1002,15 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 normPersonaId,
                 $"command -v {companionBin} 2>/dev/null || which {companionBin} 2>/dev/null || test -x /root/.local/bin/{binName} && echo /root/.local/bin/{binName}",
                 ct);
+
+            if ((binFindExit != 0 || string.IsNullOrWhiteSpace(binFindOut)) && !string.IsNullOrWhiteSpace(sidecar?.CompanionSetup))
+            {
+                await ExecInContainerAsync(normPersonaId, sidecar.CompanionSetup, ct);
+                (binFindExit, binFindOut, _) = await ExecInContainerAsync(
+                    normPersonaId,
+                    $"command -v {companionBin} 2>/dev/null || which {companionBin} 2>/dev/null || test -x /root/.local/bin/{binName} && echo /root/.local/bin/{binName}",
+                    ct);
+            }
 
             if (binFindExit == 0 && !string.IsNullOrWhiteSpace(binFindOut))
             {
@@ -1427,15 +1454,18 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         if (!string.IsNullOrWhiteSpace(loginCmd))
         {
+            var setupPrefix = !string.IsNullOrWhiteSpace(sidecar?.CompanionSetup)
+                ? $"({sidecar.CompanionSetup}) >/dev/null 2>&1 || true; "
+                : string.Empty;
             psi.ArgumentList.Add("/bin/bash");
             psi.ArgumentList.Add("-c");
-            psi.ArgumentList.Add($"export PATH=\"/root/.local/bin:/usr/local/bin:$PATH\"; {loginCmd}");
+            psi.ArgumentList.Add($"export PATH=\"/root/.local/bin:/usr/local/bin:$PATH\"; {setupPrefix}{loginCmd}");
         }
         else if (driverId.StartsWith("agy") || adapterType == "agy")
         {
-            psi.ArgumentList.Add("agy");
-            psi.ArgumentList.Add("-p");
-            psi.ArgumentList.Add("auth");
+            psi.ArgumentList.Add("/bin/bash");
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("rm -rf /tmp/agy-auth && mkdir -p /tmp/agy-auth && HOME=/tmp/agy-auth agy -p auth");
         }
         else if (driverId.StartsWith("claude") || adapterType == "claude")
         {
@@ -1490,6 +1520,23 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             {
                 tcsUrl.TrySetException(ex);
             }
+        });
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                string? line;
+                while ((line = await proc.StandardError.ReadLineAsync()) != null)
+                {
+                    var match = Regex.Match(line, @"https?://[^\s""'>]+");
+                    if (match.Success)
+                    {
+                        tcsUrl.TrySetResult(match.Value);
+                    }
+                }
+            }
+            catch { }
         });
 
         try
@@ -1566,7 +1613,10 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     }
                 }
 
-                var (chkExit, outStr, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                var (chkExit, outStr, _) = await ExecInContainerAsync(
+                    normPersonaId,
+                    "if [ -s /tmp/agy-auth/.gemini/antigravity-cli/antigravity-oauth-token ]; then mkdir -p /root/.gemini/antigravity-cli && cp /tmp/agy-auth/.gemini/antigravity-cli/antigravity-oauth-token /root/.gemini/antigravity-cli/antigravity-oauth-token; fi && cat /root/.gemini/antigravity-cli/antigravity-oauth-token",
+                    ct);
                 if (chkExit == 0 && !string.IsNullOrWhiteSpace(outStr))
                 {
                     try
@@ -2048,39 +2098,45 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             using var scope = _serviceProvider.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
             var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
-            if (!string.IsNullOrWhiteSpace(persona?.DriverId))
+            var resolvedDriverId = !string.IsNullOrWhiteSpace(persona?.DriverId)
+                ? persona.DriverId.Trim().TrimStart('@').ToLowerInvariant()
+                : normPersonaId.Trim().TrimStart('@').ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(resolvedDriverId))
             {
-                driverId = persona.DriverId.Trim().TrimStart('@').ToLowerInvariant();
-                var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
-                if (agent != null && !string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
+                var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == resolvedDriverId, ct);
+                if (agent != null)
                 {
-                    try
+                    driverId = resolvedDriverId;
+                    if (!string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
                     {
-                        using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
-                        var root = doc.RootElement;
-                        if (root.TryGetProperty("adapter", out var aProp) && aProp.ValueKind == JsonValueKind.String)
+                        try
                         {
-                            var aStr = aProp.GetString();
-                            if (!string.IsNullOrWhiteSpace(aStr)) adapterType = aStr.Trim().ToLowerInvariant();
-                        }
-                        else if (driverId.StartsWith("claude")) adapterType = "claude";
-                        else if (driverId.StartsWith("copilot")) adapterType = "copilot";
-                        else if (driverId.StartsWith("openai")) adapterType = "openai";
+                            using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
+                            var root = doc.RootElement;
+                            if (root.TryGetProperty("adapter", out var aProp) && aProp.ValueKind == JsonValueKind.String)
+                            {
+                                var aStr = aProp.GetString();
+                                if (!string.IsNullOrWhiteSpace(aStr)) adapterType = aStr.Trim().ToLowerInvariant();
+                            }
+                            else if (driverId.StartsWith("claude")) adapterType = "claude";
+                            else if (driverId.StartsWith("copilot")) adapterType = "copilot";
+                            else if (driverId.StartsWith("openai")) adapterType = "openai";
 
-                        if (root.TryGetProperty("endpoint", out var eProp) && eProp.ValueKind == JsonValueKind.String)
-                            endpoint = eProp.GetString()?.Trim();
-                        if (root.TryGetProperty("defaultModel", out var mProp) && mProp.ValueKind == JsonValueKind.String)
-                            defaultModel = mProp.GetString()?.Trim();
-                        if (root.TryGetProperty("apiKey", out var kProp) && kProp.ValueKind == JsonValueKind.String)
-                            hasApiKey = !string.IsNullOrWhiteSpace(kProp.GetString());
-                        if (root.TryGetProperty("loginCommand", out var lcProp) && lcProp.ValueKind == JsonValueKind.String)
-                            loginCmd = lcProp.GetString()?.Trim();
-                        if (root.TryGetProperty("authCheckCommand", out var acProp) && acProp.ValueKind == JsonValueKind.String)
-                            authCheckCmd = acProp.GetString()?.Trim();
-                        if (root.TryGetProperty("sidecar", out var scProp) && scProp.ValueKind == JsonValueKind.Object)
-                            sidecar = JsonSerializer.Deserialize<DriverSidecarConfig>(scProp.GetRawText());
+                            if (root.TryGetProperty("endpoint", out var eProp) && eProp.ValueKind == JsonValueKind.String)
+                                endpoint = eProp.GetString()?.Trim();
+                            if (root.TryGetProperty("defaultModel", out var mProp) && mProp.ValueKind == JsonValueKind.String)
+                                defaultModel = mProp.GetString()?.Trim();
+                            if (root.TryGetProperty("apiKey", out var kProp) && kProp.ValueKind == JsonValueKind.String)
+                                hasApiKey = !string.IsNullOrWhiteSpace(kProp.GetString());
+                            if (root.TryGetProperty("loginCommand", out var lcProp) && lcProp.ValueKind == JsonValueKind.String)
+                                loginCmd = lcProp.GetString()?.Trim();
+                            if (root.TryGetProperty("authCheckCommand", out var acProp) && acProp.ValueKind == JsonValueKind.String)
+                                authCheckCmd = acProp.GetString()?.Trim();
+                            if (root.TryGetProperty("sidecar", out var scProp) && scProp.ValueKind == JsonValueKind.Object)
+                                sidecar = JsonSerializer.Deserialize<DriverSidecarConfig>(scProp.GetRawText());
+                        }
+                        catch { }
                     }
-                    catch { }
                 }
             }
         }
@@ -2104,8 +2160,9 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             using var scope = _serviceProvider.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
             var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
-            if (persona == null) return null;
-            var driverId = !string.IsNullOrWhiteSpace(persona.DriverId) ? persona.DriverId.Trim().TrimStart('@').ToLowerInvariant() : null;
+            var driverId = !string.IsNullOrWhiteSpace(persona?.DriverId)
+                ? persona.DriverId.Trim().TrimStart('@').ToLowerInvariant()
+                : normPersonaId.Trim().TrimStart('@').ToLowerInvariant();
             if (string.IsNullOrWhiteSpace(driverId)) return null;
 
             var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
