@@ -264,12 +264,18 @@ public class OpenAiAdapterTests
     [Fact]
     public void ResolveModelContextLimit_ResolvesKnownModelsAndOptions()
     {
+        AgentMesh.Core.Services.ModelContextLimits.ClearLearnedLimits();
         OpenAiAdapter.ResolveModelContextLimit("qwen3.8-flash-next", null).Should().Be(524_288);
         OpenAiAdapter.ResolveModelContextLimit("llama3.3", null).Should().Be(131_072);
         OpenAiAdapter.ResolveModelContextLimit("qwen2.5-coder", null).Should().Be(131_072);
         OpenAiAdapter.ResolveModelContextLimit("custom", "256k").Should().Be(262_144);
+        OpenAiAdapter.ResolveModelContextLimit("custom", "512k").Should().Be(524_288);
         OpenAiAdapter.ResolveModelContextLimit("custom", "1m").Should().Be(1_048_576);
-        OpenAiAdapter.ResolveModelContextLimit("unknown", "default").Should().Be(131_072);
+        OpenAiAdapter.ResolveModelContextLimit("unknown", "default").Should().Be(1_048_576);
+
+        AgentMesh.Core.Services.ModelContextLimits.RecordLearnedLimit("unknown-custom-model", 262_144);
+        OpenAiAdapter.ResolveModelContextLimit("unknown-custom-model", "default").Should().Be(262_144);
+        AgentMesh.Core.Services.ModelContextLimits.ClearLearnedLimits();
     }
 
     [Fact]

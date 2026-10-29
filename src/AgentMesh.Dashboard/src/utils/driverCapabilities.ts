@@ -356,6 +356,17 @@ export function resolveCapabilitiesFor(
     const match = agents?.find((a) => a.id?.toLowerCase() === needle) ?? null;
     if (match) return resolveDriverCapabilities(capabilities, match);
 
+    const directDriver = capabilities.drivers?.find((d) => d.driverId?.toLowerCase() === needle) ?? null;
+    if (directDriver) {
+      return resolveDriverCapabilities(capabilities, {
+        id: directDriver.driverId,
+        name: directDriver.name,
+        runtimeType: directDriver.adapter === 'openai' ? 4 : 3,
+        trustTier: 1,
+        createdAt: directDriver.observedAt
+      });
+    }
+
     // Unregistered id: honour it as an adapter key when the API sent a baseline for it, so a
     // persona typed as "copilot" gets copilot modes rather than the agy defaults.
     const canonical = ADAPTER_ALIASES[needle];
@@ -432,6 +443,15 @@ export function contextOptionsFor(
 
   const perModel = model?.contextSizes;
   if (perModel && perModel.length > 0) {
+    if (perModel.length === 1 && String(perModel[0]).toLowerCase() === 'default') {
+      return [
+        {
+          id: 'default',
+          label: '1M (Auto-detect on overflow)',
+          description: 'Defaults to 1M token window and automatically learns the true server limit on overflow'
+        }
+      ];
+    }
     return perModel.map((id) => {
       const match = ladder.find((c) => c.id.toLowerCase() === String(id).toLowerCase());
       return match ?? { id: String(id), label: String(id), description: `${id} context window` };

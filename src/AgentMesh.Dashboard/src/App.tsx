@@ -2495,8 +2495,14 @@ export default function App() {
     setIsSavingDriverConfig(true);
     try {
       const config = await api.updateDriverConfig(agentId, patch);
-      // Reflect immediately so the row and session pickers show the new limits.
+      // Reflect immediately so the row and session pickers show the new limits and refreshed models.
       setAgents((prev) => prev.map((a) => (a.id === agentId ? { ...a, config } : a)));
+      try {
+        const refreshedCaps = await api.getCapabilities();
+        if (refreshedCaps) setCapabilities(refreshedCaps);
+      } catch {
+        // ignore
+      }
       setConfigAgent(null);
     } finally {
       setIsSavingDriverConfig(false);
@@ -3899,12 +3905,18 @@ export default function App() {
                           onChange={(e) => setNewSessionContextSize(e.target.value)}
                           className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 cursor-pointer"
                         >
-                          <option value="">Default Context</option>
-                          {availableContextSizes.map((cs) => (
-                            <option key={cs.id} value={cs.id} title={cs.description}>
-                              {cs.label}
-                            </option>
-                          ))}
+                          <option value="">
+                            {availableContextSizes.length === 1 && availableContextSizes[0].id === 'default'
+                              ? availableContextSizes[0].label
+                              : 'Default Context'}
+                          </option>
+                          {availableContextSizes
+                            .filter((cs) => cs.id !== 'default')
+                            .map((cs) => (
+                              <option key={cs.id} value={cs.id} title={cs.description}>
+                                {cs.label}
+                              </option>
+                            ))}
                         </select>
                       </div>
                     )}
@@ -5912,12 +5924,18 @@ export default function App() {
                         disabled={availablePersonaContextSizes.length === 0}
                         className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 disabled:opacity-40 cursor-pointer"
                       >
-                        <option value="">Driver / Model Default</option>
-                        {availablePersonaContextSizes.map((cs) => (
-                          <option key={cs.id} value={cs.id} title={cs.description}>
-                            {cs.label}
-                          </option>
-                        ))}
+                        <option value="">
+                          {availablePersonaContextSizes.length === 1 && availablePersonaContextSizes[0].id === 'default'
+                            ? availablePersonaContextSizes[0].label
+                            : 'Driver / Model Default'}
+                        </option>
+                        {availablePersonaContextSizes
+                          .filter((cs) => cs.id !== 'default')
+                          .map((cs) => (
+                            <option key={cs.id} value={cs.id} title={cs.description}>
+                              {cs.label}
+                            </option>
+                          ))}
                       </select>
                     </div>
 
@@ -6147,6 +6165,14 @@ export default function App() {
           onClose={() => setConfigAgent(null)}
           onSave={(patch) => handleSaveDriverConfig(configAgent.id, patch)}
           onDelete={() => handleDeleteAgent(configAgent.id)}
+          onAuthSuccess={async () => {
+            const [refreshedCaps, refreshedAgents] = await Promise.all([
+              api.getCapabilities().catch(() => null),
+              api.getAgents().catch(() => null)
+            ]);
+            if (refreshedCaps) setCapabilities(refreshedCaps);
+            if (refreshedAgents) setAgents(refreshedAgents);
+          }}
         />
       )}
 

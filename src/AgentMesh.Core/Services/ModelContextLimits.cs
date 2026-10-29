@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace AgentMesh.Core.Services;
 
 /// <summary>
@@ -21,11 +23,11 @@ namespace AgentMesh.Core.Services;
 public static class ModelContextLimits
 {
     /// <summary>
-    /// The budget applied when neither the user nor the model table says anything. 128k is the
-    /// smallest window every model we know of actually supports, so over-estimating is not a
-    /// risk; under-estimating only costs headroom.
+    /// The budget applied when neither the user, a learned overflow limit, nor the model table says
+    /// anything. Defaults to 1M (1,048,576 tokens) and auto-detects the true limit if the server
+    /// returns a context-window overflow error.
     /// </summary>
-    public const int DefaultTokenLimit = 131_072;
+    public const int DefaultTokenLimit = 1_048_576;
 
     /// <summary>
     /// Largest window the picker may offer. Sized to the widest contract any driver we forward to
@@ -33,6 +35,32 @@ public static class ModelContextLimits
     /// caps at 1M).
     /// </summary>
     public const int MaxSelectableTokenLimit = 1_048_576;
+
+    private static readonly ConcurrentDictionary<string, int> LearnedLimits =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Records a model's true context limit discovered from a server response or context-exceeded error.
+    /// </summary>
+    public static void RecordLearnedLimit(string? model, int tokens)
+    {
+        if (string.IsNullOrWhiteSpace(model) || tokens <= 0) return;
+        LearnedLimits[model.Trim()] = tokens;
+    }
+
+    /// <summary>
+    /// Returns a model's learned context limit if one has been recorded at runtime.
+    /// </summary>
+    public static int? GetLearnedLimit(string? model)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return null;
+        return LearnedLimits.TryGetValue(model.Trim(), out var tokens) && tokens > 0 ? tokens : null;
+    }
+
+    /// <summary>
+    /// Clears runtime learned context limits (primarily for test isolation).
+    /// </summary>
+    public static void ClearLearnedLimits() => LearnedLimits.Clear();
 
     /// <summary>
     /// Known model families and the windows they were verified against. A model that is not
@@ -65,6 +93,14 @@ public static class ModelContextLimits
                 requested.Value,
                 IsFallback: false,
                 Source: $"option:{contextSizeOption!.Trim().ToLowerInvariant()}");
+        }
+
+        if (GetLearnedLimit(model) is { } learned)
+        {
+            return new ModelContextResolution(
+                learned,
+                IsFallback: false,
+                Source: "learned:overflow");
         }
 
         var lowered = (model ?? string.Empty).ToLowerInvariant();

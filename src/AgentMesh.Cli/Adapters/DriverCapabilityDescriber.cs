@@ -185,8 +185,8 @@ internal static class DriverCapabilityDescriber
                     endpoint);
             }
 
-            var ids = DriverModelDiscovery.ParseOpenAiModelIds(body);
-            if (ids.Count == 0)
+            var discovered = DriverModelDiscovery.ParseOpenAiModels(body);
+            if (discovered.Count == 0)
             {
                 return Unavailable(
                     DriverAdapters.OpenAi,
@@ -204,13 +204,14 @@ internal static class DriverCapabilityDescriber
                 // OpenAI-compatible servers share an adapter, so the old server's catalogue - or its
                 // 401 - would keep answering for the new one until this runner re-registered.
                 Endpoint = endpoint,
-                Models = ids.Select(id => new DriverCapabilityDeclaration.DeclaredModel
+                Models = discovered.Select(m => new DriverCapabilityDeclaration.DeclaredModel
                 {
-                    Id = id,
-                    Name = id,
+                    Id = m.Id,
+                    Name = m.Id,
                     // /models reports no effort support, and the adapter forwards none, so an
                     // empty list here is the honest answer rather than a plausible one.
-                    Efforts = Array.Empty<string>()
+                    Efforts = Array.Empty<string>(),
+                    MaxContextTokens = m.MaxContextTokens
                 }).ToList(),
                 SupportsContextSelection = supportsContext,
                 Source = "openai-models-endpoint",

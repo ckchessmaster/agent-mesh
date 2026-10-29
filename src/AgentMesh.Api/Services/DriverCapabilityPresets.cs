@@ -118,5 +118,5 @@ public static class DriverCapabilityPresets
     /// OpenAI-compatible model while <c>ResolveModelContextLimit</c> capped the run at 128k.
     /// </remarks>
     public static IReadOnlyList<string> GenericContextSizes { get; } =
-        new[] { "default", "32k", "128k", "200k", "256k", "500k", "1m" };
+        new[] { "default", "32k", "64k", "128k", "200k", "256k", "500k", "512k", "1m" };
 }

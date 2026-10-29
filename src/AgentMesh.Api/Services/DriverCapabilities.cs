@@ -32,10 +32,12 @@ public record DriverCapabilitiesView(
     // that change or never declared anything. Kept separate from `models` because they are
     // different kinds of claim: `models` is an operator's typed allow-list, this is a machine's
     // self-report about the binary next to it.
-    DriverCapabilityDeclaration? Declared = null)
+    DriverCapabilityDeclaration? Declared = null,
+    bool HasOAuthToken = false,
+    IReadOnlyDictionary<string, int>? LearnedContextLimits = null)
 {
     public static readonly DriverCapabilitiesView Empty =
-        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null, null);
+        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null, null, null, false, null);
 
     /// <summary>
     /// Models an operator wrote into the blob. Merged over whatever the capability probe finds and
@@ -54,8 +56,11 @@ public record DriverCapabilitiesView(
     public DriverCapabilityProbeRequest ToProbeRequest(
         string driverId,
         AgentMesh.Core.Enums.RuntimeType runtimeType,
-        bool forceRefresh = false)
-        => new(
+        bool forceRefresh = false,
+        string? rawCapabilitiesJson = null)
+    {
+        var (apiKey, unredactedSidecar, oauthToken) = DriverCapabilities.ExtractProbeSecrets(rawCapabilitiesJson, Sidecar);
+        return new(
             DriverId: driverId,
             RuntimeType: runtimeType,
             Adapter: Adapter,
@@ -63,7 +68,12 @@ public record DriverCapabilitiesView(
             OperatorModels: OperatorModels,
             DefaultModel: DefaultModel,
             ForceRefresh: forceRefresh,
-            Declared: Declared);
+            Declared: Declared,
+            ApiKey: apiKey,
+            Sidecar: unredactedSidecar,
+            LearnedContextLimits: LearnedContextLimits,
+            OAuthToken: oauthToken);
+    }
 }
 
 /// <summary>
@@ -150,6 +160,20 @@ public static class DriverCapabilities
                 continue;
             }
 
+            if (key.Equals("learnedContextLimits", StringComparison.OrdinalIgnoreCase) &&
+                value is JsonObject incomingLimits &&
+                existingObj[key] is JsonObject existingLimits)
+            {
+                var mergedLimits = existingLimits.DeepClone().AsObject();
+                foreach (var (lKey, lVal) in incomingLimits)
+                {
+                    if (lVal is null) continue;
+                    mergedLimits[lKey] = lVal.DeepClone();
+                }
+                existingObj[key] = mergedLimits;
+                continue;
+            }
+
             existingObj[key] = value.DeepClone();
         }
 
@@ -215,6 +239,15 @@ public static class DriverCapabilities
             catch { }
         }
 
+        var learnedLimits = ReadLearnedContextLimits(obj);
+        if (learnedLimits != null)
+        {
+            foreach (var (model, tokens) in learnedLimits)
+            {
+                ModelContextLimits.RecordLearnedLimit(model, tokens);
+            }
+        }
+
         return new DriverCapabilitiesView(
             Adapter: ReadString(obj, "adapter"),
             Endpoint: ReadString(obj, "endpoint"),
@@ -235,7 +268,70 @@ public static class DriverCapabilities
             Models: ReadModelIds(obj["models"]),
             // Read from the already-parsed tree rather than re-parsing the string: this runs for
             // every driver on every capability request.
-            Declared: DriverCapabilityDeclaration.TryRead(obj));
+            Declared: DriverCapabilityDeclaration.TryRead(obj),
+            HasOAuthToken: !string.IsNullOrWhiteSpace(ReadString(obj, "oauthToken")),
+            LearnedContextLimits: learnedLimits);
+    }
+
+    internal static (string? ApiKey, DriverSidecarConfig? Sidecar, string? OAuthToken) ExtractProbeSecrets(
+        string? rawCapabilitiesJson,
+        DriverSidecarConfig? viewSidecar)
+    {
+        if (string.IsNullOrWhiteSpace(rawCapabilitiesJson))
+        {
+            return (null, viewSidecar, null);
+        }
+
+        try
+        {
+            var node = JsonNode.Parse(rawCapabilitiesJson);
+            if (node is not JsonObject obj) return (null, viewSidecar, null);
+
+            var apiKey = ReadString(obj, "apiKey");
+            var oauthToken = ReadString(obj, "oauthToken");
+            DriverSidecarConfig? sidecar = viewSidecar;
+            if (obj.TryGetPropertyValue("sidecar", out var sidecarNode) && sidecarNode is JsonObject sidecarObj)
+            {
+                try
+                {
+                    sidecar = JsonSerializer.Deserialize<DriverSidecarConfig>(sidecarObj.ToJsonString());
+                }
+                catch { }
+            }
+
+            return (
+                string.IsNullOrWhiteSpace(apiKey) ? null : apiKey.Trim(),
+                sidecar,
+                string.IsNullOrWhiteSpace(oauthToken) ? null : oauthToken.Trim());
+        }
+        catch
+        {
+            return (null, viewSidecar, null);
+        }
+    }
+
+    private static IReadOnlyDictionary<string, int>? ReadLearnedContextLimits(JsonObject obj)
+    {
+        if (!obj.TryGetPropertyValue("learnedContextLimits", out var node) || node is not JsonObject limitsObj)
+        {
+            return null;
+        }
+
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, val) in limitsObj)
+        {
+            if (string.IsNullOrWhiteSpace(key) || val is not JsonValue jVal) continue;
+            if (jVal.TryGetValue<int>(out var i) && i > 0)
+            {
+                map[key.Trim()] = i;
+            }
+            else if (jVal.TryGetValue<long>(out var l) && l is > 0 and <= int.MaxValue)
+            {
+                map[key.Trim()] = (int)l;
+            }
+        }
+
+        return map.Count > 0 ? map : null;
     }
 
     private static IReadOnlyList<string> ReadStringArray(JsonArray array)

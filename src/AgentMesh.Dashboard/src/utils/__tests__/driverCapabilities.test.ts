@@ -359,6 +359,54 @@ describe('contextOptionsFor', () => {
 
     expect(contextOptionsFor(resolved, 'unknown-model').map((o) => o.id)).toContain('128k');
   });
+
+  it('displays 1M (Auto-detect on overflow) when a model has only default context size', () => {
+    const a = agent({ id: 'openai-driver', capabilitiesJson: JSON.stringify({ adapter: 'openai', endpoint: 'http://h/v1' }) });
+    const resolved = resolveDriverCapabilities(
+      response([
+        {
+          ...probedAgy,
+          driverId: a.id,
+          adapter: 'openai',
+          supportsContextSelection: true,
+          models: [{ id: 'mystery-model', name: 'Mystery', efforts: [], contextSizes: ['default'] }]
+        }
+      ]),
+      a
+    );
+
+    const options = contextOptionsFor(resolved, 'mystery-model');
+    expect(options).toHaveLength(1);
+    expect(options[0].id).toBe('default');
+    expect(options[0].label).toBe('1M (Auto-detect on overflow)');
+  });
+
+  it('includes 64k and 512k labels when reported for a 512k model', () => {
+    const a = agent({ id: 'openai-driver', capabilitiesJson: JSON.stringify({ adapter: 'openai', endpoint: 'http://h/v1' }) });
+    const resolved = resolveDriverCapabilities(
+      response([
+        {
+          ...probedAgy,
+          driverId: a.id,
+          adapter: 'openai',
+          supportsContextSelection: true,
+          models: [
+            {
+              id: 'qwen3.8-flash-next',
+              name: 'Qwen 3.8 Flash Next',
+              efforts: [],
+              contextSizes: ['default', '32k', '64k', '128k', '200k', '256k', '500k', '512k']
+            }
+          ]
+        }
+      ]),
+      a
+    );
+
+    const options = contextOptionsFor(resolved, 'qwen3.8-flash-next');
+    expect(options.map((o) => o.id)).toContain('64k');
+    expect(options.map((o) => o.id)).toContain('512k');
+  });
 });
 
 describe('isContextSizeMeaningful / effectiveContextSize', () => {

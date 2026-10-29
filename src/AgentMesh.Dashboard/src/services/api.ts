@@ -327,6 +327,44 @@ export const api = {
     return res.json();
   },
 
+  async verifyDriver(driverId: string): Promise<PersonaDriverVerificationResult> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(driverId)}/verify`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to verify driver: ${res.statusText}`);
+    return res.json();
+  },
+
+  async startDriverAuth(driverId: string): Promise<PersonaAuthStartResult> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(driverId)}/auth/start`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to initiate driver login: ${res.statusText}`);
+    return res.json();
+  },
+
+  async submitDriverAuthCode(driverId: string, code: string): Promise<PersonaAuthSubmitResult> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(driverId)}/auth/submit`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ code })
+    });
+    if (!res.ok) throw new Error(`Failed to submit driver auth code: ${res.statusText}`);
+    return res.json();
+  },
+
+  async configureDriverApiKey(driverId: string, apiKey: string, provider?: string): Promise<PersonaAuthSubmitResult> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(driverId)}/auth/apikey`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ apiKey, provider })
+    });
+    if (!res.ok) throw new Error(`Failed to configure driver API key: ${res.statusText}`);
+    return res.json();
+  },
+
   async getAgentUsage(agentId: string, refresh = false): Promise<AgentUsageResponse> {
     const url = `/api/agents/${encodeURIComponent(agentId)}/usage${refresh ? '?refresh=true' : ''}`;
     const res = await apiFetch(url, { headers: getHeaders() });

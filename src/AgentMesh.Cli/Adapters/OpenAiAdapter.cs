@@ -33,6 +33,12 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
     public static Func<Guid, string, string, Task>? CommandOutputBroadcaster { get; set; }
 
+    /// <summary>
+    /// Optional callback invoked when a context-window overflow error reveals a model's true token limit.
+    /// Args: (driverId, modelId, maxContextTokens).
+    /// </summary>
+    public static Func<string, string, int, Task>? LearnedContextLimitReporter { get; set; }
+
     public static string HistoryDirectoryPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".agentmesh",
@@ -636,6 +642,23 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     if (isContextErr)
                     {
                         var effectiveLimit = parsedLimit ?? modelContextLimit;
+                        if (parsedLimit.HasValue && parsedLimit.Value > 0)
+                        {
+                            ModelContextLimits.RecordLearnedLimit(effectiveModel, parsedLimit.Value);
+                            modelContextLimit = Math.Min(modelContextLimit, parsedLimit.Value);
+                            var reporter = LearnedContextLimitReporter;
+                            var reportDriverId = preset.Id;
+                            var reportModel = effectiveModel;
+                            var reportLimit = parsedLimit.Value;
+                            if (reporter != null && !string.IsNullOrWhiteSpace(reportDriverId))
+                            {
+                                _ = Task.Run(async () =>
+                                {
+                                    try { await reporter(reportDriverId, reportModel, reportLimit); } catch { }
+                                });
+                            }
+                        }
+
                         var targetTokens = (int)(effectiveLimit * 0.70);
                         await onEvent(new TrajectoryEventPayload
                         {

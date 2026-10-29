@@ -623,15 +623,54 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
             var hostAgyState = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity_state.pbtxt");
 
-            // Check persona-specific cached oauth token
             var personaNormId = containerName.Replace("agentmesh-persona-", "");
             var personaOauthFile = Path.Combine(userHome, ".agentmesh", "tokens", $"{personaNormId}.oauth");
-            var sourceToken = File.Exists(personaOauthFile) ? personaOauthFile : (File.Exists(hostAgyToken) ? hostAgyToken : null);
+            string? driverOauthFile = null;
+
+            try
+            {
+                using var scope = _serviceProvider.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+                var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == personaNormId, ct);
+                var driverId = persona?.DriverId?.Trim().TrimStart('@').ToLowerInvariant();
+                if (!string.IsNullOrWhiteSpace(driverId))
+                {
+                    driverOauthFile = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{driverId}.oauth");
+                    var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
+                    if (driver != null && !string.IsNullOrWhiteSpace(driver.CapabilitiesJson))
+                    {
+                        using var doc = JsonDocument.Parse(driver.CapabilitiesJson);
+                        if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                            doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
+                            tokProp.ValueKind == JsonValueKind.String &&
+                            !string.IsNullOrWhiteSpace(tokProp.GetString()))
+                        {
+                            var rawTok = tokProp.GetString()!.Trim();
+                            var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                            Directory.CreateDirectory(tokensDir);
+                            await File.WriteAllTextAsync(driverOauthFile, rawTok, ct);
+                            if (!File.Exists(hostAgyToken))
+                            {
+                                var dir = Path.GetDirectoryName(hostAgyToken);
+                                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                                await File.WriteAllTextAsync(hostAgyToken, rawTok, ct);
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            var sourceToken = File.Exists(personaOauthFile)
+                ? personaOauthFile
+                : (!string.IsNullOrEmpty(driverOauthFile) && File.Exists(driverOauthFile)
+                    ? driverOauthFile
+                    : (File.Exists(hostAgyToken) ? hostAgyToken : null));
 
             if (!string.IsNullOrEmpty(sourceToken))
             {
-                var (chkExit, _, _) = await RunCliAsync(_detectedCli, $"exec {containerName} test -f /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
-                if (chkExit != 0)
+                var (chkExit, _, _) = await RunCliAsync(_detectedCli, $"exec {containerName} test -s /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                if (chkExit != 0 || (!string.IsNullOrEmpty(driverOauthFile) && sourceToken == driverOauthFile))
                 {
                     await RunCliAsync(_detectedCli, $"exec {containerName} mkdir -p /root/.gemini/antigravity-cli", ct);
                     await RunCliAsync(_detectedCli, $"cp \"{sourceToken}\" {containerName}:/root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
@@ -1532,10 +1571,20 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 {
                     try
                     {
-                        var tokensDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "tokens");
+                        var trimmedToken = outStr.Trim();
+                        var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                        var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
                         Directory.CreateDirectory(tokensDir);
                         var oauthFile = Path.Combine(tokensDir, $"{normPersonaId}.oauth");
-                        File.WriteAllText(oauthFile, outStr.Trim());
+                        File.WriteAllText(oauthFile, trimmedToken);
+                        if (!string.IsNullOrWhiteSpace(info.DriverId))
+                        {
+                            File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), trimmedToken);
+                        }
+                        var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+                        var hostDir = Path.GetDirectoryName(hostAgyToken);
+                        if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
+                        File.WriteAllText(hostAgyToken, trimmedToken);
                     }
                     catch { }
                     return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials!");

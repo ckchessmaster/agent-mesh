@@ -1,4 +1,4 @@
-﻿import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { DriverConfigModal, DRIVER_LIMIT_DEFAULTS } from '../DriverConfigModal';
 import type { Agent } from '../../types';
@@ -216,5 +216,20 @@ describe('DriverConfigModal', () => {
 
     // adapter came from capabilitiesJson, so limits must still be offered.
     expect(screen.getByLabelText(/Max steps per turn/i)).toBeInTheDocument();
+  });
+
+  it('renders Driver Authentication & Model Discovery controls for CLI drivers', () => {
+    render(
+      <DriverConfigModal
+        agent={cliAgent}
+        initialConfig={cliAgent.config}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText(/Driver Authentication & Model Discovery/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Authenticate Driver/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Verify & Refresh Models/i })).toBeInTheDocument();
   });
 });

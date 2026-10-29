@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Box,
   Play,
@@ -7,13 +7,7 @@ import {
   X,
   Terminal as TerminalIcon,
   Cpu,
-  CheckCircle2,
   AlertTriangle,
-  XCircle,
-  KeyRound,
-  ExternalLink,
-  ShieldCheck,
-  Activity,
   Layers
 } from 'lucide-react';
 import { Terminal } from '@xterm/xterm';
@@ -23,9 +17,7 @@ import '@xterm/xterm/css/xterm.css';
 import { api } from '../services/api';
 import type {
   Persona,
-  PersonaEnvironmentStatus,
-  PersonaDriverVerificationResult,
-  PersonaAuthStartResult
+  PersonaEnvironmentStatus
 } from '../types';
 
 interface PersonaEnvironmentModalProps {
@@ -34,45 +26,12 @@ interface PersonaEnvironmentModalProps {
 }
 
 export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = ({ persona, onClose }) => {
-  const [activeTab, setActiveTab] = useState<'overview' | 'verify' | 'terminal'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'terminal'>('overview');
   const [status, setStatus] = useState<PersonaEnvironmentStatus | null>(null);
   const [logs, setLogs] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [actionPending, setActionPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const driverType = useMemo(() => {
-    const raw = (persona.driverId || '').toLowerCase().trim();
-    if (raw.includes('claude') || raw.includes('anthropic')) return 'claude';
-    if (raw.includes('copilot') || raw.includes('github')) return 'copilot';
-    if (raw.includes('openai') || raw.includes('ollama') || raw.includes('vllm')) return 'openai';
-    if (raw.includes('agy') || raw.includes('gemini') || raw.includes('google')) return 'agy';
-    return 'generic';
-  }, [persona.driverId]);
-
-  const driverDisplayName = useMemo(() => {
-    if (persona.driverName && !persona.driverName.startsWith('@')) return persona.driverName;
-    if (driverType === 'claude') return 'Claude Code (Anthropic)';
-    if (driverType === 'copilot') return 'GitHub Copilot';
-    if (driverType === 'openai') return 'OpenAI Compatible';
-    if (driverType === 'agy') return 'Google AI Pro (Gemini)';
-    return persona.driverId ? `@${persona.driverId}` : 'Driver';
-  }, [persona.driverName, persona.driverId, driverType]);
-
-  // Verification state
-  const [verifying, setVerifying] = useState(false);
-  const [verifyResult, setVerifyResult] = useState<PersonaDriverVerificationResult | null>(null);
-
-  // Auth state (Dual-Mode: OAuth & API Key)
-  const [showAuthWizard, setShowAuthWizard] = useState(false);
-  const [authMode, setAuthMode] = useState<'oauth' | 'apikey'>('oauth');
-  const [authStarting, setAuthStarting] = useState(false);
-  const [authSubmitting, setAuthSubmitting] = useState(false);
-  const [authStartResult, setAuthStartResult] = useState<PersonaAuthStartResult | null>(null);
-  const [authCodeInput, setAuthCodeInput] = useState('');
-  const [apiKeyInput, setApiKeyInput] = useState('');
-  const [apiKeySaving, setApiKeySaving] = useState(false);
-  const [authSuccessMessage, setAuthSuccessMessage] = useState<string | null>(null);
 
   // Web Terminal state & refs
   const terminalContainerRef = useRef<HTMLDivElement | null>(null);
@@ -147,86 +106,6 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
       setError(msg);
     } finally {
       setActionPending(false);
-    }
-  };
-
-  const handleRunVerification = async () => {
-    try {
-      setVerifying(true);
-      setError(null);
-      const res = await api.verifyPersonaDriver(persona.id);
-      setVerifyResult(res);
-      await fetchStatusAndLogs();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-    } finally {
-      setVerifying(false);
-    }
-  };
-
-  const handleStartAuth = async () => {
-    try {
-      setAuthStarting(true);
-      setError(null);
-      setAuthSuccessMessage(null);
-      setShowAuthWizard(true);
-      const res = await api.startPersonaAuth(persona.id);
-      setAuthStartResult(res);
-      if (res.status === 'already_authenticated') {
-        setAuthSuccessMessage(res.instructions || `Driver is already authenticated with ${driverDisplayName}.`);
-      } else if (res.status === 'apikey_required') {
-        setAuthMode('apikey');
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-    } finally {
-      setAuthStarting(false);
-    }
-  };
-
-  const handleSubmitAuthCode = async () => {
-    if (!authCodeInput.trim()) return;
-    try {
-      setAuthSubmitting(true);
-      setError(null);
-      const res = await api.submitPersonaAuthCode(persona.id, authCodeInput.trim());
-      if (res.status === 'authenticated') {
-        setAuthSuccessMessage(res.message || `Successfully authenticated ${driverDisplayName} credentials!`);
-        setAuthCodeInput('');
-        setAuthStartResult(null);
-        await handleRunVerification();
-      } else {
-        setError(res.errorMessage || 'Failed to submit authorization code.');
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-    } finally {
-      setAuthSubmitting(false);
-    }
-  };
-
-  const handleSaveApiKey = async () => {
-    if (!apiKeyInput.trim()) return;
-    try {
-      setApiKeySaving(true);
-      setError(null);
-      const res = await api.configurePersonaApiKey(persona.id, apiKeyInput.trim());
-      if (res.status === 'authenticated') {
-        setAuthSuccessMessage(res.message || 'API key successfully configured!');
-        setApiKeyInput('');
-        setShowAuthWizard(false);
-        await handleRunVerification();
-      } else {
-        setError(res.errorMessage || 'Failed to configure API key.');
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-    } finally {
-      setApiKeySaving(false);
     }
   };
 
@@ -333,7 +212,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                 <span>{persona.name} Environment</span>
                 <span className="font-mono text-xs text-slate-400 font-normal">@{persona.id}</span>
               </h3>
-              <p className="text-xs text-slate-400">Dedicated persona container & driver management</p>
+              <p className="text-xs text-slate-400">Dedicated persona container &amp; interactive terminal</p>
             </div>
           </div>
           <button
@@ -355,33 +234,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
             }`}
           >
             <Layers className="w-3.5 h-3.5" />
-            <span>Overview & Logs</span>
-          </button>
-
-          <button
-            onClick={() => {
-              setActiveTab('verify');
-              if (!verifyResult && !verifying) handleRunVerification();
-            }}
-            className={`px-3 py-2 border-b-2 font-medium flex items-center gap-1.5 transition shrink-0 ${
-              activeTab === 'verify'
-                ? 'border-sky-500 text-sky-400 font-semibold'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <ShieldCheck className="w-3.5 h-3.5" />
-            <span>Driver Health</span>
-            {verifyResult && (
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  verifyResult.overallStatus === 'passed'
-                    ? 'bg-emerald-400'
-                    : verifyResult.overallStatus === 'warning'
-                    ? 'bg-amber-400'
-                    : 'bg-red-400'
-                }`}
-              />
-            )}
+            <span>Overview &amp; Logs</span>
           </button>
 
           <button
@@ -403,13 +256,6 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
           {(error || status?.errorMessage) && (
             <div className="p-3 rounded-lg bg-red-950/40 border border-red-500/30 text-xs text-red-300 leading-relaxed font-mono whitespace-pre-wrap break-all">
               {error || status?.errorMessage}
-            </div>
-          )}
-
-          {authSuccessMessage && (
-            <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-xs text-emerald-300 leading-relaxed flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>{authSuccessMessage}</span>
             </div>
           )}
 
@@ -435,7 +281,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                     className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold whitespace-nowrap flex items-center gap-1.5 transition disabled:opacity-50"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${actionPending ? 'animate-spin' : ''}`} />
-                    <span>Restart & Update</span>
+                    <span>Restart &amp; Update</span>
                   </button>
                 </div>
               )}
@@ -523,27 +369,6 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
                   </button>
 
                   <button
-                    onClick={() => {
-                      setActiveTab('verify');
-                      handleRunVerification();
-                    }}
-                    disabled={verifying}
-                    className="px-3 py-1.5 rounded-lg bg-sky-950/60 hover:bg-sky-900/60 text-sky-300 border border-sky-800/40 text-xs font-medium flex items-center gap-1.5 transition disabled:opacity-50"
-                  >
-                    <Activity className={`w-3.5 h-3.5 ${verifying ? 'animate-spin' : ''}`} />
-                    <span>Verify Driver</span>
-                  </button>
-
-                  <button
-                    onClick={handleStartAuth}
-                    disabled={authStarting}
-                    className="px-3 py-1.5 rounded-lg bg-purple-950/60 hover:bg-purple-900/60 text-purple-300 border border-purple-800/40 text-xs font-medium flex items-center gap-1.5 transition disabled:opacity-50"
-                  >
-                    <KeyRound className="w-3.5 h-3.5" />
-                    <span>Authenticate Driver</span>
-                  </button>
-
-                  <button
                     onClick={fetchStatusAndLogs}
                     disabled={loading || actionPending}
                     className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium flex items-center gap-1.5 transition disabled:opacity-50"
@@ -555,7 +380,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
 
                 <div className="flex items-center gap-1.5 text-[11px] text-slate-400 font-mono">
                   <Cpu className="w-3 h-3 text-slate-500" />
-                  <span>Volumes: /workspace & /root</span>
+                  <span>Volumes: /workspace &amp; /root</span>
                 </div>
               </div>
 
@@ -575,122 +400,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
             </div>
           )}
 
-          {/* TAB 2: DRIVER HEALTH & VERIFICATION */}
-          {activeTab === 'verify' && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h4 className="font-semibold text-sm text-white">Driver Diagnostics</h4>
-                  <p className="text-xs text-slate-400">Verifying CLI executable, auth tokens, mesh connectivity & dry-run execution</p>
-                </div>
-                <button
-                  onClick={handleRunVerification}
-                  disabled={verifying}
-                  className="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium flex items-center gap-1.5 transition disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${verifying ? 'animate-spin' : ''}`} />
-                  <span>{verifying ? 'Verifying...' : 'Re-run Diagnostics'}</span>
-                </button>
-              </div>
-
-              {verifyResult ? (
-                <div className="space-y-3">
-                  <div className={`p-3 rounded-xl border flex items-center justify-between text-xs font-medium ${
-                    verifyResult.overallStatus === 'passed'
-                      ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-300'
-                      : verifyResult.overallStatus === 'warning'
-                      ? 'bg-amber-950/30 border-amber-500/30 text-amber-300'
-                      : 'bg-red-950/30 border-red-500/30 text-red-300'
-                  }`}>
-                    <div className="flex items-center gap-2">
-                      {verifyResult.overallStatus === 'passed' ? (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      ) : verifyResult.overallStatus === 'warning' ? (
-                        <AlertTriangle className="w-4 h-4 text-amber-400" />
-                      ) : (
-                        <XCircle className="w-4 h-4 text-red-400" />
-                      )}
-                      <span>
-                        Overall Diagnostic Result: <strong className="uppercase font-mono">{verifyResult.overallStatus}</strong>
-                      </span>
-                    </div>
-                    <span className="text-[11px] font-mono text-slate-400">Driver: @{verifyResult.driverId}</span>
-                  </div>
-
-                  <div className="divide-y divide-slate-800/80 rounded-xl bg-slate-950/60 border border-slate-800/80 overflow-hidden">
-                    {verifyResult.steps.map((step, idx) => (
-                      <div key={idx} className="p-3 flex items-start gap-3">
-                        <div className="mt-0.5">
-                          {step.status === 'success' ? (
-                            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                          ) : step.status === 'warning' ? (
-                            <AlertTriangle className="w-4 h-4 text-amber-400" />
-                          ) : (
-                            <XCircle className="w-4 h-4 text-red-400" />
-                          )}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between">
-                            <span className="font-semibold text-xs text-white">{step.name}</span>
-                            <span className={`text-[10px] uppercase font-mono px-2 py-0.5 rounded ${
-                              step.status === 'success'
-                                ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800/40'
-                                : step.status === 'warning'
-                                ? 'bg-amber-950/80 text-amber-400 border border-amber-800/40'
-                                : 'bg-red-950/80 text-red-400 border border-red-800/40'
-                            }`}>
-                              {step.status}
-                            </span>
-                          </div>
-                          <p className="text-xs text-slate-300 mt-1 font-mono break-all leading-relaxed">
-                            {step.details}
-                          </p>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  {verifyResult.steps.some(s => s.status !== 'success' && (s.name.includes('Auth') || s.name.includes('Binary'))) && (
-                    <div className="p-3.5 rounded-xl bg-purple-950/40 border border-purple-800/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                      <div>
-                        <strong className="text-purple-200 block">Driver Authentication / Setup Required</strong>
-                        <p className="text-purple-300/80 text-[11px] mt-0.5">Authenticate via {driverDisplayName} interactive login or configure an API key directly.</p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => {
-                            setAuthMode('oauth');
-                            setShowAuthWizard(true);
-                            handleStartAuth();
-                          }}
-                          className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs flex items-center gap-1.5 shrink-0 transition cursor-pointer"
-                        >
-                          <KeyRound className="w-3.5 h-3.5" />
-                          <span>Interactive Login</span>
-                        </button>
-                        <button
-                          onClick={() => {
-                            setAuthMode('apikey');
-                            setShowAuthWizard(true);
-                          }}
-                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs flex items-center gap-1.5 shrink-0 transition border border-slate-700 cursor-pointer"
-                        >
-                          <KeyRound className="w-3.5 h-3.5" />
-                          <span>Direct API Key</span>
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="p-8 text-center text-slate-500 text-xs font-mono">
-                  {verifying ? 'Running diagnostics in container...' : 'Click "Re-run Diagnostics" to test driver readiness.'}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* TAB 3: INTERACTIVE WEB TERMINAL */}
+          {/* TAB 2: INTERACTIVE WEB TERMINAL */}
           {activeTab === 'terminal' && (
             <div className="space-y-3">
               <div className="flex items-center justify-between text-xs text-slate-400">
@@ -709,187 +419,11 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
               />
             </div>
           )}
-
-          {/* OAUTH DEVICE-CODE WIZARD MODAL / CARD */}
-          {showAuthWizard && (
-            <div className="p-4 rounded-xl bg-slate-950 border border-purple-500/40 space-y-3 text-xs animate-in fade-in">
-              <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
-                <div className="flex items-center gap-2 text-purple-300 font-semibold">
-                  <KeyRound className="w-4 h-4 text-purple-400" />
-                  <span>{driverDisplayName} Authentication Wizard</span>
-                </div>
-                <button
-                  onClick={() => setShowAuthWizard(false)}
-                  className="p-1 rounded text-slate-400 hover:text-white transition cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* Auth Mode Toggle */}
-              <div className="flex items-center gap-1.5 border-b border-slate-800 pb-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthMode('oauth');
-                    if (!authStartResult && !authStarting) handleStartAuth();
-                  }}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
-                    authMode === 'oauth'
-                      ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40 font-semibold'
-                      : 'text-slate-400 hover:text-slate-200 border border-transparent'
-                  }`}
-                >
-                  {driverType === 'agy'
-                    ? 'Google AI Pro OAuth'
-                    : driverType === 'copilot'
-                    ? 'GitHub Device Login'
-                    : driverType === 'claude'
-                    ? 'Claude CLI Login'
-                    : 'Browser / CLI Login'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setAuthMode('apikey')}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
-                    authMode === 'apikey'
-                      ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40 font-semibold'
-                      : 'text-slate-400 hover:text-slate-200 border border-transparent'
-                  }`}
-                >
-                  Direct API Key
-                </button>
-              </div>
-
-              {authMode === 'apikey' ? (
-                <div className="space-y-3 pt-1">
-                  <p className="text-slate-300 leading-relaxed">
-                    Configure your API key directly from the UI. Credentials will be securely saved into the persona environment secret and injected into the container:
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="password"
-                      value={apiKeyInput}
-                      onChange={e => setApiKeyInput(e.target.value)}
-                      placeholder={
-                        driverType === 'claude'
-                          ? 'Paste ANTHROPIC_API_KEY...'
-                          : driverType === 'agy'
-                          ? 'Paste GEMINI_API_KEY...'
-                          : 'Paste OPENAI_API_KEY...'
-                      }
-                      className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-purple-500"
-                    />
-                    <button
-                      onClick={handleSaveApiKey}
-                      disabled={apiKeySaving || !apiKeyInput.trim()}
-                      className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs transition disabled:opacity-50 cursor-pointer"
-                    >
-                      {apiKeySaving ? 'Saving...' : 'Save API Key'}
-                    </button>
-                  </div>
-                </div>
-              ) : authStarting ? (
-                <div className="p-4 text-center text-slate-400 text-xs font-mono">
-                  Initiating driver authorization session inside container...
-                </div>
-              ) : (authStartResult?.status === 'error' || authStartResult?.errorMessage) ? (
-                <div className="p-3.5 rounded-xl bg-red-950/50 border border-red-500/40 space-y-2.5 text-xs">
-                  <div className="flex items-center gap-2 font-semibold text-red-300">
-                    <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
-                    <span>{driverDisplayName} Authentication Failed</span>
-                  </div>
-                  <p className="font-mono text-[11px] leading-relaxed break-words text-red-200 bg-red-950/60 p-2.5 rounded-lg border border-red-800/40">
-                    {authStartResult.errorMessage}
-                  </p>
-                  <div className="flex flex-wrap items-center gap-2 pt-1">
-                    <button
-                      onClick={handleStartAuth}
-                      disabled={authStarting}
-                      className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition cursor-pointer"
-                    >
-                      Retry Login Session
-                    </button>
-                    <button
-                      onClick={() => setAuthMode('apikey')}
-                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition cursor-pointer border border-slate-700"
-                    >
-                      Switch to Direct API Key
-                    </button>
-                    <button
-                      onClick={() => {
-                        setShowAuthWizard(false);
-                        setActiveTab('terminal');
-                      }}
-                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition cursor-pointer border border-slate-700 flex items-center gap-1.5"
-                    >
-                      <TerminalIcon className="w-3.5 h-3.5 text-sky-400" />
-                      <span>Open Interactive Terminal</span>
-                    </button>
-                  </div>
-                </div>
-              ) : (authStartResult?.authUrl || authStartResult?.status === 'waiting_code' || authStartResult?.instructions?.includes('code')) ? (
-                <div className="space-y-3">
-                  {authStartResult?.authUrl ? (
-                    <>
-                      <p className="text-slate-300 leading-relaxed">
-                        Step 1: Open the link below in your browser to approve authorization:
-                      </p>
-                      <a
-                        href={authStartResult.authUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-medium text-xs transition"
-                      >
-                        <span>Authorize in Browser</span>
-                        <ExternalLink className="w-3.5 h-3.5" />
-                      </a>
-                    </>
-                  ) : (
-                    <p className="text-slate-300 leading-relaxed">
-                      {authStartResult?.instructions || 'Please complete authorization in your browser and submit the verification code below:'}
-                    </p>
-                  )}
-
-                  <p className="text-slate-300 leading-relaxed pt-1">
-                    {authStartResult?.authUrl ? 'Step 2: ' : ''}Paste the authorization code provided after login and click Submit:
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      value={authCodeInput}
-                      onChange={e => setAuthCodeInput(e.target.value)}
-                      placeholder="Paste authorization code here..."
-                      className="flex-1 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-sky-500"
-                    />
-                    <button
-                      onClick={handleSubmitAuthCode}
-                      disabled={authSubmitting || !authCodeInput.trim()}
-                      className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs transition disabled:opacity-50 cursor-pointer shrink-0"
-                    >
-                      {authSubmitting ? 'Verifying...' : 'Submit Code'}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <p className="text-slate-400">{authStartResult?.instructions || `Driver is ready. Click below to begin ${driverDisplayName} login.`}</p>
-                  <button
-                    onClick={handleStartAuth}
-                    disabled={authStarting}
-                    className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition cursor-pointer"
-                  >
-                    Start Login Session
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
         </div>
 
         {/* Footer */}
         <div className="p-3 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-500 bg-slate-900/40">
-          <span>Dedicated persona runner volume persists across container updates.</span>
+          <span>Driver authentication &amp; model discovery are managed in Driver Configuration.</span>
           <button
             onClick={onClose}
             className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition"

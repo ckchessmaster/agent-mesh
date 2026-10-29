@@ -328,6 +328,9 @@ public class AgentRunnerInstance : IAsyncDisposable
             }
         };
 
+        OpenAiAdapter.LearnedContextLimitReporter = (driverId, model, maxContextTokens) =>
+            _meshClient.ReportLearnedContextLimitAsync(driverId, _agentToken, model, maxContextTokens, _cts.Token);
+
         // Process any prompts that were queued while this agent was offline
         await CheckAndProcessPendingPromptsAsync(_cts.Token);
 
@@ -337,6 +340,7 @@ public class AgentRunnerInstance : IAsyncDisposable
 
     private async Task StartPendingPromptPollLoopAsync(CancellationToken ct)
     {
+        var lastCapabilityRefresh = DateTimeOffset.UtcNow;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -345,6 +349,13 @@ public class AgentRunnerInstance : IAsyncDisposable
                 if (State.State is RunnerConnectionState.Online or RunnerConnectionState.Busy)
                 {
                     await CheckAndProcessPendingPromptsAsync(ct);
+
+                    if (State.State == RunnerConnectionState.Online &&
+                        DateTimeOffset.UtcNow - lastCapabilityRefresh >= TimeSpan.FromMinutes(15))
+                    {
+                        lastCapabilityRefresh = DateTimeOffset.UtcNow;
+                        await _meshClient.SetAgentStatusAsync(_preset, "online", ct);
+                    }
                 }
             }
             catch (OperationCanceledException)

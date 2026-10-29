@@ -113,6 +113,8 @@ export interface DriverConfig {
   maxSteps?: number | null;
   capabilities?: string[];
   hasApiKey?: boolean;
+  hasOAuthToken?: boolean;
+  learnedContextLimits?: Record<string, number> | null;
   sidecar?: DriverSidecarConfig | null;
   hasSidecarAuthKey?: boolean;
   loginCommand?: string | null;

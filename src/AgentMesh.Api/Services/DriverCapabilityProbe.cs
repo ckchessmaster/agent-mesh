@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using AgentMesh.Core.Enums;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 
 namespace AgentMesh.Api.Services;
@@ -135,7 +136,11 @@ public sealed record DriverCapabilityProbeRequest(
     IReadOnlyList<string>? OperatorModels = null,
     string? DefaultModel = null,
     bool ForceRefresh = false,
-    DriverCapabilityDeclaration? Declared = null);
+    DriverCapabilityDeclaration? Declared = null,
+    string? ApiKey = null,
+    DriverSidecarConfig? Sidecar = null,
+    IReadOnlyDictionary<string, int>? LearnedContextLimits = null,
+    string? OAuthToken = null);
 
 /// <summary>
 /// Reads a driver's real capabilities (models, efforts, context windows) from the driver itself.
@@ -150,6 +155,8 @@ public interface IDriverCapabilityProbe
     Task<DriverCapabilityReading?> ProbeAsync(
         DriverCapabilityProbeRequest request,
         CancellationToken ct = default);
+
+    void InvalidateCache() { }
 }
 
 /// <summary>
@@ -189,7 +196,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
 
     internal static readonly TimeSpan DefaultTtl = TimeSpan.FromMinutes(10);
     internal static readonly TimeSpan DefaultNegativeTtl = TimeSpan.FromMinutes(2);
-    internal static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// Upper bound on concurrent live probes. The endpoint is <c>[AllowAnonymous]</c>, so without
@@ -224,10 +231,13 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     private readonly Func<string?> _agyExecutableResolver;
     private readonly Func<string, string, TimeSpan, CancellationToken, Task<string?>> _cliRunner;
     private readonly Func<string, string?, CancellationToken, Task<IReadOnlyList<string>?>> _httpModelLister;
+    private readonly bool _hasCustomHttpLister;
+    private readonly IPersonaContainerManager? _containerManager;
 
-    public DriverCapabilityProbe()
+    public DriverCapabilityProbe(IPersonaContainerManager? containerManager = null)
         : this(() => DefaultTtl, () => DefaultNegativeTtl, AgyExecutableLocator.Resolve, DriverCliRunner.RunAsync)
     {
+        _containerManager = containerManager;
     }
 
     internal DriverCapabilityProbe(
@@ -242,9 +252,12 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         _negativeTtlProvider = negativeTtlProvider;
         _agyExecutableResolver = agyExecutableResolver;
         _cliRunner = cliRunner;
+        _hasCustomHttpLister = httpModelLister != null;
         _httpModelLister = httpModelLister ?? ListOpenAiModelsAsync;
         _gate = new SemaphoreSlim(maxConcurrentProbes, maxConcurrentProbes);
     }
+
+    public void InvalidateCache() => _cache.Clear();
 
     public async Task<DriverCapabilityReading?> ProbeAsync(
         DriverCapabilityProbeRequest request,
@@ -269,6 +282,15 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         }
 
         var fallback = await ProbeCoreAsync(request, ct);
+
+        // When the live probe on the API host could not read the driver (e.g. runner container is
+        // asleep or the API host has no direct route), preserve a previously verified declaration
+        // whose adapter and endpoint still match the row rather than blanking the picker.
+        if ((fallback == null || fallback.Models.Count == 0) &&
+            TryLastKnownDeclaration(request, out var lastKnownReading))
+        {
+            return WithOperatorModels(lastKnownReading, request);
+        }
 
         // Applied here rather than inside ProbeCoreAsync so it covers every way the core can come
         // back empty: a fresh probe, a cached negative, and a caller that joined someone else's
@@ -407,6 +429,8 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         DriverCapabilityProbeRequest request,
         CancellationToken ct)
     {
+        EnsureHostAgyTokenIfAvailable(request.OAuthToken, request.DriverId);
+
         var executable = _agyExecutableResolver();
         if (string.IsNullOrWhiteSpace(executable))
         {
@@ -452,7 +476,53 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
             request);
     }
 
+    private static void EnsureHostAgyTokenIfAvailable(string? storedToken, string? driverId)
+    {
+        try
+        {
+            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrWhiteSpace(userHome)) return;
 
+            var hostTokenPath = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+            if (File.Exists(hostTokenPath)) return;
+
+            var candidateToken = storedToken;
+            if (string.IsNullOrWhiteSpace(candidateToken))
+            {
+                var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                if (Directory.Exists(tokensDir))
+                {
+                    if (!string.IsNullOrWhiteSpace(driverId))
+                    {
+                        var driverOauth = Path.Combine(tokensDir, $"driver-{driverId.Trim().ToLowerInvariant()}.oauth");
+                        if (File.Exists(driverOauth))
+                        {
+                            candidateToken = File.ReadAllText(driverOauth).Trim();
+                        }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(candidateToken))
+                    {
+                        var anyOauth = Directory.GetFiles(tokensDir, "*.oauth").FirstOrDefault();
+                        if (anyOauth != null)
+                        {
+                            candidateToken = File.ReadAllText(anyOauth).Trim();
+                        }
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(candidateToken))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(hostTokenPath)!);
+                File.WriteAllText(hostTokenPath, candidateToken.Trim());
+            }
+        }
+        catch
+        {
+            // Best-effort token restoration; never fail the probe on filesystem permissions.
+        }
+    }
 
     private async Task<DriverCapabilityReading?> ProbeOpenAiAsync(
         DriverCapabilityProbeRequest request,
@@ -467,31 +537,42 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 Unavailable(DriverAdapters.OpenAi, "No endpoint is configured for this driver."), request);
         }
 
-        var ids = await _httpModelLister(endpoint, ApiKeyValue(request), ct);
-        if (ids == null)
+        IReadOnlyList<DiscoveredOpenAiModel>? discovered;
+        if (_hasCustomHttpLister)
+        {
+            var ids = await _httpModelLister(endpoint, ApiKeyValue(request), ct);
+            discovered = ids?.Select(id => new DiscoveredOpenAiModel(id, null)).ToList();
+        }
+        else
+        {
+            discovered = await ListOpenAiModelsDetailedAsync(request, endpoint, ApiKeyValue(request), ct);
+        }
+
+        if (discovered == null)
         {
             return WithOperatorModels(Unavailable(DriverAdapters.OpenAi,
                 $"The server at {endpoint.TrimEnd('/')} did not return a model list."), request);
         }
 
-        if (ids.Count == 0)
+        if (discovered.Count == 0)
         {
             return WithOperatorModels(Unavailable(DriverAdapters.OpenAi,
                 $"The server at {endpoint.TrimEnd('/')} reported no models."), request);
         }
 
-        var models = ids
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Select(id => id.Trim())
-            // The listing carries no capacity information, so per-model sizes come from the shared
-            // table in AgentMesh.Core - the same table OpenAiAdapter applies at runtime, which is
-            // what stops the picker and the run from disagreeing.
-            .Select(id => new DriverModelCapability(
-                id,
-                id,
-                Array.Empty<string>(),
-                ContextSizesForModel(id)))
+        var models = discovered
+            .Where(m => !string.IsNullOrWhiteSpace(m.Id))
+            .GroupBy(m => m.Id.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Select(g =>
+            {
+                var id = g.Key;
+                var maxTokens = g.FirstOrDefault(x => x.MaxContextTokens is > 0)?.MaxContextTokens;
+                return new DriverModelCapability(
+                    id,
+                    id,
+                    Array.Empty<string>(),
+                    ContextSizesForModel(id, maxTokens, request.LearnedContextLimits));
+            })
             .ToList();
 
         return WithOperatorModels(
@@ -507,43 +588,127 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     }
 
     /// <summary>
-    /// Context options for a listed model, derived from the shared resolution table rather than a
-    /// second table in the controller.
+    /// Context options for a listed model, derived from the shared resolution table, an explicit
+    /// provider-reported limit, or a learned overflow limit.
     /// </summary>
     /// <remarks>
-    /// Only sizes at or below the model's resolved window are offered: a picker that advertises
-    /// 256k for a 128k model invites the user to select a value the runtime then clamps.
+    /// Only sizes at or below the model's verified/learned window are offered. When a model has no
+    /// known, provider-reported, or learned limit yet, only <c>"default"</c> is returned (which
+    /// runs at 1M and auto-detects the true limit on overflow).
     /// </remarks>
-    internal static IReadOnlyList<string> ContextSizesForModel(string modelId)
+    internal static IReadOnlyList<string> ContextSizesForModel(
+        string modelId,
+        int? explicitMaxTokens = null,
+        IReadOnlyDictionary<string, int>? learnedLimits = null)
     {
-        var resolved = ModelContextLimits.Resolve(modelId, contextSizeOption: null);
-        var sizes = new List<string> { "default" };
+        int? ceiling = null;
+        if (explicitMaxTokens is > 0)
+        {
+            ceiling = explicitMaxTokens.Value;
+        }
+        else if (learnedLimits != null &&
+                 learnedLimits.TryGetValue(modelId, out var learned) &&
+                 learned > 0)
+        {
+            ceiling = learned;
+        }
+        else
+        {
+            var resolved = ModelContextLimits.Resolve(modelId, contextSizeOption: null);
+            if (!resolved.IsFallback)
+            {
+                ceiling = resolved.Tokens;
+            }
+        }
 
+        var sizes = new List<string> { "default" };
+        if (ceiling is null or <= 0)
+        {
+            return sizes;
+        }
+
+        var capped = Math.Min(ceiling.Value, ModelContextLimits.MaxSelectableTokenLimit);
         foreach (var candidate in DriverCapabilityPresets.GenericContextSizes.Skip(1))
         {
             var tokens = ModelContextLimits.ParseOption(candidate);
-            if (tokens != null && tokens.Value <= resolved.Tokens) sizes.Add(candidate);
+            if (tokens != null && tokens.Value <= capped) sizes.Add(candidate);
         }
 
         return sizes;
     }
 
     /// <summary>
-    /// The API key for a live model listing, read from the environment rather than the stored
-    /// blob.
+    /// The API key for a live model listing, preferring the driver's stored key and falling back
+    /// to <c>AGENTMESH_OPENAI_API_KEY</c> on the API host.
     /// </summary>
-    /// <remarks>
-    /// <c>DriverCapabilitiesView</c> deliberately redacts the key (it must not reach the browser
-    /// bundle), and re-reading the plaintext blob here would put a secret on an
-    /// <c>[AllowAnonymous]</c> request path. Operators that need an authenticated listing set
-    /// <c>AGENTMESH_OPENAI_API_KEY</c> on the API host; drivers that do not have one get an honest
-    /// "unavailable" instead of a preset dressed up as a probe.
-    /// </remarks>
     private static string? ApiKeyValue(DriverCapabilityProbeRequest request)
     {
-        _ = request; // no per-driver secrets are read on this path
+        if (!string.IsNullOrWhiteSpace(request.ApiKey))
+        {
+            return request.ApiKey.Trim();
+        }
+
         var configured = Environment.GetEnvironmentVariable("AGENTMESH_OPENAI_API_KEY");
         return string.IsNullOrWhiteSpace(configured) ? null : configured.Trim();
+    }
+
+    private async Task<IReadOnlyList<DiscoveredOpenAiModel>?> ListOpenAiModelsDetailedAsync(
+        DriverCapabilityProbeRequest request,
+        string endpoint,
+        string? apiKey,
+        CancellationToken ct)
+    {
+        if (request.Sidecar is { Enabled: true } && _containerManager != null)
+        {
+            try
+            {
+                var sidecarRes = await _containerManager.TestDriverEndpointAsync(
+                    endpoint, apiKey, request.Sidecar, ct);
+                if (sidecarRes.Success)
+                {
+                    if (!string.IsNullOrWhiteSpace(sidecarRes.ResponseBody))
+                    {
+                        var parsed = DriverModelDiscovery.ParseOpenAiModels(sidecarRes.ResponseBody);
+                        if (parsed.Count > 0) return parsed;
+                    }
+                    if (sidecarRes.AvailableModels != null)
+                    {
+                        return sidecarRes.AvailableModels
+                            .Where(id => !string.IsNullOrWhiteSpace(id))
+                            .Select(id => new DiscoveredOpenAiModel(id.Trim(), null))
+                            .ToList();
+                    }
+                }
+            }
+            catch
+            {
+                // Fall through to direct HTTP attempt
+            }
+        }
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(ProbeTimeout);
+
+            using var httpReq = new HttpRequestMessage(HttpMethod.Get, DriverModelDiscovery.ToModelsUrl(endpoint));
+            if (!string.IsNullOrWhiteSpace(apiKey))
+            {
+                httpReq.Headers.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+            }
+
+            using var res = await SharedHttp.SendAsync(httpReq, timeoutCts.Token);
+            if (!res.IsSuccessStatusCode) return null;
+
+            var json = await res.Content.ReadAsStringAsync(timeoutCts.Token);
+            return DriverModelDiscovery.ParseOpenAiModels(json);
+        }
+        catch (Exception)
+        {
+            // Unreachable, TLS failure, non-JSON body: all mean "we could not read this server".
+            return null;
+        }
     }
 
     private static async Task<IReadOnlyList<string>?> ListOpenAiModelsAsync(
@@ -686,7 +851,46 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
 
         if (declared.Models.Count == 0) return false;
 
-        reading = new DriverCapabilityReading(
+        reading = BuildReadingFromDeclaration(declared, expectedAdapter, request.LearnedContextLimits);
+        return reading.Models.Count > 0;
+    }
+
+    /// <summary>
+    /// Serves a previously persisted model catalogue when the live probe on the API host is
+    /// unavailable (e.g. runner is offline or endpoint is only reachable via container sidecar),
+    /// provided the declaration's adapter and endpoint still match the driver row.
+    /// </summary>
+    internal static bool TryLastKnownDeclaration(
+        DriverCapabilityProbeRequest request,
+        out DriverCapabilityReading reading)
+    {
+        reading = null!;
+        var candidate = request.Declared;
+        if (candidate == null || candidate.Models.Count == 0) return false;
+        if (candidate.ObservedAt == default) return false;
+
+        var adapter = NormalizeAdapter(request);
+        if (adapter == null) return false;
+
+        var declaredAdapter = DriverAdapters.Canonicalize(candidate.Adapter);
+        if (!string.Equals(declaredAdapter, adapter, StringComparison.OrdinalIgnoreCase)) return false;
+
+        var declaredEndpoint = DriverModelDiscovery.NormalizeEndpoint(candidate.Endpoint);
+        if (declaredEndpoint != null)
+        {
+            var rowEndpoint = DriverModelDiscovery.NormalizeEndpoint(request.Endpoint);
+            if (!string.Equals(declaredEndpoint, rowEndpoint, StringComparison.OrdinalIgnoreCase)) return false;
+        }
+
+        reading = BuildReadingFromDeclaration(candidate, adapter, request.LearnedContextLimits);
+        return reading.Models.Count > 0;
+    }
+
+    private static DriverCapabilityReading BuildReadingFromDeclaration(
+        DriverCapabilityDeclaration declared,
+        string expectedAdapter,
+        IReadOnlyDictionary<string, int>? learnedLimits)
+        => new(
             Adapter: expectedAdapter,
             Models: declared.Models
                 .Where(m => !string.IsNullOrWhiteSpace(m.Id))
@@ -694,23 +898,14 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                     m.Id.Trim(),
                     string.IsNullOrWhiteSpace(m.Name) ? m.Id.Trim() : m.Name!.Trim(),
                     m.Efforts ?? Array.Empty<string>(),
-                    // Always computed here, never taken from the declaration. Which windows to
-                    // *offer* is our product policy - ContextSizesForModel bounds the list to what
-                    // the runtime will actually honour - so accepting a runner-supplied value would
-                    // let a self-report advertise a window the runtime clamps, which is the stale
-                    // "500k" defect from earlier in this job re-opened through a new channel. The
-                    // runner declares which models exist; we decide what is selectable for them.
-                    declared.SupportsContextSelection ? ContextSizesForModel(m.Id.Trim()) : null))
+                    declared.SupportsContextSelection
+                        ? ContextSizesForModel(m.Id.Trim(), m.MaxContextTokens, learnedLimits)
+                        : null))
                 .ToList(),
             ModelSource: CapabilitySourceKind.Declared,
-            // The runner's read time, not ours: the dashboard shows how old the answer is, and
-            // stamping it with "now" would make a day-old self-report look fresh.
             ObservedAt: declared.ObservedAt,
             SupportsContextSelection: declared.SupportsContextSelection,
             EffortSource: $"declared:{declared.Source ?? "runner"}");
-
-        return reading.Models.Count > 0;
-    }
 
     /// <summary>
     /// Prefers the runner's explanation for an empty catalogue over the API's own.
@@ -771,7 +966,11 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
             var existing = reading.Models.FirstOrDefault(
                 m => string.Equals(m.Id, id, StringComparison.OrdinalIgnoreCase));
 
-            merged.Add(existing ?? new DriverModelCapability(id, id, Array.Empty<string>(), null));
+            var contextSizes = reading.SupportsContextSelection
+                ? ContextSizesForModel(id, null, request.LearnedContextLimits)
+                : null;
+
+            merged.Add(existing ?? new DriverModelCapability(id, id, Array.Empty<string>(), contextSizes));
         }
 
         foreach (var model in reading.Models)

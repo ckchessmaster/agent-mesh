@@ -193,6 +193,16 @@ public class SystemController(
                     .Select(m => new OpenAiModelItemDto(m, m))
                     .ToList() ?? new List<OpenAiModelItemDto>();
 
+                if (sidecarModels.Count > 0)
+                {
+                    await TryPersistDiscoveredOpenAiModelsAsync(
+                        db,
+                        req.AgentId,
+                        req.Endpoint,
+                        sidecarModels.Select(m => new DiscoveredOpenAiModel(m.Id, null)).ToList(),
+                        ct);
+                }
+
                 return Ok(new TestOpenAiServerResponse(true, null, sidecarModels));
             }
             catch (Exception ex)
@@ -222,8 +232,9 @@ public class SystemController(
             }
 
             var json = await res.Content.ReadAsStringAsync(ct);
-            var models = DriverModelDiscovery.ParseOpenAiModelIds(json)
-                .Select(id => new OpenAiModelItemDto(id, id))
+            var discovered = DriverModelDiscovery.ParseOpenAiModels(json);
+            var models = discovered
+                .Select(m => new OpenAiModelItemDto(m.Id, m.Id))
                 .ToList();
 
             // A 200 with an unparseable body used to be reported as success with zero models,
@@ -237,11 +248,63 @@ public class SystemController(
                     models));
             }
 
+            await TryPersistDiscoveredOpenAiModelsAsync(db, req.AgentId, req.Endpoint, discovered, ct);
+
             return Ok(new TestOpenAiServerResponse(true, null, models));
         }
         catch (Exception ex)
         {
             return Ok(new TestOpenAiServerResponse(false, $"Connection failed: {ex.Message}", new()));
+        }
+    }
+
+    private async Task TryPersistDiscoveredOpenAiModelsAsync(
+        AgentMeshDbContext? db,
+        string? agentId,
+        string endpoint,
+        IReadOnlyList<DiscoveredOpenAiModel> discovered,
+        CancellationToken ct)
+    {
+        if (db == null || string.IsNullOrWhiteSpace(agentId) || discovered.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var normalizedId = agentId.Trim().TrimStart('@').ToLowerInvariant();
+            var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+            if (agent == null) return;
+
+            var declaration = new DriverCapabilityDeclaration
+            {
+                Adapter = DriverAdapters.OpenAi,
+                Endpoint = DriverModelDiscovery.NormalizeEndpoint(endpoint),
+                ObservedAt = DateTimeOffset.UtcNow,
+                Models = discovered
+                    .Select(m => new DriverCapabilityDeclaration.DeclaredModel
+                    {
+                        Id = m.Id,
+                        Name = m.Id,
+                        MaxContextTokens = m.MaxContextTokens
+                    })
+                    .ToList()
+            };
+
+            var patch = new System.Text.Json.Nodes.JsonObject
+            {
+                ["declared"] = JsonSerializer.SerializeToNode(declaration)
+            };
+
+            agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+                ?? agent.CapabilitiesJson;
+            agent.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+            _probe.InvalidateCache();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not persist discovered OpenAI models for driver {DriverId}", agentId);
         }
     }
 
@@ -299,7 +362,7 @@ public class SystemController(
         foreach (var agent in agents)
         {
             var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
-            var request = view.ToProbeRequest(agent.Id, agent.RuntimeType, forceRefresh);
+            var request = view.ToProbeRequest(agent.Id, agent.RuntimeType, forceRefresh, agent.CapabilitiesJson);
 
             DriverCapabilityReading? reading = null;
             try
