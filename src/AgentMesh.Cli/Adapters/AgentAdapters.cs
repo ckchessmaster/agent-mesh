@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Adapters;
 
@@ -634,7 +635,7 @@ public static class ActiveAgyProcessRegistry
     }
 }
 
-public class AgyAdapter : IAgentAdapter
+public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 {
     private static readonly ConcurrentDictionary<Guid, string> SessionConversations = new();
     private static readonly object MappingLock = new();
@@ -1024,6 +1025,76 @@ public class AgyAdapter : IAgentAdapter
         return null;
     }
 
+    /// <summary>
+    /// Adds the model/effort/mode selection flags to an <c>agy</c> invocation.
+    /// </summary>
+    /// <returns>The model id actually passed to the binary, or null when none was.</returns>
+    /// <remarks>
+    /// Extracted from <see cref="ExecuteRealAgyStreamAsync"/> so the argument contract is testable
+    /// without spawning the CLI. The rules encoded here are the ones the capability surface has to
+    /// advertise against: a value the picker offers but this method drops or rewrites is a lie.
+    /// <list type="bullet">
+    /// <item>
+    /// <c>--effort</c> takes the set <c>agy --help</c> documents
+    /// (<c>low|medium|high|xhigh|max</c>) and forwards it verbatim. xhigh/max used to be rewritten
+    /// down to "high" while the picker advertised all five, so a user who chose <c>max</c> silently
+    /// got <c>high</c> and the transcript reported <c>max</c>.
+    /// </item>
+    /// <item>
+    /// An effort outside that set is dropped, not mapped to a neighbour: omitting the flag lets agy
+    /// apply its own default, whereas substituting fabricates a choice the user never made.
+    /// </item>
+    /// <item>
+    /// There is deliberately no context-size flag. <c>agy --help</c> exposes none, which is why the
+    /// capability surface reports <c>supportsContextSelection: false</c> for this driver and the
+    /// dashboard hides the picker.
+    /// </item>
+    /// </list>
+    /// </remarks>
+    /// <inheritdoc />
+    public Task<DriverCapabilityDeclaration> DescribeCapabilitiesAsync(
+        AgentPresetConfig preset,
+        CancellationToken ct = default)
+        => DriverCapabilityDescriber.DescribeAgyAsync(preset, ct);
+
+    internal static string? AddAgySelectionArguments(ProcessStartInfo psi, PromptReceivedEvent promptEvent)
+    {
+        string? resolvedModel = null;
+        if (!string.IsNullOrWhiteSpace(promptEvent.Model))
+        {
+            var rawModel = promptEvent.Model.Trim();
+
+            // Retired model ids: agy no longer accepts them, so they are rewritten to the current
+            // equivalent rather than failing the run. This is a compatibility mapping on ids the
+            // driver rejects, not a substitution for missing telemetry.
+            resolvedModel = rawModel.Equals("claude-3-7-sonnet", StringComparison.OrdinalIgnoreCase) ||
+                            rawModel.Equals("claude-3-5-sonnet", StringComparison.OrdinalIgnoreCase)
+                ? "claude-sonnet-5-5"
+                : rawModel;
+
+            psi.ArgumentList.Add("--model");
+            psi.ArgumentList.Add(resolvedModel);
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.Effort))
+        {
+            var rawEffort = promptEvent.Effort.Trim().ToLowerInvariant();
+            if (DriverEffortContracts.Supports(DriverAdapters.Agy, rawEffort))
+            {
+                psi.ArgumentList.Add("--effort");
+                psi.ArgumentList.Add(rawEffort);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.Mode))
+        {
+            psi.ArgumentList.Add("--mode");
+            psi.ArgumentList.Add(promptEvent.Mode.Trim());
+        }
+
+        return resolvedModel;
+    }
+
     private static async Task ExecuteRealAgyStreamAsync(
         string agyExecutable,
         string cwd,
@@ -1061,48 +1132,7 @@ public class AgyAdapter : IAgentAdapter
             psi.ArgumentList.Add(activeConvId);
         }
 
-        string? resolvedModel = null;
-        if (!string.IsNullOrWhiteSpace(promptEvent.Model))
-        {
-            var rawModel = promptEvent.Model.Trim();
-            if (rawModel.Equals("claude-3-7-sonnet", StringComparison.OrdinalIgnoreCase) ||
-                rawModel.Equals("claude-3-5-sonnet", StringComparison.OrdinalIgnoreCase))
-            {
-                resolvedModel = "claude-sonnet-5-5";
-            }
-            else
-            {
-                resolvedModel = rawModel;
-            }
-            psi.ArgumentList.Add("--model");
-            psi.ArgumentList.Add(resolvedModel);
-        }
-
-        if (!string.IsNullOrWhiteSpace(promptEvent.Effort))
-        {
-            var rawEffort = promptEvent.Effort.Trim();
-            if (rawEffort.Equals("max", StringComparison.OrdinalIgnoreCase) ||
-                rawEffort.Equals("xhigh", StringComparison.OrdinalIgnoreCase))
-            {
-                rawEffort = "high";
-            }
-
-            var rawModel = promptEvent.Model?.Trim() ?? "";
-            var modelRejectsEffort = (rawModel.Equals("claude-3-7-sonnet", StringComparison.OrdinalIgnoreCase) ||
-                                      rawModel.Equals("claude-3-5-sonnet", StringComparison.OrdinalIgnoreCase)) &&
-                                     resolvedModel == rawModel;
-            if (!modelRejectsEffort)
-            {
-                psi.ArgumentList.Add("--effort");
-                psi.ArgumentList.Add(rawEffort);
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(promptEvent.Mode))
-        {
-            psi.ArgumentList.Add("--mode");
-            psi.ArgumentList.Add(promptEvent.Mode.Trim());
-        }
+        string? resolvedModel = AddAgySelectionArguments(psi, promptEvent);
 
         var attachedBlock = AgentAdapterFactory.FormatAttachedFilesBlock(promptEvent.Attachments);
         var agyPromptText = string.IsNullOrWhiteSpace(attachedBlock)
@@ -1366,7 +1396,11 @@ public class AgyAdapter : IAgentAdapter
                                 model = effectiveModel,
                                 effort = promptEvent.Effort,
                                 mode = promptEvent.Mode,
-                                contextSize = promptEvent.ContextSize,
+                                // null, not promptEvent.ContextSize: agy has no context-size flag
+                                // and nothing above forwards one, so echoing the value back here
+                                // claimed a window the binary was never told about. That is how a
+                                // stale "500k" badge ended up pinned to agy sessions.
+                                contextSize = (string?)null,
                                 conversationId = activeConvId,
                                 usage = new
                                 {
@@ -1458,7 +1492,7 @@ public class AgyAdapter : IAgentAdapter
                         model = fallbackEffectiveModel,
                         effort = promptEvent.Effort,
                         mode = promptEvent.Mode,
-                        contextSize = promptEvent.ContextSize,
+                        contextSize = (string?)null, // see the note on the primary path above
                         conversationId = activeConvId,
                         usage = new
                         {

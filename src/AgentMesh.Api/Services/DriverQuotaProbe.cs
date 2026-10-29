@@ -1,5 +1,4 @@
 ﻿using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Text.Json;
 using AgentMesh.Core.Enums;
 
@@ -575,58 +574,16 @@ public sealed class AgyDriverQuotaProbe : IDriverQuotaProbe
         return false;
     }
 
-    private static async Task<string?> RunCliAsync(
+    /// <summary>
+    /// Delegates to the shared runner so the quota and capability probes agree on what "the CLI
+    /// did not answer" means (non-zero exit, timeout, missing binary).
+    /// </summary>
+    private static Task<string?> RunCliAsync(
         string executable,
         string arguments,
         TimeSpan timeout,
         CancellationToken ct)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = executable,
-            Arguments = arguments,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            StandardOutputEncoding = System.Text.Encoding.UTF8
-        };
-
-        using var process = new Process { StartInfo = startInfo };
-
-        try
-        {
-            if (!process.Start()) return null;
-        }
-        catch
-        {
-            return null;
-        }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
-
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeout);
-
-        try
-        {
-            await process.WaitForExitAsync(timeoutCts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            try { process.Kill(entireProcessTree: true); } catch { }
-            return null;
-        }
-
-        var stdout = await stdoutTask;
-        await stderrTask;
-
-        // Unauthenticated / unsupported builds exit non-zero with a login prompt on stderr.
-        if (process.ExitCode != 0) return null;
-
-        return string.IsNullOrWhiteSpace(stdout) ? null : stdout;
-    }
+        => DriverCliRunner.RunAsync(executable, arguments, timeout, ct);
 }
 
 /// <summary>

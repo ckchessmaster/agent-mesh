@@ -8,10 +8,11 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Adapters;
 
-public class OpenAiAdapter : IAgentAdapter
+public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 {
     public string AdapterType => "openai";
 
@@ -170,28 +171,37 @@ public class OpenAiAdapter : IAgentAdapter
                statusCode == 504;   // Gateway Timeout
     }
 
+    /// <summary>
+    /// Resolves the token budget for a run.
+    /// </summary>
+    /// <remarks>
+    /// Delegates to <see cref="ModelContextLimits"/> so the API that renders the context picker and
+    /// the adapter that honours the choice read one table. They used to hold separate tables, which
+    /// is how the picker could advertise 256k while the run was clamped to 128k with nothing in the
+    /// response saying so.
+    /// </remarks>
     public static int ResolveModelContextLimit(string model, string? contextSizeOption)
-    {
-        if (!string.IsNullOrWhiteSpace(contextSizeOption) && !contextSizeOption.Equals("default", StringComparison.OrdinalIgnoreCase))
-        {
-            var normalized = contextSizeOption.Trim().ToLowerInvariant();
-            if (normalized.EndsWith("k") && int.TryParse(normalized[..^1], out var k))
-                return k * 1024;
-            if (normalized.EndsWith("m") && int.TryParse(normalized[..^1], out var m))
-                return m * 1024 * 1024;
-            if (int.TryParse(normalized, out var exact))
-                return exact;
-        }
+        => ModelContextLimits.ResolveTokens(model, contextSizeOption);
 
-        var mLower = model.ToLowerInvariant();
-        if (mLower.Contains("qwen3") || mLower.Contains("qwen-3")) return 524_288; // 512k tokens
-        if (mLower.Contains("qwen2.5") || mLower.Contains("qwen-2.5")) return 131_072; // 128k
-        if (mLower.Contains("llama-3") || mLower.Contains("llama3")) return 131_072; // 128k
-        if (mLower.Contains("gpt-4o")) return 131_072; // 128k
-        if (mLower.Contains("deepseek")) return 131_072; // 128k
+    /// <summary>
+    /// The credential this adapter would authenticate a run with.
+    /// </summary>
+    /// <remarks>
+    /// Extracted because the capability declaration has to read <c>/models</c> with exactly the
+    /// same credential a run uses. If the two resolved keys differently, a driver could declare the
+    /// models visible to an ambient <c>OPENAI_API_KEY</c> while running against the key saved on the
+    /// preset - a picker listing models the very next prompt would be refused.
+    /// </remarks>
+    internal static string? ResolveApiKey(AgentPresetConfig preset)
+        => !string.IsNullOrWhiteSpace(preset.ApiKey)
+            ? preset.ApiKey.Trim()
+            : Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 
-        return 131_072; // 128k safe default
-    }
+    /// <inheritdoc />
+    public Task<DriverCapabilityDeclaration> DescribeCapabilitiesAsync(
+        AgentPresetConfig preset,
+        CancellationToken ct = default)
+        => DriverCapabilityDescriber.DescribeOpenAiAsync(preset, ResolveApiKey(preset), ct);
 
     public static int EstimateMessageTokens(OpenAiMessage message)
     {
@@ -382,9 +392,7 @@ public class OpenAiAdapter : IAgentAdapter
             ? endpoint
             : $"{endpoint}/chat/completions";
 
-        var apiKey = !string.IsNullOrWhiteSpace(preset.ApiKey)
-            ? preset.ApiKey.Trim()
-            : Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        var apiKey = ResolveApiKey(preset);
 
         var effectiveModel = !string.IsNullOrWhiteSpace(promptEvent.Model) &&
                              !promptEvent.Model.Equals("default", StringComparison.OrdinalIgnoreCase) &&

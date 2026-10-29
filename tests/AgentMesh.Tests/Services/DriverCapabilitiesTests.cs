@@ -1,4 +1,5 @@
 using AgentMesh.Api.Services;
+using AgentMesh.Core.Services;
 using FluentAssertions;
 using System.Text.Json;
 using Xunit;
@@ -80,6 +81,39 @@ public class DriverCapabilitiesTests
         var caps = doc.RootElement.GetProperty("capabilities").EnumerateArray()
             .Select(e => e.GetString()).ToList();
         caps.Should().Equal("bash", "read_file", "grep");
+    }
+
+    [Fact]
+    public void Merge_OlderRunnerReregisteringWithABareArrayDoesNotWipeADeclaration()
+    {
+        // The rolling-upgrade case, in reverse: a new runner registers and declares, then a machine
+        // still running an older CLI re-registers and pushes the bare capability array it has always
+        // pushed. `declared` is absent from that patch, and Merge treats absent as "don't touch", so
+        // the declaration survives.
+        //
+        // Surviving is the right outcome and it is not merely convenient. The declaration carries
+        // its own observedAt, so a stale one falls out of the freshness window on its own and the
+        // API goes back to probing. Wiping it on every old-runner re-registration would instead
+        // make a mixed-version fleet lose declarations it had already earned, and the picker would
+        // regress to "not installed on the API host" for as long as any host ran the old CLI.
+        var declared = new DriverCapabilityDeclaration
+        {
+            Adapter = "agy",
+            Models = new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "gemini-4-argon" } },
+            Source = "agy-models",
+            ObservedAt = DateTimeOffset.UtcNow
+        };
+
+        var merged = DriverCapabilities.Merge(
+            $$"""{"adapter":"agy","capabilities":["chat"],"declared":{{declared.ToJson()}}}""",
+            """["chat","bash"]""");
+
+        var read = DriverCapabilityDeclaration.TryRead(merged);
+        read.Should().NotBeNull("an old runner's patch must not erase what a new runner declared");
+        read!.Models.Select(m => m.Id).Should().Equal("gemini-4-argon");
+
+        // The capability list does still update, so the two keys are handled independently.
+        DriverCapabilities.Parse(merged).Capabilities.Should().Equal("chat", "bash");
     }
 
     [Fact]

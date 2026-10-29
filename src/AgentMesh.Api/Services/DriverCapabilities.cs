@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Api.Services;
 
@@ -25,10 +26,44 @@ public record DriverCapabilitiesView(
     DriverSidecarConfig? Sidecar = null,
     bool HasSidecarAuthKey = false,
     string? LoginCommand = null,
-    string? AuthCheckCommand = null)
+    string? AuthCheckCommand = null,
+    IReadOnlyList<string>? Models = null,
+    // What the runner pushed about its own driver (option C), or null when the runner predates
+    // that change or never declared anything. Kept separate from `models` because they are
+    // different kinds of claim: `models` is an operator's typed allow-list, this is a machine's
+    // self-report about the binary next to it.
+    DriverCapabilityDeclaration? Declared = null)
 {
     public static readonly DriverCapabilitiesView Empty =
-        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null);
+        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null, null);
+
+    /// <summary>
+    /// Models an operator wrote into the blob. Merged over whatever the capability probe finds and
+    /// marked as an override, so the UI can say which entries were verified and which were typed.
+    /// </summary>
+    public IReadOnlyList<string> OperatorModels => Models ?? Array.Empty<string>();
+
+    /// <summary>
+    /// Builds the capability-probe request for this driver.
+    /// </summary>
+    /// <remarks>
+    /// The endpoint is the discriminator for HTTP drivers: two OpenAI-compatible drivers aimed at
+    /// different servers have different catalogues, which is precisely what the old per-adapter
+    /// table got wrong.
+    /// </remarks>
+    public DriverCapabilityProbeRequest ToProbeRequest(
+        string driverId,
+        AgentMesh.Core.Enums.RuntimeType runtimeType,
+        bool forceRefresh = false)
+        => new(
+            DriverId: driverId,
+            RuntimeType: runtimeType,
+            Adapter: Adapter,
+            Endpoint: Endpoint,
+            OperatorModels: OperatorModels,
+            DefaultModel: DefaultModel,
+            ForceRefresh: forceRefresh,
+            Declared: Declared);
 }
 
 /// <summary>
@@ -193,7 +228,14 @@ public static class DriverCapabilities
             Sidecar: sidecar,
             HasSidecarAuthKey: hasSidecarAuthKey,
             LoginCommand: ReadString(obj, "loginCommand") ?? sidecar?.LoginCommand,
-            AuthCheckCommand: ReadString(obj, "authCheckCommand") ?? sidecar?.AuthCheckCommand);
+            AuthCheckCommand: ReadString(obj, "authCheckCommand") ?? sidecar?.AuthCheckCommand,
+            // `models` is an operator-authored allow-list, distinct from `capabilities` (which is
+            // the capability-name list the CLI writes). Read separately so a driver whose provider
+            // cannot be probed can still be told what it runs.
+            Models: ReadModelIds(obj["models"]),
+            // Read from the already-parsed tree rather than re-parsing the string: this runs for
+            // every driver on every capability request.
+            Declared: DriverCapabilityDeclaration.TryRead(obj));
     }
 
     private static IReadOnlyList<string> ReadStringArray(JsonArray array)
@@ -206,6 +248,55 @@ public static class DriverCapabilities
                 values.Add(s);
             }
         }
+        return values;
+    }
+
+    /// <summary>
+    /// Reads the <c>models</c> array, which two producers write in two different shapes.
+    /// </summary>
+    /// <remarks>
+    /// The CLI writes <c>"models": []</c> or a list of id strings; the dashboard's driver form
+    /// writes objects of the shape <c>{ id, name }</c> taken straight from a live <c>/models</c>
+    /// response. Reading only the string shape would silently discard every model list the
+    /// dashboard itself saved - the opposite of what this change is for.
+    /// </remarks>
+    private static IReadOnlyList<string> ReadModelIds(JsonNode? node)
+    {
+        if (node is not JsonArray array) return Array.Empty<string>();
+
+        var values = new List<string>(array.Count);
+        foreach (var item in array)
+        {
+            if (item == null) continue;
+
+            switch (item.GetValueKind())
+            {
+                case JsonValueKind.String:
+                {
+                    if (item is JsonValue stringValue && stringValue.TryGetValue<string>(out var s) &&
+                        !string.IsNullOrWhiteSpace(s))
+                    {
+                        values.Add(s.Trim());
+                    }
+                    break;
+                }
+                case JsonValueKind.Object:
+                {
+                    if (item is JsonObject modelObj &&
+                        modelObj.TryGetPropertyValue("id", out var idNode) &&
+                        idNode is JsonValue idValue &&
+                        idValue.TryGetValue<string>(out var id) &&
+                        !string.IsNullOrWhiteSpace(id))
+                    {
+                        values.Add(id.Trim());
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
         return values;
     }
 

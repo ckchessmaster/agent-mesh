@@ -53,6 +53,14 @@ import {
   relativeTime,
   summarizeQuota
 } from './utils/driverUsage';
+import {
+  capabilitySourceLabel,
+  capabilityUnavailableMessage,
+  contextOptionsFor,
+  effectiveContextSize,
+  isContextSizeMeaningful,
+  resolveCapabilitiesFor
+} from './utils/driverCapabilities';
 import type {
   Agent,
   AgentSession,
@@ -60,7 +68,6 @@ import type {
   AskQuestionItem,
   JobMessage,
   JobTask,
-  ModelCapability,
   Persona,
   Project,
   ProjectJob,
@@ -1441,22 +1448,19 @@ export default function App() {
         : activeCreationAgent)
     : agents.find((a) => a.id === (selectedSession?.driverId || selectedSession?.creatorAgentId || selectedAgentId)) || null;
 
-  const getRuntimeCapsForDriver = useCallback((driverIdOrAgent?: string | Agent | null) => {
-    if (!capabilities || !capabilities.agentRuntimes) return null;
-    if (!driverIdOrAgent) return capabilities.agentRuntimes['agy'] || null;
-
-    const idLower = (typeof driverIdOrAgent === 'string' ? driverIdOrAgent : driverIdOrAgent.id).toLowerCase();
-    const nameLower = (typeof driverIdOrAgent === 'string' ? driverIdOrAgent : driverIdOrAgent.name).toLowerCase();
-    let key = 'agy';
-    if (idLower.includes('copilot') || nameLower.includes('copilot')) key = 'copilot';
-    else if (idLower.includes('claude') || nameLower.includes('claude')) key = 'claude';
-    else if (idLower.includes('openai') || nameLower.includes('openai') || idLower.includes('ollama') || nameLower.includes('ollama') || idLower.includes('vllm') || nameLower.includes('vllm') || idLower.includes('lmstudio') || nameLower.includes('lmstudio')) key = 'openai';
-    else if (idLower.includes('agy') || idLower.includes('antigravity') || nameLower.includes('agy') || nameLower.includes('antigravity')) key = 'agy';
-    else if (capabilities.agentRuntimes[idLower]) key = idLower;
-    else key = 'agy';
-
-    return capabilities.agentRuntimes[key] || capabilities.agentRuntimes['agy'] || null;
-  }, [capabilities]);
+  /**
+   * The capability surface for one driver.
+   *
+   * Used to be a chain of substring tests against the driver's id and name, returning one
+   * host-wide table. A driver named "my-agy-fork" that actually spoke OpenAI-compatible HTTP was
+   * handed the agy picker, and every driver got the same invented model list regardless of which
+   * server it talked to. Resolution now lives in utils/driverCapabilities.ts, where it is testable.
+   */
+  const getRuntimeCapsForDriver = useCallback(
+    (driverIdOrAgent?: string | Agent | null) =>
+      resolveCapabilitiesFor(capabilities, driverIdOrAgent, agents),
+    [capabilities, agents]
+  );
 
   const currentRuntimeCaps = useMemo(() => {
     if (!capabilities) return null;
@@ -1632,27 +1636,12 @@ export default function App() {
   };
 
   const availableModels = useMemo(() => {
-    const baseModels = currentRuntimeCaps?.models || [];
-    const agent = isCreatingSession ? activeCreationAgent : selectedAgent;
-    let extraModels: ModelCapability[] = [];
-    if (agent?.capabilitiesJson) {
-      try {
-        const parsed = JSON.parse(agent.capabilitiesJson);
-        if (Array.isArray(parsed.models)) {
-          extraModels = parsed.models.map((m: any) => ({
-            id: m.id || m.name,
-            name: m.name || m.id,
-            efforts: ['low', 'medium', 'high'],
-            contextSizes: ['32k', '128k']
-          }));
-        }
-      } catch {}
-    }
-    return [
-      ...extraModels,
-      ...baseModels.filter((m) => !extraModels.some((em) => em.id === m.id))
-    ];
-  }, [currentRuntimeCaps, isCreatingSession, activeCreationAgent, selectedAgent]);
+    // The API already merged the operator's `models` array over whatever it probed and told us
+    // which of the two it was (modelSource). Re-deriving it here from capabilitiesJson used to be
+    // where the fabrication happened: every hand-written model was given `efforts:
+    // ['low','medium','high']` and `contextSizes: ['32k','128k']`, values no driver reported.
+    return currentRuntimeCaps?.models || [];
+  }, [currentRuntimeCaps]);
 
   const availableModes = useMemo(() => {
     return currentRuntimeCaps?.modes || [];
@@ -1668,6 +1657,9 @@ export default function App() {
   }, [availableModels, currentRuntimeCaps, newSessionModel]);
 
   const availableEfforts = useMemo(() => {
+    // No fallback ladder. A driver that reports no efforts has no effort surface: the old
+    // `|| ['low','medium','high']` put a control on copilot and openai drivers whose adapters never
+    // forward one.
     return selectedModelCap?.efforts || [];
   }, [selectedModelCap]);
 
@@ -1692,24 +1684,20 @@ export default function App() {
   }, [availableModels, availableModes, availableTiers, newSessionModel, newSessionMode, newSessionTier]);
 
   const availableContextSizes = useMemo(() => {
-    if (!currentRuntimeCaps) return [];
-    const modelContextIds = selectedModelCap?.contextSizes;
-    if (modelContextIds && modelContextIds.length > 0) {
-      const driverContexts = currentRuntimeCaps.contextSizes || [];
-      return modelContextIds.map((id) => {
-        const match = driverContexts.find((c) => c.id.toLowerCase() === id.toLowerCase());
-        return match || { id, label: id, description: `${id} context window` };
-      });
-    }
-    return currentRuntimeCaps.contextSizes || [];
-  }, [currentRuntimeCaps, selectedModelCap]);
+    // Empty when the driver cannot be told its window (agy), which hides the control instead of
+    // offering one that changes nothing.
+    return contextOptionsFor(currentRuntimeCaps, newSessionModel);
+  }, [currentRuntimeCaps, newSessionModel]);
 
   // Sync / validate context size when model/driver changes
   useEffect(() => {
-    if (newSessionContextSize && availableContextSizes.length > 0 && !availableContextSizes.some((c) => c.id.toLowerCase() === newSessionContextSize.toLowerCase())) {
+    // isContextSizeMeaningful rather than "not in the rendered options": a driver that cannot be
+    // told its window renders no options at all, and a `length > 0` guard would then skip the clear
+    // and leave the stale value in state to be sent.
+    if (newSessionContextSize && !isContextSizeMeaningful(currentRuntimeCaps, newSessionContextSize)) {
       setNewSessionContextSize('');
     }
-  }, [availableContextSizes, newSessionContextSize]);
+  }, [currentRuntimeCaps, newSessionContextSize]);
 
   const createPreviewUrl = (file: File): string | undefined => {
     if (isImageAttachment(file.type, file.name) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
@@ -1893,7 +1881,12 @@ export default function App() {
         effort: newSessionEffort.trim() || undefined,
         mode: newSessionMode.trim() || undefined,
         tier: newSessionTier.trim() || undefined,
-        contextSize: newSessionContextSize.trim() || undefined
+        // The clearing effect above already empties newSessionContextSize when the driver cannot
+        // honour it, so this is defense-in-depth rather than the mechanism: the invariant "we never
+        // send a window this driver cannot honour" is asserted at the boundary where the value
+        // leaves the UI, so it does not silently depend on effect ordering or on every future
+        // setter of that state running through validation first.
+        contextSize: effectiveContextSize(currentRuntimeCaps, newSessionContextSize)
       };
       const created = targetPersona && api.createPersonaSession
         ? await api.createPersonaSession(
@@ -3802,9 +3795,12 @@ export default function App() {
                         Model
                       </label>
                       <select
+                        aria-label="New Session Model"
                         value={newSessionModel}
                         onChange={(e) => setNewSessionModel(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                        disabled={availableModels.length === 0}
+                        title={capabilitySourceLabel(currentRuntimeCaps)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         <option value="">Default Model</option>
                         {availableModels.map((m) => (
@@ -3822,6 +3818,18 @@ export default function App() {
                           onChange={(e) => setNewSessionModel(e.target.value)}
                           className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
                         />
+                      )}
+                      {/* Provenance, so a bundled preset is never mistaken for a driver answer. */}
+                      {availableModels.length > 0 ? (
+                        <p className="text-[10px] text-slate-500 leading-tight">
+                          {capabilitySourceLabel(currentRuntimeCaps)}
+                        </p>
+                      ) : (
+                        capabilityUnavailableMessage(currentRuntimeCaps) && (
+                          <p className="text-[10px] text-amber-500/80 leading-tight">
+                            {capabilityUnavailableMessage(currentRuntimeCaps)}
+                          </p>
+                        )
                       )}
                     </div>
 
@@ -4171,8 +4179,15 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* Context Size Selector Badge & Popover */}
-                    {(selectedSessionMetadata?.contextSize || sessionAvailableContextSizes.length > 0) && (
+                    {/* Context Size Selector Badge & Popover.
+
+                        Suppressed when the saved value is not one this driver can honour. A session
+                        created before the fix can carry contextSize "500k" on an agy driver, where
+                        nothing ever forwarded it; with the options list empty the user could neither
+                        see a valid choice nor clear the stale one, so the badge would assert a
+                        setting that does nothing. */}
+                    {(isContextSizeMeaningful(currentRuntimeCaps, selectedSessionMetadata?.contextSize) ||
+                      sessionAvailableContextSizes.length > 0) && (
                       <div className="relative inline-block">
                         <button
                           type="button"
@@ -5658,38 +5673,17 @@ export default function App() {
 
       {/* Create / Edit Persona Modal */}
       {showPersonaModal && (() => {
-        const driverAgent = agents.find((a) => a.id.toLowerCase() === personaDriverInput.toLowerCase());
-        let extraModels: ModelCapability[] = [];
-        if (driverAgent?.capabilitiesJson) {
-          try {
-            const parsed = JSON.parse(driverAgent.capabilitiesJson);
-            if (Array.isArray(parsed.models)) {
-              extraModels = parsed.models.map((m: any) => ({
-                id: m.id || m.name,
-                name: m.name || m.id,
-                efforts: ['low', 'medium', 'high'],
-                contextSizes: ['32k', '128k']
-              }));
-            }
-          } catch {}
-        }
-        const baseDriverModels = personaModalRuntimeCaps?.models || [];
-        const driverModels = [
-          ...extraModels,
-          ...baseDriverModels.filter((m) => !extraModels.some((em) => em.id === m.id))
-        ];
+        // The API already merged the operator's model list over whatever it probed. Re-deriving it
+        // here from capabilitiesJson is where this block used to fabricate: every hand-written
+        // model was given `efforts: ['low','medium','high']` and `contextSizes: ['32k','128k']`,
+        // numbers no driver ever reported.
+        const driverModels = personaModalRuntimeCaps?.models || [];
         const driverModes = personaModalRuntimeCaps?.modes || [];
         const driverTiers = personaModalRuntimeCaps?.tiers || [];
-        const driverContextSizes = personaModalRuntimeCaps?.contextSizes || [];
         const selectedModelObj = driverModels.find((m) => m.id === personaDefaultModel);
+        // No fallback ladder: a driver with no effort surface has no effort control.
         const driverEfforts = selectedModelObj?.efforts || [];
-        const modelContextIds = selectedModelObj?.contextSizes;
-        const availablePersonaContextSizes = (modelContextIds && modelContextIds.length > 0)
-          ? modelContextIds.map((id) => {
-              const match = driverContextSizes.find((c) => c.id.toLowerCase() === id.toLowerCase());
-              return match || { id, label: id, description: `${id} context window` };
-            })
-          : driverContextSizes;
+        const availablePersonaContextSizes = contextOptionsFor(personaModalRuntimeCaps, personaDefaultModel);
 
         const driverOptions = Array.from(
           new Map(
@@ -5829,6 +5823,8 @@ export default function App() {
                       <select
                         aria-label="Persona Default Model"
                         value={personaDefaultModel}
+                        disabled={driverModels.length === 0}
+                        title={capabilitySourceLabel(personaModalRuntimeCaps)}
                         onChange={(e) => {
                           const newModel = e.target.value;
                           setPersonaDefaultModel(newModel);
@@ -5837,7 +5833,7 @@ export default function App() {
                             setPersonaDefaultContextSize('');
                           }
                         }}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer"
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         <option value="">Driver Default</option>
                         {driverModels.map((m) => (
@@ -5846,6 +5842,18 @@ export default function App() {
                           </option>
                         ))}
                       </select>
+                      {/* Provenance, so a bundled preset is never mistaken for a driver answer. */}
+                      {driverModels.length > 0 ? (
+                        <p className="text-[10px] text-slate-500 leading-tight">
+                          {capabilitySourceLabel(personaModalRuntimeCaps)}
+                        </p>
+                      ) : (
+                        capabilityUnavailableMessage(personaModalRuntimeCaps) && (
+                          <p className="text-[10px] text-amber-500/80 leading-tight">
+                            {capabilityUnavailableMessage(personaModalRuntimeCaps)}
+                          </p>
+                        )
+                      )}
                       {personaModalRuntimeCaps?.adapter === 'openai' && (
                         <input
                           type="text"

@@ -102,6 +102,11 @@ export interface DriverConfig {
   adapter?: string | null;
   endpoint?: string | null;
   defaultModel?: string | null;
+  /**
+   * Operator-authored model allow-list, normalized to ids by the API. The driver form writes this
+   * as `{ id, name }` objects from a live `/models` response; the API flattens it.
+   */
+  models?: string[] | null;
   timeoutSeconds?: number | null;
   maxRetries?: number | null;
   retryDelayMilliseconds?: number | null;
@@ -242,21 +247,90 @@ export interface ContextSizeOption {
 export interface ModelCapability {
   id: string;
   name: string;
+  /**
+   * Effort levels this model accepts. Empty means the driver has no effort surface, which is
+   * different from "unknown": the picker is hidden rather than filled with a default ladder.
+   */
   efforts: string[];
-  contextSizes?: string[];
+  /**
+   * Context windows this model accepts, or null when the driver cannot be told its window.
+   * Absent on a baseline entry, which carries no models at all.
+   */
+  contextSizes?: string[] | null;
 }
+
+/**
+ * Where a model list came from, after normalization. Rendered differently in every place it
+ * appears: a bundled preset must never read like a driver answer, because the user will trust an
+ * entry the driver rejects.
+ *
+ * `declared` is the runner relaying what its own driver reported. It is a real driver answer, but
+ * one we did not verify ourselves and which can be up to the declaration window stale, so it is
+ * worded distinctly from `probed` rather than folded into it.
+ *
+ * This is the NORMALIZED type, not the wire type. The wire fields are typed `string` because this
+ * bundle is frequently older than the API serving it - the dashboard is a static build while the
+ * API rolls independently - and a field typed as this union would make `normalizeSource`'s
+ * fall-through to 'unavailable' unreachable by construction: TypeScript would insist an unknown
+ * value cannot arrive, while the whole reason that branch exists is that it can.
+ * `CapabilitySourceKindValues_AreExactlyTheUnionTheDashboardDeclares` is what keeps this list and
+ * the server's enum in step.
+ */
+export type CapabilitySource =
+  | 'probed'
+  | 'declared'
+  | 'static_preset'
+  | 'user_override'
+  | 'unavailable';
 
 export interface RuntimeCapabilities {
   adapter: string;
   name: string;
   modes: ModeOption[];
+  /**
+   * Always empty on the baseline map. Models are provider facts and are resolved per driver; the
+   * baseline exists only so mode and tier pickers can render before any driver is resolved.
+   */
   models: ModelCapability[];
   tiers?: TierOption[];
-  contextSizes?: ContextSizeOption[];
+  contextSizes?: ContextSizeOption[] | null;
+  /** False when the driver has no way to be told its context window, so the picker is hidden. */
+  supportsContextSelection?: boolean;
+  /** Raw wire value; read through `normalizeSource`, never compared directly. */
+  modelSource?: string;
+  observedAt?: string;
+  effortSource?: string | null;
+  unavailableReason?: string | null;
+}
+
+/** One driver's resolved capabilities — the surface the pickers should read. */
+export interface DriverCapabilities {
+  driverId: string;
+  name: string;
+  adapter: string;
+  endpoint?: string | null;
+  models: ModelCapability[];
+  /** Raw wire value; read through `normalizeSource`, never compared directly. */
+  modelSource: string;
+  observedAt: string;
+  supportsContextSelection: boolean;
+  contextSizes?: ContextSizeOption[] | null;
+  modes?: ModeOption[];
+  tiers?: TierOption[] | null;
+  effortSource?: string | null;
+  unavailableReason?: string | null;
+  defaultModel?: string | null;
+  operatorModels?: string[] | null;
 }
 
 export interface SystemCapabilitiesResponse {
   agentRuntimes: Record<string, RuntimeCapabilities>;
+  /**
+   * Per-driver readings. Undefined on an API build older than the capability work; an empty array
+   * means the newer API has no drivers, which is a different statement.
+   */
+  drivers?: DriverCapabilities[] | null;
+  schemaVersion?: number;
 }
 
 export interface QuotaBucket {

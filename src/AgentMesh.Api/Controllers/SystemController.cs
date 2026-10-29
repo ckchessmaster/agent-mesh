@@ -1,177 +1,129 @@
-using System.Collections.Concurrent;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
+using System.Security.Claims;
+using System.Text.Json;
+using AgentMesh.Api.Services;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AgentMesh.Api.Controllers;
 
+/// <summary>
+/// Reports what the runtime and each driver can actually do.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The shape of this endpoint changed: <c>agentRuntimes</c> used to be the whole answer, one
+/// hardcoded table per adapter, so every OpenAI-compatible driver was handed the same invented
+/// six models and a signed-out <c>agy</c> host got a five-model catalogue it had never read. The
+/// baseline map is still returned (the dashboard needs modes and tiers before it knows which
+/// drivers exist), but each entry now carries provenance and per-driver readings hang off
+/// <c>drivers</c>.
+/// </para>
+/// <para>
+/// The endpoint stays <c>[AllowAnonymous]</c> for dashboard-on-load compatibility, matching the
+/// read paths on <c>AgentsController</c>. What anonymous callers cannot do is force a live probe:
+/// <c>refresh=true</c> is ignored unless the request is authenticated, because a probe means
+/// spawning a subprocess or dialing an arbitrary URL from a request path.
+/// </para>
+/// </remarks>
 [ApiController]
 [Route("api/[controller]")]
 [AllowAnonymous]
-public class SystemController : ControllerBase
+public class SystemController(
+    IDriverCapabilityProbe? capabilityProbe = null,
+    ILogger<SystemController>? logger = null) : ControllerBase
 {
-    private static readonly ConcurrentDictionary<string, (DateTimeOffset CachedAt, List<ModelCapabilityDto> Models)> ModelCache = new();
+    private readonly IDriverCapabilityProbe _probe = capabilityProbe ?? NullDriverCapabilityProbe.Instance;
+    private readonly ILogger<SystemController> _logger = logger ?? NullLogger<SystemController>.Instance;
 
     [HttpGet("capabilities")]
-    public async Task<IActionResult> GetCapabilities([FromQuery] string? agentId = null)
+    public async Task<IActionResult> GetCapabilities(
+        [FromQuery] string? agentId = null,
+        [FromQuery] bool refresh = false,
+        [FromQuery] int limit = DefaultDriverLimit,
+        [FromServices] AgentMeshDbContext? db = null,
+        CancellationToken ct = default)
     {
-        var agyModels = await GetAgyModelsAsync();
+        // Anonymous callers get cached readings only. Without this, `refresh=true` plus any number
+        // of agentId permutations turns an allow-anonymous read endpoint into a subprocess- and
+        // network-fan-out primitive.
+        var effectiveRefresh = refresh && IsCallerAuthenticated();
 
-        var runtimes = new Dictionary<string, RuntimeCapabilitiesDto>(StringComparer.OrdinalIgnoreCase)
+        var runtimes = BuildBaselineRuntimes();
+        List<DriverCapabilitiesDto>? drivers = null;
+
+        if (db != null)
         {
-            ["agy"] = new(
-                Adapter: "agy",
-                Name: "Antigravity CLI (agy)",
-                Modes: new List<ModeOptionDto>
-                {
-                    new("auto", "Auto (Autonomous)", "Autonomous execution with step-by-step tool invocation"),
-                    new("plan", "Plan Only", "Explores codebase and produces an architectural plan without making edits"),
-                    new("accept-edits", "Accept Edits", "Automatically approves and applies code edits")
-                },
-                Models: agyModels,
-                ContextSizes: new List<ContextSizeOptionDto>
-                {
-                    new("128k", "128k Tokens", "Compact 128k token context window"),
-                    new("200k", "200k Tokens", "Standard 200k token context window for fast responses"),
-                    new("500k", "500k Tokens", "Extended 500k token context window for multi-file codebase tasks"),
-                    new("1m", "1M Tokens", "Large 1M token context window for deep repository analysis"),
-                    new("2m", "2M Tokens", "Maximum 2M token context window for flagship Gemini models")
-                }
-            ),
-            ["copilot"] = new(
-                Adapter: "copilot",
-                Name: "GitHub Copilot CLI",
-                Modes: new List<ModeOptionDto>
-                {
-                    new("autopilot", "Autopilot", "Executes prompt autonomously up to continuation limit"),
-                    new("plan", "Plan Mode", "Analyzes task and creates an implementation plan"),
-                    new("interactive", "Interactive", "Standard interactive guidance and chat")
-                },
-                Models: new List<ModelCapabilityDto>
-                {
-                    // GPT Models
-                    new("gpt-6.1-sol", "GPT-6.1 Sol", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("gpt-6-sol", "GPT-6 Sol", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("gpt-6-luna", "GPT-6 Luna", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("gpt-6-astra", "GPT-6 Astra", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("gpt-5.6-sol", "GPT-5.6 Sol", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("gpt-5.6-terra", "GPT-5.6 Terra", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("gpt-5.6-luna", "GPT-5.6 Luna", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("gpt-5.5", "GPT-5.5", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("gpt-5.4", "GPT-5.4", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("gpt-5.4-mini", "GPT-5.4 Mini", Array.Empty<string>(), new[] { "default", "128k" }),
-                    new("gpt-5.3-codex", "GPT-5.3 Codex", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("gpt-5-mini", "GPT-5 Mini", Array.Empty<string>(), new[] { "default", "128k" }),
-                    // Claude Models
-                    new("claude-sonnet-5.5", "Claude Sonnet 5.5", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("claude-sonnet-5", "Claude Sonnet 5", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("claude-fable-5.1", "Claude Fable 5.1", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("claude-fable-5", "Claude Fable 5", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("claude-opus-5.5", "Claude Opus 5.5", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("claude-opus-5", "Claude Opus 5", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("claude-opus-4.8", "Claude Opus 4.8", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k" }),
-                    new("claude-opus-4.8-fast", "Claude Opus 4.8 Fast", Array.Empty<string>(), new[] { "default", "200k" }),
-                    new("claude-sonnet-4.6", "Claude Sonnet 4.6", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k" }),
-                    new("claude-haiku-5.5", "Claude Haiku 5.5", Array.Empty<string>(), new[] { "default", "200k" }),
-                    new("claude-haiku-4.5", "Claude Haiku 4.5", Array.Empty<string>(), new[] { "default", "200k" }),
-                    // Specialized & Reasoning Models
-                    new("mai-code-1.1-flash", "MAI Code 1.1 Flash", Array.Empty<string>(), new[] { "default", "128k" }),
-                    new("gemini-4-argon", "Gemini 4 Argon", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m", "2m" }),
-                    new("gemini-3.8-flash", "Gemini 3.8 Flash", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("gemini-3.7-flash", "Gemini 3.7 Flash", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" }),
-                    new("grok-4.7", "Grok 4.7", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("grok-4.6", "Grok 4.6", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "128k", "200k" }),
-                    new("grok-4.5", "Grok 4.5", new[] { "low", "medium", "high" }, new[] { "default", "128k" }),
-                    new("kimi-k3", "Kimi k3", new[] { "low", "medium", "high" }, new[] { "default", "long_context", "200k", "1m" })
-                },
-                Tiers: new List<TierOptionDto>
-                {
-                    new("auto", "Auto", "Automatically select the best available model for each task"),
-                    new("efficiency", "Efficiency", "Favors faster models while preserving quality needed for the task"),
-                    new("balance", "Balance", "Balances model quality and speed while adapting to each task"),
-                    new("intelligence", "Intelligence", "Favors stronger models for complex work while remaining adaptive")
-                },
-                ContextSizes: new List<ContextSizeOptionDto>
-                {
-                    new("default", "Default Context", "Standard context tier for normal token usage"),
-                    new("long_context", "Long Context", "Extended long-context tier for eligible models"),
-                    new("128k", "128k Tokens", "128k token context window"),
-                    new("200k", "200k Tokens", "200k token context window"),
-                    new("1m", "1M Tokens", "1M token long-context window"),
-                    new("2m", "2M Tokens", "2M token maximum context window")
-                }
-            ),
-            ["claude"] = new(
-                Adapter: "claude",
-                Name: "Claude Code CLI",
-                Modes: new List<ModeOptionDto>
-                {
-                    new("auto", "Auto", "Autonomous task execution"),
-                    new("plan", "Plan", "Planning only")
-                },
-                Models: new List<ModelCapabilityDto>
-                {
-                    new("claude-sonnet-5-5", "Claude Sonnet 5.5", new[] { "low", "medium", "high" }, new[] { "auto", "200k", "500k", "1m" }),
-                    new("claude-opus-5-5", "Claude Opus 5.5", new[] { "low", "medium", "high" }, new[] { "auto", "200k", "500k", "1m" }),
-                    new("claude-3-7-sonnet", "Claude 3.7 Sonnet (Legacy)", Array.Empty<string>(), new[] { "auto", "100k", "200k" }),
-                    new("claude-3-5-sonnet", "Claude 3.5 Sonnet (Legacy)", Array.Empty<string>(), new[] { "auto", "100k", "200k" })
-                },
-                ContextSizes: new List<ContextSizeOptionDto>
-                {
-                    new("auto", "Auto Compact", "Automatic context compaction managed by Claude Code"),
-                    new("100k", "100k Tokens", "Compact 100k token auto-compact window"),
-                    new("200k", "200k Tokens", "Standard 200k token context window"),
-                    new("500k", "500k Tokens", "Extended 500k token context window"),
-                    new("1m", "1M Tokens", "Maximum 1M token context window (Claude 5.5)")
-                }
-            ),
-            ["openai"] = new(
-                Adapter: "openai",
-                Name: "Custom OpenAI Compatible Server",
-                Modes: new List<ModeOptionDto>
-                {
-                    new("auto", "Auto (Autonomous)", "Autonomous tool loop using OpenAI function calling"),
-                    new("plan", "Plan Only", "Explores codebase and plans changes without modifying files"),
-                    new("direct", "Direct Chat", "Direct conversational responses without executing tools")
-                },
-                Models: new List<ModelCapabilityDto>
-                {
-                    new("llama3.3", "Llama 3.3 (70B)", new[] { "low", "medium", "high" }, new[] { "8k", "32k", "128k" }),
-                    new("qwen2.5-coder", "Qwen 2.5 Coder (32B)", new[] { "low", "medium", "high" }, new[] { "32k", "128k" }),
-                    new("deepseek-r1", "DeepSeek-R1 (Reasoning)", new[] { "high" }, new[] { "64k", "128k" }),
-                    new("gpt-4o", "GPT-4o", new[] { "low", "medium", "high" }, new[] { "128k" }),
-                    new("gpt-4o-mini", "GPT-4o Mini", Array.Empty<string>(), new[] { "128k" }),
-                    new("custom", "Custom / Other Model", Array.Empty<string>(), new[] { "default", "32k", "128k" })
-                },
-                ContextSizes: new List<ContextSizeOptionDto>
-                {
-                    new("default", "Default Context", "Default context size for model"),
-                    new("8k", "8k Tokens", "Compact 8k token context window"),
-                    new("32k", "32k Tokens", "Standard 32k token context window"),
-                    new("64k", "64k Tokens", "Extended 64k token context window"),
-                    new("128k", "128k Tokens", "Large 128k token context window"),
-                    new("256k", "256k Tokens", "Long 256k token context window"),
-                    new("1m", "1M Tokens", "1M token context window")
-                }
-            ),
-            ["generic"] = new(
-                Adapter: "generic",
-                Name: "Custom Command Agent",
-                Modes: new List<ModeOptionDto>(),
-                Models: new List<ModelCapabilityDto>()
-            )
-        };
+            var boundedLimit = Math.Clamp(limit, 1, MaxDriverLimit);
+            drivers = await ResolveDriversAsync(db, agentId, effectiveRefresh, boundedLimit, ct);
 
-        return Ok(new SystemCapabilitiesResponse(
-            AgentRuntimes: runtimes
-        ));
+            // A typo'd agentId used to fall through to the baseline map, which looked like a
+            // successful answer about a driver that does not exist. Only assert that when the
+            // enumeration itself succeeded.
+            if (drivers != null && !string.IsNullOrWhiteSpace(agentId) && drivers.Count == 0)
+            {
+                return NotFound(new { error = $"No driver registered with id '{agentId}'." });
+            }
+        }
+
+        return Ok(new SystemCapabilitiesResponse(AgentRuntimes: runtimes)
+        {
+            // Tells the dashboard this build resolves per-driver capabilities, so an older API
+            // that omits the field is distinguishable from a newer API with no drivers.
+            SchemaVersion = CapabilitiesSchemaVersion,
+            Drivers = drivers
+        });
     }
 
+    /// <summary>
+    /// Resolves the capability reading for one driver.
+    /// </summary>
+    /// <remarks>
+    /// Exposed as its own endpoint so the dashboard can lazily re-read a single driver when a
+    /// session opens, instead of re-resolving every driver on the host.
+    /// </remarks>
+    [HttpGet("capabilities/driver/{driverId}")]
+    public async Task<IActionResult> GetDriverCapabilities(
+        string driverId,
+        [FromQuery] bool refresh = false,
+        [FromServices] AgentMeshDbContext? db = null,
+        CancellationToken ct = default)
+    {
+        if (db == null) return StatusCode(StatusCodes.Status503ServiceUnavailable, new { error = "Database unavailable." });
+
+        var effectiveRefresh = refresh && IsCallerAuthenticated();
+        var drivers = await ResolveDriversAsync(db, driverId, effectiveRefresh, 1, ct);
+
+        if (drivers == null)
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                new { error = "Driver records could not be read right now." });
+        }
+
+        return drivers.Count == 0
+            ? NotFound(new { error = $"No driver registered with id '{driverId}'." })
+            : Ok(drivers[0]);
+    }
+
+    private const int CapabilitiesSchemaVersion = 2;
+    private const int DefaultDriverLimit = 50;
+    private const int MaxDriverLimit = 200;
+
+    /// <summary>
+    /// Probes an OpenAI-compatible server for its model list, on operator demand.
+    /// </summary>
+    /// <remarks>
+    /// This is the interactive counterpart to the background capability probe: the operator typed
+    /// an endpoint and wants to know if it answers. It is deliberately not cached and takes the
+    /// endpoint from the request body rather than from a stored driver, because the point is to
+    /// validate a value that has not been saved yet.
+    /// </remarks>
     [HttpPost("drivers/test-openai")]
     public async Task<IActionResult> TestOpenAiServer(
         [FromBody] TestOpenAiServerRequest req,
@@ -187,6 +139,8 @@ public class SystemController : ControllerBase
         var effectiveApiKey = req.ApiKey;
         var effectiveSidecar = req.Sidecar;
 
+        // "Leave unchanged" in the driver form: fall back to the stored key rather than asking the
+        // operator to retype a secret they cannot see.
         if (db != null && !string.IsNullOrWhiteSpace(req.AgentId))
         {
             try
@@ -195,10 +149,10 @@ public class SystemController : ControllerBase
                 var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
                 if (agent != null && !string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
                 {
-                    using var doc = System.Text.Json.JsonDocument.Parse(agent.CapabilitiesJson);
+                    using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
                     if (string.IsNullOrWhiteSpace(effectiveApiKey) &&
                         doc.RootElement.TryGetProperty("apiKey", out var keyProp) &&
-                        keyProp.ValueKind == System.Text.Json.JsonValueKind.String)
+                        keyProp.ValueKind == JsonValueKind.String)
                     {
                         effectiveApiKey = keyProp.GetString();
                     }
@@ -206,32 +160,40 @@ public class SystemController : ControllerBase
                     if (effectiveSidecar != null && effectiveSidecar.Enabled &&
                         string.IsNullOrWhiteSpace(effectiveSidecar.AuthKey) &&
                         doc.RootElement.TryGetProperty("sidecar", out var scProp) &&
-                        scProp.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                        scProp.ValueKind == JsonValueKind.Object &&
                         scProp.TryGetProperty("authKey", out var scKeyProp) &&
-                        scKeyProp.ValueKind == System.Text.Json.JsonValueKind.String)
+                        scKeyProp.ValueKind == JsonValueKind.String)
                     {
                         effectiveSidecar.AuthKey = scKeyProp.GetString();
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // A malformed stored blob must not stop the operator from testing the endpoint
+                // they just typed; the test simply runs without the stored secret.
+                _ = ex;
+            }
         }
 
         if (effectiveSidecar != null && effectiveSidecar.Enabled && containerManager != null)
         {
             try
             {
-                var sidecarResult = await containerManager.TestDriverEndpointAsync(req.Endpoint, effectiveApiKey, effectiveSidecar, ct);
+                var sidecarResult = await containerManager.TestDriverEndpointAsync(
+                    req.Endpoint, effectiveApiKey, effectiveSidecar, ct);
+
                 if (!sidecarResult.Success)
                 {
-                    return Ok(new TestOpenAiServerResponse(false, sidecarResult.ErrorMessage ?? "Sidecar endpoint test failed.", new()));
+                    return Ok(new TestOpenAiServerResponse(
+                        false, sidecarResult.ErrorMessage ?? "Sidecar endpoint test failed.", new()));
                 }
 
-                var modelsList = sidecarResult.AvailableModels?
+                var sidecarModels = sidecarResult.AvailableModels?
                     .Select(m => new OpenAiModelItemDto(m, m))
-                    .ToList() ?? new();
+                    .ToList() ?? new List<OpenAiModelItemDto>();
 
-                return Ok(new TestOpenAiServerResponse(true, null, modelsList));
+                return Ok(new TestOpenAiServerResponse(true, null, sidecarModels));
             }
             catch (Exception ex)
             {
@@ -242,40 +204,37 @@ public class SystemController : ControllerBase
         try
         {
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
-            var baseEndpoint = req.Endpoint.Trim().TrimEnd('/');
-            var modelsUrl = baseEndpoint.EndsWith("/models", StringComparison.OrdinalIgnoreCase)
-                ? baseEndpoint
-                : $"{baseEndpoint}/models";
 
-            using var httpReq = new HttpRequestMessage(HttpMethod.Get, modelsUrl);
+            using var httpReq = new HttpRequestMessage(
+                HttpMethod.Get, DriverModelDiscovery.ToModelsUrl(req.Endpoint));
+
             if (!string.IsNullOrWhiteSpace(effectiveApiKey))
             {
-                httpReq.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", effectiveApiKey.Trim());
+                httpReq.Headers.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", effectiveApiKey.Trim());
             }
 
             using var res = await client.SendAsync(httpReq, ct);
             if (!res.IsSuccessStatusCode)
             {
-                return Ok(new TestOpenAiServerResponse(false, $"Server returned HTTP {(int)res.StatusCode} ({res.ReasonPhrase})", new()));
+                return Ok(new TestOpenAiServerResponse(
+                    false, $"Server returned HTTP {(int)res.StatusCode} ({res.ReasonPhrase})", new()));
             }
 
-            var json = await res.Content.ReadAsStringAsync();
-            using var doc = System.Text.Json.JsonDocument.Parse(json);
-            var models = new List<OpenAiModelItemDto>();
+            var json = await res.Content.ReadAsStringAsync(ct);
+            var models = DriverModelDiscovery.ParseOpenAiModelIds(json)
+                .Select(id => new OpenAiModelItemDto(id, id))
+                .ToList();
 
-            if (doc.RootElement.TryGetProperty("data", out var dataArr) && dataArr.ValueKind == System.Text.Json.JsonValueKind.Array)
+            // A 200 with an unparseable body used to be reported as success with zero models,
+            // which read as "this server has no models" rather than "this server is not speaking
+            // the models API".
+            if (models.Count == 0)
             {
-                foreach (var elem in dataArr.EnumerateArray())
-                {
-                    if (elem.TryGetProperty("id", out var idProp))
-                    {
-                        var id = idProp.GetString();
-                        if (!string.IsNullOrWhiteSpace(id))
-                        {
-                            models.Add(new OpenAiModelItemDto(id, id));
-                        }
-                    }
-                }
+                return Ok(new TestOpenAiServerResponse(
+                    false,
+                    "Server responded successfully but returned no models in the expected `data[].id` shape.",
+                    models));
             }
 
             return Ok(new TestOpenAiServerResponse(true, null, models));
@@ -286,184 +245,157 @@ public class SystemController : ControllerBase
         }
     }
 
-    private static async Task<List<ModelCapabilityDto>> GetAgyModelsAsync()
+    /// <summary>
+    /// True when the request carries credentials that actually validated.
+    /// </summary>
+    /// <remarks>
+    /// The dashboard's fallback header is a literal dev bearer token, so "has an Authorization
+    /// header" is not a usable signal here; only an authenticated principal is.
+    /// </remarks>
+    private bool IsCallerAuthenticated() => User?.Identity?.IsAuthenticated == true;
+
+    private async Task<List<DriverCapabilitiesDto>?> ResolveDriversAsync(
+        AgentMeshDbContext db,
+        string? agentId,
+        bool forceRefresh,
+        int limit,
+        CancellationToken ct)
     {
-        if (ModelCache.TryGetValue("agy", out var cached) &&
-            DateTimeOffset.UtcNow - cached.CachedAt < TimeSpan.FromMinutes(10))
+        IQueryable<Agent> query = db.Agents.AsNoTracking();
+
+        if (!string.IsNullOrWhiteSpace(agentId))
         {
-            return cached.Models;
+            // Same normalization the quota lookup uses: ids are stored lowercased and the UI
+            // sometimes passes them with a leading '@'.
+            var normalized = agentId.Trim().TrimStart('@').ToLowerInvariant();
+            query = query.Where(a => a.Id == normalized);
         }
 
-        var models = new List<ModelCapabilityDto>();
-        var agyPath = ResolveExecutablePath("agy");
-
-        if (agyPath != null)
+        List<Agent> agents;
+        try
         {
+            agents = await query
+                .OrderBy(a => a.Id)
+                .Take(limit)
+                .ToListAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // This endpoint used to read nothing but configuration, so a database outage could not
+            // affect it. Per-driver resolution introduced that dependency, and it must degrade the
+            // same way a failed probe does: the baseline map still lets the dashboard render mode
+            // and tier pickers. Returning null means "unknown", which the client distinguishes from
+            // "this host has no drivers" - an empty list here would be a lie about the fleet.
+            _logger.LogWarning(ex, "Could not enumerate drivers for capability resolution");
+            return null;
+        }
+
+        var results = new List<DriverCapabilitiesDto>(agents.Count);
+
+        foreach (var agent in agents)
+        {
+            var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
+            var request = view.ToProbeRequest(agent.Id, agent.RuntimeType, forceRefresh);
+
+            DriverCapabilityReading? reading = null;
             try
             {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-                var psi = new ProcessStartInfo
+                reading = await _probe.ProbeAsync(request, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw; // client went away; nothing to answer
+            }
+            catch (Exception ex)
+            {
+                // A probe bug must not take the capabilities endpoint down: the dashboard needs
+                // the baseline map to render at all. Report the failure instead of hiding it.
+                reading = new DriverCapabilityReading(
+                    Adapter: DriverAdapters.Canonicalize(request.Adapter) ?? request.Adapter ?? "unknown",
+                    Models: Array.Empty<DriverModelCapability>(),
+                    ModelSource: CapabilitySourceKind.Unavailable,
+                    ObservedAt: DateTimeOffset.UtcNow,
+                    SupportsContextSelection: ModelContextLimits.SupportsContextSelection(request.Adapter),
+                    UnavailableReason: $"Capability resolution failed: {ex.Message}");
+            }
+
+            results.Add(ToDto(agent, view, reading));
+        }
+
+        return results;
+    }
+
+    private static DriverCapabilitiesDto ToDto(
+        Agent agent,
+        DriverCapabilitiesView view,
+        DriverCapabilityReading? reading)
+    {
+        var adapter = DriverAdapters.Canonicalize(view.Adapter) ?? view.Adapter;
+
+        if (string.IsNullOrEmpty(adapter))
+        {
+            adapter = view.Endpoint != null
+                ? DriverAdapters.OpenAi
+                : agent.RuntimeType switch
                 {
-                    FileName = agyPath,
-                    Arguments = "models",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
+                    RuntimeType.OpenAiCompatible or RuntimeType.LocalOllama => DriverAdapters.OpenAi,
+                    RuntimeType.CliAgy => DriverAdapters.Agy,
+                    RuntimeType.McpCloud => DriverAdapters.Generic,
+                    _ => DriverAdapters.Generic
                 };
-
-                using var proc = new Process { StartInfo = psi };
-                proc.Start();
-
-                var lines = new List<string>();
-                while (await proc.StandardOutput.ReadLineAsync(cts.Token) is { } line)
-                {
-                    lines.Add(line);
-                }
-                await proc.WaitForExitAsync(cts.Token);
-
-                // Group by model base name
-                var grouped = new Dictionary<string, (string DisplayName, HashSet<string> Efforts)>(StringComparer.OrdinalIgnoreCase);
-
-                foreach (var line in lines)
-                {
-                    var trimmed = line.Trim();
-                    if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith('⠋') || trimmed.StartsWith('⠙')) continue;
-
-                    var parts = trimmed.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length == 0) continue;
-
-                    var modelId = parts[0];
-                    // Example: gemini-4-argon-medium -> base: gemini-4-argon, effort: medium
-                    var effort = ExtractEffortFromModelId(modelId);
-                    var baseId = effort != null ? modelId[..(modelId.Length - effort.Length - 1)] : modelId;
-                    var displayName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : baseId;
-
-                    // Clean (Medium) / (High) from display name
-                    if (effort != null && displayName.EndsWith($"({effort})", StringComparison.OrdinalIgnoreCase))
-                    {
-                        displayName = displayName[..^(effort.Length + 2)].Trim();
-                    }
-
-                    if (!grouped.TryGetValue(baseId, out var entry))
-                    {
-                        entry = (displayName, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-                        grouped[baseId] = entry;
-                    }
-                    if (effort != null)
-                    {
-                        entry.Efforts.Add(effort.ToLowerInvariant());
-                    }
-                }
-
-                foreach (var (baseId, (displayName, efforts)) in grouped)
-                {
-                    models.Add(new ModelCapabilityDto(
-                        Id: baseId,
-                        Name: displayName,
-                        Efforts: efforts.OrderBy(e => EffortOrder(e)).ToList(),
-                        ContextSizes: GetAgyModelContextSizes(baseId)
-                    ));
-                }
-            }
-            catch
-            {
-                // Fallback to static catalog on timeout or error
-            }
         }
 
-        if (models.Count == 0)
-        {
-            models = GetDefaultAgyCatalog();
-        }
+        // No reading means the probe had nothing to say (generic drivers, or a host where probing
+        // is disabled). That is "unavailable", not "empty list of everything".
+        reading ??= new DriverCapabilityReading(
+            Adapter: adapter,
+            Models: Array.Empty<DriverModelCapability>(),
+            ModelSource: CapabilitySourceKind.Unavailable,
+            ObservedAt: DateTimeOffset.UtcNow,
+            SupportsContextSelection: ModelContextLimits.SupportsContextSelection(adapter),
+            UnavailableReason: "This driver type has no capability discovery surface.");
 
-        ModelCache["agy"] = (DateTimeOffset.UtcNow, models);
-        return models;
+        var baseline = BaselineRuntimes.For(adapter);
+
+        return new DriverCapabilitiesDto(
+            DriverId: agent.Id,
+            Name: agent.Name,
+            Adapter: adapter,
+            Endpoint: view.Endpoint,
+            // The driver's own reading wins; the baseline only supplies modes/tiers, which are
+            // adapter-level interaction concepts rather than per-install facts.
+            Models: reading.Models.Select(ToModelDto).ToList(),
+            ModelSource: reading.ModelSource.ToWireValue(),
+            ObservedAt: reading.ObservedAt,
+            SupportsContextSelection: reading.SupportsContextSelection,
+            ContextSizes: reading.SupportsContextSelection
+                ? (baseline?.ContextSizes ?? BaselineRuntimes.DefaultContextSizes())
+                : null,
+            Modes: baseline?.Modes ?? new List<ModeOptionDto>(),
+            Tiers: baseline?.Tiers,
+            EffortSource: reading.EffortSource,
+            UnavailableReason: reading.UnavailableReason,
+            DefaultModel: view.DefaultModel,
+            OperatorModels: view.OperatorModels);
     }
 
-    private static string? ExtractEffortFromModelId(string id)
-    {
-        if (id.EndsWith("-low", StringComparison.OrdinalIgnoreCase)) return "low";
-        if (id.EndsWith("-medium", StringComparison.OrdinalIgnoreCase)) return "medium";
-        if (id.EndsWith("-high", StringComparison.OrdinalIgnoreCase)) return "high";
-        if (id.EndsWith("-xhigh", StringComparison.OrdinalIgnoreCase)) return "xhigh";
-        if (id.EndsWith("-max", StringComparison.OrdinalIgnoreCase)) return "max";
-        return null;
-    }
+    private static ModelCapabilityDto ToModelDto(DriverModelCapability model) =>
+        new(model.Id, model.Name, model.Efforts, model.ContextSizes);
 
-    private static int EffortOrder(string effort) => effort.ToLowerInvariant() switch
-    {
-        "low" => 1,
-        "medium" => 2,
-        "high" => 3,
-        "xhigh" => 4,
-        "max" => 5,
-        _ => 99
-    };
-
-    private static IReadOnlyCollection<string> GetAgyModelContextSizes(string baseId)
-    {
-        var lower = baseId.ToLowerInvariant();
-        if (lower.Contains("argon") || lower.Contains("pro") || lower.StartsWith("gemini-4"))
-        {
-            return new[] { "200k", "500k", "1m", "2m" };
-        }
-        if (lower.Contains("gemini") || lower.Contains("claude"))
-        {
-            return new[] { "200k", "500k", "1m" };
-        }
-        if (lower.Contains("gpt-oss") || lower.Contains("mini"))
-        {
-            return new[] { "128k", "200k" };
-        }
-        return new[] { "200k", "500k", "1m" };
-    }
-
-    private static List<ModelCapabilityDto> GetDefaultAgyCatalog() => new()
-    {
-        new("gemini-4-argon", "Gemini 4 Argon", new[] { "low", "medium", "high" }, new[] { "200k", "500k", "1m", "2m" }),
-        new("gemini-3.8-flash", "Gemini 3.8 Flash", new[] { "low", "medium", "high" }, new[] { "200k", "500k", "1m" }),
-        new("claude-opus-5-5", "Claude Opus 5.5", new[] { "low", "medium", "high" }, new[] { "200k", "500k", "1m" }),
-        new("claude-sonnet-5-5", "Claude Sonnet 5.5", new[] { "low", "medium", "high" }, new[] { "200k", "500k", "1m" }),
-        new("gpt-oss-120b", "GPT-OSS 120B", new[] { "medium" }, new[] { "128k", "200k" })
-    };
-
-    private static string? ResolveExecutablePath(string command)
-    {
-        if (string.IsNullOrWhiteSpace(command)) return null;
-        if (System.IO.File.Exists(command)) return Path.GetFullPath(command);
-
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var candidateDirs = new List<string>();
-
-        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        candidateDirs.AddRange(pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries));
-
-        if (!string.IsNullOrWhiteSpace(home))
-        {
-            candidateDirs.Add(Path.Combine(home, ".local", "bin"));
-            candidateDirs.Add(Path.Combine(home, ".gemini", "antigravity-cli", "bin"));
-        }
-
-        var extensions = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? new[] { "", ".exe", ".cmd", ".bat", ".ps1" }
-            : new[] { "" };
-
-        foreach (var dir in candidateDirs)
-        {
-            foreach (var ext in extensions)
-            {
-                try
-                {
-                    var fullPath = Path.Combine(dir, command + ext);
-                    if (System.IO.File.Exists(fullPath)) return fullPath;
-                }
-                catch { }
-            }
-        }
-
-        return null;
-    }
+    /// <summary>
+    /// The adapter-level interaction surface: modes and tiers.
+    /// </summary>
+    /// <remarks>
+    /// These are concepts our adapters implement, not provider telemetry, so a static table is
+    /// honest here. Models and context windows are provider facts and must not come from a table -
+    /// they are resolved per driver by <see cref="IDriverCapabilityProbe"/>.
+    /// </remarks>
+    private static Dictionary<string, RuntimeCapabilitiesDto> BuildBaselineRuntimes()
+        => BaselineRuntimes.All();
 }
 
 public record ModeOptionDto(string Id, string Label, string Description);
@@ -479,18 +411,75 @@ public record ModelCapabilityDto(
     IReadOnlyCollection<string>? ContextSizes = null
 );
 
+/// <param name="SupportsContextSelection">
+/// False when the driver cannot be told its context window, so the dashboard hides the picker.
+/// Defaults to false: a new adapter must earn the control rather than inherit one that silently
+/// does nothing.
+/// </param>
+/// <param name="ModelSource">
+/// One of the literals produced by <see cref="CapabilitySourceKindExtensions.ToWireValue"/> -
+/// <c>probed</c>, <c>declared</c>, <c>static_preset</c>, <c>user_override</c> or <c>unavailable</c>.
+/// The UI labels the picker with it so a bundled guess is never presented as a driver answer.
+/// The list is stated here for readability only; <c>CapabilitySourceKindValues_AreExactlyTheUnionThe
+/// DashboardDeclares</c> is what keeps it in step with the dashboard's union, and it was the absence
+/// of that check that let <c>static_preset</c> ship as <c>"staticpreset"</c>.
+/// </param>
 public record RuntimeCapabilitiesDto(
     string Adapter,
     string Name,
     List<ModeOptionDto> Modes,
     List<ModelCapabilityDto> Models,
     List<TierOptionDto>? Tiers = null,
-    List<ContextSizeOptionDto>? ContextSizes = null
+    List<ContextSizeOptionDto>? ContextSizes = null,
+    bool SupportsContextSelection = false,
+    // Defaults to "unavailable", not "static_preset": a new baseline entry that forgets to pass a
+    // source must not claim its empty model list was verified against a driver.
+    string ModelSource = "unavailable",
+    DateTimeOffset? ObservedAt = null,
+    string? EffortSource = null,
+    string? UnavailableReason = null
+);
+
+/// <summary>
+/// One driver's resolved capabilities.
+/// </summary>
+/// <param name="ContextSizes">
+/// Null when <see cref="SupportsContextSelection"/> is false, so a stale saved value has nothing
+/// to render against.
+/// </param>
+public record DriverCapabilitiesDto(
+    string DriverId,
+    string Name,
+    string Adapter,
+    string? Endpoint,
+    List<ModelCapabilityDto> Models,
+    string ModelSource,
+    DateTimeOffset ObservedAt,
+    bool SupportsContextSelection,
+    List<ContextSizeOptionDto>? ContextSizes,
+    List<ModeOptionDto> Modes,
+    List<TierOptionDto>? Tiers = null,
+    string? EffortSource = null,
+    string? UnavailableReason = null,
+    string? DefaultModel = null,
+    IReadOnlyList<string>? OperatorModels = null
 );
 
 public record SystemCapabilitiesResponse(
     Dictionary<string, RuntimeCapabilitiesDto> AgentRuntimes
-);
+)
+{
+    /// <summary>
+    /// Bumped when the response shape changes. Callers use it to tell "older API build" from
+    /// "newer API build with no drivers".
+    /// </summary>
+    public int SchemaVersion { get; init; } = 1;
+
+    /// <summary>
+    /// Per-driver readings, newest surface. Empty when the API has no database attached.
+    /// </summary>
+    public List<DriverCapabilitiesDto>? Drivers { get; init; }
+}
 
 public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null, DriverSidecarConfig? Sidecar = null, string? AgentId = null);
 

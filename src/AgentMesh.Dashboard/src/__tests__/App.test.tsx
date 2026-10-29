@@ -5,6 +5,7 @@ import { api } from '../services/api';
 import type {
   Agent,
   AgentSession,
+  DriverCapabilities,
   Persona,
   SessionMessage,
   SystemCapabilitiesResponse,
@@ -134,6 +135,26 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
     }
   };
 
+  // The capability payload as the API now sends it: a baseline map carrying interaction concepts
+  // only (no models), plus a per-driver reading under `drivers`.
+  const agyModelCatalogue = [
+    { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'], contextSizes: ['200k', '1m'] },
+    { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'], contextSizes: ['128k', '200k'] }
+  ];
+
+  const probedDriver = (driverId: string, name: string): DriverCapabilities => ({
+    driverId,
+    name,
+    adapter: 'agy',
+    models: agyModelCatalogue,
+    modelSource: 'probed',
+    observedAt: new Date().toISOString(),
+    // These fixtures exercise the context-size picker, so the mock host declares a driver that can
+    // be told its window. The real agy driver reports false: `agy --help` has no context flag, and
+    // AgyAdapter forwards none.
+    supportsContextSelection: true
+  });
+
   const mockCaps: SystemCapabilitiesResponse = {
     agentRuntimes: {
       agy: {
@@ -148,12 +169,13 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
           { id: '200k', label: '200k Tokens', description: '200k context' },
           { id: '1m', label: '1M Tokens', description: '1M context' }
         ],
-        models: [
-          { id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'], contextSizes: ['200k', '1m'] },
-          { id: 'gpt-oss-120b', name: 'GPT-OSS 120b', efforts: ['medium'], contextSizes: ['128k', '200k'] }
-        ]
+        supportsContextSelection: true,
+        models: [],
+        modelSource: 'unavailable'
       }
-    }
+    },
+    drivers: [probedDriver('agy-core', 'Agy Lead Architect'), probedDriver('agy', 'Antigravity CLI')],
+    schemaVersion: 2
   };
 
   beforeEach(() => {
@@ -704,6 +726,247 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       expect(screen.getByRole('option', { name: 'Efficiency' })).toBeInTheDocument();
       expect(screen.getByRole('option', { name: 'Intelligence' })).toBeInTheDocument();
     });
+  });
+
+  it('shows why the model list is empty instead of inventing one when the driver cannot be read', async () => {
+    // The regression this pins: `agy models` on a signed-out host prints
+    // "Error: Please sign in to view available models." and exits 1. The endpoint used to answer
+    // that with a fabricated five-model catalogue that looked identical to a real reading, so the
+    // operator picked a model the driver then rejected.
+    const mockAgent: Agent = {
+      id: 'agy-core',
+      name: 'Agy Lead Architect',
+      runtimeType: 3,
+      trustTier: 1,
+      status: 'online',
+      capabilitiesJson: JSON.stringify({ adapter: 'agy', capabilities: ['chat'] }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getCapabilities).mockResolvedValue({
+      ...mockCaps,
+      drivers: [
+        {
+          driverId: 'agy-core',
+          name: 'Agy Lead Architect',
+          adapter: 'agy',
+          models: [],
+          modelSource: 'unavailable',
+          observedAt: new Date().toISOString(),
+          supportsContextSelection: false,
+          unavailableReason: 'The agy CLI returned no model list; it is probably not signed in.'
+        }
+      ]
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Agy Lead Architect')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /New Session with Agy Lead Architect/i })[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Start New Session with Agy Lead Architect')).toBeInTheDocument();
+    });
+
+    // The reason is surfaced verbatim rather than papered over with a default list.
+    expect(
+      screen.getByText('The agy CLI returned no model list; it is probably not signed in.')
+    ).toBeInTheDocument();
+
+    // And the picker offers nothing but the driver's own default.
+    const modelSelect = screen.getByLabelText('New Session Model') as HTMLSelectElement;
+    expect(Array.from(modelSelect.options).map((o) => o.value)).toEqual(['']);
+  });
+
+  it('does not send a context size to a driver that cannot be told its window', async () => {
+    // The persona carries defaultContextSize "500k", but this driver reports no context surface
+    // (`agy --help` has no context flag and AgyAdapter forwards none). Sending it would put a value
+    // in the job payload that no component acts on, and the transcript would then report "500k" as
+    // if the run had been configured with one.
+    const mockDriver: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      runtimeType: 3,
+      trustTier: 1,
+      status: 'online',
+      capabilitiesJson: JSON.stringify({ adapter: 'agy', capabilities: ['chat'] }),
+      createdAt: new Date().toISOString()
+    };
+
+    const mockPersona: Persona = {
+      id: 'ctx-persona',
+      name: 'Context Persona',
+      role: 'Context Persona',
+      personaPrompt: 'Exercise the context-size surface.',
+      trustTier: 1,
+      driverId: 'agy',
+      defaultModel: 'gemini-4-argon',
+      defaultEffort: 'high',
+      defaultMode: 'plan',
+      defaultContextSize: '500k',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockDriver]);
+    vi.mocked(api.getPersonas).mockResolvedValue([mockPersona]);
+    vi.mocked(api.getCapabilities).mockResolvedValue({
+      ...mockCaps,
+      drivers: [
+        {
+          driverId: 'agy',
+          name: 'Antigravity CLI',
+          adapter: 'agy',
+          models: [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['low', 'medium', 'high'] }],
+          modelSource: 'probed',
+          observedAt: new Date().toISOString(),
+          supportsContextSelection: false
+        }
+      ]
+    });
+    vi.mocked(api.createPersonaSession).mockResolvedValue({
+      id: 'sess-no-context',
+      title: 'No Context Session',
+      status: 'thinking',
+      creatorAgentId: 'agy',
+      personaId: 'ctx-persona',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    } as any);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Context Persona')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /New Session with Context Persona/i })[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Start New Session with Context Persona')).toBeInTheDocument();
+    });
+
+    // The control is not rendered at all, so the operator cannot even see the stale default.
+    expect(screen.queryByLabelText('New Session Context Size')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText(/Refactor authentication middleware/i), {
+      target: { value: 'Ship it' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Launch Session/i }));
+
+    await waitFor(() => {
+      expect(api.createPersonaSession).toHaveBeenCalled();
+    });
+
+    const sentOptions = vi.mocked(api.createPersonaSession).mock.calls[0][3];
+    expect(sentOptions?.contextSize).toBeUndefined();
+    // The settings the driver does honour still go through.
+    expect(sentOptions?.model).toBe('gemini-4-argon');
+    expect(sentOptions?.effort).toBe('high');
+  });
+
+  it('labels where a model list came from so a preset is not mistaken for a driver answer', async () => {
+    const mockAgent: Agent = {
+      id: 'claude-driver',
+      name: 'Claude Driver',
+      runtimeType: 3,
+      trustTier: 1,
+      status: 'online',
+      capabilitiesJson: JSON.stringify({ adapter: 'claude', capabilities: ['chat'] }),
+      createdAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getCapabilities).mockResolvedValue({
+      ...mockCaps,
+      drivers: [
+        {
+          driverId: 'claude-driver',
+          name: 'Claude Driver',
+          adapter: 'claude',
+          models: [{ id: 'sonnet', name: 'Sonnet', efforts: [] }],
+          modelSource: 'static_preset',
+          observedAt: new Date().toISOString(),
+          supportsContextSelection: false
+        }
+      ]
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Claude Driver')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /New Session with Claude Driver/i })[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('Bundled preset — not verified by driver')).toBeInTheDocument();
+    });
+  });
+
+  it('hides a stale context-size badge on a driver that cannot be told its window', async () => {
+    // A session created before the fix can carry contextSize "500k" on an agy driver, where nothing
+    // ever forwarded it to the binary. With the options list empty the user could neither pick a
+    // valid value nor clear the stale one, so the badge asserted a setting that does nothing.
+    const mockAgent: Agent = {
+      id: 'agy',
+      name: 'Antigravity CLI',
+      runtimeType: 3,
+      trustTier: 1,
+      status: 'online',
+      capabilitiesJson: JSON.stringify({ adapter: 'agy', capabilities: ['chat'] }),
+      createdAt: new Date().toISOString()
+    };
+
+    const mockSession: AgentSession = {
+      id: 'session-stale-context',
+      title: 'Stale Context Session',
+      status: 'thinking',
+      metadataJson: JSON.stringify({ model: 'gemini-4-argon', effort: 'high', contextSize: '500k' }),
+      creatorAgentId: 'agy',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
+    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+    vi.mocked(api.getCapabilities).mockResolvedValue({
+      ...mockCaps,
+      drivers: [
+        {
+          driverId: 'agy',
+          name: 'Antigravity CLI',
+          adapter: 'agy',
+          models: [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon', efforts: ['high'] }],
+          modelSource: 'probed',
+          observedAt: new Date().toISOString(),
+          // The honest answer for agy: no context-size flag exists.
+          supportsContextSelection: false
+        }
+      ]
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Stale Context Session').length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(screen.getAllByText('Stale Context Session')[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('gemini-4-argon')).toBeInTheDocument();
+    });
+
+    // The model and effort badges are real and stay; the context badge does not.
+    expect(screen.getByText('high')).toBeInTheDocument();
+    expect(screen.queryByText('500k')).not.toBeInTheDocument();
   });
 
   it('renders Stop button beside input bar disabled when idle, enabled when thinking, and stops session on click', async () => {
