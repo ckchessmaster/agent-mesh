@@ -393,16 +393,14 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     {
         if (adapter == DriverAdapters.Agy) return DriverAdapters.Agy;
 
-        var endpoint = request.Endpoint?.Trim();
-        if (string.IsNullOrWhiteSpace(endpoint)) return $"{adapter}:default";
+        // Normalization is shared with a declaration's endpoint binding
+        // (DriverModelDiscovery.NormalizeEndpoint) on purpose: both decide whether two spellings
+        // name one server, and if they disagreed the cache would dedupe a pair the guard splits,
+        // or vice versa. Behaviour is unchanged from the inline version this replaces.
+        var normalized = DriverModelDiscovery.NormalizeEndpoint(request.Endpoint);
+        if (normalized == null) return $"{adapter}:default";
 
-        var normalized = endpoint.TrimEnd('/');
-        if (normalized.EndsWith("/models", StringComparison.OrdinalIgnoreCase))
-        {
-            normalized = normalized[..^"/models".Length].TrimEnd('/');
-        }
-
-        return $"{adapter}:{normalized.ToLowerInvariant()}";
+        return $"{adapter}:{normalized}";
     }
 
     private async Task<DriverCapabilityReading?> ProbeAgyAsync(
@@ -608,7 +606,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     /// updated in one.
     /// </para>
     /// <para>
-    /// Two things void a declaration:
+    /// Three things void a declaration:
     /// </para>
     /// <list type="number">
     ///   <item>It is older than <see cref="DriverCapabilityDeclaration.FreshnessWindow"/>. A
@@ -619,7 +617,18 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     ///   leaves the previous runner's declaration in place until that runner re-registers. Serving
     ///   it would hand an agy catalogue to an OpenAI-compatible driver, which is the exact
     ///   per-driver confusion this line of work set out to fix.</item>
+    ///   <item>Its endpoint disagrees with the row, when it declares one at all. The adapter check
+    ///   cannot catch a repoint between two OpenAI-compatible servers - the adapter still matches -
+    ///   so without this the old server's catalogue, or its 401, keeps answering for a driver that
+    ///   now points elsewhere, until that runner happens to re-register.</item>
     /// </list>
+    /// <para>
+    /// A declaration that declares no endpoint is <em>unbound</em>, not mismatched. That covers
+    /// <c>agy</c>, whose read is host-level and has no URL to bind to, and every runner built before
+    /// the field existed. Treating absence as a mismatch would empty every picker in a
+    /// mixed-version fleet the moment the API is upgraded - the rollout tail this design exists to
+    /// survive.
+    /// </para>
     /// </remarks>
     internal static bool TryTrustedDeclaration(
         DriverCapabilityProbeRequest request,
@@ -640,6 +649,13 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         var declaredAdapter = DriverAdapters.Canonicalize(candidate.Adapter);
         if (!string.Equals(declaredAdapter, adapter, StringComparison.OrdinalIgnoreCase)) return false;
 
+        var declaredEndpoint = DriverModelDiscovery.NormalizeEndpoint(candidate.Endpoint);
+        if (declaredEndpoint != null)
+        {
+            var rowEndpoint = DriverModelDiscovery.NormalizeEndpoint(request.Endpoint);
+            if (!string.Equals(declaredEndpoint, rowEndpoint, StringComparison.OrdinalIgnoreCase)) return false;
+        }
+
         declared = candidate;
         expectedAdapter = adapter;
         return true;
@@ -651,7 +667,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     /// <remarks>
     /// Whether the declaration may be believed at all is decided by
     /// <see cref="TryTrustedDeclaration"/>, which the reason path shares so the two cannot drift
-    /// apart again. The check specific to this method is the third: a declaration with no models is
+    /// apart again. The check specific to this method is the fourth: a declaration with no models is
     /// the runner saying "I could not read my own driver", and for an HTTP driver the API may still
     /// reach the server, so the probe gets its turn. The runner's explanation is recovered later by
     /// <see cref="WithDeclaredReason"/> if neither side produced a list.

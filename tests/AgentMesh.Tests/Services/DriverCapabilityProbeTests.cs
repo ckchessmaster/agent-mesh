@@ -62,10 +62,12 @@ public class DriverCapabilityProbeTests
         DateTimeOffset? observedAt = null,
         IReadOnlyList<DriverCapabilityDeclaration.DeclaredModel>? models = null,
         string? unavailableReason = null,
-        bool supportsContextSelection = false)
+        bool supportsContextSelection = false,
+        string? endpoint = null)
         => new()
         {
             Adapter = adapter,
+            Endpoint = endpoint,
             Models = models ?? new[]
             {
                 new DriverCapabilityDeclaration.DeclaredModel
@@ -919,6 +921,202 @@ public class DriverCapabilityProbeTests
 
         reading!.UnavailableReason.Should().Contain("Please sign in");
         reading.UnavailableReason.Should().NotContain("API host");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Review finding 3 on PR #12: a declaration must be bound to the endpoint it was read from.
+    // The adapter check cannot catch a repoint between two OpenAI-compatible servers, because the
+    // adapter still matches.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task Declared_AReasonFromADifferentEndpointDoesNotOverwriteTheLiveProbesOwnFailure()
+    {
+        // Same defect as the adapter case, one layer down: an openai row repointed at a new server
+        // keeps the old server's 401. The adapter matches, so only the endpoint binding catches it.
+        var oldServer = Declaration(
+            adapter: "openai",
+            models: Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
+            unavailableReason: "http://old-server/v1 rejected the configured API key (HTTP 401).",
+            endpoint: "http://old-server/v1");
+
+        var reading = await Probe(lister: (_, _, _) => Task.FromResult<IReadOnlyList<string>?>(null))
+            .ProbeAsync(OpenAi(endpoint: "http://new-server/v1", declared: oldServer));
+
+        reading!.Models.Should().BeEmpty();
+        reading.UnavailableReason.Should().NotContain("old-server",
+            "the operator repointed this driver; a message about the previous server is a red herring");
+    }
+
+    [Fact]
+    public async Task Declared_ACatalogueFromADifferentEndpointFallsBackToTheLiveProbe()
+    {
+        // The row was repointed and the runner has not re-registered yet. Serving the stored
+        // catalogue would show models this driver cannot run - the same class of bug as serving an
+        // agy catalogue to an openai row, just between two openai servers.
+        var elsewhere = Declaration(
+            adapter: "openai",
+            endpoint: "http://old-server/v1",
+            models: new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "model-from-old-server" } });
+
+        var reading = await Probe(lister: (_, _, _) =>
+            Task.FromResult<IReadOnlyList<string>?>(new[] { "model-from-new-server" })).ProbeAsync(
+                OpenAi(endpoint: "http://new-server/v1", declared: elsewhere));
+
+        reading!.Models.Select(m => m.Id).Should().Equal("model-from-new-server");
+        reading.ModelSource.Should().Be(CapabilitySourceKind.Probed);
+    }
+
+    [Fact]
+    public async Task Declared_ACatalogueFromTheSameEndpointStillWins()
+    {
+        // The other direction of the same guard: a matching endpoint must not be rejected, or the
+        // declaration path silently degrades to probing and the picker goes back to being wrong in
+        // Docker, which is the defect this whole line of work set out to fix.
+        var same = Declaration(
+            adapter: "openai",
+            endpoint: "http://localhost:11434/v1",
+            models: new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "declined-model-x" } });
+
+        var reading = await Probe(lister: (_, _, _) =>
+            Task.FromResult<IReadOnlyList<string>?>(new[] { "would-have-been-probed" })).ProbeAsync(
+                OpenAi(declared: same));
+
+        reading!.Models.Select(m => m.Id).Should().Equal("declined-model-x");
+        reading.ModelSource.Should().Be(CapabilitySourceKind.Declared);
+    }
+
+    [Theory]
+    [InlineData("http://localhost:11434/v1")]
+    [InlineData("http://localhost:11434/v1/")]
+    [InlineData("http://localhost:11434/v1/models")]
+    [InlineData("http://localhost:11434/v1/models/")]
+    [InlineData("HTTP://LocalHost:11434/v1")]
+    [InlineData("  http://localhost:11434/v1  ")]
+    public async Task Declared_EndpointComparisonToleratesTheSameCosmeticsTheCacheKeyAlreadyTolerates(
+        string declaredEndpoint)
+    {
+        // The row and the runner describe one server, written by two different code paths. If the
+        // comparison were exact-string, a trailing slash or a pasted /models suffix would reject a
+        // correct catalogue and regress the picker to probing for reasons nobody could explain.
+        // Deliberately the same set of cosmetics the cache key tolerates, and for the same reason.
+        var same = Declaration(
+            adapter: "openai",
+            endpoint: declaredEndpoint,
+            models: new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "declined-model-x" } });
+
+        var reading = await Probe(lister: (_, _, _) =>
+            Task.FromResult<IReadOnlyList<string>?>(new[] { "would-have-been-probed" })).ProbeAsync(
+                OpenAi(endpoint: "http://localhost:11434/v1", declared: same));
+
+        reading!.Models.Select(m => m.Id).Should().Equal("declined-model-x");
+    }
+
+    [Fact]
+    public async Task Declared_AHostLevelDeclarationCarriesNoEndpointAndIsStillTrusted()
+    {
+        // agy reads a local binary, so there is no endpoint to bind to. Requiring one would void
+        // every agy declaration - the exact driver this feature was built for.
+        var hostLevel = Declaration(adapter: "agy", endpoint: null);
+
+        var reading = await Probe().ProbeAsync(Agy(declared: hostLevel));
+
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.Declared);
+    }
+
+    [Fact]
+    public async Task Declared_AVersionOneBlobWithoutAnEndpointKeyIsStillTrusted()
+    {
+        // Mixed-version fleet, the direction that matters most: a runner built before the binding
+        // is already registered and its stored blob has no `endpoint` key at all. Absent means
+        // "unbound", never "mismatch", or upgrading the API would empty every picker in the fleet
+        // until every host happened to re-register.
+        var v1 = DriverCapabilityDeclaration.TryRead("""
+            {"adapter":"openai","declared":{"schemaVersion":1,"adapter":"openai",
+             "observedAt":"@OBSERVED@","models":[{"id":"declined-model-x"}]}}
+            """.Replace("@OBSERVED@", DateTimeOffset.UtcNow.ToString("O")));
+
+        v1.Should().NotBeNull("a v1 blob must still parse after the schema tag moves to 2");
+        v1!.Endpoint.Should().BeNull("the key was simply not written by that CLI");
+        v1.SchemaVersion.Should().Be(1, "the tag is recorded rather than enforced");
+
+        var reading = await Probe(lister: (_, _, _) =>
+            Task.FromResult<IReadOnlyList<string>?>(new[] { "would-have-been-probed" })).ProbeAsync(
+                OpenAi(declared: v1));
+
+        reading!.Models.Select(m => m.Id).Should().Equal("declined-model-x");
+    }
+
+    [Fact]
+    public void Declared_ANewerBlobThanTheReaderKnowsStillParses()
+    {
+        // The other direction of the rollout: a runner upgraded ahead of the API. Unknown members
+        // are ignored rather than rejected, so a future blob still yields its catalogue to an older
+        // reader. Without this, upgrading one host would knock a picker out on another.
+        var newer = DriverCapabilityDeclaration.TryRead("""
+            {"adapter":"openai","declared":{"schemaVersion":9,"adapter":"openai",
+             "observedAt":"@OBSERVED@","endpoint":"http://h/v1",
+             "someFieldFromAFutureCli":{"nested":true},
+             "models":[{"id":"declined-model-x"}]}}
+            """.Replace("@OBSERVED@", DateTimeOffset.UtcNow.ToString("O")));
+
+        newer!.SchemaVersion.Should().Be(9, "the tag is recorded, not enforced");
+        newer.Models.Select(m => m.Id).Should().Equal("declined-model-x");
+        newer.Endpoint.Should().Be("http://h/v1");
+    }
+
+    [Fact]
+    public async Task Declared_ABoundCatalogueIsRejectedWhenTheRowLostItsEndpoint()
+    {
+        // Clearing an endpoint is a config change like any other. A catalogue bound to the old URL
+        // must not keep answering for a row that no longer has one.
+        var bound = Declaration(
+            adapter: "openai",
+            endpoint: "http://old-server/v1",
+            models: new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "model-from-old-server" } });
+
+        var reading = await Probe(lister: (_, _, _) => Task.FromResult<IReadOnlyList<string>?>(null))
+            .ProbeAsync(OpenAi(endpoint: null, declared: bound));
+
+        reading!.Models.Select(m => m.Id).Should().NotContain("model-from-old-server");
+    }
+
+    [Fact]
+    public void Declared_TheWireSchemaTagIsTwoAndReadersDoNotGateOnIt()
+    {
+        // The tag exists to tell a shape change apart from a corrupt blob, not to reject older
+        // shapes: the API is upgraded before the fleet's runners are, and a gate would blank the
+        // picker for every host still on the previous CLI.
+        DriverCapabilityDeclaration.CurrentSchemaVersion.Should().Be(2,
+            "endpoint binding changed the declaration shape");
+        new DriverCapabilityDeclaration().SchemaVersion.Should().Be(2);
+    }
+
+    [Fact]
+    public void Declared_EndpointIsWrittenToTheWireOnlyWhenThereIsOne()
+    {
+        // agy declarations have no endpoint, and emitting `"endpoint":null` into every agy blob
+        // would be noise. The writer already omits nulls for the same reason it omits reasons.
+        new DriverCapabilityDeclaration { Adapter = DriverAdapters.Agy }.ToJson()
+            .Should().NotContain("endpoint");
+        new DriverCapabilityDeclaration { Adapter = DriverAdapters.OpenAi, Endpoint = "http://h/v1" }.ToJson()
+            .Should().Contain("\"endpoint\":\"http://h/v1\"");
+    }
+
+    [Fact]
+    public void Declared_TheEndpointNormalizerIsTheOneTheCacheKeyUses()
+    {
+        // Pinning the extracted helper against the cache key's historical behaviour, so pulling it
+        // out cannot quietly change which two drivers are considered to share a probe.
+        DriverModelDiscovery.NormalizeEndpoint("http://H:8000/v1/").Should().Be("http://h:8000/v1");
+        DriverModelDiscovery.NormalizeEndpoint("http://h:8000/v1/models").Should().Be("http://h:8000/v1");
+        DriverModelDiscovery.NormalizeEndpoint("http://h:8000/v1/models/").Should().Be("http://h:8000/v1");
+        DriverModelDiscovery.NormalizeEndpoint(null).Should().BeNull();
+        DriverModelDiscovery.NormalizeEndpoint("   ").Should().BeNull();
+
+        DriverCapabilityProbe.BuildCacheKey(DriverAdapters.OpenAi, OpenAi(endpoint: "http://H:8000/v1/"))
+            .Should().Be(DriverCapabilityProbe.BuildCacheKey(
+                DriverAdapters.OpenAi, OpenAi(endpoint: "http://h:8000/v1/models")));
     }
 
     [Fact]

@@ -165,21 +165,24 @@ internal static class DriverCapabilityDescriber
             {
                 return Unavailable(
                     DriverAdapters.OpenAi,
-                    error ?? $"Could not reach {endpoint}.");
+                    error ?? $"Could not reach {endpoint}.",
+                    endpoint);
             }
 
             if (statusCode == (int)HttpStatusCode.Unauthorized || statusCode == (int)HttpStatusCode.Forbidden)
             {
                 return Unavailable(
                     DriverAdapters.OpenAi,
-                    $"{endpoint} rejected the configured API key (HTTP {statusCode}).");
+                    $"{endpoint} rejected the configured API key (HTTP {statusCode}).",
+                    endpoint);
             }
 
             if (statusCode < 200 || statusCode >= 300)
             {
                 return Unavailable(
                     DriverAdapters.OpenAi,
-                    $"{endpoint} returned HTTP {statusCode} for /models.");
+                    $"{endpoint} returned HTTP {statusCode} for /models.",
+                    endpoint);
             }
 
             var ids = DriverModelDiscovery.ParseOpenAiModelIds(body);
@@ -187,7 +190,8 @@ internal static class DriverCapabilityDescriber
             {
                 return Unavailable(
                     DriverAdapters.OpenAi,
-                    error ?? $"{endpoint} returned no models. Check that the endpoint points at a model server, not a proxy page.");
+                    error ?? $"{endpoint} returned no models. Check that the endpoint points at a model server, not a proxy page.",
+                    endpoint);
             }
 
             var supportsContext = ModelContextLimits.SupportsContextSelection(DriverAdapters.OpenAi);
@@ -195,6 +199,11 @@ internal static class DriverCapabilityDescriber
             return new DriverCapabilityDeclaration
             {
                 Adapter = DriverAdapters.OpenAi,
+                // Bound to the URL this read actually went to, so the API can tell when the row has
+                // been repointed at another server underneath it. The adapter check cannot: two
+                // OpenAI-compatible servers share an adapter, so the old server's catalogue - or its
+                // 401 - would keep answering for the new one until this runner re-registered.
+                Endpoint = endpoint,
                 Models = ids.Select(id => new DriverCapabilityDeclaration.DeclaredModel
                 {
                     Id = id,
@@ -214,7 +223,7 @@ internal static class DriverCapabilityDescriber
         }
         catch (Exception ex)
         {
-            return Unavailable(DriverAdapters.OpenAi, $"Could not reach {endpoint}: {ex.Message}");
+            return Unavailable(DriverAdapters.OpenAi, $"Could not reach {endpoint}: {ex.Message}", endpoint);
         }
     }
 
@@ -227,9 +236,23 @@ internal static class DriverCapabilityDescriber
         // decides what is selectable.
     };
 
-    private static DriverCapabilityDeclaration Unavailable(string adapter, string reason) => new()
+    /// <summary>
+    /// A declaration that reports no models and says why.
+    /// </summary>
+    /// <param name="endpoint">
+    /// The endpoint the read was attempted against, for an HTTP driver. Carried on failures for the
+    /// same reason it is carried on successes, and arguably more: an empty catalogue is what a
+    /// repointed driver produces, so the reason path is where the API most needs to know which
+    /// server an explanation is about. Null for a host-level read, and for the "no endpoint
+    /// configured" case, where there is nothing to bind to.
+    /// </param>
+    private static DriverCapabilityDeclaration Unavailable(
+        string adapter,
+        string reason,
+        string? endpoint = null) => new()
     {
         Adapter = adapter,
+        Endpoint = endpoint,
         Models = Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
         SupportsContextSelection = ModelContextLimits.SupportsContextSelection(adapter),
         Source = null,

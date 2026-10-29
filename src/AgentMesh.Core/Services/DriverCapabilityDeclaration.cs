@@ -49,7 +49,22 @@ public sealed record DriverCapabilityDeclaration
     /// <summary>
     /// Schema tag so a future shape change is distinguishable from a truncated or foreign blob.
     /// </summary>
-    public const int CurrentSchemaVersion = 1;
+    /// <remarks>
+    /// <para>
+    /// Bumped to 2 by <see cref="Endpoint"/>, which changed what a declaration asserts: v1 said
+    /// "this adapter reported these models", v2 says "this adapter at this endpoint did".
+    /// </para>
+    /// <para>
+    /// It is a discriminator for diagnosis, <b>not</b> an admission check, and must stay that way.
+    /// The API is upgraded before the fleet's runners are, so a reader that rejected anything below
+    /// the current tag would empty every picker on deploy day and stay empty until every host
+    /// happened to re-register. A v1 blob is read as a v2 blob with an unbound endpoint, which is
+    /// exactly what it is. Pinned both ways by
+    /// <c>Declared_AVersionOneBlobWithoutAnEndpointKeyIsStillTrusted</c> and
+    /// <c>Declared_ANewerBlobThanTheReaderKnowsStillParses</c>.
+    /// </para>
+    /// </remarks>
+    public const int CurrentSchemaVersion = 2;
 
     [JsonPropertyName("schemaVersion")]
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
@@ -57,6 +72,32 @@ public sealed record DriverCapabilityDeclaration
     /// <summary>Canonical adapter id this declaration describes (see <see cref="DriverAdapters"/>).</summary>
     [JsonPropertyName("adapter")]
     public string Adapter { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The endpoint this declaration was read from, for an HTTP driver, as the runner dialled it.
+    /// Null for a host-level read (<c>agy</c>), which has no endpoint to bind to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The adapter check alone cannot catch a row repointed between two OpenAI-compatible servers:
+    /// the adapter still matches, so a stored catalogue keeps answering for a driver that now
+    /// points somewhere else, and it does so until that runner happens to re-register. Binding a
+    /// declaration to the URL it came from is what makes that edit take effect immediately.
+    /// </para>
+    /// <para>
+    /// Compared through <see cref="DriverModelDiscovery.NormalizeEndpoint"/>, never as written. The
+    /// row and the runner describe one server by two code paths, and an exact-string comparison
+    /// would reject a correct catalogue over a trailing slash or a pasted <c>/models</c> suffix -
+    /// regressing the picker to probing for reasons nobody could explain.
+    /// </para>
+    /// <para>
+    /// Absent means <em>unbound</em>, not mismatched. Runners built before this field exists send no
+    /// key, and reading that as a mismatch would empty every picker in a mixed-version fleet the
+    /// moment the API is upgraded, which is the rollout tail this design exists to survive.
+    /// </para>
+    /// </remarks>
+    [JsonPropertyName("endpoint")]
+    public string? Endpoint { get; init; }
 
     /// <summary>
     /// Models the driver reported, with the options each one accepts. Empty means "the driver

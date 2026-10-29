@@ -227,6 +227,37 @@ public static class DriverModelDiscovery
     }
 
     /// <summary>
+    /// Collapses the ways one server can be written down into a single comparable form.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Shared by the probe's cache key and by a declaration's endpoint binding, and it has to be
+    /// shared: two code paths describe the same server - an operator types a URL into a field, a
+    /// runner reports the one it actually dialled - and if the two comparisons disagreed about what
+    /// counts as "the same server", one of them would be wrong in a way nobody could reproduce.
+    /// </para>
+    /// <para>
+    /// Tolerates the differences that are not configuration differences: surrounding whitespace, a
+    /// trailing slash, an operator who pasted the full <c>.../models</c> path, and host casing,
+    /// which URLs treat as case-insensitive.
+    /// </para>
+    /// </remarks>
+    /// <returns>The normalized form, or null when there is no endpoint to normalize.</returns>
+    public static string? NormalizeEndpoint(string? endpoint)
+    {
+        var trimmed = endpoint?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed)) return null;
+
+        var normalized = trimmed.TrimEnd('/');
+        if (normalized.EndsWith("/models", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[..^"/models".Length].TrimEnd('/');
+        }
+
+        return normalized.ToLowerInvariant();
+    }
+
+    /// <summary>
     /// Turns a configured endpoint into the models URL, tolerating an operator who pasted the
     /// full <c>.../models</c> path.
     /// </summary>

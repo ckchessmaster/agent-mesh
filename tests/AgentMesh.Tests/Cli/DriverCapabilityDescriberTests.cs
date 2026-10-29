@@ -3,6 +3,7 @@ using AgentMesh.Api.Services;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 using FluentAssertions;
@@ -365,6 +366,164 @@ public sealed class DriverCapabilityDescriberTests : IDisposable
             Preset("openai", "http://h/v1"), "key", default);
 
         declared!.SupportsContextSelection.Should().BeTrue();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Endpoint binding (review finding 3, runner side).
+    //
+    // The API rejects a declaration whose endpoint no longer matches the row. These pin the other
+    // half: that a runner actually sends the value that check compares. Without them the guard is
+    // dead code in production while still passing its own tests off hand-built declarations.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task OpenAi_ASuccessfulReadIsBoundToTheEndpointItWasReadFrom()
+    {
+        DriverCapabilityDescriber.ModelsEndpointReader = (_, _, _) =>
+            Task.FromResult((200, """{"data":[{"id":"llama-3.3:latest"}]}""", (string?)null));
+
+        var declared = await DriverCapabilityDescriber.DescribeOpenAiAsync(
+            Preset("openai", "http://localhost:11434/v1"), "key", default);
+
+        declared!.Endpoint.Should().Be("http://localhost:11434/v1");
+    }
+
+    [Theory]
+    [InlineData(401, "{}")]
+    [InlineData(500, "{}")]
+    [InlineData(0, "")]
+    [InlineData(200, "<html><body>Sign in</body></html>")]
+    public async Task OpenAi_AFailedReadIsBoundTooBecauseThatIsWhereRepointingShowsUp(
+        int status, string body)
+    {
+        // The empty catalogue a repointed driver produces is a failure, so binding only the success
+        // path would leave the exact case finding 3 describes unguarded: the row now points at
+        // server B while the stored reason still complains about server A.
+        DriverCapabilityDescriber.ModelsEndpointReader = (_, _, _) =>
+            Task.FromResult((status, body, (string?)null));
+
+        var declared = await DriverCapabilityDescriber.DescribeOpenAiAsync(
+            Preset("openai", "http://old-server/v1"), "key", default);
+
+        declared!.Models.Should().BeEmpty();
+        declared.Endpoint.Should().Be("http://old-server/v1",
+            "an unbound failure reason is the one the API cannot invalidate");
+    }
+
+    [Fact]
+    public async Task OpenAi_NoEndpointMeansNoBindingRatherThanAnEmptyOne()
+    {
+        // "There was no endpoint" and "the endpoint does not match" are different statements. An
+        // empty string would normalize to null on the API side anyway, but writing it would make
+        // the wire format ambiguous about which one the runner meant.
+        DriverCapabilityDescriber.ModelsEndpointReader = (_, _, _) =>
+            Task.FromResult((200, """{"data":[{"id":"m"}]}""", (string?)null));
+
+        var declared = await DriverCapabilityDescriber.DescribeOpenAiAsync(
+            Preset("openai"), "key", default);
+
+        declared!.Endpoint.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Agy_DeclaresNoEndpointBecauseItsReadIsHostLevel()
+    {
+        // agy reads a local binary. Inventing an endpoint for it would let the API's binding check
+        // reject the very driver this feature was built for.
+        WithAgyInstalled();
+        DriverCapabilityDescriber.AgyModelsRunner = (_, _, _, _) =>
+            Task.FromResult((0, SampleAgyModels, string.Empty));
+
+        var declared = await DriverCapabilityDescriber.DescribeAgyAsync(Preset());
+
+        declared!.Endpoint.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task TheEndpointSurvivesTheRoundTripThroughTheRegistrationBlob()
+    {
+        // The API reads the value back out of a stored blob, not off the runner's object. If
+        // serialization dropped it - a null-ignoring writer, a name mismatch - the guard would
+        // silently never fire and every test above would still pass.
+        DriverCapabilityDescriber.ModelsEndpointReader = (_, _, _) =>
+            Task.FromResult((401, "{}", (string?)null));
+
+        var declared = await DriverCapabilityDescriber.DescribeOpenAiAsync(
+            Preset("openai", "http://old-server/v1"), "bad", default);
+
+        var blob = MeshClient.SerializePresetCapabilities(
+            Preset("openai", "http://old-server/v1"), declared);
+
+        var readBack = DriverCapabilityDeclaration.TryRead(blob);
+
+        readBack!.Endpoint.Should().Be("http://old-server/v1");
+        readBack.UnavailableReason.Should().Contain("401");
+    }
+
+    [Fact]
+    public async Task TheApiAcceptsABindingWrittenByTheRunnerForACosmeticallyDifferentRow()
+    {
+        // The cross-boundary contract in one test: the value is produced by the real describer from
+        // what an operator typed, serialized the way a registration serializes it, stored, read
+        // back by the API's parser, then judged by the API's own trust guard.
+        //
+        // Each half is tested separately elsewhere, which is exactly how a mismatch could survive:
+        // the runner writes "  http://LLM:8000/v1/  " and the row says "http://llm:8000/v1/models";
+        // both are correct about one server, and only the two halves disagreeing shows up here.
+        DriverCapabilityDescriber.ModelsEndpointReader = (_, _, _) =>
+            Task.FromResult((200, """{"data":[{"id":"llama-3.3:latest"}]}""", (string?)null));
+
+        var declared = await DriverCapabilityDescriber.DescribeOpenAiAsync(
+            Preset("openai", "  http://LLM:8000/v1/  "), "key", default);
+
+        var stored = MeshClient.SerializePresetCapabilities(
+            Preset("openai", "  http://LLM:8000/v1/  "), declared);
+
+        var readBack = DriverCapabilityDeclaration.TryRead(stored);
+        readBack.Should().NotBeNull();
+
+        var row = new DriverCapabilityProbeRequest(
+            DriverId: "openai-driver",
+            RuntimeType: RuntimeType.OpenAiCompatible,
+            Adapter: "openai",
+            Endpoint: "http://llm:8000/v1/models",
+            Declared: readBack);
+
+        DriverCapabilityProbe.TryTrustedDeclaration(
+            row, DateTimeOffset.UtcNow, out var trusted, out var adapter)
+            .Should().BeTrue("one server written two ways is still one server");
+        trusted.Endpoint.Should().Be("http://LLM:8000/v1/",
+            "the describer trims surrounding whitespace but does not otherwise rewrite what the " +
+            "operator typed; the guard compares normalized forms rather than mutating the report");
+        adapter.Should().Be(DriverAdapters.OpenAi);
+    }
+
+    [Fact]
+    public async Task TheApiRejectsABindingWrittenByTheRunnerOnceTheRowIsRepointed()
+    {
+        // The other half of the contract, and the actual defect: the same stored declaration must
+        // stop being trusted the moment the row points at a different server. Had the runner written
+        // no endpoint, this would return true and the stale catalogue would win - which is why the
+        // binding has to be produced on the runner, not inferred later.
+        DriverCapabilityDescriber.ModelsEndpointReader = (_, _, _) =>
+            Task.FromResult((200, """{"data":[{"id":"model-from-old-server"}]}""", (string?)null));
+
+        var declared = await DriverCapabilityDescriber.DescribeOpenAiAsync(
+            Preset("openai", "http://old-server/v1"), "key", default);
+
+        var stored = MeshClient.SerializePresetCapabilities(
+            Preset("openai", "http://old-server/v1"), declared);
+
+        var row = new DriverCapabilityProbeRequest(
+            DriverId: "openai-driver",
+            RuntimeType: RuntimeType.OpenAiCompatible,
+            Adapter: "openai",
+            Endpoint: "http://new-server/v1",
+            Declared: DriverCapabilityDeclaration.TryRead(stored));
+
+        DriverCapabilityProbe.TryTrustedDeclaration(
+            row, DateTimeOffset.UtcNow, out _, out _)
+            .Should().BeFalse("the row no longer points at the server this catalogue came from");
     }
 
     // ---------------------------------------------------------------------------------------
