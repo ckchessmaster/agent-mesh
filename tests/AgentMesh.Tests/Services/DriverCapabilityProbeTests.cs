@@ -860,6 +860,67 @@ public class DriverCapabilityProbeTests
             .BeEquivalentTo(DriverCapabilityProbe.ContextSizesForModel("gpt-5.1-codex"));
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Review finding 2 on PR #12: the reason-preference path must apply the same guards as the
+    // catalogue path. It consulted `declared` with no freshness and no adapter check, so a stale
+    // or foreign self-report could overwrite the API's own, current reason.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task Declared_AStaleReasonDoesNotOverwriteTheLiveProbesOwnFailure()
+    {
+        // A runner that died last week must not keep a driver showing last week's explanation. The
+        // live probe's reason is the only current fact about the driver, so it has to survive.
+        var stale = Declaration(
+            models: Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
+            unavailableReason: "signed out on this machine",
+            observedAt: DateTimeOffset.UtcNow - DriverCapabilityDeclaration.FreshnessWindow - TimeSpan.FromMinutes(1));
+
+        var reading = await Probe(executableResolver: () => null).ProbeAsync(Agy(declared: stale));
+
+        reading!.Models.Should().BeEmpty();
+        reading.UnavailableReason.Should().Contain("API host",
+            "a stale self-report must not replace the reason the API actually observed today");
+        reading.UnavailableReason.Should().NotContain("signed out on this machine");
+    }
+
+    [Fact]
+    public async Task Declared_AReasonFromAnotherAdapterDoesNotOverwriteTheLiveProbesOwnFailure()
+    {
+        // A row repointed from agy to openai whose new endpoint is unreachable. The agy explanation
+        // is about a driver this row no longer is, and serving it sends the operator to fix the
+        // wrong thing.
+        var mismatched = Declaration(
+            adapter: "agy",
+            models: Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
+            unavailableReason: "agy is not signed in on this machine");
+
+        var reading = await Probe(lister: (_, _, _) => Task.FromResult<IReadOnlyList<string>?>(null))
+            .ProbeAsync(OpenAi(declared: mismatched));
+
+        reading!.Models.Should().BeEmpty();
+        reading.UnavailableReason.Should().NotContain("agy is not signed in");
+        reading.UnavailableReason.Should().Contain("server",
+            "the reason must describe the driver this row points at now");
+    }
+
+    [Fact]
+    public async Task Declared_AFreshMatchingReasonStillWins()
+    {
+        // The guard must not disable the fix it sits next to: in Docker the API's own reason is
+        // always about where the API runs, so a trustworthy runner's reason is still the one worth
+        // showing. Asserted alongside the two rejections so a change that simply stops applying
+        // declared reasons altogether cannot pass this file.
+        var matching = Declaration(
+            models: Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
+            unavailableReason: "agy reported no models (Error: Please sign in.)");
+
+        var reading = await Probe(executableResolver: () => null).ProbeAsync(Agy(declared: matching));
+
+        reading!.UnavailableReason.Should().Contain("Please sign in");
+        reading.UnavailableReason.Should().NotContain("API host");
+    }
+
     [Fact]
     public void Declared_FreshnessRejectsAClockFarInTheFuture()
     {

@@ -595,27 +595,66 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     }
 
     /// <summary>
-    /// Layers the operator's <c>models</c> array and <c>defaultModel</c> over whatever the probe
-    /// produced, marking the result as an override so the UI can say which list is whose.
-    /// </summary>
-    /// <summary>
-    /// Builds a reading from the runner's own report of its driver, when there is one to trust.
+    /// Whether a runner's self-report may be believed for this driver row at all.
     /// </summary>
     /// <remarks>
-    /// Three things void a declaration and fall through to a live read instead:
+    /// <para>
+    /// Both consumers of a declaration - the catalogue path and the reason path - have to apply the
+    /// same checks, which is why this is one predicate rather than two sets of <c>if</c>s. They had
+    /// already drifted: <see cref="WithDeclaredReason"/> consulted a declaration without checking
+    /// its age or its adapter, so a runner that died last week could keep a driver showing last
+    /// week's explanation, and a row repointed from <c>agy</c> to <c>openai</c> could be told to go
+    /// sign into a driver it no longer is. A guard duplicated in two places is a guard that gets
+    /// updated in one.
+    /// </para>
+    /// <para>
+    /// Two things void a declaration:
+    /// </para>
     /// <list type="number">
     ///   <item>It is older than <see cref="DriverCapabilityDeclaration.FreshnessWindow"/>. A
-    ///   catalogue from a runner that died last week must not pin the picker forever.</item>
+    ///   catalogue from a runner that died last week must not pin the picker forever, and neither
+    ///   must its parting explanation.</item>
     ///   <item>Its adapter disagrees with the row. The blob is written by a runner but the row can
     ///   be edited underneath it: repointing a driver at a different adapter in the dashboard
     ///   leaves the previous runner's declaration in place until that runner re-registers. Serving
     ///   it would hand an agy catalogue to an OpenAI-compatible driver, which is the exact
     ///   per-driver confusion this line of work set out to fix.</item>
-    ///   <item>It carries no models. An empty declaration is the runner saying "I could not read
-    ///   my own driver", and for an HTTP driver the API may still reach the server, so the probe
-    ///   gets its turn. The runner's explanation is recovered later by
-    ///   <see cref="WithDeclaredReason"/> if neither side produced a list.</item>
     /// </list>
+    /// </remarks>
+    internal static bool TryTrustedDeclaration(
+        DriverCapabilityProbeRequest request,
+        DateTimeOffset now,
+        out DriverCapabilityDeclaration declared,
+        out string expectedAdapter)
+    {
+        declared = null!;
+        expectedAdapter = null!;
+
+        var candidate = request.Declared;
+        if (candidate == null) return false;
+        if (!candidate.IsFresh(now)) return false;
+
+        var adapter = NormalizeAdapter(request);
+        if (adapter == null) return false;
+
+        var declaredAdapter = DriverAdapters.Canonicalize(candidate.Adapter);
+        if (!string.Equals(declaredAdapter, adapter, StringComparison.OrdinalIgnoreCase)) return false;
+
+        declared = candidate;
+        expectedAdapter = adapter;
+        return true;
+    }
+
+    /// <summary>
+    /// Builds a reading from the runner's own report of its driver, when there is one to trust.
+    /// </summary>
+    /// <remarks>
+    /// Whether the declaration may be believed at all is decided by
+    /// <see cref="TryTrustedDeclaration"/>, which the reason path shares so the two cannot drift
+    /// apart again. The check specific to this method is the third: a declaration with no models is
+    /// the runner saying "I could not read my own driver", and for an HTTP driver the API may still
+    /// reach the server, so the probe gets its turn. The runner's explanation is recovered later by
+    /// <see cref="WithDeclaredReason"/> if neither side produced a list.
     /// </remarks>
     internal static bool TryDeclaredReading(
         DriverCapabilityProbeRequest request,
@@ -624,15 +663,10 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     {
         reading = null!;
 
-        var declared = request.Declared;
-        if (declared == null) return false;
-        if (!declared.IsFresh(now ?? DateTimeOffset.UtcNow)) return false;
-
-        var expectedAdapter = NormalizeAdapter(request);
-        if (expectedAdapter == null) return false;
-
-        var declaredAdapter = DriverAdapters.Canonicalize(declared.Adapter);
-        if (!string.Equals(declaredAdapter, expectedAdapter, StringComparison.OrdinalIgnoreCase)) return false;
+        if (!TryTrustedDeclaration(request, now ?? DateTimeOffset.UtcNow, out var declared, out var expectedAdapter))
+        {
+            return false;
+        }
 
         if (declared.Models.Count == 0) return false;
 
@@ -666,10 +700,18 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     /// Prefers the runner's explanation for an empty catalogue over the API's own.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// "Not signed in on this machine" is ground truth about an account. "The agy CLI is not
     /// installed on the API host" is a fact about where the API happens to run, and in a Docker
     /// deployment that is always true, so it would mask the real reason every time. When neither
     /// side produced a model list, the runner's reason is the one worth showing.
+    /// </para>
+    /// <para>
+    /// An explanation is a claim about a driver, so it gets the same scrutiny as a catalogue:
+    /// <see cref="TryTrustedDeclaration"/>. Without it, this method overwrote a live probe's failure
+    /// with a stale declaration's parting words, or with a message about an adapter the row no
+    /// longer uses - both of which send the operator off to fix something that is not broken.
+    /// </para>
     /// </remarks>
     private static DriverCapabilityReading? WithDeclaredReason(
         DriverCapabilityReading? reading,
@@ -677,12 +719,18 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     {
         if (reading is not { Models.Count: 0 }) return reading;
 
-        var reason = request.Declared?.UnavailableReason;
+        if (!TryTrustedDeclaration(request, DateTimeOffset.UtcNow, out var declared, out _)) return reading;
+
+        var reason = declared.UnavailableReason;
         if (string.IsNullOrWhiteSpace(reason)) return reading;
 
         return reading with { UnavailableReason = reason };
     }
 
+    /// <summary>
+    /// Layers the operator's <c>models</c> array and <c>defaultModel</c> over whatever the probe
+    /// produced, marking the result as an override so the UI can say which list is whose.
+    /// </summary>
     private static DriverCapabilityReading WithOperatorModels(
         DriverCapabilityReading reading,
         DriverCapabilityProbeRequest request)
