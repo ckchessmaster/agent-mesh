@@ -252,11 +252,27 @@ describe('resolveDriverCapabilities', () => {
   });
 
   it('treats an unknown modelSource as unavailable', () => {
+    // An unknown source must not be presented as a verified driver answer, so falling through to
+    // 'unavailable' is the right call. What makes it dangerous is the half that is NOT wrong: the
+    // model list survives normalization untouched.
+    //
+    // So the real symptom is a contradiction on screen, not an empty picker. App.tsx branches on
+    // `availableModels.length > 0` before it renders provenance, so a populated select sits under a
+    // caption reading "Model list unavailable". That is what happened for real to static_preset and
+    // user_override, whose wire values the old ToString().ToLowerInvariant() mangled into
+    // "staticpreset"/"useroverride" - neither of which is in this union.
+    //
+    // Both halves are pinned because the interesting property is that the data is fine and only the
+    // label lies: a test asserting an empty list would pass for the wrong reason.
     const resolved = resolveDriverCapabilities(
-      response([{ ...probedAgy, modelSource: 'definitely-not-a-source' as DriverCapabilities['modelSource'] }]),
+      response([{ ...probedAgy, modelSource: 'definitely-not-a-source' }]),
       agent()
     );
+
     expect(resolved?.source).toBe('unavailable');
+    expect(resolved?.models.map((m) => m.id)).toEqual(['gemini-4-argon']);
+    expect(capabilitySourceLabel(resolved)).toMatch(/unavailable/i);
+    expect(capabilityUnavailableMessage(resolved)).toBeNull();
   });
 });
 
@@ -463,6 +479,35 @@ describe('capabilitySourceLabel', () => {
     expect(capabilitySourceLabel(resolveDriverCapabilities(response([probedAgy]), agent()))).toMatch(
       /read from this driver/i
     );
+  });
+
+  it('labels a runner-declared list as reported via its runner, not as read by us', () => {
+    // Option C. The runner relayed this from the machine next to the binary, so it is a real
+    // driver answer but one we did not verify ourselves and which can be window-stale. Folding it
+    // into 'probed' would have told the user we checked when we did not.
+    const resolved = resolveDriverCapabilities(
+      response([{ ...probedAgy, modelSource: 'declared' }]),
+      agent()
+    );
+
+    expect(resolved?.source).toBe('declared');
+    expect(capabilitySourceLabel(resolved)).toMatch(/reported by this driver/i);
+    expect(capabilitySourceLabel(resolved)).toMatch(/runner/i);
+    expect(capabilitySourceLabel(resolved)).not.toMatch(/read from this driver/i);
+  });
+
+  it('still offers a declared model list to the picker', () => {
+    // The regression this guards: normalizeSource used to enumerate accepted literals inline, so a
+    // source it did not know fell through to 'unavailable'. The list itself survived, but the
+    // caption under it claimed there was none. 'declared' would have arrived looking broken.
+    const resolved = resolveDriverCapabilities(
+      response([{ ...probedAgy, modelSource: 'declared' }]),
+      agent()
+    );
+
+    expect(resolved?.models.map((m) => m.id)).toEqual(['gemini-4-argon']);
+    expect(effortsFor(resolved, null).sort()).toEqual(['high', 'low', 'max', 'xhigh']);
+    expect(capabilityUnavailableMessage(resolved)).toBeNull();
   });
 
   it('labels an operator list as operator-configured', () => {

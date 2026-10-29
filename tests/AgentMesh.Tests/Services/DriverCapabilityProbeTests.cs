@@ -1,5 +1,6 @@
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
+using AgentMesh.Core.Services;
 using FluentAssertions;
 
 namespace AgentMesh.Tests.Services;
@@ -35,17 +36,50 @@ public class DriverCapabilityProbeTests
             lister,
             maxConcurrent);
 
-    private static DriverCapabilityProbeRequest Agy(string id = "agy", bool refresh = false)
-        => new(DriverId: id, RuntimeType: RuntimeType.CliAgy, Adapter: "agy", Endpoint: null, ForceRefresh: refresh);
+    private static DriverCapabilityProbeRequest Agy(
+        string id = "agy",
+        bool refresh = false,
+        DriverCapabilityDeclaration? declared = null)
+        => new(DriverId: id, RuntimeType: RuntimeType.CliAgy, Adapter: "agy", Endpoint: null,
+            ForceRefresh: refresh, Declared: declared);
 
     private static DriverCapabilityProbeRequest OpenAi(
         string id = "openai",
         string? endpoint = "http://localhost:11434/v1",
         IReadOnlyList<string>? models = null,
         string? defaultModel = null,
-        bool refresh = false)
+        bool refresh = false,
+        DriverCapabilityDeclaration? declared = null)
         => new(DriverId: id, RuntimeType: RuntimeType.OpenAiCompatible, Adapter: "openai",
-            Endpoint: endpoint, OperatorModels: models, DefaultModel: defaultModel, ForceRefresh: refresh);
+            Endpoint: endpoint, OperatorModels: models, DefaultModel: defaultModel,
+            ForceRefresh: refresh, Declared: declared);
+
+    /// <summary>
+    /// A declaration as a runner would push it (option C).
+    /// </summary>
+    private static DriverCapabilityDeclaration Declaration(
+        string adapter = "agy",
+        DateTimeOffset? observedAt = null,
+        IReadOnlyList<DriverCapabilityDeclaration.DeclaredModel>? models = null,
+        string? unavailableReason = null,
+        bool supportsContextSelection = false)
+        => new()
+        {
+            Adapter = adapter,
+            Models = models ?? new[]
+            {
+                new DriverCapabilityDeclaration.DeclaredModel
+                {
+                    Id = "declined-model-x",
+                    Name = "Declined Model X",
+                    Efforts = new[] { "low", "high" }
+                }
+            },
+            SupportsContextSelection = supportsContextSelection,
+            Source = unavailableReason == null ? "agy-models" : null,
+            UnavailableReason = unavailableReason,
+            ObservedAt = observedAt ?? DateTimeOffset.UtcNow
+        };
 
     private static DriverCapabilityProbeRequest Claude(string id = "claude")
         => new(DriverId: id, RuntimeType: RuntimeType.CliAgy, Adapter: "claude", Endpoint: null);
@@ -551,7 +585,7 @@ public class DriverCapabilityProbeTests
     {
         var raw = "⠋ Fetching available models...\n\nAvailable models:\ngemini-4-argon-low  Gemini 4 Argon (low)\n";
 
-        var models = DriverCapabilityProbe.ParseAgyModels(raw);
+        var models = DriverModelDiscovery.ParseAgyModels(raw);
 
         models.Should().ContainSingle().Which.Id.Should().Be("gemini-4-argon");
     }
@@ -560,7 +594,7 @@ public class DriverCapabilityProbeTests
     public void ParseAgyModels_NonEffortSuffixesAreNotStripped()
     {
         // Stripping "-nano" would invent a base model the CLI never offered.
-        var models = DriverCapabilityProbe.ParseAgyModels("gemini-4-flash-nano  Gemini 4 Flash Nano\n");
+        var models = DriverModelDiscovery.ParseAgyModels("gemini-4-flash-nano  Gemini 4 Flash Nano\n");
 
         models.Should().ContainSingle().Which.Id.Should().Be("gemini-4-flash-nano");
         models.Single().Efforts.Should().BeEmpty();
@@ -572,7 +606,7 @@ public class DriverCapabilityProbeTests
         // Two invariants at once. An unknown suffix must not become an advertised effort, because
         // AgyAdapter drops anything outside the documented --effort set. And it must not be stripped
         // off the id either: `gemini-x-ultra` is a real id the CLI printed, so it stays a model.
-        var models = DriverCapabilityProbe.ParseAgyModels(
+        var models = DriverModelDiscovery.ParseAgyModels(
             "gemini-x-ultra  Gemini X (ultra)\ngemini-x-high  Gemini X (high)\n");
 
         var baseModel = models.Single(m => m.Id == "gemini-x");
@@ -596,16 +630,352 @@ public class DriverCapabilityProbeTests
     {
         // Asymmetric failure modes: accepting a prose line puts a fake model in the picker that the
         // user then sends to the driver; rejecting a real one yields an empty list plus a reason.
-        DriverCapabilityProbe.LooksLikeModelId(token).Should().Be(expected);
+        DriverModelDiscovery.LooksLikeModelId(token).Should().Be(expected);
     }
 
     [Fact]
     public void ExtractEffortSuffix_RecognizesOnlyDocumentedLevels()
     {
-        DriverCapabilityProbe.ExtractEffortSuffix("m-xhigh").Should().Be("xhigh");
-        DriverCapabilityProbe.ExtractEffortSuffix("m-max").Should().Be("max");
-        DriverCapabilityProbe.ExtractEffortSuffix("m-medium").Should().Be("medium");
-        DriverCapabilityProbe.ExtractEffortSuffix("m-beta").Should().BeNull();
+        DriverModelDiscovery.ExtractEffortSuffix("m-xhigh").Should().Be("xhigh");
+        DriverModelDiscovery.ExtractEffortSuffix("m-max").Should().Be("max");
+        DriverModelDiscovery.ExtractEffortSuffix("m-medium").Should().Be("medium");
+        DriverModelDiscovery.ExtractEffortSuffix("m-beta").Should().BeNull();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Option C: the runner declares its own driver's capabilities at registration.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task Declared_FreshDeclarationWinsAndNoProbeIoHappens()
+    {
+        // The whole point of C: a driver whose runner is healthy never touches the probe
+        // machinery. Counting calls is the assertion - a reading that happens to match would also
+        // pass if the probe had run and agreed by luck.
+        var probed = 0;
+        var probe = Probe(cliRunner: (_, _, _, _) =>
+        {
+            Interlocked.Increment(ref probed);
+            return Task.FromResult<string?>(SampleAgyModels);
+        });
+
+        var reading = await probe.ProbeAsync(Agy(declared: Declaration()));
+
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.Declared);
+        reading.Models.Select(m => m.Id).Should().Equal("declined-model-x");
+        reading.Models[0].Efforts.Should().Equal("low", "high");
+        probed.Should().Be(0, "a fresh self-report must not trigger a subprocess");
+    }
+
+    [Fact]
+    public async Task Declared_ObservationTimeIsTheRunnersNotOurs()
+    {
+        // The dashboard renders how old the answer is. Stamping it with "now" would make a
+        // declaration from an hour ago look fresh.
+        //
+        // Relative to now, not a fixed wall-clock: a literal timestamp is in the future for part of
+        // every day, and IsFresh rejects future skew, so a fixed value would make this test pass or
+        // fail depending on the hour it runs at.
+        var observed = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(5);
+
+        var reading = await Probe().ProbeAsync(Agy(declared: Declaration(observedAt: observed)));
+
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.Declared);
+        reading.ObservedAt.Should().Be(observed);
+    }
+
+    [Fact]
+    public async Task Declared_StaleDeclarationFallsBackToTheLiveProbe()
+    {
+        // A catalogue from a runner that died last week must not pin the picker forever.
+        var stale = Declaration(observedAt: DateTimeOffset.UtcNow - DriverCapabilityDeclaration.FreshnessWindow - TimeSpan.FromMinutes(1));
+
+        var reading = await Probe().ProbeAsync(Agy(declared: stale));
+
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.Probed);
+        reading.Models.Select(m => m.Id).Should().Equal("gemini-4-argon", "claude-sonnet-5-5");
+    }
+
+    [Fact]
+    public async Task Declared_AdapterMismatchFallsBackRatherThanServingTheWrongCatalogue()
+    {
+        // The blob is written by a runner but the row can be edited underneath it: repointing a
+        // driver at a different adapter in the dashboard leaves the previous declaration in place
+        // until that runner re-registers. Serving it would hand an agy catalogue to an OpenAI
+        // driver, which is the exact per-driver confusion this work removes.
+        var reading = await Probe(lister: (_, _, _) =>
+            Task.FromResult<IReadOnlyList<string>?>(new[] { "local-llama-3.3" })).ProbeAsync(
+                OpenAi(declared: Declaration(adapter: "agy")));
+
+        reading!.Models.Select(m => m.Id).Should().Equal("local-llama-3.3");
+        reading.ModelSource.Should().Be(CapabilitySourceKind.Probed);
+    }
+
+    [Fact]
+    public async Task Declared_EmptyDeclarationFallsBackBecauseTheApiMayStillReachTheServer()
+    {
+        // An empty declaration means "I could not read my own driver". For an HTTP driver the API
+        // may well reach the server, so the probe gets its turn.
+        var empty = Declaration(models: Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
+            unavailableReason: "not signed in on the runner");
+
+        var reading = await Probe(lister: (_, _, _) =>
+            Task.FromResult<IReadOnlyList<string>?>(new[] { "reachable-model" })).ProbeAsync(
+                OpenAi(declared: empty));
+
+        reading!.Models.Select(m => m.Id).Should().Equal("reachable-model");
+    }
+
+    [Fact]
+    public async Task Declared_WhenNeitherSideHasModels_TheRunnersReasonWins()
+    {
+        // The regression this exists for. In Docker the API image has no agy binary, so its own
+        // reason is always "not installed on the API host" - a fact about where the API runs, not
+        // about the driver. The runner's "not signed in" is ground truth about the account.
+        var probe = Probe(executableResolver: () => null);
+
+        var reading = await probe.ProbeAsync(Agy(declared: Declaration(
+            models: Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
+            unavailableReason: "agy reported no models (Error: Please sign in to view available models.)")));
+
+        reading!.Models.Should().BeEmpty();
+        reading.UnavailableReason.Should().Contain("Please sign in");
+        reading.UnavailableReason.Should().NotContain("API host");
+    }
+
+    [Fact]
+    public async Task Declared_WhenNeitherSideHasModels_TheApiReasonSurvivesWithoutADeclaration()
+    {
+        // The runner's reason only overrides when there is one. A runner older than C sends no
+        // declaration, and today's message must be unchanged.
+        var reading = await Probe(executableResolver: () => null).ProbeAsync(Agy());
+
+        reading!.UnavailableReason.Should().Contain("API host");
+    }
+
+    [Fact]
+    public async Task Declared_AppliesEvenWhenTheApiResultWasAlreadyCached()
+    {
+        // The reason preference must cover a cached negative, not just a fresh probe, or the
+        // message a driver shows depends on which request happened to be first.
+        var probe = Probe(executableResolver: () => null, negativeTtl: TimeSpan.FromMinutes(5));
+
+        await probe.ProbeAsync(Agy("driver-a")); // populates the shared negative cache entry
+
+        var reading = await probe.ProbeAsync(Agy("driver-b", declared: Declaration(
+            models: Array.Empty<DriverCapabilityDeclaration.DeclaredModel>(),
+            unavailableReason: "signed out on this machine")));
+
+        reading!.UnavailableReason.Should().Contain("signed out on this machine");
+    }
+
+    [Fact]
+    public async Task Declared_IsPerDriverAndNeverLeaksThroughTheSharedCache()
+    {
+        // The probe cache is keyed per adapter+endpoint so N drivers sharing one agy install share
+        // one answer. A declaration is per-driver, so caching it there would hand one runner's
+        // catalogue to every other driver on that adapter.
+        var probe = Probe(executableResolver: () => null);
+
+        var declared = await probe.ProbeAsync(Agy("driver-a", declared: Declaration()));
+        var undeclared = await probe.ProbeAsync(Agy("driver-b"));
+
+        declared!.Models.Should().HaveCount(1);
+        undeclared!.Models.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Declared_OperatorAllowListStillMergesOverADeclaration()
+    {
+        // An operator typing a model is a stronger statement than a runner's self-report, exactly
+        // as it is stronger than a probe's answer.
+        var request = Agy(declared: Declaration()) with { OperatorModels = new[] { "hand-typed-model" } };
+
+        var reading = await Probe().ProbeAsync(request);
+
+        reading!.Models.Select(m => m.Id).Should().Contain("hand-typed-model");
+        reading.ModelSource.Should().Be(CapabilitySourceKind.UserOverride);
+    }
+
+    [Fact]
+    public async Task Declared_ContextSizesAreTheApisPolicyNotTheRunnersClaim()
+    {
+        // Which windows to *offer* is bounded by what the runtime will honour, so the API computes
+        // it. The runner declares which models exist.
+        var declared = Declaration(
+            adapter: "openai",
+            supportsContextSelection: true,
+            models: new[]
+            {
+                new DriverCapabilityDeclaration.DeclaredModel { Id = "gpt-5.1-codex", Name = "GPT 5.1 Codex" }
+            });
+
+        var reading = await Probe().ProbeAsync(OpenAi(declared: declared));
+
+        reading!.SupportsContextSelection.Should().BeTrue();
+        reading.Models[0].ContextSizes.Should().NotBeNullOrEmpty();
+    }
+
+    [Fact]
+    public async Task Declared_NoContextControlWhenTheDriverCannotHonourOne()
+    {
+        var declared = Declaration(
+            adapter: "openai",
+            supportsContextSelection: false,
+            models: new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "gpt-5.1-codex" } });
+
+        var reading = await Probe().ProbeAsync(OpenAi(declared: declared));
+
+        reading!.SupportsContextSelection.Should().BeFalse();
+        reading.Models[0].ContextSizes.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Declared_ARunnerSuppliedContextSizeListIsIgnored()
+    {
+        // Which windows to offer is the API's product policy, bounded to what the runtime actually
+        // honours. A runner advertising a window we would clamp re-opens the stale "500k" defect
+        // through the declaration channel, so the value is dropped rather than trusted.
+        //
+        // Built as a raw blob rather than through the typed record because DeclaredModel has no
+        // ContextSizes property at all: the point is that the wire format carries no such field
+        // even if some future CLI starts sending one.
+        // Concatenated rather than interpolated: a raw string would need four '$' prefixes to hold
+        // the JSON's closing braces, which reads worse than it is worth.
+        var blob = """
+            {"adapter":"openai","declared":{"adapter":"openai","observedAt":"@OBSERVED@",
+             "supportsContextSelection":true,
+             "models":[{"id":"gpt-5.1-codex","contextSizes":["1m","2m","999k"]}]}}
+            """.Replace("@OBSERVED@", DateTimeOffset.UtcNow.ToString("O"));
+
+        var declared = DriverCapabilityDeclaration.TryRead(blob);
+        declared.Should().NotBeNull("the blob must still parse with an unknown extra field");
+
+        var reading = await Probe().ProbeAsync(OpenAi(declared: declared));
+
+        reading!.Models[0].ContextSizes.Should().NotBeNull();
+        reading.Models[0].ContextSizes.Should().NotContain("999k",
+            "a runner must not be able to advertise a window the runtime will clamp");
+        reading.Models[0].ContextSizes.Should()
+            .BeEquivalentTo(DriverCapabilityProbe.ContextSizesForModel("gpt-5.1-codex"));
+    }
+
+    [Fact]
+    public void Declared_FreshnessRejectsAClockFarInTheFuture()
+    {
+        // A runner with a fast clock must not be trusted forever; the window is symmetric.
+        var future = new DriverCapabilityDeclaration
+        {
+            Adapter = "agy",
+            Models = new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "m-1" } },
+            ObservedAt = DateTimeOffset.UtcNow + TimeSpan.FromHours(2)
+        };
+
+        future.IsFresh(DateTimeOffset.UtcNow).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Declared_UnsetObservationTimeIsNeverFresh()
+    {
+        new DriverCapabilityDeclaration { Adapter = "agy" }.IsFresh(DateTimeOffset.UtcNow).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Declared_TryRead_RoundTripsThroughTheBlob()
+    {
+        var declaration = Declaration();
+
+        var read = DriverCapabilityDeclaration.TryRead(
+            $$"""{"adapter":"agy","declared":{{declaration.ToJson()}}}""");
+
+        read.Should().NotBeNull();
+        read!.Adapter.Should().Be("agy");
+        read.Models.Select(m => m.Id).Should().Equal("declined-model-x");
+        read.Models[0].Efforts.Should().Equal("low", "high");
+        read.IsFresh(DateTimeOffset.UtcNow).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Declared_TryRead_ReturnsNullWhenAbsentRatherThanAnEmptyCatalogue()
+    {
+        // Null means "this runner predates C", which is a fallback to probing. An empty list would
+        // mean "this driver has no models" and would blank the picker for every old runner.
+        DriverCapabilityDeclaration.TryRead("""{"adapter":"agy","capabilities":["chat"]}""").Should().BeNull();
+        DriverCapabilityDeclaration.TryRead("""["chat"]""").Should().BeNull();
+        DriverCapabilityDeclaration.TryRead(null).Should().BeNull();
+        DriverCapabilityDeclaration.TryRead("").Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData("""{"declared":"not-an-object"}""")]
+    [InlineData("""{"declared":{"models":"not-an-array"}}""")]
+    [InlineData("""{"declared":{"observedAt":"not-a-date"}}""")]
+    [InlineData("""{"declared":}""")]
+    public void Declared_TryRead_DegradesToNoDeclarationOnMalformedInput(string blob)
+    {
+        // The blob is stored as text and has three writers. A corrupt `declared` node must fall
+        // back to probing, not throw and take down the capability endpoint for every driver.
+        DriverCapabilityDeclaration.TryRead(blob).Should().BeNull();
+    }
+
+    [Fact]
+    public void Declared_TryRead_IsCaseInsensitiveLikeTheRestOfTheBlobReader()
+    {
+        var read = DriverCapabilityDeclaration.TryRead(
+            """{"Declared":{"Adapter":"agy","Models":[{"Id":"m-1"}],"ObservedAt":"2026-10-29T08:00:00+00:00"}}""");
+
+        read.Should().NotBeNull();
+        read!.Models.Select(m => m.Id).Should().Equal("m-1");
+    }
+
+    [Fact]
+    public void Declared_MergeKeepsTheDeclarationWhenTheOperatorEditsAnotherKey()
+    {
+        // Merge treats an absent key as "not set", not "clear it". A dashboard save that patches
+        // `defaultModel` must not erase what the runner declared, or the declaration would vanish
+        // until the runner happened to re-register.
+        var withDeclaration = $$"""{"adapter":"agy","declared":{{Declaration().ToJson()}}}""";
+
+        var merged = DriverCapabilities.Merge(withDeclaration, """{"defaultModel":"gemini-4-argon"}""");
+
+        DriverCapabilityDeclaration.TryRead(merged).Should().NotBeNull();
+        DriverCapabilities.Parse(merged).DefaultModel.Should().Be("gemini-4-argon");
+    }
+
+    [Fact]
+    public void Declared_ReDeclarationReplacesTheWholeNodeNotJustPartOfIt()
+    {
+        // `declared` is replaced wholesale by Merge, which is what a re-declaration needs: a
+        // model list that shrank must actually shrink rather than keep stale entries alive.
+        var old = $$"""{"declared":{{Declaration().ToJson()}}}""";
+        var replacement = Declaration(models: new[]
+        {
+            new DriverCapabilityDeclaration.DeclaredModel { Id = "only-model" }
+        }).ToJson();
+
+        var merged = DriverCapabilities.Merge(old, $$"""{"declared":{{replacement}}}""");
+
+        var read = DriverCapabilityDeclaration.TryRead(merged);
+        read!.Models.Select(m => m.Id).Should().Equal("only-model");
+    }
+
+    [Fact]
+    public void Declared_ParseExposesItOnTheViewWithoutReParsingTheBlob()
+    {
+        var blob = $$"""{"adapter":"agy","declared":{{Declaration().ToJson()}}}""";
+
+        var view = DriverCapabilities.Parse(blob);
+
+        view.Declared.Should().NotBeNull();
+        view.Declared!.Models.Select(m => m.Id).Should().Equal("declined-model-x");
+        view.ToProbeRequest("agy", RuntimeType.CliAgy).Declared.Should().NotBeNull();
+    }
+
+    [Fact]
+    public void Declared_EmptyViewCarriesNoDeclaration()
+    {
+        DriverCapabilitiesView.Empty.Declared.Should().BeNull();
+        DriverCapabilities.Parse("""["chat"]""").Declared.Should().BeNull();
     }
 
     [Fact]

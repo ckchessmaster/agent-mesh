@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Api.Services;
 
@@ -26,10 +27,15 @@ public record DriverCapabilitiesView(
     bool HasSidecarAuthKey = false,
     string? LoginCommand = null,
     string? AuthCheckCommand = null,
-    IReadOnlyList<string>? Models = null)
+    IReadOnlyList<string>? Models = null,
+    // What the runner pushed about its own driver (option C), or null when the runner predates
+    // that change or never declared anything. Kept separate from `models` because they are
+    // different kinds of claim: `models` is an operator's typed allow-list, this is a machine's
+    // self-report about the binary next to it.
+    DriverCapabilityDeclaration? Declared = null)
 {
     public static readonly DriverCapabilitiesView Empty =
-        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null);
+        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null, null);
 
     /// <summary>
     /// Models an operator wrote into the blob. Merged over whatever the capability probe finds and
@@ -56,7 +62,8 @@ public record DriverCapabilitiesView(
             Endpoint: Endpoint,
             OperatorModels: OperatorModels,
             DefaultModel: DefaultModel,
-            ForceRefresh: forceRefresh);
+            ForceRefresh: forceRefresh,
+            Declared: Declared);
 }
 
 /// <summary>
@@ -225,7 +232,10 @@ public static class DriverCapabilities
             // `models` is an operator-authored allow-list, distinct from `capabilities` (which is
             // the capability-name list the CLI writes). Read separately so a driver whose provider
             // cannot be probed can still be told what it runs.
-            Models: ReadModelIds(obj["models"]));
+            Models: ReadModelIds(obj["models"]),
+            // Read from the already-parsed tree rather than re-parsing the string: this runs for
+            // every driver on every capability request.
+            Declared: DriverCapabilityDeclaration.TryRead(obj));
     }
 
     private static IReadOnlyList<string> ReadStringArray(JsonArray array)

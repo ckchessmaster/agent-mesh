@@ -206,7 +206,7 @@ public class SystemController(
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
 
             using var httpReq = new HttpRequestMessage(
-                HttpMethod.Get, OpenAiModelListing.ToModelsUrl(req.Endpoint));
+                HttpMethod.Get, DriverModelDiscovery.ToModelsUrl(req.Endpoint));
 
             if (!string.IsNullOrWhiteSpace(effectiveApiKey))
             {
@@ -222,7 +222,7 @@ public class SystemController(
             }
 
             var json = await res.Content.ReadAsStringAsync(ct);
-            var models = OpenAiModelListing.ParseIds(json)
+            var models = DriverModelDiscovery.ParseOpenAiModelIds(json)
                 .Select(id => new OpenAiModelItemDto(id, id))
                 .ToList();
 
@@ -418,11 +418,11 @@ public record ModelCapabilityDto(
 /// </param>
 /// <param name="ModelSource">
 /// One of the literals produced by <see cref="CapabilitySourceKindExtensions.ToWireValue"/> -
-/// <c>probed</c>, <c>static_preset</c>, <c>user_override</c> or <c>unavailable</c>. The UI labels the
-/// picker with it so a bundled guess is never presented as a driver answer. The list is stated here
-/// for readability only; <c>CapabilitySourceKindValues_AreExactlyTheUnionTheDashboardDeclares</c> is
-/// what keeps it in step with the dashboard's union, and it was the absence of that check that let
-/// <c>static_preset</c> ship as <c>"staticpreset"</c>.
+/// <c>probed</c>, <c>declared</c>, <c>static_preset</c>, <c>user_override</c> or <c>unavailable</c>.
+/// The UI labels the picker with it so a bundled guess is never presented as a driver answer.
+/// The list is stated here for readability only; <c>CapabilitySourceKindValues_AreExactlyTheUnionThe
+/// DashboardDeclares</c> is what keeps it in step with the dashboard's union, and it was the absence
+/// of that check that let <c>static_preset</c> ship as <c>"staticpreset"</c>.
 /// </param>
 public record RuntimeCapabilitiesDto(
     string Adapter,

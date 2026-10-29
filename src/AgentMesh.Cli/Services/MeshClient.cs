@@ -2,7 +2,9 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Services;
 
@@ -11,6 +13,18 @@ public class MeshClient
     private readonly HttpClient _http;
     private readonly CliConfig _config;
     private readonly ConfigStore _configStore;
+
+    /// <summary>
+    /// The last capability declaration this runner produced (option C).
+    /// </summary>
+    /// <remarks>
+    /// Cached rather than re-read per push. <see cref="SetAgentStatusAsync"/> also runs during
+    /// shutdown to report "offline", and spawning <c>agy models</c> there would delay process exit
+    /// by up to its timeout for no benefit - nobody reads a dead runner's catalogue. Reconnects
+    /// refresh it, which is what keeps a long-lived runner's declaration inside the API's
+    /// freshness window.
+    /// </remarks>
+    private DriverCapabilityDeclaration? _declaredCapabilities;
 
     public MeshClient(CliConfig config, ConfigStore configStore, HttpClient? httpClient = null)
     {
@@ -76,9 +90,41 @@ public class MeshClient
     }
 
     public static string SerializePresetCapabilities(AgentPresetConfig preset)
+        => SerializePresetCapabilities(preset, declared: null);
+
+    /// <summary>
+    /// Builds the capabilities blob a runner pushes about itself, optionally carrying the
+    /// driver's own self-report (option C).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The declaration is nested under its own <c>declared</c> key rather than flattened into
+    /// <c>models</c>, because <c>models</c> already means something else: an operator's typed
+    /// allow-list, which the API merges over probed results as an override. Reusing that key would
+    /// have made a machine's self-report indistinguishable from a human's assertion, and the
+    /// override merge would have treated the runner's list as authoritative over the provider.
+    /// </para>
+    /// <para>
+    /// The shape change is strictly additive. A runner with nothing to declare writes exactly what
+    /// it writes today (an object for OpenAI-compatible drivers, a bare capability array for
+    /// others), so this cannot alter behaviour for any driver that is not opted in. When there is
+    /// a declaration, the bare-array form is upgraded to an object with the list relocated under
+    /// <c>capabilities</c> - the same normalization <c>DriverCapabilities.AsObject</c> and
+    /// <c>AgentKind.ParseExistingAsObject</c> already perform, so no reader sees a shape it does
+    /// not already handle. It is also an improvement for the dashboard, whose
+    /// <c>parseCapabilitiesJson</c> returns null for an array and therefore reads nothing at all
+    /// out of an agy blob today.
+    /// </para>
+    /// </remarks>
+    public static string SerializePresetCapabilities(
+        AgentPresetConfig preset,
+        DriverCapabilityDeclaration? declared)
     {
-        if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) ||
-            !string.IsNullOrWhiteSpace(preset.Endpoint))
+        var isOpenAiCompatible =
+            string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) ||
+            !string.IsNullOrWhiteSpace(preset.Endpoint);
+
+        if (isOpenAiCompatible)
         {
             var caps = new Dictionary<string, object?>
             {
@@ -93,15 +139,72 @@ public class MeshClient
                 ["sidecar"] = preset.Sidecar,
                 ["capabilities"] = preset.Capabilities
             };
+
+            if (declared != null) caps["declared"] = declared;
+
             return JsonSerializer.Serialize(caps);
         }
 
-        return JsonSerializer.Serialize(preset.Capabilities);
+        if (declared == null)
+        {
+            return JsonSerializer.Serialize(preset.Capabilities);
+        }
+
+        var agyCaps = new Dictionary<string, object?>
+        {
+            ["adapter"] = preset.AdapterType,
+            ["capabilities"] = preset.Capabilities,
+            ["declared"] = declared
+        };
+
+        return JsonSerializer.Serialize(agyCaps);
+    }
+
+    /// <summary>
+    /// Asks the local driver what it can actually do, for the registration payload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Adapters without a discovery surface (<c>claude</c>, <c>copilot</c>, <c>generic</c>) do not
+    /// implement <see cref="IDescribesOwnCapabilities"/> and return null here, which leaves the
+    /// blob exactly as it was before this change.
+    /// </para>
+    /// <para>
+    /// Every failure is swallowed into a null declaration. A runner that cannot read its own model
+    /// list must still come online: registration is how it receives prompts, and a capability
+    /// picker is not worth delaying that. The API then falls back to its own probe, which is
+    /// precisely today\'s behaviour.
+    /// </para>
+    /// </remarks>
+    private static async Task<DriverCapabilityDeclaration?> DescribeCapabilitiesAsync(
+        AgentPresetConfig preset,
+        CancellationToken ct)
+    {
+        try
+        {
+            if (AgentAdapterFactory.Create(preset) is not IDescribesOwnCapabilities describer)
+            {
+                return null;
+            }
+
+            return await describer.DescribeCapabilitiesAsync(preset, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (Exception)
+        {
+            // No logger on this path (MeshClient has none) and none is worth introducing: the
+            // outcome is identical either way - the API falls back to probing.
+            return null;
+        }
     }
 
     public async Task<string> EnsureAgentRegisteredAsync(AgentPresetConfig preset, CancellationToken ct = default)
     {
-        var capabilitiesJson = SerializePresetCapabilities(preset);
+        _declaredCapabilities = await DescribeCapabilitiesAsync(preset, ct);
+        var capabilitiesJson = SerializePresetCapabilities(preset, _declaredCapabilities);
 
         var registerPayload = new
         {
@@ -150,7 +253,15 @@ public class MeshClient
     {
         try
         {
-            var capabilitiesJson = SerializePresetCapabilities(preset);
+            // Going back online is a natural refresh point: the runner has been disconnected, the
+            // account behind the driver may have changed, and this is not the shutdown path.
+            // Reporting offline must never read the driver - see _declaredCapabilities.
+            if (string.Equals(status, "online", StringComparison.OrdinalIgnoreCase))
+            {
+                _declaredCapabilities = await DescribeCapabilitiesAsync(preset, ct) ?? _declaredCapabilities;
+            }
+
+            var capabilitiesJson = SerializePresetCapabilities(preset, _declaredCapabilities);
             using var req = CreateRequest(HttpMethod.Post, "api/agents", preset.Token ?? _config.MasterToken, preset.Id);
             req.Content = JsonContent.Create(new
             {

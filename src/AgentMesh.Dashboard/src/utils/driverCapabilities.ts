@@ -22,7 +22,12 @@ import type {
  * concepts (modes, tiers) that our adapters implement rather than provider facts.
  */
 
-export type CapabilitySource = 'probed' | 'static_preset' | 'user_override' | 'unavailable';
+export type CapabilitySource =
+  | 'probed'
+  | 'declared'
+  | 'static_preset'
+  | 'user_override'
+  | 'unavailable';
 
 const CANONICAL_KEYS = ['agy', 'copilot', 'claude', 'openai', 'generic'] as const;
 
@@ -231,12 +236,26 @@ export interface ResolvedDriverCapabilities {
 
 const EMPTY_SOURCE: CapabilitySource = 'unavailable';
 
+/**
+ * Every source the API is allowed to report, as one list.
+ *
+ * Derived rather than re-enumerated inside `normalizeSource`: the previous version listed the
+ * accepted literals in the body of a conditional, so a new `CapabilitySourceKind` on the server
+ * fell through to `unavailable` and rendered a populated model list as "Model list unavailable".
+ * That is precisely how `declared` would have been lost. Adding a source here is now the single
+ * edit, and `CapabilitiesWireFormatTests` fails if the two sides disagree.
+ */
+const CAPABILITY_SOURCES: readonly CapabilitySource[] = [
+  'probed',
+  'declared',
+  'static_preset',
+  'user_override',
+  'unavailable'
+];
+
 function normalizeSource(value?: string): CapabilitySource {
   const normalized = (value ?? '').toLowerCase();
-  return normalized === 'probed' ||
-    normalized === 'static_preset' ||
-    normalized === 'user_override' ||
-    normalized === 'unavailable'
+  return CAPABILITY_SOURCES.includes(normalized as CapabilitySource)
     ? (normalized as CapabilitySource)
     : EMPTY_SOURCE;
 }
@@ -470,6 +489,12 @@ export function capabilitySourceLabel(resolved: ResolvedDriverCapabilities | nul
   switch (resolved.source) {
     case 'probed':
       return 'Read from this driver';
+    case 'declared':
+      // Worded distinctly from 'probed' on purpose. It is the driver's own answer, but relayed by
+      // the runner rather than read by us, and it can be up to the declaration window stale. A
+      // user who sees "Read from this driver" will not consider that the runner may have been
+      // offline since the provider changed.
+      return 'Reported by this driver (via its runner)';
     case 'static_preset':
       return 'Bundled preset — not verified by driver';
     case 'user_override':

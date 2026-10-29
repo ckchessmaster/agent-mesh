@@ -1,6 +1,8 @@
 using System.Security.Claims;
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Services;
+using AgentMesh.Cli.Models;
+using AgentMesh.Cli.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -533,6 +535,174 @@ public class SystemControllerTests
             .GetDriverCapabilities("agy-core", db: unreachable);
 
         result.Should().BeOfType<ObjectResult>().Which.StatusCode.Should().Be(503);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Option C wiring: the declaration stored by a runner must reach the probe.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task GetCapabilities_PassesTheStoredDeclarationToTheProbe()
+    {
+        // The probe-side tests cover what happens *with* a declaration; this covers the only path
+        // by which one gets there. Parse -> ToProbeRequest is two hops across two projects, and a
+        // silent break in either means every runner's self-report is ignored and the API keeps
+        // probing a binary it does not have - which is the production bug C exists to fix, and it
+        // would fail closed: no error, just an empty picker forever.
+        var declaration = new DriverCapabilityDeclaration
+        {
+            Adapter = "agy",
+            Models = new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "runner-reported-model" } },
+            Source = "agy-models",
+            ObservedAt = DateTimeOffset.UtcNow
+        };
+
+        using var db = TestDbContextFactory.Create();
+        db.Agents.Add(AgyDriver());
+        await db.SaveChangesAsync();
+        db.Agents.Find("agy-core")!.CapabilitiesJson =
+            $$"""{"adapter":"agy","capabilities":["chat"],"declared":{{declaration.ToJson()}}}""";
+        await db.SaveChangesAsync();
+
+        var probe = new RecordingProbe(null);
+
+        await CapabilitiesAsync(Controller(probe), db);
+
+        var request = probe.Requests.Should().ContainSingle().Subject;
+        request.Declared.Should().NotBeNull("a stored declaration that never reaches the probe is dead weight in the blob");
+        request.Declared!.Models.Select(m => m.Id).Should().Equal("runner-reported-model");
+    }
+
+    [Fact]
+    public async Task GetCapabilities_PassesNoDeclarationForADriverThatNeverDeclared()
+    {
+        // The other half: absence must stay absence. If a missing declaration were materialized as
+        // an empty one, the probe would treat it as "the driver reported nothing" instead of
+        // falling through to a live read, blanking the picker for every runner predating C.
+        using var db = TestDbContextFactory.Create();
+        db.Agents.Add(AgyDriver());
+        await db.SaveChangesAsync();
+
+        var probe = new RecordingProbe(null);
+
+        await CapabilitiesAsync(Controller(probe), db);
+
+        probe.Requests.Should().ContainSingle().Subject.Declared.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetCapabilities_DeclarationIsPerDriverNotSharedAcrossTheResult()
+    {
+        // The endpoint resolves several drivers in one call. A declaration leaking from one row to
+        // another would show an agy catalogue under an OpenAI driver - the per-driver confusion
+        // this line of work started with.
+        var declaration = new DriverCapabilityDeclaration
+        {
+            Adapter = "agy",
+            Models = new[] { new DriverCapabilityDeclaration.DeclaredModel { Id = "agy-only-model" } },
+            ObservedAt = DateTimeOffset.UtcNow
+        };
+
+        var agy = AgyDriver("agy-core");
+        agy.CapabilitiesJson = $$"""{"adapter":"agy","declared":{{declaration.ToJson()}}}""";
+        var openai = OpenAiDriver("qwen-driver");
+
+        using var db = TestDbContextFactory.Create();
+        db.Agents.Add(agy);
+        db.Agents.Add(openai);
+        await db.SaveChangesAsync();
+
+        var probe = new RecordingProbe(null);
+
+        await CapabilitiesAsync(Controller(probe), db);
+
+        var byDriver = probe.Requests.ToDictionary(r => r.DriverId, r => r.Declared);
+        byDriver["agy-core"].Should().NotBeNull();
+        byDriver["qwen-driver"].Should().BeNull("the agy runner's declaration must not be attributed to another driver");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The full round trip: what the runner writes is what the probe is asked to use.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task RegistrationRoundTrip_RunnerDeclarationReachesTheProbeThroughTheRealWritePath()
+    {
+        // The other tests in this group seed CapabilitiesJson by hand, which pins the read side but
+        // proves nothing about the write side. This one uses the real producer
+        // (MeshClient.SerializePresetCapabilities) and the real writer (AgentsController.UpsertAgent,
+        // which merges rather than overwrites), so a change to either shape - the CLI's bare-array
+        // upgrade, or Merge's treatment of an absent key - fails here instead of in production.
+        //
+        // The existing row deliberately holds the pre-C bare-array shape, so the merge exercises an
+        // upgrading runner writing the object form over an old blob. Note what this does NOT prove:
+        // the array normalization itself is already pinned by
+        // Merge_ArrayExistingNormalizedToObject_KeepsCapabilitiesWhenLimitsAdded, and it would pass
+        // even if that normalization broke, because the pushed blob carries its own capability list
+        // and never needs the fallback. What is new here is only that the real producer and the real
+        // writer agree on the key names.
+        using var db = TestDbContextFactory.Create();
+        db.Agents.Add(new Agent
+        {
+            Id = "agy-core",
+            Name = "Antigravity CLI",
+            Role = "Driver",
+            RuntimeType = RuntimeType.CliAgy,
+            // The pre-C shape: a bare capability array, no object wrapper at all.
+            CapabilitiesJson = """["chat","tools"]"""
+        });
+        await db.SaveChangesAsync();
+
+        var declaration = new DriverCapabilityDeclaration
+        {
+            Adapter = "agy",
+            Models = new[]
+            {
+                new DriverCapabilityDeclaration.DeclaredModel
+                {
+                    Id = "gemini-4-argon",
+                    Name = "Gemini 4 Argon",
+                    Efforts = new[] { "low", "high" }
+                }
+            },
+            Source = "agy-models",
+            ObservedAt = DateTimeOffset.UtcNow
+        };
+
+        // Exactly what the runner puts on the wire.
+        var pushed = MeshClient.SerializePresetCapabilities(
+            new AgentPresetConfig
+            {
+                Id = "agy-core",
+                Name = "Antigravity CLI",
+                AdapterType = "agy",
+                Capabilities = new List<string> { "chat", "tools" }
+            },
+            declaration);
+
+        var agents = new AgentsController(db, new ApiKeyService());
+        var registered = await agents.UpsertAgent(new RegisterAgentRequest(
+            Id: "agy-core",
+            Name: "Antigravity CLI",
+            RuntimeType: RuntimeType.CliAgy,
+            CapabilitiesJson: pushed));
+
+        registered.Should().BeOfType<OkObjectResult>();
+
+        var probe = new RecordingProbe(null);
+        await CapabilitiesAsync(Controller(probe), db);
+
+        var request = probe.Requests.Should().ContainSingle().Subject;
+        request.Declared.Should().NotBeNull(
+            "a declaration that survives serialization but not the merge is invisible to the API");
+        request.Declared!.Models.Select(m => m.Id).Should().Equal("gemini-4-argon");
+        request.Declared.Models[0].Efforts.Should().Equal("low", "high");
+        request.Declared.IsFresh(DateTimeOffset.UtcNow).Should().BeTrue(
+            "the observedAt written by the CLI must survive the round trip as a real timestamp");
+
+        // And the pre-existing capability strings must not be collateral damage of the shape change.
+        DriverCapabilities.Parse(db.Agents.Find("agy-core")!.CapabilitiesJson)
+            .Capabilities.Should().Equal("chat", "tools");
     }
 
     private sealed class ThrowingProbe : IDriverCapabilityProbe

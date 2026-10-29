@@ -162,6 +162,35 @@ public class CapabilitiesWireFormatTests : IClassFixture<WebApplicationFactory<A
         runtime.GetProperty("modelSource").GetString().Should().Be("unavailable");
     }
 
+    [Theory]
+    [InlineData(CapabilitySourceKind.Probed, "probed")]
+    [InlineData(CapabilitySourceKind.Declared, "declared")]
+    [InlineData(CapabilitySourceKind.StaticPreset, "static_preset")]
+    [InlineData(CapabilitySourceKind.UserOverride, "user_override")]
+    [InlineData(CapabilitySourceKind.Unavailable, "unavailable")]
+    public async Task Capabilities_EverySourceKindSerializesToTheLiteralTheUiSwitchesOn(
+        CapabilitySourceKind kind,
+        string expected)
+    {
+        // The previous version of this file pinned only "probed", which left the multi-word members
+        // untested and broken: the DTO was produced with `ToString().ToLowerInvariant()`, so
+        // StaticPreset became "staticpreset" and UserOverride became "useroverride". Neither is in
+        // the UI's union, so normalizeSource fell through to 'unavailable'. The model list still
+        // rendered - App.tsx branches on list length, not on source - but the caption beneath it
+        // read "Model list unavailable", contradicting the picker above it. Silent, and confined to
+        // the two sources that are not the happy path, which is why one pinned value passed.
+        _probe.Reading = new DriverCapabilityReading(
+            Adapter: "agy",
+            Models: new[] { new DriverModelCapability("m", "M", Array.Empty<string>()) },
+            ModelSource: kind,
+            ObservedAt: DateTimeOffset.UtcNow,
+            SupportsContextSelection: false);
+
+        using var doc = await GetAsync();
+
+        Drivers(doc)[0].GetProperty("modelSource").GetString().Should().Be(expected);
+    }
+
     [Fact]
     public async Task Capabilities_BaselineRuntimeCarriesAnEmptyModelArrayNotNull()
     {
@@ -267,42 +296,14 @@ public class CapabilitiesWireFormatTests : IClassFixture<WebApplicationFactory<A
         return JsonDocument.Parse(json);
     }
 
-    [Theory]
-    [InlineData(CapabilitySourceKind.Probed, "probed")]
-    [InlineData(CapabilitySourceKind.StaticPreset, "static_preset")]
-    [InlineData(CapabilitySourceKind.UserOverride, "user_override")]
-    [InlineData(CapabilitySourceKind.Unavailable, "unavailable")]
-    public async Task Capabilities_EverySourceKindSerializesToTheLiteralTheUiSwitchesOn(
-        CapabilitySourceKind kind,
-        string expected)
-    {
-        // The previous version of this file pinned only "probed", which left the multi-word members
-        // untested and broken: the DTO was produced with `ToString().ToLowerInvariant()`, so
-        // StaticPreset became "staticpreset" and UserOverride became "useroverride". Neither is in
-        // the UI's union, so normalizeSource fell through to 'unavailable'. The model list still
-        // rendered - App.tsx branches on list length, not on source - but the caption beneath it
-        // read "Model list unavailable", contradicting the picker above it. Silent, and confined to
-        // the two sources that are not the happy path, which is why one pinned value passed.
-        _probe.Reading = new DriverCapabilityReading(
-            Adapter: "agy",
-            Models: new[] { new DriverModelCapability("m", "M", Array.Empty<string>()) },
-            ModelSource: kind,
-            ObservedAt: DateTimeOffset.UtcNow,
-            SupportsContextSelection: false);
-
-        using var doc = await GetAsync();
-
-        Drivers(doc)[0].GetProperty("modelSource").GetString().Should().Be(expected);
-    }
 
     [Fact]
     public void CapabilitySourceKindValues_AreExactlyTheUnionTheDashboardDeclares()
     {
         // The test above pins each member's literal. This one closes the other direction, which is
-        // how a new CapabilitySourceKind on the server would be lost: if the dashboard's union does
-        // not know the value, normalizeSource falls through to 'unavailable' and the caption under a
-        // real model list claims there is none. No C# test can see that on its own, because the C#
-        // side is self-consistent.
+        // how the `declared` source would have been lost: adding a CapabilitySourceKind on the
+        // server without teaching normalizeSource about it makes a populated model list render as
+        // "Model list unavailable", and no C# test can see that because the C# side is self-consistent.
         //
         // Reading the TypeScript from disk rather than restating it here is deliberate. A hardcoded
         // expected-set in C# is a second copy of the contract and drifts exactly like the code it

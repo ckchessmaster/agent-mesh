@@ -12,7 +12,7 @@ using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Adapters;
 
-public class OpenAiAdapter : IAgentAdapter
+public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 {
     public string AdapterType => "openai";
 
@@ -182,6 +182,26 @@ public class OpenAiAdapter : IAgentAdapter
     /// </remarks>
     public static int ResolveModelContextLimit(string model, string? contextSizeOption)
         => ModelContextLimits.ResolveTokens(model, contextSizeOption);
+
+    /// <summary>
+    /// The credential this adapter would authenticate a run with.
+    /// </summary>
+    /// <remarks>
+    /// Extracted because the capability declaration has to read <c>/models</c> with exactly the
+    /// same credential a run uses. If the two resolved keys differently, a driver could declare the
+    /// models visible to an ambient <c>OPENAI_API_KEY</c> while running against the key saved on the
+    /// preset - a picker listing models the very next prompt would be refused.
+    /// </remarks>
+    internal static string? ResolveApiKey(AgentPresetConfig preset)
+        => !string.IsNullOrWhiteSpace(preset.ApiKey)
+            ? preset.ApiKey.Trim()
+            : Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+
+    /// <inheritdoc />
+    public Task<DriverCapabilityDeclaration> DescribeCapabilitiesAsync(
+        AgentPresetConfig preset,
+        CancellationToken ct = default)
+        => DriverCapabilityDescriber.DescribeOpenAiAsync(preset, ResolveApiKey(preset), ct);
 
     public static int EstimateMessageTokens(OpenAiMessage message)
     {
@@ -372,9 +392,7 @@ public class OpenAiAdapter : IAgentAdapter
             ? endpoint
             : $"{endpoint}/chat/completions";
 
-        var apiKey = !string.IsNullOrWhiteSpace(preset.ApiKey)
-            ? preset.ApiKey.Trim()
-            : Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        var apiKey = ResolveApiKey(preset);
 
         var effectiveModel = !string.IsNullOrWhiteSpace(promptEvent.Model) &&
                              !promptEvent.Model.Equals("default", StringComparison.OrdinalIgnoreCase) &&

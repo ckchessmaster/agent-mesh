@@ -635,7 +635,7 @@ public static class ActiveAgyProcessRegistry
     }
 }
 
-public class AgyAdapter : IAgentAdapter
+public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 {
     private static readonly ConcurrentDictionary<Guid, string> SessionConversations = new();
     private static readonly object MappingLock = new();
@@ -1051,6 +1051,12 @@ public class AgyAdapter : IAgentAdapter
     /// </item>
     /// </list>
     /// </remarks>
+    /// <inheritdoc />
+    public Task<DriverCapabilityDeclaration> DescribeCapabilitiesAsync(
+        AgentPresetConfig preset,
+        CancellationToken ct = default)
+        => DriverCapabilityDescriber.DescribeAgyAsync(preset, ct);
+
     internal static string? AddAgySelectionArguments(ProcessStartInfo psi, PromptReceivedEvent promptEvent)
     {
         string? resolvedModel = null;

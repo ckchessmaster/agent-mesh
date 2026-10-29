@@ -25,6 +25,14 @@ public enum CapabilitySourceKind
     UserOverride,
 
     /// <summary>
+    /// Reported by the runner that owns the driver, pushed at registration (option C). Trusted
+    /// more than a probe's guess about a server it cannot see, but less than a direct read, and
+    /// labelled as self-reported for that reason: it is a claim from the machine next to the
+    /// binary, not a verification by us.
+    /// </summary>
+    Declared,
+
+    /// <summary>
     /// The driver exists but could not be read (not installed, signed out, unreachable). The UI
     /// says so instead of showing a list the user will trust and then send back to the driver.
     /// </summary>
@@ -58,25 +66,14 @@ public static class CapabilitySourceKindExtensions
     public static string ToWireValue(this CapabilitySourceKind source) => source switch
     {
         CapabilitySourceKind.Probed => "probed",
+        CapabilitySourceKind.Declared => "declared",
         CapabilitySourceKind.StaticPreset => "static_preset",
         CapabilitySourceKind.UserOverride => "user_override",
         CapabilitySourceKind.Unavailable => "unavailable"
     };
 }
 
-/// <summary>A model the driver can run, with the options that model actually accepts.</summary>
-/// <param name="Efforts">
-/// Effort values to offer. Only values the adapter will forward verbatim belong here - see
-/// <see cref="DriverCapabilityReading.EffortSource"/>.
-/// </param>
-/// <param name="ContextSizes">
-/// Context options for this model, or null when the driver cannot be told the window size.
-/// </param>
-public sealed record DriverModelCapability(
-    string Id,
-    string Name,
-    IReadOnlyList<string> Efforts,
-    IReadOnlyList<string>? ContextSizes = null);
+
 
 /// <summary>
 /// A capability reading for one driver. Every field is either probed, preset, operator-supplied,
@@ -120,9 +117,15 @@ public sealed record DriverCapabilityReading(
 /// <param name="OperatorModels">
 /// The <c>models</c> array from the driver's capabilities blob, if an operator wrote one.
 /// </param>
+/// <param name="Declared">
+/// What the runner pushed about its own driver (option C), read out of the driver's capabilities
+/// blob. Preferred over a live probe while fresh, because the runner is the only component that
+/// can read a binary installed on its machine rather than on the API host.
+/// </param>
 /// <param name="ForceRefresh">
 /// Bypass the TTL cache. Only honoured for authenticated callers - see
-/// <c>SystemController.GetCapabilities</c>.
+/// <c>SystemController.GetCapabilities</c>. A fresh declaration is still preferred: refresh means
+/// "go look at the provider again", not "ignore what the driver told us about itself".
 /// </param>
 public sealed record DriverCapabilityProbeRequest(
     string DriverId,
@@ -131,7 +134,8 @@ public sealed record DriverCapabilityProbeRequest(
     string? Endpoint,
     IReadOnlyList<string>? OperatorModels = null,
     string? DefaultModel = null,
-    bool ForceRefresh = false);
+    bool ForceRefresh = false,
+    DriverCapabilityDeclaration? Declared = null);
 
 /// <summary>
 /// Reads a driver's real capabilities (models, efforts, context windows) from the driver itself.
@@ -245,6 +249,40 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     public async Task<DriverCapabilityReading?> ProbeAsync(
         DriverCapabilityProbeRequest request,
         CancellationToken ct = default)
+    {
+        // Option C: a fresh self-report from the runner wins outright.
+        //
+        // Two reasons this is checked before the adapter resolution and before the cache:
+        //
+        //   1. It is per-driver, while the cache below is keyed per adapter+endpoint because N
+        //      drivers sharing one agy install share one answer. Caching a declaration there would
+        //      hand one runner's catalogue to every other driver on that adapter.
+        //   2. It removes the request-path I/O entirely - no subprocess, no outbound call - which
+        //      is the point of the change. A driver whose runner is healthy never touches the
+        //      probe machinery at all.
+        //
+        // A stale or absent declaration falls through to the live probe, which is what keeps
+        // runners older than this change working exactly as they do today.
+        if (TryDeclaredReading(request, out var declaredReading))
+        {
+            return WithOperatorModels(declaredReading, request);
+        }
+
+        var fallback = await ProbeCoreAsync(request, ct);
+
+        // Applied here rather than inside ProbeCoreAsync so it covers every way the core can come
+        // back empty: a fresh probe, a cached negative, and a caller that joined someone else's
+        // in-flight read. Doing it only on the leader path meant the reason a driver showed for
+        // having no models depended on which request happened to be first.
+        return WithDeclaredReason(fallback, request);
+    }
+
+    /// <summary>
+    /// The live resolution path: cache, single-flight, bounded gate, per-adapter discovery.
+    /// </summary>
+    private async Task<DriverCapabilityReading?> ProbeCoreAsync(
+        DriverCapabilityProbeRequest request,
+        CancellationToken ct)
     {
         var adapter = NormalizeAdapter(request);
         if (adapter == null) return null; // generic / unknown: nothing to discover
@@ -391,7 +429,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 "The agy CLI returned no model list; it is probably not signed in on the API host."), request);
         }
 
-        var models = ParseAgyModels(raw);
+        var models = DriverModelDiscovery.ParseAgyModels(raw);
         if (models.Count == 0)
         {
             // The CLI answered, but not in a shape we could read. An empty probed list would be
@@ -416,159 +454,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
             request);
     }
 
-    /// <summary>
-    /// Parses <c>agy models</c> output. The CLI prints one <c>&lt;id&gt; &lt;display name&gt;</c>
-    /// row per effort variant and offers no JSON mode (<c>--output-format</c> is a print-mode
-    /// flag), so text parsing is the only channel available.
-    /// </summary>
-    /// <remarks>
-    /// Effort variants are grouped back into one entry per base model: the picker selects a model
-    /// and an effort separately, and <c>AgyAdapter</c> passes <c>--model</c> without the suffix.
-    /// </remarks>
-    internal static IReadOnlyList<DriverModelCapability> ParseAgyModels(string raw)
-    {
-        var grouped = new Dictionary<string, (string DisplayName, HashSet<string> Efforts)>(
-            StringComparer.OrdinalIgnoreCase);
-        var order = new List<string>();
 
-        foreach (var line in raw.Split('\n'))
-        {
-            var trimmed = line.Trim();
-            if (string.IsNullOrWhiteSpace(trimmed)) continue;
-
-            // Spinners, progress lines and the "Fetching available models..." banner.
-            if (IsBrailleSpinner(trimmed[0])) continue;
-            if (trimmed.StartsWith("fetching ", StringComparison.OrdinalIgnoreCase)) continue;
-            if (trimmed.StartsWith("error", StringComparison.OrdinalIgnoreCase)) continue;
-            if (trimmed.StartsWith("available models", StringComparison.OrdinalIgnoreCase)) continue;
-            if (trimmed.StartsWith("model", StringComparison.OrdinalIgnoreCase) &&
-                (trimmed.Contains("name", StringComparison.OrdinalIgnoreCase) ||
-                 trimmed.Contains("id", StringComparison.OrdinalIgnoreCase)))
-            {
-                continue; // header row
-            }
-
-            var parts = trimmed.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 0) continue;
-
-            var modelId = parts[0];
-            if (!LooksLikeModelId(modelId)) continue;
-
-            var effort = ExtractEffortSuffix(modelId);
-            var baseId = effort != null ? modelId[..(modelId.Length - effort.Length - 1)] : modelId;
-            if (string.IsNullOrEmpty(baseId)) continue;
-
-            var displayName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : baseId;
-            if (effort != null && displayName.EndsWith($"({effort})", StringComparison.OrdinalIgnoreCase))
-            {
-                displayName = displayName[..^(effort.Length + 2)].Trim();
-            }
-
-            if (!grouped.TryGetValue(baseId, out var entry))
-            {
-                entry = (string.IsNullOrWhiteSpace(displayName) ? baseId : displayName,
-                    new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-                grouped[baseId] = entry;
-                order.Add(baseId);
-            }
-
-            if (effort != null) entry.Efforts.Add(effort.ToLowerInvariant());
-        }
-
-        return order
-            .Select(baseId =>
-            {
-                var (displayName, efforts) = grouped[baseId];
-                return new DriverModelCapability(
-                    Id: baseId,
-                    Name: displayName,
-                    // Only efforts the binary documents AND the adapter forwards verbatim.
-                    Efforts: efforts
-                        .Where(AgyAdapterAcceptsEffort)
-                        .OrderBy(EffortOrder)
-                        .ToList(),
-                    // agy has no context-size flag; per-model sizes used to be invented by
-                    // substring-matching the model id.
-                    ContextSizes: null);
-            })
-            .ToList();
-    }
-
-    private static bool IsBrailleSpinner(char c) => c >= '\u2800' && c <= '\u28FF';
-
-    /// <summary>
-    /// Whether a token is shaped like a model id rather than a word of prose.
-    /// </summary>
-    /// <remarks>
-    /// <c>agy models</c> has no machine-readable mode, so this is text parsing and it will
-    /// eventually meet an output format we have not seen. The failure modes are not symmetric:
-    /// accepting a prose line invents a model the user can select and then send to the driver,
-    /// while rejecting a real one yields an empty list plus a reason the UI displays. So the rule
-    /// is strict - an id must be long, made only of id characters, and carry a version separator
-    /// ('-', '.' or a digit), which is true of every id shape observed from the drivers we target
-    /// (<c>gemini-4-argon-high</c>, <c>gpt-4o</c>, <c>claude-sonnet-5-5</c>, <c>llama3.3</c>).
-    /// </remarks>
-    internal static bool LooksLikeModelId(string token)
-    {
-        if (token.Length < 4) return false;
-
-        // Ids start and end with an identifier character. This is what rejects "Error:" and
-        // "models:" while keeping "llama3.1:8b", whose colon is part of a real ollama tag.
-        if (!char.IsAsciiLetterOrDigit(token[0]) || !char.IsAsciiLetterOrDigit(token[^1])) return false;
-
-        var hasSeparator = false;
-        foreach (var c in token)
-        {
-            if (char.IsAsciiLetterOrDigit(c))
-            {
-                // A digit inside an id ("gpt-4o", "llama3.3") is a version marker, which is the
-                // other way a real id distinguishes itself from an English word.
-                if (char.IsAsciiDigit(c)) hasSeparator = true;
-                continue;
-            }
-
-            if (c is '-' or '.' or '_' or ':')
-            {
-                hasSeparator = true;
-                continue;
-            }
-
-            return false; // prose carries punctuation we do not expect in an id
-        }
-
-        return hasSeparator;
-    }
-
-    internal static string? ExtractEffortSuffix(string id)
-    {
-        foreach (var suffix in new[] { "-low", "-medium", "-high", "-xhigh", "-max" })
-        {
-            if (id.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return suffix[1..].ToLowerInvariant();
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// The effort set <c>agy --help</c> documents for <c>--effort</c>
-    /// (<c>low|medium|high|xhigh|max</c>).
-    /// </summary>
-    /// <remarks>
-    /// A model id ending in <c>-nano</c> or <c>-beta</c> is a variant, not an effort; stripping it
-    /// would invent a model the CLI never offered.
-    /// </remarks>
-    internal static bool AgyAdapterAcceptsEffort(string effort) =>
-        effort.ToLowerInvariant() is "low" or "medium" or "high" or "xhigh" or "max";
-
-    private static int EffortOrder(string effort) => effort.ToLowerInvariant() switch
-    {
-        "low" => 1,
-        "medium" => 2,
-        "high" => 3,
-        "xhigh" => 4,
-        "max" => 5,
-        _ => 99
-    };
 
     private async Task<DriverCapabilityReading?> ProbeOpenAiAsync(
         DriverCapabilityProbeRequest request,
@@ -672,7 +558,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(ProbeTimeout);
 
-            using var httpReq = new HttpRequestMessage(HttpMethod.Get, OpenAiModelListing.ToModelsUrl(endpoint));
+            using var httpReq = new HttpRequestMessage(HttpMethod.Get, DriverModelDiscovery.ToModelsUrl(endpoint));
             if (!string.IsNullOrWhiteSpace(apiKey))
             {
                 httpReq.Headers.Authorization =
@@ -683,7 +569,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
             if (!res.IsSuccessStatusCode) return null;
 
             var json = await res.Content.ReadAsStringAsync(timeoutCts.Token);
-            return OpenAiModelListing.ParseIds(json);
+            return DriverModelDiscovery.ParseOpenAiModelIds(json);
         }
         catch (Exception)
         {
@@ -712,6 +598,91 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     /// Layers the operator's <c>models</c> array and <c>defaultModel</c> over whatever the probe
     /// produced, marking the result as an override so the UI can say which list is whose.
     /// </summary>
+    /// <summary>
+    /// Builds a reading from the runner's own report of its driver, when there is one to trust.
+    /// </summary>
+    /// <remarks>
+    /// Three things void a declaration and fall through to a live read instead:
+    /// <list type="number">
+    ///   <item>It is older than <see cref="DriverCapabilityDeclaration.FreshnessWindow"/>. A
+    ///   catalogue from a runner that died last week must not pin the picker forever.</item>
+    ///   <item>Its adapter disagrees with the row. The blob is written by a runner but the row can
+    ///   be edited underneath it: repointing a driver at a different adapter in the dashboard
+    ///   leaves the previous runner's declaration in place until that runner re-registers. Serving
+    ///   it would hand an agy catalogue to an OpenAI-compatible driver, which is the exact
+    ///   per-driver confusion this line of work set out to fix.</item>
+    ///   <item>It carries no models. An empty declaration is the runner saying "I could not read
+    ///   my own driver", and for an HTTP driver the API may still reach the server, so the probe
+    ///   gets its turn. The runner's explanation is recovered later by
+    ///   <see cref="WithDeclaredReason"/> if neither side produced a list.</item>
+    /// </list>
+    /// </remarks>
+    internal static bool TryDeclaredReading(
+        DriverCapabilityProbeRequest request,
+        out DriverCapabilityReading reading,
+        DateTimeOffset? now = null)
+    {
+        reading = null!;
+
+        var declared = request.Declared;
+        if (declared == null) return false;
+        if (!declared.IsFresh(now ?? DateTimeOffset.UtcNow)) return false;
+
+        var expectedAdapter = NormalizeAdapter(request);
+        if (expectedAdapter == null) return false;
+
+        var declaredAdapter = DriverAdapters.Canonicalize(declared.Adapter);
+        if (!string.Equals(declaredAdapter, expectedAdapter, StringComparison.OrdinalIgnoreCase)) return false;
+
+        if (declared.Models.Count == 0) return false;
+
+        reading = new DriverCapabilityReading(
+            Adapter: expectedAdapter,
+            Models: declared.Models
+                .Where(m => !string.IsNullOrWhiteSpace(m.Id))
+                .Select(m => new DriverModelCapability(
+                    m.Id.Trim(),
+                    string.IsNullOrWhiteSpace(m.Name) ? m.Id.Trim() : m.Name!.Trim(),
+                    m.Efforts ?? Array.Empty<string>(),
+                    // Always computed here, never taken from the declaration. Which windows to
+                    // *offer* is our product policy - ContextSizesForModel bounds the list to what
+                    // the runtime will actually honour - so accepting a runner-supplied value would
+                    // let a self-report advertise a window the runtime clamps, which is the stale
+                    // "500k" defect from earlier in this job re-opened through a new channel. The
+                    // runner declares which models exist; we decide what is selectable for them.
+                    declared.SupportsContextSelection ? ContextSizesForModel(m.Id.Trim()) : null))
+                .ToList(),
+            ModelSource: CapabilitySourceKind.Declared,
+            // The runner's read time, not ours: the dashboard shows how old the answer is, and
+            // stamping it with "now" would make a day-old self-report look fresh.
+            ObservedAt: declared.ObservedAt,
+            SupportsContextSelection: declared.SupportsContextSelection,
+            EffortSource: $"declared:{declared.Source ?? "runner"}");
+
+        return reading.Models.Count > 0;
+    }
+
+    /// <summary>
+    /// Prefers the runner's explanation for an empty catalogue over the API's own.
+    /// </summary>
+    /// <remarks>
+    /// "Not signed in on this machine" is ground truth about an account. "The agy CLI is not
+    /// installed on the API host" is a fact about where the API happens to run, and in a Docker
+    /// deployment that is always true, so it would mask the real reason every time. When neither
+    /// side produced a model list, the runner's reason is the one worth showing.
+    /// </remarks>
+    private static DriverCapabilityReading? WithDeclaredReason(
+        DriverCapabilityReading? reading,
+        DriverCapabilityProbeRequest request)
+    {
+        if (reading is not { Models.Count: 0 }) return reading;
+
+        var reason = request.Declared?.UnavailableReason;
+        if (string.IsNullOrWhiteSpace(reason)) return reading;
+
+        return reading with { UnavailableReason = reason };
+    }
+
     private static DriverCapabilityReading WithOperatorModels(
         DriverCapabilityReading reading,
         DriverCapabilityProbeRequest request)

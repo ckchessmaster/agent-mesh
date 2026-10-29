@@ -260,10 +260,28 @@ export interface ModelCapability {
 }
 
 /**
- * Where a model list came from. Rendered differently in every place it appears: a bundled preset
- * must never read like a driver answer, because the user will trust an entry the driver rejects.
+ * Where a model list came from, after normalization. Rendered differently in every place it
+ * appears: a bundled preset must never read like a driver answer, because the user will trust an
+ * entry the driver rejects.
+ *
+ * `declared` is the runner relaying what its own driver reported. It is a real driver answer, but
+ * one we did not verify ourselves and which can be up to the declaration window stale, so it is
+ * worded distinctly from `probed` rather than folded into it.
+ *
+ * This is the NORMALIZED type, not the wire type. The wire fields are typed `string` because this
+ * bundle is frequently older than the API serving it - the dashboard is a static build while the
+ * API rolls independently - and a field typed as this union would make `normalizeSource`'s
+ * fall-through to 'unavailable' unreachable by construction: TypeScript would insist an unknown
+ * value cannot arrive, while the whole reason that branch exists is that it can.
+ * `CapabilitySourceKindValues_AreExactlyTheUnionTheDashboardDeclares` is what keeps this list and
+ * the server's enum in step.
  */
-export type CapabilitySource = 'probed' | 'static_preset' | 'user_override' | 'unavailable';
+export type CapabilitySource =
+  | 'probed'
+  | 'declared'
+  | 'static_preset'
+  | 'user_override'
+  | 'unavailable';
 
 export interface RuntimeCapabilities {
   adapter: string;
@@ -278,7 +296,8 @@ export interface RuntimeCapabilities {
   contextSizes?: ContextSizeOption[] | null;
   /** False when the driver has no way to be told its context window, so the picker is hidden. */
   supportsContextSelection?: boolean;
-  modelSource?: CapabilitySource;
+  /** Raw wire value; read through `normalizeSource`, never compared directly. */
+  modelSource?: string;
   observedAt?: string;
   effortSource?: string | null;
   unavailableReason?: string | null;
@@ -291,7 +310,8 @@ export interface DriverCapabilities {
   adapter: string;
   endpoint?: string | null;
   models: ModelCapability[];
-  modelSource: CapabilitySource;
+  /** Raw wire value; read through `normalizeSource`, never compared directly. */
+  modelSource: string;
   observedAt: string;
   supportsContextSelection: boolean;
   contextSizes?: ContextSizeOption[] | null;
