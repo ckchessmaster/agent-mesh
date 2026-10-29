@@ -19,7 +19,16 @@ namespace AgentMesh.Tests.Cli;
 /// socket. That is not merely for speed: CI runners and the API container have no driver binaries
 /// installed, so a test that shelled out would fail on exactly the machines where the production
 /// code cannot work either - and would then be deleted rather than fixed.
+/// <para>
+/// Shares the <c>DriverCapabilityDescriberSeams</c> collection with
+/// <c>MeshClientDeclarationIsolationTests</c>, which swaps the same static seams. xUnit parallelizes
+/// across classes, and a constructor captures "whatever is current" as the value to restore, so two
+/// classes doing that concurrently cross-restore each other's fakes: one class's Dispose puts the
+/// real seams back mid-flight through the other's tests. With agy off PATH - CI's image - the real
+/// resolver then returns null and a declaration silently comes back empty.
+/// </para>
 /// </remarks>
+[Collection("DriverCapabilityDescriberSeams")]
 public sealed class DriverCapabilityDescriberTests : IDisposable
 {
     private const string SampleAgyModels = """

@@ -28,7 +28,17 @@ namespace AgentMesh.Tests.Cli;
 /// preset-to-adapter-to-declaration path has to be the production one. Nothing spawns a binary or
 /// opens a socket; the mesh is a capturing handler.
 /// </para>
+/// <para>
+/// Shares the <c>DriverCapabilityDescriberSeams</c> collection with
+/// <c>DriverCapabilityDescriberTests</c> because both swap the same static seams. xUnit runs
+/// different classes in parallel, and one class's constructor captures "whatever is current" as the
+/// original to restore, so two classes doing that concurrently cross-restore each other's fakes and
+/// a test can end up running against the real subprocess runner. That is not theoretical: with agy
+/// off PATH - which is what CI's image has - the leaked real runner returns null and the case
+/// sensitivity case loses its two models.
+/// </para>
 /// </remarks>
+[Collection("DriverCapabilityDescriberSeams")]
 public sealed class MeshClientDeclarationIsolationTests : IDisposable
 {
     private const string AgyCatalogue = """
