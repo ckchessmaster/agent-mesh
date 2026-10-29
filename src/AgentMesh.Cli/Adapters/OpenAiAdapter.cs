@@ -8,6 +8,7 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Adapters;
 
@@ -170,28 +171,17 @@ public class OpenAiAdapter : IAgentAdapter
                statusCode == 504;   // Gateway Timeout
     }
 
+    /// <summary>
+    /// Resolves the token budget for a run.
+    /// </summary>
+    /// <remarks>
+    /// Delegates to <see cref="ModelContextLimits"/> so the API that renders the context picker and
+    /// the adapter that honours the choice read one table. They used to hold separate tables, which
+    /// is how the picker could advertise 256k while the run was clamped to 128k with nothing in the
+    /// response saying so.
+    /// </remarks>
     public static int ResolveModelContextLimit(string model, string? contextSizeOption)
-    {
-        if (!string.IsNullOrWhiteSpace(contextSizeOption) && !contextSizeOption.Equals("default", StringComparison.OrdinalIgnoreCase))
-        {
-            var normalized = contextSizeOption.Trim().ToLowerInvariant();
-            if (normalized.EndsWith("k") && int.TryParse(normalized[..^1], out var k))
-                return k * 1024;
-            if (normalized.EndsWith("m") && int.TryParse(normalized[..^1], out var m))
-                return m * 1024 * 1024;
-            if (int.TryParse(normalized, out var exact))
-                return exact;
-        }
-
-        var mLower = model.ToLowerInvariant();
-        if (mLower.Contains("qwen3") || mLower.Contains("qwen-3")) return 524_288; // 512k tokens
-        if (mLower.Contains("qwen2.5") || mLower.Contains("qwen-2.5")) return 131_072; // 128k
-        if (mLower.Contains("llama-3") || mLower.Contains("llama3")) return 131_072; // 128k
-        if (mLower.Contains("gpt-4o")) return 131_072; // 128k
-        if (mLower.Contains("deepseek")) return 131_072; // 128k
-
-        return 131_072; // 128k safe default
-    }
+        => ModelContextLimits.ResolveTokens(model, contextSizeOption);
 
     public static int EstimateMessageTokens(OpenAiMessage message)
     {

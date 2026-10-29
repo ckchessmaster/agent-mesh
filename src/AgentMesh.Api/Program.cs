@@ -34,6 +34,13 @@ builder.Services.AddSingleton<ICredentialEncryptionService, AesCredentialEncrypt
 // provider CLI that takes seconds to answer.
 builder.Services.AddSingleton<AgyDriverQuotaProbe>();
 builder.Services.AddSingleton<IDriverQuotaProbe>(sp => sp.GetRequiredService<AgyDriverQuotaProbe>());
+
+// Driver capability introspection (models, efforts, context windows) resolved per driver from
+// the driver itself. Same singleton rationale as the quota probe, plus a concurrency gate: this
+// one is reachable from an [AllowAnonymous] endpoint, so it bounds how many subprocesses and
+// outbound listing calls a cold cache may spawn at once.
+builder.Services.AddSingleton<DriverCapabilityProbe>();
+builder.Services.AddSingleton<IDriverCapabilityProbe>(sp => sp.GetRequiredService<DriverCapabilityProbe>());
 builder.Services.AddHttpContextAccessor();
 
 var oidcAuthority = builder.Configuration["Oidc:Authority"] ?? "http://localhost:8085/dex";
