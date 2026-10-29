@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace AgentMesh.Core.Services;
 
@@ -16,6 +17,14 @@ public sealed record DriverModelCapability(
     string Name,
     IReadOnlyList<string> Efforts,
     IReadOnlyList<string>? ContextSizes = null);
+
+/// <summary>
+/// A model entry extracted from an OpenAI-compatible <c>/models</c> response, including its
+/// server-reported maximum context window in tokens when the provider supplies one.
+/// </summary>
+public sealed record DiscoveredOpenAiModel(
+    string Id,
+    int? MaxContextTokens = null);
 
 /// <summary>
 /// Parsing primitives for driver capability discovery, shared by the API's background probe and
@@ -36,64 +45,71 @@ public sealed record DriverModelCapability(
 /// </remarks>
 public static class DriverModelDiscovery
 {
+    private static readonly Regex AnsiEscapeRegex = new(
+        @"\x1B\[[0-9;?]*[ -/]*[@-~]",
+        RegexOptions.Compiled);
+
     /// <summary>
-        /// Parses <c>agy models</c> output. The CLI prints one <c>&lt;id&gt; &lt;display name&gt;</c>
-        /// row per effort variant and offers no JSON mode (<c>--output-format</c> is a print-mode
-        /// flag), so text parsing is the only channel available.
-        /// </summary>
-        /// <remarks>
-        /// Effort variants are grouped back into one entry per base model: the picker selects a model
-        /// and an effort separately, and <c>AgyAdapter</c> passes <c>--model</c> without the suffix.
-        /// </remarks>
-        public static IReadOnlyList<DriverModelCapability> ParseAgyModels(string raw)
+    /// Parses <c>agy models</c> output. The CLI prints one <c>&lt;id&gt; &lt;display name&gt;</c>
+    /// row per effort variant and offers no JSON mode (<c>--output-format</c> is a print-mode
+    /// flag), so text parsing is the only channel available.
+    /// </summary>
+    /// <remarks>
+    /// Effort variants are grouped back into one entry per base model: the picker selects a model
+    /// and an effort separately, and <c>AgyAdapter</c> passes <c>--model</c> without the suffix.
+    /// Splits on both <c>\r</c> and <c>\n</c> because <c>agy models</c> overwrites its Braille
+    /// spinner line using carriage returns (<c>\r⠋ Fetching available models...\rgemini-4-argon-medium...</c>)
+    /// without emitting a newline before the first model row.
+    /// </remarks>
+    public static IReadOnlyList<DriverModelCapability> ParseAgyModels(string raw)
+    {
+        var grouped = new Dictionary<string, (string DisplayName, HashSet<string> Efforts)>(
+            StringComparer.OrdinalIgnoreCase);
+        var order = new List<string>();
+
+        foreach (var line in raw.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
         {
-            var grouped = new Dictionary<string, (string DisplayName, HashSet<string> Efforts)>(
-                StringComparer.OrdinalIgnoreCase);
-            var order = new List<string>();
+            var cleaned = AnsiEscapeRegex.Replace(line, string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(cleaned)) continue;
 
-            foreach (var line in raw.Split('\n'))
+            // Spinners, progress lines and the "Fetching available models..." banner.
+            if (IsBrailleSpinner(cleaned[0])) continue;
+            if (cleaned.StartsWith("fetching ", StringComparison.OrdinalIgnoreCase)) continue;
+            if (cleaned.StartsWith("error", StringComparison.OrdinalIgnoreCase)) continue;
+            if (cleaned.StartsWith("available models", StringComparison.OrdinalIgnoreCase)) continue;
+            if (cleaned.StartsWith("model", StringComparison.OrdinalIgnoreCase) &&
+                (cleaned.Contains("name", StringComparison.OrdinalIgnoreCase) ||
+                 cleaned.Contains("id", StringComparison.OrdinalIgnoreCase)))
             {
-                var trimmed = line.Trim();
-                if (string.IsNullOrWhiteSpace(trimmed)) continue;
-
-                // Spinners, progress lines and the "Fetching available models..." banner.
-                if (IsBrailleSpinner(trimmed[0])) continue;
-                if (trimmed.StartsWith("fetching ", StringComparison.OrdinalIgnoreCase)) continue;
-                if (trimmed.StartsWith("error", StringComparison.OrdinalIgnoreCase)) continue;
-                if (trimmed.StartsWith("available models", StringComparison.OrdinalIgnoreCase)) continue;
-                if (trimmed.StartsWith("model", StringComparison.OrdinalIgnoreCase) &&
-                    (trimmed.Contains("name", StringComparison.OrdinalIgnoreCase) ||
-                     trimmed.Contains("id", StringComparison.OrdinalIgnoreCase)))
-                {
-                    continue; // header row
-                }
-
-                var parts = trimmed.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length == 0) continue;
-
-                var modelId = parts[0];
-                if (!LooksLikeModelId(modelId)) continue;
-
-                var effort = ExtractEffortSuffix(modelId);
-                var baseId = effort != null ? modelId[..(modelId.Length - effort.Length - 1)] : modelId;
-                if (string.IsNullOrEmpty(baseId)) continue;
-
-                var displayName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : baseId;
-                if (effort != null && displayName.EndsWith($"({effort})", StringComparison.OrdinalIgnoreCase))
-                {
-                    displayName = displayName[..^(effort.Length + 2)].Trim();
-                }
-
-                if (!grouped.TryGetValue(baseId, out var entry))
-                {
-                    entry = (string.IsNullOrWhiteSpace(displayName) ? baseId : displayName,
-                        new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-                    grouped[baseId] = entry;
-                    order.Add(baseId);
-                }
-
-                if (effort != null) entry.Efforts.Add(effort.ToLowerInvariant());
+                continue; // header row
             }
+
+            var parts = cleaned.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) continue;
+
+            var modelId = parts[0];
+            if (!LooksLikeModelId(modelId)) continue;
+
+            var effort = ExtractEffortSuffix(modelId);
+            var baseId = effort != null ? modelId[..(modelId.Length - effort.Length - 1)] : modelId;
+            if (string.IsNullOrEmpty(baseId)) continue;
+
+            var displayName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : baseId;
+            if (effort != null && displayName.EndsWith($"({effort})", StringComparison.OrdinalIgnoreCase))
+            {
+                displayName = displayName[..^(effort.Length + 2)].Trim();
+            }
+
+            if (!grouped.TryGetValue(baseId, out var entry))
+            {
+                entry = (string.IsNullOrWhiteSpace(displayName) ? baseId : displayName,
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                grouped[baseId] = entry;
+                order.Add(baseId);
+            }
+
+            if (effort != null) entry.Efforts.Add(effort.ToLowerInvariant());
+        }
 
             return order
                 .Select(baseId =>
@@ -195,35 +211,133 @@ public static class DriverModelDiscovery
     /// otherwise would render an empty picker as a successful probe.
     /// </summary>
     public static IReadOnlyList<string> ParseOpenAiModelIds(string json)
+        => ParseOpenAiModels(json).Select(m => m.Id).ToList();
+
+    /// <summary>
+    /// Extracts model entries (id plus optional provider-reported context window limit) from an
+    /// OpenAI-compatible <c>/models</c> payload.
+    /// </summary>
+    public static IReadOnlyList<DiscoveredOpenAiModel> ParseOpenAiModels(string json)
     {
         try
         {
             using var doc = JsonDocument.Parse(json);
 
-            if (!TryGetPropertyCaseInsensitive(doc.RootElement, "data", out var data) ||
+            JsonElement data;
+            if (!TryGetPropertyCaseInsensitive(doc.RootElement, "data", out data) ||
                 data.ValueKind != JsonValueKind.Array)
             {
-                return Array.Empty<string>();
-            }
-
-            var ids = new List<string>();
-            foreach (var item in data.EnumerateArray())
-            {
-                if (item.ValueKind != JsonValueKind.Object) continue;
-                if (TryGetPropertyCaseInsensitive(item, "id", out var id) &&
-                    id.ValueKind == JsonValueKind.String)
+                if (!TryGetPropertyCaseInsensitive(doc.RootElement, "models", out data) ||
+                    data.ValueKind != JsonValueKind.Array)
                 {
-                    var value = id.GetString();
-                    if (!string.IsNullOrWhiteSpace(value)) ids.Add(value!);
+                    return Array.Empty<DiscoveredOpenAiModel>();
                 }
             }
 
-            return ids;
+            var models = new List<DiscoveredOpenAiModel>();
+            foreach (var item in data.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+
+                string? modelId = null;
+                if (TryGetPropertyCaseInsensitive(item, "id", out var id) &&
+                    id.ValueKind == JsonValueKind.String)
+                {
+                    modelId = id.GetString();
+                }
+                else if (TryGetPropertyCaseInsensitive(item, "name", out var nameProp) &&
+                         nameProp.ValueKind == JsonValueKind.String)
+                {
+                    modelId = nameProp.GetString();
+                }
+
+                if (string.IsNullOrWhiteSpace(modelId)) continue;
+
+                var maxContext = ExtractModelContextLimit(item);
+                models.Add(new DiscoveredOpenAiModel(modelId!.Trim(), maxContext));
+            }
+
+            return models;
         }
         catch (JsonException)
         {
-            return Array.Empty<string>();
+            return Array.Empty<DiscoveredOpenAiModel>();
         }
+    }
+
+    private static readonly string[] ContextLimitFieldNames =
+    {
+        "max_model_len",
+        "context_length",
+        "max_context_length",
+        "context_window",
+        "max_input_tokens",
+        "input_token_limit",
+        "n_ctx"
+    };
+
+    private static readonly string[] NestedContextContainerNames =
+    {
+        "top_provider",
+        "architecture",
+        "limits",
+        "model_info"
+    };
+
+    private static int? ExtractModelContextLimit(JsonElement item)
+    {
+        foreach (var field in ContextLimitFieldNames)
+        {
+            if (TryGetPositiveInt(item, field, out var direct))
+            {
+                return direct;
+            }
+        }
+
+        foreach (var containerName in NestedContextContainerNames)
+        {
+            if (TryGetPropertyCaseInsensitive(item, containerName, out var nested) &&
+                nested.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var field in ContextLimitFieldNames)
+                {
+                    if (TryGetPositiveInt(nested, field, out var nestedVal))
+                    {
+                        return nestedVal;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryGetPositiveInt(JsonElement obj, string name, out int result)
+    {
+        result = 0;
+        if (!TryGetPropertyCaseInsensitive(obj, name, out var prop)) return false;
+
+        if (prop.ValueKind == JsonValueKind.Number)
+        {
+            if (prop.TryGetInt32(out var val) && val > 0)
+            {
+                result = val;
+                return true;
+            }
+            if (prop.TryGetInt64(out var lVal) && lVal > 0 && lVal <= int.MaxValue)
+            {
+                result = (int)lVal;
+                return true;
+            }
+        }
+        else if (prop.ValueKind == JsonValueKind.String &&
+                 int.TryParse(prop.GetString(), out var parsed) && parsed > 0)
+        {
+            result = parsed;
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>

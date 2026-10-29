@@ -36,10 +36,12 @@ public static class BaselineRuntimes
     {
         new("default", "Default Context", "Let the driver use its own default window"),
         new("32k", "32k Tokens", "Compact 32k token context window"),
+        new("64k", "64k Tokens", "Medium 64k token context window"),
         new("128k", "128k Tokens", "Standard 128k token context window"),
         new("200k", "200k Tokens", "Extended 200k token context window"),
         new("256k", "256k Tokens", "Long 256k token context window"),
         new("500k", "500k Tokens", "Very long 500k token context window"),
+        new("512k", "512k Tokens", "Extended 512k token context window"),
         new("1m", "1M Tokens", "Maximum 1M token context window")
     };
 

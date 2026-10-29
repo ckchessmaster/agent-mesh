@@ -690,6 +690,40 @@ public class MeshClient
         }
     }
 
+    public async Task<bool> ReportLearnedContextLimitAsync(
+        string driverId,
+        string? agentToken,
+        string model,
+        int maxContextTokens,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(driverId) || string.IsNullOrWhiteSpace(model) || maxContextTokens <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            var token = !string.IsNullOrWhiteSpace(agentToken) ? agentToken : _config.MasterToken;
+            using var req = CreateRequest(
+                HttpMethod.Post,
+                $"api/agents/{Uri.EscapeDataString(driverId.Trim().ToLowerInvariant())}/context-limit",
+                token,
+                driverId);
+            req.Content = JsonContent.Create(new
+            {
+                model,
+                maxContextTokens
+            });
+            using var res = await _http.SendAsync(req, ct);
+            return res.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public async Task<bool> SyncSessionArtifactAsync(Guid sessionId, string name, string content, string? summary = null, string? contentType = "text/markdown", CancellationToken ct = default, string? base64Content = null)
     {
         try

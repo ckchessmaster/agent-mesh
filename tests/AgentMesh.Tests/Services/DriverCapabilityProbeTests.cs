@@ -1245,4 +1245,83 @@ public class DriverCapabilityProbeTests
         reading.Should().BeNull();
     }
 
+    [Fact]
+    public void ParseAgyModels_HandlesCarriageReturnSpinnerPrefixWithoutDroppingFirstModel()
+    {
+        var rawWithCarriageReturns =
+            "\r\u001b[2K⠋ Fetching available models...\r\u001b[2K⠙ Fetching available models...\rgemini-4-argon-medium      Gemini 4 Argon (medium)\ngemini-3-8-flash-low       Gemini 3.8 Flash (low)\nclaude-opus-5-5-high       Claude Opus 5.5 (high)\nclaude-sonnet-5-5          Claude Sonnet 5.5\ngpt-oss-120b-medium        GPT-OSS 120B (medium)\n";
+
+        var models = DriverModelDiscovery.ParseAgyModels(rawWithCarriageReturns);
+
+        models.Select(m => m.Id).Should().Equal(
+            "gemini-4-argon",
+            "gemini-3-8-flash",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "gpt-oss-120b");
+    }
+
+    [Fact]
+    public void ParseOpenAiModels_ExtractsMaxContextTokensFromProviderPayload()
+    {
+        var json = """
+            {
+              "data": [
+                { "id": "qwen3.8-flash-next", "max_model_len": 524288 },
+                { "id": "custom-1m", "context_length": 1048576 },
+                { "id": "mystery-model" }
+              ]
+            }
+            """;
+
+        var models = DriverModelDiscovery.ParseOpenAiModels(json);
+
+        models.Should().HaveCount(3);
+        models.Single(m => m.Id == "qwen3.8-flash-next").MaxContextTokens.Should().Be(524_288);
+        models.Single(m => m.Id == "custom-1m").MaxContextTokens.Should().Be(1_048_576);
+        models.Single(m => m.Id == "mystery-model").MaxContextTokens.Should().BeNull();
+    }
+
+    [Fact]
+    public void ContextSizesForModel_Offers512kForQwen3AndAutoDetectDefaultForUnknownModels()
+    {
+        ModelContextLimits.ClearLearnedLimits();
+
+        var qwenSizes = DriverCapabilityProbe.ContextSizesForModel("qwen3.8-flash-next");
+        qwenSizes.Should().Contain("64k").And.Contain("512k").And.NotContain("1m");
+
+        var unknownSizes = DriverCapabilityProbe.ContextSizesForModel("completely-unknown-model");
+        unknownSizes.Should().Equal("default");
+
+        var learned = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["completely-unknown-model"] = 262_144
+        };
+        var learnedSizes = DriverCapabilityProbe.ContextSizesForModel(
+            "completely-unknown-model",
+            learnedLimits: learned);
+        learnedSizes.Should().Contain("256k").And.NotContain("512k");
+    }
+
+    [Fact]
+    public void ToProbeRequest_ExtractsApiKeyAndLearnedLimitsFromRawCapabilitiesJson()
+    {
+        var raw = """
+            {
+              "adapter": "openai",
+              "endpoint": "http://private-ai:8000/v1",
+              "apiKey": "sk-secret-token",
+              "learnedContextLimits": {
+                "private-model": 524288
+              }
+            }
+            """;
+
+        var view = DriverCapabilities.Parse(raw);
+        var req = view.ToProbeRequest("private-ai", RuntimeType.OpenAiCompatible, rawCapabilitiesJson: raw);
+
+        req.ApiKey.Should().Be("sk-secret-token");
+        req.LearnedContextLimits.Should().ContainKey("private-model").WhoseValue.Should().Be(524_288);
+    }
+
 }

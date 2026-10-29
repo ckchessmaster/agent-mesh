@@ -1,6 +1,28 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { X, Save, Info, KeyRound, AlertTriangle, Trash2, Network, ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
-import type { Agent, DriverConfig, DriverSidecarConfig } from '../types';
+import {
+  X,
+  Save,
+  Info,
+  KeyRound,
+  AlertTriangle,
+  Trash2,
+  Network,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  ShieldCheck,
+  CheckCircle2,
+  XCircle,
+  ExternalLink,
+  RefreshCw
+} from 'lucide-react';
+import type {
+  Agent,
+  DriverConfig,
+  DriverSidecarConfig,
+  PersonaDriverVerificationResult,
+  PersonaAuthStartResult
+} from '../types';
 import { api } from '../services/api';
 
 interface DriverConfigModalProps {
@@ -22,6 +44,7 @@ interface DriverConfigModalProps {
     authCheckCommand?: string;
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
+  onAuthSuccess?: () => void | Promise<void>;
 }
 
 /**
@@ -54,21 +77,121 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   saving,
   onClose,
   onSave,
-  onDelete
+  onDelete,
+  onAuthSuccess
 }) => {
   const config = initialConfig ?? agent.config ?? {};
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
-  const isOpenAiDriver = useMemo(() => {
-    if (config.adapter) return config.adapter.toLowerCase() === 'openai';
+  const driverAdapter = useMemo(() => {
+    if (config.adapter) return config.adapter.toLowerCase();
     try {
       const parsed = agent.capabilitiesJson ? JSON.parse(agent.capabilitiesJson) : null;
-      return String(parsed?.adapter ?? '').toLowerCase() === 'openai';
+      if (parsed?.adapter) return String(parsed.adapter).toLowerCase();
+      if (parsed?.endpoint) return 'openai';
     } catch {
-      return false;
+      // ignore
     }
-  }, [config.adapter, agent.capabilitiesJson]);
+    const idLower = (agent.id || '').toLowerCase();
+    if (idLower.includes('claude')) return 'claude';
+    if (idLower.includes('copilot')) return 'copilot';
+    if (idLower.includes('openai') || idLower.includes('ollama') || idLower.includes('vllm')) return 'openai';
+    return 'agy';
+  }, [config.adapter, agent.capabilitiesJson, agent.id]);
+
+  const isOpenAiDriver = driverAdapter === 'openai';
+
+  // Driver Verification & Authentication state
+  const [verifying, setVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<PersonaDriverVerificationResult | null>(null);
+  const [showAuthWizard, setShowAuthWizard] = useState(false);
+  const [authMode, setAuthMode] = useState<'oauth' | 'apikey'>(isOpenAiDriver ? 'apikey' : 'oauth');
+  const [authStarting, setAuthStarting] = useState(false);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authStartResult, setAuthStartResult] = useState<PersonaAuthStartResult | null>(null);
+  const [authCodeInput, setAuthCodeInput] = useState('');
+  const [wizardApiKeyInput, setWizardApiKeyInput] = useState('');
+  const [wizardApiKeySaving, setWizardApiKeySaving] = useState(false);
+  const [authSuccessMessage, setAuthSuccessMessage] = useState<string | null>(null);
+
+  const handleVerifyDriver = async () => {
+    try {
+      setVerifying(true);
+      setError(null);
+      const res = await api.verifyDriver(agent.id);
+      setVerifyResult(res);
+      await onAuthSuccess?.();
+    } catch (err: any) {
+      setError(err?.message || 'Failed to verify driver.');
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  const handleStartDriverAuth = async () => {
+    try {
+      setAuthStarting(true);
+      setError(null);
+      setAuthSuccessMessage(null);
+      setShowAuthWizard(true);
+      const res = await api.startDriverAuth(agent.id);
+      setAuthStartResult(res);
+      if (res.status === 'already_authenticated') {
+        setAuthSuccessMessage(res.instructions || 'Driver is already authenticated.');
+        await onAuthSuccess?.();
+      } else if (res.status === 'apikey_required') {
+        setAuthMode('apikey');
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Failed to start driver authentication.');
+    } finally {
+      setAuthStarting(false);
+    }
+  };
+
+  const handleSubmitDriverAuthCode = async () => {
+    if (!authCodeInput.trim()) return;
+    try {
+      setAuthSubmitting(true);
+      setError(null);
+      const res = await api.submitDriverAuthCode(agent.id, authCodeInput.trim());
+      if (res.status === 'authenticated') {
+        setAuthSuccessMessage(res.message || 'Successfully authenticated driver and refreshed models!');
+        setAuthCodeInput('');
+        setAuthStartResult(null);
+        setShowAuthWizard(false);
+        await handleVerifyDriver();
+      } else {
+        setError(res.errorMessage || 'Failed to verify authorization code.');
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Failed to submit authorization code.');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleSaveWizardApiKey = async () => {
+    if (!wizardApiKeyInput.trim()) return;
+    try {
+      setWizardApiKeySaving(true);
+      setError(null);
+      const res = await api.configureDriverApiKey(agent.id, wizardApiKeyInput.trim(), driverAdapter);
+      if (res.status === 'authenticated') {
+        setAuthSuccessMessage(res.message || 'API key saved and models refreshed!');
+        setWizardApiKeyInput('');
+        setShowAuthWizard(false);
+        await handleVerifyDriver();
+      } else {
+        setError(res.errorMessage || 'Failed to save API key.');
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Failed to save API key.');
+    } finally {
+      setWizardApiKeySaving(false);
+    }
+  };
 
   const [endpoint, setEndpoint] = useState(config.endpoint ?? '');
   const [apiKey, setApiKey] = useState('');
@@ -145,6 +268,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
           success: true,
           message: `Connected successfully! Found ${res.models?.length ?? 0} model(s).`
         });
+        await onAuthSuccess?.();
       } else {
         setEndpointTestResult({
           success: false,
@@ -327,6 +451,195 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
               </span>
             </div>
           )}
+
+          {/* Driver Authentication & Model Discovery */}
+          <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold text-white flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Driver Authentication &amp; Model Discovery</span>
+                  {(config.hasOAuthToken || config.hasApiKey) && (
+                    <span className="px-1.5 py-0.2 rounded bg-emerald-950/80 border border-emerald-600/40 text-[9px] font-mono text-emerald-300">
+                      authenticated
+                    </span>
+                  )}
+                </div>
+                <p className="text-[10px] text-slate-400 mt-0.5">
+                  Authenticate once for this driver and automatically discover available models for all bound personas.
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleVerifyDriver}
+                  disabled={verifying}
+                  className="px-2.5 py-1 rounded-lg bg-sky-950/60 hover:bg-sky-900/60 text-sky-300 border border-sky-800/40 text-[11px] font-medium flex items-center gap-1 transition disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3 h-3 ${verifying ? 'animate-spin' : ''}`} />
+                  <span>{verifying ? 'Verifying...' : 'Verify & Refresh Models'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleStartDriverAuth}
+                  disabled={authStarting}
+                  className="px-2.5 py-1 rounded-lg bg-purple-950/60 hover:bg-purple-900/60 text-purple-300 border border-purple-800/40 text-[11px] font-medium flex items-center gap-1 transition disabled:opacity-50 cursor-pointer"
+                >
+                  <KeyRound className="w-3 h-3" />
+                  <span>Authenticate Driver</span>
+                </button>
+              </div>
+            </div>
+
+            {authSuccessMessage && (
+              <div className="p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-[11px] text-emerald-300 flex items-center gap-2">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>{authSuccessMessage}</span>
+              </div>
+            )}
+
+            {verifyResult && (
+              <div className="space-y-2 pt-1">
+                <div className="divide-y divide-slate-800/80 rounded-lg bg-slate-900/80 border border-slate-800 overflow-hidden">
+                  {verifyResult.steps.map((step, idx) => (
+                    <div key={idx} className="p-2.5 flex items-start gap-2.5 text-xs">
+                      <div className="mt-0.5">
+                        {step.status === 'success' ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : step.status === 'warning' ? (
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                        ) : (
+                          <XCircle className="w-3.5 h-3.5 text-rose-400" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-[11px] text-white">{step.name}</span>
+                          <span className="text-[9px] uppercase font-mono text-slate-400">{step.status}</span>
+                        </div>
+                        <p className="text-[11px] text-slate-300 mt-0.5 font-mono break-all">{step.details}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {showAuthWizard && (
+              <div className="p-3 rounded-lg bg-slate-900 border border-purple-500/40 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                  <span className="font-semibold text-purple-300 flex items-center gap-1.5">
+                    <KeyRound className="w-3.5 h-3.5 text-purple-400" />
+                    <span>Driver Authentication</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowAuthWizard(false)}
+                    className="text-slate-400 hover:text-white cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  {!isOpenAiDriver && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthMode('oauth');
+                        if (!authStartResult && !authStarting) handleStartDriverAuth();
+                      }}
+                      className={`px-2.5 py-1 rounded text-[11px] font-medium cursor-pointer ${
+                        authMode === 'oauth'
+                          ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Interactive OAuth Login
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setAuthMode('apikey')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-medium cursor-pointer ${
+                      authMode === 'apikey'
+                        ? 'bg-purple-600/30 text-purple-300 border border-purple-500/40'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Direct API Key
+                  </button>
+                </div>
+
+                {authMode === 'apikey' ? (
+                  <div className="flex items-center gap-2 pt-1">
+                    <input
+                      type="password"
+                      value={wizardApiKeyInput}
+                      onChange={(e) => setWizardApiKeyInput(e.target.value)}
+                      placeholder="Paste API key..."
+                      className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-purple-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleSaveWizardApiKey}
+                      disabled={wizardApiKeySaving || !wizardApiKeyInput.trim()}
+                      className="px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs disabled:opacity-50 cursor-pointer"
+                    >
+                      {wizardApiKeySaving ? 'Saving...' : 'Save Key'}
+                    </button>
+                  </div>
+                ) : authStarting ? (
+                  <div className="p-3 text-center text-slate-400 text-[11px] font-mono">
+                    Starting driver login session...
+                  </div>
+                ) : authStartResult?.status === 'error' || authStartResult?.errorMessage ? (
+                  <div className="p-2.5 rounded bg-rose-950/50 border border-rose-500/40 text-[11px] text-rose-200 font-mono">
+                    {authStartResult.errorMessage}
+                  </div>
+                ) : (
+                  <div className="space-y-2 pt-1">
+                    {authStartResult?.authUrl && (
+                      <div className="space-y-1.5">
+                        <p className="text-[11px] text-slate-300">
+                          Step 1: Open the authorization link in your browser to sign in:
+                        </p>
+                        <a
+                          href={authStartResult.authUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px] transition"
+                        >
+                          <span>Authorize in Browser</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
+                    )}
+                    <p className="text-[11px] text-slate-300">
+                      {authStartResult?.authUrl ? 'Step 2: ' : ''}Paste the authorization code below and click Submit:
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={authCodeInput}
+                        onChange={(e) => setAuthCodeInput(e.target.value)}
+                        placeholder="Paste authorization code..."
+                        className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-sky-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleSubmitDriverAuthCode}
+                        disabled={authSubmitting || !authCodeInput.trim()}
+                        className="px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs disabled:opacity-50 cursor-pointer shrink-0"
+                      >
+                        {authSubmitting ? 'Verifying...' : 'Submit Code'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
           {isOpenAiDriver && (
             <>

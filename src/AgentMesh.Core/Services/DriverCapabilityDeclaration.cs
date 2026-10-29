@@ -174,6 +174,13 @@ public sealed record DriverCapabilityDeclaration
         [JsonPropertyName("efforts")]
         public IReadOnlyList<string> Efforts { get; init; } = Array.Empty<string>();
 
+        /// <summary>
+        /// Provider-reported maximum context window in tokens (e.g. from <c>max_model_len</c> or
+        /// <c>context_length</c> in <c>/v1/models</c>), when the server explicitly supplies one.
+        /// </summary>
+        [JsonPropertyName("maxContextTokens")]
+        public int? MaxContextTokens { get; init; }
+
         // No contextSizes field, deliberately. Which windows to *offer* is the API's product
         // policy (bounded to what the runtime will actually honour), not a provider fact, so a
         // runner is not asked to declare it and the API does not read it even if a future CLI

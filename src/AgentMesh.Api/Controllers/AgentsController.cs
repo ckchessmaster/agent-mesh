@@ -1,6 +1,9 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Security.Claims;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
@@ -22,9 +25,13 @@ public class AgentsController(
     AgentMeshDbContext db,
     IApiKeyService apiKeyService,
     IHubContext<AgentMeshHub>? hubContext = null,
-    IDriverQuotaProbe? quotaProbe = null) : ControllerBase
+    IDriverQuotaProbe? quotaProbe = null,
+    IPersonaContainerManager? containerManager = null,
+    IDriverCapabilityProbe? capabilityProbe = null) : ControllerBase
 {
     private IDriverQuotaProbe QuotaProbe => quotaProbe ?? NullDriverQuotaProbe.Instance;
+    private IDriverCapabilityProbe CapabilityProbe => capabilityProbe ?? NullDriverCapabilityProbe.Instance;
+    private static readonly ConcurrentDictionary<string, HostAuthSession> _activeHostAuthSessions = new(StringComparer.OrdinalIgnoreCase);
 
     [HttpPost("register")]
     [AllowAnonymous]
@@ -297,6 +304,12 @@ public class AgentsController(
         agent.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        CapabilityProbe.InvalidateCache();
+        if (req.Endpoint is not null || !string.IsNullOrWhiteSpace(req.ApiKey) || req.Adapter is not null)
+        {
+            await SyncDriverCapabilitiesFromProbeAsync(agent, HttpContext?.RequestAborted ?? CancellationToken.None);
+        }
+
         var sessionCount = await db.AgentSessions.CountAsync(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId);
         var personas = await GetDriverPersonasSummaryAsync(normalizedId);
         var dto = ToDto(agent, sessionCount, personas);
@@ -307,6 +320,786 @@ public class AgentsController(
         }
 
         return Ok(DriverCapabilities.Parse(agent.CapabilitiesJson));
+    }
+
+    [HttpPost("{id}/context-limit")]
+    public async Task<IActionResult> RecordLearnedContextLimit(
+        string id,
+        [FromBody] RecordLearnedContextLimitRequest req,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(req.Model) || req.MaxContextTokens <= 0)
+        {
+            return BadRequest(new { error = "Model and positive MaxContextTokens are required." });
+        }
+
+        var normalizedId = id.Trim().TrimStart('@').ToLowerInvariant();
+        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        var modelKey = req.Model.Trim();
+        ModelContextLimits.RecordLearnedLimit(modelKey, req.MaxContextTokens);
+
+        var patch = new JsonObject
+        {
+            ["learnedContextLimits"] = new JsonObject
+            {
+                [modelKey] = req.MaxContextTokens
+            }
+        };
+
+        agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+            ?? agent.CapabilitiesJson;
+        agent.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+
+        CapabilityProbe.InvalidateCache();
+
+        return Ok(DriverCapabilities.Parse(agent.CapabilitiesJson));
+    }
+
+    [HttpPost("{id}/verify")]
+    public async Task<IActionResult> VerifyDriver(string id, CancellationToken ct = default)
+    {
+        var normalizedId = id.Trim().TrimStart('@').ToLowerInvariant();
+        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var adapter = ResolveAdapterType(agent, view);
+        var steps = new List<PersonaDriverVerificationStep>();
+
+        if (adapter == DriverAdapters.OpenAi)
+        {
+            steps.Add(new PersonaDriverVerificationStep(
+                "Driver Adapter Check",
+                "success",
+                $"OpenAI-compatible adapter configured ({view.Endpoint ?? "no endpoint set"})"));
+
+            if (view.HasApiKey || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OPENAI_API_KEY")))
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Authentication Check",
+                    "success",
+                    "API key is configured on driver"));
+            }
+            else if (!string.IsNullOrWhiteSpace(view.Endpoint) &&
+                     (view.Endpoint.Contains("localhost", StringComparison.OrdinalIgnoreCase) ||
+                      view.Endpoint.Contains("127.0.0.1", StringComparison.OrdinalIgnoreCase)))
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Authentication Check",
+                    "success",
+                    "Local endpoint configured (no API key required)"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Authentication Check",
+                    "warning",
+                    "No API key stored for this driver. Configure an API key if required by the server."));
+            }
+
+            var probeReading = await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+            if (probeReading != null && probeReading.Models.Count > 0)
+            {
+                var sample = string.Join(", ", probeReading.Models.Take(5).Select(m => m.Id));
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Endpoint & Model Discovery",
+                    "success",
+                    $"Discovered {probeReading.Models.Count} model(s): {sample}"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Endpoint & Model Discovery",
+                    "failed",
+                    probeReading?.UnavailableReason ?? "Failed to discover models from endpoint."));
+            }
+
+            var oaStatus = steps.Any(s => s.Status == "failed") ? "failed" :
+                           steps.Any(s => s.Status == "warning") ? "warning" : "passed";
+            return Ok(new PersonaDriverVerificationResult(normalizedId, normalizedId, oaStatus, steps));
+        }
+
+        var cliBin = adapter switch
+        {
+            DriverAdapters.Claude => "claude",
+            DriverAdapters.Copilot => "gh",
+            _ => "agy"
+        };
+
+        var hostBinPath = FindHostBinary(cliBin);
+        if (hostBinPath != null)
+        {
+            var (verExit, verOut, verErr) = await RunHostCommandAsync(hostBinPath, "--version", ct);
+            if (verExit == 0)
+            {
+                var verLine = !string.IsNullOrWhiteSpace(verOut) ? verOut.Split('\n')[0].Trim() : "available";
+                steps.Add(new PersonaDriverVerificationStep(
+                    "CLI Binary Check",
+                    "success",
+                    $"{cliBin} installed on API host ({verLine})"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "CLI Binary Check",
+                    "failed",
+                    $"{cliBin} check failed (exit {verExit}): {verErr}"));
+            }
+
+            if (adapter == DriverAdapters.Agy)
+            {
+                await EnsureHostAgyTokenFromDriverAsync(agent, ct);
+                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+                if (System.IO.File.Exists(hostAgyToken))
+                {
+                    var rawTok = (await System.IO.File.ReadAllTextAsync(hostAgyToken, ct)).Trim();
+                    if (!string.IsNullOrWhiteSpace(rawTok))
+                    {
+                        await SaveDriverOAuthTokenAsync(agent, rawTok, ct);
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Authentication Check",
+                            "success",
+                            "Google AI Pro OAuth token active on API host"));
+                    }
+                    else
+                    {
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Authentication Check",
+                            "warning",
+                            "OAuth token file is empty. Click 'Authenticate Driver' to sign in."));
+                    }
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Authentication Check",
+                        "warning",
+                        "Not authenticated with Google AI Pro. Click 'Authenticate Driver' to sign in."));
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(view.AuthCheckCommand))
+            {
+                var (chkExit, chkOut, chkErr) = await RunHostShellAsync(view.AuthCheckCommand, ct);
+                if (chkExit == 0)
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Authentication Check",
+                        "success",
+                        $"Authenticated ({(!string.IsNullOrWhiteSpace(chkOut) ? chkOut.Split('\n')[0].Trim() : "ok")})"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Authentication Check",
+                        "warning",
+                        $"Auth check exited with {chkExit}: {chkErr}"));
+                }
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Authentication Check",
+                    "success",
+                    $"{adapter} CLI ready on API host"));
+            }
+
+            var reading = await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+            if (reading != null && reading.Models.Count > 0)
+            {
+                var sample = string.Join(", ", reading.Models.Take(5).Select(m => m.Id));
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Model Catalog Discovery",
+                    "success",
+                    $"Discovered {reading.Models.Count} model(s): {sample}"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Model Catalog Discovery",
+                    "warning",
+                    reading?.UnavailableReason ?? "No models returned by probe."));
+            }
+
+            var status = steps.Any(s => s.Status == "failed") ? "failed" :
+                         steps.Any(s => s.Status == "warning") ? "warning" : "passed";
+            return Ok(new PersonaDriverVerificationResult(normalizedId, normalizedId, status, steps));
+        }
+
+        // Fallback: if CLI binary is not on the API host, check via bound persona container
+        var targetPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
+        if (containerManager != null && targetPersonaId != null)
+        {
+            var containerResult = await containerManager.VerifyDriverAsync(targetPersonaId, ct);
+            await SyncDriverCapabilitiesFromContainerOrProbeAsync(agent, targetPersonaId, adapter, ct);
+            return Ok(containerResult with { PersonaId = normalizedId, DriverId = normalizedId });
+        }
+
+        steps.Add(new PersonaDriverVerificationStep(
+            "CLI Binary Check",
+            "failed",
+            $"The {cliBin} CLI is not installed on the API host and no container runtime was available."));
+        return Ok(new PersonaDriverVerificationResult(normalizedId, normalizedId, "failed", steps));
+    }
+
+    [HttpPost("{id}/auth/start")]
+    public async Task<IActionResult> StartDriverAuth(string id, CancellationToken ct = default)
+    {
+        var normalizedId = id.Trim().TrimStart('@').ToLowerInvariant();
+        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var adapter = ResolveAdapterType(agent, view);
+        var loginCmd = !string.IsNullOrWhiteSpace(view.LoginCommand) ? view.LoginCommand : view.Sidecar?.LoginCommand;
+
+        if (adapter == DriverAdapters.OpenAi && string.IsNullOrWhiteSpace(loginCmd))
+        {
+            if (view.HasApiKey)
+            {
+                return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "already_authenticated", Instructions: "OpenAI API key is already configured on this driver."));
+            }
+            return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "apikey_required", Instructions: "OpenAI-compatible drivers authenticate via API key. Enter your API key below."));
+        }
+
+        var cliBin = adapter switch
+        {
+            DriverAdapters.Claude => "claude",
+            DriverAdapters.Copilot => "gh",
+            _ => "agy"
+        };
+
+        var hostBinPath = FindHostBinary(cliBin);
+        if (hostBinPath != null || !string.IsNullOrWhiteSpace(loginCmd))
+        {
+            if (_activeHostAuthSessions.TryGetValue(normalizedId, out var existing) && !existing.Process.HasExited)
+            {
+                if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
+                {
+                    return Ok(new PersonaAuthStartResult(
+                        normalizedId,
+                        normalizedId,
+                        "waiting_code",
+                        existing.AuthUrl,
+                        "Click the authorization link to sign in, then paste the authorization code below."));
+                }
+                _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                await existing.DisposeAsync();
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            if (!string.IsNullOrWhiteSpace(loginCmd))
+            {
+                psi.FileName = "/bin/bash";
+                psi.ArgumentList.Add("-c");
+                psi.ArgumentList.Add(loginCmd);
+            }
+            else if (adapter == DriverAdapters.Agy)
+            {
+                psi.FileName = hostBinPath!;
+                psi.ArgumentList.Add("-p");
+                psi.ArgumentList.Add("auth");
+            }
+            else if (adapter == DriverAdapters.Claude)
+            {
+                psi.FileName = hostBinPath!;
+                psi.ArgumentList.Add("login");
+            }
+            else if (adapter == DriverAdapters.Copilot)
+            {
+                psi.FileName = hostBinPath!;
+                psi.ArgumentList.Add("auth");
+                psi.ArgumentList.Add("login");
+                psi.ArgumentList.Add("-w");
+            }
+            else
+            {
+                return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "apikey_required", Instructions: "Enter your API key below or configure a Login Command."));
+            }
+
+            var proc = new Process { StartInfo = psi };
+            proc.Start();
+
+            var tcsUrl = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var readerTask = Task.Run(async () =>
+            {
+                try
+                {
+                    string? line;
+                    while ((line = await proc.StandardOutput.ReadLineAsync()) != null)
+                    {
+                        var match = Regex.Match(line, @"https?://[^\s""'>]+");
+                        if (match.Success)
+                        {
+                            tcsUrl.TrySetResult(match.Value);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    tcsUrl.TrySetException(ex);
+                }
+            });
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    string? line;
+                    while ((line = await proc.StandardError.ReadLineAsync()) != null)
+                    {
+                        var match = Regex.Match(line, @"https?://[^\s""'>]+");
+                        if (match.Success)
+                        {
+                            tcsUrl.TrySetResult(match.Value);
+                        }
+                    }
+                }
+                catch { }
+            });
+
+            var completed = await Task.WhenAny(tcsUrl.Task, Task.Delay(10000, ct));
+            if (completed == tcsUrl.Task && tcsUrl.Task.IsCompletedSuccessfully)
+            {
+                var authUrl = await tcsUrl.Task;
+                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl);
+                return Ok(new PersonaAuthStartResult(
+                    normalizedId,
+                    normalizedId,
+                    "waiting_code",
+                    authUrl,
+                    "Click the authorization link to sign in, then paste the authorization code below."));
+            }
+
+            try { if (!proc.HasExited) proc.Kill(true); } catch { }
+            return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "error", ErrorMessage: "Could not capture authorization link from CLI login command."));
+        }
+
+        var targetPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
+        if (containerManager != null && targetPersonaId != null)
+        {
+            var res = await containerManager.StartAuthAsync(targetPersonaId, ct);
+            return Ok(res with { PersonaId = normalizedId, DriverId = normalizedId });
+        }
+
+        return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "error", ErrorMessage: $"CLI binary '{cliBin}' is not installed on the API host."));
+    }
+
+    [HttpPost("{id}/auth/submit")]
+    public async Task<IActionResult> SubmitDriverAuthCode(
+        string id,
+        [FromBody] PersonasController.SubmitAuthCodeRequest req,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(req.Code))
+        {
+            return BadRequest(new { error = "Authorization code is required." });
+        }
+
+        var normalizedId = id.Trim().TrimStart('@').ToLowerInvariant();
+        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var adapter = ResolveAdapterType(agent, view);
+
+        if (_activeHostAuthSessions.TryRemove(normalizedId, out var session))
+        {
+            try
+            {
+                await session.Writer.WriteLineAsync(req.Code.Trim());
+                await session.Writer.FlushAsync(ct);
+
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                try
+                {
+                    await session.Process.WaitForExitAsync(linkedCts.Token);
+                }
+                catch (OperationCanceledException) { }
+
+                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+                if (System.IO.File.Exists(hostAgyToken))
+                {
+                    var rawTok = (await System.IO.File.ReadAllTextAsync(hostAgyToken, ct)).Trim();
+                    if (!string.IsNullOrWhiteSpace(rawTok))
+                    {
+                        await SaveDriverOAuthTokenAsync(agent, rawTok, ct);
+                        await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
+                        await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                        return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed model catalog!"));
+                    }
+                }
+
+                if (session.Process.HasExited && session.Process.ExitCode == 0)
+                {
+                    await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                    return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Driver authentication completed successfully!"));
+                }
+
+                return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: "Authorization code was submitted, but authentication could not be verified."));
+            }
+            catch (Exception ex)
+            {
+                return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: ex.Message));
+            }
+            finally
+            {
+                await session.DisposeAsync();
+            }
+        }
+
+        var targetPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
+        if (containerManager != null && targetPersonaId != null)
+        {
+            var res = await containerManager.SubmitAuthCodeAsync(targetPersonaId, req.Code, ct);
+            if (res.Status == "authenticated")
+            {
+                await SyncDriverCapabilitiesFromContainerOrProbeAsync(agent, targetPersonaId, adapter, ct);
+            }
+            return Ok(res with { PersonaId = normalizedId });
+        }
+
+        return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: "No active authentication session found for this driver. Click 'Authenticate Driver' first."));
+    }
+
+    [HttpPost("{id}/auth/apikey")]
+    public async Task<IActionResult> ConfigureDriverApiKey(
+        string id,
+        [FromBody] PersonasController.ConfigureApiKeyRequest req,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(req.ApiKey))
+        {
+            return BadRequest(new { error = "API key is required." });
+        }
+
+        var normalizedId = id.Trim().TrimStart('@').ToLowerInvariant();
+        var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        var patch = new JsonObject
+        {
+            ["apiKey"] = req.ApiKey.Trim()
+        };
+
+        agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+            ?? agent.CapabilitiesJson;
+        agent.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+
+        if (containerManager != null)
+        {
+            var boundPersonas = await db.Personas.AsNoTracking().Where(p => p.DriverId == normalizedId).Select(p => p.Id).ToListAsync(ct);
+            foreach (var pId in boundPersonas)
+            {
+                try
+                {
+                    var st = await containerManager.GetStatusAsync(pId, ct);
+                    if (st.Status == "running")
+                    {
+                        await containerManager.ConfigureApiKeyAsync(pId, req.ApiKey.Trim(), req.Provider ?? normalizedId, ct);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+
+        return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "API key saved to driver configuration and model catalog refreshed!"));
+    }
+
+    internal async Task<DriverCapabilityReading?> SyncDriverCapabilitiesFromProbeAsync(Agent agent, CancellationToken ct)
+    {
+        CapabilityProbe.InvalidateCache();
+        var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var probeReq = view.ToProbeRequest(agent.Id, agent.RuntimeType, forceRefresh: true, rawCapabilitiesJson: agent.CapabilitiesJson);
+        try
+        {
+            var reading = await CapabilityProbe.ProbeAsync(probeReq, ct);
+            if (reading != null && reading.Models.Count > 0)
+            {
+                var declaration = new DriverCapabilityDeclaration
+                {
+                    Adapter = reading.Adapter,
+                    Endpoint = DriverModelDiscovery.NormalizeEndpoint(view.Endpoint),
+                    ObservedAt = DateTimeOffset.UtcNow,
+                    Models = reading.Models.Select(m => new DriverCapabilityDeclaration.DeclaredModel
+                    {
+                        Id = m.Id,
+                        Name = m.Name,
+                        Efforts = m.Efforts.ToList()
+                    }).ToList()
+                };
+
+                var patch = new JsonObject
+                {
+                    ["declared"] = JsonSerializer.SerializeToNode(declaration)
+                };
+
+                agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+                    ?? agent.CapabilitiesJson;
+                agent.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+                CapabilityProbe.InvalidateCache();
+            }
+            return reading;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task SyncDriverCapabilitiesFromContainerOrProbeAsync(
+        Agent agent,
+        string personaId,
+        string adapter,
+        CancellationToken ct)
+    {
+        if (containerManager != null && adapter == DriverAdapters.Agy)
+        {
+            try
+            {
+                var (tokExit, tokOut, _) = await containerManager.ExecInContainerAsync(
+                    personaId,
+                    "cat /root/.gemini/antigravity-cli/antigravity-oauth-token",
+                    ct);
+                if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
+                {
+                    await SaveDriverOAuthTokenAsync(agent, tokOut.Trim(), ct);
+                }
+
+                var (modExit, modOut, _) = await containerManager.ExecInContainerAsync(
+                    personaId,
+                    "timeout 15 agy models",
+                    ct);
+                if (modExit == 0 && !string.IsNullOrWhiteSpace(modOut))
+                {
+                    var parsed = DriverModelDiscovery.ParseAgyModels(modOut);
+                    if (parsed.Count > 0)
+                    {
+                        var declaration = new DriverCapabilityDeclaration
+                        {
+                            Adapter = DriverAdapters.Agy,
+                            ObservedAt = DateTimeOffset.UtcNow,
+                            Models = parsed.Select(m => new DriverCapabilityDeclaration.DeclaredModel
+                            {
+                                Id = m.Id,
+                                Name = m.Name,
+                                Efforts = m.Efforts.ToList()
+                            }).ToList()
+                        };
+
+                        var patch = new JsonObject
+                        {
+                            ["declared"] = JsonSerializer.SerializeToNode(declaration)
+                        };
+                        agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+                            ?? agent.CapabilitiesJson;
+                        agent.UpdatedAt = DateTimeOffset.UtcNow;
+                        await db.SaveChangesAsync(ct);
+                        CapabilityProbe.InvalidateCache();
+                        return;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+    }
+
+    private async Task SaveDriverOAuthTokenAsync(Agent agent, string rawToken, CancellationToken ct)
+    {
+        try
+        {
+            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+            Directory.CreateDirectory(tokensDir);
+            await System.IO.File.WriteAllTextAsync(Path.Combine(tokensDir, $"driver-{agent.Id}.oauth"), rawToken, ct);
+
+            var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+            var hostDir = Path.GetDirectoryName(hostAgyToken);
+            if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
+            await System.IO.File.WriteAllTextAsync(hostAgyToken, rawToken, ct);
+        }
+        catch { }
+
+        var patch = new JsonObject
+        {
+            ["oauthToken"] = rawToken
+        };
+        agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+            ?? agent.CapabilitiesJson;
+        agent.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+    }
+
+    private static async Task EnsureHostAgyTokenFromDriverAsync(Agent agent, CancellationToken ct)
+    {
+        try
+        {
+            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+            if (System.IO.File.Exists(hostAgyToken)) return;
+
+            if (!string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
+            {
+                using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                    doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
+                    tokProp.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(tokProp.GetString()))
+                {
+                    var dir = Path.GetDirectoryName(hostAgyToken);
+                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                    await System.IO.File.WriteAllTextAsync(hostAgyToken, tokProp.GetString()!.Trim(), ct);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private async Task SeedDriverCredentialsToBoundPersonasAsync(string driverId, CancellationToken ct)
+    {
+        if (containerManager == null) return;
+        try
+        {
+            var personas = await db.Personas.AsNoTracking().Where(p => p.DriverId == driverId).Select(p => p.Id).ToListAsync(ct);
+            foreach (var pId in personas)
+            {
+                var st = await containerManager.GetStatusAsync(pId, ct);
+                if (st.Status == "running")
+                {
+                    await containerManager.EnsureRunningAsync(pId, ct);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private async Task<string?> ResolveTargetPersonaForDriverAsync(string driverId, CancellationToken ct)
+    {
+        var persona = await db.Personas.AsNoTracking()
+            .Where(p => p.DriverId == driverId)
+            .OrderBy(p => p.Id)
+            .FirstOrDefaultAsync(ct);
+        return persona?.Id;
+    }
+
+    private static string ResolveAdapterType(Agent agent, DriverCapabilitiesView view)
+    {
+        var canonical = DriverAdapters.Canonicalize(view.Adapter);
+        if (!string.IsNullOrEmpty(canonical)) return canonical;
+        if (!string.IsNullOrWhiteSpace(view.Endpoint)) return DriverAdapters.OpenAi;
+        if (agent.Id.StartsWith("claude", StringComparison.OrdinalIgnoreCase)) return DriverAdapters.Claude;
+        if (agent.Id.StartsWith("copilot", StringComparison.OrdinalIgnoreCase)) return DriverAdapters.Copilot;
+        if (agent.Id.StartsWith("openai", StringComparison.OrdinalIgnoreCase)) return DriverAdapters.OpenAi;
+        return agent.RuntimeType switch
+        {
+            RuntimeType.OpenAiCompatible or RuntimeType.LocalOllama => DriverAdapters.OpenAi,
+            RuntimeType.CliAgy => DriverAdapters.Agy,
+            _ => DriverAdapters.Agy
+        };
+    }
+
+    private static string? FindHostBinary(string name)
+    {
+        var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var extraCandidates = new[]
+        {
+            Path.Combine(userHome, ".local", "bin", name),
+            Path.Combine(userHome, ".gemini", "antigravity-cli", "bin", name),
+            $"/usr/local/bin/{name}",
+            $"/usr/bin/{name}"
+        };
+
+        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        var pathDirs = pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Select(d => Path.Combine(d, name));
+
+        foreach (var candidate in pathDirs.Concat(extraCandidates))
+        {
+            if (System.IO.File.Exists(candidate)) return candidate;
+        }
+
+        return null;
+    }
+
+    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunHostCommandAsync(
+        string binary,
+        string arguments,
+        CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = binary,
+            Arguments = arguments,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var proc = new Process { StartInfo = psi };
+        proc.Start();
+        var outTask = proc.StandardOutput.ReadToEndAsync(ct);
+        var errTask = proc.StandardError.ReadToEndAsync(ct);
+        await proc.WaitForExitAsync(ct);
+        return (proc.ExitCode, (await outTask).Trim(), (await errTask).Trim());
+    }
+
+    private static Task<(int ExitCode, string StdOut, string StdErr)> RunHostShellAsync(
+        string command,
+        CancellationToken ct)
+    {
+        var escaped = command.Replace("\"", "\\\"");
+        return RunHostCommandAsync("/bin/bash", $"-c \"{escaped}\"", ct);
+    }
+
+    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl) : IAsyncDisposable
+    {
+        public Process Process { get; } = process;
+        public StreamWriter Writer { get; } = writer;
+        public Task ReaderTask { get; } = readerTask;
+        public string AuthUrl { get; } = authUrl;
+
+        public async ValueTask DisposeAsync()
+        {
+            try { if (!Process.HasExited) Process.Kill(true); } catch { }
+            try { Writer.Dispose(); } catch { }
+            try { Process.Dispose(); } catch { }
+            await ValueTask.CompletedTask;
+        }
     }
 
     [HttpDelete("{id}")]
@@ -720,6 +1513,11 @@ public class AgentsController(
         );
     }
 }
+
+public record RecordLearnedContextLimitRequest(
+    string Model,
+    int MaxContextTokens
+);
 
 public record DriverPersonaSummaryDto(
     string Id,

@@ -1648,11 +1648,29 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     var (chkExit, outStr, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
                     if (chkExit == 0 && !string.IsNullOrWhiteSpace(outStr))
                     {
+                        var trimmedToken = outStr.Trim();
                         await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
                         {
-                            ["antigravity-oauth-token"] = Encoding.UTF8.GetBytes(outStr.Trim()),
-                            ["ANTIGRAVITY_OAUTH_TOKEN"] = Encoding.UTF8.GetBytes(outStr.Trim())
+                            ["antigravity-oauth-token"] = Encoding.UTF8.GetBytes(trimmedToken),
+                            ["ANTIGRAVITY_OAUTH_TOKEN"] = Encoding.UTF8.GetBytes(trimmedToken)
                         }, ct);
+
+                        try
+                        {
+                            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                            var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                            Directory.CreateDirectory(tokensDir);
+                            File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), trimmedToken);
+                            if (!string.IsNullOrWhiteSpace(info.DriverId))
+                            {
+                                File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), trimmedToken);
+                            }
+                            var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+                            var hostDir = Path.GetDirectoryName(hostAgyToken);
+                            if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
+                            File.WriteAllText(hostAgyToken, trimmedToken);
+                        }
+                        catch { }
 
                         return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials and persisted in Kubernetes secret!");
                     }
@@ -2048,8 +2066,51 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         try
         {
             var personaSecretName = $"agentmesh-persona-{normPersonaId}-creds";
-            var secret = await _client.CoreV1.ReadNamespacedSecretAsync(personaSecretName, _namespace, cancellationToken: ct);
-            if (secret?.Data != null && secret.Data.TryGetValue("antigravity-oauth-token", out var tokenBytes))
+            byte[]? tokenBytes = null;
+            try
+            {
+                var secret = await _client.CoreV1.ReadNamespacedSecretAsync(personaSecretName, _namespace, cancellationToken: ct);
+                if (secret?.Data != null && secret.Data.TryGetValue("antigravity-oauth-token", out var sb))
+                {
+                    tokenBytes = sb;
+                }
+            }
+            catch { }
+
+            if (tokenBytes == null || tokenBytes.Length == 0)
+            {
+                try
+                {
+                    using var scope = _serviceProvider.CreateScope();
+                    var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+                    var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+                    var driverId = persona?.DriverId?.Trim().TrimStart('@').ToLowerInvariant();
+                    if (!string.IsNullOrWhiteSpace(driverId))
+                    {
+                        var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
+                        if (driver != null && !string.IsNullOrWhiteSpace(driver.CapabilitiesJson))
+                        {
+                            using var doc = JsonDocument.Parse(driver.CapabilitiesJson);
+                            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                                doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
+                                tokProp.ValueKind == JsonValueKind.String &&
+                                !string.IsNullOrWhiteSpace(tokProp.GetString()))
+                            {
+                                var rawTok = tokProp.GetString()!.Trim();
+                                tokenBytes = Encoding.UTF8.GetBytes(rawTok);
+                                await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
+                                {
+                                    ["antigravity-oauth-token"] = tokenBytes,
+                                    ["ANTIGRAVITY_OAUTH_TOKEN"] = tokenBytes
+                                }, ct);
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (tokenBytes != null && tokenBytes.Length > 0)
             {
                 var base64 = Convert.ToBase64String(tokenBytes);
                 await ExecInContainerAsync(normPersonaId, $"mkdir -p /root/.gemini/antigravity-cli && echo '{base64}' | base64 -d > /root/.gemini/antigravity-cli/antigravity-oauth-token && chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
