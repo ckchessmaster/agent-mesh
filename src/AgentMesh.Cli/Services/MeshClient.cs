@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -15,7 +16,7 @@ public class MeshClient
     private readonly ConfigStore _configStore;
 
     /// <summary>
-    /// The last capability declaration this runner produced (option C).
+    /// The last capability declaration each driver in this process produced, keyed by preset id.
     /// </summary>
     /// <remarks>
     /// Cached rather than re-read per push. <see cref="SetAgentStatusAsync"/> also runs during
@@ -23,8 +24,28 @@ public class MeshClient
     /// by up to its timeout for no benefit - nobody reads a dead runner's catalogue. Reconnects
     /// refresh it, which is what keeps a long-lived runner's declaration inside the API's
     /// freshness window.
+    /// <para>
+    /// <b>Why it is keyed.</b> A <see cref="MeshClient"/> is not one-per-runner:
+    /// <c>Program.cs</c> builds a single instance and <c>AgentProcessManager</c> hands it to every
+    /// <c>AgentRunnerInstance</c> (<c>agentmesh start --all</c>, multiple driver targets, the TUI).
+    /// A single field is therefore shared state between drivers, and both write sites turn that
+    /// into a leak: registration assigns unconditionally, so runner B's read overwrites runner A's
+    /// and A's next push - including its shutdown push - reports B's catalogue as A's own; and the
+    /// reconnect path's <c>?? </c> fallback means an adapter with no discovery surface
+    /// (<c>claude</c>, <c>copilot</c>, <c>generic</c>) inherits whatever another runner cached.
+    /// The API cannot detect either: a declaration is a self-report and reads as authoritative.
+    /// </para>
+    /// <para>
+    /// Keyed by <see cref="AgentPresetConfig.Id"/> with the same case-insensitivity every other
+    /// agent id in the CLI uses, because ids are lower-cased in some paths
+    /// (<c>ResolveOrCreatePreset</c>) and not in others; a case-sensitive key would turn that into
+    /// a silent cache miss and drop the declaration. The key space is the local preset set, so it
+    /// is bounded and needs no eviction: entries are replaced on re-registration and die with the
+    /// process.
+    /// </para>
     /// </remarks>
-    private DriverCapabilityDeclaration? _declaredCapabilities;
+    private readonly ConcurrentDictionary<string, DriverCapabilityDeclaration> _declaredCapabilities =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public MeshClient(CliConfig config, ConfigStore configStore, HttpClient? httpClient = null)
     {
@@ -201,10 +222,51 @@ public class MeshClient
         }
     }
 
+    /// <summary>
+    /// Records what a driver reported about itself at registration, replacing any earlier value.
+    /// </summary>
+    /// <remarks>
+    /// A null clears the entry. <see cref="ConcurrentDictionary{TKey, TValue}"/> rejects null
+    /// values, so "nothing to declare" is expressed as the absence of a key rather than a null
+    /// stored under one - which is also how <see cref="DeclarationFor"/> reads it back.
+    /// </remarks>
+    private void RememberRegistration(string presetId, DriverCapabilityDeclaration? declared)
+    {
+        if (declared == null) _declaredCapabilities.TryRemove(presetId, out _);
+        else _declaredCapabilities[presetId] = declared;
+    }
+
+    /// <summary>
+    /// Applies a reconnect refresh and returns the declaration to push for this driver.
+    /// </summary>
+    /// <remarks>
+    /// A failed read keeps this driver's own previous value rather than blanking a picker that was
+    /// working, which is the behaviour the old <c>?? </c> intended. The difference is scope: it now
+    /// falls back to <em>this</em> preset's entry, never to whatever another runner cached.
+    /// </remarks>
+    private DriverCapabilityDeclaration? RefreshDeclaration(
+        AgentPresetConfig preset,
+        DriverCapabilityDeclaration? refreshed)
+    {
+        if (refreshed != null) _declaredCapabilities[preset.Id] = refreshed;
+        return refreshed ?? DeclarationFor(preset.Id);
+    }
+
+    /// <summary>
+    /// The declaration currently cached for this driver, or null when it has none.
+    /// </summary>
+    private DriverCapabilityDeclaration? DeclarationFor(string presetId)
+        => _declaredCapabilities.TryGetValue(presetId, out var declared) ? declared : null;
+
     public async Task<string> EnsureAgentRegisteredAsync(AgentPresetConfig preset, CancellationToken ct = default)
     {
-        _declaredCapabilities = await DescribeCapabilitiesAsync(preset, ct);
-        var capabilitiesJson = SerializePresetCapabilities(preset, _declaredCapabilities);
+        // Registration is a fresh read, so a null result is a statement about the driver rather
+        // than a transient failure: it means "this adapter has nothing to declare". Clearing any
+        // earlier value is what stops a row repointed from agy to claude going on advertising
+        // agy's catalogue until the process happens to restart.
+        var declared = await DescribeCapabilitiesAsync(preset, ct);
+        RememberRegistration(preset.Id, declared);
+        var capabilitiesJson = SerializePresetCapabilities(preset, declared);
 
         var registerPayload = new
         {
@@ -256,12 +318,16 @@ public class MeshClient
             // Going back online is a natural refresh point: the runner has been disconnected, the
             // account behind the driver may have changed, and this is not the shutdown path.
             // Reporting offline must never read the driver - see _declaredCapabilities.
-            if (string.Equals(status, "online", StringComparison.OrdinalIgnoreCase))
-            {
-                _declaredCapabilities = await DescribeCapabilitiesAsync(preset, ct) ?? _declaredCapabilities;
-            }
+            //
+            // A failed refresh read keeps this driver's previous declaration rather than blanking a
+            // picker that was working. That is what the old `?? ` did, and it is now scoped to one
+            // driver: reading the shared field is how a claude runner ended up pushing agy's
+            // catalogue.
+            var declared = string.Equals(status, "online", StringComparison.OrdinalIgnoreCase)
+                ? RefreshDeclaration(preset, await DescribeCapabilitiesAsync(preset, ct))
+                : DeclarationFor(preset.Id);
 
-            var capabilitiesJson = SerializePresetCapabilities(preset, _declaredCapabilities);
+            var capabilitiesJson = SerializePresetCapabilities(preset, declared);
             using var req = CreateRequest(HttpMethod.Post, "api/agents", preset.Token ?? _config.MasterToken, preset.Id);
             req.Content = JsonContent.Create(new
             {
