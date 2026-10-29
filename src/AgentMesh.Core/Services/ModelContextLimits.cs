@@ -69,7 +69,7 @@ public static class ModelContextLimits
     /// </summary>
     private static readonly (string[] Match, int Tokens)[] KnownModels =
     {
-        (new[] { "qwen3", "qwen-3" }, 524_288),          // 512k
+        (new[] { "qwen3", "qwen-3", "flash-next" }, 524_288), // 512k
         (new[] { "qwen2.5", "qwen-2.5" }, 131_072),      // 128k
         (new[] { "llama-3", "llama3" }, 131_072),        // 128k
         (new[] { "gpt-4o" }, 131_072),                   // 128k

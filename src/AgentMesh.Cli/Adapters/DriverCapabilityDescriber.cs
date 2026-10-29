@@ -194,6 +194,14 @@ internal static class DriverCapabilityDescriber
                     endpoint);
             }
 
+            foreach (var modelInfo in discovered)
+            {
+                if (modelInfo.MaxContextTokens is > 0)
+                {
+                    ModelContextLimits.RecordLearnedLimit(modelInfo.Id, modelInfo.MaxContextTokens.Value);
+                }
+            }
+
             var supportsContext = ModelContextLimits.SupportsContextSelection(DriverAdapters.OpenAi);
 
             return new DriverCapabilityDeclaration

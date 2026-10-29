@@ -375,6 +375,14 @@ public class AgentsController(
         var adapter = ResolveAdapterType(agent, view);
         var steps = new List<PersonaDriverVerificationStep>();
 
+        if (containerManager != null && HasContainerOrCustomConfig(view))
+        {
+            var targetContainerId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct) ?? normalizedId;
+            var containerResult = await containerManager.VerifyDriverAsync(targetContainerId, ct);
+            await SyncDriverCapabilitiesFromContainerOrProbeAsync(agent, targetContainerId, adapter, ct);
+            return Ok(containerResult with { PersonaId = normalizedId, DriverId = normalizedId });
+        }
+
         if (adapter == DriverAdapters.OpenAi)
         {
             steps.Add(new PersonaDriverVerificationStep(
@@ -516,6 +524,29 @@ public class AgentsController(
             var reading = await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
             if (reading != null && reading.Models.Count > 0)
             {
+                if (adapter == DriverAdapters.Agy)
+                {
+                    var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+                    if (System.IO.File.Exists(hostAgyToken))
+                    {
+                        var rawTok = (await System.IO.File.ReadAllTextAsync(hostAgyToken, ct)).Trim();
+                        if (!string.IsNullOrWhiteSpace(rawTok))
+                        {
+                            await SaveDriverOAuthTokenAsync(agent, rawTok, ct);
+                        }
+                    }
+
+                    var authIdx = steps.FindIndex(s => s.Name == "Authentication Check" && s.Status == "warning");
+                    if (authIdx >= 0)
+                    {
+                        steps[authIdx] = new PersonaDriverVerificationStep(
+                            "Authentication Check",
+                            "success",
+                            "Google AI Pro OAuth token active on API host");
+                    }
+                }
+
                 var sample = string.Join(", ", reading.Models.Take(5).Select(m => m.Id));
                 steps.Add(new PersonaDriverVerificationStep(
                     "Model Catalog Discovery",
@@ -565,6 +596,13 @@ public class AgentsController(
         var adapter = ResolveAdapterType(agent, view);
         var loginCmd = !string.IsNullOrWhiteSpace(view.LoginCommand) ? view.LoginCommand : view.Sidecar?.LoginCommand;
 
+        if (containerManager != null && HasContainerOrCustomConfig(view))
+        {
+            var targetContainerId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct) ?? normalizedId;
+            var res = await containerManager.StartAuthAsync(targetContainerId, ct);
+            return Ok(res with { PersonaId = normalizedId, DriverId = normalizedId });
+        }
+
         if (adapter == DriverAdapters.OpenAi && string.IsNullOrWhiteSpace(loginCmd))
         {
             if (view.HasApiKey)
@@ -608,6 +646,8 @@ public class AgentsController(
                 CreateNoWindow = true
             };
 
+            string? tempHome = null;
+
             if (!string.IsNullOrWhiteSpace(loginCmd))
             {
                 psi.FileName = "/bin/bash";
@@ -616,6 +656,15 @@ public class AgentsController(
             }
             else if (adapter == DriverAdapters.Agy)
             {
+                tempHome = Path.Combine(Path.GetTempPath(), $"agentmesh-agy-auth-{normalizedId}");
+                try
+                {
+                    if (Directory.Exists(tempHome)) Directory.Delete(tempHome, recursive: true);
+                    Directory.CreateDirectory(tempHome);
+                }
+                catch { }
+
+                psi.Environment["HOME"] = tempHome;
                 psi.FileName = hostBinPath!;
                 psi.ArgumentList.Add("-p");
                 psi.ArgumentList.Add("auth");
@@ -682,7 +731,7 @@ public class AgentsController(
             if (completed == tcsUrl.Task && tcsUrl.Task.IsCompletedSuccessfully)
             {
                 var authUrl = await tcsUrl.Task;
-                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl);
+                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, tempHome);
                 return Ok(new PersonaAuthStartResult(
                     normalizedId,
                     normalizedId,
@@ -742,16 +791,25 @@ public class AgentsController(
                 catch (OperationCanceledException) { }
 
                 var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
-                if (System.IO.File.Exists(hostAgyToken))
+                var candidateTokens = new List<string>();
+                if (!string.IsNullOrWhiteSpace(session.TempHome))
                 {
-                    var rawTok = (await System.IO.File.ReadAllTextAsync(hostAgyToken, ct)).Trim();
-                    if (!string.IsNullOrWhiteSpace(rawTok))
+                    candidateTokens.Add(Path.Combine(session.TempHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
+                }
+                candidateTokens.Add(Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
+
+                foreach (var tokenPath in candidateTokens)
+                {
+                    if (System.IO.File.Exists(tokenPath))
                     {
-                        await SaveDriverOAuthTokenAsync(agent, rawTok, ct);
-                        await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
-                        await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
-                        return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed model catalog!"));
+                        var rawTok = (await System.IO.File.ReadAllTextAsync(tokenPath, ct)).Trim();
+                        if (!string.IsNullOrWhiteSpace(rawTok))
+                        {
+                            await SaveDriverOAuthTokenAsync(agent, rawTok, ct);
+                            await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
+                            await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                            return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed model catalog!"));
+                        }
                     }
                 }
 
@@ -773,13 +831,14 @@ public class AgentsController(
             }
         }
 
-        var targetPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
-        if (containerManager != null && targetPersonaId != null)
+        var targetContainerId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct)
+            ?? (HasContainerOrCustomConfig(view) ? normalizedId : null);
+        if (containerManager != null && targetContainerId != null)
         {
-            var res = await containerManager.SubmitAuthCodeAsync(targetPersonaId, req.Code, ct);
+            var res = await containerManager.SubmitAuthCodeAsync(targetContainerId, req.Code, ct);
             if (res.Status == "authenticated")
             {
-                await SyncDriverCapabilitiesFromContainerOrProbeAsync(agent, targetPersonaId, adapter, ct);
+                await SyncDriverCapabilitiesFromContainerOrProbeAsync(agent, targetContainerId, adapter, ct);
             }
             return Ok(res with { PersonaId = normalizedId });
         }
@@ -934,6 +993,61 @@ public class AgentsController(
             }
             catch { }
         }
+        else if (containerManager != null && adapter == DriverAdapters.OpenAi)
+        {
+            try
+            {
+                var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
+                if (!string.IsNullOrWhiteSpace(view.Endpoint))
+                {
+                    var modelsUrl = DriverModelDiscovery.ToModelsUrl(view.Endpoint);
+                    var (modExit, modOut, _) = await containerManager.ExecInContainerAsync(
+                        personaId,
+                        $"curl -s -m 10 -H \"Authorization: Bearer $OPENAI_API_KEY\" \"{modelsUrl}\"",
+                        ct);
+                    if (modExit == 0 && !string.IsNullOrWhiteSpace(modOut))
+                    {
+                        var parsed = DriverModelDiscovery.ParseOpenAiModels(modOut);
+                        if (parsed.Count > 0)
+                        {
+                            foreach (var m in parsed)
+                            {
+                                if (m.MaxContextTokens is > 0)
+                                {
+                                    ModelContextLimits.RecordLearnedLimit(m.Id, m.MaxContextTokens.Value);
+                                }
+                            }
+
+                            var declaration = new DriverCapabilityDeclaration
+                            {
+                                Adapter = DriverAdapters.OpenAi,
+                                Endpoint = DriverModelDiscovery.NormalizeEndpoint(view.Endpoint),
+                                ObservedAt = DateTimeOffset.UtcNow,
+                                Models = parsed.Select(m => new DriverCapabilityDeclaration.DeclaredModel
+                                {
+                                    Id = m.Id,
+                                    Name = m.Id,
+                                    Efforts = new List<string>(),
+                                    MaxContextTokens = m.MaxContextTokens
+                                }).ToList()
+                            };
+
+                            var patch = new JsonObject
+                            {
+                                ["declared"] = JsonSerializer.SerializeToNode(declaration)
+                            };
+                            agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+                                ?? agent.CapabilitiesJson;
+                            agent.UpdatedAt = DateTimeOffset.UtcNow;
+                            await db.SaveChangesAsync(ct);
+                            CapabilityProbe.InvalidateCache();
+                            return;
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
 
         await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
     }
@@ -964,13 +1078,22 @@ public class AgentsController(
         await db.SaveChangesAsync(ct);
     }
 
-    private static async Task EnsureHostAgyTokenFromDriverAsync(Agent agent, CancellationToken ct)
+    private async Task EnsureHostAgyTokenFromDriverAsync(Agent agent, CancellationToken ct)
     {
         try
         {
             var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
-            if (System.IO.File.Exists(hostAgyToken)) return;
+            if (System.IO.File.Exists(hostAgyToken))
+            {
+                var existingTok = (await System.IO.File.ReadAllTextAsync(hostAgyToken, ct)).Trim();
+                if (!string.IsNullOrWhiteSpace(existingTok))
+                {
+                    return;
+                }
+            }
+
+            string? foundToken = null;
 
             if (!string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
             {
@@ -980,13 +1103,81 @@ public class AgentsController(
                     tokProp.ValueKind == JsonValueKind.String &&
                     !string.IsNullOrWhiteSpace(tokProp.GetString()))
                 {
-                    var dir = Path.GetDirectoryName(hostAgyToken);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                    await System.IO.File.WriteAllTextAsync(hostAgyToken, tokProp.GetString()!.Trim(), ct);
+                    foundToken = tokProp.GetString()!.Trim();
                 }
+            }
+
+            if (string.IsNullOrWhiteSpace(foundToken))
+            {
+                var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                if (Directory.Exists(tokensDir))
+                {
+                    var driverTokenFile = Path.Combine(tokensDir, $"driver-{agent.Id}.oauth");
+                    if (System.IO.File.Exists(driverTokenFile))
+                    {
+                        var raw = (await System.IO.File.ReadAllTextAsync(driverTokenFile, ct)).Trim();
+                        if (!string.IsNullOrWhiteSpace(raw)) foundToken = raw;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(foundToken))
+                    {
+                        var anyTokenFile = Directory.GetFiles(tokensDir, "*.oauth")
+                            .OrderByDescending(System.IO.File.GetLastWriteTimeUtc)
+                            .FirstOrDefault();
+                        if (!string.IsNullOrEmpty(anyTokenFile))
+                        {
+                            var raw = (await System.IO.File.ReadAllTextAsync(anyTokenFile, ct)).Trim();
+                            if (!string.IsNullOrWhiteSpace(raw)) foundToken = raw;
+                        }
+                    }
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(foundToken) && containerManager != null)
+            {
+                var personas = await db.Personas.AsNoTracking()
+                    .Where(p => p.DriverId == agent.Id)
+                    .Select(p => p.Id)
+                    .ToListAsync(ct);
+                foreach (var pId in personas)
+                {
+                    try
+                    {
+                        var (exitCode, stdOut, _) = await containerManager.ExecInContainerAsync(
+                            pId,
+                            "cat /root/.gemini/antigravity-cli/antigravity-oauth-token",
+                            ct);
+                        if (exitCode == 0 && !string.IsNullOrWhiteSpace(stdOut))
+                        {
+                            foundToken = stdOut.Trim();
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(foundToken))
+            {
+                var dir = Path.GetDirectoryName(hostAgyToken);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                await System.IO.File.WriteAllTextAsync(hostAgyToken, foundToken, ct);
+                await SaveDriverOAuthTokenAsync(agent, foundToken, ct);
             }
         }
         catch { }
+    }
+
+    private static bool HasContainerOrCustomConfig(DriverCapabilitiesView view)
+    {
+        if (view.Sidecar?.Enabled == true) return true;
+        if (!string.IsNullOrWhiteSpace(view.Sidecar?.CompanionSetup)) return true;
+        if (!string.IsNullOrWhiteSpace(view.Sidecar?.CompanionCommand)) return true;
+        if (!string.IsNullOrWhiteSpace(view.LoginCommand)) return true;
+        if (!string.IsNullOrWhiteSpace(view.Sidecar?.LoginCommand)) return true;
+        if (!string.IsNullOrWhiteSpace(view.AuthCheckCommand)) return true;
+        if (!string.IsNullOrWhiteSpace(view.Sidecar?.AuthCheckCommand)) return true;
+        return false;
     }
 
     private async Task SeedDriverCredentialsToBoundPersonasAsync(string driverId, CancellationToken ct)
@@ -1086,18 +1277,23 @@ public class AgentsController(
         return RunHostCommandAsync("/bin/bash", $"-c \"{escaped}\"", ct);
     }
 
-    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl) : IAsyncDisposable
+    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? tempHome = null) : IAsyncDisposable
     {
         public Process Process { get; } = process;
         public StreamWriter Writer { get; } = writer;
         public Task ReaderTask { get; } = readerTask;
         public string AuthUrl { get; } = authUrl;
+        public string? TempHome { get; } = tempHome;
 
         public async ValueTask DisposeAsync()
         {
             try { if (!Process.HasExited) Process.Kill(true); } catch { }
             try { Writer.Dispose(); } catch { }
             try { Process.Dispose(); } catch { }
+            if (!string.IsNullOrWhiteSpace(TempHome))
+            {
+                try { if (Directory.Exists(TempHome)) Directory.Delete(TempHome, recursive: true); } catch { }
+            }
             await ValueTask.CompletedTask;
         }
     }

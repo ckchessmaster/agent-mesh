@@ -232,4 +232,35 @@ describe('DriverConfigModal', () => {
     expect(screen.getByRole('button', { name: /Authenticate Driver/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Verify & Refresh Models/i })).toBeInTheDocument();
   });
+
+  it('offers Interactive OAuth Login for an OpenAI driver when a custom Login Command is configured', () => {
+    const customAuthOpenAi: Agent = {
+      ...openAiAgent,
+      config: {
+        ...openAiAgent.config,
+        loginCommand: 'aip login',
+        authCheckCommand: 'aip status',
+        sidecar: {
+          enabled: true,
+          type: 'tailscale',
+          companionCommand: 'aip proxy 11434',
+          companionPort: 11434,
+          loginCommand: 'aip login',
+          authCheckCommand: 'aip status'
+        }
+      }
+    };
+
+    render(
+      <DriverConfigModal
+        agent={customAuthOpenAi}
+        initialConfig={customAuthOpenAi.config}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Authenticate Driver/i }));
+    expect(screen.getByRole('button', { name: /Interactive OAuth Login/i })).toBeInTheDocument();
+  });
 });

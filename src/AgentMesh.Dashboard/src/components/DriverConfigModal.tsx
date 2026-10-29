@@ -101,12 +101,15 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   }, [config.adapter, agent.capabilitiesJson, agent.id]);
 
   const isOpenAiDriver = driverAdapter === 'openai';
+  const initialLoginCmd = config.loginCommand ?? config.sidecar?.loginCommand ?? '';
 
   // Driver Verification & Authentication state
   const [verifying, setVerifying] = useState(false);
   const [verifyResult, setVerifyResult] = useState<PersonaDriverVerificationResult | null>(null);
   const [showAuthWizard, setShowAuthWizard] = useState(false);
-  const [authMode, setAuthMode] = useState<'oauth' | 'apikey'>(isOpenAiDriver ? 'apikey' : 'oauth');
+  const [authMode, setAuthMode] = useState<'oauth' | 'apikey'>(
+    !isOpenAiDriver || Boolean(initialLoginCmd.trim()) ? 'oauth' : 'apikey'
+  );
   const [authStarting, setAuthStarting] = useState(false);
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authStartResult, setAuthStartResult] = useState<PersonaAuthStartResult | null>(null);
@@ -135,6 +138,9 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       setError(null);
       setAuthSuccessMessage(null);
       setShowAuthWizard(true);
+      if (hasInteractiveLogin) {
+        setAuthMode('oauth');
+      }
       const res = await api.startDriverAuth(agent.id);
       setAuthStartResult(res);
       if (res.status === 'already_authenticated') {
@@ -142,6 +148,8 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         await onAuthSuccess?.();
       } else if (res.status === 'apikey_required') {
         setAuthMode('apikey');
+      } else if (res.status === 'waiting_code') {
+        setAuthMode('oauth');
       }
     } catch (err: any) {
       setError(err?.message || 'Failed to start driver authentication.');
@@ -222,6 +230,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [companionPort, setCompanionPort] = useState(config.sidecar?.companionPort ? String(config.sidecar.companionPort) : '');
   const [loginCommand, setLoginCommand] = useState(config.loginCommand ?? config.sidecar?.loginCommand ?? '');
   const [authCheckCommand, setAuthCheckCommand] = useState(config.authCheckCommand ?? config.sidecar?.authCheckCommand ?? '');
+  const hasInteractiveLogin = !isOpenAiDriver || Boolean(loginCommand.trim());
   const [companionExpanded, setCompanionExpanded] = useState(Boolean(config.sidecar?.companionCommand || config.sidecar?.companionSetup || config.loginCommand || config.sidecar?.loginCommand));
   const [sidecarExpanded, setSidecarExpanded] = useState(Boolean(config.sidecar?.enabled));
   const [isTestingEndpoint, setIsTestingEndpoint] = useState(false);
@@ -542,7 +551,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                 </div>
 
                 <div className="flex items-center gap-1.5">
-                  {!isOpenAiDriver && (
+                  {hasInteractiveLogin && (
                     <button
                       type="button"
                       onClick={() => {

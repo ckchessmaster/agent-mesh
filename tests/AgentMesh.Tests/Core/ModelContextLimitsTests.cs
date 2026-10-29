@@ -11,6 +11,7 @@ public class ModelContextLimitsTests
 {
     [Theory]
     [InlineData("qwen3.8-flash-next", 524_288)]
+    [InlineData("flash-next-abliterated", 524_288)]
     [InlineData("qwen-3-mini", 524_288)]
     [InlineData("qwen2.5-coder", 131_072)]
     [InlineData("llama3.3", 131_072)]
