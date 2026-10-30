@@ -14,6 +14,11 @@
     <PackageReference Include="AWSSDK.S3" Version="4.0.104.2" />
     <PackageReference Include="Docker.DotNet" Version="3.125.15" />
     <PackageReference Include="EFCore.NamingConventions" Version="10.0.1" />
+    <!-- GitHubPullRequestService talks to the GitHub REST API through IHttpClientFactory, which
+         lives in Microsoft.Extensions.Http. The API host already has it via the ASP.NET Core shared
+         framework; this class library does not, and naming the dependency here is what keeps the
+         service testable without a web host. -->
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.12" />
     <PackageReference Include="KubernetesClient" Version="21.0.8" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.12">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

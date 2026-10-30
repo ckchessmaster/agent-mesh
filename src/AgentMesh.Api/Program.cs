@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -121,6 +121,21 @@ builder.Services.AddScoped<JobTurnDispatcher>();
 builder.Services.AddScoped<IJobHandoffService, JobHandoffService>();
 builder.Services.AddHostedService<JobHandoffReaper>();
 
+// Platform MCP tools (post_job_message / manage_task / open_pull_request).
+// The context resolver is what lets an agent call these without knowing its own job id: a runner
+// never learns it, so it is recovered from the turn session the dispatcher created for that persona.
+builder.Services.AddScoped<IPlatformCallContextResolver, PlatformCallContextResolver>();
+
+// Server-side git push + GitHub PR creation. Scoped because it reads the calling persona's
+// credentials and configuration per call; the HttpClient itself is pooled by the factory.
+builder.Services.AddHttpClient(GitHubPullRequestService.HttpClientName, client =>
+{
+    // No default Authorization header: the token is per-call (it can come from a persona row), and a
+    // header set here would be sent to whatever GitHub:ApiBaseUrl points at.
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+builder.Services.AddScoped<IGitHubPullRequestService, GitHubPullRequestService>();
+
 // Dedicated Persona Container Environments & Idle Reaper
 builder.Services.AddPersonaContainerManager(builder.Configuration);
 builder.Services.AddHostedService<PersonaIdleReaperService>();
@@ -158,12 +173,15 @@ builder.Services.AddMcpServer()
     .WithTools<StagingTools>()
     .WithTools<SessionTools>()
     .WithTools<MemoryTools>()
+    .WithTools<PlatformMcpTools>()
     // save_memory takes `category` as a string so a bad value gets an actionable error instead of the
     // library's generic invocation failure; this puts the enum constraint back on the published schema.
     .WithRequestFilters(filters => filters.AddListToolsFilter(next => async (context, cancellationToken) =>
     {
         var result = await next(context, cancellationToken);
         MemoryToolSchema.ApplyCategoryEnum(result);
+        // Same trade-off for manage_task's `action` and `status` arguments.
+        PlatformToolSchema.ApplyManagedTaskEnums(result);
         return result;
     }));
 
