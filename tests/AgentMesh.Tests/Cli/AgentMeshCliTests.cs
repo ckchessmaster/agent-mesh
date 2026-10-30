@@ -533,8 +533,13 @@ public class AgentMeshCliTests
                 timeout: TimeSpan.FromSeconds(1));
             sw.Stop();
 
-            exitCode.Should().Be(-1);
-            stderr.Should().Contain("timed out");
+            // Contract change (sandbox hardening): a timeout now reports the GNU timeout(1) status 124
+            // rather than the ad-hoc -1, so a caller can distinguish "we cut it off" from "the command
+            // failed", and the diagnostic is the structured CommandTimedOut header.
+            exitCode.Should().Be(AgentMesh.Core.Models.CommandExecutionPolicy.TimeoutExitCode);
+            stderr.Should().Contain("CommandTimedOut");
+            stderr.Should().Contain("exceeded limit of 1s");
+            stderr.Should().Contain("Partial output captured before timeout:");
             sw.ElapsedMilliseconds.Should().BeLessThan(5000);
         }
         finally
