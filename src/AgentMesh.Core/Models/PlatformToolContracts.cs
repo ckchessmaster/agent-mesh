@@ -48,12 +48,23 @@ public record OpenPullRequestArgs(
     string? BranchName = null
 );
 
-public record OpenPullRequestResult(
-    bool Success,
-    int? PrNumber,
-    string? PrUrl,
-    string Message
-);
+// NOTE: the job spec also lists an `OpenPullRequestResult(Success, PrNumber, PrUrl, Message)`
+// record, and it is deliberately not implemented here. Two reasons.
+//
+// First, the spec contradicts itself: §C.1 documents the tool's return as
+// {success, pr_number, pr_url, status} — with a `status` and no `message` — while §3 defines a DTO
+// with a `message` and no `status`. Only one can be the wire contract, and the documented response
+// body is the thing an agent codes against and the DoD test pins.
+//
+// Second, the response the tool actually returns is a superset of both: it adds `simulated`,
+// `headBranch`, `baseBranch`, `reviewer`, `nextStep`, and `resolvedFrom`, each of which exists to
+// stop a specific agent failure (believing a simulated PR was real; re-pushing a branch that
+// already landed; passing back an empty reviewer). Binding that to the spec's four fields would
+// either drop the safeguards or widen the record until it matched nothing in the document.
+//
+// The domain-level result that IS shared across layers is GitHubPullRequestResult below. It is
+// named and pinned by tests; a second, unused shape for the same concept would only invite someone
+// to "fix" one half and break the other.
 
 /// <summary>
 /// Everything the PR service needs to push a branch and open a pull request against it.
