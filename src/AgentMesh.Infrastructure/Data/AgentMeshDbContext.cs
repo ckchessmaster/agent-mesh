@@ -17,6 +17,7 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     public DbSet<JobMessage> JobMessages => Set<JobMessage>();
     public DbSet<JobWorkspaceState> JobWorkspaceStates => Set<JobWorkspaceState>();
     public DbSet<JobHandoff> JobHandoffs => Set<JobHandoff>();
+    public DbSet<AgentMemory> AgentMemories => Set<AgentMemory>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
