@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Adapters;
@@ -161,58 +162,131 @@ public static class AgentAdapterFactory
         }
     }
 
-    public static void KillProcessTree(Process proc)
+    /// <summary>
+    /// Tears down a process and everything it spawned.
+    /// </summary>
+    /// <remarks>
+    /// Delegates to <see cref="SandboxShell.KillProcessTree"/> so the solution has exactly one teardown
+    /// ladder. The previous local implementation relied on <c>Kill(entireProcessTree)</c> plus
+    /// <c>pkill -P</c>, which cannot reach a fork whose parent already exited and was reparented to init —
+    /// the exact shape of a hung <c>node</c> test worker still holding a port.
+    /// </remarks>
+    public static void KillProcessTree(Process proc) => SandboxShell.KillProcessTree(proc);
+
+    /// <summary>
+    /// Tears down a process, signalling its whole process group when the caller knows the group leader.
+    /// </summary>
+    /// <param name="processGroupLeaderPid">
+    /// The group-leader pid reported by <see cref="RunCommandAsync"/>, or 0 when unknown. Signalling a group
+    /// the caller does not own can take down the worker itself, so 0 deliberately degrades to the
+    /// descendant walk rather than guessing.
+    /// </param>
+    public static void KillProcessTree(Process proc, int processGroupLeaderPid)
+        => SandboxShell.KillProcessTree(proc, processGroupLeaderPid);
+
+    /// <summary>
+    /// Runs a shell command and returns the hardened result: clamped timeout, process-group teardown on
+    /// kill, and non-destructive log spillover.
+    /// </summary>
+    /// <remarks>
+    /// This is the real entry point for a driver's <c>run_command</c> tool call. The engine itself lives in
+    /// <see cref="SandboxShell"/> (Core) because the Temporal worker activity must enforce the same limits;
+    /// keeping the policy here would let the CLI and the worker drift apart.
+    /// </remarks>
+    /// <param name="command">Command line for the shell.</param>
+    /// <param name="workingDirectory">Existing working directory.</param>
+    /// <param name="ct">Turn/host cancellation. Propagates as <see cref="OperationCanceledException"/>.</param>
+    /// <param name="timeout">
+    /// Legacy internal override. Ignored when <paramref name="timeoutSeconds"/> is supplied; prefer the
+    /// latter so every caller goes through the same clamp.
+    /// </param>
+    /// <param name="sessionId">Session that owns the command; enables the dashboard's per-command stop.</param>
+    /// <param name="commandId">Correlation id for the live tail and the stop button.</param>
+    /// <param name="onOutputChunk">Streaming sink for the dashboard.</param>
+    /// <param name="timeoutSeconds">Untrusted per-invocation timeout from the tool call; clamped by policy.</param>
+    /// <param name="trustedTimeout">
+    /// Wall-clock limit from in-process code, honoured verbatim instead of clamped. Use for probes and tests
+    /// that need a budget outside the untrusted-input range [5,600].
+    /// </param>
+    /// <param name="log">
+    /// Optional sink for teardown diagnostics (SIGTERM escalation, undrained streams). Defaults to
+    /// <see cref="System.Diagnostics.Debug"/> because the static adapter factory has no
+    /// <see cref="Microsoft.Extensions.Logging.ILogger"/> to hand it, and writing to the console would
+    /// corrupt the Spectre.Console TUI.
+    /// </param>
+    public static async Task<CommandExecutionResult> RunCommandAsync(
+        string command,
+        string workingDirectory,
+        CancellationToken ct,
+        TimeSpan? timeout = null,
+        Guid? sessionId = null,
+        string? commandId = null,
+        Func<string, Task>? onOutputChunk = null,
+        int? timeoutSeconds = null,
+        bool trustedTimeout = false,
+        Action<string>? log = null)
     {
+        // Precedence: an explicit per-call timeout wins, then a legacy TimeSpan, then the policy default.
+        int? requested = timeoutSeconds
+            ?? (timeout.HasValue ? (int)Math.Round(timeout.Value.TotalSeconds) : (int?)null);
+
+        // A trusted caller's TimeSpan bypasses the clamp; a value arriving from a tool call does not.
+        var args = new RunCommandArgs(
+            Command: command,
+            WorkingDirectory: workingDirectory,
+            TimeoutSeconds: requested);
+
+        var effectiveTrustedTimeout = trustedTimeout ? timeout : null;
+
+        var executionId = sessionId.HasValue
+            ? $"{sessionId.Value:N}-{(string.IsNullOrWhiteSpace(commandId) ? "adhoc" : commandId)}"
+            : Guid.NewGuid().ToString("N");
+
+        // The operator "stop this command" button cancels this source. It is deliberately *not* the turn
+        // token: stopping one command must not cancel the agent's whole turn.
+        using var abortCts = new CancellationTokenSource();
+
+        // Assigned from inside the onStarted callback (the group pid does not exist until Start() returns)
+        // and disposed here, so the registry entry cannot outlive the call.
+        IDisposable? registration = null;
+
         try
         {
-            var pid = 0;
-            try { pid = proc.Id; } catch { }
-            try { if (proc.HasExited) return; } catch { }
-
-            // On Linux/macOS, kill child processes first so background scripts/daemons don't survive as orphans
-            if (pid > 0 && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                try
-                {
-                    using var pkill = Process.Start(new ProcessStartInfo
+            return await SandboxShell.RunAsync(
+                args,
+                ct,
+                onOutputChunk,
+                log: log ?? (message => System.Diagnostics.Debug.WriteLine($"[sandbox] {message}")),
+                abortToken: abortCts.Token,
+                executionId: executionId,
+                trustedTimeout: effectiveTrustedTimeout,
+                onStarted: sessionId.HasValue
+                    ? (proc, groupLeaderPid) =>
                     {
-                        FileName = "pkill",
-                        ArgumentList = { "-9", "-P", pid.ToString() },
-                        CreateNoWindow = true,
-                        UseShellExecute = false
-                    });
-                    pkill?.WaitForExit(300);
-                }
-                catch { }
-            }
-
-            try
-            {
-                proc.Kill(entireProcessTree: true);
-            }
-            catch { }
-
-            if (pid > 0 && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                try
-                {
-                    using var killProc = Process.Start(new ProcessStartInfo
-                    {
-                        FileName = "kill",
-                        ArgumentList = { "-9", pid.ToString() },
-                        CreateNoWindow = true,
-                        UseShellExecute = false
-                    });
-                    killProc?.WaitForExit(300);
-                }
-                catch { }
-            }
-
-            try { proc.StandardInput?.Close(); } catch { }
+                        registration = ActiveCommandRegistry.Register(
+                            sessionId.Value, commandId, proc, abortCts, groupLeaderPid);
+                    }
+                    : null);
         }
-        catch { }
+        finally
+        {
+            registration?.Dispose();
+        }
     }
 
+    /// <summary>
+    /// Compatibility shim for adapters that consume <c>(exit, stdout, stderr)</c>.
+    /// </summary>
+    /// <remarks>
+    /// The spillover preview is returned in <c>StdOut</c> so existing callers keep working; the timeout and
+    /// abort diagnostics go to <c>StdErr</c>, which is where the adapters already look when a command fails.
+    /// Callers that need <see cref="CommandExecutionResult.LogFilePath"/> should use
+    /// <see cref="RunCommandAsync"/> directly.
+    ///
+    /// A <see cref="TimeSpan"/> passed here is treated as trusted: it comes from in-process code (a driver
+    /// adapter or a test), not from a model's tool call, so it is honoured verbatim rather than clamped to
+    /// the [5,600] untrusted-input range.
+    /// </remarks>
     public static async Task<(int ExitCode, string StdOut, string StdErr)> RunShellCommandAsync(
         string command,
         string workingDirectory,
@@ -222,112 +296,20 @@ public static class AgentAdapterFactory
         string? commandId = null,
         Func<string, Task>? onOutputChunk = null)
     {
-        var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-        var psi = new ProcessStartInfo
-        {
-            FileName = isWindows ? "cmd.exe" : "/bin/bash",
-            WorkingDirectory = workingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
+        var result = await RunCommandAsync(
+            command, workingDirectory, ct, timeout, sessionId, commandId, onOutputChunk,
+            trustedTimeout: true);
 
-        if (isWindows)
+        // Route on the flags, not on the exit code: 124 is also a legitimate exit status for a command that
+        // internally invokes `timeout(1)`, and misclassifying one of those as our own teardown would move
+        // real output onto the stderr channel.
+        if (result.TimedOut || result.Aborted)
         {
-            psi.ArgumentList.Add("/c");
-            psi.ArgumentList.Add(command);
-        }
-        else
-        {
-            psi.ArgumentList.Add("-c");
-            psi.ArgumentList.Add(command);
+            // The diagnostic is the payload; keep it on stderr so "command failed" paths surface it.
+            return (result.ExitCode, string.Empty, result.Output);
         }
 
-        using var proc = new Process { StartInfo = psi };
-        using var cmdCts = new CancellationTokenSource();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, cmdCts.Token);
-        var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(180);
-
-        IDisposable? regDisposable = null;
-        if (sessionId.HasValue)
-        {
-            regDisposable = ActiveCommandRegistry.Register(sessionId.Value, commandId, proc, cmdCts);
-        }
-
-        using var reg = linkedCts.Token.Register(() => KillProcessTree(proc));
-        proc.Start();
-
-        try
-        {
-            var stdOutSb = new StringBuilder();
-            var stdErrSb = new StringBuilder();
-
-            async Task ReadStreamAsync(StreamReader reader, StringBuilder sb)
-            {
-                var buffer = new char[2048];
-                while (!linkedCts.Token.IsCancellationRequested)
-                {
-                    int read;
-                    try
-                    {
-                        read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), linkedCts.Token);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    if (read <= 0) break;
-                    var chunk = new string(buffer, 0, read);
-                    lock (sb)
-                    {
-                        sb.Append(chunk);
-                    }
-                    if (sessionId.HasValue)
-                    {
-                        ActiveCommandRegistry.AppendOutput(sessionId.Value, commandId, chunk);
-                    }
-                    if (onOutputChunk != null)
-                    {
-                        try { await onOutputChunk(chunk); } catch { }
-                    }
-                }
-            }
-
-            var stdOutTask = ReadStreamAsync(proc.StandardOutput, stdOutSb);
-            var stdErrTask = ReadStreamAsync(proc.StandardError, stdErrSb);
-
-            var waitTask = proc.WaitForExitAsync(linkedCts.Token);
-            var timeoutTask = Task.Delay(effectiveTimeout, CancellationToken.None);
-
-            var finished = await Task.WhenAny(waitTask, timeoutTask);
-            linkedCts.Token.ThrowIfCancellationRequested();
-
-            if (finished == timeoutTask && !proc.HasExited)
-            {
-                KillProcessTree(proc);
-                return (-1, string.Empty, $"Error: Command execution timed out after {effectiveTimeout.TotalSeconds:F0}s.");
-            }
-
-            await waitTask;
-            await Task.WhenAll(stdOutTask, stdErrTask);
-
-            linkedCts.Token.ThrowIfCancellationRequested();
-            return (proc.ExitCode, stdOutSb.ToString().Trim(), stdErrSb.ToString().Trim());
-        }
-        catch (OperationCanceledException)
-        {
-            KillProcessTree(proc);
-            if (cmdCts.IsCancellationRequested && !ct.IsCancellationRequested)
-            {
-                return (-1, string.Empty, "🛑 Command aborted by operator.");
-            }
-            throw;
-        }
-        finally
-        {
-            regDisposable?.Dispose();
-        }
+        return (result.ExitCode, result.Output, string.Empty);
     }
 
     public record ExtractedQuestion(string Question, List<string> Options, bool IsMultiSelect);
@@ -494,22 +476,37 @@ public static class AgentAdapterFactory
     }
 }
 
+/// <summary>
+/// A live shell command, so the dashboard's stop button can reach the exact process it wants gone.
+/// </summary>
+/// <param name="ProcessGroupLeaderPid">
+/// The pid to signal *as a process group* when the command leads its own group, else 0. Carrying it here is
+/// what lets an operator abort reach backgrounded forks instead of only the shell that spawned them.
+/// </param>
 public record CommandExecutionHandle(
     Guid SessionId,
     string? CommandId,
     Process Process,
     CancellationTokenSource Cts,
     DateTimeOffset StartedAt,
-    StringBuilder? LiveOutput = null);
+    StringBuilder? LiveOutput = null,
+    int ProcessGroupLeaderPid = 0);
 
 public static class ActiveCommandRegistry
 {
     private static readonly ConcurrentDictionary<string, CommandExecutionHandle> ActiveCommands = new();
 
     public static IDisposable Register(Guid sessionId, string? commandId, Process proc, CancellationTokenSource cts)
+        => Register(sessionId, commandId, proc, cts, 0);
+
+    /// <param name="processGroupLeaderPid">
+    /// The group leader pid, or 0 when the process does not lead its own group. Supplied by the caller
+    /// rather than read here because it only exists once the process has started.
+    /// </param>
+    public static IDisposable Register(Guid sessionId, string? commandId, Process proc, CancellationTokenSource cts, int processGroupLeaderPid)
     {
         var outputSb = new StringBuilder();
-        var handle = new CommandExecutionHandle(sessionId, commandId, proc, cts, DateTimeOffset.UtcNow, outputSb);
+        var handle = new CommandExecutionHandle(sessionId, commandId, proc, cts, DateTimeOffset.UtcNow, outputSb, processGroupLeaderPid);
         var key = $"{sessionId}:{(string.IsNullOrWhiteSpace(commandId) ? "current" : commandId)}";
         ActiveCommands[key] = handle;
         ActiveCommands[$"{sessionId}:current"] = handle;
@@ -571,7 +568,8 @@ public static class ActiveCommandRegistry
 
             if (handle.Process != null)
             {
-                AgentAdapterFactory.KillProcessTree(handle.Process);
+                // Pass the group leader so an operator abort reaches backgrounded forks, not just the shell.
+                AgentAdapterFactory.KillProcessTree(handle.Process, handle.ProcessGroupLeaderPid);
             }
             return true;
         }

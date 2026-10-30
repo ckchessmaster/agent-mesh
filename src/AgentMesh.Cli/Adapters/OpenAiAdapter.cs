@@ -123,6 +123,26 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return 600; // 10 minutes default (increased from 100s / 5m)
     }
 
+    /// <summary>
+    /// The wall-clock budget for a single shell command, or <c>null</c> to mean "use the sandbox default".
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="ResolveTimeoutSeconds"/> on purpose. That helper answers "how long may we
+    /// wait for a model endpoint to answer", and its 600s fallback is right there and wrong here: a hung
+    /// <c>dotnet test</c> should be reaped at 180s unless an operator deliberately configured otherwise.
+    /// Only an explicit preset value is honoured; the env var is not, because
+    /// <c>OPENAI_TIMEOUT_SECONDS</c> is documented as the endpoint budget.
+    /// </remarks>
+    public static int? ResolveCommandTimeoutSeconds(AgentPresetConfig preset)
+    {
+        if (preset?.TimeoutSeconds is int configured && configured > 0)
+        {
+            return configured;
+        }
+
+        return null;
+    }
+
     public static int ResolveMaxRetries(AgentPresetConfig preset)
     {
         if (preset.MaxRetries.HasValue && preset.MaxRetries.Value >= 0)
@@ -894,7 +914,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         ToolArgsJson = toolArgs
                     });
 
-                    var toolTimeout = ResolveTimeoutSeconds(preset);
+                    // Command budget, not the HTTP handshake budget: ResolveTimeoutSeconds falls back to
+                    // 600s, which would mean a wedged test runner holds a worker for ten minutes and the
+                    // 180s sandbox default never applies.
+                    var toolTimeout = ResolveCommandTimeoutSeconds(preset);
                     var toolResult = await ExecuteToolLocallyAsync(
                         toolName,
                         toolArgs,
@@ -979,7 +1002,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     ToolArgsJson = fbArgs
                 });
 
-                var toolTimeout = ResolveTimeoutSeconds(preset);
+                // Command budget, not the HTTP handshake budget: ResolveTimeoutSeconds falls back to 600s,
+                // which would mean a wedged test runner holds a worker for ten minutes and the 180s sandbox
+                // default never applies.
+                var toolTimeout = ResolveCommandTimeoutSeconds(preset);
                 var toolResult = await ExecuteToolLocallyAsync(
                     fbName,
                     fbArgs ?? "{}",
@@ -1231,14 +1257,15 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 function = new
                 {
                     name = "run_command",
-                    description = "Execute a shell command in the workspace directory. Use this to run builds, tests, git commands, and inspection tools.",
+                    description = "Execute a shell command in the workspace directory. Use this to run builds, tests, git commands, and inspection tools. Long output is preserved in full on disk and returned as a head/tail preview; the result names the log file to grep.",
                     parameters = new
                     {
                         type = "object",
                         properties = new
                         {
                             command = new { type = "string", description = "The exact shell command line string to execute." },
-                            workingDirectory = new { type = "string", description = "Optional subdirectory or working directory. Defaults to workspace root." }
+                            workingDirectory = new { type = "string", description = "Optional subdirectory or working directory. Defaults to workspace root." },
+                            timeout_seconds = new { type = "integer", description = "Optional wall-clock limit in seconds (5-600, default 180). Use a larger value for full builds or test suites; the command's whole process tree is killed if it exceeds the limit." }
                         },
                         required = new[] { "command" }
                     }
@@ -1431,22 +1458,39 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         Directory.CreateDirectory(effectiveDir);
                     }
 
-                    var timeout = timeoutSeconds.HasValue && timeoutSeconds.Value > 0
-                        ? TimeSpan.FromSeconds(timeoutSeconds.Value)
-                        : TimeSpan.FromSeconds(180);
+                    // Timeout precedence, most specific first:
+                    //   1. `timeout_seconds` on the tool call (the model knows whether it is running `echo`
+                    //      or a full solution build).
+                    //   2. An operator's explicit preset configuration, threaded through `timeoutSeconds`.
+                    //   3. null -> the policy default (180s) inside SandboxShell.
+                    // Deliberately not ResolveTimeoutSeconds(preset): that is the HTTP handshake budget and
+                    // falls back to 600, which would defeat the sandbox default entirely.
+                    var requestedTimeout = GetPropertyInt(root, "timeout_seconds", "timeoutSeconds", "timeout")
+                        ?? timeoutSeconds;
 
-                    var (exitCode, stdout, stderr) = await AgentAdapterFactory.RunShellCommandAsync(
+                    var result = await AgentAdapterFactory.RunCommandAsync(
                         cmd,
                         effectiveDir,
                         ct,
-                        timeout,
-                        sessionId,
-                        commandId,
-                        onOutputChunk);
+                        timeout: null,
+                        sessionId: sessionId,
+                        commandId: commandId,
+                        onOutputChunk: onOutputChunk,
+                        timeoutSeconds: requestedTimeout);
+
                     var sb = new StringBuilder();
-                    if (!string.IsNullOrWhiteSpace(stdout)) sb.AppendLine(stdout);
-                    if (!string.IsNullOrWhiteSpace(stderr)) sb.AppendLine(stderr);
-                    sb.AppendLine($"Exit Code: {exitCode}");
+                    if (!string.IsNullOrWhiteSpace(result.Output)) sb.AppendLine(result.Output);
+
+                    // The exit code line is what the adapters and existing tests key on. For a timeout the
+                    // diagnostic already names 124; repeating it keeps one source of truth for the number.
+                    sb.Append($"Exit Code: {result.ExitCode}");
+
+                    if (result.LogFilePath != null && !result.Output.Contains(result.LogFilePath, StringComparison.Ordinal))
+                    {
+                        sb.AppendLine();
+                        sb.Append($"Full output: {result.LogFilePath}");
+                    }
+
                     return sb.ToString().Trim();
                 }
 

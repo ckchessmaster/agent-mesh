@@ -7,8 +7,10 @@ namespace AgentMesh.Tests.Core;
 /// The context-window table is now shared between the API that renders the picker and the adapter
 /// that honours the choice. These tests pin the values both sides used to disagree about.
 /// </summary>
-public class ModelContextLimitsTests
+public class ModelContextLimitsTests : IDisposable
 {
+    public ModelContextLimitsTests() => ModelContextLimits.ClearLearnedLimits();
+    public void Dispose() => ModelContextLimits.ClearLearnedLimits();
     [Theory]
     [InlineData("qwen3.8-flash-next", 524_288)]
     [InlineData("flash-next-abliterated", 524_288)]
