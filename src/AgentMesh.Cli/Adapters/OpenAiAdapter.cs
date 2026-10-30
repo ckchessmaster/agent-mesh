@@ -330,36 +330,38 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             return true;
 
         // Phase 2: If still over limit, slide older message turns atomically
+        // Keep an existing model-written summary pinned right after the system prompt.
+        var first = history.Count > 1 && history[1].Role == "system" && history[1].Content != null && history[1].Content.StartsWith(SummaryMarker, StringComparison.Ordinal) ? 2 : 1;
         var prunedTurns = 0;
-        while (history.Count > (protectedTailCount + 1) && EstimateTotalTokens(history) > targetMaxTokens)
+        while (history.Count > (protectedTailCount + first) && EstimateTotalTokens(history) > targetMaxTokens)
         {
-            var msg1 = history[1];
+            var msg1 = history[first];
             if (msg1.Role == "user")
             {
-                history.RemoveAt(1);
+                history.RemoveAt(first);
                 prunedTurns++;
                 modified = true;
             }
             else if (msg1.Role == "assistant")
             {
-                history.RemoveAt(1);
+                history.RemoveAt(first);
                 modified = true;
-                while (history.Count > 1 && history[1].Role == "tool")
+                while (history.Count > first && history[first].Role == "tool")
                 {
-                    history.RemoveAt(1);
+                    history.RemoveAt(first);
                 }
                 prunedTurns++;
             }
             else
             {
-                history.RemoveAt(1);
+                history.RemoveAt(first);
                 modified = true;
             }
         }
 
         if (prunedTurns > 0)
         {
-            history.Insert(1, new OpenAiMessage
+            history.Insert(first, new OpenAiMessage
             {
                 Role = "system",
                 Content = $"[Context Compaction: {prunedTurns} earlier conversation turns were pruned to keep within the model context window. Work continues from recent context below.]"
@@ -388,6 +390,131 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
 
         return modified;
+    }
+
+    private const string SummaryMarker = "[Conversation Summary";
+    private const int SummaryTranscriptMaxChars = 120_000;
+
+    /// <summary>
+    /// Replaces older turns (everything between the system prompt and the protected tail) with a single
+    /// model-written summary. The summarizer request is bounded in size, so it stays safe even when the
+    /// full history is too large for the server. Returns false (history untouched) on any failure.
+    /// </summary>
+    public static async Task<bool> TrySummarizeOldTurnsAsync(
+        List<OpenAiMessage> history,
+        int protectedTailCount,
+        string chatUrl,
+        string model,
+        string? apiKey,
+        AgentPresetConfig preset,
+        int timeoutSeconds,
+        CancellationToken ct)
+    {
+        if (history.Count <= 2) return false;
+
+        var cutoff = Math.Max(1, history.Count - protectedTailCount);
+        // Never start the kept tail on a tool message (would orphan it from its assistant tool call).
+        while (cutoff > 1 && cutoff < history.Count && history[cutoff].Role == "tool") cutoff--;
+        if (cutoff <= 1) return false;
+
+        var middle = history.GetRange(1, cutoff - 1);
+
+        // Build a bounded transcript. Prior summaries come first; recent turns are favored over old ones.
+        static string Clip(string? s, int max) =>
+            string.IsNullOrEmpty(s) ? "" : s.Length <= max ? s : s[..(max / 2)] + " …[clipped]… " + s[^(max / 2)..];
+
+        var priorSummary = new StringBuilder();
+        var lines = new List<string>();
+        foreach (var m in middle)
+        {
+            if (m.Role == "system" && m.Content != null && m.Content.StartsWith(SummaryMarker, StringComparison.Ordinal))
+            {
+                priorSummary.AppendLine(Clip(m.Content, 20_000));
+                continue;
+            }
+            var sb = new StringBuilder();
+            sb.Append('[').Append(m.Role).Append("] ");
+            sb.Append(Clip(m.Content, m.Role == "tool" ? 600 : 4_000));
+            if (m.ToolCalls != null)
+            {
+                foreach (var tc in m.ToolCalls)
+                    sb.Append($"\n  -> tool_call {tc.Function?.Name}({Clip(tc.Function?.Arguments, 300)})");
+            }
+            lines.Add(sb.ToString());
+        }
+
+        var kept = new List<string>();
+        var budget = SummaryTranscriptMaxChars;
+        for (int i = lines.Count - 1; i >= 0 && budget > 0; i--)
+        {
+            budget -= lines[i].Length;
+            kept.Add(lines[i]);
+        }
+        kept.Reverse();
+
+        var transcript = new StringBuilder();
+        if (priorSummary.Length > 0)
+            transcript.AppendLine("PREVIOUS SUMMARY:\n" + priorSummary + "\n");
+        if (kept.Count < lines.Count)
+            transcript.AppendLine($"(… {lines.Count - kept.Count} older messages omitted for length …)\n");
+        transcript.AppendLine("CONVERSATION:");
+        foreach (var l in kept) transcript.AppendLine(l).AppendLine();
+
+        const string summarizerPrompt =
+            "You compress an AI coding agent's conversation history so the agent can continue seamlessly. " +
+            "Write a dense, factual summary in Markdown covering: the user's goals and instructions (verbatim for key constraints), " +
+            "decisions made, files/paths/commands/identifiers touched, what was completed, errors encountered and their resolutions, " +
+            "current state, and outstanding TODOs / next steps. Merge any PREVIOUS SUMMARY into your output. " +
+            "Do not invent details. Do not address the user. Output only the summary.";
+
+        var req = new Dictionary<string, object?>
+        {
+            ["model"] = model,
+            ["messages"] = new object[]
+            {
+                new Dictionary<string, object?> { ["role"] = "system", ["content"] = summarizerPrompt },
+                new Dictionary<string, object?> { ["role"] = "user", ["content"] = transcript.ToString() }
+            },
+            ["stream"] = false,
+            ["max_tokens"] = 3000
+        };
+
+        try
+        {
+            using var httpReq = new HttpRequestMessage(HttpMethod.Post, chatUrl);
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            if (preset.CustomHeaders != null)
+                foreach (var kvp in preset.CustomHeaders)
+                    httpReq.Headers.TryAddWithoutValidation(kvp.Key, kvp.Value);
+            httpReq.Content = new StringContent(JsonSerializer.Serialize(req), Encoding.UTF8, "application/json");
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(Math.Max(120, timeoutSeconds)));
+            using var res = await HttpClientInstance.SendAsync(httpReq, cts.Token);
+            if (!res.IsSuccessStatusCode) return false;
+
+            var body = await res.Content.ReadAsStringAsync(cts.Token);
+            using var doc = JsonDocument.Parse(body);
+            var summary = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
+            if (string.IsNullOrWhiteSpace(summary)) return false;
+
+            history.RemoveRange(1, cutoff - 1);
+            history.Insert(1, new OpenAiMessage
+            {
+                Role = "system",
+                Content = $"{SummaryMarker} — {middle.Count} earlier messages were compacted into this summary]\n{summary.Trim()}"
+            });
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     public static string TruncateToolResult(string result, int maxChars = 50_000)
@@ -526,8 +653,18 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
         var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
 
+        // Compaction: summarize older turns with the model (lossy fallback to truncation), then persist.
+        async Task<(bool Changed, bool Summarized)> CompactAsync(int target, bool aggressive)
+        {
+            var summarized = await TrySummarizeOldTurnsAsync(history, aggressive ? 2 : 4, chatUrl, effectiveModel, apiKey, preset, timeoutSeconds, ct);
+            var changed = CompactHistory(history, target, aggressive);
+            if (changed || summarized) SaveHistoryToDisk(promptEvent.SessionId, history);
+            return (changed || summarized, summarized);
+        }
+
         var maxSteps = ResolveMaxSteps(preset);
         var stepCount = 0;
+        var streamRetryAttempt = 0;
         var responseEmitted = false;
         var askedQuestion = false;
         long totalInputTokens = 0;
@@ -545,14 +682,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (EstimateTotalTokens(history) > targetMaxTokens)
             {
                 var beforeEst = EstimateTotalTokens(history);
-                var compacted = CompactHistory(history, targetMaxTokens);
+                var (compacted, summarized) = await CompactAsync(targetMaxTokens, false);
                 if (compacted)
                 {
                     var afterEst = EstimateTotalTokens(history);
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "thought",
-                        Content = $"[@{preset.Id}] Proactively compacted conversation history ({beforeEst} -> {afterEst} tokens) to remain within {modelContextLimit} context limit."
+                        Content = $"[@{preset.Id}] Proactively {(summarized ? "summarized" : "truncated")} conversation history ({beforeEst} -> {afterEst} tokens) to remain within {modelContextLimit} context limit."
                     });
                 }
             }
@@ -686,7 +823,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             Content = $"[@{preset.Id}] Context window exceeded ({promptTokens?.ToString() ?? "prompt"} tokens vs {effectiveLimit} limit). Compacting history and retrying..."
                         });
 
-                        var compacted = CompactHistory(history, targetTokens, forceAggressive: true);
+                        var (compacted, _) = await CompactAsync(targetTokens, true);
                         if (compacted)
                         {
                             httpRes.Dispose();
@@ -727,6 +864,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             var reasoningBuilder = new StringBuilder();
             var toolCallsByIndex = new SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)>();
 
+            Exception? streamDropped = null;
             using (var stream = await activeResponse.Content.ReadAsStreamAsync(ct))
             using (var reader = new StreamReader(stream))
             {
@@ -749,6 +887,13 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             EventType = "thought",
                             Content = $"[@{preset.Id}] Streaming response timed out after {streamReadTimeout.TotalSeconds:F0}s of inactivity from server."
                         });
+                        break;
+                    }
+                    catch (Exception ex) when (ex is IOException || ex is HttpRequestException)
+                    {
+                        // Server/proxy dropped the stream mid-response (e.g. "ResponseEnded"),
+                        // typically after a very large prompt prefill. Discard partial output and retry the step.
+                        streamDropped = ex;
                         break;
                     }
 
@@ -845,6 +990,43 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                 }
             }
+
+            if (streamDropped != null)
+            {
+                if (streamRetryAttempt < maxRetries)
+                {
+                    streamRetryAttempt++;
+                    var delayMs = GetRetryDelayMilliseconds(null, streamRetryAttempt, preset);
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = $"[@{preset.Id}] Response stream dropped ({streamDropped.Message}). Retrying in {delayMs / 1000.0:F1}s (attempt {streamRetryAttempt}/{maxRetries})..."
+                    });
+                    // A deterministic failure on a huge prompt won't fix itself: shrink the history
+                    // on every retry (halving the estimate) so the next attempt is actually different.
+                    var estBefore = EstimateTotalTokens(history);
+                    var shrinkTarget = Math.Max(8_000, estBefore / 2);
+                    if ((await CompactAsync(shrinkTarget, true)).Changed)
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] Shrunk history ({estBefore} -> {EstimateTotalTokens(history)} est. tokens) before retrying."
+                        });
+                    }
+                    await Task.Delay(delayMs, ct);
+                    stepCount--;
+                    continue;
+                }
+
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "response",
+                    Content = $"❌ Response stream from {chatUrl} ended prematurely ({streamDropped.Message}) after {streamRetryAttempt} retries. The prompt (~{EstimateTotalTokens(history)} est. tokens) may be too large for the server or a proxy timed out during prefill."
+                });
+                return;
+            }
+            streamRetryAttempt = 0;
 
             // If reasoning occurred, emit thought event
             if (reasoningBuilder.Length > 0)
