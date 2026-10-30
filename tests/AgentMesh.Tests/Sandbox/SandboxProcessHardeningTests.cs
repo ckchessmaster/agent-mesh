@@ -53,7 +53,9 @@ public class SandboxProcessHardeningTests
             CreateNoWindow = true,
         };
         psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add($"pgrep -af '{EscapeForSingleQuotes(marker)}' 2>/dev/null || true");
+        // Anchor to the command/binary invocation so orchestrator processes (e.g. agy, dotnet) that
+        // happen to contain the marker in their prompt or arguments are not falsely identified as survivors.
+        psi.ArgumentList.Add($"pgrep -af '(^|/){EscapeForSingleQuotes(marker)}($|\\s)' 2>/dev/null || true");
 
         using var proc = Process.Start(psi)!;
         var output = await proc.StandardOutput.ReadToEndAsync();

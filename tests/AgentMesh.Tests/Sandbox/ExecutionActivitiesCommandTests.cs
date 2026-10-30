@@ -126,7 +126,7 @@ public class ExecutionActivitiesCommandTests
                     RedirectStandardOutput = true,
                     UseShellExecute = false,
                     CreateNoWindow = true,
-                    ArgumentList = { "-c", $"pgrep -af 'sleep {sleeperSeconds}' 2>/dev/null | grep -v pgrep || true" }
+                    ArgumentList = { "-c", $"pgrep -af '(^|/)sleep {sleeperSeconds}($|\\s)' 2>/dev/null | grep -v pgrep || true" }
                 }
             };
             pgrep.Start();
@@ -197,7 +197,7 @@ public class ExecutionActivitiesCommandTests
                     RedirectStandardOutput = true,
                     UseShellExecute = false,
                     CreateNoWindow = true,
-                    ArgumentList = { "-c", $"pgrep -af 'sleep {sleeperSeconds}' 2>/dev/null | grep -v pgrep || true" }
+                    ArgumentList = { "-c", $"pgrep -af '(^|/)sleep {sleeperSeconds}($|\\s)' 2>/dev/null | grep -v pgrep || true" }
                 }
             };
             pgrep.Start();
