@@ -4,6 +4,7 @@ using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Api.Tools;
 using AgentMesh.Core.Services;
+using AgentMesh.Infrastructure;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Storage;
 using AgentMesh.Infrastructure.Containers;
@@ -42,6 +43,8 @@ builder.Services.AddSingleton<IDriverQuotaProbe>(sp => sp.GetRequiredService<Agy
 builder.Services.AddSingleton<DriverCapabilityProbe>();
 builder.Services.AddSingleton<IDriverCapabilityProbe>(sp => sp.GetRequiredService<DriverCapabilityProbe>());
 builder.Services.AddHttpContextAccessor();
+builder.Services.AddAgentMeshRepositories();
+builder.Services.AddScoped<IMemoryContextResolver, MemoryContextResolver>();
 
 var oidcAuthority = builder.Configuration["Oidc:Authority"] ?? "http://localhost:8085/dex";
 var oidcClientId = builder.Configuration["Oidc:ClientId"] ?? "agentmesh-dashboard";
@@ -153,7 +156,16 @@ builder.Services.AddSignalR()
 builder.Services.AddMcpServer()
     .WithHttpTransport()
     .WithTools<StagingTools>()
-    .WithTools<SessionTools>();
+    .WithTools<SessionTools>()
+    .WithTools<MemoryTools>()
+    // save_memory takes `category` as a string so a bad value gets an actionable error instead of the
+    // library's generic invocation failure; this puts the enum constraint back on the published schema.
+    .WithRequestFilters(filters => filters.AddListToolsFilter(next => async (context, cancellationToken) =>
+    {
+        var result = await next(context, cancellationToken);
+        MemoryToolSchema.ApplyCategoryEnum(result);
+        return result;
+    }));
 
 var app = builder.Build();
 
