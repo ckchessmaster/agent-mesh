@@ -1761,7 +1761,15 @@ public class ProjectJobsController(
         return basePath;
     }
 
-    private static JobMessageDto ToMessageDto(JobMessage m)
+    /// <summary>
+    /// Maps a persisted <see cref="JobMessage"/> onto the wire shape the Cockpit consumes.
+    /// </summary>
+    /// <remarks>
+    /// Internal rather than private because the <c>post_job_message</c> MCP tool broadcasts the
+    /// identical payload. Two mappers producing one event name is how a chat message ends up
+    /// rendering differently depending on whether a human or an agent sent it.
+    /// </remarks>
+    internal static JobMessageDto ToMessageDto(JobMessage m)
     {
         List<string> mentions;
         try
