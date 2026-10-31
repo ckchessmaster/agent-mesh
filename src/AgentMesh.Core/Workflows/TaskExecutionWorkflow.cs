@@ -132,6 +132,9 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
 
     private string _currentStatus = "Initializing";
     private string? _awaitingFrom;
+
+    /// <summary>The job this run belongs to, for log correlation only.</summary>
+    private string _jobId = string.Empty;
     private DateTimeOffset? _awaitingSince;
     private int _turnCount;
     private TurnOutcomeStatus? _lastOutcome;
@@ -269,21 +272,54 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                         // it needs server-side credentials the agent never holds, and its failure must
                         // be visible as a distinct event in the history rather than buried in a turn's
                         // prose.
-                        var mergeResult = await Workflow.ExecuteActivityAsync(
-                            (IGitActivities act) => act.MergePullRequestAsync(_activePrUrl!),
-                            new ActivityOptions
-                            {
-                                StartToCloseTimeout = TimeSpan.FromMinutes(5),
-                                // Retry a merge that failed transiently (rate limit, 5xx). Safe
-                                // because the activity treats "already merged" as success, so a retry
-                                // after a timeout that GitHub actually honoured does not double-apply.
-                                RetryPolicy = new()
+                        string? mergeResult;
+                        try
+                        {
+                            mergeResult = await Workflow.ExecuteActivityAsync(
+                                (IGitActivities act) => act.MergePullRequestAsync(_activePrUrl!),
+                                new ActivityOptions
                                 {
-                                    InitialInterval = TimeSpan.FromSeconds(5),
-                                    MaximumInterval = TimeSpan.FromMinutes(1),
-                                    MaximumAttempts = 3,
-                                },
-                            });
+                                    StartToCloseTimeout = TimeSpan.FromMinutes(5),
+                                    // Retry a merge that failed transiently (rate limit, 5xx). Safe
+                                    // because the activity treats "already merged" as success, so a retry
+                                    // after a timeout that GitHub actually honoured does not double-apply.
+                                    RetryPolicy = new()
+                                    {
+                                        InitialInterval = TimeSpan.FromSeconds(5),
+                                        MaximumInterval = TimeSpan.FromMinutes(1),
+                                        MaximumAttempts = 3,
+                                    },
+                                });
+                        }
+                        catch (Exception ex) when (IsTurnHalt(ex))
+                        {
+                            // The same translation the turn activity gets, and for the same reason: the
+                            // activity raises a rejection (merge conflict, head moved after approval, not
+                            // mergeable, no PR URL) as a non-retryable ApplicationFailure precisely so
+                            // Temporal does not hammer GitHub with a call that will never succeed, and its
+                            // own comment states the workflow turns that into a halted task with the reason
+                            // intact. Until now it did not — the call sat outside this filter, so the
+                            // exception escaped the run and the workflow ended Failed with no result at all.
+                            //
+                            // The cost of that was not cosmetic. A crashed workflow writes no
+                            // TaskExecutionResult and never reaches the _currentStatus assignment below, so
+                            // the status endpoint kept serving "Merging PR" — the last value written before
+                            // the crash — indefinitely. The rejection classes are exactly the ones a human
+                            // can resolve (fix the conflict, re-review the new head), and the operator's
+                            // only clue was a merge that appeared to be in progress forever.
+                            //
+                            // Reusing IsTurnHalt rather than writing a merge-specific filter is the point:
+                            // it keeps transient failures (raised as ordinary exceptions, retryable) out of
+                            // this branch so the RetryPolicy above still applies, and keeps a genuine
+                            // workflow cancellation propagating so an operator's stop is not reported as an
+                            // agent failure.
+                            var reason = $"Approved merge could not complete: {HaltReasonOf(ex)}";
+                            _currentStatus = $"Halted: {reason}";
+                            _lastOutcome = TurnOutcomeStatus.Failed;
+                            _isTerminated = true;
+
+                            return new TaskExecutionResult(false, input.TaskId, _activePrUrl, reason);
+                        }
 
                         _currentStatus = "Completed";
                         _isTerminated = true;
