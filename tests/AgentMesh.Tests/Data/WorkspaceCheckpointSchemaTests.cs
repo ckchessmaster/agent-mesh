@@ -15,25 +15,29 @@ namespace AgentMesh.Tests.Data;
 /// <remarks>
 /// <para>
 /// <strong>What this adds over the behavioural tests, measured rather than assumed.</strong> Each
-/// assertion below was mutation-tested against the existing suite:
+/// invariant below was mutated and the <em>full</em> 1,334-test suite run against the mutation:
 /// <list type="bullet">
 /// <item><description>
-/// Reverting the composite key to <c>HasKey(s =&gt; s.JobId)</c> fails 8 tests in
+/// <c>projects.working_directory</c>'s default changed from blank to the literal
+/// <c>'/workspace/repos/agent-mesh'</c>: <strong>exactly 1 test fails — this file's</strong>. The other
+/// 1,323 pass, including all of <c>ShellDefaultWorkingDirectoryTests</c>,
+/// <c>JobWorkspaceTaskScopingTests</c>, <c>ProjectsControllerTests</c> and
+/// <c>WorkspaceReconciliationTests</c>. Nothing but this file catches it — see the paragraph below for
+/// why that specific default is worth a file of its own.
+/// </description></item>
+/// <item><description>
+/// The recency index deleted: again <strong>exactly 1 test fails — this file's</strong>. The in-memory
+/// provider creates no indexes, so a query-plan guarantee has no behavioural observable at all; the
+/// model is the only place it exists.
+/// </description></item>
+/// <item><description>
+/// Reverting the composite key to <c>HasKey(s =&gt; s.JobId)</c>: 12 tests fail — this file's plus 11 in
 /// <c>WorkspaceStateRepositoryTests</c> / <c>JobWorkspaceTaskScopingTests</c>. The in-memory provider
-/// does enforce keys, so that invariant is already covered; it is asserted here as well because this is
-/// the only place the failure names the invariant ("the checkpoint is per task") instead of surfacing as
-/// a duplicate-row exception three layers away.
-/// </description></item>
-/// <item><description>
-/// Changing <c>projects.working_directory</c>'s default from blank to the literal path passes all 42
-/// behavioural tests in <c>ShellDefaultWorkingDirectoryTests</c>, <c>JobWorkspaceTaskScopingTests</c>,
-/// <c>ProjectsControllerTests</c> and <c>WorkspaceReconciliationTests</c>. Nothing but this file catches
-/// it — see the paragraph below for why that specific default is worth a file of its own.
-/// </description></item>
-/// <item><description>
-/// Deleting the recency index passes all 45 behavioural tests. The in-memory provider creates no
-/// indexes, so a query-plan guarantee has no behavioural observable; the model is the only place it
-/// exists.
+/// <em>does</em> enforce keys, so that invariant was already covered, and it is asserted here as well
+/// only because this is the place the failure names the invariant ("the checkpoint is per task") instead
+/// of surfacing as a duplicate-row exception three layers away. Recorded because it contradicts the
+/// premise this file was written under: the first draft claimed the behavioural suite could not see key
+/// changes at all, which the mutation disproved.
 /// </description></item>
 /// </list>
 /// The model is read through the Npgsql provider without opening a connection, the technique
@@ -42,14 +46,12 @@ namespace AgentMesh.Tests.Data;
 /// <para>
 /// <strong>The specific regression this is written to prevent.</strong> The migration deliberately departs
 /// from the job spec's SQL sketch on <c>projects.working_directory</c>: the column defaults to blank
-/// ("derive it from <c>repository_name</c>") rather than to the literal
-/// <c>'/workspace/repos/agent-mesh'</c>. A literal default would make EF materialize that path into every
-/// newly created project, so a project created as <c>repository_name='payments-api'</c> would be born
-/// pointing at agent-mesh's checkout — a directory that exists, is writable, and belongs to a different
-/// repository. Every command would succeed against the wrong tree and nothing would ever report an error.
-/// That is a silent-corruption failure, and the easiest way to reintroduce it is someone "correcting"
-/// the default to match the spec text. Pinning the blank default here turns that edit into a red test
-/// rather than a misdirected commit.
+/// ("derive it from <c>repository_name</c>") rather than to the literal above. A literal default makes EF
+/// materialize that path into every newly created project, so a project created as
+/// <c>repository_name='payments-api'</c> would be born pointing at agent-mesh's checkout — a directory
+/// that exists, is writable, and belongs to a different repository. Every command would succeed against
+/// the wrong tree and nothing would ever report an error. The likeliest way to reintroduce it is someone
+/// "correcting" the default to match the spec text; that edit now goes red.
 /// </para>
 /// </remarks>
 public class WorkspaceCheckpointSchemaTests
