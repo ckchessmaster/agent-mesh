@@ -1,9 +1,10 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Api.Tools;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Services;
 using AgentMesh.Tests.Helpers;
@@ -142,6 +143,48 @@ public class PlatformMcpToolsTests
 
         _sent.Should().Contain(e => e.Name == "SessionUpdated",
             "the runner's status chip must flip without a page refresh");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WhenNotRequiresReply_AndWorkflowRouterPresent_SignalsWorkflow()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["astra", "rook"]);
+        var routerMock = new Mock<IWorkflowSignalRouter>();
+        routerMock.Setup(r => r.SendChatMessageAsync(job.Id, It.IsAny<ChatMessageSignal>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SignalDelivery($"task-execution-{job.Id:N}", SignalDeliveryStatus.Delivered));
+
+        var tools = BuildTools(db, Context(jobId: job.Id, personaId: "astra"), workflows: routerMock.Object);
+        var json = await tools.PostJobMessage("Architecture reviewed; all looks good.", "rook", requires_reply: false);
+
+        var result = Parse(json);
+        result.GetProperty("success").GetBoolean().Should().BeTrue();
+
+        routerMock.Verify(r => r.SendChatMessageAsync(
+            job.Id,
+            It.Is<ChatMessageSignal>(s => s.SenderId == "astra" && s.Content.Contains("Architecture reviewed")),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WhenRequiresReply_DoesNotSignalWorkflow()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["astra", "rook"]);
+        var routerMock = new Mock<IWorkflowSignalRouter>();
+
+        var tools = BuildTools(db, Context(jobId: job.Id, personaId: "rook"), workflows: routerMock.Object);
+        var json = await tools.PostJobMessage("Do we use postgres or sqlite?", "astra", requires_reply: true);
+
+        var result = Parse(json);
+        result.GetProperty("success").GetBoolean().Should().BeTrue();
+
+        routerMock.Verify(r => r.SendChatMessageAsync(
+            It.IsAny<Guid>(),
+            It.IsAny<ChatMessageSignal>(),
+            It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -904,7 +947,8 @@ public class PlatformMcpToolsTests
     private PlatformMcpTools BuildTools(
         AgentMeshDbContext db,
         PlatformCallContext context,
-        IReadOnlyDictionary<string, string?>? configuration = null)
+        IReadOnlyDictionary<string, string?>? configuration = null,
+        IWorkflowSignalRouter? workflows = null)
     {
         var resolver = new Mock<IPlatformCallContextResolver>();
         resolver.Setup(r => r.ResolveAsync(It.IsAny<CancellationToken>())).ReturnsAsync(context);
@@ -919,7 +963,8 @@ public class PlatformMcpToolsTests
             _pullRequests.Object,
             _hub.Object,
             NullLogger<PlatformMcpTools>.Instance,
-            config);
+            config,
+            workflows);
     }
 
     private static PlatformCallContext Context(

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -9,6 +10,8 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AgentMesh.Api.Controllers;
 
@@ -127,7 +130,9 @@ public record JobMessageDto(
 public class ProjectJobsController(
     AgentMeshDbContext db,
     IHubContext<AgentMeshHub>? hubContext = null,
-    IStorageService? storageService = null) : ControllerBase
+    IStorageService? storageService = null,
+    IWorkflowSignalRouter? workflows = null,
+    ILogger<ProjectJobsController>? logger = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -915,7 +920,10 @@ public class ProjectJobsController(
     }
 
     [HttpPost("api/project-jobs/{id}/messages")]
-    public async Task<IActionResult> PostJobMessage(Guid id, [FromBody] PostJobMessageRequest req)
+    public async Task<IActionResult> PostJobMessage(
+        Guid id,
+        [FromBody] PostJobMessageRequest req,
+        CancellationToken ct = default)
     {
         var effectiveContent = !string.IsNullOrWhiteSpace(req.Content)
             ? req.Content.Trim()
@@ -1317,7 +1325,82 @@ public class ProjectJobsController(
             }
         }
 
+        await RouteReplyToWorkflowAsync(id, jobMsg, req, ct);
+
         return Ok(msgDto);
+    }
+
+    /// <summary>
+    /// Hands a human reply to the Temporal workflow that is parked waiting for one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the release half of the durable pause. Without it the workflow waits out its seven-day
+    /// gate while a human answers in a chat window nobody is reading — which is a worse failure than the
+    /// busy-polling it replaces, because at least polling eventually noticed.
+    /// </para>
+    /// <para>
+    /// <strong>Only a human reply is routed.</strong> A message from a persona is agent-to-agent
+    /// conversation: it belongs in the job ledger, and forwarding it would release the workflow's
+    /// <c>AwaitingInput</c> gate on a message the workflow never asked for, resuming a turn to act on
+    /// chatter. It would also let one agent answer another agent's escalation and thereby un-block a task
+    /// the escalation was raised against.
+    /// </para>
+    /// <para>
+    /// <strong>Never fails the request.</strong> The message is already committed and broadcast by the
+    /// time this runs. A Temporal outage must not turn into "your message was not saved" — the reply is
+    /// in the ledger either way, and the workflow's own gate still has days left on it. The delivery
+    /// result is logged, and the dedicated endpoints under
+    /// <c>MacroTurnsController</c> surface it to a caller that needs to know.
+    /// </para>
+    /// </remarks>
+    private async Task RouteReplyToWorkflowAsync(
+        Guid jobId,
+        JobMessage message,
+        PostJobMessageRequest req,
+        CancellationToken ct)
+    {
+        if (workflows is null) return;
+
+        // A null logger is the normal state for the ~40 controller tests that construct this type
+        // directly, so the routing block's two log calls go through a local no-op rather than the
+        // null-conditional operator at each site.
+        ILogger log = logger ?? NullLogger<ProjectJobsController>.Instance;
+
+        try
+        {
+            var senderId = !string.IsNullOrWhiteSpace(message.SenderId)
+                ? message.SenderId
+                : (!string.IsNullOrWhiteSpace(req.SenderId)
+                    ? req.SenderId
+                    : (string.Equals(req.SenderType, "persona", StringComparison.OrdinalIgnoreCase)
+                        ? (req.SenderName ?? "persona")
+                        : "operator"));
+
+            var delivery = await workflows.SendChatMessageAsync(
+                jobId,
+                new Core.Workflows.ChatMessageSignal(
+                    SenderId: senderId,
+                    Content: message.Content,
+                    Timestamp: message.CreatedAt,
+                    // The persisted row's id is the dedup key: a retried request re-sends the same id and
+                    // the workflow drops the duplicate instead of rendering the reply twice.
+                    MessageId: message.Id.ToString()),
+                ct);
+
+            if (!delivery.Delivered)
+            {
+                log.LogInformation(
+                    "Chat reply on job {JobId} was not routed to a workflow ({Status}: {Detail}); " +
+                    "the message is saved and will be visible to the next dispatched turn regardless",
+                    jobId, delivery.Status, delivery.Detail ?? "(none)");
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            log.LogWarning(ex,
+                "Routing a chat reply into the workflow for job {JobId} failed", jobId);
+        }
     }
 
     [HttpPost("api/project-jobs/{id}/complete")]

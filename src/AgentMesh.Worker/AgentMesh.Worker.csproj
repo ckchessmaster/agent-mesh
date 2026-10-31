@@ -16,6 +16,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The prompt-stack assembler's section ordering, sliding-window cap and drift detection are
+         asserted directly against the in-memory provider, which requires the internal members. Same
+         convention the Api, Cli, Core and Infrastructure projects declare. -->
+    <InternalsVisibleTo Include="AgentMesh.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\AgentMesh.ServiceDefaults\AgentMesh.ServiceDefaults.csproj" />
     <ProjectReference Include="..\AgentMesh.Infrastructure\AgentMesh.Infrastructure.csproj" />
     <ProjectReference Include="..\AgentMesh.Core\AgentMesh.Core.csproj" />

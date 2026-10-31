@@ -1,4 +1,4 @@
-using AgentMesh.Core.Enums;
+﻿using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
@@ -35,6 +35,24 @@ public class ProjectConfiguration : IEntityTypeConfiguration<Project>
         builder.Property(p => p.GitBaseBranch)
             .HasMaxLength(128)
             .HasDefaultValue("main")
+            .IsRequired();
+
+        // The {repo_name} in /workspace/repos/{repo_name}. Required with a default rather than
+        // nullable: every consumer that resolves a path has to get *a* directory back, and a null
+        // here would push the fallback into each of the three hosts that read it — where they would
+        // each invent a slightly different one.
+        builder.Property(p => p.RepositoryName)
+            .HasMaxLength(WorkspacePathResolver.MaxRepositoryNameLength)
+            .HasDefaultValue(Project.DefaultRepositoryName)
+            .IsRequired();
+
+        // Blank, not a literal path: see Project.WorkingDirectory for why a column default of
+        // '/workspace/repos/agent-mesh' would point every new multi-repo project at another
+        // repository's checkout. The migration still backfills legacy rows to that exact path so
+        // their resolved directory is unchanged by this feature.
+        builder.Property(p => p.WorkingDirectory)
+            .HasMaxLength(WorkspacePathResolver.MaxWorkingDirectoryLength)
+            .HasDefaultValue(string.Empty)
             .IsRequired();
 
         builder.Property(p => p.S3BucketName)

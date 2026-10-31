@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -120,6 +120,7 @@ builder.Services.AddScoped<IJobWorkspaceService, JobWorkspaceService>();
 builder.Services.AddScoped<JobTurnDispatcher>();
 builder.Services.AddScoped<IJobHandoffService, JobHandoffService>();
 builder.Services.AddHostedService<JobHandoffReaper>();
+builder.Services.AddScoped<IWorkflowSignalRouter, WorkflowSignalRouter>();
 
 // Platform MCP tools (post_job_message / manage_task / open_pull_request).
 // The context resolver is what lets an agent call these without knowing its own job id: a runner
@@ -157,6 +158,7 @@ builder.Services.AddCors(options =>
 
 // Configure Controllers & SignalR
 builder.Services.AddControllers()
+    .AddControllersAsServices()
     .AddJsonOptions(options =>
     {
         options.JsonSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles;

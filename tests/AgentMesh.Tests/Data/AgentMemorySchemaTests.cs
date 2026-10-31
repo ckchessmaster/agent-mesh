@@ -238,16 +238,48 @@ public class AgentMemorySchemaTests
         sql.Should().Contain(TableName);
     }
 
+    /// <summary>
+    /// The migration currently at the tip of the sequence.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TipMigrationId"/> is the tripwire's current value, updated by whoever stacks the next
+    /// migration. See <see cref="MigrationSequence_KeepsMigrationsInOrder"/>.
+    /// </remarks>
+    private const string TipMigrationId = "20261030171746_AddMultiRepoPathsAndTaskCheckpoints";
+
     [Fact]
-    public void MigrationSequence_KeepsAgentMemoriesAtTheTip()
+    public void MigrationSequence_KeepsMigrationsInOrder()
     {
         // Migrations apply in id order. Pinning the tip means a later migration stacked on top of this one
         // shows up as a failure to re-check rather than a silent assumption that the snapshot is current.
+        //
+        // The tripwire fired when AddMultiRepoPathsAndTaskCheckpoints was added, and re-checking it is
+        // what produced the assertions below: agent_memories is no longer the tip, so "is the tip" is no
+        // longer the invariant worth holding. What is still worth holding is that it is present, that it
+        // is ordered after the tables its foreign keys read, and that exactly one migration sits above it
+        // — so a fifth migration trips this test again rather than sliding in unnoticed.
         using var db = TestDbContextFactory.Postgres();
         var migrations = db.GetService<IMigrationsAssembly>().Migrations.Keys.ToList();
 
         migrations.Should().Contain(MigrationId);
-        migrations.IndexOf(MigrationId).Should().Be(migrations.Count - 1);
+        migrations.Should().Contain(TipMigrationId);
+
+        var agentMemoriesIndex = migrations.IndexOf(MigrationId);
+        var tipIndex = migrations.IndexOf(TipMigrationId);
+
+        tipIndex.Should().Be(migrations.Count - 1,
+            $"{TipMigrationId} is the expected tip; if a new migration was added, update TipMigrationId " +
+            "and re-check that agent_memories' position is still correct");
+        agentMemoriesIndex.Should().BeLessThan(tipIndex,
+            "the memories table predates the multi-repo migration and must not be re-ordered after it");
+
+        // The dependency that ordering actually protects: agent_memories' read path and the checkpoint's
+        // create path both resolve a project, so projects must exist first.
+        migrations.IndexOf("20261020184553_AddProjectsAndJobs")
+            .Should().BeLessThan(agentMemoriesIndex,
+                "agent_memories is scoped by project, so the projects table must be created first");
+
+        migrations.Should().HaveCount(tipIndex + 1);
     }
 
     [Fact]

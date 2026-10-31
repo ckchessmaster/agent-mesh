@@ -574,6 +574,28 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
             LastRequest = request;
             return Task.FromResult(_next);
         }
+
+        /// <summary>
+        /// Merge is asserted by <c>GitActivitiesTests</c> against a dedicated fake, not here: this
+        /// harness exists to drive the MCP tool surface, and no MCP tool merges. The stub implements it
+        /// only because <see cref="IGitHubPullRequestService"/> now declares the member — a PR opened
+        /// through <c>open_pull_request</c> and merged through a Temporal review signal are two
+        /// different trust decisions on two different code paths.
+        /// </summary>
+        public Task<GitHubMergeResult> MergePullRequestAsync(
+            GitHubMergeRequest request,
+            CancellationToken ct = default)
+        {
+            LastMergeRequest = request;
+            return Task.FromResult(_nextMerge);
+        }
+
+        public GitHubMergeRequest? LastMergeRequest { get; private set; }
+
+        private GitHubMergeResult _nextMerge = new(true, "Merged pull request #4242 via squash (commit abc1234).");
+
+        public void MergeFailsWith(string reason, string message) =>
+            _nextMerge = new GitHubMergeResult(false, message, reason);
     }
 
     /// <summary>
