@@ -352,6 +352,130 @@ public class TaskExecutionWorkflowTests
             "the last status written before the cancellation is all there is; promoting it to " +
             "'Halted: …' would report an operator's stop as an agent failure");
     }
+
+    /// <summary>
+    /// A persona cannot release its own escalation by posting again.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The escalation exists to force a decision from somebody else. If the asker could answer it, the
+    /// durable pause becomes a no-op that costs a turn instead of a pod — the same self-approval class as
+    /// the review-gate bypass fixed elsewhere in this PR, reached from the other direction. The run is
+    /// started with <c>PersonaId: "rook"</c> and <c>AgentId: "driver-rook"</c>, so a signal from either id
+    /// is the same principal.
+    /// </para>
+    /// <para>
+    /// Asserted as "still parked, and the drop is visible" rather than merely "not resumed": a test that
+    /// only waited on the park would also pass if the signal were dropped for an unrelated reason, and an
+    /// invisible drop is what makes an operator suspect the router rather than the sender.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("rook", "the persona id the run was started with")]
+    [InlineData("ROOK", "casing must not defeat the check; the start endpoint takes whatever was posted")]
+    [InlineData("@rook", "a leading @ is how the Cockpit and post_job_message both render a persona")]
+    [InlineData("driver-rook", "the driver agent id, which is the same principal and how an MCP caller may identify itself")]
+    public async Task SelfSignal_IsDroppedAndCounted(string senderId, string why)
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        turns.Enqueue(TurnOutcome.Awaiting("operator", "Which auth model do you want?"));
+        turns.Enqueue(TurnOutcome.Completed("should never run"));
+
+        var handle = await StartWorkflowAsync(env);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(senderId, "I'll just answer my own question.", DateTimeOffset.UtcNow, "msg-self")));
+
+        // The drop must be observable, not silent.
+        await WaitUntilAsync(handle, s => s.IgnoredSelfSignalCount == 1);
+
+        var parked = await handle.QueryAsync(w => w.GetTaskStatus());
+        parked!.PendingChatCount.Should().Be(0,
+            $"a self-signal from {senderId} must not even be buffered — {why}");
+        parked.Status.Should().StartWith("Waiting on input",
+            "the gate stays closed; releasing it on the asker's own message is the defect");
+
+        // Release it properly and confirm the run was intact rather than wedged by the drop.
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("operator", "Use OIDC.", DateTimeOffset.UtcNow, "msg-real")));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+        result.Success.Should().BeTrue("dropping a self-signal must not damage the run");
+        turns.Calls.Should().Be(2);
+    }
+
+    /// <summary>
+    /// Somebody else can still release the park — the fix must not seal the gate shut.
+    /// </summary>
+    /// <remarks>
+    /// The mirror of the self-signal test, and the one that keeps the check honest: an over-broad
+    /// comparison (say, "drop anything that is not the operator") would pass the test above while
+    /// reintroducing the deadlock this change exists to remove.
+    /// </remarks>
+    [Theory]
+    [InlineData("astra")]
+    [InlineData("sorren")]
+    [InlineData("operator")]
+    [InlineData("vane")]
+    public async Task ASignalFromAnotherParty_ReleasesThePark(string senderId)
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        turns.Enqueue(TurnOutcome.Awaiting(senderId, "Which auth model do you want?"));
+        turns.Enqueue(TurnOutcome.Completed("Shipped with the model you picked."));
+
+        var handle = await StartWorkflowAsync(env);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(senderId, "Use OIDC, not passwords.", DateTimeOffset.UtcNow, "msg-1")));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+
+        result.Success.Should().BeTrue();
+        var status = await handle.QueryAsync(w => w.GetTaskStatus());
+        status!.IgnoredSelfSignalCount.Should().Be(0,
+            $"{senderId} is not this run's persona, so nothing may be counted against it");
+    }
+
+    /// <summary>
+    /// A run started without a persona id cannot self-check, and must not drop everything.
+    /// </summary>
+    /// <remarks>
+    /// <c>PersonaId</c> is optional on <see cref="TaskExecutionInput"/>. A null-normalizing bug here would
+    /// fail closed — every signal treated as self-sent — which would look identical to the deadlock this
+    /// feature fixes, and would be reported as "the router is broken" rather than as a null check.
+    /// </remarks>
+    [Fact]
+    public async Task NoPersonaOnInput_StillAcceptsSignals()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        turns.Enqueue(TurnOutcome.Completed("done"));
+
+        var input = SampleInput with { PersonaId = null, AgentId = null };
+        var handle = await env.Client.StartWorkflowAsync(
+            (TaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(input),
+            new WorkflowOptions($"task-execution-{Guid.NewGuid():N}", Queue));
+
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "OIDC.", DateTimeOffset.UtcNow, "msg-1")));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+        result.Success.Should().BeTrue();
+    }
+
     /// <summary>
     /// A workflow that has no PR URL cannot be merged, and halts rather than crashing.
     /// </summary>
