@@ -475,6 +475,18 @@ public class TaskExecutionWorkflowTests
         parkedStatus.Status.Should().StartWith("Waiting on input");
         parkedStatus.PersonaId.Should().Be("rook");
 
+        // Message addressed to operator (e.g. MCP post_job_message(target_persona: "operator")) must not wake this run
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(
+                SenderId: "astra",
+                Content: "FYI operator, reviewed",
+                Timestamp: DateTimeOffset.UtcNow,
+                MessageId: "msg-op",
+                TargetPersonaId: "operator")));
+
+        parkedStatus = await handle.QueryAsync(w => w.GetTaskStatus());
+        parkedStatus!.PendingChatCount.Should().Be(0, "a message addressed to operator must not wake rook's parked workflow");
+
         // Now deliver a message addressed to @rook
         await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
             new ChatMessageSignal(

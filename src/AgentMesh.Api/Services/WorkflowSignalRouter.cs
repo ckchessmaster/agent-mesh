@@ -78,18 +78,28 @@ public interface IWorkflowSignalRouter
     /// an unreachable Temporal must not swallow chat replies. See the implementation for why the probe is
     /// bounded to <see cref="WorkflowSignalRouter.ProbeTimeout"/>.
     /// </remarks>
-    Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default);
-
     /// <summary>
-    /// Whether a running macro task workflow owns this job's next turn for the specified target persona.
+    /// Whether a running macro task workflow owns this job's next turn for the specified target persona,
+    /// or for any persona when <paramref name="targetPersonaId"/> is null or whitespace.
     /// </summary>
     /// <remarks>
     /// Scopes ownership to the orchestrated persona: when <paramref name="targetPersonaId"/> is provided,
     /// returns true only if the running workflow is driving that persona (or falls back to true if the
-    /// workflow's persona is unset).
+    /// workflow's persona is unset). Fails toward false: an unreachable Temporal must not swallow chat replies.
     /// </remarks>
-    Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
-        IsWorkflowDrivingAsync(jobId, ct);
+    Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Whether a running macro task workflow is currently driving turns on this job.
+    /// </summary>
+    /// <remarks>
+    /// Consulted by <c>PostJobMessage</c> before it dispatches a legacy SignalR runner, so a job under
+    /// Temporal management cannot also acquire a second agent on the same branch. Fails toward false:
+    /// an unreachable Temporal must not swallow chat replies. See the implementation for why the probe is
+    /// bounded to <see cref="WorkflowSignalRouter.ProbeTimeout"/>.
+    /// </remarks>
+    Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+        IsWorkflowDrivingAsync(jobId, null, ct);
 }
 
 /// <summary>What happened when a signal was routed.</summary>
@@ -319,6 +329,10 @@ public class WorkflowSignalRouter(
             (TaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(input),
             new WorkflowOptions(workflowId, TaskQueue)
             {
+                Memo = new Dictionary<string, object>
+                {
+                    ["personaId"] = input.PersonaId ?? string.Empty,
+                },
                 // AllowDuplicate is the default and is what we want: a workflow that completed for this
                 // job id can be re-run for a *different* task, which is the normal case for a checklist.
                 // The guard against double-running is the DescribeAsync check above, not the reuse
@@ -506,7 +520,18 @@ public class WorkflowSignalRouter(
             }
 
             // Scope ownership to the orchestrated persona:
-            // Query the running workflow to verify whether it is driving targetPersonaId.
+            // 1. Prefer reading the persona from workflow Memo (answered by the Temporal server directly,
+            // with no worker dependency so worker rollouts do not block or time out probe requests).
+            if (description.Memo != null &&
+                description.Memo.TryGetValue("personaId", out var raw) &&
+                raw != null &&
+                await raw.ToValueAsync<string>() is { Length: > 0 } driving)
+            {
+                return string.Equals(NormalizePersona(driving), NormalizePersona(targetPersonaId), StringComparison.Ordinal);
+            }
+
+            // 2. Fall back to querying the running workflow only when the memo is missing
+            // (e.g. workflows started before the memo was recorded).
             try
             {
                 var status = await handle.QueryAsync(
@@ -530,9 +555,9 @@ public class WorkflowSignalRouter(
             }
             catch (Exception ex)
             {
-                logger?.LogDebug("Could not query task status for workflow {WorkflowId}; falling back to job-level ownership: {Detail}",
+                logger?.LogDebug("Could not query task status for workflow {WorkflowId}; failing toward dispatch: {Detail}",
                     WorkflowIdFor(jobId), Describe(ex));
-                return true;
+                return false;
             }
         }
         // Re-thrown only when the CALLER went away. Our own budget expiring is also an

@@ -172,6 +172,28 @@ public class TurnSessionResolutionTests
     }
 
     /// <summary>
+    /// When the checkpoint points at a closed session and the workflow-start candidate is live,
+    /// resolution does NOT fall back to the older candidate; it returns null to trigger a fresh dispatch.
+    /// </summary>
+    [Fact]
+    public async Task ResolveExistingSession_WhenCheckpointIsTerminalAndWorkflowStartIsLive_ReturnsNull()
+    {
+        using var db = Db();
+        await SeedProjectAndJobAsync(db);
+        await SeedSessionAsync(db, StartSession, status: "thinking");
+        await SeedSessionAsync(db, CheckpointSession, status: "completed");
+        await SeedCheckpointAsync(db, CheckpointSession);
+
+        var runner = NewRunner(db);
+
+        var resolved = await runner.ResolveExistingSessionAsync(Request(turnSessionId: StartSession), CancellationToken.None);
+
+        resolved.Should().BeNull(
+            "a closed session in the checkpoint means the last turn finished; falling back to the older live session " +
+            "would re-attach to an obsolete session from before that finished turn");
+    }
+
+    /// <summary>
     /// A session id whose row no longer exists is treated as not live.
     /// </summary>
     /// <remarks>

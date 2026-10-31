@@ -415,6 +415,28 @@ public class WorkflowSignalRouterTests
     }
 
     /// <summary>
+    /// When workflow is started with Memo, the ownership probe reads from Temporal server description
+    /// and succeeds even when no worker is running (no worker dependency).
+    /// </summary>
+    [Fact]
+    public async Task IsWorkflowDriving_WithMemo_AnswersWithoutWorkerDependency()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var router = new WorkflowSignalRouter(env.Client);
+        var jobId = Guid.NewGuid();
+        var input = InputFor(jobId.ToString(), "task-memo") with { PersonaId = "rook" };
+
+        var startResult = await router.StartTaskWorkflowAsync(input);
+        startResult.Started.Should().BeTrue();
+
+        // Notice: NO worker is started or running.
+        // A Temporal query would hang/fail because there is no worker to answer it.
+        // But the describe call reads Memo directly from Temporal server:
+        (await router.IsWorkflowDrivingAsync(jobId, "rook")).Should().BeTrue("memo identifies rook as driving persona without worker");
+        (await router.IsWorkflowDrivingAsync(jobId, "astra")).Should().BeFalse("memo distinguishes peer persona without worker");
+    }
+
+    /// <summary>
     /// A job that was never orchestrated answers false rather than throwing.
     /// </summary>
     /// <remarks>

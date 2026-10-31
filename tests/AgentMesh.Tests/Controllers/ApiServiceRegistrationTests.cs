@@ -422,7 +422,7 @@ public class ApiServiceRegistrationTests : IClassFixture<WebApplicationFactory<A
         /// </remarks>
         public bool WorkflowDriving { get; set; }
 
-        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
             Task.FromResult(WorkflowDriving);
     }
 }

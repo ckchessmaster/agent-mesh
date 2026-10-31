@@ -1287,7 +1287,7 @@ public class PlatformMcpToolsTests
             Guid jobId, string? taskId, CancellationToken ct = default) =>
             Task.FromResult<AgentMesh.Core.Workflows.TaskStatusView?>(null);
 
-        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
             Task.FromResult(false);
     }
 
@@ -1316,7 +1316,7 @@ public class PlatformMcpToolsTests
             Task.FromException<AgentMesh.Core.Workflows.TaskStatusView?>(
                 new InvalidOperationException("simulated outage"));
 
-        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
             Task.FromException<bool>(new InvalidOperationException("simulated outage"));
     }
 }

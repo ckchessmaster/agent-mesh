@@ -482,9 +482,9 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     /// Whether an incoming chat signal is addressed to this workflow run.
     /// </summary>
     /// <remarks>
-    /// A message addressed explicitly to another persona (via REST @mentions or MCP target_persona)
-    /// must not release this run's wait condition. Unaddressed messages (TargetPersonaId is null)
-    /// and messages mentioning this persona, its driver agent, or "operator" are accepted.
+    /// A message addressed explicitly to another persona or to "operator" (via REST @mentions or MCP target_persona)
+    /// must not release this run's wait condition. Only unaddressed messages (TargetPersonaId is null)
+    /// and messages explicitly mentioning this persona or its driver agent are accepted.
     /// </remarks>
     private bool IsAddressedToThisRun(string? targetPersonaId)
     {
@@ -505,8 +505,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
             if (target is null) continue;
 
             if (string.Equals(target, _personaId, StringComparison.Ordinal) ||
-                string.Equals(target, _agentId, StringComparison.Ordinal) ||
-                string.Equals(target, "operator", StringComparison.Ordinal))
+                string.Equals(target, _agentId, StringComparison.Ordinal))
             {
                 return true;
             }

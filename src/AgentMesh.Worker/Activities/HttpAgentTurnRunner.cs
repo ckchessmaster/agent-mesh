@@ -218,19 +218,20 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     /// </remarks>
     internal async Task<Guid?> ResolveExistingSessionAsync(AgentTurnRequest request, CancellationToken ct)
     {
-        // Candidates in preference order. Unparseable and empty-GUID values are dropped here rather than
-        // at each use site, so a malformed id degrades to "no existing session" (dispatch fresh) instead
-        // of to "attach to GUID zero", which would observe a session that cannot exist.
-        var candidates = new List<(Guid id, string source)>();
+        // 1. Check the durable checkpoint first. The checkpoint is written mid-turn by the runner and
+        // is therefore fresher than any value fixed at workflow start.
+        Guid? fromCheckpoint = null;
+        bool checkpointChecked = false;
 
         try
         {
             var checkpoint = await checkpoints.GetCheckpointAsync(
                 request.Input.JobId, request.Input.TaskId, ct);
 
-            if (TryLiveId(checkpoint?.TurnSessionId, out var fromCheckpoint))
+            if (TryLiveId(checkpoint?.TurnSessionId, out var checkpointId))
             {
-                candidates.Add((fromCheckpoint, "checkpoint"));
+                fromCheckpoint = checkpointId;
+                checkpointChecked = true;
             }
         }
         catch (OperationCanceledException)
@@ -248,52 +249,70 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                 request.Input.TaskId);
         }
 
-        if (TryLiveId(request.TurnSessionId, out var fromRequest))
+        if (checkpointChecked && fromCheckpoint.HasValue)
         {
-            candidates.Add((fromRequest, "workflow input"));
+            var live = await CheckSessionStatusAsync(fromCheckpoint.Value, "checkpoint", request.Input.TaskId, ct);
+            if (live is not null && !TerminalStatuses.Contains(live, StringComparer.OrdinalIgnoreCase))
+            {
+                logger.LogInformation(
+                    "Re-attaching to live turn session {SessionId} (status {Status}, from checkpoint) for task " +
+                    "{TaskId} instead of dispatching a second agent",
+                    fromCheckpoint.Value, live, request.Input.TaskId);
+                return fromCheckpoint.Value;
+            }
+
+            // A checkpoint naming a closed session means the last turn finished, so the next turn is
+            // new work and needs a new session. Falling back to an older workflow-start session would
+            // re-observe a stale transcript or spin on an obsolete session.
+            logger.LogDebug(
+                "Turn session {SessionId} from checkpoint is {State} for task {TaskId}; not re-attaching " +
+                "and not falling back to older candidates; fresh turn required",
+                fromCheckpoint.Value, live is null ? "missing" : $"terminal ({live})", request.Input.TaskId);
+            return null;
         }
 
-        foreach (var (id, source) in candidates)
+        // 2. Only if no checkpoint session existed (e.g. turn 1 before any checkpoint was recorded,
+        // or reading the checkpoint failed), fall back to checking the workflow-start value.
+        if (TryLiveId(request.TurnSessionId, out var fromRequest))
         {
-            string? live;
-            try
+            var live = await CheckSessionStatusAsync(fromRequest, "workflow input", request.Input.TaskId, ct);
+            if (live is not null && !TerminalStatuses.Contains(live, StringComparer.OrdinalIgnoreCase))
             {
-                live = await db.AgentSessions.AsNoTracking()
-                    .Where(s => s.Id == id)
-                    .Select(s => s.Status)
-                    .FirstOrDefaultAsync(ct);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex,
-                    "Could not check whether turn session {SessionId} is still live for task {TaskId}",
-                    id, request.Input.TaskId);
-                continue;
+                logger.LogInformation(
+                    "Re-attaching to live turn session {SessionId} (status {Status}, from workflow input) for task " +
+                    "{TaskId} instead of dispatching a second agent",
+                    fromRequest, live, request.Input.TaskId);
+                return fromRequest;
             }
 
-            // A session row that does not exist is treated as not live. It is not "unknown, assume
-            // fine": attaching to a vanished session would observe nothing and settle on the ledger
-            // fallback, which is the same silent misbehaviour as attaching to a closed one.
-            if (live is null || TerminalStatuses.Contains(live, StringComparer.OrdinalIgnoreCase))
-            {
-                logger.LogDebug(
-                    "Turn session {SessionId} from {Source} is {State} for task {TaskId}; not re-attaching",
-                    id, source, live is null ? "missing" : $"terminal ({live})", request.Input.TaskId);
-                continue;
-            }
-
-            logger.LogInformation(
-                "Re-attaching to live turn session {SessionId} (status {Status}, from {Source}) for task " +
-                "{TaskId} instead of dispatching a second agent",
-                id, live, source, request.Input.TaskId);
-            return id;
+            logger.LogDebug(
+                "Turn session {SessionId} from workflow input is {State} for task {TaskId}; not re-attaching",
+                fromRequest, live is null ? "missing" : $"terminal ({live})", request.Input.TaskId);
         }
 
         return null;
+    }
+
+    private async Task<string?> CheckSessionStatusAsync(Guid id, string source, string taskId, CancellationToken ct)
+    {
+        try
+        {
+            return await db.AgentSessions.AsNoTracking()
+                .Where(s => s.Id == id)
+                .Select(s => s.Status)
+                .FirstOrDefaultAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Could not check whether turn session {SessionId} from {Source} is still live for task {TaskId}",
+                id, source, taskId);
+            return null;
+        }
     }
 
     /// <summary>Parses a session id that is present, well-formed, and not the empty GUID.</summary>

@@ -1926,6 +1926,49 @@ public class ProjectJobsControllerTests
     }
 
     /// <summary>
+    /// When multiple personas are mentioned in different orders (e.g. "@rook @astra" vs "@astra @rook"),
+    /// the probe checks each mention independently, so non-driven personas are always dispatched
+    /// regardless of mention order.
+    /// </summary>
+    [Theory]
+    [InlineData("@rook @astra please collaborate", "rook,astra")]
+    [InlineData("@astra @rook please collaborate", "astra,rook")]
+    public async Task PostJobMessage_MentionOrder_DispatchesPeerPersonaRegardlessOfOrder(string content, string expectedSignalTarget)
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-order-" + Guid.NewGuid().ToString("N")[..6]);
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "agy" });
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = project.Id, PersonaId = "rook" });
+
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement feature",
+            AssignedPersonaId = "rook",
+        };
+        var job = MakeAssignmentJob(project.Id, "Order Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "rook", // Workflow is driving rook, not astra
+        };
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: content, SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue(
+            "non-driven peer persona @astra must be dispatched regardless of mention order");
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "rook")).Should().BeFalse(
+            "driven persona @rook must be suppressed from legacy dispatch regardless of mention order");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaId.Should().Be(expectedSignalTarget);
+    }
+
+    /// <summary>
     /// When the workflow is driving the targeted persona (e.g. rook), dispatching that persona is suppressed.
     /// </summary>
     [Fact]
@@ -2190,7 +2233,7 @@ public class ProjectJobsControllerTests
             Guid jobId, string? taskId, CancellationToken ct = default) =>
             Task.FromResult<AgentMesh.Core.Workflows.TaskStatusView?>(null);
 
-        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
             Task.FromException<bool>(new InvalidOperationException("simulated Temporal outage"));
     }
 }
