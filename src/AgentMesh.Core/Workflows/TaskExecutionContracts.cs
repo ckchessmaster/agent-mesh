@@ -134,6 +134,14 @@ public record TaskStatusView(
     /// </remarks>
     int IgnoredSelfSignalCount = 0,
     /// <summary>
+    /// Chat signals this run refused because they were addressed to another persona or operator.
+    /// </summary>
+    /// <remarks>
+    /// Surfaced alongside <see cref="IgnoredSelfSignalCount"/> so that misaddressed chat signals
+    /// dropped by third-party isolation are visible on the status view instead of appearing lost.
+    /// </remarks>
+    int IgnoredMisaddressedSignalCount = 0,
+    /// <summary>
     /// The persona this workflow run is driving, or null if unassigned.
     /// </summary>
     string? PersonaId = null);

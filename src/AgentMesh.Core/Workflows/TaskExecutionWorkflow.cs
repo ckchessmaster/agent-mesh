@@ -140,6 +140,12 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     /// </remarks>
     private int _ignoredSelfSignals;
 
+    /// <summary>
+    /// Chat signals dropped by the third-party persona isolation check in <see cref="ReceiveChatMessageAsync"/>.
+    /// Reported through the status query: see <see cref="TaskStatusView.IgnoredMisaddressedSignalCount"/>.
+    /// </summary>
+    private int _ignoredMisaddressedSignals;
+
     private string _currentStatus = "Initializing";
     private string? _awaitingFrom;
 
@@ -471,6 +477,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         // A message addressed to a third-party persona on the job must not release this run's wait gate.
         if (!IsAddressedToThisRun(signal.TargetPersonaId))
         {
+            _ignoredMisaddressedSignals++;
             return Task.CompletedTask;
         }
 
@@ -578,6 +585,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         PrUrl: _activePrUrl,
         TurnSessionId: _turnSessionId,
         IgnoredSelfSignalCount: _ignoredSelfSignals,
+        IgnoredMisaddressedSignalCount: _ignoredMisaddressedSignals,
         PersonaId: _personaId);
 
     /// <summary>

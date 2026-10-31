@@ -472,6 +472,7 @@ public class TaskExecutionWorkflowTests
 
         var parkedStatus = await handle.QueryAsync(w => w.GetTaskStatus());
         parkedStatus!.PendingChatCount.Should().Be(0, "a message addressed to @astra must not be enqueued into @rook's inbox");
+        parkedStatus.IgnoredMisaddressedSignalCount.Should().Be(1, "a message addressed to @astra must be counted as misaddressed");
         parkedStatus.Status.Should().StartWith("Waiting on input");
         parkedStatus.PersonaId.Should().Be("rook");
 
@@ -486,6 +487,7 @@ public class TaskExecutionWorkflowTests
 
         parkedStatus = await handle.QueryAsync(w => w.GetTaskStatus());
         parkedStatus!.PendingChatCount.Should().Be(0, "a message addressed to operator must not wake rook's parked workflow");
+        parkedStatus.IgnoredMisaddressedSignalCount.Should().Be(2, "a message addressed to operator must also be counted as misaddressed");
 
         // Now deliver a message addressed to @rook
         await handle.SignalAsync(w => w.ReceiveChatMessageAsync(

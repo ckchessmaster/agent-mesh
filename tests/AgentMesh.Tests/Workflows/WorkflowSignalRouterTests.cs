@@ -6,6 +6,7 @@ using AgentMesh.Core.Workflows;
 using AgentMesh.Tests.Sandbox;
 using FluentAssertions;
 using Temporalio.Activities;
+using Temporalio.Client;
 using Temporalio.Testing;
 using Temporalio.Worker;
 using Xunit;
@@ -434,6 +435,30 @@ public class WorkflowSignalRouterTests
         // But the describe call reads Memo directly from Temporal server:
         (await router.IsWorkflowDrivingAsync(jobId, "rook")).Should().BeTrue("memo identifies rook as driving persona without worker");
         (await router.IsWorkflowDrivingAsync(jobId, "astra")).Should().BeFalse("memo distinguishes peer persona without worker");
+    }
+
+    /// <summary>
+    /// When workflow was started without Memo (e.g. legacy workflow run) and worker is down,
+    /// the status query times out/fails and probe fails toward dispatch (returns false).
+    /// </summary>
+    [Fact]
+    public async Task IsWorkflowDriving_WithoutMemo_WhenWorkerIsDown_QueryFailureReturnsFalse()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var router = new WorkflowSignalRouter(env.Client);
+        var jobId = Guid.NewGuid();
+        var workflowId = WorkflowSignalRouter.WorkflowIdFor(jobId);
+        var input = InputFor(jobId.ToString(), "task-no-memo") with { PersonaId = "rook" };
+
+        // Start workflow directly without Memo so the describe call finds no persona memo
+        await env.Client.StartWorkflowAsync(
+            (TaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(input),
+            new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue));
+
+        // No worker is running to answer the status query.
+        // Query failure must return false to fail toward legacy dispatch rather than swallowing the message.
+        var driving = await router.IsWorkflowDrivingAsync(jobId, "astra");
+        driving.Should().BeFalse("query failure without memo must fail toward dispatch (false), not swallow peer messages");
     }
 
     /// <summary>

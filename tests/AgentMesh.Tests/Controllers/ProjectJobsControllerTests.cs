@@ -2107,7 +2107,8 @@ public class ProjectJobsControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = NewRoutingController(db, new ThrowingOwnershipRouter());
+        var router = new ThrowingOwnershipRouter();
+        var controller = NewRoutingController(db, router);
 
         var result = await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
             Content: "yes, use OIDC", SenderType: "user", SenderId: "operator"));
@@ -2116,6 +2117,8 @@ public class ProjectJobsControllerTests
             "a Temporal outage must not turn into a failed message post");
         (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue(
             "and it must not silently swallow the turn either");
+        router.ChatSends.Should().ContainSingle(
+            "the signal is still delivered to the workflow router even when the ownership probe fails");
     }
 
     /// <summary>
@@ -2209,13 +2212,18 @@ public class ProjectJobsControllerTests
 
     private sealed class ThrowingOwnershipRouter : AgentMesh.Api.Services.IWorkflowSignalRouter
     {
+        public List<(Guid jobId, AgentMesh.Core.Workflows.ChatMessageSignal signal)> ChatSends { get; } = [];
+
         public Task<AgentMesh.Api.Services.SignalDelivery> SendChatMessageAsync(
             Guid jobId,
             AgentMesh.Core.Workflows.ChatMessageSignal signal,
-            CancellationToken ct = default) =>
-            Task.FromResult(new AgentMesh.Api.Services.SignalDelivery(
+            CancellationToken ct = default)
+        {
+            ChatSends.Add((jobId, signal));
+            return Task.FromResult(new AgentMesh.Api.Services.SignalDelivery(
                 "task-execution-" + jobId.ToString("N"),
                 AgentMesh.Api.Services.SignalDeliveryStatus.NoRunningWorkflow));
+        }
 
         public Task<AgentMesh.Api.Services.SignalDelivery> SendPrReviewAsync(
             Guid jobId,
