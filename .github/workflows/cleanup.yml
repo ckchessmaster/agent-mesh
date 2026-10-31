@@ -1,0 +1,103 @@
+name: Weekly Cleanup
+
+# Keeps only the most recent N releases (plus their CI artifacts and GHCR images/chart versions).
+# Git tags are intentionally left in place.
+
+on:
+  schedule:
+    - cron: '17 3 * * 0' # Sundays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: 'Number of most recent releases to keep'
+        required: false
+        default: '3'
+      dry_run:
+        description: 'Only report what would be deleted'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write   # delete releases
+  actions: write    # delete workflow artifacts
+  packages: write   # delete GHCR package versions
+
+concurrency:
+  group: cleanup
+  cancel-in-progress: false
+
+env:
+  KEEP: ${{ github.event.inputs.keep || '3' }}
+  # Scheduled runs are always live; manual runs default to dry-run.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run || 'false' }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  releases-and-artifacts:
+    name: Prune Releases & CI Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old releases
+        id: releases
+        run: |
+          set -euo pipefail
+          # Newest first by creation date (not by tag name).
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+            --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' > all.txt
+          head -n "$KEEP" all.txt > keep.txt
+          tail -n +"$((KEEP + 1))" all.txt > delete.txt
+
+          echo "Keeping:"; cat keep.txt
+          echo "KEEP_TAGS=$(paste -sd, keep.txt)" >> "$GITHUB_OUTPUT"
+
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would delete release $tag"
+            else
+              echo "Deleting release $tag"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+            fi
+          done < delete.txt
+
+      - name: Prune old workflow artifacts
+        env:
+          KEEP_TAGS: ${{ steps.releases.outputs.KEEP_TAGS }}
+        run: |
+          set -euo pipefail
+          # Keep artifacts from runs of the kept release tags, and anything newer than 1 day
+          # (so in-flight / just-finished runs are never touched).
+          cutoff=$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.created_at < \"$cutoff\") | [.id, (.workflow_run.head_branch // \"\")] | @tsv" \
+            > artifacts.tsv
+
+          count=0
+          while IFS=$'\t' read -r id branch; do
+            case ",$KEEP_TAGS," in *",$branch,"*) continue ;; esac
+            count=$((count + 1))
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would delete artifact $id ($branch)"
+            else
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" > /dev/null || echo "failed to delete artifact $id"
+            fi
+          done < artifacts.tsv
+          echo "Artifacts targeted: $count"
+
+  container-images:
+    name: Prune GHCR Images & Helm Chart
+    runs-on: ubuntu-latest
+    steps:
+      # Uses a multi-arch/attestation-aware cleaner so per-platform and provenance manifests of
+      # kept images are never deleted. `latest` is always preserved.
+      - name: Clean up GHCR package versions
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          # Optional PAT with delete:packages, needed if GITHUB_TOKEN can't manage the packages.
+          token: ${{ secrets.PACKAGES_PAT || github.token }}
+          packages: agent-mesh-api,agent-mesh-worker,agent-mesh-dashboard,agent-mesh-persona-runner,charts/agent-mesh
+          keep-n-tagged: ${{ env.KEEP }}
+          delete-untagged: true
+          exclude-tags: latest
+          dry-run: ${{ env.DRY_RUN }}
