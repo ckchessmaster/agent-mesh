@@ -68,6 +68,17 @@ public interface IWorkflowSignalRouter
     /// distinguishes the two.
     /// </remarks>
     Task<TaskStatusView?> GetStatusAsync(Guid jobId, string? taskId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Whether a running macro task workflow owns this job's next turn.
+    /// </summary>
+    /// <remarks>
+    /// Consulted by <c>PostJobMessage</c> before it dispatches a legacy SignalR runner, so a job under
+    /// Temporal management cannot also acquire a second agent on the same branch. Fails toward false:
+    /// an unreachable Temporal must not swallow chat replies. See the implementation for why the probe is
+    /// bounded to <see cref="WorkflowSignalRouter.ProbeTimeout"/>.
+    /// </remarks>
+    Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default);
 }
 
 /// <summary>What happened when a signal was routed.</summary>
@@ -147,7 +158,8 @@ public record WorkflowStartResult(
 /// </remarks>
 public class WorkflowSignalRouter(
     ITemporalClient temporal,
-    ILogger<WorkflowSignalRouter>? logger = null) : IWorkflowSignalRouter
+    ILogger<WorkflowSignalRouter>? logger = null,
+    AgentMesh.Core.Repositories.IWorkspaceStateRepository? checkpoints = null) : IWorkflowSignalRouter
 {
     /// <summary>Prefix for every macro task workflow id.</summary>
     public const string WorkflowIdPrefix = "task-execution-";
@@ -329,11 +341,12 @@ public class WorkflowSignalRouter(
         CancellationToken ct = default)
     {
         var workflowId = WorkflowIdFor(jobId);
+        TaskStatusView? status;
 
         try
         {
             var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(workflowId);
-            return await handle.QueryAsync(
+            status = await handle.QueryAsync(
                 w => w.GetTaskStatus(),
                 new WorkflowQueryOptions { Rpc = Rpc(ct) });
         }
@@ -347,7 +360,157 @@ public class WorkflowSignalRouter(
                 workflowId, Describe(ex));
             return null;
         }
+
+        return status is null ? null : await WithTurnSessionId(status, jobId, taskId, ct);
     }
+
+    /// <summary>
+    /// Fills in the session id the workflow cannot know.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Why the workflow cannot report this itself.</strong> <c>TurnOutcome</c> deliberately has
+    /// no <c>TurnSessionId</c> field: the session id is a per-<em>attempt</em> identity, and threading it
+    /// back through the workflow would record a second id for a task whose first attempt timed out —
+    /// orphaning the very session the retry is supposed to re-attach to. The pairing therefore lives in
+    /// the durable checkpoint row, written by the runner mid-turn. So the workflow's own
+    /// <c>_turnSessionId</c> can only ever be the value the run was started with, which for the normal
+    /// case (start without one) is null forever, and the status endpoint's
+    /// <c>TurnSessionId</c> — documented as "latest turn session, for deep-linking into the transcript"
+    /// — was a permanently empty column.
+    /// </para>
+    /// <para>
+    /// Reading it here rather than in the workflow keeps the workflow deterministic and adds no new wire
+    /// type: the checkpoint is already the single source of truth for the pairing, and this is a read of
+    /// it on the display path only.
+    /// </para>
+    /// <para>
+    /// <strong>Never fails the request.</strong> The workflow query already succeeded; a database hiccup
+    /// here must not turn a working status endpoint into a 500, so an unavailable pairing degrades to the
+    /// un-enriched view.
+    /// </para>
+    /// </remarks>
+    private async Task<TaskStatusView> WithTurnSessionId(
+        TaskStatusView status,
+        Guid jobId,
+        string? taskId,
+        CancellationToken ct)
+    {
+        if (checkpoints is null)
+        {
+            return status;
+        }
+
+        try
+        {
+            // The checkpoint wins even when the workflow already carries a value. Its own field can only
+            // ever be the id the run was *started* with, so on an explicit start it would deep-link to
+            // turn 1's transcript for the rest of the run — while the field is documented as "latest turn
+            // session". The checkpoint is rewritten at every turn boundary, so it is the only freshest
+            // answer available. The workflow's value remains the fallback for a task whose row has no
+            // pairing yet.
+            var pairing = string.IsNullOrWhiteSpace(taskId)
+                ? (await checkpoints.GetCheckpointsForJobAsync(jobId.ToString(), ct))
+                    .FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.TurnSessionId))?.TurnSessionId
+                : (await checkpoints.GetCheckpointAsync(jobId.ToString(), taskId, ct))?.TurnSessionId;
+
+            return string.IsNullOrWhiteSpace(pairing)
+                ? status
+                : status with { TurnSessionId = pairing };
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(ex,
+                "Could not read the turn-session pairing for job {JobId}; the status view will carry no " +
+                "transcript deep-link", jobId);
+            return status;
+        }
+    }
+
+    /// <summary>
+    /// Whether a macro task workflow is currently running for this job, and therefore owns its next turn.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Why this exists as a separate call.</strong> <c>PostJobMessage</c> has to decide, before it
+    /// dispatches anything, whether a legacy SignalR runner or the durable workflow should act on the
+    /// reply. Both acting is not a benign race: each starts an agent on the same working tree, so two
+    /// agents edit one branch, push over each other, and the operator sees a rejected push nobody can
+    /// explain. The answer is "exactly one owner per job", and the only authority on that is whether the
+    /// workflow is live.
+    /// </para>
+    /// <para>
+    /// <strong>Fails toward the legacy path.</strong> A describe that errors, times out, or returns
+    /// anything unexpected yields false, which leaves <c>PostJobMessage</c> behaving exactly as it did
+    /// before orchestration existed. The alternative — treating an unreachable Temporal as "a workflow is
+    /// driving, so suppress the dispatch" — would mean a control-plane outage silently swallows every chat
+    /// reply on every job: no runner, no signal, no error to the sender. A double-drive under an outage is
+    /// recoverable; a dropped turn is not.
+    /// </para>
+    /// <para>
+    /// <strong>Bounded by a deadline, not by an RPC timeout.</strong> This runs on the hottest chat
+    /// endpoint in the product, in the request path, on every message that mentions a persona, so it must
+    /// not be able to hold a request thread.
+    /// </para>
+    /// <para>
+    /// The obvious implementation — <c>RpcOptions.Timeout</c> — does not do that, and I wrote it that way
+    /// before measuring. Against a dead endpoint with the SDK's default retry policy, a 1.5-second RPC
+    /// timeout took <strong>9.08 seconds</strong> end to end: the timeout bounds a single attempt and each
+    /// retry then re-dials from scratch. A cancellation deadline on the same call took <strong>1.52
+    /// seconds</strong>, because a deadline bounds the whole operation including retries. So the bound here
+    /// is a linked <see cref="CancellationTokenSource"/>, and <see cref="ProbeTimeout"/> is a total budget,
+    /// not a per-attempt timeout.
+    /// </para>
+    /// </remarks>
+    public async Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default)
+    {
+        try
+        {
+            // Linked, so the caller's own cancellation still propagates immediately and independently of
+            // the budget. CancelAfter alone would also work, but linking keeps both sources observable and
+            // leaves ct unmutated for the rest of the request.
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(ProbeTimeout);
+
+            var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(WorkflowIdFor(jobId));
+            var description = await handle.DescribeAsync(
+                new WorkflowDescribeOptions { Rpc = new RpcOptions { CancellationToken = deadline.Token } });
+
+            return description.Status == WorkflowExecutionStatus.Running;
+        }
+        // Re-thrown only when the CALLER went away. Our own budget expiring is also an
+        // OperationCanceledException, and must degrade to false like any other probe failure: the request
+        // is still live, and the right answer under a slow control plane is "not orchestrated, dispatch as
+        // usual". Distinguishing the two by testing ct rather than the linked token is why the filter is on
+        // ct.IsCancellationRequested and not a bare catch.
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Includes the ordinary case of a job that has never been orchestrated: the server answers
+            // with "execution not found", which is not an error condition here, so it is Debug-level.
+            // Also includes the budget expiring, which is the whole point of the bound.
+            logger?.LogDebug("Orchestration probe for {WorkflowId} answered negatively: {Detail}",
+                WorkflowIdFor(jobId), Describe(ex));
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Total budget for the per-message orchestration probe, <em>including</em> SDK retries.
+    /// </summary>
+    /// <remarks>
+    /// Enforced as a cancellation deadline rather than as <c>RpcOptions.Timeout</c>, for the measured
+    /// reason on <see cref="IsWorkflowDrivingAsync"/>: the latter bounds one attempt, and the default retry
+    /// policy then re-dials, tripling it (1.5s configured, 9.08s observed).
+    /// </remarks>
+    public static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(1.5);
 
     /// <summary>
     /// The execution's status, or null when there is no such execution.

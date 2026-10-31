@@ -1,5 +1,7 @@
-﻿using AgentMesh.Api.Services;
+﻿using System.Diagnostics;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Activities;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Tests.Sandbox;
 using FluentAssertions;
@@ -346,8 +348,403 @@ public class WorkflowSignalRouterTests
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // The ownership probe (PostJobMessage consults this before dispatching)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A running workflow owns the job's next turn.
+    /// </summary>
+    /// <remarks>
+    /// The positive case of the rule that keeps a legacy SignalR runner off a branch the workflow is
+    /// already driving. Without it, an unaddressed human reply resolves its target to the pending task's
+    /// assignee — the orchestrated persona — and both paths start an agent.
+    /// </remarks>
+    [Fact]
+    public async Task IsWorkflowDriving_ForARunningWorkflow_IsTrue()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        var handle = await StartAsync(env, jobId);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        var router = new WorkflowSignalRouter(env.Client);
+
+        (await router.IsWorkflowDrivingAsync(jobId)).Should().BeTrue();
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Layout A", DateTimeOffset.UtcNow, "msg-x")));
+        await handle.GetResultAsync();
+    }
+
+    /// <summary>
+    /// A job that was never orchestrated answers false rather than throwing.
+    /// </summary>
+    /// <remarks>
+    /// This is the overwhelmingly common case — orchestration is opt-in per task, so almost every job in
+    /// the product hits this path on every chat message. The server's "execution not found" RPC error must
+    /// be an ordinary false here, or the probe would fail the hottest endpoint in the product for the
+    /// majority of jobs.
+    /// </remarks>
+    [Fact]
+    public async Task IsWorkflowDriving_ForAnUnknownJob_IsFalseRatherThanThrowing()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var router = new WorkflowSignalRouter(env.Client);
+
+        var act = async () => await router.IsWorkflowDrivingAsync(Guid.NewGuid());
+
+        await act.Should().NotThrowAsync();
+        (await router.IsWorkflowDrivingAsync(Guid.NewGuid())).Should().BeFalse();
+    }
+
+    /// <summary>
+    /// A workflow that has closed stops owning the job, so the legacy path is available again.
+    /// </summary>
+    /// <remarks>
+    /// The other half of "the workflow's own liveness is the only answer that cannot drift". A completed
+    /// run must not keep suppressing dispatches forever — that would freeze a job whose orchestration
+    /// ended but which still takes chat replies, which is the same silent-swallow failure an unreachable
+    /// Temporal would cause.
+    /// </remarks>
+    [Fact]
+    public async Task IsWorkflowDriving_AfterTheWorkflowCompletes_IsFalse()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        turns.Enqueue(TurnOutcome.Completed("done"));
+        var handle = await StartAsync(env, jobId);
+        await handle.GetResultAsync();
+
+        var router = new WorkflowSignalRouter(env.Client);
+
+        (await router.IsWorkflowDrivingAsync(jobId)).Should().BeFalse(
+            "a finished run must release the job back to the ordinary chat path");
+    }
+
+    /// <summary>
+    /// The probe returns within its budget when Temporal is unreachable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Why this is measured rather than asserted on a constant.</strong> The first version of this
+    /// test checked that <c>ProbeTimeout</c> was ≤ 2 seconds. That is theatre: it pins a number, not the
+    /// behaviour, and it stayed green while the implementation was wrong. The implementation it was
+    /// guarding passed <c>RpcOptions.Timeout = 1.5s</c> — which bounds a single <em>attempt</em>, after
+    /// which the SDK's default retry policy re-dials from scratch. Measured against a dead endpoint:
+    /// <strong>9.08 seconds</strong> for a call configured to give up in 1.5. A cancellation deadline on
+    /// the same call: <strong>1.52 seconds</strong>.
+    /// </para>
+    /// <para>
+    /// So this test drives the real method against a real client whose server has gone away, and asserts
+    /// the elapsed wall-clock bound. It fails against the <c>RpcOptions.Timeout</c> version and passes
+    /// against the deadline version — verified by running it against both. That is the property that
+    /// matters: this probe sits in the request path of every job-chat message that mentions a persona, and
+    /// a stalled control plane must degrade to "not orchestrated" in about a second rather than hold a
+    /// request thread for nine.
+    /// </para>
+    /// <para>
+    /// The upper bound is 3 seconds against a 1.5-second budget. It is not tight enough to be a latency
+    /// assertion — the deadline is enforced by a timer, so the passing case lands near 1.5s on any machine
+    /// speed — but it is wide enough that ordinary scheduling noise cannot fail it, and narrow enough that
+    /// the regression it guards (measured at 5.9–9.1s) trips it immediately.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task IsWorkflowDriving_WhenTemporalIsUnreachable_ReturnsWithinItsBudget()
+    {
+        // A real client, connected to a real server, then orphaned by that server shutting down. This is
+        // the only way to exercise the actual gRPC path: WorkflowHandle is not mockable (Moq cannot proxy
+        // it — it has no accessible constructor), and a hand-rolled TCP black hole fails at ConnectAsync
+        // before the probe is ever reached.
+        var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var client = env.Client;
+        var router = new WorkflowSignalRouter(client);
+        await env.DisposeAsync();
+
+        var elapsed = Stopwatch.StartNew();
+        var driving = await router.IsWorkflowDrivingAsync(Guid.NewGuid());
+        elapsed.Stop();
+
+        driving.Should().BeFalse("an unreachable control plane must answer 'not orchestrated'");
+        elapsed.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(3),
+            $"the probe's budget is {WorkflowSignalRouter.ProbeTimeout.TotalSeconds:0.#}s and it bounds " +
+            "the whole operation; ~9s means it regressed to RpcOptions.Timeout, which bounds one attempt " +
+            "and then lets the retry policy re-dial");
+    }
+
+    /// <summary>
+    /// The caller's own cancellation still propagates through the probe's budget.
+    /// </summary>
+    /// <remarks>
+    /// The budget is a linked token, so it must not swallow the caller's reason for cancelling: the
+    /// request thread is going away and continuing to dispatch would leak a turn for a client that has
+    /// left. Distinguishing "my deadline" (degrade to false) from "the caller left" (re-throw) is the whole
+    /// job of the exception filter on the probe.
+    /// </remarks>
+    [Fact]
+    public async Task IsWorkflowDriving_WhenTheCallerCancels_Propagates()
+    {
+        var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var client = env.Client;
+        var router = new WorkflowSignalRouter(client);
+        await env.DisposeAsync();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+
+        var act = async () => await router.IsWorkflowDrivingAsync(Guid.NewGuid(), cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>(
+            "the caller went away; degrading that to 'false' would keep the request alive to dispatch a " +
+            "turn nobody is waiting for");
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+    // The status view's transcript deep-link (2d)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The status view carries the session id from the durable checkpoint, not the one the workflow
+    /// happens to remember.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The workflow's own <c>_turnSessionId</c> is assigned exactly once, from
+    /// <c>input.TurnSessionId</c>, and never updated — by design. <see cref="TurnOutcome"/> deliberately
+    /// has no session-id field because the id is per-<em>attempt</em>: recording it in the workflow would
+    /// store a second id for a task whose first attempt timed out and orphan the session the retry is
+    /// meant to re-attach to. The consequence, before this was fixed, was that the field was null for
+    /// every workflow started without an explicit id (the normal case) and pinned to turn 1 for every
+    /// workflow started with one — so the endpoint's documented "latest turn session, for deep-linking
+    /// into the transcript" was either empty or wrong.
+    /// </para>
+    /// <para>
+    /// The pairing lives in the checkpoint row, which the runner writes mid-turn. Reading it here keeps
+    /// the workflow deterministic and adds no wire type; the checkpoint stays the single source of truth.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task GetStatus_EnrichesWithTheCheckpointSessionId()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        var taskId = "task-a";
+        var sessionId = Guid.NewGuid();
+
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        var handle = await StartAsync(env, jobId);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        var router = new WorkflowSignalRouter(
+            env.Client, checkpoints: new StubCheckpoints((taskId, sessionId)));
+
+        var status = await router.GetStatusAsync(jobId, taskId);
+
+        status.Should().NotBeNull();
+        status!.TurnSessionId.Should().Be(sessionId.ToString(),
+            "the checkpoint is the only freshest record of the pairing; the workflow cannot know it");
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Layout A", DateTimeOffset.UtcNow, "msg-x")));
+        await handle.GetResultAsync();
+    }
+
+    /// <summary>
+    /// With no task id supplied, the newest checkpoint on the job supplies the deep-link.
+    /// </summary>
+    /// <remarks>
+    /// The status endpoint's <c>taskId</c> is an optional query parameter and the dashboard polls without
+    /// one, so the job-level path is the common case rather than an edge case.
+    /// </remarks>
+    [Fact]
+    public async Task GetStatus_WithoutATaskId_UsesTheNewestPairedCheckpointOnTheJob()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        var older = Guid.NewGuid();
+        var newest = Guid.NewGuid();
+
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        var handle = await StartAsync(env, jobId);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        // Ordered newest-first, matching the repository's documented contract, and the first row carries
+        // no pairing so the scan has to skip it.
+        var router = new WorkflowSignalRouter(
+            env.Client,
+            checkpoints: new StubCheckpoints(
+                ("task-unpaired", null),
+                ("task-b", newest),
+                ("task-a", older)));
+
+        var status = await router.GetStatusAsync(jobId, taskId: null);
+
+        status!.TurnSessionId.Should().Be(newest.ToString());
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Layout A", DateTimeOffset.UtcNow, "msg-x")));
+        await handle.GetResultAsync();
+    }
+
+    /// <summary>
+    /// No pairing anywhere leaves the rest of the status view intact.
+    /// </summary>
+    /// <remarks>
+    /// The enrichment is additive. A task that has not dispatched a turn yet has no session id, and that
+    /// must not cost the caller the lifecycle state it did ask for.
+    /// </remarks>
+    [Fact]
+    public async Task GetStatus_WithNoPairing_StillReturnsTheStatusView()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        var handle = await StartAsync(env, jobId);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        var router = new WorkflowSignalRouter(env.Client, checkpoints: new StubCheckpoints(("task-a", null)));
+
+        var status = await router.GetStatusAsync(jobId, "task-a");
+
+        status.Should().NotBeNull();
+        status!.TurnSessionId.Should().BeNull();
+        status.Status.Should().StartWith("Waiting on input");
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Layout A", DateTimeOffset.UtcNow, "msg-x")));
+        await handle.GetResultAsync();
+    }
+
+    /// <summary>
+    /// A pairing lookup that throws must not turn a working status endpoint into a failure.
+    /// </summary>
+    /// <remarks>
+    /// The workflow query has already succeeded by this point; the database read is a display nicety. A
+    /// 500 here would make the dashboard claim the control plane is broken when only the deep-link is
+    /// unavailable — the same "unusable gate gets routed around" failure this branch already fixed once in
+    /// the review gate.
+    /// </remarks>
+    [Fact]
+    public async Task GetStatus_WhenThePairingLookupThrows_StillReturnsTheStatusView()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        var handle = await StartAsync(env, jobId);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        var router = new WorkflowSignalRouter(
+            env.Client, checkpoints: new ThrowingCheckpoints());
+
+        var status = await router.GetStatusAsync(jobId, "task-a");
+
+        status.Should().NotBeNull("a failed deep-link lookup must not fail the status request");
+        status!.Status.Should().StartWith("Waiting on input");
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Layout A", DateTimeOffset.UtcNow, "msg-x")));
+        await handle.GetResultAsync();
+    }
+
+    /// <summary>
+    /// A router built without the repository — the shape every pre-existing test uses — is unchanged.
+    /// </summary>
+    /// <remarks>
+    /// Pins the backward compatibility of the new optional constructor parameter: the enrichment is
+    /// additive, and a host that has not wired the repository still answers status queries exactly as
+    /// before rather than throwing on a null dependency.
+    /// </remarks>
+    [Fact]
+    public async Task GetStatus_WithoutACheckpointRepository_BehavesAsBefore()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        var handle = await StartAsync(env, jobId);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        var router = new WorkflowSignalRouter(env.Client);
+
+        var status = await router.GetStatusAsync(jobId, "task-a");
+
+        status.Should().NotBeNull();
+        status!.TurnSessionId.Should().BeNull();
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Layout A", DateTimeOffset.UtcNow, "msg-x")));
+        await handle.GetResultAsync();
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // Wiring
     // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A checkpoint store that answers only the two reads the status enrichment performs.
+    /// </summary>
+    private sealed class StubCheckpoints(params (string TaskId, Guid? SessionId)[] rows)
+        : AgentMesh.Core.Repositories.IWorkspaceStateRepository
+    {
+        public Task<bool> SaveCheckpointAsync(
+            TaskWorkingCheckpoint checkpoint, CancellationToken ct = default) => Task.FromResult(true);
+
+        public Task<TaskWorkingCheckpoint?> GetCheckpointAsync(
+            string jobId, string taskId, CancellationToken ct = default) =>
+            Task.FromResult(For(taskId));
+
+        public Task<IReadOnlyList<TaskWorkingCheckpoint>> GetCheckpointsForJobAsync(
+            string jobId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<TaskWorkingCheckpoint>>(
+                rows.Select(r => For(r.TaskId)).OfType<TaskWorkingCheckpoint>().ToList());
+
+        private TaskWorkingCheckpoint? For(string taskId)
+        {
+            var match = rows.FirstOrDefault(r => r.TaskId == taskId);
+            if (match.TaskId is null) return null;
+
+            return new TaskWorkingCheckpoint(
+                JobId: "job", TaskId: taskId, ActiveBranch: "fix/x", Status: "working",
+                LastSummary: "s", ModifiedFiles: [], ActiveStash: null,
+                UpdatedAt: DateTimeOffset.UtcNow, TurnSessionId: match.SessionId?.ToString());
+        }
+    }
+
+    private sealed class ThrowingCheckpoints
+        : AgentMesh.Core.Repositories.IWorkspaceStateRepository
+    {
+        public Task<bool> SaveCheckpointAsync(
+            TaskWorkingCheckpoint checkpoint, CancellationToken ct = default) => Task.FromResult(true);
+
+        public Task<TaskWorkingCheckpoint?> GetCheckpointAsync(
+            string jobId, string taskId, CancellationToken ct = default) =>
+            Task.FromException<TaskWorkingCheckpoint?>(
+                new InvalidOperationException("simulated store outage"));
+
+        public Task<IReadOnlyList<TaskWorkingCheckpoint>> GetCheckpointsForJobAsync(
+            string jobId, CancellationToken ct = default) =>
+            Task.FromException<IReadOnlyList<TaskWorkingCheckpoint>>(
+                new InvalidOperationException("simulated store outage"));
+    }
 
     private static TaskExecutionInput InputFor(string jobId, string taskId) => new(
         JobId: jobId,

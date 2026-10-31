@@ -60,7 +60,13 @@ public class PlatformMcpTools(
     IGitHubPullRequestService pullRequests,
     IHubContext<AgentMeshHub> hubContext,
     ILogger<PlatformMcpTools> logger,
-    IConfiguration? configuration = null)
+    IConfiguration? configuration = null,
+    // Optional for the same reason it is optional on ProjectJobsController: the tool is constructed
+    // directly by tests that exercise the ledger behaviour and must not be forced to know about Temporal.
+    // The production container registers it (Program.cs), and ApiServiceRegistrationTests pins that —
+    // without that pin, an absent registration here would silently leave every MCP-routed escalation
+    // undeliverable, which is the exact defect this parameter exists to fix.
+    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -255,6 +261,28 @@ public class PlatformMcpTools(
             await hubContext.Clients.All.SendAsync("SessionUpdated", parkedSession, ct);
         }
 
+        // Route into a parked macro workflow, if this job has one.
+        //
+        // This is the escalation channel, so it is the one that mattered. An orchestrated agent blocks
+        // with post_job_message(requires_reply: true, target_persona: "astra") and parks in
+        // AwaitingInput; the only party who can answer is another persona, and another persona answers
+        // through THIS tool, not through the REST endpoint. Routing only the REST path therefore left
+        // every cross-persona escalation — the normal shape of two-man review in this product —
+        // undeliverable, and the task sat for the full seven days.
+        //
+        // Every message is offered, including the sender's own escalation, and the workflow decides.
+        // That is not sloppiness: an escalation from the orchestrated persona arrives while its own turn
+        // is still running, so the workflow has not reached WaitConditionAsync yet and the signal would
+        // be buffered into _chatInbox — which releases the park the instant it is entered, making the
+        // durable pause a no-op that costs a turn. TaskExecutionWorkflow.ReceiveChatMessageAsync drops
+        // self-sent signals and counts the drop, so the ordering hazard is closed at the one place that
+        // knows who the run belongs to. Filtering here instead would need this tool to resolve the
+        // workflow's persona, which it cannot do without a second round trip.
+        //
+        // Never fails the tool. The message is committed and broadcast above; a Temporal outage must not
+        // make a delivered message look undeliverable to the agent that sent it.
+        await RouteReplyToWorkflowAsync(job.Id, message, sender, ct);
+
         return JsonSerializer.Serialize(new
         {
             success = true,
@@ -291,6 +319,74 @@ public class PlatformMcpTools(
         session.Status = WaitingForInputStatus;
         session.UpdatedAt = DateTimeOffset.UtcNow;
         return session;
+    }
+
+    /// <summary>
+    /// Hands a persona-authored job message to the macro workflow parked on this job, if there is one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The mirror of <c>ProjectJobsController.RouteReplyToWorkflowAsync</c> for the channel agents
+    /// actually use. Both are needed because the two surfaces are not interchangeable: a human answers in
+    /// the Cockpit (REST), another persona answers with <c>post_job_message</c> (this tool). Routing only
+    /// the REST path is what left cross-persona escalations wedged.
+    /// </para>
+    /// <para>
+    /// <strong>Deliberately not filtered on <c>requires_reply</c>.</strong> The obvious rule — route only
+    /// messages that ask for a reply — is backwards here. A message with <c>requires_reply: true</c> from
+    /// the orchestrated persona is that persona <em>raising</em> an escalation, not answering one; it is
+    /// precisely the message that must not release the gate, and it is stopped by the workflow's own
+    /// self-sender check, which is the only place that knows who the run belongs to. Meanwhile a plain
+    /// persona post with no reply flag can be the answer to an escalation the workflow is already parked
+    /// on — <c>post_job_message</c> carries no "in reply to" field, so the flag cannot distinguish them.
+    /// Offering everything and letting the run decide is the version that is correct in both cases.
+    /// </para>
+    /// <para>
+    /// <strong>Sender id prefers the persona, then the agent.</strong> <c>SenderIdentity</c> permits a
+    /// caller with only an agent identity, and the workflow's self-check compares against both its persona
+    /// and its driver id; sending a null here would make an agent-identified self-message look like it
+    /// came from nobody and slip past.
+    /// </para>
+    /// <para>
+    /// Never fails the tool: the message is already committed and broadcast, and a Temporal outage must
+    /// not make a delivered message look undeliverable to the agent that sent it.
+    /// </para>
+    /// </remarks>
+    private async Task RouteReplyToWorkflowAsync(
+        Guid jobId,
+        JobMessage message,
+        SenderIdentity sender,
+        CancellationToken ct)
+    {
+        if (workflows is null) return;
+
+        try
+        {
+            var delivery = await workflows.SendChatMessageAsync(
+                jobId,
+                new Core.Workflows.ChatMessageSignal(
+                    SenderId: sender.PersonaId ?? sender.AgentId ?? "unknown",
+                    Content: message.Content,
+                    Timestamp: message.CreatedAt,
+                    // The persisted row's id is the dedup key, matching the REST path: a retried call
+                    // re-sends the same id and the workflow drops the duplicate rather than rendering the
+                    // same reply twice.
+                    MessageId: message.Id.ToString()),
+                ct);
+
+            if (!delivery.Delivered)
+            {
+                logger.LogInformation(
+                    "post_job_message on job {JobId} was not routed to a workflow ({Status}: {Detail}); " +
+                    "the message is saved and the next dispatched turn will read it from the ledger",
+                    jobId, delivery.Status, delivery.Detail ?? "(none)");
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex,
+                "Routing a post_job_message reply into the workflow for job {JobId} failed", jobId);
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────────
