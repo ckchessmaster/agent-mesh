@@ -145,6 +145,146 @@ public class PlatformMcpToolsTests
             "the runner's status chip must flip without a page refresh");
     }
 
+    // ── Durable-workflow routing (escalation release) ────────────────────────────
+    //
+    // An orchestrated agent parks in Temporal's history, not in a runner, so nothing polling the
+    // session table will ever notice a reply. The other persona answers it through THIS tool — not
+    // through the REST endpoint a human uses — so if routing lives only on the REST path, every
+    // cross-persona escalation (the normal shape of two-man review here) is undeliverable and the task
+    // sits for the full seven-day gate.
+
+    [Fact]
+    public async Task PostJobMessage_RoutesTheReplyIntoTheParkedWorkflow()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["astra", "rook"]);
+
+        var router = new RecordingRouter();
+        var tools = BuildTools(
+            db, Context(jobId: job.Id, personaId: "astra", agentId: "astra-driver"), router);
+
+        await tools.PostJobMessage("Use OIDC, not passwords. Here is the spec.", "rook",
+            requires_reply: false);
+
+        router.ChatSends.Should().HaveCount(1,
+            "a persona-to-persona message is how an escalation actually gets answered; not routing it " +
+            "leaves the workflow parked while the answer sits in the ledger");
+        router.ChatSends[0].jobId.Should().Be(job.Id);
+        router.ChatSends[0].signal.SenderId.Should().Be("astra",
+            "the workflow's self-check compares against this id; sending the agent id or a blank would " +
+            "either mis-attribute the answer or defeat the check");
+        router.ChatSends[0].signal.Content.Should().Contain("OIDC");
+    }
+
+    /// <summary>
+    /// Routing is not gated on <c>requires_reply</c>, because the flag cannot distinguish the cases.
+    /// </summary>
+    /// <remarks>
+    /// The obvious rule — "route only messages that ask for a reply" — is backwards here. A
+    /// <c>requires_reply: true</c> from the orchestrated persona is that persona <em>raising</em> an
+    /// escalation, which must not release its own gate; a plain progress-free answer from another persona
+    /// carries no flag at all, because <c>post_job_message</c> has no "in reply to" field. So the flag
+    /// selects the wrong set in both directions. Everything is offered and the workflow decides, which is
+    /// the only component that knows who the run belongs to.
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_RoutesEvenWithoutRequiresReply()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["sorren", "rook"]);
+
+        var router = new RecordingRouter();
+        var tools = BuildTools(db, Context(jobId: job.Id, personaId: "sorren"), router);
+
+        await tools.PostJobMessage("Architecture sign-off: approved, merge it.", "rook",
+            requires_reply: false);
+
+        router.ChatSends.Should().HaveCount(1,
+            "the answer to an escalation carries no requires_reply flag; gating on it would drop the " +
+            "only message that can release the gate");
+    }
+
+    /// <summary>
+    /// A Temporal outage must not make a delivered message look undeliverable to the agent that sent it.
+    /// </summary>
+    /// <remarks>
+    /// The message is committed and broadcast before routing runs. Surfacing a routing failure as a tool
+    /// error would invite the agent to re-post, duplicating the ledger entry for a message the human
+    /// already saw — and an agent that believes its escalation failed starts escalating harder.
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_WhenRoutingThrows_StillReportsSuccess()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["astra", "rook"]);
+
+        var tools = BuildTools(
+            db,
+            Context(jobId: job.Id, personaId: "astra", sessionId: Guid.NewGuid()),
+            new ThrowingRouter());
+
+        var result = Parse(await tools.PostJobMessage(
+            "Answering your escalation.", "rook", requires_reply: true));
+
+        result.GetProperty("success").GetBoolean().Should().BeTrue();
+        result.GetProperty("messageId").GetGuid().Should().NotBeEmpty();
+
+        var stored = await ReadBackAsync(dbName, d => d.JobMessages.SingleAsync(m => m.JobId == job.Id));
+        stored.Content.Should().Contain("Answering your escalation.");
+    }
+
+    /// <summary>
+    /// The dedup key is the persisted row id, matching the REST path.
+    /// </summary>
+    /// <remarks>
+    /// A retried MCP call re-sends the same id so the workflow drops the duplicate instead of rendering
+    /// the same answer twice, which reads to the model as the human repeating themselves.
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_UsesThePersistedRowIdAsTheDedupKey()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["astra", "rook"]);
+
+        var router = new RecordingRouter();
+        var tools = BuildTools(db, Context(jobId: job.Id, personaId: "astra"), router);
+
+        var result = Parse(await tools.PostJobMessage("Dedup me.", "rook", requires_reply: false));
+
+        var messageId = result.GetProperty("messageId").GetGuid();
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.MessageId.Should().Be(messageId.ToString(),
+            "the signal must carry the id of the row that was actually written, or the workflow's " +
+            "duplicate window cannot match a redelivery against it");
+    }
+
+    /// <summary>
+    /// With no router wired, the tool behaves exactly as before orchestration existed.
+    /// </summary>
+    /// <remarks>
+    /// Pins the optional-parameter contract: the ~60 tests in this file construct the tool without a
+    /// router, and production registers one (pinned by <c>ApiServiceRegistrationTests</c>). A null here
+    /// must be a silent no-op, not a null reference.
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_WithoutARouter_StillPersistsAndBroadcasts()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["astra", "rook"]);
+
+        var tools = BuildTools(db, Context(jobId: job.Id, personaId: "astra"), workflows: null);
+
+        var result = Parse(await tools.PostJobMessage("No router here.", "rook", requires_reply: false));
+
+        result.GetProperty("success").GetBoolean().Should().BeTrue();
+        _sent.Should().Contain(e => e.Name == "JobMessageCreated");
+    }
+
     [Fact]
     public async Task PostJobMessage_WhenNotRequiresReply_AndWorkflowRouterPresent_SignalsWorkflow()
     {
@@ -168,12 +308,14 @@ public class PlatformMcpToolsTests
     }
 
     [Fact]
-    public async Task PostJobMessage_WhenRequiresReply_DoesNotSignalWorkflow()
+    public async Task PostJobMessage_WhenRequiresReply_SignalsWorkflow()
     {
         var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
         using var db = NewDb(dbName);
         var job = await SeedJobAsync(db, personas: ["astra", "rook"]);
         var routerMock = new Mock<IWorkflowSignalRouter>();
+        routerMock.Setup(r => r.SendChatMessageAsync(job.Id, It.IsAny<ChatMessageSignal>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SignalDelivery($"task-execution-{job.Id:N}", SignalDeliveryStatus.Delivered));
 
         var tools = BuildTools(db, Context(jobId: job.Id, personaId: "rook"), workflows: routerMock.Object);
         var json = await tools.PostJobMessage("Do we use postgres or sqlite?", "astra", requires_reply: true);
@@ -182,9 +324,9 @@ public class PlatformMcpToolsTests
         result.GetProperty("success").GetBoolean().Should().BeTrue();
 
         routerMock.Verify(r => r.SendChatMessageAsync(
-            It.IsAny<Guid>(),
-            It.IsAny<ChatMessageSignal>(),
-            It.IsAny<CancellationToken>()), Times.Never);
+            job.Id,
+            It.Is<ChatMessageSignal>(s => s.SenderId == "rook" && s.Content.Contains("Do we use postgres")),
+            It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -947,8 +1089,23 @@ public class PlatformMcpToolsTests
     private PlatformMcpTools BuildTools(
         AgentMeshDbContext db,
         PlatformCallContext context,
-        IReadOnlyDictionary<string, string?>? configuration = null,
-        IWorkflowSignalRouter? workflows = null)
+        IReadOnlyDictionary<string, string?>? configuration = null) =>
+        BuildTools(db, context, workflows: null, configuration);
+
+    /// <summary>
+    /// Builds the tool, optionally with a signal router.
+    /// </summary>
+    /// <remarks>
+    /// The router parameter is optional on <c>PlatformMcpTools</c> for the same reason it is optional on
+    /// <c>ProjectJobsController</c>: the ~60 tests here exercise ledger behaviour and must not be forced to
+    /// know about Temporal. Overloading rather than editing every call site keeps that property while
+    /// letting the routing tests supply a recording fake.
+    /// </remarks>
+    private PlatformMcpTools BuildTools(
+        AgentMeshDbContext db,
+        PlatformCallContext context,
+        IWorkflowSignalRouter? workflows,
+        IReadOnlyDictionary<string, string?>? configuration = null)
     {
         var resolver = new Mock<IPlatformCallContextResolver>();
         resolver.Setup(r => r.ResolveAsync(It.IsAny<CancellationToken>())).ReturnsAsync(context);
@@ -1090,4 +1247,74 @@ public class PlatformMcpToolsTests
 
     private static JsonElement Parse(string json) => JsonDocument.Parse(json).RootElement.Clone();
 
+    /// <summary>
+    /// A router that records what it was asked to deliver.
+    /// </summary>
+    /// <remarks>
+    /// A hand-written fake rather than a <c>Mock&lt;IWorkflowSignalRouter&gt;</c> because the assertion is
+    /// about the *payload* — which sender id and which dedup key reach the wire — and reading those off a
+    /// recorded tuple is clearer than re-deriving them from <c>Invocations</c>. It also lets the same fake
+    /// answer <c>IsWorkflowDrivingAsync</c> without a second setup expression.
+    /// </remarks>
+    private sealed class RecordingRouter : IWorkflowSignalRouter
+    {
+        public List<(Guid jobId, AgentMesh.Core.Workflows.ChatMessageSignal signal)> ChatSends { get; } = [];
+
+        public Task<SignalDelivery> SendChatMessageAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.ChatMessageSignal signal,
+            CancellationToken ct = default)
+        {
+            ChatSends.Add((jobId, signal));
+            return Task.FromResult(new SignalDelivery(
+                WorkflowSignalRouter.WorkflowIdFor(jobId), SignalDeliveryStatus.Delivered));
+        }
+
+        public Task<SignalDelivery> SendPrReviewAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.PrReviewSignal signal,
+            CancellationToken ct = default) =>
+            Task.FromResult(new SignalDelivery(
+                WorkflowSignalRouter.WorkflowIdFor(jobId), SignalDeliveryStatus.Delivered));
+
+        public Task<WorkflowStartResult> StartTaskWorkflowAsync(
+            AgentMesh.Core.Workflows.TaskExecutionInput input, CancellationToken ct = default) =>
+            Task.FromResult(new WorkflowStartResult(true, "test-workflow"));
+
+        public Task<AgentMesh.Core.Workflows.TaskStatusView?> GetStatusAsync(
+            Guid jobId, string? taskId, CancellationToken ct = default) =>
+            Task.FromResult<AgentMesh.Core.Workflows.TaskStatusView?>(null);
+
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+            Task.FromResult(false);
+    }
+
+    /// <summary>A router that fails the way an unreachable Temporal fails.</summary>
+    private sealed class ThrowingRouter : IWorkflowSignalRouter
+    {
+        public Task<SignalDelivery> SendChatMessageAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.ChatMessageSignal signal,
+            CancellationToken ct = default) =>
+            Task.FromException<SignalDelivery>(
+                new InvalidOperationException("simulated Temporal outage on the signal call"));
+
+        public Task<SignalDelivery> SendPrReviewAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.PrReviewSignal signal,
+            CancellationToken ct = default) =>
+            Task.FromException<SignalDelivery>(new InvalidOperationException("simulated outage"));
+
+        public Task<WorkflowStartResult> StartTaskWorkflowAsync(
+            AgentMesh.Core.Workflows.TaskExecutionInput input, CancellationToken ct = default) =>
+            Task.FromException<WorkflowStartResult>(new InvalidOperationException("simulated outage"));
+
+        public Task<AgentMesh.Core.Workflows.TaskStatusView?> GetStatusAsync(
+            Guid jobId, string? taskId, CancellationToken ct = default) =>
+            Task.FromException<AgentMesh.Core.Workflows.TaskStatusView?>(
+                new InvalidOperationException("simulated outage"));
+
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+            Task.FromException<bool>(new InvalidOperationException("simulated outage"));
+    }
 }

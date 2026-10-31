@@ -130,15 +130,51 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     /// <summary>Most recent review decision awaiting consumption.</summary>
     private PrReviewSignal? _prReview;
 
+    /// <summary>
+    /// Chat signals dropped by the self-escalation check in <see cref="ReceiveChatMessageAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Reported through the status query because <c>AgentMesh.Core</c> deliberately carries no logging
+    /// abstraction (it references only <c>Temporalio</c>), and a silent drop is indistinguishable from a
+    /// signal that never arrived. See <see cref="TaskStatusView.IgnoredSelfSignalCount"/>.
+    /// </remarks>
+    private int _ignoredSelfSignals;
+
     private string _currentStatus = "Initializing";
     private string? _awaitingFrom;
+
+    /// <summary>
+    /// The persona this workflow is driving, for the self-escalation check in
+    /// <see cref="ReceiveChatMessageAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Captured from the run input rather than re-read, so it is part of the deterministic history and
+    /// identical on replay. Normalized to lowercase at assignment so the comparison against a sender id
+    /// (which arrives lowercased from the MCP tool but as-typed from the start endpoint) cannot be
+    /// defeated by casing.
+    /// </remarks>
+    private string? _personaId;
+
+    /// <summary>
+    /// The driver agent id this run dispatches turns as, for the same self-check.
+    /// </summary>
+    /// <remarks>
+    /// Needed because <c>post_job_message</c> resolves its sender as <c>personaId ?? agentId</c>
+    /// (PlatformMcpTools.SenderIdentity), and the persona half is derived from the calling session. An
+    /// out-of-band or header-only caller can therefore present just the agent id — which for the
+    /// orchestrated agent is the same principal. Comparing the persona alone would let that message
+    /// through and the agent could still answer its own escalation.
+    /// </remarks>
+    private string? _agentId;
+
+    /// <summary>The job this run belongs to, for log correlation only.</summary>
+    private string _jobId = string.Empty;
     private DateTimeOffset? _awaitingSince;
     private int _turnCount;
     private TurnOutcomeStatus? _lastOutcome;
     private string? _activePrUrl;
     private int? _activePrNumber;
     private string? _turnSessionId;
-    private string? _personaId;
     private bool _isTerminated;
 
     /// <summary>
@@ -155,7 +191,12 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     {
         _currentStatus = "Running";
         _turnSessionId = input.TurnSessionId;
-        _personaId = input.PersonaId;
+
+        // Identity for the signal filters. Normalized here rather than at each comparison so the run's
+        // view of "who am I" is fixed once, deterministically, from the input that was recorded in
+        // history — a replay cannot disagree with the original execution about which sender ids to drop.
+        _personaId = NormalizeIdentity(input.PersonaId);
+        _agentId = NormalizeIdentity(input.AgentId);
 
         while (!_isTerminated)
         {
@@ -292,7 +333,27 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                         }
                         catch (Exception ex) when (IsTurnHalt(ex))
                         {
-                            var reason = HaltReasonOf(ex);
+                            // The same translation the turn activity gets, and for the same reason: the
+                            // activity raises a rejection (merge conflict, head moved after approval, not
+                            // mergeable, no PR URL) as a non-retryable ApplicationFailure precisely so
+                            // Temporal does not hammer GitHub with a call that will never succeed, and its
+                            // own comment states the workflow turns that into a halted task with the reason
+                            // intact. Until now it did not — the call sat outside this filter, so the
+                            // exception escaped the run and the workflow ended Failed with no result at all.
+                            //
+                            // The cost of that was not cosmetic. A crashed workflow writes no
+                            // TaskExecutionResult and never reaches the _currentStatus assignment below, so
+                            // the status endpoint kept serving "Merging PR" — the last value written before
+                            // the crash — indefinitely. The rejection classes are exactly the ones a human
+                            // can resolve (fix the conflict, re-review the new head), and the operator's
+                            // only clue was a merge that appeared to be in progress forever.
+                            //
+                            // Reusing IsTurnHalt rather than writing a merge-specific filter is the point:
+                            // it keeps transient failures (raised as ordinary exceptions, retryable) out of
+                            // this branch so the RetryPolicy above still applies, and keeps a genuine
+                            // workflow cancellation propagating so an operator's stop is not reported as an
+                            // agent failure.
+                            var reason = $"Approved merge could not complete: {HaltReasonOf(ex)}";
                             _currentStatus = $"Halted: {reason}";
                             _lastOutcome = TurnOutcomeStatus.Failed;
                             _isTerminated = true;
@@ -373,24 +434,75 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     {
         if (signal is null) return Task.CompletedTask;
 
-        // An agent must not receive its own chat messages as replies. When an orchestrated agent
-        // escalates to a persona or posts into the ledger, its own message must never release the
-        // wait gate or enqueue into its own chat inbox.
-        if (!string.IsNullOrWhiteSpace(_personaId) &&
-            string.Equals(signal.SenderId, _personaId, StringComparison.OrdinalIgnoreCase))
-        {
-            return Task.CompletedTask;
-        }
-
         // Duplicate suppression. A redelivery is normal — the API retried a call that timed out
         // client-side but landed server-side — and a duplicated reply would be rendered into the
         // prompt twice, which reads to the model as the human repeating themselves and can change its
         // answer.
         if (IsDuplicate(signal.MessageId)) return Task.CompletedTask;
 
+        // A persona must not be able to answer its own escalation.
+        //
+        // Without this, an agent that parked with requires_reply could release itself by posting a
+        // second message to the job — the same self-approval class as the review-gate bypass fixed
+        // elsewhere in this PR, reached from the other direction. The escalation exists to force a
+        // decision from somebody else; letting the asker supply it turns the durable pause into a no-op
+        // that costs a turn instead of a pod.
+        //
+        // This is deliberately the ONLY filter on the gate. The tempting stronger rule — "release only
+        // for the party named in _awaitingFrom" — cannot be enforced from a sender id, and I wrote it
+        // here before measuring why it must not be:
+        //
+        //   The REST router stamps a human reply's SenderId from whatever the caller supplied
+        //   (ProjectJobsController: `req.SenderId ?? "operator"`), and a persona's from its persona id.
+        //   A human posting as "sorren" and a persona named "sorren" therefore arrive as the identical
+        //   string. So an awaited-party gate would (a) lock the operator out of answering an escalation
+        //   their own agent raised — the exact deadlock this change exists to remove, reintroduced in a
+        //   new form — and (b) be trivially bypassable by a persona that happens to share a name.
+        //
+        // Distinguishing them needs the sender's *kind* on the wire, not its id. That is a change to
+        // ChatMessageSignal, which is a workflow wire contract; flagged for @Architect rather than
+        // invented here. Until then the self-check is the property that is actually enforceable, and
+        // everything else is left to the turn, which reads the full job ledger anyway.
+        if (IsSelf(signal.SenderId))
+        {
+            // Counted rather than logged: see IgnoredSelfSignalCount. A drop with no observable trace
+            // would leave an operator staring at a task that will not resume, with nothing to point at.
+            _ignoredSelfSignals++;
+            return Task.CompletedTask;
+        }
+
         _chatInbox.Enqueue(signal);
         return Task.CompletedTask;
     }
+
+    /// <summary>Whether a sender is the persona this workflow is driving.</summary>
+    /// <remarks>
+    /// Case-insensitive because persona ids arrive lowercased from the MCP tool's
+    /// <c>Trim().TrimStart('@').ToLowerInvariant()</c> and from the REST mentions regex, but the workflow
+    /// input is whatever the operator posted to the start endpoint. A case-sensitive comparison would
+    /// silently disable the self-check for a starter who typed "Rook".
+    /// </remarks>
+    private bool IsSelf(string? senderId)
+    {
+        var sender = NormalizeIdentity(senderId);
+        if (sender is null) return false;
+
+        return string.Equals(sender, _personaId, StringComparison.Ordinal) ||
+               string.Equals(sender, _agentId, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Canonical form for identity comparisons: trimmed, leading '@' removed, lowercased.
+    /// </summary>
+    /// <remarks>
+    /// Applied to both sides so the comparison is exact rather than fuzzy. The three components that
+    /// produce these ids normalize differently — the MCP tool lowercases, the REST mentions regex
+    /// lowercases, and the start endpoint takes whatever the operator posted — so normalizing only the
+    /// incoming sender would leave the stored value as-typed and re-open the hole for a starter who typed
+    /// "Rook". Null when blank, so an unset identity never matches a blank sender.
+    /// </remarks>
+    private static string? NormalizeIdentity(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim().TrimStart('@').ToLowerInvariant();
 
     /// <summary>
     /// Accepts a review decision, releasing a PR-review pause.
@@ -425,7 +537,8 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         LastOutcome: _lastOutcome,
         PendingChatCount: _chatInbox.Count,
         PrUrl: _activePrUrl,
-        TurnSessionId: _turnSessionId);
+        TurnSessionId: _turnSessionId,
+        IgnoredSelfSignalCount: _ignoredSelfSignals);
 
     /// <summary>
     /// Issues the macro turn activity. Split out so the try/catch around it reads as one decision

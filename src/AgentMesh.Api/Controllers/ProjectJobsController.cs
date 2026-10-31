@@ -1018,8 +1018,39 @@ public class ProjectJobsController(
         Persona? turnPersona = null;
         Agent? turnDriver = null;
 
+        // A job under Temporal management must not also acquire a legacy SignalR runner.
+        //
+        // This is the ownership rule the feature's own documentation claimed and did not enforce. The
+        // dispatch branch below keys off "a persona was mentioned and no session id was supplied", and an
+        // unaddressed human reply resolves targetPersonaId to the next pending task's assignee — which on
+        // an orchestrated job is exactly the persona the workflow is driving. So a plain "yes, use OIDC"
+        // posted to a parked task BOTH released the workflow's gate (via RouteReplyToWorkflowAsync at the
+        // end of this method) AND queued or dispatched a second agent onto the same working tree. Two
+        // agents, one branch: they edit the same files, push over each other, and the operator gets a
+        // rejected push nobody can explain.
+        //
+        // Probed rather than inferred. There is no column recording "this job is orchestrated", and
+        // inventing one would need a migration plus a write on every start path — and a stale flag would
+        // be worse than no flag, because it would suppress dispatches for jobs whose workflow had already
+        // closed. The workflow's own liveness is the only answer that cannot drift.
+        //
+        // Fails toward dispatch: if Temporal is unreachable the probe answers false and this endpoint
+        // behaves exactly as it did before orchestration existed. Suppressing a turn because the control
+        // plane is down would silently swallow chat replies, which is the failure this feature is meant to
+        // remove.
+        //
+        // Caught here rather than trusted from the router. The production implementation already swallows
+        // its own probe failures, so this looks redundant — but "the router happens not to throw today"
+        // is not a contract, and the consequence of it ever throwing is an exception escaping the hottest
+        // chat endpoint in the product. A hint query must not be able to fail the request that consulted
+        // it. Cancellation is the one exception re-thrown: the caller genuinely went away.
+        var workflowOwnsNextTurn = targetPersonaId is not null
+                                   && req.TurnSessionId is null
+                                   && workflows is not null
+                                   && await ProbeWorkflowOwnershipAsync(id, ct);
+
         // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn or queue!
-        if (targetPersonaId != null && req.TurnSessionId == null)
+        if (targetPersonaId != null && req.TurnSessionId == null && !workflowOwnsNextTurn)
         {
             var persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == targetPersonaId);
             if (persona != null)
@@ -1331,7 +1362,39 @@ public class ProjectJobsController(
     }
 
     /// <summary>
-    /// Hands a human reply to the Temporal workflow that is parked waiting for one.
+    /// Whether a macro workflow currently owns this job's next turn.
+    /// </summary>
+    /// <remarks>
+    /// A defensive wrapper around <see cref="IWorkflowSignalRouter.IsWorkflowDrivingAsync"/>: the answer
+    /// is a hint that gates a legacy dispatch, so any failure — including one the router itself did not
+    /// anticipate — resolves to "not orchestrated" and the endpoint behaves as it did before orchestration
+    /// existed. See the call site for why that direction is the safe one.
+    /// <para>
+    /// Cancellation is re-thrown rather than swallowed: the caller went away, and continuing to dispatch a
+    /// turn for a request nobody is waiting on would leak a session.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> ProbeWorkflowOwnershipAsync(Guid jobId, CancellationToken ct)
+    {
+        try
+        {
+            return await workflows!.IsWorkflowDrivingAsync(jobId, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            (logger ?? NullLogger<ProjectJobsController>.Instance).LogWarning(ex,
+                "The orchestration ownership probe for job {JobId} failed; falling back to the legacy " +
+                "dispatch path", jobId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Hands a reply to the Temporal workflow that is parked waiting for one.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -1340,18 +1403,44 @@ public class ProjectJobsController(
     /// busy-polling it replaces, because at least polling eventually noticed.
     /// </para>
     /// <para>
-    /// <strong>Only a human reply is routed.</strong> A message from a persona is agent-to-agent
-    /// conversation: it belongs in the job ledger, and forwarding it would release the workflow's
-    /// <c>AwaitingInput</c> gate on a message the workflow never asked for, resuming a turn to act on
-    /// chatter. It would also let one agent answer another agent's escalation and thereby un-block a task
-    /// the escalation was raised against.
+    /// <strong>Human AND persona replies are routed; system messages are not.</strong> The filter used to
+    /// be <c>SenderType == "user"</c>, on the reasoning that a persona message is agent-to-agent chatter
+    /// that belongs in the ledger rather than a release signal. That reasoning was sound for chatter and
+    /// fatal for escalations: an orchestrated agent blocks with
+    /// <c>post_job_message(requires_reply: true, target_persona: "astra")</c>, parks in
+    /// <c>AwaitingInput</c>, and the only party who can answer is another persona — who answers via
+    /// <c>post_job_message</c> or this same REST endpoint, both of which stamp <c>SenderType = "persona"</c>.
+    /// So the escalation could never be answered, and the task sat for the full seven days. A cross-persona
+    /// review request, the normal shape of "two-man review" in this product, was a guaranteed deadlock.
+    /// </para>
+    /// <para>
+    /// <c>system</c> stays excluded because those rows are generated bookkeeping (handoff notices, task
+    /// completion markers) that nobody addressed to anyone; releasing a turn on one would be pure noise.
+    /// </para>
+    /// <para>
+    /// <strong>What this knowingly accepts.</strong> A persona posting an unrelated status note to the job
+    /// will now release a parked gate, costing one turn that had nothing to act on. That is the cheaper
+    /// failure: the turn activity reads the whole job ledger
+    /// (<c>HttpAgentTurnRunner</c> builds its observation state from <c>db.JobMessages</c>), so nothing said
+    /// is lost either way, and a wasted turn is recoverable while a permanently wedged task is not.
+    /// </para>
+    /// <para>
+    /// The stricter rule — "release only for the party named in the wait" — is not enforceable from a
+    /// sender id and was tried and reverted here. A human posting as <c>SenderId="sorren"</c> and a persona
+    /// named <c>sorren</c> arrive as the identical string, because the router takes the id from the caller
+    /// and only falls back to <c>"operator"</c> when none was supplied. So an awaited-party gate would both
+    /// lock the operator out of answering their own agent's escalation and be bypassable by any persona
+    /// sharing a name. Enforcing it needs the sender's <em>kind</em> on the wire, which is a change to
+    /// <c>ChatMessageSignal</c> — a workflow wire contract — and is flagged for @Architect rather than
+    /// invented here. The one property that <em>is</em> enforceable from an id, "the asker may not answer
+    /// itself", is implemented in <c>TaskExecutionWorkflow.ReceiveChatMessageAsync</c>.
     /// </para>
     /// <para>
     /// <strong>Never fails the request.</strong> The message is already committed and broadcast by the
     /// time this runs. A Temporal outage must not turn into "your message was not saved" — the reply is
     /// in the ledger either way, and the workflow's own gate still has days left on it. The delivery
-    /// result is logged, and the dedicated endpoints under
-    /// <c>MacroTurnsController</c> surface it to a caller that needs to know.
+    /// result is logged, and the dedicated endpoints under <c>MacroTurnsController</c> surface it to a
+    /// caller that needs to know.
     /// </para>
     /// </remarks>
     private async Task RouteReplyToWorkflowAsync(
@@ -1361,6 +1450,9 @@ public class ProjectJobsController(
         CancellationToken ct)
     {
         if (workflows is null) return;
+        // Only generated bookkeeping is excluded. See the remarks: excluding every non-human sender is
+        // what made cross-persona escalations undeliverable.
+        if (string.Equals(req.SenderType, "system", StringComparison.OrdinalIgnoreCase)) return;
 
         // A null logger is the normal state for the ~40 controller tests that construct this type
         // directly, so the routing block's two log calls go through a local no-op rather than the

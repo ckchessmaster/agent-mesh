@@ -109,7 +109,25 @@ public record TaskStatusView(
     TurnOutcomeStatus? LastOutcome,
     int PendingChatCount,
     string? PrUrl = null,
-    string? TurnSessionId = null);
+    string? TurnSessionId = null,
+    /// <summary>
+    /// Chat signals this run refused because they came from its own persona.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Surfaced rather than logged-and-forgotten because <c>AgentMesh.Core</c> carries no logging
+    /// abstraction by design — it references only <c>Temporalio</c> — and a self-signal drop is otherwise
+    /// invisible. Without it, an agent that escalates and then posts again to the same job sees its task
+    /// refuse to resume with no explanation anywhere: not in the status, not in the result, not in the
+    /// ledger. That is the "confidently reports the wrong thing" failure this whole feature exists to
+    /// remove, applied to the control plane itself.
+    /// </para>
+    /// <para>
+    /// A count rather than the last sender id, because the sender id is always the run's own persona —
+    /// the number is the only part that varies and the only part that answers "did my reply land?".
+    /// </para>
+    /// </remarks>
+    int IgnoredSelfSignalCount = 0);
 
 /// <summary>
 /// The wire names of <see cref="ITaskExecutionWorkflow"/>'s handlers.
