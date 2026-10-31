@@ -750,17 +750,24 @@ public class TurnContextAssembler(
     /// match, so the cost is bounded by how many sessions are loaded, not by the table size.
     /// </para>
     /// </remarks>
+    /// <para>
+    /// <strong>Why the checkpoint outranks the input.</strong> <c>input.TurnSessionId</c> is fixed when
+    /// the workflow starts and never changes for the life of the run; the checkpoint is rewritten at every
+    /// turn boundary. So once turn 2 dispatches a new session, the input still names turn 1's. Reading the
+    /// input first — which is what this method used to do, contradicting the list above — would pin the
+    /// sliding window to the first session forever: the agent would keep being handed turn 1's
+    /// conversation and never see its own most recent work, which is the exact context-loss the window
+    /// exists to prevent. The order below is the one the doc has always claimed.
+    /// </para>
+    /// </remarks>
     internal async Task<Guid?> ResolveTurnSessionIdAsync(TaskExecutionInput input, CancellationToken ct)
     {
-        if (Guid.TryParse(input.TurnSessionId?.Trim(), out var fromInput))
-        {
-            return fromInput;
-        }
-
+        // 1. The checkpoint: the session that actually produced this task's last turn.
         try
         {
             var checkpoint = await checkpoints.GetCheckpointAsync(input.JobId, input.TaskId, ct);
-            if (Guid.TryParse(checkpoint?.TurnSessionId?.Trim(), out var fromCheckpoint))
+            if (Guid.TryParse(checkpoint?.TurnSessionId?.Trim(), out var fromCheckpoint) &&
+                fromCheckpoint != Guid.Empty)
             {
                 return fromCheckpoint;
             }
@@ -772,6 +779,12 @@ public class TurnContextAssembler(
         catch (Exception ex)
         {
             logger?.LogWarning(ex, "Checkpoint lookup for the turn session failed on job {JobId}", input.JobId);
+        }
+
+        // 2. The workflow input, when the starter knew it and no turn has recorded a newer one.
+        if (Guid.TryParse(input.TurnSessionId?.Trim(), out var fromInput) && fromInput != Guid.Empty)
+        {
+            return fromInput;
         }
 
         if (!Guid.TryParse(input.JobId.Trim(), out var jobId)) return null;

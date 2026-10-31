@@ -182,45 +182,55 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     /// The session this task is already running in, if any.
     /// </summary>
     /// <remarks>
-    /// Read from the checkpoint rather than from the workflow input, because the input is fixed at
-    /// workflow start and cannot know about a session created by turn three. The checkpoint is written
-    /// by the turn activity at every boundary, so it is the freshest record of "which session is this
-    /// task's".
+    /// <para>
+    /// <strong>What this is for.</strong> Temporal retries an activity whose <c>StartToCloseTimeout</c>
+    /// elapses, and a naive implementation would start a second agent on a branch the first is still
+    /// working. The pairing is persisted before the first poll
+    /// (<see cref="RecordSessionPairingAsync"/>) precisely so a retry can find it and re-attach.
+    /// </para>
+    /// <para>
+    /// <strong>Order: durable checkpoint first, then the start-time value on the request.</strong> The
+    /// checkpoint is written mid-turn by the runner, so it is the freshest record of which session this
+    /// task is in. <c>request.TurnSessionId</c> is <c>input.TurnSessionId</c>, fixed when the workflow
+    /// started, and can therefore only ever be older — it cannot know about the session turn three
+    /// created. The previous order put the stale value first and returned it unconditionally, which is
+    /// defect #2 of the review; see below.
+    /// </para>
+    /// <para>
+    /// <strong>Liveness is checked for both candidates, not just the checkpoint one.</strong> Attaching
+    /// to a terminal session does not fail — it silently misbehaves. <see cref="ObserveAsync"/> settles
+    /// immediately because the status is already in <see cref="TerminalStatuses"/>, and
+    /// <c>ClassifySignals</c> then re-reads the <em>closed</em> transcript and re-derives the previous
+    /// turn's outcome from it. The workflow sees <c>Continue</c>, loops, and re-derives the same outcome
+    /// again, burning all 40 turns into <c>StuckLoopDetected</c> while doing no work. A pre-declared
+    /// session is not exempt from that: it completes during turn 1 like any other.
+    /// </para>
+    /// <para>
+    /// The bug the old order produced, stated exactly, because the code comment asserted the opposite:
+    /// an explicit id was returned "always", on every turn, with no liveness check. So a workflow started
+    /// with <c>TurnSessionId</c> populated never dispatched turn 2 — the assembled prompt and the
+    /// <c>pendingReply</c> the human waited days to send were both dropped on the floor — and spun to the
+    /// turn ceiling. The comment justified it with "or a previous attempt in this same activity
+    /// invocation set it", which is not a thing that happens: <see cref="DispatchAsync"/> hardcodes
+    /// <c>turnSessionId = (Guid?)null</c> in its payload and never mutates the request, so that value is
+    /// only ever the one from workflow start.
+    /// </para>
     /// </remarks>
-    private async Task<Guid?> ResolveExistingSessionAsync(AgentTurnRequest request, CancellationToken ct)
+    internal async Task<Guid?> ResolveExistingSessionAsync(AgentTurnRequest request, CancellationToken ct)
     {
-        // An explicit id on the request always wins: the workflow was started with it, or a previous
-        // attempt in this same activity invocation set it.
-        if (Guid.TryParse(request.TurnSessionId?.Trim(), out var explicitId) && explicitId != Guid.Empty)
-        {
-            return explicitId;
-        }
+        // Candidates in preference order. Unparseable and empty-GUID values are dropped here rather than
+        // at each use site, so a malformed id degrades to "no existing session" (dispatch fresh) instead
+        // of to "attach to GUID zero", which would observe a session that cannot exist.
+        var candidates = new List<(Guid id, string source)>();
 
         try
         {
             var checkpoint = await checkpoints.GetCheckpointAsync(
                 request.Input.JobId, request.Input.TaskId, ct);
 
-            if (Guid.TryParse(checkpoint?.TurnSessionId?.Trim(), out var fromCheckpoint) &&
-                fromCheckpoint != Guid.Empty)
+            if (TryLiveId(checkpoint?.TurnSessionId, out var fromCheckpoint))
             {
-                // Only re-attach to a session that is still live. A completed one is history: reusing
-                // its id would append this turn's messages to a closed transcript and the settle check
-                // below would immediately read it as finished, returning an outcome derived from the
-                // *previous* turn.
-                var live = await db.AgentSessions.AsNoTracking()
-                    .Where(s => s.Id == fromCheckpoint)
-                    .Select(s => s.Status)
-                    .FirstOrDefaultAsync(ct);
-
-                if (live is not null && !TerminalStatuses.Contains(live, StringComparer.OrdinalIgnoreCase))
-                {
-                    logger.LogInformation(
-                        "Re-attaching to live turn session {SessionId} (status {Status}) for task {TaskId} " +
-                        "instead of dispatching a second agent",
-                        fromCheckpoint, live, request.Input.TaskId);
-                    return fromCheckpoint;
-                }
+                candidates.Add((fromCheckpoint, "checkpoint"));
             }
         }
         catch (OperationCanceledException)
@@ -229,15 +239,66 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         }
         catch (Exception ex)
         {
-            // Falling through to a fresh dispatch is safe here: the endpoint is idempotent on the
-            // session id and, when we have no id to send, a genuinely new turn is the correct answer.
+            // Falling through to the request value and then to a fresh dispatch is safe here: the
+            // endpoint is idempotent on the session id and, when we have no id to send, a genuinely new
+            // turn is the correct answer.
             logger.LogWarning(ex,
-                "Could not check for an existing turn session for task {TaskId}; dispatching a new turn",
+                "Could not read the durable turn-session pairing for task {TaskId}; falling back to the " +
+                "workflow-start value and then to a fresh dispatch",
                 request.Input.TaskId);
+        }
+
+        if (TryLiveId(request.TurnSessionId, out var fromRequest))
+        {
+            candidates.Add((fromRequest, "workflow input"));
+        }
+
+        foreach (var (id, source) in candidates)
+        {
+            string? live;
+            try
+            {
+                live = await db.AgentSessions.AsNoTracking()
+                    .Where(s => s.Id == id)
+                    .Select(s => s.Status)
+                    .FirstOrDefaultAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex,
+                    "Could not check whether turn session {SessionId} is still live for task {TaskId}",
+                    id, request.Input.TaskId);
+                continue;
+            }
+
+            // A session row that does not exist is treated as not live. It is not "unknown, assume
+            // fine": attaching to a vanished session would observe nothing and settle on the ledger
+            // fallback, which is the same silent misbehaviour as attaching to a closed one.
+            if (live is null || TerminalStatuses.Contains(live, StringComparer.OrdinalIgnoreCase))
+            {
+                logger.LogDebug(
+                    "Turn session {SessionId} from {Source} is {State} for task {TaskId}; not re-attaching",
+                    id, source, live is null ? "missing" : $"terminal ({live})", request.Input.TaskId);
+                continue;
+            }
+
+            logger.LogInformation(
+                "Re-attaching to live turn session {SessionId} (status {Status}, from {Source}) for task " +
+                "{TaskId} instead of dispatching a second agent",
+                id, live, source, request.Input.TaskId);
+            return id;
         }
 
         return null;
     }
+
+    /// <summary>Parses a session id that is present, well-formed, and not the empty GUID.</summary>
+    private static bool TryLiveId(string? value, out Guid id) =>
+        Guid.TryParse(value?.Trim(), out id) && id != Guid.Empty;
 
     private async Task<Guid?> DispatchAsync(AgentTurnRequest request, CancellationToken ct)
     {

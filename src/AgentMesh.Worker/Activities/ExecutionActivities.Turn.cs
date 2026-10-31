@@ -175,6 +175,25 @@ public partial class ExecutionActivities
                          ?? context.Checkpoint?.ActiveBranch
                          ?? input.TargetBranch;
 
+            // The pairing must be read fresh, not carried from `context.Checkpoint`.
+            //
+            // `context.Checkpoint` is the snapshot the assembler loaded BEFORE the dispatch. The runner
+            // writes the real session id to the durable row DURING the turn
+            // (HttpAgentTurnRunner.RecordSessionPairingAsync, deliberately before the first poll so a
+            // cancelled attempt can still be found by its retry). So on turn 1 of a workflow started
+            // without an explicit TurnSessionId — the normal case — both operands here are null:
+            // `input.TurnSessionId` because the starter did not supply one, and `context.Checkpoint`
+            // because the row did not exist when the prompt was assembled. SaveCheckpointAsync then
+            // assigns CheckpointTurnSessionId unconditionally, so the write CLEARS the S1 the runner had
+            // just recorded.
+            //
+            // That is not a cosmetic bookkeeping loss. The pairing is the only thing that makes Temporal's
+            // retry of a timed-out activity re-attach to the agent that is already running instead of
+            // starting a second one on the same branch. Destroying it at the end of every successful turn
+            // means the guarantee holds only for a turn that fails mid-flight and never for a turn that
+            // succeeds — precisely inverted from what the design intends.
+            var durablePairing = await ResolveDurableTurnSessionIdAsync(input, ct);
+
             var checkpoint = new TaskWorkingCheckpoint(
                 JobId: input.JobId,
                 TaskId: input.TaskId,
@@ -186,7 +205,12 @@ public partial class ExecutionActivities
                 UpdatedAt: DateTimeOffset.UtcNow,
                 HeadCommit: report?.HeadCommitOneline ?? context.Checkpoint?.HeadCommit,
                 ChecklistFocus: context.Checkpoint?.ChecklistFocus,
-                TurnSessionId: input.TurnSessionId ?? context.Checkpoint?.TurnSessionId);
+                // Durable pairing first, then the pre-turn snapshot, then the start-time input. The
+                // durable row is the freshest record of "which session is this task's" precisely because
+                // the runner writes it mid-turn; the other two can only be older.
+                TurnSessionId: durablePairing
+                               ?? context.Checkpoint?.TurnSessionId
+                               ?? input.TurnSessionId);
 
             var saved = await ResolveCheckpoints().SaveCheckpointAsync(checkpoint, ct);
 
@@ -314,6 +338,47 @@ public partial class ExecutionActivities
         checkpoints ?? throw new InvalidOperationException(
             $"No {nameof(IWorkspaceStateRepository)} is registered, so no checkpoint can be written " +
             "and context recovery cannot work. The worker needs its database connection string.");
+
+    /// <summary>
+    /// The session id currently recorded on the durable row, or null.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Re-read at the post-turn boundary rather than taken from <c>context.Checkpoint</c>, because the
+    /// runner writes the real session id mid-turn and the assembler's snapshot predates that write. See
+    /// the call site in <see cref="WriteCheckpointAsync"/> for the clobber this prevents.
+    /// </para>
+    /// <para>
+    /// <strong>Never throws.</strong> A lookup failure must degrade to the pre-turn snapshot, not abort
+    /// the checkpoint write: the turn already did real work, and losing the branch, the dirty-file list
+    /// and the summary because one column's re-read failed would be a worse outcome than keeping a
+    /// session id that is one turn stale. The outer catch in <see cref="WriteCheckpointAsync"/> would
+    /// swallow a throw here and skip the save entirely, which is exactly the trade this method exists to
+    /// avoid — hence the local try rather than letting it propagate.
+    /// </para>
+    /// </remarks>
+    private async Task<string?> ResolveDurableTurnSessionIdAsync(
+        TaskExecutionInput input,
+        CancellationToken ct)
+    {
+        try
+        {
+            var current = await ResolveCheckpoints().GetCheckpointAsync(input.JobId, input.TaskId, ct);
+            return string.IsNullOrWhiteSpace(current?.TurnSessionId) ? null : current!.TurnSessionId;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Could not re-read the durable turn-session pairing for job {JobId} task {TaskId}; " +
+                "the checkpoint will carry the pre-turn value instead",
+                input.JobId, input.TaskId);
+            return null;
+        }
+    }
 
     // The four dependencies arrive as optional constructor parameters on the other partial
     // (assembler / checkpoints / turnRunner / reconciler) and are read through the primary-constructor
