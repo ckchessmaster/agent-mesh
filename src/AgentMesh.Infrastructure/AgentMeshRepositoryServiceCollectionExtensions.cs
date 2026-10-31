@@ -22,6 +22,7 @@ public static class AgentMeshRepositoryServiceCollectionExtensions
     public static IServiceCollection AddAgentMeshRepositories(this IServiceCollection services)
     {
         services.TryAddScoped<IAgentMemoryRepository, AgentMemoryRepository>();
+        services.TryAddScoped<IWorkspaceStateRepository, WorkspaceStateRepository>();
         return services;
     }
 }

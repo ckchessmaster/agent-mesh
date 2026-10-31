@@ -524,14 +524,61 @@ namespace AgentMesh.Infrastructure.Migrations
             modelBuilder.Entity("AgentMesh.Core.Models.JobWorkspaceState", b =>
                 {
                     b.Property<Guid>("JobId")
-                        .ValueGeneratedOnAdd()
                         .HasColumnType("uuid")
                         .HasColumnName("job_id");
+
+                    b.Property<string>("TaskId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasDefaultValue("_unassigned")
+                        .HasColumnName("task_id");
 
                     b.Property<string>("BundleS3Key")
                         .HasMaxLength(512)
                         .HasColumnType("character varying(512)")
                         .HasColumnName("bundle_s3key");
+
+                    b.Property<string>("CheckpointActiveStash")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("checkpoint_active_stash");
+
+                    b.Property<string>("CheckpointBranch")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("checkpoint_branch");
+
+                    b.Property<string>("CheckpointFocus")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("checkpoint_focus");
+
+                    b.Property<string>("CheckpointHeadCommit")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("checkpoint_head_commit");
+
+                    b.Property<string>("CheckpointModifiedFilesJson")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("checkpoint_modified_files_json");
+
+                    b.Property<string>("CheckpointStatus")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("checkpoint_status");
+
+                    b.Property<string>("CheckpointSummary")
+                        .HasMaxLength(4096)
+                        .HasColumnType("character varying(4096)")
+                        .HasColumnName("checkpoint_summary");
+
+                    b.Property<Guid?>("CheckpointTurnSessionId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("checkpoint_turn_session_id");
+
+                    b.Property<DateTimeOffset?>("CheckpointUpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("checkpoint_updated_at");
 
                     b.Property<string>("ContentHash")
                         .HasMaxLength(64)
@@ -603,7 +650,7 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnName("updated_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
 
-                    b.HasKey("JobId")
+                    b.HasKey("JobId", "TaskId")
                         .HasName("pk_job_workspace_states");
 
                     b.HasIndex("LastSavedByAgentId")
@@ -611,6 +658,9 @@ namespace AgentMesh.Infrastructure.Migrations
 
                     b.HasIndex("LeaseHolderAgentId")
                         .HasDatabaseName("ix_job_workspace_states_lease_holder");
+
+                    b.HasIndex("JobId", "CheckpointUpdatedAt")
+                        .HasDatabaseName("ix_job_workspace_states_checkpoint_recency");
 
                     b.ToTable("job_workspace_states", (string)null);
                 });
@@ -770,6 +820,14 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDefaultValue("")
                         .HasColumnName("project_instructions");
 
+                    b.Property<string>("RepositoryName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasDefaultValue("agent-mesh")
+                        .HasColumnName("repository_name");
+
                     b.Property<string>("S3BucketName")
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)")
@@ -785,6 +843,14 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("updated_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("WorkingDirectory")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasDefaultValue("")
+                        .HasColumnName("working_directory");
 
                     b.Property<int>("WorkspaceType")
                         .ValueGeneratedOnAdd()

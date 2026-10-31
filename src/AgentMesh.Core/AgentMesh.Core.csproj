@@ -7,6 +7,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The probe script's shape and the section parser are exercised directly by the test suite:
+         asserting on the generated bash is the only way to prove a path containing a quote stays data
+         rather than becoming shell syntax, and that is not observable from the parsed result. Same
+         convention the Api, Cli and Infrastructure projects declare. -->
+    <InternalsVisibleTo Include="AgentMesh.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Temporalio" Version="1.20.0" />
   </ItemGroup>
 
