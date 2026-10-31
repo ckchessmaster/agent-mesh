@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -22,7 +23,81 @@ public interface IGitHubPullRequestService
     Task<GitHubPullRequestResult> PushBranchAndCreatePrAsync(
         GitHubPullRequestRequest request,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Merges an already-approved pull request.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="PushBranchAndCreatePrAsync"/> because it is a different trust
+    /// decision: opening a PR is an agent asking for review, merging one is the platform acting on a
+    /// decision a human already made. Keeping them apart is what lets the workflow call merge only
+    /// after a review signal, and lets an operator see the two events distinctly in history.
+    /// <para>
+    /// Implementations must treat "already merged" as success. Temporal retries an activity whose
+    /// timeout elapses after the server already honoured the call, and a merge that reports failure
+    /// on the retry would halt a task whose work is genuinely landed.
+    /// </para>
+    /// </remarks>
+    Task<GitHubMergeResult> MergePullRequestAsync(
+        GitHubMergeRequest request,
+        CancellationToken ct = default);
 }
+
+/// <summary>Which merge strategy GitHub should apply.</summary>
+/// <remarks>
+/// <see cref="Squash"/> is the default the workflow asks for, matching the convention this project's
+/// own history follows (release/feature commits squashed onto <c>main</c>). The value is carried on
+/// the request rather than hardcoded so a repository that requires merge commits is not silently
+/// rejected by a policy the platform invented.
+/// </remarks>
+public enum GitHubMergeMethod
+{
+    Merge,
+    Squash,
+    Rebase,
+}
+
+/// <summary>An instruction to merge one pull request.</summary>
+/// <param name="PrUrlOrNumber">
+/// The PR URL (<c>https://github.com/o/r/pull/12</c>) or bare number. A URL is what the workflow
+/// holds after <c>open_pull_request</c>, so accepting it avoids a second lookup to recover the number.
+/// </param>
+/// <param name="Repository">
+/// <c>owner/repo</c>. Optional: falls back to <c>GitHub:Repository</c> configuration, then to parsing
+/// the URL, in that order.
+/// </param>
+/// <param name="Method">Merge strategy.</param>
+/// <param name="CommitTitle">Optional squash/merge commit title.</param>
+/// <param name="CommitMessage">Optional commit body.</param>
+/// <param name="Sha">
+/// The head SHA the reviewer actually approved. When supplied it is sent as <c>sha</c>, which makes
+/// GitHub reject the merge if the author pushed since the approval — the check that stops an
+/// unreviewed commit from riding an earlier approval into the base branch.
+/// </param>
+public record GitHubMergeRequest(
+    string PrUrlOrNumber,
+    string? Repository = null,
+    GitHubMergeMethod Method = GitHubMergeMethod.Squash,
+    string? CommitTitle = null,
+    string? CommitMessage = null,
+    string? Sha = null);
+
+/// <summary>The outcome of a merge attempt.</summary>
+/// <param name="AlreadyMerged">
+/// True when the PR was already merged, which is reported as <see cref="Success"/> with this flag set
+/// so the caller can tell a fresh merge from an idempotent replay without parsing the message.
+/// </param>
+/// <param name="FailureReason">
+/// Machine-readable cause (<c>no_credentials</c>, <c>not_found</c>, <c>not_mergeable</c>,
+/// <c>sha_mismatch</c>, <c>api_error</c>) so the workflow can distinguish "the reviewer changed the
+/// PR and it now conflicts" from "GitHub was briefly unreachable".
+/// </param>
+public record GitHubMergeResult(
+    bool Success,
+    string Message,
+    string? FailureReason = null,
+    bool AlreadyMerged = false,
+    string? MergeCommitSha = null);
 
 /// <summary>A single <c>git</c> invocation, already resolved to an argument vector.</summary>
 /// <remarks>
@@ -311,6 +386,447 @@ public class GitHubPullRequestService(
     /// <c>gh auth login</c>.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// Merges an approved pull request through the GitHub REST API.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Why it reads the PR before merging it.</strong> GitHub's merge endpoint answers a
+    /// merge attempt on an already-merged PR with <c>405</c> and a body that says "Pull Request is not
+    /// mergeable" — the same response it gives for a genuine merge conflict. Without the pre-read, a
+    /// retry after a timed-out-but-successful merge would be reported to the workflow as a conflict,
+    /// and the workflow would halt a task whose work had already landed. The <c>GET</c> costs one
+    /// extra call per merge (merges happen once per task) and buys the distinction between "already
+    /// done, treat as success" and "actually blocked, tell a human".
+    /// </para>
+    /// <para>
+    /// <strong>Why the approved SHA is forwarded.</strong> <c>sha</c> makes GitHub reject the merge if
+    /// the head moved after the review. Omitting it would let an author push a new commit between
+    /// approval and merge and have it land on the strength of a review that never saw it — the exact
+    /// bypass the two-man review rule exists to prevent. When the caller does not know the SHA the
+    /// merge still proceeds (a reviewer approving through the Cockpit usually does not supply one),
+    /// but the gap is logged so the platform's behaviour is auditable rather than silently optimistic.
+    /// </para>
+    /// <para>
+    /// <strong>No simulation path.</strong> <see cref="PushBranchAndCreatePrAsync"/> fabricates PR #999
+    /// when no credentials are configured, which is defensible for an opening action an agent can
+    /// retry. Faking a merge is not: the workflow would mark the task completed and report a merged PR
+    /// that does not exist, and the work would never reach the base branch. Missing credentials are
+    /// therefore a hard failure with <c>no_credentials</c>.
+    /// </para>
+    /// </remarks>
+    public async Task<GitHubMergeResult> MergePullRequestAsync(
+        GitHubMergeRequest request,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (string.IsNullOrWhiteSpace(request.PrUrlOrNumber))
+        {
+            return MergeFailure("invalid_request", "A pull request URL or number is required.");
+        }
+
+        var (refOwner, refRepo, refNumber) = ParsePullRequestReference(request.PrUrlOrNumber);
+
+        if (refNumber is not { } parsedNumber)
+        {
+            return MergeFailure("invalid_pr_reference",
+                $"'{Truncate(Sanitize(request.PrUrlOrNumber), 120)}' is neither a pull request URL nor a number.");
+        }
+
+        var prNumber = parsedNumber;
+        var options = ReadOptions();
+
+        // Precedence: an explicit repository on the request, then configuration, then the owner/repo
+        // parsed out of the PR URL itself. The URL is last rather than first because it is the value the
+        // agent's tool call produced, while configuration is the operator's statement of where this
+        // deployment's work lives; when they disagree, merging into the configured repository is the
+        // answer that matches the credentials being used.
+        var repo = ResolveRepository(request.Repository, options.Repository)
+                   ?? (refOwner is not null && refRepo is not null ? (refOwner, refRepo) : null);
+
+        if (repo is not { } target)
+        {
+            return MergeFailure("no_repository",
+                "Cannot determine the repository to merge from: the request carried no owner/repo, " +
+                "GitHub:Repository is not configured, and the pull request reference is a bare number.");
+        }
+
+        var token = await ResolveTokenAsync(options, ct);
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return MergeFailure("no_credentials",
+                "No GitHub credentials are configured (GitHub:Token, or the App id/key/installation " +
+                "triple). A merge is never simulated: reporting success here would mark the task " +
+                "complete while the work sits unmerged on its branch.");
+        }
+
+        // ── Pre-read: distinguish "already merged" from "not mergeable" ───────────
+        var getState = await SendAsync(
+            HttpMethod.Get,
+            $"/repos/{target.Owner}/{target.Repo}/pulls/{prNumber}",
+            new StringContent(string.Empty, Encoding.UTF8, "application/json"),
+            token,
+            ct);
+
+        var getBody = await SafeBodyAsync(getState, ct);
+
+        if (!getState.IsSuccessStatusCode)
+        {
+            var reason = getState.StatusCode == System.Net.HttpStatusCode.NotFound ? "not_found" : "api_error";
+            await LogFailure("pr-read", target.Owner, target.Repo, getState, token, ct);
+            return MergeFailure(reason,
+                $"Could not read pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+                $"from {target.Owner}/{target.Repo}: HTTP {(int)getState.StatusCode}.", getBody, token);
+        }
+
+        var (state, headSha, mergedSha) = TryReadPullRequestState(getBody);
+
+        if (string.Equals(state, "merged", StringComparison.OrdinalIgnoreCase))
+        {
+            logger.LogInformation(
+                "Pull request {Owner}/{Repo}#{Pr} was already merged (commit {Sha}); reporting success " +
+                "so a retried merge activity does not halt a completed task.",
+                target.Owner, target.Repo, prNumber, mergedSha ?? "(unknown)");
+
+            return new GitHubMergeResult(
+                Success: true,
+                Message: $"Pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+                         $"was already merged{(string.IsNullOrWhiteSpace(mergedSha) ? "." : $" as {mergedSha}.")}",
+                AlreadyMerged: true,
+                MergeCommitSha: mergedSha);
+        }
+
+        if (!string.Equals(state, "open", StringComparison.OrdinalIgnoreCase))
+        {
+            return MergeFailure("pr_closed",
+                $"Pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+                $"is '{state ?? "unknown"}', not open, so it cannot be merged.");
+        }
+
+        // ── Merge ────────────────────────────────────────────────────────────────
+        var sha = !string.IsNullOrWhiteSpace(request.Sha)
+            ? request.Sha.Trim()
+            // Fall back to the head we just read. This does NOT re-establish the approval guarantee
+            // (we are merging whatever is current, which is what the caller asked for by not naming a
+            // SHA), but sending it still protects against a push racing between this read and the
+            // merge call.
+            : headSha;
+
+        if (string.IsNullOrWhiteSpace(request.Sha) && !string.IsNullOrWhiteSpace(headSha))
+        {
+            logger.LogWarning(
+                "Merging {Owner}/{Repo}#{Pr} without a reviewer-supplied SHA; the merge will accept " +
+                "head {Sha} as current. Pass PrReviewSignal-approved head SHA to enforce " +
+                "approve-then-freeze.",
+                target.Owner, target.Repo, prNumber, headSha);
+        }
+
+        var payload = new Dictionary<string, object?>
+        {
+            ["merge_method"] = request.Method switch
+            {
+                GitHubMergeMethod.Merge => "merge",
+                GitHubMergeMethod.Rebase => "rebase",
+                _ => "squash",
+            },
+        };
+
+        if (!string.IsNullOrWhiteSpace(request.CommitTitle)) payload["commit_title"] = request.CommitTitle.Trim();
+        if (!string.IsNullOrWhiteSpace(request.CommitMessage)) payload["commit_message"] = request.CommitMessage.Trim();
+        if (!string.IsNullOrWhiteSpace(sha)) payload["sha"] = sha;
+
+        var mergeResponse = await SendAsync(
+            HttpMethod.Put,
+            $"/repos/{target.Owner}/{target.Repo}/pulls/{prNumber}/merge",
+            JsonPayload(payload),
+            token,
+            ct);
+
+        var mergeBody = await SafeBodyAsync(mergeResponse, ct);
+
+        if (mergeResponse.IsSuccessStatusCode)
+        {
+            var commitSha = TryReadJsonString(mergeBody, "sha");
+
+            logger.LogInformation(
+                "Merged pull request {Owner}/{Repo}#{Pr} via {Method} (commit {Sha}).",
+                target.Owner, target.Repo, prNumber, payload["merge_method"], commitSha ?? "(unknown)");
+
+            return new GitHubMergeResult(
+                Success: true,
+                Message: $"Merged pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+                         $"into {target.Owner}/{target.Repo} via {payload["merge_method"]}" +
+                         $"{(string.IsNullOrWhiteSpace(commitSha) ? "." : $" (commit {commitSha}).")}",
+                MergeCommitSha: commitSha);
+        }
+
+        // 409 with a sha we sent means the head moved after approval — the guard doing its job, not a
+        // transient error. Naming it separately stops the workflow's retry policy from hammering a
+        // merge that will never succeed without a fresh review.
+        if (mergeResponse.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            return MergeFailure("sha_mismatch",
+                $"GitHub refused to merge pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}: " +
+                "the head commit changed since the reviewed state, or the branch now conflicts with the base. " +
+                "A re-review is required.", mergeBody, token);
+        }
+
+        if (mergeResponse.StatusCode == System.Net.HttpStatusCode.MethodNotAllowed)
+        {
+            return MergeFailure("not_mergeable",
+                $"Pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} is not " +
+                "mergeable (dirty state, blocked by branch protection, or required checks failing).",
+                mergeBody, token);
+        }
+
+        if (mergeResponse.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return MergeFailure("not_found",
+                $"Pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} was not " +
+                $"found in {target.Owner}/{target.Repo} (or the configured identity cannot see it).",
+                mergeBody, token);
+        }
+
+        await LogFailure("pr-merge", target.Owner, target.Repo, mergeResponse, token, ct);
+
+        // 5xx and 403 rate-limit are the retryable cases; the workflow's RetryPolicy handles them.
+        return MergeFailure("api_error",
+            $"GitHub rejected the merge of pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}: " +
+            $"HTTP {(int)mergeResponse.StatusCode}.", mergeBody, token);
+    }
+
+    /// <summary>
+    /// Extracts <c>state</c>, <c>head.sha</c> and <c>merge_commit_sha</c> from a pull-request payload.
+    /// </summary>
+    /// <remarks>
+    /// Tolerant of a missing or malformed body: an unreadable payload yields a null state, which the
+    /// caller reports as "unknown" rather than throwing inside the merge path. GitHub's shape is
+    /// stable, but this runs against whatever the API returned, and a parse failure must not become a
+    /// 500 on the activity.
+    /// </remarks>
+    internal static (string? State, string? HeadSha, string? MergedSha) TryReadPullRequestState(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return (null, null, null);
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null, null);
+
+            var state = doc.RootElement.TryGetProperty("state", out var s) && s.ValueKind == JsonValueKind.String
+                ? s.GetString()
+                : null;
+
+            string? headSha = null;
+            if (doc.RootElement.TryGetProperty("head", out var head) &&
+                head.ValueKind == JsonValueKind.Object &&
+                head.TryGetProperty("sha", out var sha) &&
+                sha.ValueKind == JsonValueKind.String)
+            {
+                headSha = sha.GetString();
+            }
+
+            var mergedSha = TryRead(doc.RootElement, "merge_commit_sha");
+            return (state, headSha, mergedSha);
+        }
+        catch (JsonException)
+        {
+            return (null, null, null);
+        }
+    }
+
+    private static string? TryReadJsonString(string? json, string property)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                ? TryRead(doc.RootElement, property)
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string? TryRead(JsonElement root, string property) =>
+        root.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    /// <summary>
+    /// Reads a response body without letting a transport failure replace the status code's story.
+    /// </summary>
+    private static async Task<string> SafeBodyAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        try
+        {
+            return await response.Content.ReadAsStringAsync(ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or ObjectDisposedException)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Resolves <c>owner/repo</c> from a request value or a configuration value.
+    /// </summary>
+    /// <remarks>
+    /// Accepts both <c>owner/repo</c> and a full URL, because <c>GitHub:Repository</c> is configured
+    /// as a slug while a project's <c>git_repository_url</c> is a URL, and both end up here depending
+    /// on which caller supplied the value.
+    /// </remarks>
+    internal static (string Owner, string Repo)? ResolveRepository(string? explicitRepo, string? configuredRepo)
+    {
+        var candidate = FirstNonEmpty(explicitRepo, configuredRepo);
+        if (string.IsNullOrWhiteSpace(candidate)) return null;
+
+        var parsed = ParseOwnerRepo(candidate);
+        if (parsed is not null) return parsed;
+
+        var parts = candidate.Trim().TrimStart('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length >= 2 ? (parts[0], parts[1]) : null;
+    }
+
+    /// <summary>
+    /// Parses a pull-request reference into owner, repo and number, in one pass.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Why this exists alongside <see cref="ParseOwnerRepo"/>.</strong> Reusing that helper here
+    /// was the first attempt and it is wrong in a way that only shows up against a real PR URL:
+    /// <c>ParseOwnerRepo</c> takes the <em>last two</em> path segments because that is correct for a
+    /// repository URL, so <c>https://github.com/o/r/pull/18</c> yields owner=<c>"pull"</c>,
+    /// repo=<c>"18"</c>. The merge would then be attempted against
+    /// <c>/repos/pull/18/pulls/18/merge</c> — a 404 that reads as "the pull request does not exist"
+    /// while the actual defect is that the platform parsed its own URL shape incorrectly. A PR reference
+    /// has a different shape from a repository reference, so it gets its own parser.
+    /// </para>
+    /// <para>
+    /// Every component is optional because the three input forms that arrive here carry different
+    /// subsets: a full PR URL carries all three, a configured <c>GitHub:Repository</c> slug carries
+    /// owner and repo only, and a bare number a human typed into a review form carries only the number.
+    /// Callers fill the gaps from configuration and refuse when a required component cannot be resolved
+    /// from any source.
+    /// </para>
+    /// <para>
+    /// A query or fragment is stripped before anything else, because links copied out of the GitHub UI
+    /// or a chat message carry them (<c>?_use_iframe=true</c>, <c>#discussion_r123</c>) and a number
+    /// parsed as <c>"18?_use_iframe=true"</c> fails — turning a reviewer's pasted approval into an
+    /// unexplained rejection.
+    /// </para>
+    /// </remarks>
+    /// <returns>The components that were present; null for each one that was not.</returns>
+    internal static (string? Owner, string? Repo, int? Number) ParsePullRequestReference(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return (null, null, null);
+
+        var candidate = value.Trim();
+
+        var cut = candidate.IndexOfAny(['?', '#']);
+        if (cut >= 0) candidate = candidate[..cut];
+
+        candidate = candidate.TrimEnd('/');
+        if (candidate.Length == 0) return (null, null, null);
+
+        // Credentials embedded in a URL must never be propagated, and a scheme or SSH separator has to
+        // come off before the path is split. Same treatment ParseOwnerRepo applies.
+        var schemeSeparator = candidate.IndexOf("://", StringComparison.Ordinal);
+        if (schemeSeparator >= 0)
+        {
+            var afterScheme = candidate[(schemeSeparator + 3)..];
+            var firstSlash = afterScheme.IndexOf('/');
+            if (firstSlash < 0) return (null, null, null);
+            candidate = afterScheme[(firstSlash + 1)..];
+        }
+        else
+        {
+            var colon = candidate.IndexOf(':');
+            if (colon >= 0 && !candidate.Contains('/')) return (null, null, null); // ssh:git@host:path handled below
+            if (colon >= 0) candidate = candidate[(colon + 1)..];
+        }
+
+        if (candidate.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+        {
+            candidate = candidate[..^4];
+        }
+
+        var segments = candidate.Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
+        if (segments.Count == 0) return (null, null, null);
+
+        int? number = null;
+        var pullIndex = segments.FindIndex(
+            s => string.Equals(s, "pull", StringComparison.OrdinalIgnoreCase));
+
+        if (pullIndex >= 0)
+        {
+            // The number is the segment after /pull/, when there is one. Anything trailing it
+            // (/files, /commits, /checks) is dropped.
+            if (pullIndex + 1 < segments.Count &&
+                int.TryParse(segments[pullIndex + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) &&
+                parsed > 0)
+            {
+                number = parsed;
+            }
+
+            segments = segments.GetRange(0, pullIndex);
+        }
+        else if (segments.Count == 1 &&
+                 int.TryParse(segments[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var bare) &&
+                 bare > 0)
+        {
+            // A bare "18": a number, no repository.
+            return (null, null, bare);
+        }
+
+        string? owner = null;
+        string? repo = null;
+
+        if (segments.Count >= 2)
+        {
+            owner = segments[^2];
+            repo = segments[^1];
+            if (string.IsNullOrWhiteSpace(owner) || string.IsNullOrWhiteSpace(repo))
+            {
+                owner = repo = null;
+            }
+        }
+
+        return (owner, repo, number);
+    }
+
+    /// <summary>
+    /// Pulls the PR number out of a URL or accepts a bare number.
+    /// </summary>
+    /// <remarks>
+    /// Delegates to <see cref="ParsePullRequestReference"/>, which owns the URL shapes and the reasons
+    /// they are handled the way they are. Kept as a separate entry point because a caller that already
+    /// knows the repository only needs the number.
+    /// </remarks>
+    internal static bool TryResolvePrNumber(string value, out int prNumber)
+    {
+        var (_, _, number) = ParsePullRequestReference(value);
+        prNumber = number ?? 0;
+        return number is not null;
+    }
+
+    private static GitHubMergeResult MergeFailure(string reason, string message, string? body = null, string? token = null)
+    {
+        // The body is GitHub's own explanation and is genuinely useful to the agent or operator
+        // reading the job chat, but it is also untrusted text that can echo a URL. Redact and cap it
+        // the same way the push path does before it goes anywhere durable.
+        var detail = string.IsNullOrWhiteSpace(body)
+            ? string.Empty
+            : " " + Truncate(Redact(Sanitize(body), token ?? string.Empty), 300);
+
+        return new GitHubMergeResult(false, message + detail, reason);
+    }
+
     public GitHubPullRequestOptions ReadOptions() => new(
         Token: FirstNonEmpty(configuration["GitHub:Token"]),
         AppId: FirstNonEmpty(configuration["GitHub:AppId"]),
