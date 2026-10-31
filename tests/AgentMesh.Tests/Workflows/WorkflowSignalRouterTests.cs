@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
@@ -377,6 +377,40 @@ public class WorkflowSignalRouterTests
 
         await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
             new ChatMessageSignal("astra", "Layout A", DateTimeOffset.UtcNow, "msg-x")));
+        await handle.GetResultAsync();
+    }
+
+    /// <summary>
+    /// When scoped to the persona the workflow is driving, IsWorkflowDrivingAsync answers true.
+    /// When scoped to a different peer persona, it answers false so that peer can be dispatched.
+    /// </summary>
+    [Fact]
+    public async Task IsWorkflowDriving_ScopedToPersona_DistinguishesDrivingFromPeerPersonas()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        var jobId = Guid.NewGuid();
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Which auth model?"));
+        // StartAsync launches the workflow with PersonaId = "rook"
+        var handle = await StartAsync(env, jobId);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        var router = new WorkflowSignalRouter(env.Client);
+
+        // Targeted check for the driving persona (rook) -> true
+        (await router.IsWorkflowDrivingAsync(jobId, "rook")).Should().BeTrue();
+        (await router.IsWorkflowDrivingAsync(jobId, "@Rook")).Should().BeTrue("normalization handles casing and leading @");
+
+        // Targeted check for a peer persona (astra) -> false (peer should not be locked out)
+        (await router.IsWorkflowDrivingAsync(jobId, "astra")).Should().BeFalse("workflow is driving rook, not astra");
+
+        // Unscoped check (null or empty) -> true (job-level running check)
+        (await router.IsWorkflowDrivingAsync(jobId, null)).Should().BeTrue();
+
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Use OIDC", DateTimeOffset.UtcNow, "msg-fin")));
         await handle.GetResultAsync();
     }
 

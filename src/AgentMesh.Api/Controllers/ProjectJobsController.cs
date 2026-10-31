@@ -961,8 +961,12 @@ public class ProjectJobsController(
             .Select(pp => pp.PersonaId)
             .ToListAsync();
 
-        // Check if an assigned persona was mentioned
-        string? targetPersonaId = mentions.FirstOrDefault(m => assignedPersonaIds.Contains(m));
+        // Check if an assigned persona was explicitly mentioned (filtering out incidental @tokens like
+        // email addresses user@example.com or code directives @Inject, @page, @types/node)
+        var explicitPersonaMentions = mentions
+            .Where(m => assignedPersonaIds.Any(ap => string.Equals(ap, m, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+        string? targetPersonaId = explicitPersonaMentions.FirstOrDefault();
 
         // No mention: whoever owns the next pending task is the one expected to act, so an
         // unaddressed follow-up lands with them instead of defaulting to the lead every time.
@@ -1047,7 +1051,7 @@ public class ProjectJobsController(
         var workflowOwnsNextTurn = targetPersonaId is not null
                                    && req.TurnSessionId is null
                                    && workflows is not null
-                                   && await ProbeWorkflowOwnershipAsync(id, ct);
+                                   && await ProbeWorkflowOwnershipAsync(id, targetPersonaId, ct);
 
         // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn or queue!
         if (targetPersonaId != null && req.TurnSessionId == null && !workflowOwnsNextTurn)
@@ -1356,7 +1360,8 @@ public class ProjectJobsController(
             }
         }
 
-        await RouteReplyToWorkflowAsync(id, jobMsg, req, ct);
+        var explicitTarget = explicitPersonaMentions.Count > 0 ? string.Join(",", explicitPersonaMentions) : null;
+        await RouteReplyToWorkflowAsync(id, jobMsg, req, explicitTarget, ct);
 
         return Ok(msgDto);
     }
@@ -1374,11 +1379,11 @@ public class ProjectJobsController(
     /// turn for a request nobody is waiting on would leak a session.
     /// </para>
     /// </remarks>
-    private async Task<bool> ProbeWorkflowOwnershipAsync(Guid jobId, CancellationToken ct)
+    private async Task<bool> ProbeWorkflowOwnershipAsync(Guid jobId, string? targetPersonaId, CancellationToken ct)
     {
         try
         {
-            return await workflows!.IsWorkflowDrivingAsync(jobId, ct);
+            return await workflows!.IsWorkflowDrivingAsync(jobId, targetPersonaId, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -1447,6 +1452,7 @@ public class ProjectJobsController(
         Guid jobId,
         JobMessage message,
         PostJobMessageRequest req,
+        string? targetPersonaId,
         CancellationToken ct)
     {
         if (workflows is null) return;
@@ -1477,7 +1483,8 @@ public class ProjectJobsController(
                     Timestamp: message.CreatedAt,
                     // The persisted row's id is the dedup key: a retried request re-sends the same id and
                     // the workflow drops the duplicate instead of rendering the reply twice.
-                    MessageId: message.Id.ToString()),
+                    MessageId: message.Id.ToString(),
+                    TargetPersonaId: targetPersonaId),
                 ct);
 
             if (!delivery.Delivered)

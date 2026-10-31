@@ -174,6 +174,8 @@ public class PlatformMcpToolsTests
         router.ChatSends[0].signal.SenderId.Should().Be("astra",
             "the workflow's self-check compares against this id; sending the agent id or a blank would " +
             "either mis-attribute the answer or defeat the check");
+        router.ChatSends[0].signal.TargetPersonaId.Should().Be("rook",
+            "the target persona must be threaded through so third-party workflows are not prematurely woken");
         router.ChatSends[0].signal.Content.Should().Contain("OIDC");
     }
 

@@ -445,6 +445,51 @@ public class TaskExecutionWorkflowTests
     }
 
     /// <summary>
+    /// A chat signal explicitly targeted at another persona must not release this run's wait condition.
+    /// </summary>
+    [Fact]
+    public async Task SignalAddressedToDifferentPersona_IsIgnoredAndDoesNotWakeParkedWorkflow()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Waiting for Astra"));
+        turns.Enqueue(TurnOutcome.Completed("Done with work"));
+
+        // SampleInput has PersonaId: "rook"
+        var handle = await StartWorkflowAsync(env);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        // Operator mentions @astra
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(
+                SenderId: "operator",
+                Content: "@astra please review rook's PR",
+                Timestamp: DateTimeOffset.UtcNow,
+                MessageId: "msg-peer",
+                TargetPersonaId: "astra")));
+
+        var parkedStatus = await handle.QueryAsync(w => w.GetTaskStatus());
+        parkedStatus!.PendingChatCount.Should().Be(0, "a message addressed to @astra must not be enqueued into @rook's inbox");
+        parkedStatus.Status.Should().StartWith("Waiting on input");
+        parkedStatus.PersonaId.Should().Be("rook");
+
+        // Now deliver a message addressed to @rook
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(
+                SenderId: "astra",
+                Content: "Approved, proceed!",
+                Timestamp: DateTimeOffset.UtcNow,
+                MessageId: "msg-addressed",
+                TargetPersonaId: "rook")));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+        result.Success.Should().BeTrue();
+        turns.Calls.Should().Be(2);
+    }
+
+    /// <summary>
     /// A run started without a persona id cannot self-check, and must not drop everything.
     /// </summary>
     /// <remarks>

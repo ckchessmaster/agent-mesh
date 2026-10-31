@@ -281,7 +281,7 @@ public class PlatformMcpTools(
         //
         // Never fails the tool. The message is committed and broadcast above; a Temporal outage must not
         // make a delivered message look undeliverable to the agent that sent it.
-        await RouteReplyToWorkflowAsync(job.Id, message, sender, ct);
+        await RouteReplyToWorkflowAsync(job.Id, message, sender, target, ct);
 
         return JsonSerializer.Serialize(new
         {
@@ -356,6 +356,7 @@ public class PlatformMcpTools(
         Guid jobId,
         JobMessage message,
         SenderIdentity sender,
+        string? targetPersona,
         CancellationToken ct)
     {
         if (workflows is null) return;
@@ -371,7 +372,8 @@ public class PlatformMcpTools(
                     // The persisted row's id is the dedup key, matching the REST path: a retried call
                     // re-sends the same id and the workflow drops the duplicate rather than rendering the
                     // same reply twice.
-                    MessageId: message.Id.ToString()),
+                    MessageId: message.Id.ToString(),
+                    TargetPersonaId: targetPersona),
                 ct);
 
             if (!delivery.Delivered)

@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Workflows;
+using AgentMesh.Core.Workflows;
 using Temporalio.Api.Enums.V1;
 using Temporalio.Client;
 using Temporalio.Exceptions;
@@ -79,6 +79,17 @@ public interface IWorkflowSignalRouter
     /// bounded to <see cref="WorkflowSignalRouter.ProbeTimeout"/>.
     /// </remarks>
     Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Whether a running macro task workflow owns this job's next turn for the specified target persona.
+    /// </summary>
+    /// <remarks>
+    /// Scopes ownership to the orchestrated persona: when <paramref name="targetPersonaId"/> is provided,
+    /// returns true only if the running workflow is driving that persona (or falls back to true if the
+    /// workflow's persona is unset).
+    /// </remarks>
+    Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
+        IsWorkflowDrivingAsync(jobId, ct);
 }
 
 /// <summary>What happened when a signal was routed.</summary>
@@ -466,7 +477,10 @@ public class WorkflowSignalRouter(
     /// not a per-attempt timeout.
     /// </para>
     /// </remarks>
-    public async Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default)
+    public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
+        IsWorkflowDrivingAsync(jobId, null, ct);
+
+    public async Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default)
     {
         try
         {
@@ -480,7 +494,46 @@ public class WorkflowSignalRouter(
             var description = await handle.DescribeAsync(
                 new WorkflowDescribeOptions { Rpc = new RpcOptions { CancellationToken = deadline.Token } });
 
-            return description.Status == WorkflowExecutionStatus.Running;
+            if (description.Status != WorkflowExecutionStatus.Running)
+            {
+                return false;
+            }
+
+            // If no target persona was specified, running status is sufficient.
+            if (string.IsNullOrWhiteSpace(targetPersonaId))
+            {
+                return true;
+            }
+
+            // Scope ownership to the orchestrated persona:
+            // Query the running workflow to verify whether it is driving targetPersonaId.
+            try
+            {
+                var status = await handle.QueryAsync(
+                    w => w.GetTaskStatus(),
+                    new WorkflowQueryOptions { Rpc = new RpcOptions { CancellationToken = deadline.Token } });
+
+                // Fall back to job-level suppression only if the workflow's PersonaId is null/unset.
+                if (string.IsNullOrWhiteSpace(status?.PersonaId))
+                {
+                    return true;
+                }
+
+                var normTarget = NormalizePersona(targetPersonaId);
+                var normDriving = NormalizePersona(status.PersonaId);
+
+                return string.Equals(normTarget, normDriving, StringComparison.Ordinal);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger?.LogDebug("Could not query task status for workflow {WorkflowId}; falling back to job-level ownership: {Detail}",
+                    WorkflowIdFor(jobId), Describe(ex));
+                return true;
+            }
         }
         // Re-thrown only when the CALLER went away. Our own budget expiring is also an
         // OperationCanceledException, and must degrade to false like any other probe failure: the request
@@ -501,6 +554,9 @@ public class WorkflowSignalRouter(
             return false;
         }
     }
+
+    private static string? NormalizePersona(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim().TrimStart('@').ToLowerInvariant();
 
     /// <summary>
     /// Total budget for the per-message orchestration probe, <em>including</em> SDK retries.

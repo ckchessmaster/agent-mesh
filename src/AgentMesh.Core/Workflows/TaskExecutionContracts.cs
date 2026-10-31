@@ -1,4 +1,4 @@
-﻿namespace AgentMesh.Core.Workflows;
+namespace AgentMesh.Core.Workflows;
 
 /// <summary>
 /// A chat reply delivered into a running task workflow.
@@ -23,11 +23,16 @@
 /// <param name="Content">Message body, already Markdown.</param>
 /// <param name="Timestamp">When the sender wrote it — server time, not the agent's clock.</param>
 /// <param name="MessageId">Persisted chat row id, when the reply was stored.</param>
+/// <param name="TargetPersonaId">
+/// Optional explicit target persona or comma-delimited mentions this reply was addressed to.
+/// When supplied, workflows driving a different persona drop the signal so they are not woken prematurely.
+/// </param>
 public record ChatMessageSignal(
     string SenderId,
     string Content,
     DateTimeOffset Timestamp,
-    string? MessageId = null);
+    string? MessageId = null,
+    string? TargetPersonaId = null);
 
 /// <summary>
 /// An external code-review decision on the task's pull request.
@@ -127,7 +132,11 @@ public record TaskStatusView(
     /// the number is the only part that varies and the only part that answers "did my reply land?".
     /// </para>
     /// </remarks>
-    int IgnoredSelfSignalCount = 0);
+    int IgnoredSelfSignalCount = 0,
+    /// <summary>
+    /// The persona this workflow run is driving, or null if unassigned.
+    /// </summary>
+    string? PersonaId = null);
 
 /// <summary>
 /// The wire names of <see cref="ITaskExecutionWorkflow"/>'s handlers.

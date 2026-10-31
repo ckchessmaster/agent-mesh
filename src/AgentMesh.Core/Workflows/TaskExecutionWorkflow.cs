@@ -166,9 +166,6 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     /// through and the agent could still answer its own escalation.
     /// </remarks>
     private string? _agentId;
-
-    /// <summary>The job this run belongs to, for log correlation only.</summary>
-    private string _jobId = string.Empty;
     private DateTimeOffset? _awaitingSince;
     private int _turnCount;
     private TurnOutcomeStatus? _lastOutcome;
@@ -471,8 +468,51 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
             return Task.CompletedTask;
         }
 
+        // A message addressed to a third-party persona on the job must not release this run's wait gate.
+        if (!IsAddressedToThisRun(signal.TargetPersonaId))
+        {
+            return Task.CompletedTask;
+        }
+
         _chatInbox.Enqueue(signal);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Whether an incoming chat signal is addressed to this workflow run.
+    /// </summary>
+    /// <remarks>
+    /// A message addressed explicitly to another persona (via REST @mentions or MCP target_persona)
+    /// must not release this run's wait condition. Unaddressed messages (TargetPersonaId is null)
+    /// and messages mentioning this persona, its driver agent, or "operator" are accepted.
+    /// </remarks>
+    private bool IsAddressedToThisRun(string? targetPersonaId)
+    {
+        if (string.IsNullOrWhiteSpace(targetPersonaId))
+        {
+            return true;
+        }
+
+        var targets = targetPersonaId.Split([',', ';', ' '], StringSplitOptions.RemoveEmptyEntries);
+        if (targets.Length == 0)
+        {
+            return true;
+        }
+
+        foreach (var rawTarget in targets)
+        {
+            var target = NormalizeIdentity(rawTarget);
+            if (target is null) continue;
+
+            if (string.Equals(target, _personaId, StringComparison.Ordinal) ||
+                string.Equals(target, _agentId, StringComparison.Ordinal) ||
+                string.Equals(target, "operator", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>Whether a sender is the persona this workflow is driving.</summary>
@@ -538,7 +578,8 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         PendingChatCount: _chatInbox.Count,
         PrUrl: _activePrUrl,
         TurnSessionId: _turnSessionId,
-        IgnoredSelfSignalCount: _ignoredSelfSignals);
+        IgnoredSelfSignalCount: _ignoredSelfSignals,
+        PersonaId: _personaId);
 
     /// <summary>
     /// Issues the macro turn activity. Split out so the try/catch around it reads as one decision

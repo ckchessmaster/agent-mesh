@@ -1890,6 +1890,125 @@ public class ProjectJobsControllerTests
     }
 
     /// <summary>
+    /// When the workflow is driving a different persona (e.g. rook), mentions of peer personas (e.g. astra)
+    /// must NOT be suppressed by the workflow's running status.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WhenWorkflowIsDrivingPeerPersona_StillDispatchesTargetPersona()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-peer");
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Review the PR",
+            AssignedPersonaId = "astra",
+        };
+        var job = MakeAssignmentJob(project.Id, "Peer Review Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "rook", // Workflow is driving rook, not astra
+        };
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "@astra please review rook's PR", SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue(
+            "a parked workflow driving rook must not lock out peer personas like @astra from being dispatched");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaId.Should().Be("astra",
+            "the signal should carry the target persona so rook's workflow drops it rather than waking prematurely");
+    }
+
+    /// <summary>
+    /// When the workflow is driving the targeted persona (e.g. rook), dispatching that persona is suppressed.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WhenWorkflowIsDrivingTargetPersona_SuppressesTargetPersonaDispatch()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-target");
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "agy" });
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = project.Id, PersonaId = "rook" });
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement feature",
+            AssignedPersonaId = "rook",
+        };
+        var job = MakeAssignmentJob(project.Id, "Target Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "rook",
+        };
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "@rook please continue", SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "rook")).Should().BeFalse(
+            "the workflow owns rook's turns; a second runner must not be dispatched");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaId.Should().Be("rook");
+    }
+
+    /// <summary>
+    /// Incidental @tokens like email addresses (user@example.com) or code directives (@inject, @types/node)
+    /// must not be treated as persona targets when routing replies to workflows.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WithIncidentalAtTokens_DoesNotSetTargetPersonaId()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-incidental");
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement feature",
+            AssignedPersonaId = "soren",
+        };
+        var job = MakeAssignmentJob(project.Id, "Incidental Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "soren",
+        };
+        var controller = NewRoutingController(db, router);
+
+        // 1. Incidental tokens in message from a persona without explicit persona mentions
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "Please email user@example.com and check @inject in the codebase",
+            SenderType: "persona",
+            SenderId: "astra"));
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaId.Should().BeNull(
+            "incidental @tokens that do not correspond to assigned personas must not masquerade as a TargetPersonaId");
+
+        // 2. Explicit mention alongside an email address retains only the assigned persona
+        router.ChatSends.Clear();
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "@soren please send logs to user@example.com",
+            SenderType: "user",
+            SenderId: "operator"));
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaId.Should().Be("soren",
+            "the explicit persona mention should be preserved while the email address @example is filtered out");
+    }
+
+    /// <summary>
     /// When the workflow is not driving, the legacy path is untouched.
     /// </summary>
     /// <remarks>
@@ -2000,6 +2119,9 @@ public class ProjectJobsControllerTests
         /// <summary>What the ownership probe answers.</summary>
         public bool WorkflowDriving { get; set; }
 
+        /// <summary>Which persona the workflow is driving (null = any).</summary>
+        public string? DrivingPersonaId { get; set; }
+
         public Task<AgentMesh.Api.Services.SignalDelivery> SendChatMessageAsync(
             Guid jobId,
             AgentMesh.Core.Workflows.ChatMessageSignal signal,
@@ -2029,6 +2151,17 @@ public class ProjectJobsControllerTests
 
         public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
             Task.FromResult(WorkflowDriving);
+
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default)
+        {
+            if (!WorkflowDriving) return Task.FromResult(false);
+            if (string.IsNullOrWhiteSpace(targetPersonaId) || string.IsNullOrWhiteSpace(DrivingPersonaId))
+                return Task.FromResult(true);
+
+            var normTarget = targetPersonaId.Trim().TrimStart('@').ToLowerInvariant();
+            var normDriving = DrivingPersonaId.Trim().TrimStart('@').ToLowerInvariant();
+            return Task.FromResult(string.Equals(normTarget, normDriving, StringComparison.Ordinal));
+        }
     }
 
     private sealed class ThrowingOwnershipRouter : AgentMesh.Api.Services.IWorkflowSignalRouter
