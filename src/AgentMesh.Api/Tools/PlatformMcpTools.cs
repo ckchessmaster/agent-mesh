@@ -1,4 +1,4 @@
-﻿using System.ComponentModel;
+using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AgentMesh.Api.Controllers;
@@ -60,7 +60,8 @@ public class PlatformMcpTools(
     IGitHubPullRequestService pullRequests,
     IHubContext<AgentMeshHub> hubContext,
     ILogger<PlatformMcpTools> logger,
-    IConfiguration? configuration = null)
+    IConfiguration? configuration = null,
+    IWorkflowSignalRouter? workflows = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -253,6 +254,34 @@ public class PlatformMcpTools(
         if (parkedSession is not null)
         {
             await hubContext.Clients.All.SendAsync("SessionUpdated", parkedSession, ct);
+        }
+
+        if (!requires_reply && workflows is not null)
+        {
+            try
+            {
+                var delivery = await workflows.SendChatMessageAsync(
+                    job.Id,
+                    new Core.Workflows.ChatMessageSignal(
+                        SenderId: sender.PersonaId ?? "persona",
+                        Content: renderedContent,
+                        Timestamp: message.CreatedAt,
+                        MessageId: message.Id.ToString()),
+                    ct);
+
+                if (!delivery.Delivered)
+                {
+                    logger.LogInformation(
+                        "post_job_message on job {JobId} from {Sender} was not routed to a workflow ({Status}: {Detail})",
+                        job.Id, sender.PersonaId, delivery.Status, delivery.Detail ?? "(none)");
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex,
+                    "Routing persona reply from {Sender} into the workflow for job {JobId} failed",
+                    sender.PersonaId, job.Id);
+            }
         }
 
         return JsonSerializer.Serialize(new

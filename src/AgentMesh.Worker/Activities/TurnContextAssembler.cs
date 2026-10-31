@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using System.Text.Json;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
@@ -752,11 +752,6 @@ public class TurnContextAssembler(
     /// </remarks>
     internal async Task<Guid?> ResolveTurnSessionIdAsync(TaskExecutionInput input, CancellationToken ct)
     {
-        if (Guid.TryParse(input.TurnSessionId?.Trim(), out var fromInput))
-        {
-            return fromInput;
-        }
-
         try
         {
             var checkpoint = await checkpoints.GetCheckpointAsync(input.JobId, input.TaskId, ct);
@@ -772,6 +767,11 @@ public class TurnContextAssembler(
         catch (Exception ex)
         {
             logger?.LogWarning(ex, "Checkpoint lookup for the turn session failed on job {JobId}", input.JobId);
+        }
+
+        if (Guid.TryParse(input.TurnSessionId?.Trim(), out var fromInput))
+        {
+            return fromInput;
         }
 
         if (!Guid.TryParse(input.JobId.Trim(), out var jobId)) return null;

@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
@@ -185,17 +185,11 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     /// Read from the checkpoint rather than from the workflow input, because the input is fixed at
     /// workflow start and cannot know about a session created by turn three. The checkpoint is written
     /// by the turn activity at every boundary, so it is the freshest record of "which session is this
-    /// task's".
+    /// task's". Only a session that is still live is re-attached to; a completed session is history and
+    /// reusing it would skip dispatch, drop prompts, and observe a stale terminal state.
     /// </remarks>
-    private async Task<Guid?> ResolveExistingSessionAsync(AgentTurnRequest request, CancellationToken ct)
+    internal async Task<Guid?> ResolveExistingSessionAsync(AgentTurnRequest request, CancellationToken ct)
     {
-        // An explicit id on the request always wins: the workflow was started with it, or a previous
-        // attempt in this same activity invocation set it.
-        if (Guid.TryParse(request.TurnSessionId?.Trim(), out var explicitId) && explicitId != Guid.Empty)
-        {
-            return explicitId;
-        }
-
         try
         {
             var checkpoint = await checkpoints.GetCheckpointAsync(
@@ -216,7 +210,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                 if (live is not null && !TerminalStatuses.Contains(live, StringComparer.OrdinalIgnoreCase))
                 {
                     logger.LogInformation(
-                        "Re-attaching to live turn session {SessionId} (status {Status}) for task {TaskId} " +
+                        "Re-attaching to live turn session {SessionId} (status {Status}) from checkpoint for task {TaskId} " +
                         "instead of dispatching a second agent",
                         fromCheckpoint, live, request.Input.TaskId);
                     return fromCheckpoint;
@@ -229,11 +223,41 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         }
         catch (Exception ex)
         {
-            // Falling through to a fresh dispatch is safe here: the endpoint is idempotent on the
-            // session id and, when we have no id to send, a genuinely new turn is the correct answer.
             logger.LogWarning(ex,
-                "Could not check for an existing turn session for task {TaskId}; dispatching a new turn",
+                "Could not check checkpoint for an existing turn session for task {TaskId}",
                 request.Input.TaskId);
+        }
+
+        // An explicit id on the request: the workflow was started with it, or an activity attempt passed it.
+        // We must apply the same liveness check: an already-terminal explicit session must not skip dispatch.
+        if (Guid.TryParse(request.TurnSessionId?.Trim(), out var explicitId) && explicitId != Guid.Empty)
+        {
+            try
+            {
+                var live = await db.AgentSessions.AsNoTracking()
+                    .Where(s => s.Id == explicitId)
+                    .Select(s => s.Status)
+                    .FirstOrDefaultAsync(ct);
+
+                if (live is not null && !TerminalStatuses.Contains(live, StringComparer.OrdinalIgnoreCase))
+                {
+                    logger.LogInformation(
+                        "Re-attaching to live explicit turn session {SessionId} (status {Status}) for task {TaskId} " +
+                        "instead of dispatching a second agent",
+                        explicitId, live, request.Input.TaskId);
+                    return explicitId;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex,
+                    "Could not check liveness of explicit turn session {SessionId} for task {TaskId}",
+                    explicitId, request.Input.TaskId);
+            }
         }
 
         return null;

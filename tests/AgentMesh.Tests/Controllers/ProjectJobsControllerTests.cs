@@ -1,8 +1,10 @@
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
@@ -1688,5 +1690,48 @@ public class ProjectJobsControllerTests
         prompt.Content.Should().Contain("[ ] (CURRENT ACTIVE FOCUS) Unassigned task");
         prompt.Content.Should().NotContain("[Assigned:");
         prompt.Content.Should().NotContain("[Task Ownership Rule]");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WithPersonaSender_RoutesReplyToWorkflowSignalRouter()
+    {
+        var dbName = "ProjectJobs_PersonaRoute_" + Guid.NewGuid().ToString("N");
+        using var db = TestDbContextFactory.Create(dbName);
+        var project = new Project
+        {
+            Id = "proj-persona-route",
+            Name = "Persona Route Project",
+            WorkspaceType = WorkspaceType.Git
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Route Job",
+            GitBranchName = "mesh/job-route"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var routerMock = new Mock<IWorkflowSignalRouter>();
+        routerMock.Setup(r => r.SendChatMessageAsync(job.Id, It.IsAny<ChatMessageSignal>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SignalDelivery($"task-execution-{job.Id:N}", SignalDeliveryStatus.Delivered));
+
+        var controller = new ProjectJobsController(db, workflows: routerMock.Object);
+        var msgReq = new PostJobMessageRequest(
+            Content: "Architecture approved. Proceed with implementation.",
+            SenderType: "persona",
+            SenderId: "astra",
+            SenderName: "Astra"
+        );
+
+        var result = await controller.PostJobMessage(job.Id, msgReq);
+        result.Should().BeOfType<OkObjectResult>();
+
+        routerMock.Verify(r => r.SendChatMessageAsync(
+            job.Id,
+            It.Is<ChatMessageSignal>(s => s.SenderId == "astra" && s.Content.Contains("Architecture approved")),
+            It.IsAny<CancellationToken>()), Times.Once);
     }
 }

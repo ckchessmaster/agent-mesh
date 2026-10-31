@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
@@ -10,6 +10,7 @@ using AgentMesh.Worker.Activities;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Moq;
 using Xunit;
 
 namespace AgentMesh.Tests.Workflows;
@@ -445,6 +446,46 @@ public class TurnContextAssemblerTests
 
         prompt.Should().Contain("[RECENT CONVERSATION]")
             .And.Contain("no prior messages in this session");
+    }
+
+    /// <summary>
+    /// Checkpoint TurnSessionId takes precedence over input TurnSessionId to match documented order.
+    /// </summary>
+    [Fact]
+    public async Task ResolveTurnSessionId_PrefersCheckpointOverInput()
+    {
+        using var db = Db();
+        await SeedProjectAndJobAsync(db);
+
+        var checkpointSessionId = Guid.NewGuid();
+        var inputSessionId = Guid.NewGuid();
+
+        var repoMock = new Mock<IWorkspaceStateRepository>();
+        repoMock.Setup(r => r.GetCheckpointAsync(Input.JobId, Input.TaskId, default))
+            .ReturnsAsync(new TaskWorkingCheckpoint(
+                JobId: Input.JobId,
+                TaskId: Input.TaskId,
+                ActiveBranch: "main",
+                Status: JobTaskStatus.InProgress,
+                LastSummary: "summary",
+                ModifiedFiles: [],
+                ActiveStash: null,
+                UpdatedAt: DateTimeOffset.UtcNow,
+                TurnSessionId: checkpointSessionId.ToString()));
+
+        var assembler = new TurnContextAssembler(
+            db,
+            repoMock.Object,
+            new ShellWorkspaceReconciler(shellRunner: (_, _, _) =>
+                Task.FromResult(new CommandExecutionResult(true, 0, CleanProbeOutput))),
+            null,
+            new AgentMemoryRepository(db));
+
+        var input = Input with { TurnSessionId = inputSessionId.ToString() };
+        var resolved = await assembler.ResolveTurnSessionIdAsync(input, CancellationToken.None);
+
+        resolved.Should().Be(checkpointSessionId,
+            "the checkpoint's session represents the freshest turn and must take precedence over the workflow input");
     }
 
     // ──────────────────────────────────────────────────────────────────────────

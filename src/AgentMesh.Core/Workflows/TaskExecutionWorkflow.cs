@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Activities;
+using AgentMesh.Core.Activities;
 using Temporalio.Exceptions;
 using Temporalio.Workflows;
 
@@ -138,6 +138,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     private string? _activePrUrl;
     private int? _activePrNumber;
     private string? _turnSessionId;
+    private string? _personaId;
     private bool _isTerminated;
 
     /// <summary>
@@ -154,6 +155,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     {
         _currentStatus = "Running";
         _turnSessionId = input.TurnSessionId;
+        _personaId = input.PersonaId;
 
         while (!_isTerminated)
         {
@@ -269,21 +271,34 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                         // it needs server-side credentials the agent never holds, and its failure must
                         // be visible as a distinct event in the history rather than buried in a turn's
                         // prose.
-                        var mergeResult = await Workflow.ExecuteActivityAsync(
-                            (IGitActivities act) => act.MergePullRequestAsync(_activePrUrl!),
-                            new ActivityOptions
-                            {
-                                StartToCloseTimeout = TimeSpan.FromMinutes(5),
-                                // Retry a merge that failed transiently (rate limit, 5xx). Safe
-                                // because the activity treats "already merged" as success, so a retry
-                                // after a timeout that GitHub actually honoured does not double-apply.
-                                RetryPolicy = new()
+                        string? mergeResult;
+                        try
+                        {
+                            mergeResult = await Workflow.ExecuteActivityAsync(
+                                (IGitActivities act) => act.MergePullRequestAsync(_activePrUrl!),
+                                new ActivityOptions
                                 {
-                                    InitialInterval = TimeSpan.FromSeconds(5),
-                                    MaximumInterval = TimeSpan.FromMinutes(1),
-                                    MaximumAttempts = 3,
-                                },
-                            });
+                                    StartToCloseTimeout = TimeSpan.FromMinutes(5),
+                                    // Retry a merge that failed transiently (rate limit, 5xx). Safe
+                                    // because the activity treats "already merged" as success, so a retry
+                                    // after a timeout that GitHub actually honoured does not double-apply.
+                                    RetryPolicy = new()
+                                    {
+                                        InitialInterval = TimeSpan.FromSeconds(5),
+                                        MaximumInterval = TimeSpan.FromMinutes(1),
+                                        MaximumAttempts = 3,
+                                    },
+                                });
+                        }
+                        catch (Exception ex) when (IsTurnHalt(ex))
+                        {
+                            var reason = HaltReasonOf(ex);
+                            _currentStatus = $"Halted: {reason}";
+                            _lastOutcome = TurnOutcomeStatus.Failed;
+                            _isTerminated = true;
+
+                            return new TaskExecutionResult(false, input.TaskId, _activePrUrl, reason);
+                        }
 
                         _currentStatus = "Completed";
                         _isTerminated = true;
@@ -357,6 +372,15 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     public Task ReceiveChatMessageAsync(ChatMessageSignal signal)
     {
         if (signal is null) return Task.CompletedTask;
+
+        // An agent must not receive its own chat messages as replies. When an orchestrated agent
+        // escalates to a persona or posts into the ledger, its own message must never release the
+        // wait gate or enqueue into its own chat inbox.
+        if (!string.IsNullOrWhiteSpace(_personaId) &&
+            string.Equals(signal.SenderId, _personaId, StringComparison.OrdinalIgnoreCase))
+        {
+            return Task.CompletedTask;
+        }
 
         // Duplicate suppression. A redelivery is normal — the API retried a call that timed out
         // client-side but landed server-side — and a duplicated reply would be rendered into the

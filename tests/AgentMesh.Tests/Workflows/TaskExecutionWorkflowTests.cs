@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Activities;
+using AgentMesh.Core.Activities;
 using AgentMesh.Tests.Sandbox;
 using AgentMesh.Core.Workflows;
 using FluentAssertions;
@@ -488,6 +488,80 @@ public class TaskExecutionWorkflowTests
         await handle.GetResultAsync<TaskExecutionResult>();
     }
 
+    /// <summary>
+    /// A non-retryable merge failure halts the task cleanly with status and structured result rather than crashing with an unhandled exception.
+    /// </summary>
+    [Fact]
+    public async Task Workflow_NonRetryableMergeFailure_HaltsCleanlyAndReportsReason()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        var git = new FakeGitActivity
+        {
+            FailureToThrow = new Temporalio.Exceptions.ApplicationFailureException(
+                "Merge conflict detected on https://github.com/o/r/pull/18",
+                nonRetryable: true,
+                errorType: "merge_conflict")
+        };
+        await using var worker = TestWorker.Start(env, turns, git);
+
+        turns.Enqueue(TurnOutcome.AwaitingReview("https://github.com/o/r/pull/18", 18, "Review ready"));
+
+        var handle = await StartWorkflowAsync(env);
+        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
+
+        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
+            new PrReviewSignal("sorren", IsApproved: true, "Approved", DateTimeOffset.UtcNow, 18)));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+
+        result.Success.Should().BeFalse();
+        result.Summary.Should().Contain("Merge conflict detected");
+        git.Calls.Should().ContainSingle();
+
+        var finalStatus = await handle.QueryAsync(w => w.GetTaskStatus());
+        finalStatus.Status.Should().StartWith("Halted: ").And.Contain("Merge conflict detected");
+    }
+
+    /// <summary>
+    /// A self-message from the workflow's own persona is ignored and does not unblock an AwaitingInput gate.
+    /// </summary>
+    [Fact]
+    public async Task Workflow_SelfChatMessage_IsIgnoredAndDoesNotUnblockAwaitingInput()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Waiting on Astra"));
+        turns.Enqueue(TurnOutcome.Completed("Finished after response"));
+
+        // SampleInput has PersonaId: "rook"
+        var handle = await StartWorkflowAsync(env);
+        await WaitUntilAsync(handle, s => s.Status == "Waiting on input from astra");
+
+        // Send a self-message authored by "rook"
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("rook", "My own notes", DateTimeOffset.UtcNow, "self-1")));
+
+        // Give time for any potential handling
+        await Task.Delay(2000);
+
+        // Status should still be parked on Astra
+        var status = await handle.QueryAsync(w => w.GetTaskStatus());
+        status.Status.Should().Be("Waiting on input from astra");
+        turns.Calls.Should().Be(1, "self-message must not release the wait gate");
+
+        // Now send reply from Astra
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("astra", "Here is the guidance.", DateTimeOffset.UtcNow, "astra-1")));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+        result.Success.Should().BeTrue();
+        turns.Calls.Should().Be(2, "reply from Astra unblocks the turn");
+        turns.PendingReplyAt(1)!.SenderId.Should().Be("astra");
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // Harness
     // ──────────────────────────────────────────────────────────────────────────
@@ -579,9 +653,10 @@ public class TaskExecutionWorkflowTests
         WorkflowEnvironment.StartTimeSkippingAsync();
 
     private static Task<WorkflowHandle<TaskExecutionWorkflow, TaskExecutionResult>> StartWorkflowAsync(
-        WorkflowEnvironment env) =>
+        WorkflowEnvironment env,
+        TaskExecutionInput? input = null) =>
         env.Client.StartWorkflowAsync(
-            (TaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(SampleInput),
+            (TaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(input ?? SampleInput),
             new WorkflowOptions($"task-execution-{Guid.NewGuid():N}", Queue));
 
     /// <summary>
@@ -736,11 +811,16 @@ public class TaskExecutionWorkflowTests
     private sealed class FakeGitActivity : IGitActivities
     {
         public List<string> Calls { get; } = [];
+        public Exception? FailureToThrow { get; set; }
 
         [Activity]
         public Task<string> MergePullRequestAsync(string prUrl)
         {
             Calls.Add(prUrl);
+            if (FailureToThrow != null)
+            {
+                throw FailureToThrow;
+            }
             return Task.FromResult($"merged {prUrl}");
         }
     }

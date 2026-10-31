@@ -1361,7 +1361,6 @@ public class ProjectJobsController(
         CancellationToken ct)
     {
         if (workflows is null) return;
-        if (!string.Equals(req.SenderType, "user", StringComparison.OrdinalIgnoreCase)) return;
 
         // A null logger is the normal state for the ~40 controller tests that construct this type
         // directly, so the routing block's two log calls go through a local no-op rather than the
@@ -1370,10 +1369,18 @@ public class ProjectJobsController(
 
         try
         {
+            var senderId = !string.IsNullOrWhiteSpace(message.SenderId)
+                ? message.SenderId
+                : (!string.IsNullOrWhiteSpace(req.SenderId)
+                    ? req.SenderId
+                    : (string.Equals(req.SenderType, "persona", StringComparison.OrdinalIgnoreCase)
+                        ? (req.SenderName ?? "persona")
+                        : "operator"));
+
             var delivery = await workflows.SendChatMessageAsync(
                 jobId,
                 new Core.Workflows.ChatMessageSignal(
-                    SenderId: string.IsNullOrWhiteSpace(req.SenderId) ? "operator" : req.SenderId!,
+                    SenderId: senderId,
                     Content: message.Content,
                     Timestamp: message.CreatedAt,
                     // The persisted row's id is the dedup key: a retried request re-sends the same id and
