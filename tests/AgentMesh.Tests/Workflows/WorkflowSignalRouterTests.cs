@@ -579,7 +579,7 @@ public class WorkflowSignalRouterTests
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
 
-        var act = async () => await router.IsWorkflowDrivingAsync(Guid.NewGuid(), cts.Token);
+        var act = async () => await router.IsWorkflowDrivingAsync(Guid.NewGuid(), ct: cts.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>(
             "the caller went away; degrading that to 'false' would keep the request alive to dispatch a " +

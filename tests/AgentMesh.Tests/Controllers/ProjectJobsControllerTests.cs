@@ -1921,8 +1921,7 @@ public class ProjectJobsControllerTests
             "a parked workflow driving rook must not lock out peer personas like @astra from being dispatched");
 
         router.ChatSends.Should().ContainSingle();
-        router.ChatSends[0].signal.TargetPersonaId.Should().Be("astra",
-            "the signal should carry the target persona so rook's workflow drops it rather than waking prematurely");
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("astra");
     }
 
     /// <summary>
@@ -1931,9 +1930,9 @@ public class ProjectJobsControllerTests
     /// regardless of mention order.
     /// </summary>
     [Theory]
-    [InlineData("@rook @astra please collaborate", "rook,astra")]
-    [InlineData("@astra @rook please collaborate", "astra,rook")]
-    public async Task PostJobMessage_MentionOrder_DispatchesPeerPersonaRegardlessOfOrder(string content, string expectedSignalTarget)
+    [InlineData("@rook @astra please collaborate", new[] { "rook", "astra" })]
+    [InlineData("@astra @rook please collaborate", new[] { "astra", "rook" })]
+    public async Task PostJobMessage_MentionOrder_DispatchesPeerPersonaRegardlessOfOrder(string content, string[] expectedSignalTargets)
     {
         var (db, project, _, _) = BuildAssignmentContext("proj-order-" + Guid.NewGuid().ToString("N")[..6]);
         db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "agy" });
@@ -1965,7 +1964,7 @@ public class ProjectJobsControllerTests
             "driven persona @rook must be suppressed from legacy dispatch regardless of mention order");
 
         router.ChatSends.Should().ContainSingle();
-        router.ChatSends[0].signal.TargetPersonaId.Should().Be(expectedSignalTarget);
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal(expectedSignalTargets);
     }
 
     /// <summary>
@@ -2001,7 +2000,7 @@ public class ProjectJobsControllerTests
             "the workflow owns rook's turns; a second runner must not be dispatched");
 
         router.ChatSends.Should().ContainSingle();
-        router.ChatSends[0].signal.TargetPersonaId.Should().Be("rook");
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("rook");
     }
 
     /// <summary>
@@ -2036,7 +2035,7 @@ public class ProjectJobsControllerTests
             SenderId: "astra"));
 
         router.ChatSends.Should().ContainSingle();
-        router.ChatSends[0].signal.TargetPersonaId.Should().BeNull(
+        router.ChatSends[0].signal.TargetPersonaIds.Should().BeNull(
             "incidental @tokens that do not correspond to assigned personas must not masquerade as a TargetPersonaId");
 
         // 2. Explicit mention alongside an email address retains only the assigned persona
@@ -2047,8 +2046,50 @@ public class ProjectJobsControllerTests
             SenderId: "operator"));
 
         router.ChatSends.Should().ContainSingle();
-        router.ChatSends[0].signal.TargetPersonaId.Should().Be("soren",
-            "the explicit persona mention should be preserved while the email address @example is filtered out");
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("soren");
+    }
+
+    /// <summary>
+    /// When a persona posts a message mentioning itself alongside peer personas, it does not dispatch
+    /// a turn for itself, but peer personas are still dispatched and all mentions are passed as signal targets.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WhenSenderIsPersona_DoesNotDispatchTurnForSenderItself_EvenIfMentioned()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-self-mention-" + Guid.NewGuid().ToString("N")[..6]);
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "agy" });
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = project.Id, PersonaId = "rook" });
+
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Collaborative task",
+            AssignedPersonaId = "rook",
+        };
+        var job = MakeAssignmentJob(project.Id, "Self Mention Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = false // Legacy dispatch enabled for both
+        };
+        var controller = NewRoutingController(db, router);
+
+        // Astra sends message mentioning both @astra and @rook
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "Hey @rook, @astra here. Can you take a look at the PR?",
+            SenderType: "persona",
+            SenderId: "astra",
+            SenderName: "Astra"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeFalse(
+            "a persona sender must not dispatch a turn for itself even if it mentioned its own name");
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "rook")).Should().BeTrue(
+            "the addressed peer persona @rook must still be dispatched");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("rook", "astra");
     }
 
     /// <summary>
@@ -2195,10 +2236,7 @@ public class ProjectJobsControllerTests
             Guid jobId, string? taskId, CancellationToken ct = default) =>
             Task.FromResult<AgentMesh.Core.Workflows.TaskStatusView?>(null);
 
-        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
-            Task.FromResult(WorkflowDriving);
-
-        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default)
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId = null, CancellationToken ct = default)
         {
             if (!WorkflowDriving) return Task.FromResult(false);
             if (string.IsNullOrWhiteSpace(targetPersonaId) || string.IsNullOrWhiteSpace(DrivingPersonaId))

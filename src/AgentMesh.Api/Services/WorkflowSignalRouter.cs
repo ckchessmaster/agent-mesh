@@ -87,19 +87,7 @@ public interface IWorkflowSignalRouter
     /// returns true only if the running workflow is driving that persona (or falls back to true if the
     /// workflow's persona is unset). Fails toward false: an unreachable Temporal must not swallow chat replies.
     /// </remarks>
-    Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default);
-
-    /// <summary>
-    /// Whether a running macro task workflow is currently driving turns on this job.
-    /// </summary>
-    /// <remarks>
-    /// Consulted by <c>PostJobMessage</c> before it dispatches a legacy SignalR runner, so a job under
-    /// Temporal management cannot also acquire a second agent on the same branch. Fails toward false:
-    /// an unreachable Temporal must not swallow chat replies. See the implementation for why the probe is
-    /// bounded to <see cref="WorkflowSignalRouter.ProbeTimeout"/>.
-    /// </remarks>
-    Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
-        IsWorkflowDrivingAsync(jobId, null, ct);
+    Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId = null, CancellationToken ct = default);
 }
 
 /// <summary>What happened when a signal was routed.</summary>
@@ -491,10 +479,7 @@ public class WorkflowSignalRouter(
     /// not a per-attempt timeout.
     /// </para>
     /// </remarks>
-    public Task<bool> IsWorkflowDrivingAsync(Guid jobId, CancellationToken ct = default) =>
-        IsWorkflowDrivingAsync(jobId, null, ct);
-
-    public async Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default)
+    public async Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId = null, CancellationToken ct = default)
     {
         try
         {

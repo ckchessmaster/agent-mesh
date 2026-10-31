@@ -965,7 +965,7 @@ public class ProjectJobsController(
         // email addresses user@example.com or code directives @Inject, @page, @types/node)
         var explicitPersonaMentions = mentions
             .Where(m => assignedPersonaIds.Any(ap => string.Equals(ap, m, StringComparison.OrdinalIgnoreCase)))
-            .Select(m => assignedPersonaIds.First(ap => string.Equals(ap, m, StringComparison.OrdinalIgnoreCase)))
+            .Select(m => assignedPersonaIds.First(ap => string.Equals(ap, m, StringComparison.OrdinalIgnoreCase)).Trim().ToLowerInvariant())
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -1022,6 +1022,17 @@ public class ProjectJobsController(
         var candidatePersonas = explicitPersonaMentions.Count > 0
             ? explicitPersonaMentions
             : (fallbackPersonaId != null ? [fallbackPersonaId] : new List<string>());
+
+        // A persona must not dispatch a turn for itself: if the sender is a persona on this project,
+        // exclude it from candidatePersonas so it doesn't wake or dispatch itself.
+        if (string.Equals(req.SenderType, "persona", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(req.SenderId))
+        {
+            var senderPersonaId = req.SenderId.Trim().ToLowerInvariant();
+            candidatePersonas = candidatePersonas
+                .Where(p => !string.Equals(p, senderPersonaId, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
 
         // Determine which candidate personas are not driven by a running macro workflow.
         // The workflow's ownership is probed for each explicit mention so that mentioning an
@@ -1353,8 +1364,10 @@ public class ProjectJobsController(
             }
         }
 
-        var explicitTarget = explicitPersonaMentions.Count > 0 ? string.Join(",", explicitPersonaMentions) : null;
-        await RouteReplyToWorkflowAsync(id, jobMsg, req, explicitTarget, ct);
+        IReadOnlyList<string>? explicitTargets = explicitPersonaMentions.Count > 0
+            ? explicitPersonaMentions.AsReadOnly()
+            : null;
+        await RouteReplyToWorkflowAsync(id, jobMsg, req, explicitTargets, ct);
 
         return Ok(msgDto);
     }
@@ -1445,7 +1458,7 @@ public class ProjectJobsController(
         Guid jobId,
         JobMessage message,
         PostJobMessageRequest req,
-        string? targetPersonaId,
+        IReadOnlyList<string>? targetPersonaIds,
         CancellationToken ct)
     {
         if (workflows is null) return;
@@ -1477,7 +1490,7 @@ public class ProjectJobsController(
                     // The persisted row's id is the dedup key: a retried request re-sends the same id and
                     // the workflow drops the duplicate instead of rendering the reply twice.
                     MessageId: message.Id.ToString(),
-                    TargetPersonaId: targetPersonaId),
+                    TargetPersonaIds: targetPersonaIds),
                 ct);
 
             if (!delivery.Delivered)

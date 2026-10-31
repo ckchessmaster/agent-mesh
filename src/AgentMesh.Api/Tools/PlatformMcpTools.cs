@@ -363,6 +363,10 @@ public class PlatformMcpTools(
 
         try
         {
+            IReadOnlyList<string>? targetPersonaIds = !string.IsNullOrWhiteSpace(targetPersona)
+                ? [targetPersona.Trim().TrimStart('@').ToLowerInvariant()]
+                : null;
+
             var delivery = await workflows.SendChatMessageAsync(
                 jobId,
                 new Core.Workflows.ChatMessageSignal(
@@ -373,7 +377,7 @@ public class PlatformMcpTools(
                     // re-sends the same id and the workflow drops the duplicate rather than rendering the
                     // same reply twice.
                     MessageId: message.Id.ToString(),
-                    TargetPersonaId: targetPersona),
+                    TargetPersonaIds: targetPersonaIds),
                 ct);
 
             if (!delivery.Delivered)

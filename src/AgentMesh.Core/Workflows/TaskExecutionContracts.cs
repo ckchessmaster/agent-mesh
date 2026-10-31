@@ -23,8 +23,8 @@ namespace AgentMesh.Core.Workflows;
 /// <param name="Content">Message body, already Markdown.</param>
 /// <param name="Timestamp">When the sender wrote it — server time, not the agent's clock.</param>
 /// <param name="MessageId">Persisted chat row id, when the reply was stored.</param>
-/// <param name="TargetPersonaId">
-/// Optional explicit target persona or comma-delimited mentions this reply was addressed to.
+/// <param name="TargetPersonaIds">
+/// Optional explicit target personas this reply was addressed to.
 /// When supplied, workflows driving a different persona drop the signal so they are not woken prematurely.
 /// </param>
 public record ChatMessageSignal(
@@ -32,7 +32,7 @@ public record ChatMessageSignal(
     string Content,
     DateTimeOffset Timestamp,
     string? MessageId = null,
-    string? TargetPersonaId = null);
+    IReadOnlyList<string>? TargetPersonaIds = null);
 
 /// <summary>
 /// An external code-review decision on the task's pull request.

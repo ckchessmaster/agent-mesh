@@ -468,7 +468,7 @@ public class TaskExecutionWorkflowTests
                 Content: "@astra please review rook's PR",
                 Timestamp: DateTimeOffset.UtcNow,
                 MessageId: "msg-peer",
-                TargetPersonaId: "astra")));
+                TargetPersonaIds: new[] { "astra" })));
 
         var parkedStatus = await handle.QueryAsync(w => w.GetTaskStatus());
         parkedStatus!.PendingChatCount.Should().Be(0, "a message addressed to @astra must not be enqueued into @rook's inbox");
@@ -483,7 +483,7 @@ public class TaskExecutionWorkflowTests
                 Content: "FYI operator, reviewed",
                 Timestamp: DateTimeOffset.UtcNow,
                 MessageId: "msg-op",
-                TargetPersonaId: "operator")));
+                TargetPersonaIds: new[] { "operator" })));
 
         parkedStatus = await handle.QueryAsync(w => w.GetTaskStatus());
         parkedStatus!.PendingChatCount.Should().Be(0, "a message addressed to operator must not wake rook's parked workflow");
@@ -496,7 +496,68 @@ public class TaskExecutionWorkflowTests
                 Content: "Approved, proceed!",
                 Timestamp: DateTimeOffset.UtcNow,
                 MessageId: "msg-addressed",
-                TargetPersonaId: "rook")));
+                TargetPersonaIds: new[] { "rook" })));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+        result.Success.Should().BeTrue();
+        turns.Calls.Should().Be(2);
+    }
+
+    /// <summary>
+    /// When a reply is addressed to several personas, one of them this workflow's persona,
+    /// it wakes this workflow as long as the sender is NOT this persona itself.
+    /// If the sender IS this persona, it is dropped by the self-check and does not wake.
+    /// </summary>
+    [Fact]
+    public async Task SignalAddressedToMultiplePersonas_WakesWhenAddressedToSelf_UnlessSenderIsSelf()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        turns.Enqueue(TurnOutcome.Awaiting("astra", "Waiting for input"));
+        turns.Enqueue(TurnOutcome.Completed("Finished task after multi-target wake"));
+
+        // SampleInput has PersonaId: "rook"
+        var handle = await StartWorkflowAsync(env);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        // 1. Reply addressed to multiple personas that do NOT include "rook" -> ignored as misaddressed
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(
+                SenderId: "operator",
+                Content: "@astra @soren please check this out",
+                Timestamp: DateTimeOffset.UtcNow,
+                MessageId: "msg-multi-peer",
+                TargetPersonaIds: new[] { "astra", "soren" })));
+
+        var status = await handle.QueryAsync(w => w.GetTaskStatus());
+        status!.PendingChatCount.Should().Be(0);
+        status.IgnoredMisaddressedSignalCount.Should().Be(1);
+        status.Status.Should().StartWith("Waiting on input");
+
+        // 2. Reply addressed to "rook" AND "astra", but sent BY "rook" -> ignored by self-check (never wake self)
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(
+                SenderId: "rook",
+                Content: "@rook @astra here is my self note",
+                Timestamp: DateTimeOffset.UtcNow,
+                MessageId: "msg-multi-self",
+                TargetPersonaIds: new[] { "rook", "astra" })));
+
+        status = await handle.QueryAsync(w => w.GetTaskStatus());
+        status!.PendingChatCount.Should().Be(0);
+        status.IgnoredSelfSignalCount.Should().Be(1, "messages sent by the driving persona itself must not wake it");
+        status.Status.Should().StartWith("Waiting on input");
+
+        // 3. Reply addressed to "rook" AND "astra", sent by a peer or operator -> wakes this workflow!
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal(
+                SenderId: "astra",
+                Content: "@rook @astra I reviewed and approved both parts",
+                Timestamp: DateTimeOffset.UtcNow,
+                MessageId: "msg-multi-valid",
+                TargetPersonaIds: new[] { "rook", "astra" })));
 
         var result = await handle.GetResultAsync<TaskExecutionResult>();
         result.Success.Should().BeTrue();

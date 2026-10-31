@@ -475,7 +475,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         }
 
         // A message addressed to a third-party persona on the job must not release this run's wait gate.
-        if (!IsAddressedToThisRun(signal.TargetPersonaId))
+        if (!IsAddressedToThisRun(signal.TargetPersonaIds))
         {
             _ignoredMisaddressedSignals++;
             return Task.CompletedTask;
@@ -489,24 +489,18 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     /// Whether an incoming chat signal is addressed to this workflow run.
     /// </summary>
     /// <remarks>
-    /// A message addressed explicitly to another persona or to "operator" (via REST @mentions or MCP target_persona)
-    /// must not release this run's wait condition. Only unaddressed messages (TargetPersonaId is null)
+    /// A message addressed explicitly to other personas (via REST @mentions or MCP target_persona)
+    /// must not release this run's wait condition. Only unaddressed messages (TargetPersonaIds is null or empty)
     /// and messages explicitly mentioning this persona or its driver agent are accepted.
     /// </remarks>
-    private bool IsAddressedToThisRun(string? targetPersonaId)
+    private bool IsAddressedToThisRun(IReadOnlyList<string>? targetPersonaIds)
     {
-        if (string.IsNullOrWhiteSpace(targetPersonaId))
+        if (targetPersonaIds is null || targetPersonaIds.Count == 0)
         {
             return true;
         }
 
-        var targets = targetPersonaId.Split([',', ';', ' '], StringSplitOptions.RemoveEmptyEntries);
-        if (targets.Length == 0)
-        {
-            return true;
-        }
-
-        foreach (var rawTarget in targets)
+        foreach (var rawTarget in targetPersonaIds)
         {
             var target = NormalizeIdentity(rawTarget);
             if (target is null) continue;
