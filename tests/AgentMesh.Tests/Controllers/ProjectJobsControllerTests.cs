@@ -1,8 +1,10 @@
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
@@ -1688,5 +1690,596 @@ public class ProjectJobsControllerTests
         prompt.Content.Should().Contain("[ ] (CURRENT ACTIVE FOCUS) Unassigned task");
         prompt.Content.Should().NotContain("[Assigned:");
         prompt.Content.Should().NotContain("[Task Ownership Rule]");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_WithPersonaSender_RoutesReplyToWorkflowSignalRouter()
+    {
+        var dbName = "ProjectJobs_PersonaRoute_" + Guid.NewGuid().ToString("N");
+        using var db = TestDbContextFactory.Create(dbName);
+        var project = new Project
+        {
+            Id = "proj-persona-route",
+            Name = "Persona Route Project",
+            WorkspaceType = WorkspaceType.Git
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Route Job",
+            GitBranchName = "mesh/job-route"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var routerMock = new Mock<IWorkflowSignalRouter>();
+        routerMock.Setup(r => r.SendChatMessageAsync(job.Id, It.IsAny<ChatMessageSignal>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SignalDelivery($"task-execution-{job.Id:N}", SignalDeliveryStatus.Delivered));
+
+        var controller = new ProjectJobsController(db, workflows: routerMock.Object);
+        var msgReq = new PostJobMessageRequest(
+            Content: "Architecture approved. Proceed with implementation.",
+            SenderType: "persona",
+            SenderId: "astra",
+            SenderName: "Astra"
+        );
+
+        var result = await controller.PostJobMessage(job.Id, msgReq);
+        result.Should().BeOfType<OkObjectResult>();
+
+        routerMock.Verify(r => r.SendChatMessageAsync(
+            job.Id,
+            It.Is<ChatMessageSignal>(s => s.SenderId == "astra" && s.Content.Contains("Architecture approved")),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Durable-workflow routing and turn ownership
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A persona reply releases a parked workflow.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The filter here used to be <c>SenderType == "user"</c>, on the reasoning that a persona message is
+    /// agent-to-agent chatter. That was right about chatter and fatal about escalations: an orchestrated
+    /// agent blocks with <c>requires_reply: true, target_persona: "astra"</c>, and the only party who can
+    /// answer is another persona — whose reply arrives with <c>SenderType = "persona"</c>. So the
+    /// escalation could never be answered and the task sat for the full seven-day gate. A cross-persona
+    /// review request, which is the normal shape of two-man review in this product, was a guaranteed
+    /// deadlock.
+    /// </para>
+    /// <para>
+    /// Seeded with no personas assigned to the project, so the endpoint's own dispatch branch is skipped
+    /// and the assertion isolates the routing call. Assigning a persona here would let the test pass
+    /// through the legacy dispatcher instead.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_RoutesAPersonaReplyIntoTheWorkflow()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project { Id = "proj-route", Name = "Route", WorkspaceType = WorkspaceType.Git });
+        var job = MakeAssignmentJob("proj-route", "Escalation Job", new List<JobTaskDto>());
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter();
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "Sign-off: approved, merge it.",
+            SenderType: "persona",
+            SenderId: "astra"));
+
+        router.ChatSends.Should().ContainSingle(
+            "a persona is the only party who can answer an agent's escalation; dropping the reply is " +
+            "what left parked tasks wedged for seven days");
+        router.ChatSends[0].signal.SenderId.Should().Be("astra");
+        router.ChatSends[0].signal.Content.Should().Contain("approved");
+    }
+
+    /// <summary>
+    /// A human reply is still routed — the relaxation must not cost the original case.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_StillRoutesAHumanReply()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project { Id = "proj-route", Name = "Route", WorkspaceType = WorkspaceType.Git });
+        var job = MakeAssignmentJob("proj-route", "Human Reply Job", new List<JobTaskDto>());
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter();
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "Use OIDC.", SenderType: "user", SenderId: "operator"));
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.SenderId.Should().Be("operator");
+    }
+
+    /// <summary>
+    /// Generated bookkeeping is still excluded.
+    /// </summary>
+    /// <remarks>
+    /// <c>system</c> rows are notices nobody addressed to anyone (handoff records, completion markers).
+    /// Releasing a turn on one would be pure noise, and the ack the endpoint itself writes for a persona
+    /// dispatch is exactly such a row — so routing them would make a single human message wake the
+    /// workflow twice.
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_DoesNotRouteASystemMessage()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project { Id = "proj-route", Name = "Route", WorkspaceType = WorkspaceType.Git });
+        var job = MakeAssignmentJob("proj-route", "System Message Job", new List<JobTaskDto>());
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter();
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "Job handed off from astra to sorren.",
+            SenderType: "system",
+            SenderId: "system"));
+
+        router.ChatSends.Should().BeEmpty(
+            "system rows are generated bookkeeping, not a reply anybody is waiting on");
+    }
+
+    /// <summary>
+    /// A job under workflow management does not also acquire a legacy SignalR runner.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The ownership rule the feature's documentation claimed and this endpoint did not enforce. The
+    /// dispatch branch keys off "a persona was mentioned and no session id was supplied", and an
+    /// unaddressed human reply resolves the target to the next pending task's assignee — on an
+    /// orchestrated job, exactly the persona the workflow is driving. So a plain "yes, use OIDC" both
+    /// released the workflow's gate AND queued a second agent on the same working tree: two agents, one
+    /// branch, edits clobbering each other and pushes rejected for reasons nobody could reproduce.
+    /// </para>
+    /// <para>
+    /// Asserted as "no session was created and nothing was queued" rather than by watching for a dispatch
+    /// call, because the dispatch here is a SignalR send plus a row insert — the rows are what a later
+    /// reader would find, and they are what an operator would blame.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_WhenTheWorkflowIsDriving_DoesNotDispatchALegacyRunner()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-own");
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement the gate",
+            AssignedPersonaId = "astra",
+        };
+        var job = MakeAssignmentJob(project.Id, "Orchestrated Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter { WorkflowDriving = true };
+        var controller = NewRoutingController(db, router);
+
+        // Unaddressed: targetPersonaId resolves to the pending task's assignee, which is the persona the
+        // workflow is driving. This is the exact shape that used to double-drive.
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "yes, use OIDC", SenderType: "user", SenderId: "operator"));
+
+        router.ChatSends.Should().ContainSingle(
+            "the reply still has to reach the parked workflow — suppression is about the runner, not the signal");
+
+        (await db.AgentSessions.AnyAsync()).Should().BeFalse(
+            "a workflow-driven job must not also start a SignalR turn: two agents on one branch is the " +
+            "failure this guard exists to prevent");
+        (await db.JobMessages.AnyAsync(m => m.SenderType == "persona")).Should().BeFalse(
+            "the 'I'm on it' ack comes from the legacy dispatch path; emitting it while the workflow " +
+            "owns the turn would tell the operator an agent started that did not");
+
+        var reloaded = await db.ProjectJobs.SingleAsync(j => j.Id == job.Id);
+        ParseQueued(reloaded.QueuedTurnsJson).Should().BeEmpty(
+            "and the reply must not be parked in the legacy queue either, where a runner would claim it");
+    }
+
+    /// <summary>
+    /// When the workflow is driving a different persona (e.g. rook), mentions of peer personas (e.g. astra)
+    /// must NOT be suppressed by the workflow's running status.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WhenWorkflowIsDrivingPeerPersona_StillDispatchesTargetPersona()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-peer");
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Review the PR",
+            AssignedPersonaId = "astra",
+        };
+        var job = MakeAssignmentJob(project.Id, "Peer Review Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "rook", // Workflow is driving rook, not astra
+        };
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "@astra please review rook's PR", SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue(
+            "a parked workflow driving rook must not lock out peer personas like @astra from being dispatched");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("astra");
+    }
+
+    /// <summary>
+    /// When multiple personas are mentioned in different orders (e.g. "@rook @astra" vs "@astra @rook"),
+    /// the probe checks each mention independently, so non-driven personas are always dispatched
+    /// regardless of mention order.
+    /// </summary>
+    [Theory]
+    [InlineData("@rook @astra please collaborate", new[] { "rook", "astra" })]
+    [InlineData("@astra @rook please collaborate", new[] { "astra", "rook" })]
+    public async Task PostJobMessage_MentionOrder_DispatchesPeerPersonaRegardlessOfOrder(string content, string[] expectedSignalTargets)
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-order-" + Guid.NewGuid().ToString("N")[..6]);
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "agy" });
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = project.Id, PersonaId = "rook" });
+
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement feature",
+            AssignedPersonaId = "rook",
+        };
+        var job = MakeAssignmentJob(project.Id, "Order Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "rook", // Workflow is driving rook, not astra
+        };
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: content, SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue(
+            "non-driven peer persona @astra must be dispatched regardless of mention order");
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "rook")).Should().BeFalse(
+            "driven persona @rook must be suppressed from legacy dispatch regardless of mention order");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal(expectedSignalTargets);
+    }
+
+    /// <summary>
+    /// When the workflow is driving the targeted persona (e.g. rook), dispatching that persona is suppressed.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WhenWorkflowIsDrivingTargetPersona_SuppressesTargetPersonaDispatch()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-target");
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "agy" });
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = project.Id, PersonaId = "rook" });
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement feature",
+            AssignedPersonaId = "rook",
+        };
+        var job = MakeAssignmentJob(project.Id, "Target Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "rook",
+        };
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "@rook please continue", SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "rook")).Should().BeFalse(
+            "the workflow owns rook's turns; a second runner must not be dispatched");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("rook");
+    }
+
+    /// <summary>
+    /// Incidental @tokens like email addresses (user@example.com) or code directives (@inject, @types/node)
+    /// must not be treated as persona targets when routing replies to workflows.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WithIncidentalAtTokens_DoesNotSetTargetPersonaId()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-incidental");
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement feature",
+            AssignedPersonaId = "soren",
+        };
+        var job = MakeAssignmentJob(project.Id, "Incidental Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = true,
+            DrivingPersonaId = "soren",
+        };
+        var controller = NewRoutingController(db, router);
+
+        // 1. Incidental tokens in message from a persona without explicit persona mentions
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "Please email user@example.com and check @inject in the codebase",
+            SenderType: "persona",
+            SenderId: "astra"));
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaIds.Should().BeNull(
+            "incidental @tokens that do not correspond to assigned personas must not masquerade as a TargetPersonaId");
+
+        // 2. Explicit mention alongside an email address retains only the assigned persona
+        router.ChatSends.Clear();
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "@soren please send logs to user@example.com",
+            SenderType: "user",
+            SenderId: "operator"));
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("soren");
+    }
+
+    /// <summary>
+    /// When a persona posts a message mentioning itself alongside peer personas, it does not dispatch
+    /// a turn for itself, but peer personas are still dispatched and all mentions are passed as signal targets.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WhenSenderIsPersona_DoesNotDispatchTurnForSenderItself_EvenIfMentioned()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-self-mention-" + Guid.NewGuid().ToString("N")[..6]);
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "agy" });
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = project.Id, PersonaId = "rook" });
+
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Collaborative task",
+            AssignedPersonaId = "rook",
+        };
+        var job = MakeAssignmentJob(project.Id, "Self Mention Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter
+        {
+            WorkflowDriving = false // Legacy dispatch enabled for both
+        };
+        var controller = NewRoutingController(db, router);
+
+        // Astra sends message mentioning both @astra and @rook
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "Hey @rook, @astra here. Can you take a look at the PR?",
+            SenderType: "persona",
+            SenderId: "astra",
+            SenderName: "Astra"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeFalse(
+            "a persona sender must not dispatch a turn for itself even if it mentioned its own name");
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "rook")).Should().BeTrue(
+            "the addressed peer persona @rook must still be dispatched");
+
+        router.ChatSends.Should().ContainSingle();
+        router.ChatSends[0].signal.TargetPersonaIds.Should().Equal("rook", "astra");
+    }
+
+    /// <summary>
+    /// When the workflow is not driving, the legacy path is untouched.
+    /// </summary>
+    /// <remarks>
+    /// The counterpart that keeps the guard honest. Without it, "always suppress" would pass the test
+    /// above while silently disabling every non-orchestrated job in the product — including every job
+    /// that exists today, since orchestration is opt-in per task.
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_WhenNoWorkflowIsDriving_StillDispatchesTheLegacyRunner()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-own");
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement the gate",
+            AssignedPersonaId = "astra",
+        };
+        var job = MakeAssignmentJob(project.Id, "Plain Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new RecordingRouter { WorkflowDriving = false };
+        var controller = NewRoutingController(db, router);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "yes, use OIDC", SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue(
+            "the pre-orchestration behaviour must survive intact for a job nobody is orchestrating");
+    }
+
+    /// <summary>
+    /// A router that cannot answer the ownership probe must not suppress the dispatch.
+    /// </summary>
+    /// <remarks>
+    /// Fails toward dispatch, deliberately. The real router swallows its own probe errors and returns
+    /// false; a fake that throws models the caller being handed an exception anyway (a cancellation
+    /// racing the request). Either way the answer must be "dispatch as if not orchestrated": a control-plane
+    /// outage that silently swallows chat replies is worse than the double-drive it avoids, because a
+    /// double-drive is visible and recoverable while a dropped turn is neither.
+    /// </remarks>
+    [Fact]
+    public async Task PostJobMessage_WhenTheOwnershipProbeThrows_StillDispatches()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-own");
+        var task = new JobTaskDto
+        {
+            Id = Guid.NewGuid(),
+            Title = "Implement the gate",
+            AssignedPersonaId = "astra",
+        };
+        var job = MakeAssignmentJob(project.Id, "Outage Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new ThrowingOwnershipRouter();
+        var controller = NewRoutingController(db, router);
+
+        var result = await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "yes, use OIDC", SenderType: "user", SenderId: "operator"));
+
+        result.Should().BeOfType<OkObjectResult>(
+            "a Temporal outage must not turn into a failed message post");
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue(
+            "and it must not silently swallow the turn either");
+        router.ChatSends.Should().ContainSingle(
+            "the signal is still delivered to the workflow router even when the ownership probe fails");
+    }
+
+    /// <summary>
+    /// With no router wired, the endpoint behaves exactly as it did before orchestration existed.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_WithoutARouter_DispatchesAndRoutesNothing()
+    {
+        var (db, project, _, _) = BuildAssignmentContext("proj-own");
+        var task = new JobTaskDto { Id = Guid.NewGuid(), Title = "T", AssignedPersonaId = "astra" };
+        var job = MakeAssignmentJob(project.Id, "No Router Job", new List<JobTaskDto> { task });
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        await controller.PostJobMessage(job.Id, new PostJobMessageRequest(
+            Content: "yes, use OIDC", SenderType: "user", SenderId: "operator"));
+
+        (await db.AgentSessions.AnyAsync(s => s.PersonaId == "astra")).Should().BeTrue();
+    }
+
+    // ── Harness for the routing tests ────────────────────────────────────────────
+
+    /// <summary>
+    /// Builds the controller with a router, leaving the other optional parameters null.
+    /// </summary>
+    /// <remarks>
+    /// Positional through <c>workflows</c> because the constructor's later parameters are optional; a
+    /// named argument keeps that ordering dependency visible instead of silent.
+    /// </remarks>
+    private static ProjectJobsController NewRoutingController(
+        AgentMeshDbContext db,
+        AgentMesh.Api.Services.IWorkflowSignalRouter router) =>
+        new(db, hubContext: null, storageService: null, workflows: router);
+
+    private static List<QueuedJobTurnDto> ParseQueued(string json) =>
+        ProjectJobsController.ParseQueuedTurns(json);
+
+    private sealed class RecordingRouter : AgentMesh.Api.Services.IWorkflowSignalRouter
+    {
+        public List<(Guid jobId, AgentMesh.Core.Workflows.ChatMessageSignal signal)> ChatSends { get; } = [];
+
+        /// <summary>What the ownership probe answers.</summary>
+        public bool WorkflowDriving { get; set; }
+
+        /// <summary>Which persona the workflow is driving (null = any).</summary>
+        public string? DrivingPersonaId { get; set; }
+
+        public Task<AgentMesh.Api.Services.SignalDelivery> SendChatMessageAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.ChatMessageSignal signal,
+            CancellationToken ct = default)
+        {
+            ChatSends.Add((jobId, signal));
+            return Task.FromResult(new AgentMesh.Api.Services.SignalDelivery(
+                "task-execution-" + jobId.ToString("N"),
+                AgentMesh.Api.Services.SignalDeliveryStatus.Delivered));
+        }
+
+        public Task<AgentMesh.Api.Services.SignalDelivery> SendPrReviewAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.PrReviewSignal signal,
+            CancellationToken ct = default) =>
+            Task.FromResult(new AgentMesh.Api.Services.SignalDelivery(
+                "task-execution-" + jobId.ToString("N"),
+                AgentMesh.Api.Services.SignalDeliveryStatus.Delivered));
+
+        public Task<AgentMesh.Api.Services.WorkflowStartResult> StartTaskWorkflowAsync(
+            AgentMesh.Core.Workflows.TaskExecutionInput input, CancellationToken ct = default) =>
+            Task.FromResult(new AgentMesh.Api.Services.WorkflowStartResult(true, "test-workflow"));
+
+        public Task<AgentMesh.Core.Workflows.TaskStatusView?> GetStatusAsync(
+            Guid jobId, string? taskId, CancellationToken ct = default) =>
+            Task.FromResult<AgentMesh.Core.Workflows.TaskStatusView?>(null);
+
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId = null, CancellationToken ct = default)
+        {
+            if (!WorkflowDriving) return Task.FromResult(false);
+            if (string.IsNullOrWhiteSpace(targetPersonaId) || string.IsNullOrWhiteSpace(DrivingPersonaId))
+                return Task.FromResult(true);
+
+            var normTarget = targetPersonaId.Trim().TrimStart('@').ToLowerInvariant();
+            var normDriving = DrivingPersonaId.Trim().TrimStart('@').ToLowerInvariant();
+            return Task.FromResult(string.Equals(normTarget, normDriving, StringComparison.Ordinal));
+        }
+    }
+
+    private sealed class ThrowingOwnershipRouter : AgentMesh.Api.Services.IWorkflowSignalRouter
+    {
+        public List<(Guid jobId, AgentMesh.Core.Workflows.ChatMessageSignal signal)> ChatSends { get; } = [];
+
+        public Task<AgentMesh.Api.Services.SignalDelivery> SendChatMessageAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.ChatMessageSignal signal,
+            CancellationToken ct = default)
+        {
+            ChatSends.Add((jobId, signal));
+            return Task.FromResult(new AgentMesh.Api.Services.SignalDelivery(
+                "task-execution-" + jobId.ToString("N"),
+                AgentMesh.Api.Services.SignalDeliveryStatus.NoRunningWorkflow));
+        }
+
+        public Task<AgentMesh.Api.Services.SignalDelivery> SendPrReviewAsync(
+            Guid jobId,
+            AgentMesh.Core.Workflows.PrReviewSignal signal,
+            CancellationToken ct = default) =>
+            Task.FromResult(new AgentMesh.Api.Services.SignalDelivery(
+                "task-execution-" + jobId.ToString("N"),
+                AgentMesh.Api.Services.SignalDeliveryStatus.NoRunningWorkflow));
+
+        public Task<AgentMesh.Api.Services.WorkflowStartResult> StartTaskWorkflowAsync(
+            AgentMesh.Core.Workflows.TaskExecutionInput input, CancellationToken ct = default) =>
+            Task.FromResult(new AgentMesh.Api.Services.WorkflowStartResult(true, "test-workflow"));
+
+        public Task<AgentMesh.Core.Workflows.TaskStatusView?> GetStatusAsync(
+            Guid jobId, string? taskId, CancellationToken ct = default) =>
+            Task.FromResult<AgentMesh.Core.Workflows.TaskStatusView?>(null);
+
+        public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
+            Task.FromException<bool>(new InvalidOperationException("simulated Temporal outage"));
     }
 }

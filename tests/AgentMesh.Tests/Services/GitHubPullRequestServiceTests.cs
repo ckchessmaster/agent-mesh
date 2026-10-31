@@ -855,6 +855,362 @@ public class GitHubPullRequestServiceTests
         }
     }
 
+    // ── MergePullRequestAsync ─────────────────────────────────────────────────────
+
+    private const string PrUrl = "https://github.com/ckchessmaster/agent-mesh/pull/18";
+    private const string ReadPath = "/repos/ckchessmaster/agent-mesh/pulls/18";
+    private const string MergePath = "/repos/ckchessmaster/agent-mesh/pulls/18/merge";
+
+    /// <summary>
+    /// An approved pull request is merged with the configured strategy.
+    /// </summary>
+    [Fact]
+    public async Task Merge_SendsTheMergeCallWithTheSquashMethod()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"abc1234def"}}""")
+            .Respond(HttpMethod.Put, MergePath, 200, """{"merged":true,"sha":"5f4e3d2"}""");
+
+        var service = BuildService(TokenConfig(), handler: handler);
+
+        var result = await service.MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.Success.Should().BeTrue(result.Message);
+        result.AlreadyMerged.Should().BeFalse();
+        result.MergeCommitSha.Should().Be("5f4e3d2");
+        result.Message.Should().Contain("squash");
+
+        var merge = handler.Requests.Single(r => r.Method == HttpMethod.Put);
+        merge.Body.Should().Contain("\"merge_method\":\"squash\"");
+        merge.Authorization.Should().NotBeNull("the merge is authenticated with the server credential");
+    }
+
+    /// <summary>
+    /// The head SHA the reviewer approved is forwarded, so a later push cannot ride the approval in.
+    /// </summary>
+    /// <remarks>
+    /// Without <c>sha</c>, an author who pushes a new commit between approval and merge lands it on the
+    /// strength of a review that never saw it — the exact bypass the two-man review rule exists to
+    /// prevent.
+    /// </remarks>
+    [Fact]
+    public async Task Merge_ForwardsTheApprovedSha()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"reviewed-sha"}}""")
+            .Respond(HttpMethod.Put, MergePath, 200, """{"merged":true,"sha":"m1"}""");
+
+        await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl, Sha: "reviewed-sha"));
+
+        handler.Requests.Single(r => r.Method == HttpMethod.Put)
+            .Body.Should().Contain("reviewed-sha");
+    }
+
+    /// <summary>
+    /// When no approved SHA was supplied, the current head is sent.
+    /// </summary>
+    /// <remarks>
+    /// This does not re-establish the approval guarantee — it is what the caller asked for by not naming
+    /// a SHA — but it still closes the window between this read and the merge call.
+    /// </remarks>
+    [Fact]
+    public async Task Merge_WithoutAnApprovedSha_SendsTheHeadItJustRead()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"current-head"}}""")
+            .Respond(HttpMethod.Put, MergePath, 200, """{"merged":true,"sha":"m1"}""");
+
+        await BuildService(TokenConfig(), handler: handler).MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        handler.Requests.Single(r => r.Method == HttpMethod.Put).Body.Should().Contain("current-head");
+    }
+
+    /// <summary>
+    /// An already-merged pull request is reported as success.
+    /// </summary>
+    /// <remarks>
+    /// The idempotency contract. Temporal retries an activity whose timeout elapsed after GitHub already
+    /// honoured the call; without this, the retry would report failure and halt a task whose work had
+    /// genuinely landed. GitHub's own merge endpoint answers this case with 405 and the same body it uses
+    /// for a real conflict, which is why the state is read first rather than inferred from the merge
+    /// response.
+    /// </remarks>
+    [Fact]
+    public async Task Merge_WhenAlreadyMerged_ReportsSuccessRatherThanAConflict()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200,
+                """{"state":"merged","head":{"sha":"aaa"},"merge_commit_sha":"bbbccc"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.Success.Should().BeTrue(result.Message);
+        result.AlreadyMerged.Should().BeTrue();
+        result.MergeCommitSha.Should().Be("bbbccc");
+        result.Message.Should().Contain("already merged");
+
+        handler.Requests.Should().NotContain(r => r.Method == HttpMethod.Put,
+            "a merged pull request must not be re-merged");
+    }
+
+    [Fact]
+    public async Task Merge_WhenClosed_ReportsAPrClosedReason()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"closed","head":{"sha":"aaa"}}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.Success.Should().BeFalse();
+        result.FailureReason.Should().Be("pr_closed");
+    }
+
+    /// <summary>
+    /// A 409 on the merge is the SHA guard rejecting a moved head, not a transient fault.
+    /// </summary>
+    /// <remarks>
+    /// Naming it separately is what stops the workflow's retry policy from hammering a merge that will
+    /// never succeed without a fresh review.
+    /// </remarks>
+    [Fact]
+    public async Task Merge_WhenHeadMovedAfterApproval_ReportsShaMismatch()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"aaa"}}""")
+            .Respond(HttpMethod.Put, MergePath, 409, """{"message":"Pull Request is out of date at commit"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl, Sha: "aaa"));
+
+        result.Success.Should().BeFalse();
+        result.FailureReason.Should().Be("sha_mismatch");
+        result.Message.Should().Contain("re-review",
+            "the operator needs to know a fresh review is required, not that GitHub was briefly down");
+    }
+
+    [Fact]
+    public async Task Merge_WhenNotMergeable_ReportsThatReason()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"aaa"}}""")
+            .Respond(HttpMethod.Put, MergePath, 405, """{"message":"Pull Request is not mergeable"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.FailureReason.Should().Be("not_mergeable");
+    }
+
+    [Fact]
+    public async Task Merge_OnA5xx_ReportsAGenericApiErrorTheWorkflowCanRetry()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"aaa"}}""")
+            .Respond(HttpMethod.Put, MergePath, 503, """{"message":"service unavailable"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.FailureReason.Should().Be("api_error",
+            "GitActivities treats only this reason as retryable, so a permanent rejection must not be " +
+            "classified here or the workflow will retry a merge that can never succeed");
+    }
+
+    /// <summary>
+    /// A merge is never simulated.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="GitHubPullRequestService.PushBranchAndCreatePrAsync"/> fabricates PR #999 with no
+    /// credentials, which is defensible for an opening action an agent can retry. Faking a merge would
+    /// mark the task completed and report a merged PR that does not exist, and the work would never reach
+    /// the base branch.
+    /// </remarks>
+    [Fact]
+    public async Task Merge_WithNoCredentials_RefusesInsteadOfSimulating()
+    {
+        var handler = new StubHttpHandler();
+        var service = BuildService(new Dictionary<string, string?> { ["GitHub:Repository"] = "ckchessmaster/agent-mesh" },
+            handler: handler);
+
+        var result = await service.MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.Success.Should().BeFalse();
+        result.FailureReason.Should().Be("no_credentials");
+        result.Message.Should().Contain("never simulated");
+        handler.Requests.Should().BeEmpty("no credential means no API call at all");
+    }
+
+    [Fact]
+    public async Task Merge_ResolvesTheRepositoryFromConfigurationWhenTheReferenceIsABareNumber()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"a"}}""")
+            .Respond(HttpMethod.Put, MergePath, 200, """{"merged":true,"sha":"m"}""");
+
+        var settings = TokenConfig();
+        settings["GitHub:Repository"] = "ckchessmaster/agent-mesh";
+
+        var result = await BuildService(settings, handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest("18"));
+
+        result.Success.Should().BeTrue(result.Message);
+        handler.Requests.Should().Contain(r => r.Path == MergePath);
+    }
+
+    [Fact]
+    public async Task Merge_WhenTheRepositoryIsUnresolvable_Refuses()
+    {
+        var service = BuildService(TokenConfig(), handler: new StubHttpHandler());
+
+        // A bare number with no configured repository: there is nothing to derive owner/repo from.
+        var result = await service.MergePullRequestAsync(new GitHubMergeRequest("18"));
+
+        result.FailureReason.Should().Be("no_repository");
+    }
+
+    [Fact]
+    public async Task Merge_WhenThePullRequestDoesNotExist_ReportsNotFound()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 404, """{"message":"Not Found"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.FailureReason.Should().Be("not_found");
+        handler.Requests.Should().NotContain(r => r.Method == HttpMethod.Put);
+    }
+
+    /// <summary>
+    /// A missing reference and a malformed one are reported as different reasons.
+    /// </summary>
+    /// <remarks>
+    /// Worth separating because the caller's fix differs: an absent value means the workflow reached the
+    /// merge gate without ever recording a PR (a workflow bug, or a review signal for a task that has no
+    /// PR), while a malformed one means a link was pasted in a shape the parser does not know. Both must
+    /// fail before any HTTP call, since neither can be retried usefully.
+    /// </remarks>
+    [Theory]
+    [InlineData("   ", "invalid_request")]
+    [InlineData("", "invalid_request")]
+    [InlineData("https://github.com/o/r/pull/abc", "invalid_pr_reference")]
+    [InlineData("not a url", "invalid_pr_reference")]
+    public async Task Merge_WithAnUnusableReference_FailsBeforeAnyCall(string reference, string expectedReason)
+    {
+        var handler = new StubHttpHandler();
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(reference));
+
+        result.Success.Should().BeFalse();
+        result.FailureReason.Should().Be(expectedReason);
+        handler.Requests.Should().BeEmpty();
+    }
+
+    /// <summary>
+    /// An error body from GitHub is capped and stripped of credentials before it travels.
+    /// </summary>
+    /// <remarks>
+    /// The failure message becomes an activity failure, which lands in Temporal's history — readable by
+    /// anyone with console access. GitHub echoes the request URL in some bodies, and a proxy error page
+    /// can echo an Authorization header.
+    /// </remarks>
+    [Fact]
+    public async Task Merge_RedactsTheTokenFromAnErrorBody()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"a"}}""")
+            .Respond(HttpMethod.Put, MergePath, 403,
+                $$"""{"message":"Bad credentials for {{Token}}","documentation_url":"https://docs.github.com"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.Message.Should().NotContain(Token, "the token must never reach the caller or the history");
+        result.Message.Should().Contain("[redacted]");
+    }
+
+    [Fact]
+    public async Task Merge_StripsAQueryAndFragmentFromACopiedPrLink()
+    {
+        // Links pasted out of the GitHub UI or a chat message carry these, and a number parsed as
+        // "18?_use_iframe=true" fails — turning a reviewer's pasted approval into an unexplained rejection.
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"a"}}""")
+            .Respond(HttpMethod.Put, MergePath, 200, """{"merged":true,"sha":"m"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest("https://github.com/ckchessmaster/agent-mesh/pull/18/files#diff-1"));
+
+        result.Success.Should().BeTrue(result.Message);
+    }
+
+    [Theory]
+    [InlineData("https://github.com/o/r/pull/18", 18)]
+    [InlineData("https://github.com/o/r/pull/18/", 18)]
+    [InlineData("https://github.com/o/r/pull/18/files", 18)]
+    [InlineData("https://github.com/o/r/pull/18?_use_iframe=true", 18)]
+    [InlineData("https://github.com/o/r/pull/18#discussion_r123456", 18)]
+    [InlineData("18", 18)]
+    [InlineData("  18  ", 18)]
+    [InlineData("https://github.com/o/r/pull/abc", 0)]
+    [InlineData("https://github.com/o/r", 0)]
+    [InlineData("", 0)]
+    [InlineData("not a url", 0)]
+    public void TryResolvePrNumber_HandlesTheFormsThatArrive(string input, int expected)
+    {
+        var ok = GitHubPullRequestService.TryResolvePrNumber(input, out var parsed);
+        (ok ? parsed : 0).Should().Be(expected, $"'{input}' should resolve to {expected}");
+    }
+
+    [Theory]
+    [InlineData("ckchessmaster/agent-mesh", "ckchessmaster", "agent-mesh")]
+    [InlineData("https://github.com/ckchessmaster/agent-mesh", "ckchessmaster", "agent-mesh")]
+    [InlineData("https://github.com/ckchessmaster/agent-mesh.git", "ckchessmaster", "agent-mesh")]
+    // Credentials embedded in a push URL must never be propagated.
+    [InlineData("https://user:tok@github.com/o/r.git", "o", "r")]
+    public void ResolveRepository_AcceptsASlugOrAUrl(string input, string owner, string repo)
+    {
+        var resolved = GitHubPullRequestService.ResolveRepository(input, null);
+        resolved!.Value.Owner.Should().Be(owner);
+        resolved.Value.Repo.Should().Be(repo);
+    }
+
+    [Fact]
+    public void ResolveRepository_PrefersTheExplicitValueAndFallsBackToConfig()
+    {
+        GitHubPullRequestService.ResolveRepository(null, "cfg/repo")!.Value.Repo.Should().Be("repo");
+        GitHubPullRequestService.ResolveRepository("explicit/repo", "cfg/repo")!.Value.Repo.Should().Be("repo");
+        GitHubPullRequestService.ResolveRepository(null, null).Should().BeNull();
+    }
+
+    [Fact]
+    public void TryReadPullRequestState_ReadsStateHeadAndMergeCommit()
+    {
+        var (state, headSha, mergedSha) = GitHubPullRequestService.TryReadPullRequestState(
+            """{"state":"open","head":{"sha":"abc123"},"merge_commit_sha":null,"number":18}""");
+
+        state.Should().Be("open");
+        headSha.Should().Be("abc123");
+        mergedSha.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("<html>502 Bad Gateway</html>")]
+    [InlineData("[]")]
+    [InlineData("{}")]
+    public void TryReadPullRequestState_ToleratesAnUnparseableBody(string? json)
+    {
+        // GitHub's shape is stable, but this runs against whatever the API returned and a parse failure
+        // must not become a 500 on the activity.
+        GitHubPullRequestService.TryReadPullRequestState(json).State.Should().BeNull();
+    }
+
     // ── Fixtures ──────────────────────────────────────────────────────────────────
 
     private static readonly GitCommandResult GitOk = new(0, "", "");

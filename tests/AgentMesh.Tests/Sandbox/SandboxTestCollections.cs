@@ -1,4 +1,4 @@
-namespace AgentMesh.Tests.Sandbox;
+﻿namespace AgentMesh.Tests.Sandbox;
 
 /// <summary>
 /// Collection name shared by every test that exercises log spillover.
@@ -17,4 +17,20 @@ namespace AgentMesh.Tests.Sandbox;
 public static class SandboxTestCollections
 {
     public const string Spillover = "SandboxSpillover";
+
+    /// <summary>
+    /// Collection name shared by every test that boots a Temporal test server.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Temporalio.Testing.WorkflowEnvironment.StartTimeSkippingAsync"/> launches a
+    /// <c>temporal-test-server</c> subprocess and reserves an ephemeral port. xUnit parallelises across
+    /// collections, so N classes in N collections would each start their own server; on a small CI
+    /// container that is N processes polling the same host for ports, and the failure mode is a
+    /// server that fails to bind and a test that reports "Timeout expired" against code that is fine.
+    ///
+    /// Serialising costs wall clock (each server takes a second or two to come up). The alternative —
+    /// sharing one environment across classes — would require a fixture whose lifetime outlives the
+    /// collection and would couple every workflow test to the first one's shutdown behaviour.
+    /// </remarks>
+    public const string Temporal = "TemporalWorkflowEnvironment";
 }

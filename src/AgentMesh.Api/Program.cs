@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -25,6 +25,23 @@ builder.AddRedisClient("redis");
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
 var temporalNamespace = builder.Configuration["Temporal:Namespace"] ?? "default";
 builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespace: temporalNamespace);
+
+// The macro-orchestration signal router: start a task workflow, read its status, and deliver a chat
+// reply or a review decision into a workflow that is durably parked.
+//
+// Scoped, not singleton: it resolves an ITemporalClient per call and holds no state worth caching
+// across requests, and the two controllers that take it are themselves scoped.
+//
+// This registration is load-bearing in a way that is easy to miss, because nothing fails at startup
+// when it is absent. MacroTurnsController takes IWorkflowSignalRouter as a *required* parameter, so
+// its endpoints would 500 on every request — visible. But ProjectJobsController takes it as an
+// *optional* parameter (defaulting to null, so the ~40 existing controller tests can construct that
+// type without knowing about Temporal), and RouteReplyToWorkflowAsync opens with
+// `if (workflows is null) return;`. Unregistered, that means Job Chat replies are persisted,
+// broadcast, and then silently never routed: the workflow sits in its seven-day park while a human
+// answers in a window nothing is reading. A whole class of feature disappears without an error.
+// Pinned by ApiServiceRegistrationTests so it cannot regress quietly.
+builder.Services.AddScoped<IWorkflowSignalRouter, WorkflowSignalRouter>();
 
 // Configure Authentication & Authorization
 builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();

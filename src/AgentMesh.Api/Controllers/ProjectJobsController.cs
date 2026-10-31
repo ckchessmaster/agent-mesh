@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -9,6 +10,8 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AgentMesh.Api.Controllers;
 
@@ -127,7 +130,9 @@ public record JobMessageDto(
 public class ProjectJobsController(
     AgentMeshDbContext db,
     IHubContext<AgentMeshHub>? hubContext = null,
-    IStorageService? storageService = null) : ControllerBase
+    IStorageService? storageService = null,
+    IWorkflowSignalRouter? workflows = null,
+    ILogger<ProjectJobsController>? logger = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -915,7 +920,10 @@ public class ProjectJobsController(
     }
 
     [HttpPost("api/project-jobs/{id}/messages")]
-    public async Task<IActionResult> PostJobMessage(Guid id, [FromBody] PostJobMessageRequest req)
+    public async Task<IActionResult> PostJobMessage(
+        Guid id,
+        [FromBody] PostJobMessageRequest req,
+        CancellationToken ct = default)
     {
         var effectiveContent = !string.IsNullOrWhiteSpace(req.Content)
             ? req.Content.Trim()
@@ -953,34 +961,40 @@ public class ProjectJobsController(
             .Select(pp => pp.PersonaId)
             .ToListAsync();
 
-        // Check if an assigned persona was mentioned
-        string? targetPersonaId = mentions.FirstOrDefault(m => assignedPersonaIds.Contains(m));
+        // Check if an assigned persona was explicitly mentioned (filtering out incidental @tokens like
+        // email addresses user@example.com or code directives @Inject, @page, @types/node)
+        var explicitPersonaMentions = mentions
+            .Where(m => assignedPersonaIds.Any(ap => string.Equals(ap, m, StringComparison.OrdinalIgnoreCase)))
+            .Select(m => assignedPersonaIds.First(ap => string.Equals(ap, m, StringComparison.OrdinalIgnoreCase)).Trim().ToLowerInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
+        string? fallbackPersonaId = null;
         // No mention: whoever owns the next pending task is the one expected to act, so an
         // unaddressed follow-up lands with them instead of defaulting to the lead every time.
-        if (targetPersonaId == null && req.SenderType == "user")
+        if (explicitPersonaMentions.Count == 0 && req.SenderType == "user")
         {
             var nextPendingTask = ParseTasks(job.TasksJson).FirstOrDefault(t => !t.IsCompleted);
             var assigneeId = nextPendingTask?.AssignedPersonaId?.Trim().ToLowerInvariant();
             if (assigneeId != null && assignedPersonaIds.Contains(assigneeId))
             {
-                targetPersonaId = assigneeId;
-                if (!mentions.Contains(targetPersonaId))
+                fallbackPersonaId = assigneeId;
+                if (!mentions.Contains(fallbackPersonaId))
                 {
-                    mentions.Add(targetPersonaId);
+                    mentions.Add(fallbackPersonaId);
                 }
             }
         }
 
         // If no explicit mention and message comes from user, fall back to DefaultLeadPersonaId if assigned
-        if (targetPersonaId == null && req.SenderType == "user" && !string.IsNullOrWhiteSpace(project.DefaultLeadPersonaId))
+        if (explicitPersonaMentions.Count == 0 && fallbackPersonaId == null && req.SenderType == "user" && !string.IsNullOrWhiteSpace(project.DefaultLeadPersonaId))
         {
             if (assignedPersonaIds.Contains(project.DefaultLeadPersonaId))
             {
-                targetPersonaId = project.DefaultLeadPersonaId;
-                if (!mentions.Contains(targetPersonaId))
+                fallbackPersonaId = project.DefaultLeadPersonaId;
+                if (!mentions.Contains(fallbackPersonaId))
                 {
-                    mentions.Add(targetPersonaId);
+                    mentions.Add(fallbackPersonaId);
                 }
             }
         }
@@ -1005,97 +1019,114 @@ public class ProjectJobsController(
             CreatedAt = DateTimeOffset.UtcNow
         };
 
-        JobMessage? ackMsg = null;
-        AgentSession? turnSession = null;
-        Persona? turnPersona = null;
-        Agent? turnDriver = null;
+        var candidatePersonas = explicitPersonaMentions.Count > 0
+            ? explicitPersonaMentions
+            : (fallbackPersonaId != null ? [fallbackPersonaId] : new List<string>());
 
-        // If a target persona was chosen and no TurnSessionId was provided, initiate execution turn or queue!
-        if (targetPersonaId != null && req.TurnSessionId == null)
+        // A persona must not dispatch a turn for itself: if the sender is a persona on this project,
+        // exclude it from candidatePersonas so it doesn't wake or dispatch itself.
+        if (string.Equals(req.SenderType, "persona", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(req.SenderId))
         {
-            var persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == targetPersonaId);
-            if (persona != null)
+            var senderPersonaId = req.SenderId.Trim().ToLowerInvariant();
+            candidatePersonas = candidatePersonas
+                .Where(p => !string.Equals(p, senderPersonaId, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+
+        // Determine which candidate personas are not driven by a running macro workflow.
+        // The workflow's ownership is probed for each explicit mention so that mentioning an
+        // owned persona along with a peer persona (e.g. "@rook @astra" or "@astra @rook")
+        // dispatches the peer persona regardless of mention order.
+        var personasToDispatch = new List<string>();
+        if (req.TurnSessionId == null)
+        {
+            foreach (var candidateId in candidatePersonas)
             {
-                // Check MaxConcurrentJobs limit
-                bool shouldQueue = false;
-                string? busyJobTitle = null;
-
-                if (persona.MaxConcurrentJobs.HasValue && persona.MaxConcurrentJobs.Value > 0)
+                var workflowOwnsTurn = workflows is not null && await ProbeWorkflowOwnershipAsync(id, candidateId, ct);
+                if (!workflowOwnsTurn)
                 {
-                    var activeTurnSessions = await db.AgentSessions
-                        .AsNoTracking()
-                        .Where(s => s.PersonaId == persona.Id && (s.Status == "thinking" || s.Status == "busy"))
-                        .ToListAsync();
-
-                    var busyJobIds = activeTurnSessions
-                        .Select(s => ExtractJobId(s.MetadataJson))
-                        .Where(jid => jid.HasValue && jid.Value != id)
-                        .Select(jid => jid!.Value)
-                        .Distinct()
-                        .ToList();
-
-                    if (busyJobIds.Count >= persona.MaxConcurrentJobs.Value)
-                    {
-                        shouldQueue = true;
-                        var firstBusyJob = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == busyJobIds[0]);
-                        busyJobTitle = firstBusyJob?.Title ?? "another job";
-                    }
+                    personasToDispatch.Add(candidateId);
                 }
+            }
+        }
 
-                if (shouldQueue)
+        var busyMessages = new List<JobMessage>();
+        var ackMessages = new List<JobMessage>();
+        var dispatchedSessions = new List<(AgentSession turnSession, Persona turnPersona, Agent turnDriver)>();
+
+        foreach (var candidatePersonaId in personasToDispatch)
+        {
+            var persona = await db.Personas.FirstOrDefaultAsync(p => p.Id == candidatePersonaId);
+            if (persona == null) continue;
+
+            // Check MaxConcurrentJobs limit
+            bool shouldQueue = false;
+            string? busyJobTitle = null;
+
+            if (persona.MaxConcurrentJobs.HasValue && persona.MaxConcurrentJobs.Value > 0)
+            {
+                var activeTurnSessions = await db.AgentSessions
+                    .AsNoTracking()
+                    .Where(s => s.PersonaId == persona.Id && (s.Status == "thinking" || s.Status == "busy"))
+                    .ToListAsync();
+
+                var busyJobIds = activeTurnSessions
+                    .Select(s => ExtractJobId(s.MetadataJson))
+                    .Where(jid => jid.HasValue && jid.Value != id)
+                    .Select(jid => jid!.Value)
+                    .Distinct()
+                    .ToList();
+
+                if (busyJobIds.Count >= persona.MaxConcurrentJobs.Value)
                 {
-                    var queuedTurns = ParseQueuedTurns(job.QueuedTurnsJson);
-                    var queuedTurn = new QueuedJobTurnDto(
-                        Id: Guid.NewGuid(),
-                        JobId: id,
-                        ProjectId: project.Id,
-                        TargetPersonaId: persona.Id,
-                        SenderType: req.SenderType,
-                        SenderId: req.SenderId,
-                        SenderName: req.SenderName,
-                        Content: effectiveContent,
-                        Mentions: mentions,
-                        Attachments: req.Attachments,
-                        Priority: job.Priority,
-                        CreatedAt: DateTimeOffset.UtcNow
-                    );
-                    queuedTurns.Add(queuedTurn);
-                    job.QueuedTurnsJson = JsonSerializer.Serialize(queuedTurns, JsonOpts);
-                    job.UpdatedAt = DateTimeOffset.UtcNow;
-
-                    db.JobMessages.Add(jobMsg);
-
-                    var busyContent = $"I'm currently busy working on another job (\"{busyJobTitle}\"), but I've queued this up and will start as soon as I'm done!";
-                    var busyMsg = new JobMessage
-                    {
-                        Id = Guid.NewGuid(),
-                        JobId = id,
-                        SenderType = "persona",
-                        SenderId = persona.Id,
-                        SenderName = persona.Name,
-                        Content = busyContent,
-                        MentionsJson = JsonSerializer.Serialize(new List<string> { persona.Id }, JsonOpts),
-                        TurnSessionId = null,
-                        CreatedAt = DateTimeOffset.UtcNow
-                    };
-                    db.JobMessages.Add(busyMsg);
-                    await db.SaveChangesAsync();
-
-                    if (hubContext != null)
-                    {
-                        await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(jobMsg));
-                        await hubContext.Clients.All.SendAsync("JobMessageCreated", ToMessageDto(busyMsg));
-                        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
-                        var jobDto = ToDto(job, project.Name, msgCount);
-                        await hubContext.Clients.All.SendAsync("JobUpdated", jobDto);
-                    }
-
-                    return Ok(ToMessageDto(jobMsg));
+                    shouldQueue = true;
+                    var firstBusyJob = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == busyJobIds[0]);
+                    busyJobTitle = firstBusyJob?.Title ?? "another job";
                 }
+            }
 
-                turnPersona = persona;
-                var driverId = persona.DriverId.Trim().ToLowerInvariant();
-                var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
+            if (shouldQueue)
+            {
+                var queuedTurns = ParseQueuedTurns(job.QueuedTurnsJson);
+                var queuedTurn = new QueuedJobTurnDto(
+                    Id: Guid.NewGuid(),
+                    JobId: id,
+                    ProjectId: project.Id,
+                    TargetPersonaId: persona.Id,
+                    SenderType: req.SenderType,
+                    SenderId: req.SenderId,
+                    SenderName: req.SenderName,
+                    Content: effectiveContent,
+                    Mentions: mentions,
+                    Attachments: req.Attachments,
+                    Priority: job.Priority,
+                    CreatedAt: DateTimeOffset.UtcNow
+                );
+                queuedTurns.Add(queuedTurn);
+                job.QueuedTurnsJson = JsonSerializer.Serialize(queuedTurns, JsonOpts);
+                job.UpdatedAt = DateTimeOffset.UtcNow;
+
+                var busyContent = $"I'm currently busy working on another job (\"{busyJobTitle}\"), but I've queued this up and will start as soon as I'm done!";
+                var busyMsg = new JobMessage
+                {
+                    Id = Guid.NewGuid(),
+                    JobId = id,
+                    SenderType = "persona",
+                    SenderId = persona.Id,
+                    SenderName = persona.Name,
+                    Content = busyContent,
+                    MentionsJson = JsonSerializer.Serialize(new List<string> { persona.Id }, JsonOpts),
+                    TurnSessionId = null,
+                    CreatedAt = DateTimeOffset.UtcNow
+                };
+                db.JobMessages.Add(busyMsg);
+                busyMessages.Add(busyMsg);
+                continue;
+            }
+
+            var driverId = persona.DriverId.Trim().ToLowerInvariant();
+            var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
                 if (driver == null)
                 {
                     driver = new Agent
@@ -1107,7 +1138,7 @@ public class ProjectJobsController(
                     };
                     db.Agents.Add(driver);
                 }
-                turnDriver = driver;
+                var turnDriver = driver;
 
                 var turnSessionId = Guid.NewGuid();
 
@@ -1185,7 +1216,7 @@ public class ProjectJobsController(
                     ["attachments"] = combinedAttachments
                 };
 
-                turnSession = new AgentSession
+                var turnSession = new AgentSession
                 {
                     Id = turnSessionId,
                     Title = $"Job Turn: {job.Title} (@{persona.Name})",
@@ -1199,7 +1230,7 @@ public class ProjectJobsController(
                 };
 
                 db.AgentSessions.Add(turnSession);
-                jobMsg.TurnSessionId = turnSession.Id;
+                jobMsg.TurnSessionId ??= turnSession.Id;
 
                 var taskContext = FormatTaskContext(tasks, persona.Id, assigneeNames);
 
@@ -1266,7 +1297,7 @@ public class ProjectJobsController(
                 {
                     var ackContent = BuildAckContent(tasks, activeTask);
 
-                    ackMsg = new JobMessage
+                    var ackMsg = new JobMessage
                     {
                         Id = Guid.NewGuid(),
                         JobId = id,
@@ -1279,9 +1310,11 @@ public class ProjectJobsController(
                         CreatedAt = DateTimeOffset.UtcNow.AddMilliseconds(2)
                     };
                     db.JobMessages.Add(ackMsg);
+                    ackMessages.Add(ackMsg);
                 }
+
+                dispatchedSessions.Add((turnSession, persona, driver));
             }
-        }
 
         db.JobMessages.Add(jobMsg);
         job.UpdatedAt = DateTimeOffset.UtcNow;
@@ -1291,7 +1324,7 @@ public class ProjectJobsController(
 
         if (hubContext != null)
         {
-            if (turnSession != null && turnPersona != null && turnDriver != null)
+            foreach (var (turnSession, turnPersona, turnDriver) in dispatchedSessions)
             {
                 await hubContext.Clients.All.SendAsync("SessionCreated", new SessionSummaryDto(
                     turnSession.Id,
@@ -1309,15 +1342,170 @@ public class ProjectJobsController(
                 ));
             }
 
+            await hubContext.Clients.All.SendAsync("JobMessageCreated", msgDto);
             await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
-            if (ackMsg != null)
+            foreach (var busy in busyMessages)
             {
-                var ackDto = ToMessageDto(ackMsg);
+                var busyDto = ToMessageDto(busy);
+                await hubContext.Clients.All.SendAsync("JobMessageCreated", busyDto);
+                await hubContext.Clients.All.SendAsync("JobMessageAdded", busyDto);
+            }
+            foreach (var ack in ackMessages)
+            {
+                var ackDto = ToMessageDto(ack);
+                await hubContext.Clients.All.SendAsync("JobMessageCreated", ackDto);
                 await hubContext.Clients.All.SendAsync("JobMessageAdded", ackDto);
+            }
+            if (busyMessages.Count > 0 || ackMessages.Count > 0)
+            {
+                var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+                var jobDto = ToDto(job, project.Name, msgCount);
+                await hubContext.Clients.All.SendAsync("JobUpdated", jobDto);
             }
         }
 
+        IReadOnlyList<string>? explicitTargets = explicitPersonaMentions.Count > 0
+            ? explicitPersonaMentions.AsReadOnly()
+            : null;
+        await RouteReplyToWorkflowAsync(id, jobMsg, req, explicitTargets, ct);
+
         return Ok(msgDto);
+    }
+
+    /// <summary>
+    /// Whether a macro workflow currently owns this job's next turn.
+    /// </summary>
+    /// <remarks>
+    /// A defensive wrapper around <see cref="IWorkflowSignalRouter.IsWorkflowDrivingAsync"/>: the answer
+    /// is a hint that gates a legacy dispatch, so any failure — including one the router itself did not
+    /// anticipate — resolves to "not orchestrated" and the endpoint behaves as it did before orchestration
+    /// existed. See the call site for why that direction is the safe one.
+    /// <para>
+    /// Cancellation is re-thrown rather than swallowed: the caller went away, and continuing to dispatch a
+    /// turn for a request nobody is waiting on would leak a session.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> ProbeWorkflowOwnershipAsync(Guid jobId, string? targetPersonaId, CancellationToken ct)
+    {
+        try
+        {
+            return await workflows!.IsWorkflowDrivingAsync(jobId, targetPersonaId, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            (logger ?? NullLogger<ProjectJobsController>.Instance).LogWarning(ex,
+                "The orchestration ownership probe for job {JobId} failed; falling back to the legacy " +
+                "dispatch path", jobId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Hands a reply to the Temporal workflow that is parked waiting for one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the release half of the durable pause. Without it the workflow waits out its seven-day
+    /// gate while a human answers in a chat window nobody is reading — which is a worse failure than the
+    /// busy-polling it replaces, because at least polling eventually noticed.
+    /// </para>
+    /// <para>
+    /// <strong>Human AND persona replies are routed; system messages are not.</strong> The filter used to
+    /// be <c>SenderType == "user"</c>, on the reasoning that a persona message is agent-to-agent chatter
+    /// that belongs in the ledger rather than a release signal. That reasoning was sound for chatter and
+    /// fatal for escalations: an orchestrated agent blocks with
+    /// <c>post_job_message(requires_reply: true, target_persona: "astra")</c>, parks in
+    /// <c>AwaitingInput</c>, and the only party who can answer is another persona — who answers via
+    /// <c>post_job_message</c> or this same REST endpoint, both of which stamp <c>SenderType = "persona"</c>.
+    /// So the escalation could never be answered, and the task sat for the full seven days. A cross-persona
+    /// review request, the normal shape of "two-man review" in this product, was a guaranteed deadlock.
+    /// </para>
+    /// <para>
+    /// <c>system</c> stays excluded because those rows are generated bookkeeping (handoff notices, task
+    /// completion markers) that nobody addressed to anyone; releasing a turn on one would be pure noise.
+    /// </para>
+    /// <para>
+    /// <strong>What this knowingly accepts.</strong> A persona posting an unrelated status note to the job
+    /// will now release a parked gate, costing one turn that had nothing to act on. That is the cheaper
+    /// failure: the turn activity reads the whole job ledger
+    /// (<c>HttpAgentTurnRunner</c> builds its observation state from <c>db.JobMessages</c>), so nothing said
+    /// is lost either way, and a wasted turn is recoverable while a permanently wedged task is not.
+    /// </para>
+    /// <para>
+    /// The stricter rule — "release only for the party named in the wait" — is not enforceable from a
+    /// sender id and was tried and reverted here. A human posting as <c>SenderId="sorren"</c> and a persona
+    /// named <c>sorren</c> arrive as the identical string, because the router takes the id from the caller
+    /// and only falls back to <c>"operator"</c> when none was supplied. So an awaited-party gate would both
+    /// lock the operator out of answering their own agent's escalation and be bypassable by any persona
+    /// sharing a name. Enforcing it needs the sender's <em>kind</em> on the wire, which is a change to
+    /// <c>ChatMessageSignal</c> — a workflow wire contract — and is flagged for @Architect rather than
+    /// invented here. The one property that <em>is</em> enforceable from an id, "the asker may not answer
+    /// itself", is implemented in <c>TaskExecutionWorkflow.ReceiveChatMessageAsync</c>.
+    /// </para>
+    /// <para>
+    /// <strong>Never fails the request.</strong> The message is already committed and broadcast by the
+    /// time this runs. A Temporal outage must not turn into "your message was not saved" — the reply is
+    /// in the ledger either way, and the workflow's own gate still has days left on it. The delivery
+    /// result is logged, and the dedicated endpoints under <c>MacroTurnsController</c> surface it to a
+    /// caller that needs to know.
+    /// </para>
+    /// </remarks>
+    private async Task RouteReplyToWorkflowAsync(
+        Guid jobId,
+        JobMessage message,
+        PostJobMessageRequest req,
+        IReadOnlyList<string>? targetPersonaIds,
+        CancellationToken ct)
+    {
+        if (workflows is null) return;
+        // Only generated bookkeeping is excluded. See the remarks: excluding every non-human sender is
+        // what made cross-persona escalations undeliverable.
+        if (string.Equals(req.SenderType, "system", StringComparison.OrdinalIgnoreCase)) return;
+
+        // A null logger is the normal state for the ~40 controller tests that construct this type
+        // directly, so the routing block's two log calls go through a local no-op rather than the
+        // null-conditional operator at each site.
+        ILogger log = logger ?? NullLogger<ProjectJobsController>.Instance;
+
+        try
+        {
+            var senderId = !string.IsNullOrWhiteSpace(message.SenderId)
+                ? message.SenderId
+                : (!string.IsNullOrWhiteSpace(req.SenderId)
+                    ? req.SenderId
+                    : (string.Equals(req.SenderType, "persona", StringComparison.OrdinalIgnoreCase)
+                        ? (req.SenderName ?? "persona")
+                        : "operator"));
+
+            var delivery = await workflows.SendChatMessageAsync(
+                jobId,
+                new Core.Workflows.ChatMessageSignal(
+                    SenderId: senderId,
+                    Content: message.Content,
+                    Timestamp: message.CreatedAt,
+                    // The persisted row's id is the dedup key: a retried request re-sends the same id and
+                    // the workflow drops the duplicate instead of rendering the reply twice.
+                    MessageId: message.Id.ToString(),
+                    TargetPersonaIds: targetPersonaIds),
+                ct);
+
+            if (!delivery.Delivered)
+            {
+                log.LogInformation(
+                    "Chat reply on job {JobId} was not routed to a workflow ({Status}: {Detail}); " +
+                    "the message is saved and will be visible to the next dispatched turn regardless",
+                    jobId, delivery.Status, delivery.Detail ?? "(none)");
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            log.LogWarning(ex,
+                "Routing a chat reply into the workflow for job {JobId} failed", jobId);
+        }
     }
 
     [HttpPost("api/project-jobs/{id}/complete")]
