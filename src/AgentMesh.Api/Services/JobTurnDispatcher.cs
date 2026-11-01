@@ -1,4 +1,4 @@
-using AgentMesh.Api.Hubs;
+﻿using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -20,7 +20,23 @@ public record JobTurnRequest(
     string? PreflightContext = null,
     List<JobAttachmentDto>? Attachments = null,
     /// <summary>Snapshot the incoming runner should hydrate from. Null = hydrate from whatever is durable.</summary>
-    JobWorkspaceHydration? Hydration = null);
+    JobWorkspaceHydration? Hydration = null,
+    /// <summary>
+    /// The layered prompt composed by the worker, when the caller has one.
+    /// </summary>
+    /// <remarks>
+    /// When present, the dispatcher stops composing its own project/job envelope: the stack's turn-0
+    /// layer already carries the project, the resolved working root, the branch, the task manifest and
+    /// the live git state, and prepending a second envelope on top of it would state the same facts
+    /// twice in two different formats — the drift that lets an agent quote a branch name that is not
+    /// the one its tools will use. It is also what breaks the prefix cache, because the dispatcher's
+    /// envelope leads with the volatile branch name.
+    /// <para>
+    /// Null keeps every existing caller (job chat, queued-turn drain, autonomous handoff) on today's
+    /// behaviour, which is why this is trailing and optional.
+    /// </para>
+    /// </remarks>
+    PromptStackWirePayload? PromptStack = null);
 
 public record JobWorkspaceHydration(
     string? GitRemoteUrl,
@@ -146,15 +162,24 @@ public class JobTurnDispatcher(
         };
         db.AgentSessions.Add(turnSession);
 
-        var promptWithContext =
-            $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
-            (!string.IsNullOrWhiteSpace(project.ProjectInstructions)
-                ? $"[Project Guidelines: {project.ProjectInstructions}]\n"
-                : "") +
-            $"[Job Context: {job.Title} - {job.Description}]\n" +
-            (req.PreflightContext ?? string.Empty) +
-            "\n" +
-            req.Prompt;
+        // Two prompt shapes travel together, and the reason is deployment order rather than taste. See
+        // the remark on JobTurnRequest.PromptStack: when the worker composed a layered stack, that
+        // stack's own turn-0 envelope is authoritative and this method must not prepend a second one.
+        // When it did not, the legacy envelope below is the only context the runner will ever get.
+        var hasLayeredStack = req.PromptStack is not null;
+
+        var promptWithContext = hasLayeredStack
+            ? req.Prompt + (string.IsNullOrWhiteSpace(req.PreflightContext)
+                ? string.Empty
+                : "\n" + req.PreflightContext)
+            : $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
+              (!string.IsNullOrWhiteSpace(project.ProjectInstructions)
+                  ? $"[Project Guidelines: {project.ProjectInstructions}]\n"
+                  : "") +
+              $"[Job Context: {job.Title} - {job.Description}]\n" +
+              (req.PreflightContext ?? string.Empty) +
+              "\n" +
+              req.Prompt;
 
         var promptMsg = new SessionMessage
         {
@@ -184,7 +209,9 @@ public class JobTurnDispatcher(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
 
-        await BroadcastAsync(turnSession, promptMsg, driver, persona, job, project, promptWithContext, attachments, hydration, ct);
+        await BroadcastAsync(
+            turnSession, promptMsg, driver, persona, job, project, promptWithContext, attachments,
+            hydration, ct, req.PromptStack);
 
         return new DispatchedJobTurn(turnSession, promptMsg, driver);
     }
@@ -199,7 +226,8 @@ public class JobTurnDispatcher(
         string prompt,
         List<JobAttachmentDto> attachments,
         JobWorkspaceHydration? hydration,
-        CancellationToken ct)
+        CancellationToken ct,
+        PromptStackWirePayload? promptStack = null)
     {
         if (hubContext == null) return;
 
@@ -215,6 +243,10 @@ public class JobTurnDispatcher(
             personaRole = persona.Role,
             personaPrompt = persona.PersonaPrompt,
             prompt,
+            // The layered stack, forwarded verbatim. A runner that receives it splits messages[0] and
+            // messages[1] from it; one that does not (older binary, or a dispatch path that has no
+            // composer) falls back to `prompt` plus its own locally built system prompt.
+            promptStack,
             sender = promptMsg.SenderAgentId,
             model = persona.DefaultModel,
             effort = persona.DefaultEffort,

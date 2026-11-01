@@ -1,6 +1,7 @@
 ﻿using System.Security.Claims;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -28,13 +29,20 @@ namespace AgentMesh.Api.Controllers;
 /// </param>
 /// <param name="Sender">Display name recorded as the prompt's author.</param>
 /// <param name="PreflightContext">Extra lines appended after the envelope, ending in a newline.</param>
+/// <param name="PromptStack">
+/// The layered prompt the worker composed, split into a cacheable system prefix and a turn-0 user
+/// envelope. Optional: a caller that sends none gets today's behaviour, where the dispatcher builds the
+/// envelope itself and the runner builds its own system prompt. Additive so the worker, the API and the
+/// CLI binary can be deployed in any order.
+/// </param>
 public record StartMacroTurnRequest(
     string Prompt,
     string PersonaId,
     string? TaskId = null,
     Guid? TurnSessionId = null,
     string? Sender = null,
-    string? PreflightContext = null);
+    string? PreflightContext = null,
+    PromptStackWirePayload? PromptStack = null);
 
 /// <summary>What a dispatch produced.</summary>
 /// <param name="AlreadyRunning">
@@ -163,6 +171,7 @@ public class MacroTurnController(
             req.Prompt,
             Sender: string.IsNullOrWhiteSpace(req.Sender) ? ResolveSender() : req.Sender.Trim(),
             PreflightContext: req.PreflightContext,
+            PromptStack: req.PromptStack,
             // The macro turn carries no attachments: the assembler already folded the checklist item's
             // attachments into the prompt text, and re-staging them here would duplicate them into the
             // turn session's directory under a second id.
