@@ -2,6 +2,7 @@ using System.Security.Claims;
 using System.Text.Json;
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
@@ -103,7 +104,7 @@ public class JobChatControllerTests
         // Verify temporal workflow was started with SignalWithStart configuration
         capturedOptions.Should().NotBeNull();
         capturedOptions!.Id.Should().Be($"job-{jobId}");
-        capturedOptions.TaskQueue.Should().Be("job-execution-queue");
+        capturedOptions.TaskQueue.Should().Be(WorkflowSignalRouter.TaskQueue);
         capturedOptions.StartSignal.Should().Be("ReceiveChatMessage");
         capturedOptions.StartSignalArgs.Should().NotBeNull();
         capturedOptions.StartSignalArgs!.Should().HaveCount(1);
@@ -160,6 +161,97 @@ public class JobChatControllerTests
         var forbidden = result.Should().BeOfType<ObjectResult>().Subject;
         forbidden.StatusCode.Should().Be(StatusCodes.Status403Forbidden);
         forbidden.Value.ToString().Should().Contain("self_review_not_allowed");
+    }
+
+    [Fact]
+    public async Task PostReview_WhenAssignedAgentIdIsNull_ResolvesAuthorFromPrLinkage_AndRejectsSelfReviewWhileAllowingSecondEyes()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Autonomous Job Without AssignedAgentId",
+            AssignedAgentId = null,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+
+        // 1. Implementer opens PR and writes PR linkage to job ledger
+        var prLinkage = new { prNumber = 101, prUrl = "https://github.com/org/repo/pull/101", source = "mcp:open_pull_request" };
+        db.JobMessages.Add(new JobMessage
+        {
+            Id = Guid.NewGuid(),
+            JobId = jobId,
+            SenderType = "persona",
+            SenderId = "implementer-bot",
+            SenderName = "Implementer",
+            Content = "Opened pull request #101",
+            StructuredPayloadJson = JsonSerializer.Serialize(prLinkage),
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-10)
+        });
+
+        // 2. Later, another persona (e.g. tech lead) posts a chat message WITHOUT PR linkage
+        db.JobMessages.Add(new JobMessage
+        {
+            Id = Guid.NewGuid(),
+            JobId = jobId,
+            SenderType = "persona",
+            SenderId = "astra",
+            SenderName = "Astra",
+            Content = "Reviewing this PR now.",
+            StructuredPayloadJson = null,
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-2)
+        });
+
+        await db.SaveChangesAsync();
+
+        var controller = new JobChatController(
+            db,
+            null,
+            _mockHubContext.Object,
+            NullLogger<JobChatController>.Instance
+        );
+
+        // Case A: The implementer attempts to review their PR -> must be rejected as self review
+        var implementerUser = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "implementer-bot"),
+            new Claim("agent_id", "implementer-bot")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = implementerUser }
+        };
+
+        var selfReviewRequest = new SubmitJobPrReviewRequest(ReviewerId: "implementer-bot", IsApproved: true, ReviewComments: "Self approval", PrNumber: 101);
+        var selfReviewResult = await controller.SubmitReview(jobId.ToString(), selfReviewRequest);
+
+        var forbidden = selfReviewResult.Should().BeOfType<ObjectResult>().Subject;
+        forbidden.StatusCode.Should().Be(StatusCodes.Status403Forbidden);
+        forbidden.Value.ToString().Should().Contain("self_review_not_allowed");
+
+        // Case B: The commenter (Astra / Tech Lead) submits the review -> must NOT be treated as author, allowed to approve
+        var techLeadUser = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "astra"),
+            new Claim("agent_id", "astra"),
+            new Claim(ClaimTypes.Role, "tech_lead")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = techLeadUser }
+        };
+
+        var leadReviewRequest = new SubmitJobPrReviewRequest(ReviewerId: "astra", IsApproved: true, ReviewComments: "LGTM!", PrNumber: 101);
+        var leadReviewResult = await controller.SubmitReview(jobId.ToString(), leadReviewRequest);
+
+        leadReviewResult.Should().BeOfType<OkObjectResult>();
     }
 
     [Fact]

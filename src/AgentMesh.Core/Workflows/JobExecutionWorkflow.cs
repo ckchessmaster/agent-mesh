@@ -236,6 +236,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     public Task ReceiveSetChecklistAsync(List<ChecklistTaskItem> tasks)
     {
         _tasks = tasks ?? new();
+        _currentHeartbeat = "Checklist registered. Awaiting plan approval.";
         return Task.CompletedTask;
     }
 

@@ -493,27 +493,6 @@ public class PlatformMcpTools(
                 IsCompleted = false
             }).ToList();
 
-            job.TasksJson = JsonSerializer.Serialize(newTasks, BlobOptions);
-            if (newTasks.Count > 0)
-            {
-                job.CurrentTaskId = newTasks[0].Id.ToString();
-            }
-            if (!string.IsNullOrWhiteSpace(notes))
-            {
-                job.ProgressHeartbeat = notes.Trim();
-            }
-            job.UpdatedAt = DateTimeOffset.UtcNow;
-            await db.SaveChangesAsync(ct);
-
-            var checklistAgentJob = await db.AgentJobs.FindAsync([job.Id], ct);
-            if (checklistAgentJob is not null)
-            {
-                checklistAgentJob.CurrentTaskId = job.CurrentTaskId;
-                checklistAgentJob.ProgressHeartbeat = job.ProgressHeartbeat;
-                checklistAgentJob.UpdatedAt = DateTimeOffset.UtcNow;
-                await db.SaveChangesAsync(ct);
-            }
-
             if (workflows is not null)
             {
                 var checklistItems = args.Tasks.Select(t => new ChecklistTaskItem(t.Title, t.TargetFile, t.VerificationMethod)).ToList();
@@ -536,14 +515,30 @@ public class PlatformMcpTools(
                 }
             }
 
+            job.TasksJson = JsonSerializer.Serialize(newTasks, BlobOptions);
+            if (newTasks.Count > 0)
+            {
+                job.CurrentTaskId = newTasks[0].Id.ToString();
+            }
+            var heartbeatNote = !string.IsNullOrWhiteSpace(notes) ? $" ({notes.Trim()})" : string.Empty;
+            job.ProgressHeartbeat = $"Awaiting plan approval{heartbeatNote}";
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+
+            var checklistAgentJob = await db.AgentJobs.FindAsync([job.Id], ct);
+            if (checklistAgentJob is not null)
+            {
+                checklistAgentJob.CurrentTaskId = job.CurrentTaskId;
+                checklistAgentJob.ProgressHeartbeat = job.ProgressHeartbeat;
+                checklistAgentJob.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+            }
+
             await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
-            await hubContext.Clients.Group(job.Id.ToString()).SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
             await hubContext.Clients.All.SendAsync("ChecklistUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
-            await hubContext.Clients.Group(job.Id.ToString()).SendAsync("ChecklistUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
             if (!string.IsNullOrWhiteSpace(job.ProgressHeartbeat))
             {
                 await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
-                await hubContext.Clients.Group(job.Id.ToString()).SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
             }
 
             return JsonSerializer.Serialize(new

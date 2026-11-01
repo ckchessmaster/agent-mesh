@@ -1,5 +1,7 @@
 using System.Security.Claims;
+using System.Text.Json;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
@@ -108,10 +110,7 @@ public class JobChatController(
         if (parsedGuid.HasValue)
         {
             agentJob = await dbContext.AgentJobs.FindAsync([parsedGuid.Value]);
-            if (agentJob is null)
-            {
-                projectJob = await dbContext.ProjectJobs.FindAsync([parsedGuid.Value]);
-            }
+            projectJob = await dbContext.ProjectJobs.FindAsync([parsedGuid.Value]);
         }
 
         if (agentJob is null && projectJob is null)
@@ -164,7 +163,7 @@ public class JobChatController(
                 Timestamp: DateTimeOffset.UtcNow
             );
 
-            var options = new WorkflowOptions(workflowId, "job-execution-queue")
+            var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue)
             {
                 StartSignal = "ReceiveChatMessage",
                 StartSignalArgs = new object?[] { chatSignal }
@@ -218,10 +217,7 @@ public class JobChatController(
         if (parsedGuid.HasValue)
         {
             agentJob = await dbContext.AgentJobs.FindAsync([parsedGuid.Value]);
-            if (agentJob is null)
-            {
-                projectJob = await dbContext.ProjectJobs.FindAsync([parsedGuid.Value]);
-            }
+            projectJob = await dbContext.ProjectJobs.FindAsync([parsedGuid.Value]);
         }
 
         if (agentJob is null && projectJob is null)
@@ -297,14 +293,13 @@ public class JobChatController(
         {
             agentJob.ProgressHeartbeat = "Plan approved. Starting implementation";
             agentJob.UpdatedAt = DateTimeOffset.UtcNow;
-            await dbContext.SaveChangesAsync();
         }
-        else if (projectJob is not null)
+        if (projectJob is not null)
         {
             projectJob.ProgressHeartbeat = "Plan approved. Starting implementation";
             projectJob.UpdatedAt = DateTimeOffset.UtcNow;
-            await dbContext.SaveChangesAsync();
         }
+        await dbContext.SaveChangesAsync();
 
         if (hubContext is not null)
         {
@@ -337,10 +332,7 @@ public class JobChatController(
         if (parsedGuid.HasValue)
         {
             agentJob = await dbContext.AgentJobs.FindAsync([parsedGuid.Value]);
-            if (agentJob is null)
-            {
-                projectJob = await dbContext.ProjectJobs.FindAsync([parsedGuid.Value]);
-            }
+            projectJob = await dbContext.ProjectJobs.FindAsync([parsedGuid.Value]);
         }
 
         if (agentJob is null && projectJob is null)
@@ -352,15 +344,22 @@ public class JobChatController(
 
         if (string.IsNullOrEmpty(author) && parsedGuid.HasValue)
         {
-            var openPrMessage = await dbContext.JobMessages
+            var prRows = await dbContext.JobMessages
                 .AsNoTracking()
-                .Where(m => m.JobId == parsedGuid.Value && m.SenderType == "persona" && m.SenderId != null)
+                .Where(m => m.JobId == parsedGuid.Value && m.SenderType == "persona" && m.StructuredPayloadJson != null)
                 .OrderByDescending(m => m.CreatedAt)
-                .FirstOrDefaultAsync();
+                .ToListAsync();
 
-            if (openPrMessage != null && !string.IsNullOrWhiteSpace(openPrMessage.SenderId))
+            foreach (var row in prRows)
             {
-                author = openPrMessage.SenderId.Trim().ToLowerInvariant();
+                if (!TryReadPrLinkage(row.StructuredPayloadJson, out _, out var rowPrNum)) continue;
+                if (request.PrNumber.HasValue && rowPrNum.HasValue && rowPrNum.Value != request.PrNumber.Value) continue;
+
+                if (!string.IsNullOrWhiteSpace(row.SenderId))
+                {
+                    author = row.SenderId.Trim().ToLowerInvariant();
+                    break;
+                }
             }
         }
 
@@ -414,5 +413,40 @@ public class JobChatController(
         }
 
         return Ok(new { success = true, isApproved = request.IsApproved, reviewer });
+    }
+
+    private static bool TryReadPrLinkage(
+        string? structuredPayloadJson,
+        out string? prUrl,
+        out int? prNumber)
+    {
+        prUrl = null;
+        prNumber = null;
+        if (string.IsNullOrWhiteSpace(structuredPayloadJson)) return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(structuredPayloadJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+
+            if (doc.RootElement.TryGetProperty("prUrl", out var url) &&
+                url.ValueKind == JsonValueKind.String)
+            {
+                prUrl = url.GetString();
+            }
+
+            if (doc.RootElement.TryGetProperty("prNumber", out var number) &&
+                number.ValueKind == JsonValueKind.Number &&
+                number.TryGetInt32(out var parsed))
+            {
+                prNumber = parsed;
+            }
+
+            return prUrl is not null || prNumber is not null;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 }

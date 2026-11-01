@@ -1,4 +1,5 @@
 using System.Text.Json;
+using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Api.Tools;
@@ -191,7 +192,8 @@ public class ManageTaskChecklistTests
         // Verify persisted state in db
         var savedJob = await db.ProjectJobs.FindAsync(jobId);
         savedJob.Should().NotBeNull();
-        savedJob!.ProgressHeartbeat.Should().Be("Decomposition complete. 4 tasks created.");
+        savedJob!.ProgressHeartbeat.Should().Contain("Awaiting plan approval");
+        savedJob.ProgressHeartbeat.Should().Contain("Decomposition complete. 4 tasks created.");
         savedJob.CurrentTaskId.Should().NotBeNullOrEmpty();
     }
 
@@ -328,5 +330,82 @@ public class ManageTaskChecklistTests
         // Assert: Must return workflow_signal_rejected instead of silently succeeding
         root.GetProperty("error").GetString().Should().Be("workflow_signal_rejected");
         root.GetProperty("message").GetString().Should().Contain("Workflow execution terminated");
+
+        // Verify that database was NOT mutated when workflow rejected the signal
+        var unmutatedJob = await db.ProjectJobs.FindAsync(jobId);
+        unmutatedJob!.TasksJson.Should().Be("[]");
+        unmutatedJob.CurrentTaskId.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task UpdateTaskStatus_RejectsAfterSetChecklist_UntilPlanApproved_ThenSucceeds()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Discovery Stage Job",
+            AssignedAgentId = "implementer",
+            CurrentTaskId = "stage-1-discovery",
+            ProgressHeartbeat = "Exploring codebase and generating checklist",
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var tools = BuildTools(db, jobId);
+
+        var threeTasks = Enumerable.Range(1, 3)
+            .Select(i => new ChecklistTaskItem($"Task {i}", $"src/File{i}.cs", $"verify-{i}"))
+            .ToList();
+
+        var setChecklistArgs = new ManageTaskArgs(
+            Action: "set_checklist",
+            Tasks: threeTasks,
+            ProgressNote: "Discovery complete, decomposed into 3 tasks."
+        );
+
+        // Act 1: Stage 1 Discovery concludes by setting checklist
+        var setChecklistRaw = await tools.ManageTaskAsync(setChecklistArgs, jobId.ToString());
+        using var doc1 = JsonDocument.Parse(setChecklistRaw);
+        doc1.RootElement.GetProperty("success").GetBoolean().Should().BeTrue();
+
+        // Verify job state immediately after set_checklist: stamped with "Awaiting plan approval"
+        var stagedJob = await db.ProjectJobs.FindAsync(jobId);
+        stagedJob!.ProgressHeartbeat.Should().Contain("Awaiting plan approval");
+        var tasks = ProjectJobsController.ParseTasks(stagedJob.TasksJson);
+        tasks.Should().HaveCount(3);
+        var firstTaskId = tasks[0].Id.ToString();
+
+        // Act 2: Caller attempts update_task_status BEFORE plan approval -> MUST BE REJECTED
+        var updateBeforeApprovalArgs = new ManageTaskArgs(
+            Action: "update_task_status",
+            TaskId: firstTaskId,
+            Status: "in_progress"
+        );
+
+        var updateRaw1 = await tools.ManageTaskAsync(updateBeforeApprovalArgs, jobId.ToString());
+        using var doc2 = JsonDocument.Parse(updateRaw1);
+        doc2.RootElement.GetProperty("error").GetString().Should().Be("discovery_phase_read_only");
+
+        // Act 3: Plan is approved by operator/lead (which sets ProgressHeartbeat = "Plan approved. Starting implementation")
+        stagedJob.ProgressHeartbeat = "Plan approved. Starting implementation";
+        await db.SaveChangesAsync();
+
+        // Act 4: Caller attempts update_task_status AFTER plan approval -> MUST SUCCEED
+        var updateAfterApprovalArgs = new ManageTaskArgs(
+            Action: "update_task_status",
+            TaskId: firstTaskId,
+            Status: "in_progress"
+        );
+
+        var updateRaw2 = await tools.ManageTaskAsync(updateAfterApprovalArgs, jobId.ToString());
+        using var doc3 = JsonDocument.Parse(updateRaw2);
+        doc3.RootElement.GetProperty("success").GetBoolean().Should().BeTrue();
+        doc3.RootElement.GetProperty("status").GetString().Should().Be("in_progress");
     }
 }
