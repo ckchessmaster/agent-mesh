@@ -33,6 +33,7 @@ namespace AgentMesh.Tests.Repositories;
 /// created and deleted by the fixture, so it must be a name dedicated to this purpose.
 /// </para>
 /// </remarks>
+[Collection(PostgresScratchCollection.Name)]
 public class AgentMemoryPostgresRepositoryTests : IAsyncLifetime
 {
     private readonly ITestOutputHelper _output;
