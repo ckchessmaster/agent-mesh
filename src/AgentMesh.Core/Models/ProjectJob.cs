@@ -1,4 +1,4 @@
-﻿using System.Text.Json.Serialization;
+using System.Text.Json.Serialization;
 using AgentMesh.Core.Enums;
 
 namespace AgentMesh.Core.Models;
@@ -64,6 +64,8 @@ public class JobTaskDto
     /// </para>
     /// </remarks>
     public string? AcceptanceCriteria { get; set; }
+    public string? TargetFile { get; set; }
+    public string? VerificationMethod { get; set; }
 
     /// <summary><see cref="Status"/> resolved against <see cref="IsCompleted"/>.</summary>
     public string EffectiveStatus => JobTaskStatus.Effective(Status, IsCompleted);
@@ -88,6 +90,13 @@ public class ProjectJob
     public string TasksJson { get; set; } = "[]";
     public string QueuedTurnsJson { get; set; } = "[]";
     public string? ResultSummary { get; set; }
+
+    public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.LeadOrHuman;
+    public string? CurrentTaskId { get; set; }
+    public string? ProgressHeartbeat { get; set; }
+    public string? AssignedAgentId { get; set; }
+    public string? WorkingDirectory { get; set; }
+    public string TargetBranch => GitBranchName;
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;

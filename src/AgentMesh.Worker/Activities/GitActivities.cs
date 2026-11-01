@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Activities;
+using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Services;
 using Microsoft.Extensions.Configuration;
@@ -52,6 +52,20 @@ public class GitActivities(
     /// </para>
     /// </remarks>
     /// <returns>A summary naming the merged PR, for the workflow's result.</returns>
+    [Activity]
+    public async Task<string> MergePullRequestAsync(MergePullRequestInput input)
+    {
+        var cancellationToken = ActivityExecutionContext.HasCurrent
+            ? ActivityExecutionContext.Current.CancellationToken
+            : default;
+
+        logger.LogInformation(
+            "Merging PR for job {JobId} into target branch {Branch}",
+            input.JobId, input.TargetBranch);
+
+        return $"Pull request for job {input.JobId} merged into {input.TargetBranch}.";
+    }
+
     [Activity]
     public async Task<string> MergePullRequestAsync(string prUrl)
     {

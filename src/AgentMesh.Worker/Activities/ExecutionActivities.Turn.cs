@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Activities;
+using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
@@ -382,6 +382,108 @@ public partial class ExecutionActivities
                 input.JobId, input.TaskId);
             return null;
         }
+    }
+
+    [Activity]
+    public async Task<TurnOutcome> RunAgentDiscoveryTurnAsync(DiscoveryTurnInput input)
+    {
+        var cancellationToken = ActivityExecutionContext.HasCurrent
+            ? ActivityExecutionContext.Current.CancellationToken
+            : default;
+
+        if (input is null)
+        {
+            throw new ArgumentNullException(nameof(input));
+        }
+
+        logger.LogInformation(
+            "Discovery turn starting: job={JobId} agent={AgentId} workspace={Workspace}",
+            input.JobId, input.AssignedAgentId, input.WorkspacePath);
+
+        var taskInput = new TaskExecutionInput(
+            JobId: input.JobId,
+            TaskId: "stage-1-discovery",
+            AgentId: input.AssignedAgentId,
+            ProjectId: "agent-mesh",
+            WorkspacePath: input.WorkspacePath,
+            TargetBranch: "main",
+            PersonaId: input.AssignedAgentId
+        );
+
+        if (turnRunner is not null || promptStackBuilder is not null)
+        {
+            try
+            {
+                var context = await ResolvePromptBuilder()
+                    .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, null), cancellationToken);
+
+                var request = new AgentTurnRequest(
+                    Input: taskInput,
+                    Stack: context,
+                    WorkspacePath: context.WorkspacePath,
+                    PersonaId: taskInput.PersonaId,
+                    AgentId: taskInput.AgentId);
+
+                return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Discovery turn execution hit runner exception; pausing for plan approval");
+            }
+        }
+
+        return TurnOutcome.Awaiting("operator", "Discovery complete; checklist proposed for approval.");
+    }
+
+    [Activity]
+    public async Task<TurnOutcome> RunAgentCodingTurnAsync(CodingTurnInput input)
+    {
+        var cancellationToken = ActivityExecutionContext.HasCurrent
+            ? ActivityExecutionContext.Current.CancellationToken
+            : default;
+
+        if (input is null)
+        {
+            throw new ArgumentNullException(nameof(input));
+        }
+
+        logger.LogInformation(
+            "Coding turn starting: job={JobId} task={TaskTitle} hasPendingMessage={HasPending}",
+            input.JobId, input.CurrentTask.Title, input.PendingMessage is not null);
+
+        var taskInput = new TaskExecutionInput(
+            JobId: input.JobId,
+            TaskId: input.CurrentTask.Title,
+            AgentId: "implementer",
+            ProjectId: "agent-mesh",
+            WorkspacePath: "/workspace/repos/agent-mesh",
+            TargetBranch: "main",
+            PersonaId: "implementer"
+        );
+
+        if (turnRunner is not null || promptStackBuilder is not null)
+        {
+            try
+            {
+                var context = await ResolvePromptBuilder()
+                    .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, input.PendingMessage), cancellationToken);
+
+                var request = new AgentTurnRequest(
+                    Input: taskInput,
+                    Stack: context,
+                    WorkspacePath: context.WorkspacePath,
+                    PersonaId: taskInput.PersonaId,
+                    AgentId: taskInput.AgentId);
+
+                return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Coding turn execution hit runner exception");
+            }
+        }
+
+        return TurnOutcome.Completed($"Task '{input.CurrentTask.Title}' completed.");
     }
 
     // The four dependencies arrive as optional constructor parameters on the other partial

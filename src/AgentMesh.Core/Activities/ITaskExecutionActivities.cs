@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Workflows;
+using AgentMesh.Core.Workflows;
 using Temporalio.Activities;
 
 namespace AgentMesh.Core.Activities;
@@ -95,4 +95,8 @@ public interface IGitActivities
     /// </remarks>
     [Activity]
     Task<string> MergePullRequestAsync(string prUrl);
+
+    [Activity]
+    Task<string> MergePullRequestAsync(AgentMesh.Core.Workflows.MergePullRequestInput input) =>
+        MergePullRequestAsync($"job-{input.JobId}");
 }

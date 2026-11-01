@@ -409,6 +409,23 @@ export const ProjectJobPriority = {
 } as const;
 export type ProjectJobPriority = (typeof ProjectJobPriority)[keyof typeof ProjectJobPriority];
 
+export const PlanApprovalPolicy = {
+  LeadOrHuman: 0,
+  HumanOnly: 1
+} as const;
+export type PlanApprovalPolicy = (typeof PlanApprovalPolicy)[keyof typeof PlanApprovalPolicy];
+
+export const JobLifecycleStatus = {
+  Planning: 'Planning',
+  AwaitingApproval: 'AwaitingApproval',
+  InProgress: 'InProgress',
+  AwaitingReview: 'AwaitingReview',
+  Completed: 'Completed',
+  Blocked: 'Blocked',
+  Failed: 'Failed'
+} as const;
+export type JobLifecycleStatus = (typeof JobLifecycleStatus)[keyof typeof JobLifecycleStatus];
+
 export interface QueuedJobTurnDto {
   id: string;
   jobId: string;
@@ -456,6 +473,10 @@ export interface JobTask {
   id: string;
   title: string;
   isCompleted: boolean;
+  status?: string;
+  statusNotes?: string | null;
+  targetFile?: string | null;
+  verificationMethod?: string | null;
   requiresDiscussion?: boolean;
   assignedPersonaId?: string | null;
   completedAt?: string | null;
@@ -486,6 +507,10 @@ export interface ProjectJob {
   tasks: JobTask[];
   resultSummary?: string | null;
   priority?: ProjectJobPriority | number;
+  approvalPolicy?: PlanApprovalPolicy | number;
+  currentTaskId?: string | null;
+  progressHeartbeat?: string | null;
+  lifecycleStatus?: JobLifecycleStatus | string | null;
   queuedTurns?: QueuedJobTurnDto[];
   messageCount: number;
   createdAt: string;

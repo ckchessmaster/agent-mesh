@@ -401,22 +401,26 @@ public class PlatformMcpTools(
 
     [McpServerTool(Name = "manage_task")]
     [Description(
-        "Inspect or update checklist tasks in the current active job. Use list_all to see the sequential " +
-        "checklist, get_details for one task, and set_status to move a task you own through " +
+        "Inspect, set or update checklist tasks in the current active job. Use set_checklist to register 3-6 tasks, " +
+        "list_all or get_checklist to see tasks, get_details for one task, and update_task_status (or set_status) to move a task through " +
         "todo -> in_progress -> awaiting_review -> completed.")]
     public Task<string> ManageTask(
-        [Description("Action to perform: 'get_details', 'set_status', or 'list_all'.")]
+        [Description("Action to perform: 'set_checklist', 'update_task_status', 'get_checklist', 'get_details', 'set_status', or 'list_all'.")]
         string action,
-        [Description("The task identifier (required for get_details and set_status). Run list_all first to obtain it.")]
+        [Description("List of 3 to 6 atomic tasks when action is 'set_checklist'.")]
+        IReadOnlyList<ChecklistTaskItem>? tasks = null,
+        [Description("The task identifier (required for get_details and update_task_status). Run get_checklist first to obtain it.")]
         string? task_id = null,
-        [Description("New status for the task (required for set_status): 'todo', 'in_progress', 'awaiting_review', or 'completed'.")]
+        [Description("New status for the task: 'todo', 'in_progress', 'completed', 'blocked', or 'awaiting_review'.")]
         string? status = null,
         [Description("Optional status note or reason. Recorded on the task and shown to reviewers.")]
         string? notes = null,
+        [Description("Terse 1-sentence heartbeat note indicating current progress.")]
+        string? progress_note = null,
         [Description("Optional job GUID. Only needed when calling outside a dispatched job turn.")]
         string? job_id = null,
         CancellationToken ct = default) =>
-        ManageTaskAsync(new ManageTaskArgs(action, task_id, status, notes), job_id, ct);
+        ManageTaskAsync(new ManageTaskArgs(action, tasks, task_id, status, progress_note, notes), job_id, ct);
 
     /// <summary>
     /// The domain entry point behind <c>manage_task</c>.
@@ -428,12 +432,15 @@ public class PlatformMcpTools(
     {
         var task_id = args.TaskId;
         var status = args.Status;
-        var notes = args.Notes;
+        var notes = args.ProgressNote ?? args.Notes;
 
         var normalizedAction = args.Action?.Trim().ToLowerInvariant();
         if (normalizedAction is not (PlatformToolSchema.ActionGetDetails
                 or PlatformToolSchema.ActionSetStatus
-                or PlatformToolSchema.ActionListAll))
+                or PlatformToolSchema.ActionListAll
+                or PlatformToolSchema.ActionSetChecklist
+                or PlatformToolSchema.ActionUpdateTaskStatus
+                or PlatformToolSchema.ActionGetChecklist))
         {
             return Error("invalid_action",
                 $"Invalid action '{args.Action}'. Allowed values: {string.Join(", ", PlatformToolSchema.AllActions.Select(a => $"'{a}'"))}.");
@@ -451,10 +458,82 @@ public class PlatformMcpTools(
             return rejection!;
         }
 
-        var tasks = ProjectJobsController.ParseTasks(job.TasksJson);
         var callerPersona = CallerPersona(context.Context);
 
-        if (normalizedAction == PlatformToolSchema.ActionListAll)
+        if (normalizedAction == PlatformToolSchema.ActionSetChecklist)
+        {
+            if (args.Tasks is null || args.Tasks.Count == 0)
+            {
+                return Error("missing_tasks", "set_checklist requires a non-empty list of tasks.");
+            }
+
+            if (args.Tasks.Count > 6)
+            {
+                return Error("task_count_exceeded",
+                    $"Breakdown exceeds maximum of 6 tasks (received {args.Tasks.Count}). Please consolidate tasks into 3 to 6 atomic, verifiable tasks.",
+                    details: new { taskCount = args.Tasks.Count, minTasks = 3, maxTasks = 6 });
+            }
+
+            if (args.Tasks.Count < 3)
+            {
+                return Error("task_count_below_minimum",
+                    $"Breakdown requires a minimum of 3 tasks (received {args.Tasks.Count}). Please decompose the job into 3 to 6 atomic, verifiable tasks.",
+                    details: new { taskCount = args.Tasks.Count, minTasks = 3, maxTasks = 6 });
+            }
+
+            var newTasks = args.Tasks.Select(item => new JobTaskDto
+            {
+                Id = Guid.NewGuid(),
+                Title = item.Title,
+                TargetFile = item.TargetFile,
+                VerificationMethod = item.VerificationMethod,
+                AcceptanceCriteria = item.VerificationMethod,
+                Status = "todo",
+                IsCompleted = false
+            }).ToList();
+
+            job.TasksJson = JsonSerializer.Serialize(newTasks, BlobOptions);
+            if (newTasks.Count > 0)
+            {
+                job.CurrentTaskId = newTasks[0].Id.ToString();
+            }
+            if (!string.IsNullOrWhiteSpace(notes))
+            {
+                job.ProgressHeartbeat = notes.Trim();
+            }
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+
+            var checklistAgentJob = await db.AgentJobs.FindAsync([job.Id], ct);
+            if (checklistAgentJob is not null)
+            {
+                checklistAgentJob.CurrentTaskId = job.CurrentTaskId;
+                checklistAgentJob.ProgressHeartbeat = job.ProgressHeartbeat;
+                checklistAgentJob.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+            }
+
+            await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
+            await hubContext.Clients.All.SendAsync("ChecklistUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
+            if (!string.IsNullOrWhiteSpace(job.ProgressHeartbeat))
+            {
+                await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                jobId = job.Id,
+                jobTitle = job.Title,
+                taskCount = newTasks.Count,
+                tasks = newTasks.Select((t, i) => TaskView(t, i)).ToList(),
+                message = $"Successfully registered {newTasks.Count} tasks in checklist for job {job.Id}."
+            }, JsonOptions);
+        }
+
+        var tasks = ProjectJobsController.ParseTasks(job.TasksJson);
+
+        if (normalizedAction is PlatformToolSchema.ActionListAll or PlatformToolSchema.ActionGetChecklist)
         {
             return JsonSerializer.Serialize(new
             {
@@ -465,6 +544,8 @@ public class PlatformMcpTools(
                 gitBranch = job.GitBranchName,
                 taskCount = tasks.Count,
                 callerPersona,
+                currentTaskId = job.CurrentTaskId,
+                progressHeartbeat = job.ProgressHeartbeat,
                 tasks = tasks.Select((t, i) => TaskView(t, i)).ToList(),
             }, JsonOptions);
         }
@@ -487,7 +568,7 @@ public class PlatformMcpTools(
             }, JsonOptions);
         }
 
-        // set_status
+        // set_status or update_task_status
         if (!JobTaskStatus.TryNormalize(status, out var nextStatus))
         {
             return Error("invalid_status",
@@ -523,15 +604,33 @@ public class PlatformMcpTools(
         var previousStatus = currentStatus;
         ApplyStatus(target, nextStatus, notes);
 
+        job.CurrentTaskId = target.Id.ToString();
+        if (!string.IsNullOrWhiteSpace(notes))
+        {
+            job.ProgressHeartbeat = notes.Trim();
+        }
         job.TasksJson = JsonSerializer.Serialize(tasks, BlobOptions);
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
+
+        var agentJob = await db.AgentJobs.FindAsync([job.Id], ct);
+        if (agentJob is not null)
+        {
+            agentJob.CurrentTaskId = job.CurrentTaskId;
+            agentJob.ProgressHeartbeat = job.ProgressHeartbeat;
+            agentJob.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+        }
 
         logger.LogInformation(
             "manage_task: job={JobId} task={TaskId} '{From}' -> '{To}' by {Caller}",
             job.Id, target.Id, previousStatus, nextStatus, callerPersona ?? "(unknown)");
 
         await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks }, ct);
+        if (!string.IsNullOrWhiteSpace(job.ProgressHeartbeat))
+        {
+            await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
+        }
 
         return JsonSerializer.Serialize(new
         {

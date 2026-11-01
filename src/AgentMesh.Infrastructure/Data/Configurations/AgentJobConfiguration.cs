@@ -59,6 +59,26 @@ public class AgentJobConfiguration : IEntityTypeConfiguration<AgentJob>
             .HasDefaultValue("{}")
             .IsRequired();
 
+        builder.Property(j => j.ApprovalPolicy)
+            .HasColumnName("approval_policy")
+            .HasConversion<string>()
+            .HasMaxLength(32)
+            .HasDefaultValue(PlanApprovalPolicy.LeadOrHuman)
+            .IsRequired();
+
+        builder.Property(j => j.CurrentTaskId)
+            .HasColumnName("current_task_id")
+            .HasMaxLength(64);
+
+        builder.Property(j => j.ProgressHeartbeat)
+            .HasColumnName("progress_heartbeat")
+            .HasColumnType("text");
+
+        builder.Ignore(j => j.AssignedAgentId);
+        builder.Ignore(j => j.ProjectId);
+        builder.Ignore(j => j.WorkingDirectory);
+        builder.Ignore(j => j.TargetBranch);
+
         builder.Property(j => j.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")
             .IsRequired();
