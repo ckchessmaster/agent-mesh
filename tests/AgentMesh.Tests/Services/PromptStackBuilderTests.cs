@@ -7,6 +7,7 @@ using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Repositories;
 using AgentMesh.Tests.Helpers;
 using AgentMesh.Worker.Activities;
+using AgentMesh.Worker.Services;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -26,14 +27,14 @@ namespace AgentMesh.Tests.Workflows;
 /// separately, because a query the in-memory provider tolerates and Postgres rejects would make this
 /// the untested path — and it is the path every turn takes.
 /// </remarks>
-public class TurnContextAssemblerTests
+public class PromptStackBuilderTests
 {
     private const string ProjectId = "agent-mesh";
     private static readonly Guid JobId = Guid.Parse("11111111-1111-1111-1111-111111111111");
     private static readonly Guid TaskId = Guid.Parse("22222222-2222-2222-2222-222222222222");
     private static readonly Guid SessionId = Guid.Parse("33333333-3333-3333-3333-333333333333");
 
-    private readonly string _dbName = "TurnContext_" + Guid.NewGuid();
+    private readonly string _dbName = "PromptStack_" + Guid.NewGuid();
 
     private AgentMeshDbContext Db() => TestDbContextFactory.Create(_dbName);
 
@@ -84,25 +85,25 @@ public class TurnContextAssemblerTests
 
         var assembled = await AssembleAsync(db, checkpoints);
 
-        assembled.HistoryMessageCount.Should().Be(TurnContextAssembler.DefaultSlidingWindowSize,
+        assembled.HistoryMessageCount.Should().Be(PromptStackBuilder.DefaultSlidingWindowSize,
             "the window is a fixed cap, not 'everything recent enough to fit'");
-        assembled.Prompt.Should().NotContain("thought-000", "the oldest message must not be loaded");
-        assembled.Prompt.Should().NotContain("thought-044");
+        assembled.FlattenToSinglePrompt().Should().NotContain("thought-000", "the oldest message must not be loaded");
+        assembled.FlattenToSinglePrompt().Should().NotContain("thought-044");
 
         // The newest message must be present, and the boundary message too — proving the cap took the
         // newest 15 rather than some other 15.
-        assembled.Prompt.Should().Contain($"thought-{total - 1:D3}");
-        assembled.Prompt.Should().Contain("thought-045",
+        assembled.FlattenToSinglePrompt().Should().Contain($"thought-{total - 1:D3}");
+        assembled.FlattenToSinglePrompt().Should().Contain("thought-045",
             "045 is the 15th from the end; its presence pins the window's position, not just its size");
 
         // The checkpoint rides along, so the older context the window dropped is not simply lost.
         assembled.Checkpoint.Should().NotBeNull();
-        assembled.Prompt.Should().Contain("[WORKING CHECKPOINT]");
-        assembled.Prompt.Should().Contain("Wired the reconciler; tests still red.");
-        assembled.Prompt.Should().Contain("feat/recovery");
-        assembled.Prompt.Should().Contain("c0ffee1 wire: reconciler");
+        assembled.FlattenToSinglePrompt().Should().Contain("[WORKING CHECKPOINT");
+        assembled.FlattenToSinglePrompt().Should().Contain("Wired the reconciler; tests still red.");
+        assembled.FlattenToSinglePrompt().Should().Contain("feat/recovery");
+        assembled.FlattenToSinglePrompt().Should().Contain("c0ffee1 wire: reconciler");
 
-        assembled.Prompt.Should().Contain("window capped at 15",
+        assembled.FlattenToSinglePrompt().Should().Contain("window capped at 15",
             "the agent must be told the conversation was truncated, or it will assume it is seeing the " +
             "whole history and conclude nothing else happened");
     }
@@ -142,13 +143,13 @@ public class TurnContextAssemblerTests
 
         var assembled = await AssembleAsync(db, new WorkspaceStateRepository(db));
 
-        assembled.Prompt.Should().NotContain("HUGE-DUMP", "tool results are excluded from the window");
-        assembled.HistoryMessageCount.Should().Be(TurnContextAssembler.DefaultSlidingWindowSize,
+        assembled.FlattenToSinglePrompt().Should().NotContain("HUGE-DUMP", "tool results are excluded from the window");
+        assembled.HistoryMessageCount.Should().Be(PromptStackBuilder.DefaultSlidingWindowSize,
             "the cap is applied to the filtered set, so a tool-heavy session still yields a full window");
 
         // The 15 newest *kept* rows are 39, 37, ... 11. Row 9 is the 16th newest kept row and must be out.
-        assembled.Prompt.Should().Contain("kept-039").And.Contain("kept-011");
-        assembled.Prompt.Should().NotContain("kept-009");
+        assembled.FlattenToSinglePrompt().Should().Contain("kept-039").And.Contain("kept-011");
+        assembled.FlattenToSinglePrompt().Should().NotContain("kept-009");
     }
 
     /// <summary>
@@ -180,10 +181,10 @@ public class TurnContextAssemblerTests
 
         var assembled = await AssembleAsync(db, new WorkspaceStateRepository(db));
 
-        assembled.Prompt.Should().Contain("[truncated by harness:")
+        assembled.FlattenToSinglePrompt().Should().Contain("[truncated by harness:")
             .And.Contain("chars omitted]",
                 "an unmarked cut reads to the model as the payload ending mid-sentence");
-        assembled.Prompt.Length.Should().BeLessThan(huge.Length,
+        assembled.FlattenToSinglePrompt().Length.Should().BeLessThan(huge.Length,
             "the window's job is to keep input context lean");
     }
 
@@ -217,7 +218,7 @@ public class TurnContextAssemblerTests
 
         await db.SaveChangesAsync();
 
-        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db))).Prompt;
+        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db))).FlattenToSinglePrompt();
 
         var positions = Enumerable.Range(1, 5)
             .Select(i => prompt.IndexOf($"STEP-{i}", StringComparison.Ordinal))
@@ -252,25 +253,52 @@ public class TurnContextAssemblerTests
             JobId.ToString(), TaskId.ToString(), "feat/x", JobTaskStatus.InProgress,
             "earlier work", [], null, DateTimeOffset.UtcNow, TurnSessionId: SessionId.ToString()));
 
-        var prompt = (await AssembleAsync(db, checkpoints,
-            new ChatMessageSignal("astra", "Use the existing validator.", DateTimeOffset.UtcNow))).Prompt;
+        var assembled = await AssembleAsync(db, checkpoints,
+            new ChatMessageSignal("astra", "Use the existing validator.", DateTimeOffset.UtcNow));
+        var prompt = assembled.FlattenToSinglePrompt();
 
+        // The cached prefix carries layers 1-5 in strict stability order; the envelope carries layer 6
+        // and the recovery state. Asserted across both halves because the split IS the contract: a
+        // layer that migrates from the prefix into the envelope silently costs every turn its cache hit.
         var order = new[]
         {
-            "[PROJECT CONTEXT]",
-            "[PERSONA & PLATFORM RULES]",
-            "[PERSISTENT MEMORY & NOTES]",
-            "[TASK ENVELOPE]",
-            "[WORKING CHECKPOINT]",
+            "[LAYER 1: PLATFORM INVARIANTS]",
+            "[LAYER 2: MASTER PERSONA]",
+            "[LAYER 3: PROJECT MANIFEST]",
+            "[LAYER 4: TEAM TOPOLOGY & ESCALATION PATHS]",
+            "[LAYER 5: PERSISTENT MEMORY & NOTES",
+            PromptStackWirePayload.EnvelopeMarker,
+            // The live probe precedes the checkpoint: the note reports what is true now and the
+            // checkpoint what the harness recorded at the end of the last turn. Leading with the
+            // current measurement is what makes the drift sentence ("the note above, the checkpoint
+            // below") read correctly, and an agent that reads a stale state first anchors on it.
             EnvironmentRecoveryNote.Header,
-            "[RECENT CONVERSATION]",
+            "[WORKING CHECKPOINT",
+            "[CONVERSATION STATE]",
             "[INCOMING MESSAGE]",
+            "[OBJECTIVE]",
         };
 
         var positions = order.Select(marker => prompt.IndexOf(marker, StringComparison.Ordinal)).ToList();
 
         positions.Should().OnlyContain(p => p >= 0, $"every section must be present; prompt was:\n{prompt}");
         positions.Should().BeInAscendingOrder("the spec fixes this order");
+
+        // The prefix must stop before the envelope: a volatile byte anywhere in the cached block
+        // invalidates everything after it for every subsequent turn.
+        var cached = assembled.CachedSystemPrompt;
+        cached.Should().NotContain(PromptStackWirePayload.EnvelopeMarker)
+            .And.NotContain("[WORKING CHECKPOINT")
+            .And.NotContain(EnvironmentRecoveryNote.Header)
+            .And.NotContain("[INCOMING MESSAGE]");
+
+        // Layers 1-5 are the prefix, and nothing else is.
+        cached.Should().Contain("[LAYER 1: PLATFORM INVARIANTS]")
+            .And.Contain("[LAYER 2: MASTER PERSONA]")
+            .And.Contain("[LAYER 3: PROJECT MANIFEST]")
+            .And.Contain("[LAYER 4: TEAM TOPOLOGY & ESCALATION PATHS]")
+            .And.Contain("[LAYER 5: PERSISTENT MEMORY & NOTES");
+        assembled.UserTaskEnvelope.Should().StartWith(PromptStackWirePayload.EnvelopeMarker);
     }
 
     /// <summary>
@@ -287,10 +315,10 @@ public class TurnContextAssemblerTests
         var assembled = await AssembleAsync(db, new WorkspaceStateRepository(db));
 
         assembled.MemoryCount.Should().Be(2);
-        assembled.Prompt.Should().Contain("[PERSISTENT MEMORY & NOTES]");
-        assembled.Prompt.Should().Contain("dotnet_test_flags")
+        assembled.FlattenToSinglePrompt().Should().Contain("[LAYER 5: PERSISTENT MEMORY & NOTES (project: agent-mesh)]");
+        assembled.FlattenToSinglePrompt().Should().Contain("dotnet_test_flags")
             .And.Contain("dotnet test -v quiet --nologo");
-        assembled.Prompt.Should().Contain("build_and_test");
+        assembled.FlattenToSinglePrompt().Should().Contain("build_and_test");
     }
 
     /// <summary>
@@ -317,7 +345,7 @@ public class TurnContextAssemblerTests
         var assembled = await AssembleAsync(db, new WorkspaceStateRepository(db));
 
         assembled.MemoryCount.Should().Be(2);
-        assembled.Prompt.Should().Contain("agent-lesson").And.Contain("persona-lesson");
+        assembled.FlattenToSinglePrompt().Should().Contain("agent-lesson").And.Contain("persona-lesson");
     }
 
     /// <summary>
@@ -338,8 +366,8 @@ public class TurnContextAssemblerTests
 
         var assembled = await AssembleAsync(db, new WorkspaceStateRepository(db));
 
-        assembled.Prompt.Should().NotContain("other-project-secret");
-        assembled.Prompt.Should().Contain("global-lesson",
+        assembled.FlattenToSinglePrompt().Should().NotContain("other-project-secret");
+        assembled.FlattenToSinglePrompt().Should().Contain("global-lesson",
             "the global bucket is deliberately widened into every project read");
     }
 
@@ -363,10 +391,10 @@ public class TurnContextAssemblerTests
         assembled.WorkspacePath.Should().Be("/workspace/repos/payments-api",
             "a blank working_directory must derive from repository_name, not fall back to the default " +
             "repo — that is the multi-repo bug this feature removes");
-        assembled.Prompt.Should().Contain("/workspace/repos/payments-api");
-        assembled.Prompt.Should().NotContain("/workspace/repos/agent-mesh",
+        assembled.FlattenToSinglePrompt().Should().Contain("/workspace/repos/payments-api");
+        assembled.FlattenToSinglePrompt().Should().NotContain("/workspace/repos/agent-mesh",
             "the default path must not appear once the project names a different repository");
-        assembled.Prompt.Should().Contain("do not run pwd",
+        assembled.FlattenToSinglePrompt().Should().Contain("do not run pwd",
             "naming the directory only helps if the prompt also says not to verify it");
     }
 
@@ -402,7 +430,7 @@ public class TurnContextAssemblerTests
         await SeedProjectAndJobAsync(db);
         await SeedSessionAsync(db);
 
-        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db))).Prompt;
+        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db))).FlattenToSinglePrompt();
 
         prompt.Should().Contain("Implement the reconciler");
         prompt.Should().Contain("← this workflow",
@@ -423,7 +451,7 @@ public class TurnContextAssemblerTests
         var reply = new ChatMessageSignal(
             "sorren", "Please split the migration into two commits.", DateTimeOffset.UtcNow, "m-77");
 
-        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db), reply)).Prompt;
+        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db), reply)).FlattenToSinglePrompt();
 
         prompt.Should().Contain("[INCOMING MESSAGE]");
         prompt.Should().Contain("Please split the migration into two commits.");
@@ -442,10 +470,10 @@ public class TurnContextAssemblerTests
         using var db = Db();
         await SeedProjectAndJobAsync(db);
 
-        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db))).Prompt;
+        var prompt = (await AssembleAsync(db, new WorkspaceStateRepository(db))).FlattenToSinglePrompt();
 
-        prompt.Should().Contain("[RECENT CONVERSATION]")
-            .And.Contain("no prior messages in this session");
+        prompt.Should().Contain("[CONVERSATION STATE]")
+            .And.Contain("No prior messages in this session");
     }
 
     /// <summary>
@@ -473,7 +501,7 @@ public class TurnContextAssemblerTests
                 UpdatedAt: DateTimeOffset.UtcNow,
                 TurnSessionId: checkpointSessionId.ToString()));
 
-        var assembler = new TurnContextAssembler(
+        var assembler = new PromptStackBuilder(
             db,
             repoMock.Object,
             new ShellWorkspaceReconciler(shellRunner: (_, _, _) =>
@@ -481,8 +509,17 @@ public class TurnContextAssemblerTests
             null,
             new AgentMemoryRepository(db));
 
-        var input = Input with { TurnSessionId = inputSessionId.ToString() };
-        var resolved = await assembler.ResolveTurnSessionIdAsync(input, CancellationToken.None);
+        var context = PromptStackContext.FromTaskInput(Input with { TurnSessionId = inputSessionId.ToString() });
+        var resolved = await assembler.ResolveTurnSessionIdAsync(
+            context,
+            // The checkpoint is passed in rather than re-read: the composer loads it once per assembly
+            // and hands the same instance to the window resolver.
+            new TaskWorkingCheckpoint(
+                JobId: Input.JobId, TaskId: Input.TaskId, ActiveBranch: "main",
+                Status: JobTaskStatus.InProgress, LastSummary: "summary", ModifiedFiles: [],
+                ActiveStash: null, UpdatedAt: DateTimeOffset.UtcNow,
+                TurnSessionId: checkpointSessionId.ToString()),
+            CancellationToken.None);
 
         resolved.Should().Be(checkpointSessionId,
             "the checkpoint's session represents the freshest turn and must take precedence over the workflow input");
@@ -509,13 +546,14 @@ public class TurnContextAssemblerTests
         var reconciler = new ShellWorkspaceReconciler(
             shellRunner: (_, _, _) => Task.FromResult(new CommandExecutionResult(false, 127, "git: not found")));
 
-        var assembled = await new TurnContextAssembler(
+        var assembled = await new PromptStackBuilder(
             db, new WorkspaceStateRepository(db), reconciler, null,
-            new AgentMemoryRepository(db)).AssembleAsync(Input);
+            new AgentMemoryRepository(db)).BuildPromptStackAsync(PromptStackContext.FromTaskInput(Input));
 
         assembled.EnvironmentNote.Should().BeNull();
-        assembled.Prompt.Should().NotContain(EnvironmentRecoveryNote.Header);
-        assembled.Prompt.Should().Contain("[TASK ENVELOPE]", "the rest of the stack is unaffected");
+        assembled.FlattenToSinglePrompt().Should().NotContain(EnvironmentRecoveryNote.Header);
+        assembled.FlattenToSinglePrompt().Should().Contain(PromptStackWirePayload.EnvelopeMarker, "the rest of the stack is unaffected")
+            .And.Contain("[LAYER 1: PLATFORM INVARIANTS]", "a failed probe degrades one section, not the whole stack");
     }
 
     /// <summary>
@@ -523,20 +561,20 @@ public class TurnContextAssemblerTests
     /// </summary>
     [Theory]
     [InlineData("8", 8)]
-    [InlineData("500", TurnContextAssembler.MaxSlidingWindowSize)]
-    [InlineData("0", TurnContextAssembler.DefaultSlidingWindowSize)]
-    [InlineData("-3", TurnContextAssembler.DefaultSlidingWindowSize)]
+    [InlineData("500", PromptStackBuilder.MaxSlidingWindowSize)]
+    [InlineData("0", PromptStackBuilder.DefaultSlidingWindowSize)]
+    [InlineData("-3", PromptStackBuilder.DefaultSlidingWindowSize)]
     public void WindowSize_IsConfigurableAndCeiled(string configured, int expected)
     {
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
             {
-                [TurnContextAssembler.WindowSizeConfigKey] = configured,
+                [PromptStackBuilder.WindowSizeConfigKey] = configured,
             })
             .Build();
 
         using var db = Db();
-        var assembler = new TurnContextAssembler(
+        var assembler = new PromptStackBuilder(
             db, new WorkspaceStateRepository(db), new ShellWorkspaceReconciler(), null, null, config);
 
         // The ceiling exists because the window is what keeps input context lean; a mis-set value of
@@ -547,9 +585,9 @@ public class TurnContextAssemblerTests
 
     private static int ResolveWindow(IConfiguration config)
     {
-        var configured = config.GetValue<int?>(TurnContextAssembler.WindowSizeConfigKey);
-        if (configured is null or <= 0) return TurnContextAssembler.DefaultSlidingWindowSize;
-        return Math.Min(configured.Value, TurnContextAssembler.MaxSlidingWindowSize);
+        var configured = config.GetValue<int?>(PromptStackBuilder.WindowSizeConfigKey);
+        if (configured is null or <= 0) return PromptStackBuilder.DefaultSlidingWindowSize;
+        return Math.Min(configured.Value, PromptStackBuilder.MaxSlidingWindowSize);
     }
 
     /// <summary>
@@ -600,12 +638,12 @@ public class TurnContextAssemblerTests
         PersonaId: "rook",
         TurnSessionId: SessionId.ToString());
 
-    private static Task<AssembledTurnContext> AssembleAsync(
+    private static Task<AssembledPromptStack> AssembleAsync(
         AgentMeshDbContext db,
         IWorkspaceStateRepository checkpoints,
         ChatMessageSignal? reply = null,
         TaskExecutionInput? input = null) =>
-        new TurnContextAssembler(
+        new PromptStackBuilder(
             db,
             checkpoints,
             // A probe that reports a clean tree on a real temp directory: the note's presence and
@@ -615,7 +653,7 @@ public class TurnContextAssemblerTests
                 Task.FromResult(new CommandExecutionResult(true, 0, CleanProbeOutput))),
             null,
             new AgentMemoryRepository(db))
-        .AssembleAsync(input ?? Input, reply);
+        .BuildPromptStackAsync(PromptStackContext.FromTaskInput(input ?? Input, reply));
 
     private const string CleanProbeOutput = """
         @@HEADTYPE@@

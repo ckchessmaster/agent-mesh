@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
@@ -330,9 +330,21 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                 "container, started by the API's turn dispatcher over this endpoint.");
         }
 
+        // The prompt travels in two shapes at once, and that is deliberate rather than redundant.
+        //
+        // `prompt` is the flattened stack: what an old API stores on the session row and what a CLI
+        // binary predating the split still reads. `promptStack` is the layered form, which is what a
+        // runner uses to build messages[0]/messages[1] and therefore what makes the prefix cacheable.
+        //
+        // Sending both is what lets the worker, the API and the CLI ship independently. Dropping the
+        // flat field would make a worker deployed ahead of its API dispatch a turn with no prompt at
+        // all, and dropping the stack would leave the cache win hostage to a coordinated release of
+        // three artefacts — the CLI binary included, since it is published to dist/cli/ and baked into
+        // persona container images rebuilt on their own schedule.
         var payload = new
         {
             prompt = request.Prompt,
+            promptStack = PromptStackWirePayload.From(request.Stack),
             personaId = request.PersonaId,
             taskId = request.Input.TaskId,
             turnSessionId = (Guid?)null,

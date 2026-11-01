@@ -36,15 +36,15 @@ namespace AgentMesh.Worker.Activities;
 /// properties on the other partial. The worker registers this type with
 /// <c>AddScopedActivities&lt;ExecutionActivities&gt;()</c>, which resolves through the DI
 /// <em>constructor</em> activator and performs no property injection — so properties would have been
-/// silently null on every real turn, and the failure would surface as "no assembler registered" in
-/// production while every unit test that sets them passed. Optional keeps Job A's
+/// silently null on every real turn, and the failure would surface as "no prompt stack builder
+/// registered" in production while every unit test that sets them passed. Optional keeps Job A's
 /// <c>new ExecutionActivities(logger)</c> call sites compiling unchanged.
 /// </remarks>
 public partial class ExecutionActivities(
     ILogger<ExecutionActivities> logger,
     IStorageService? storageService = null,
     IConfiguration? config = null,
-    ITurnContextAssembler? assembler = null,
+    IPromptStackBuilder? promptStackBuilder = null,
     IWorkspaceStateRepository? checkpoints = null,
     IAgentTurnRunner? turnRunner = null,
     IWorkspaceReconciler? reconciler = null) : IExecutionActivities
