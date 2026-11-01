@@ -16,6 +16,13 @@ public class AgentJob
     public ApprovalStatus ApprovalStatus { get; set; } = ApprovalStatus.AutoApproved;
     public ExecutionStatus ExecutionStatus { get; set; } = ExecutionStatus.Staged;
     public string? TemporalWorkflowId { get; set; }
+    public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.LeadOrHuman;
+    public string? CurrentTaskId { get; set; }
+    public string? ProgressHeartbeat { get; set; }
+    public string? AssignedAgentId { get; set; }
+    public string? ProjectId { get; set; }
+    public string? WorkingDirectory { get; set; }
+    public string? TargetBranch { get; set; }
     public string? ResultJson { get; set; }
     public string? ResultS3Uri { get; set; }
     public string ArtifactsManifestJson { get; set; } = "{}";

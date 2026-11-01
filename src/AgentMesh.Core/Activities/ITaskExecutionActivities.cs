@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Workflows;
+using AgentMesh.Core.Workflows;
 using Temporalio.Activities;
 
 namespace AgentMesh.Core.Activities;
@@ -95,4 +95,10 @@ public interface IGitActivities
     /// </remarks>
     [Activity]
     Task<string> MergePullRequestAsync(string prUrl);
+
+    [Activity("MergeJobPullRequest")]
+    Task<string> MergeJobPullRequestAsync(AgentMesh.Core.Workflows.MergePullRequestInput input) =>
+        !string.IsNullOrWhiteSpace(input.PrUrl)
+            ? MergePullRequestAsync(input.PrUrl)
+            : throw new Temporalio.Exceptions.ApplicationFailureException("Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
 }

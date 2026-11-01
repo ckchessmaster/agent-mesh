@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using AgentMesh.Core.Models;
 using ModelContextProtocol.Protocol;
@@ -50,8 +50,14 @@ public static class PlatformToolSchema
     public const string ActionGetDetails = "get_details";
     public const string ActionSetStatus = "set_status";
     public const string ActionListAll = "list_all";
+    public const string ActionSetChecklist = "set_checklist";
+    public const string ActionUpdateTaskStatus = "update_task_status";
+    public const string ActionGetChecklist = "get_checklist";
 
-    public static readonly IReadOnlyList<string> AllActions = [ActionGetDetails, ActionSetStatus, ActionListAll];
+    public static readonly IReadOnlyList<string> AllActions = [
+        ActionGetDetails, ActionSetStatus, ActionListAll,
+        ActionSetChecklist, ActionUpdateTaskStatus, ActionGetChecklist
+    ];
 
     /// <summary>
     /// Adds the <c>enum</c> keywords to <c>manage_task</c>'s arguments on a <c>tools/list</c>

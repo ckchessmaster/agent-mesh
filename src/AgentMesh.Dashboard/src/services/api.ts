@@ -1083,6 +1083,16 @@ export const api = {
     return res.json();
   },
 
+  async approvePlan(jobId: string, approverRole?: string, comments?: string): Promise<{ success: boolean; approverId?: string; approverRole?: string }> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/approve-plan`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ approverRole, comments })
+    });
+    if (!res.ok) throw new Error(`Failed to approve plan: ${res.statusText}`);
+    return res.json();
+  },
+
   async completeJob(id: string, req?: { resultSummary?: string }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/complete`, {
       method: 'POST',

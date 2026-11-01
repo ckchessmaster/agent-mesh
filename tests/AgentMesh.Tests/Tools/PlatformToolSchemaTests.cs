@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using AgentMesh.Api.Tools;
 using AgentMesh.Core.Models;
 using FluentAssertions;
@@ -114,7 +114,7 @@ public class PlatformToolSchemaTests
         using var schema = JsonDocument.Parse(tool.InputSchema.GetRawText());
         var properties = schema.RootElement.GetProperty("properties");
 
-        properties.GetProperty("action").GetProperty("enum").GetArrayLength().Should().Be(3);
+        properties.GetProperty("action").GetProperty("enum").GetArrayLength().Should().Be(PlatformToolSchema.AllActions.Count);
 
         // The untouched property is still the boolean it was. Asserted on ValueKind rather than by
         // calling TryGetProperty on it, which throws on a non-object element — the JSON Schema
@@ -186,7 +186,7 @@ public class PlatformToolSchemaTests
 
         act.Should().NotThrow();
         tool.InputSchema.GetProperty("properties").GetProperty("action")
-            .GetProperty("enum").GetArrayLength().Should().Be(3);
+            .GetProperty("enum").GetArrayLength().Should().Be(PlatformToolSchema.AllActions.Count);
     }
 
     [Fact]
@@ -211,11 +211,15 @@ public class PlatformToolSchemaTests
         // The advertised enum and the handler's own switch read these constants. If a value were
         // added to one and not the other, a client would be told a call is valid and then refused
         // for making it — the worst kind of contract break, because it looks like a server bug.
-        PlatformToolSchema.AllActions.Should().Equal("get_details", "set_status", "list_all");
+        PlatformToolSchema.AllActions.Should().Equal(
+            "get_details", "set_status", "list_all", "set_checklist", "update_task_status", "get_checklist");
 
         PlatformToolSchema.ActionGetDetails.Should().Be("get_details");
         PlatformToolSchema.ActionSetStatus.Should().Be("set_status");
         PlatformToolSchema.ActionListAll.Should().Be("list_all");
+        PlatformToolSchema.ActionSetChecklist.Should().Be("set_checklist");
+        PlatformToolSchema.ActionUpdateTaskStatus.Should().Be("update_task_status");
+        PlatformToolSchema.ActionGetChecklist.Should().Be("get_checklist");
     }
 
     [Fact]

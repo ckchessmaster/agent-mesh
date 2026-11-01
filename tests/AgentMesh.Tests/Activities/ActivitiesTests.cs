@@ -58,4 +58,22 @@ public class ActivitiesTests
         // Assert
         await act.Should().NotThrowAsync();
     }
+
+    [Fact]
+    public async Task MergeJobPullRequestAsync_WhenPrUrlIsNull_ThrowsNonRetryableApplicationFailure_WithNoPrUrl()
+    {
+        // Arrange
+        var mockPullRequests = new Moq.Mock<AgentMesh.Infrastructure.Services.IGitHubPullRequestService>();
+        var config = new ConfigurationBuilder().Build();
+        var activity = new GitActivities(NullLogger<GitActivities>.Instance, mockPullRequests.Object, config);
+        var input = new MergePullRequestInput(JobId: Guid.NewGuid().ToString("N"), TargetBranch: "main", PrUrl: null);
+
+        // Act
+        var act = async () => await activity.MergeJobPullRequestAsync(input);
+
+        // Assert
+        var ex = await act.Should().ThrowAsync<Temporalio.Exceptions.ApplicationFailureException>();
+        ex.Which.NonRetryable.Should().BeTrue();
+        ex.Which.ErrorType.Should().Be("no_pr_url");
+    }
 }

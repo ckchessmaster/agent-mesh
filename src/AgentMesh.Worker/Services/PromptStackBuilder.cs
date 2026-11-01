@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using AgentMesh.Core.Models;
@@ -257,49 +257,7 @@ public class PromptStackBuilder(
     {
         var sb = new StringBuilder();
         sb.Append("[LAYER 1: PLATFORM INVARIANTS]\n");
-        sb.Append("Rules enforced by the AgentMesh harness. They are not preferences; violating one " +
-                  "stops the task rather than merely discouraging you.\n\n");
-
-        sb.Append("[EXECUTION RULES]\n");
-        sb.Append("* 3-strike limit: after three consecutive failed attempts at the same build or test " +
-                  "failure, revert your last change, stop running commands, and escalate in Job Chat " +
-                  "with the exact error, what you tried, and your hypothesis. Then yield your turn.\n");
-        sb.Append("* Two-man review gate: a task is never done because it compiles. Open a PR, request " +
-                  "review, and wait. Self-merging your own pull request is forbidden.\n");
-        sb.Append("* Reproduce before fixing: read the log, the source lines, and run a targeted test " +
-                  "before editing application code.\n");
-        sb.Append("* Scoped verification: filter test runs to what you changed; never run the full " +
-                  "repository suite during development iterations.\n");
-        sb.Append("* No shell sleep and no flakiness loops: never write for/while retry loops or long " +
-                  "sleeps to mask an intermittent failure. Find the unmocked socket, the unclosed " +
-                  "timer, or the lingering connection — or escalate.\n");
-        sb.Append("* Definition of done: scoped unit and integration tests pass, the branch is pushed, " +
-                  "a PR is opened, and review is requested from someone else.\n\n");
-
-        sb.Append("[PROCESS SANDBOX]\n");
-        sb.Append($"* A command is killed at {CommandExecutionPolicy.DefaultTimeoutSeconds}s unless you " +
-                  $"ask for a budget between {CommandExecutionPolicy.MinTimeoutSeconds} and " +
-                  $"{CommandExecutionPolicy.MaxTimeoutSeconds}s; a reaped command exits " +
-                  $"{CommandExecutionPolicy.TimeoutExitCode}.\n");
-        sb.Append($"* Output over {CommandExecutionPolicy.SpillLineThreshold} lines or " +
-                  $"{CommandExecutionPolicy.SpillByteThreshold} bytes is written in full to " +
-                  $"{CommandOutputSpillover.RunsDirectory}/ and returned to you as a head/tail preview " +
-                  $"naming the log file. The preview is not the whole output: grep the named file " +
-                  $"rather than concluding the log ended where the preview did. The live pointer is " +
-                  $"{CommandOutputSpillover.RunsDirectory}/last_run.log.\n\n");
-
-        sb.Append("[PLATFORM TOOLS]\n");
-        sb.Append("Report progress through the platform tools rather than prose, so the durable state " +
-                  "matches what you claim:\n");
-        sb.Append("* save_memory — persist a verified lesson under a category " +
-                  $"({string.Join(", ", AgentMemoryCategories.All)}). Save what you proved, not what " +
-                  "you guessed; a wrong memory is retrieved under its wrong heading forever.\n");
-        sb.Append("* post_job_message — report to Job Chat using the 3-R shape: Result, Reasoning, " +
-                  "Risk / Next Step.\n");
-        sb.Append("* manage_task — move the checklist item's status; the workflow parks on your status " +
-                  "change, so an unreported completion is a task that never resumes.\n");
-        sb.Append("* open_pull_request — open the PR and request review. Never merge your own.\n");
-
+        sb.Append(Prompts.PlatformPrompts.PlatformInvariants);
         return sb.ToString();
     }
 
@@ -564,6 +522,14 @@ public class PromptStackBuilder(
         if (job is not null && !string.IsNullOrWhiteSpace(job.Description))
         {
             sb.Append("* Job: ").Append(job.Title.Trim()).Append(" — ").Append(CollapseWhitespace(job.Description)).Append('\n');
+        }
+
+        if (context.TaskId == "stage-1-discovery")
+        {
+            sb.Append("\n[STAGE 1: DISCOVERY & DECOMPOSITION]\n");
+            sb.Append("* Phase: Read-only Discovery. Inspect the codebase (grep, find, read_file, git log).\n");
+            sb.Append("* Objective: Decompose the job into 3 to 6 atomic tasks and register them with manage_task(set_checklist).\n");
+            sb.Append("* Post plan & questions via post_job_message(requires_reply: true), then conclude your turn. Do not begin implementation.\n");
         }
 
         AppendChecklist(sb, job, context.TaskId);

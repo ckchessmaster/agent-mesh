@@ -124,6 +124,14 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("action_verb");
 
+                    b.Property<string>("ApprovalPolicy")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasDefaultValue("LeadOrHuman")
+                        .HasColumnName("approval_policy");
+
                     b.Property<string>("ApprovalStatus")
                         .IsRequired()
                         .HasMaxLength(32)
@@ -137,11 +145,21 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDefaultValue("{}")
                         .HasColumnName("artifacts");
 
+                    b.Property<string>("AssignedAgentId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("assigned_agent_id");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("CurrentTaskId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("current_task_id");
 
                     b.Property<string>("ErrorMessage")
                         .HasColumnType("text")
@@ -163,6 +181,15 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(512)")
                         .HasColumnName("payload_s3_uri");
 
+                    b.Property<string>("ProgressHeartbeat")
+                        .HasColumnType("text")
+                        .HasColumnName("progress_heartbeat");
+
+                    b.Property<string>("ProjectId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("project_id");
+
                     b.Property<string>("RequestedByAgentId")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -182,6 +209,11 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("uuid")
                         .HasColumnName("session_id");
 
+                    b.Property<string>("TargetBranch")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("target_branch");
+
                     b.Property<string>("TargetService")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -198,6 +230,11 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("updated_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("WorkingDirectory")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("working_directory");
 
                     b.HasKey("Id")
                         .HasName("pk_agent_jobs");
@@ -874,11 +911,28 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("uuid")
                         .HasColumnName("id");
 
+                    b.Property<string>("ApprovalPolicy")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasDefaultValue("LeadOrHuman")
+                        .HasColumnName("approval_policy");
+
+                    b.Property<string>("AssignedAgentId")
+                        .HasColumnType("text")
+                        .HasColumnName("assigned_agent_id");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("CurrentTaskId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("current_task_id");
 
                     b.Property<string>("Description")
                         .IsRequired()
@@ -901,6 +955,10 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("integer")
                         .HasDefaultValue(1)
                         .HasColumnName("priority");
+
+                    b.Property<string>("ProgressHeartbeat")
+                        .HasColumnType("text")
+                        .HasColumnName("progress_heartbeat");
 
                     b.Property<string>("ProjectId")
                         .IsRequired()
@@ -948,6 +1006,10 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("updated_at")
                         .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("WorkingDirectory")
+                        .HasColumnType("text")
+                        .HasColumnName("working_directory");
 
                     b.HasKey("Id")
                         .HasName("pk_project_jobs");

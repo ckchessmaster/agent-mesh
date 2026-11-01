@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using AgentMesh.Api.Controllers;
 using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Data;
@@ -35,9 +35,11 @@ public sealed record PlatformCallContext(
     string? GitBranch,
     string? GitRemoteUrl,
     string? GitBaseBranch,
-    string? WorkspaceDirectory)
+    string? WorkspaceDirectory,
+    string? TaskId = null)
 {
     public bool HasIdentity => !string.IsNullOrWhiteSpace(AgentId) || !string.IsNullOrWhiteSpace(PersonaId);
+    public bool IsDiscoveryPhase => TaskId == "stage-1-discovery";
 }
 
 public interface IPlatformCallContextResolver
@@ -134,6 +136,7 @@ public class PlatformCallContextResolver(
         var gitRemote = ReadMetadataString(session?.MetadataJson, "workspaceGitRemote")
                         ?? ReadMetadataString(session?.MetadataJson, "gitUrl");
         var gitBase = ReadMetadataString(session?.MetadataJson, "gitBaseBranch");
+        var taskId = ReadMetadataString(session?.MetadataJson, "taskId");
 
         return new PlatformCallContext(
             AgentId: agentId,
@@ -148,7 +151,8 @@ public class PlatformCallContextResolver(
             GitBranch: gitBranch,
             GitRemoteUrl: gitRemote,
             GitBaseBranch: gitBase,
-            WorkspaceDirectory: jobId is not null ? ResolveWorkspaceDirectory(jobId.Value) : null);
+            WorkspaceDirectory: jobId is not null ? ResolveWorkspaceDirectory(jobId.Value) : null,
+            TaskId: taskId);
     }
 
     private static (string? Value, string Source) ResolveAgentId(HttpContext? context)

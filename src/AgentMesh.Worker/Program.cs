@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Repositories;
+using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure;
@@ -74,6 +74,7 @@ builder.Services.AddHostedTemporalWorker(
     // AgentTaskWorkflow is what DiscordWebhookController and StagingTools start today, and both
     // keep running on their own workflow ids.
     .AddWorkflow<TaskExecutionWorkflow>()
+    .AddWorkflow<JobExecutionWorkflow>()
     .AddScopedActivities<DatabaseActivities>()
     .AddScopedActivities<ExecutionActivities>()
     .AddScopedActivities<NotificationActivities>()

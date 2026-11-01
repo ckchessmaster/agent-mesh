@@ -1,4 +1,5 @@
-﻿using AgentMesh.Core.Models;
+using AgentMesh.Core.Models;
+using AgentMesh.Core.Workflows;
 using Temporalio.Activities;
 
 namespace AgentMesh.Core.Activities;
@@ -40,4 +41,10 @@ public interface IExecutionActivities
         string? commandId = null,
         string? taskWorkspacePath = null,
         CancellationToken cancellationToken = default);
+
+    [Activity]
+    Task<TurnOutcome> RunAgentDiscoveryTurnAsync(AgentMesh.Core.Workflows.DiscoveryTurnInput input);
+
+    [Activity]
+    Task<TurnOutcome> RunAgentCodingTurnAsync(AgentMesh.Core.Workflows.CodingTurnInput input);
 }

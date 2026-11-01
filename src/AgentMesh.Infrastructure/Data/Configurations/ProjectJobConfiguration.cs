@@ -55,6 +55,21 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
 
         builder.Property(j => j.ResultSummary);
 
+        builder.Property(j => j.ApprovalPolicy)
+            .HasColumnName("approval_policy")
+            .HasConversion<string>()
+            .HasMaxLength(32)
+            .HasDefaultValue(PlanApprovalPolicy.LeadOrHuman)
+            .IsRequired();
+
+        builder.Property(j => j.CurrentTaskId)
+            .HasColumnName("current_task_id")
+            .HasMaxLength(64);
+
+        builder.Property(j => j.ProgressHeartbeat)
+            .HasColumnName("progress_heartbeat")
+            .HasColumnType("text");
+
         builder.Property(j => j.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")
             .IsRequired();

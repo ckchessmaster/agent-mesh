@@ -32,10 +32,12 @@ import {
   MessageSquareQuote,
   Play,
   HelpCircle,
-  Sliders
+  Sliders,
+  Activity,
+  ShieldCheck
 } from 'lucide-react';
 import type { AgentSession, AskQuestionItem, JobMessage, JobTask, Persona, Project, ProjectJob, QuestionAnswerPayload, SessionAttachment } from '../types';
-import { ProjectJobStatus } from '../types';
+import { ProjectJobStatus, PlanApprovalPolicy, JobLifecycleStatus } from '../types';
 import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
 import { MarkdownMessage } from './MarkdownMessage';
 import { QuestionCard, parseTextQuestions } from './QuestionCard';
@@ -216,6 +218,8 @@ interface JobCockpitProps {
   tasks: JobTask[];
   messages: JobMessage[];
   personas?: Persona[];
+  allowManualTaskCreation?: boolean;
+  userRole?: string;
   onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
   onAddTask: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
   onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
@@ -256,6 +260,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   messages,
   personas = [],
   sessions = [],
+  allowManualTaskCreation,
+  userRole = 'operator',
   onSendMessage,
   onAddTask,
   onToggleTask,
@@ -335,6 +341,39 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   // Question answering state
   const [submittingQuestionId, setSubmittingQuestionId] = useState<string | null>(null);
   const [answeredQuestionIds, setAnsweredQuestionIds] = useState<string[]>([]);
+
+  // Autonomous job vs manual task flow
+  const isAutonomousJob = allowManualTaskCreation !== undefined
+    ? !allowManualTaskCreation
+    : (job.approvalPolicy !== undefined || job.lifecycleStatus !== undefined || Boolean(job.progressHeartbeat));
+  const showManualAddTaskForm = !isAutonomousJob;
+
+  // Plan approval state (Stage 2 Gate)
+  const [isApprovingPlan, setIsApprovingPlan] = useState(false);
+  const [planApproved, setPlanApproved] = useState(false);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+
+  const isAwaitingApproval =
+    !planApproved &&
+    (job.lifecycleStatus === JobLifecycleStatus.AwaitingApproval ||
+     (job.status as any) === 'awaiting_approval' ||
+     (job.status as any) === 'AwaitingApproval');
+
+  const handleApprovePlan = async () => {
+    setIsApprovingPlan(true);
+    setApprovalError(null);
+    try {
+      await api.approvePlan(job.id, userRole);
+      setPlanApproved(true);
+      if (onUpdateJob) {
+        await onUpdateJob({ status: ProjectJobStatus.Active });
+      }
+    } catch (err: any) {
+      setApprovalError(err?.message || 'Failed to approve plan.');
+    } finally {
+      setIsApprovingPlan(false);
+    }
+  };
 
   const handleAnswerQuestion = async (
     msg: JobMessage,
@@ -1439,6 +1478,54 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         </div>
       </div>
 
+      {/* Plan Approval Action Banner (Stage 2 Gate) */}
+      {isAwaitingApproval && (
+        <div
+          className="border-b border-amber-500/30 bg-amber-950/30 px-3 sm:px-6 py-3 shrink-0"
+          data-testid="plan-approval-action-bar"
+        >
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-amber-400" />
+                <span className="text-xs font-semibold text-amber-200">
+                  Plan Approval Gate Required (Stage 2)
+                </span>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                  {job.approvalPolicy === PlanApprovalPolicy.HumanOnly || job.approvalPolicy === 1
+                    ? 'Human Only'
+                    : 'Lead or Human'}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-300">
+                The implementer completed discovery and proposed {uniqueTasks.length} tasks in the checklist. Approve to unblock autonomous implementation.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {approvalError && (
+                <span className="text-[11px] text-rose-400 max-w-[200px] truncate" title={approvalError}>
+                  {approvalError}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={handleApprovePlan}
+                disabled={isApprovingPlan || ((job.approvalPolicy === PlanApprovalPolicy.HumanOnly || job.approvalPolicy === 1) && userRole !== 'operator')}
+                className="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition shadow-sm cursor-pointer"
+                data-testid="approve-plan-btn"
+              >
+                {isApprovingPlan ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Check className="w-3.5 h-3.5" />
+                )}
+                <span>Approve Plan</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Redesigned Task Checklist */}
       <div className="px-3 sm:px-6 py-2 sm:py-3 border-b border-slate-800/60 bg-slate-900/50">
         {/* Task Header & Progress Bar */}
@@ -1462,23 +1549,41 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
               ({completedCount}/{uniqueTasks.length} completed • {progressPercent}%)
             </span>
+            <span
+              className="text-[11px] font-mono text-slate-300 bg-slate-800/80 px-2 py-0.5 rounded-full border border-slate-700/50 shrink-0"
+              data-testid="deterministic-progress-meter"
+            >
+              Task {uniqueTasks.length === 0 ? 0 : (firstPendingTaskIndex >= 0 ? firstPendingTaskIndex + 1 : uniqueTasks.length)} of {uniqueTasks.length} ({progressPercent}% complete)
+            </span>
             {firstPendingTask && (
-              <span
-                className={`hidden xl:inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg border max-w-xs truncate ${
-                  firstPendingTask.requiresDiscussion
-                    ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
-                    : 'bg-sky-500/10 text-sky-300 border-sky-500/25'
-                }`}
-                title={`Current sequential target: ${firstPendingTask.title}${firstPendingTask.requiresDiscussion ? ' (Discussion Required)' : ''}`}
-                data-testid="current-focus-badge"
-              >
-                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${firstPendingTask.requiresDiscussion ? 'bg-amber-400 animate-pulse' : 'bg-sky-400 animate-pulse'}`} />
-                <span className="text-slate-400 font-normal">Focus:</span>
-                {firstPendingTask.requiresDiscussion && (
-                  <span className="text-amber-400 font-semibold" data-testid="focus-discuss-tag">[Discuss]</span>
+              <div className="hidden xl:flex flex-col gap-0.5 max-w-xs truncate">
+                <span
+                  className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg border max-w-xs truncate ${
+                    firstPendingTask.requiresDiscussion
+                      ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                      : 'bg-sky-500/10 text-sky-300 border-sky-500/25'
+                  }`}
+                  title={`Current sequential target: ${firstPendingTask.title}${firstPendingTask.requiresDiscussion ? ' (Discussion Required)' : ''}`}
+                  data-testid="current-focus-badge"
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${firstPendingTask.requiresDiscussion ? 'bg-amber-400 animate-pulse' : 'bg-sky-400 animate-pulse'}`} />
+                  <span className="text-slate-400 font-normal">Focus:</span>
+                  {firstPendingTask.requiresDiscussion && (
+                    <span className="text-amber-400 font-semibold" data-testid="focus-discuss-tag">[Discuss]</span>
+                  )}
+                  <span className="truncate">#{firstPendingTaskIndex + 1} {firstPendingTask.title}</span>
+                </span>
+                {job.progressHeartbeat && (
+                  <div
+                    className="flex items-center gap-1.5 text-[10px] text-sky-300/90 italic pl-1 truncate"
+                    title={`Heartbeat: ${job.progressHeartbeat}`}
+                    data-testid="job-progress-heartbeat"
+                  >
+                    <Activity className="w-3 h-3 text-sky-400 shrink-0 animate-pulse" />
+                    <span className="truncate">{job.progressHeartbeat}</span>
+                  </div>
                 )}
-                <span className="truncate">#{firstPendingTaskIndex + 1} {firstPendingTask.title}</span>
-              </span>
+              </div>
             )}
           </div>
 
@@ -1544,225 +1649,245 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             ) : (
               <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1" data-testid="job-tasks-list">
                 {filteredTasks.map((task, idx) => {
-                  const isCurrentFocus = !task.isCompleted && task.id === firstPendingTaskId;
+                  const isCurrentFocus = !task.isCompleted && (task.id === (job.currentTaskId || firstPendingTaskId));
+                  const isTaskCompleted = task.isCompleted || task.status === 'completed';
+                  const isTaskInProgress = !isTaskCompleted && (task.status === 'in_progress' || isCurrentFocus);
 
                   return (
                     <div
                       key={task.id}
-                      className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl border text-xs transition group ${
-                        task.isCompleted
+                      className={`flex flex-col gap-1.5 px-3 py-2 rounded-xl border text-xs transition group ${
+                        isTaskCompleted
                           ? 'bg-emerald-950/15 border-emerald-500/25 text-emerald-300/80'
-                          : isCurrentFocus
+                          : isTaskInProgress
                           ? 'bg-sky-950/25 border-sky-500/40 text-slate-100 shadow-sm ring-1 ring-sky-500/20'
                           : 'bg-slate-950/60 border-slate-800/80 text-slate-300 hover:border-slate-700/80'
                       }`}
                     >
-                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                        <button
-                          type="button"
-                          onClick={() => onToggleTask(task.id, !task.isCompleted)}
-                          className="cursor-pointer text-slate-400 hover:text-sky-400 transition shrink-0 p-0.5"
-                          title={task.isCompleted ? 'Mark as incomplete' : 'Mark as complete'}
-                          data-testid={`toggle-task-${task.id}`}
-                        >
-                          {task.isCompleted ? (
-                            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                          ) : (
-                            <Circle className="w-4 h-4 text-slate-500 hover:text-sky-400" />
-                          )}
-                        </button>
-                        <span className={`font-mono text-[10px] shrink-0 ${isCurrentFocus ? 'text-sky-400 font-semibold' : 'text-slate-500'}`}>
-                          #{idx + 1}
-                        </span>
-                        <div className="min-w-0 flex-1">
-                          <span
-                            className={`break-words leading-relaxed ${
-                              task.isCompleted
-                                ? 'line-through text-slate-400'
-                                : isCurrentFocus
-                                ? 'text-slate-100 font-semibold'
-                                : 'text-slate-200 font-medium'
-                            }`}
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                          <button
+                            type="button"
+                            onClick={() => onToggleTask(task.id, !task.isCompleted)}
+                            className="cursor-pointer text-slate-400 hover:text-sky-400 transition shrink-0 p-0.5"
+                            title={isTaskCompleted ? 'Mark as incomplete' : 'Mark as complete'}
+                            data-testid={`toggle-task-${task.id}`}
                           >
-                            {task.title}
+                            {isTaskCompleted ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                            ) : isTaskInProgress ? (
+                              <div className="relative flex items-center justify-center w-4 h-4" data-testid={`task-progress-indicator-${task.id}`}>
+                                <span className="animate-ping absolute inline-flex h-3 w-3 rounded-full bg-sky-400 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-500"></span>
+                              </div>
+                            ) : (
+                              <Circle className="w-4 h-4 text-slate-500 hover:text-sky-400" />
+                            )}
+                          </button>
+                          <span className={`font-mono text-[10px] shrink-0 ${isTaskInProgress ? 'text-sky-400 font-semibold' : 'text-slate-500'}`}>
+                            #{idx + 1}
                           </span>
-                          {/* Task Attachments Badge List */}
-                          {task.attachments && task.attachments.length > 0 && (
-                            <div className="flex flex-wrap gap-1.5 mt-1" data-testid={`task-attachments-${task.id}`}>
-                              {task.attachments.map((att) => {
-                                const isImg = isImageAttachment(att.contentType, att.fileName);
-                                return (
-                                  <div
-                                    key={att.id}
-                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-[10px] text-slate-300 group/taskatt"
-                                    data-testid={`task-att-${att.id}`}
-                                  >
-                                    {isImg ? (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleOpenLightbox({ url: att.downloadUrl, fileName: att.fileName, sizeBytes: att.sizeBytes })}
-                                        className="cursor-pointer flex items-center gap-1 hover:text-sky-300"
-                                        title="View image"
-                                      >
-                                        <ImageIcon className="w-3 h-3 text-sky-400 shrink-0" />
-                                        <span className="truncate max-w-[110px]">{att.fileName}</span>
-                                      </button>
-                                    ) : (
-                                      <a
-                                        href={att.downloadUrl}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        className="flex items-center gap-1 text-slate-300 hover:text-sky-300"
-                                        title="Download attachment"
-                                      >
-                                        <Paperclip className="w-3 h-3 text-slate-400 shrink-0" />
-                                        <span className="truncate max-w-[110px]">{att.fileName}</span>
-                                      </a>
-                                    )}
-                                    {att.sizeBytes > 0 && (
-                                      <span className="text-[9px] text-slate-500 font-mono">
-                                        ({formatAttachmentSize(att.sizeBytes)})
-                                      </span>
-                                    )}
-                                    {!task.isCompleted && onUpdateTask && (
-                                      <button
-                                        type="button"
-                                        onClick={async (e) => {
-                                          e.stopPropagation();
-                                          try {
-                                            await api.deleteTaskAttachment(job.id, task.id, att.id);
-                                          } catch { }
-                                          const remaining = (task.attachments || []).filter((a) => a.id !== att.id);
-                                          await onUpdateTask(task.id, { attachments: remaining });
-                                        }}
-                                        className="text-slate-500 hover:text-rose-400 p-0.5 rounded transition cursor-pointer ml-0.5 opacity-0 group-hover/taskatt:opacity-100"
-                                        title="Remove attachment"
-                                        data-testid={`delete-task-att-${att.id}`}
-                                      >
-                                        <X className="w-2.5 h-2.5" />
-                                      </button>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                            </div>
+                          <div className="min-w-0 flex-1">
+                            <span
+                              className={`break-words leading-relaxed ${
+                                isTaskCompleted
+                                  ? 'line-through text-slate-400'
+                                  : isTaskInProgress
+                                  ? 'text-slate-100 font-semibold'
+                                  : 'text-slate-200 font-medium'
+                              }`}
+                            >
+                              {task.title}
+                            </span>
+                            {/* Task Attachments Badge List */}
+                            {task.attachments && task.attachments.length > 0 && (
+                              <div className="flex flex-wrap gap-1.5 mt-1" data-testid={`task-attachments-${task.id}`}>
+                                {task.attachments.map((att) => {
+                                  const isImg = isImageAttachment(att.contentType, att.fileName);
+                                  return (
+                                    <div
+                                      key={att.id}
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-[10px] text-slate-300 group/taskatt"
+                                      data-testid={`task-att-${att.id}`}
+                                    >
+                                      {isImg ? (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleOpenLightbox({ url: att.downloadUrl, fileName: att.fileName, sizeBytes: att.sizeBytes })}
+                                          className="cursor-pointer flex items-center gap-1 hover:text-sky-300"
+                                          title="View image"
+                                        >
+                                          <ImageIcon className="w-3 h-3 text-sky-400 shrink-0" />
+                                          <span className="truncate max-w-[110px]">{att.fileName}</span>
+                                        </button>
+                                      ) : (
+                                        <a
+                                          href={att.downloadUrl}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          className="flex items-center gap-1 text-slate-300 hover:text-sky-300"
+                                          title="Download attachment"
+                                        >
+                                          <Paperclip className="w-3 h-3 text-slate-400 shrink-0" />
+                                          <span className="truncate max-w-[110px]">{att.fileName}</span>
+                                        </a>
+                                      )}
+                                      {att.sizeBytes > 0 && (
+                                        <span className="text-[9px] text-slate-500 font-mono">
+                                          ({formatAttachmentSize(att.sizeBytes)})
+                                        </span>
+                                      )}
+                                      {!task.isCompleted && onUpdateTask && (
+                                        <button
+                                          type="button"
+                                          onClick={async (e) => {
+                                            e.stopPropagation();
+                                            try {
+                                              await api.deleteTaskAttachment(job.id, task.id, att.id);
+                                            } catch { }
+                                            const remaining = (task.attachments || []).filter((a) => a.id !== att.id);
+                                            await onUpdateTask(task.id, { attachments: remaining });
+                                          }}
+                                          className="text-slate-500 hover:text-rose-400 p-0.5 rounded transition cursor-pointer ml-0.5 opacity-0 group-hover/taskatt:opacity-100"
+                                          title="Remove attachment"
+                                          data-testid={`delete-task-att-${att.id}`}
+                                        >
+                                          <X className="w-2.5 h-2.5" />
+                                        </button>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          {!task.isCompleted && onAssignTask ? (
+                            <select
+                              value={task.assignedPersonaId || ''}
+                              disabled={assigningTaskId === task.id}
+                              onChange={(e) => handleAssignTask(task.id, e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              aria-label={`Assignee for task ${task.title}`}
+                              data-testid={`assign-task-${task.id}`}
+                              title={
+                                task.assignedPersonaId
+                                  ? `Assigned to @${memberNameFor(task.assignedPersonaId)} — change assignee`
+                                  : 'Unassigned — pick who owns this task'
+                              }
+                              className={`max-w-[130px] rounded-md border px-1.5 py-1 text-[10px] transition focus:outline-none focus:border-sky-500 disabled:opacity-50 cursor-pointer ${
+                                task.assignedPersonaId
+                                  ? 'bg-sky-500/10 border-sky-500/30 text-sky-200'
+                                  : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              <option value="">Unassigned</option>
+                              {teamMembers.map((m) => (
+                                <option key={m.id} value={m.id}>
+                                  {m.name}
+                                </option>
+                              ))}
+                            </select>
+                          ) : task.assignedPersonaId ? (
+                            // Completed rows keep the assignee as read-only history: reassigning
+                            // work that is already done would move nothing but the label.
+                            <span
+                              className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/60 text-slate-400 border border-slate-700/50 truncate max-w-[110px]"
+                              title={`Was handled by @${memberNameFor(task.assignedPersonaId)}`}
+                              data-testid={`task-assignee-static-${task.id}`}
+                            >
+                              @{memberNameFor(task.assignedPersonaId)}
+                            </span>
+                          ) : null}
+                          {isTaskCompleted ? (
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                              Completed
+                            </span>
+                          ) : (
+                            <>
+                              {task.requiresDiscussion && (
+                                <span
+                                  className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 font-semibold"
+                                  data-testid={`task-discuss-${task.id}`}
+                                  title="Discussion required before starting coding"
+                                >
+                                  <MessageSquareQuote className="w-3 h-3 text-amber-400 shrink-0" />
+                                  Discuss First
+                                </span>
+                              )}
+                              {isTaskInProgress ? (
+                                <span
+                                  className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
+                                  data-testid={`task-focus-${task.id}`}
+                                >
+                                  <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+                                  In Progress
+                                </span>
+                              ) : (
+                                <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
+                                  Queued
+                                </span>
+                              )}
+                            </>
                           )}
+                          {!task.isCompleted && onUpdateTask && (
+                            <button
+                              type="button"
+                              disabled={isUploadingTaskAttachment === task.id}
+                              onClick={() => {
+                                setTargetTaskForUpload(task.id);
+                                existingTaskFileInputRef.current?.click();
+                              }}
+                              className="p-1 rounded text-slate-500 hover:text-sky-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer disabled:opacity-50"
+                              title="Attach file to task"
+                              data-testid={`attach-task-${task.id}`}
+                            >
+                              {isUploadingTaskAttachment === task.id ? (
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
+                              ) : (
+                                <Paperclip className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                          )}
+                          {!task.isCompleted && onUpdateTask && (
+                            <button
+                              type="button"
+                              onClick={() => onUpdateTask(task.id, { requiresDiscussion: !task.requiresDiscussion })}
+                              className={`p-1 rounded transition cursor-pointer ${
+                                task.requiresDiscussion
+                                  ? 'text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30'
+                                  : 'text-slate-500 hover:text-amber-400 hover:bg-slate-800 opacity-0 group-hover:opacity-100'
+                              }`}
+                              title={task.requiresDiscussion ? 'Discussion required before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
+                              data-testid={`toggle-discuss-task-${task.id}`}
+                            >
+                              <MessageSquareQuote className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => onDeleteTask(task.id)}
+                            className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer"
+                            title="Delete task"
+                            data-testid={`delete-task-${task.id}`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-2 shrink-0">
-                        {!task.isCompleted && onAssignTask ? (
-                          <select
-                            value={task.assignedPersonaId || ''}
-                            disabled={assigningTaskId === task.id}
-                            onChange={(e) => handleAssignTask(task.id, e.target.value)}
-                            onClick={(e) => e.stopPropagation()}
-                            aria-label={`Assignee for task ${task.title}`}
-                            data-testid={`assign-task-${task.id}`}
-                            title={
-                              task.assignedPersonaId
-                                ? `Assigned to @${memberNameFor(task.assignedPersonaId)} — change assignee`
-                                : 'Unassigned — pick who owns this task'
-                            }
-                            className={`max-w-[130px] rounded-md border px-1.5 py-1 text-[10px] transition focus:outline-none focus:border-sky-500 disabled:opacity-50 cursor-pointer ${
-                              task.assignedPersonaId
-                                ? 'bg-sky-500/10 border-sky-500/30 text-sky-200'
-                                : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                            }`}
-                          >
-                            <option value="">Unassigned</option>
-                            {teamMembers.map((m) => (
-                              <option key={m.id} value={m.id}>
-                                {m.name}
-                              </option>
-                            ))}
-                          </select>
-                        ) : task.assignedPersonaId ? (
-                          // Completed rows keep the assignee as read-only history: reassigning
-                          // work that is already done would move nothing but the label.
-                          <span
-                            className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/60 text-slate-400 border border-slate-700/50 truncate max-w-[110px]"
-                            title={`Was handled by @${memberNameFor(task.assignedPersonaId)}`}
-                            data-testid={`task-assignee-static-${task.id}`}
-                          >
-                            @{memberNameFor(task.assignedPersonaId)}
-                          </span>
-                        ) : null}
-                        {task.isCompleted ? (
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
-                            Completed
-                          </span>
-                        ) : (
-                          <>
-                            {task.requiresDiscussion && (
-                              <span
-                                className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 font-semibold"
-                                data-testid={`task-discuss-${task.id}`}
-                                title="Discussion required before starting coding"
-                              >
-                                <MessageSquareQuote className="w-3 h-3 text-amber-400 shrink-0" />
-                                Discuss First
-                              </span>
-                            )}
-                            {isCurrentFocus ? (
-                              <span
-                                className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
-                                data-testid={`task-focus-${task.id}`}
-                              >
-                                <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
-                                In Progress
-                              </span>
-                            ) : (
-                              <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
-                                Queued
-                              </span>
-                            )}
-                          </>
-                        )}
-                        {!task.isCompleted && onUpdateTask && (
-                          <button
-                            type="button"
-                            disabled={isUploadingTaskAttachment === task.id}
-                            onClick={() => {
-                              setTargetTaskForUpload(task.id);
-                              existingTaskFileInputRef.current?.click();
-                            }}
-                            className="p-1 rounded text-slate-500 hover:text-sky-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer disabled:opacity-50"
-                            title="Attach file to task"
-                            data-testid={`attach-task-${task.id}`}
-                          >
-                            {isUploadingTaskAttachment === task.id ? (
-                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
-                            ) : (
-                              <Paperclip className="w-3.5 h-3.5" />
-                            )}
-                          </button>
-                        )}
-                        {!task.isCompleted && onUpdateTask && (
-                          <button
-                            type="button"
-                            onClick={() => onUpdateTask(task.id, { requiresDiscussion: !task.requiresDiscussion })}
-                            className={`p-1 rounded transition cursor-pointer ${
-                              task.requiresDiscussion
-                                ? 'text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30'
-                                : 'text-slate-500 hover:text-amber-400 hover:bg-slate-800 opacity-0 group-hover:opacity-100'
-                            }`}
-                            title={task.requiresDiscussion ? 'Discussion required before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
-                            data-testid={`toggle-discuss-task-${task.id}`}
-                          >
-                            <MessageSquareQuote className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => onDeleteTask(task.id)}
-                          className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer"
-                          title="Delete task"
-                          data-testid={`delete-task-${task.id}`}
+                      {/* Heartbeat Note beneath active task indicator */}
+                      {isTaskInProgress && job.progressHeartbeat && (
+                        <div
+                          className="flex items-center gap-1.5 text-[11px] text-sky-300/90 italic pt-0.5 pl-6"
+                          data-testid="task-heartbeat-note"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
+                          <Activity className="w-3 h-3 text-sky-400 animate-pulse shrink-0" />
+                          <span className="truncate">{job.progressHeartbeat}</span>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1789,90 +1914,92 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               </div>
             )}
 
-            {/* Clean Inline Add Task Form */}
-            <form onSubmit={handleAddTaskSubmit} className="space-y-1.5 pt-1">
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={newTaskTitle}
-                  onChange={(e) => setNewTaskTitle(e.target.value)}
-                  placeholder="+ Add task..."
-                  className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition shadow-inner"
-                  data-testid="new-task-input"
-                />
-                <button
-                  type="button"
-                  onClick={() => newTaskFileInputRef.current?.click()}
-                  className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
-                    newTaskAttachments.length > 0
-                      ? 'bg-sky-500/20 border-sky-500/40 text-sky-300 font-semibold shadow-sm'
-                      : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                  }`}
-                  title="Attach files to task"
-                  data-testid="new-task-attach-btn"
-                >
-                  <Paperclip className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">
-                    Attach{newTaskAttachments.length > 0 ? ` (${newTaskAttachments.length})` : ''}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setNewTaskRequiresDiscussion((prev) => !prev)}
-                  className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
-                    newTaskRequiresDiscussion
-                      ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold shadow-sm'
-                      : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                  }`}
-                  title={newTaskRequiresDiscussion ? 'Flagged for discussion before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
-                  data-testid="new-task-discuss-toggle"
-                >
-                  <MessageSquareQuote className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Discuss</span>
-                </button>
-                <button
-                  type="submit"
-                  disabled={!newTaskTitle.trim() || isAddingTask}
-                  className="px-3.5 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer shadow-sm"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Add Task</span>
-                </button>
-              </div>
-
-              {/* Staged attachments for new task */}
-              {newTaskAttachments.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 px-1" data-testid="new-task-staged-attachments">
-                  {newTaskAttachments.map((att) => (
-                    <div
-                      key={att.localId}
-                      className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800 text-[10px] text-slate-300"
-                    >
-                      {att.uploading ? (
-                        <RefreshCw className="w-3 h-3 text-sky-400 animate-spin" />
-                      ) : (
-                        <Paperclip className="w-3 h-3 text-sky-400" />
-                      )}
-                      <span className="truncate max-w-[120px]">{att.name}</span>
-                      {att.sizeBytes && (
-                        <span className="text-[9px] text-slate-500 font-mono">
-                          ({formatAttachmentSize(att.sizeBytes)})
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => removeNewTaskAttachment(att.localId)}
-                        className="text-slate-500 hover:text-rose-400 p-0.5 rounded cursor-pointer"
-                        title="Remove file"
-                        data-testid={`remove-new-task-att-${att.localId}`}
-                      >
-                        <X className="w-2.5 h-2.5" />
-                      </button>
-                    </div>
-                  ))}
+            {/* Inline Add Task Form (Autonomous implementers own task decomposition during discovery) */}
+            {showManualAddTaskForm && (
+              <form onSubmit={handleAddTaskSubmit} className="space-y-1.5 pt-1">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={newTaskTitle}
+                    onChange={(e) => setNewTaskTitle(e.target.value)}
+                    placeholder="+ Add task..."
+                    className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition shadow-inner"
+                    data-testid="new-task-input"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => newTaskFileInputRef.current?.click()}
+                    className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
+                      newTaskAttachments.length > 0
+                        ? 'bg-sky-500/20 border-sky-500/40 text-sky-300 font-semibold shadow-sm'
+                        : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="Attach files to task"
+                    data-testid="new-task-attach-btn"
+                  >
+                    <Paperclip className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">
+                      Attach{newTaskAttachments.length > 0 ? ` (${newTaskAttachments.length})` : ''}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setNewTaskRequiresDiscussion((prev) => !prev)}
+                    className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
+                      newTaskRequiresDiscussion
+                        ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold shadow-sm'
+                        : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                    title={newTaskRequiresDiscussion ? 'Flagged for discussion before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
+                    data-testid="new-task-discuss-toggle"
+                  >
+                    <MessageSquareQuote className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Discuss</span>
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!newTaskTitle.trim() || isAddingTask}
+                    className="px-3.5 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer shadow-sm"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add Task</span>
+                  </button>
                 </div>
-              )}
-            </form>
+
+                {/* Staged attachments for new task */}
+                {newTaskAttachments.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 px-1" data-testid="new-task-staged-attachments">
+                    {newTaskAttachments.map((att) => (
+                      <div
+                        key={att.localId}
+                        className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800 text-[10px] text-slate-300"
+                      >
+                        {att.uploading ? (
+                          <RefreshCw className="w-3 h-3 text-sky-400 animate-spin" />
+                        ) : (
+                          <Paperclip className="w-3 h-3 text-sky-400" />
+                        )}
+                        <span className="truncate max-w-[120px]">{att.name}</span>
+                        {att.sizeBytes && (
+                          <span className="text-[9px] text-slate-500 font-mono">
+                            ({formatAttachmentSize(att.sizeBytes)})
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => removeNewTaskAttachment(att.localId)}
+                          className="text-slate-500 hover:text-rose-400 p-0.5 rounded cursor-pointer"
+                          title="Remove file"
+                          data-testid={`remove-new-task-att-${att.localId}`}
+                        >
+                          <X className="w-2.5 h-2.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </form>
+            )}
           </div>
         )}
       </div>

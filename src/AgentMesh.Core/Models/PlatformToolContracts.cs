@@ -1,4 +1,4 @@
-﻿namespace AgentMesh.Core.Models;
+namespace AgentMesh.Core.Models;
 
 /// <summary>
 /// Typed contracts behind the platform communication and PR tools
@@ -29,11 +29,39 @@ public record PostJobMessageArgs(
     bool RequiresReply
 );
 
+public record ChecklistTaskItem(
+    string Title,
+    string? TargetFile = null,
+    string? VerificationMethod = null
+);
+
 public record ManageTaskArgs(
     string Action,
+    IReadOnlyList<ChecklistTaskItem>? Tasks = null,
     string? TaskId = null,
     string? Status = null,
+    string? ProgressNote = null,
     string? Notes = null
+)
+{
+    public ManageTaskArgs(string action, string? taskId = null, string? status = null, string? notes = null)
+        : this(action, null, taskId, status, notes, notes)
+    {
+    }
+}
+
+public record PlanApprovedSignal(
+    string ApproverId,
+    string ApproverRole,
+    string? Comments,
+    DateTimeOffset Timestamp
+);
+
+public record JobMessageRecord(
+    string JobId,
+    string SenderId,
+    string Content,
+    DateTimeOffset Timestamp
 );
 
 public record Summary3R(

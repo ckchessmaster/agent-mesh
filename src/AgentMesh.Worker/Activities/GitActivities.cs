@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Activities;
+using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Services;
 using Microsoft.Extensions.Configuration;
@@ -52,6 +52,27 @@ public class GitActivities(
     /// </para>
     /// </remarks>
     /// <returns>A summary naming the merged PR, for the workflow's result.</returns>
+    [Activity("MergeJobPullRequest")]
+    public async Task<string> MergeJobPullRequestAsync(MergePullRequestInput input)
+    {
+        var cancellationToken = ActivityExecutionContext.HasCurrent
+            ? ActivityExecutionContext.Current.CancellationToken
+            : default;
+
+        logger.LogInformation(
+            "Merging PR for job {JobId} into target branch {Branch}",
+            input.JobId, input.TargetBranch);
+
+        var prUrl = input.PrUrl;
+        if (string.IsNullOrWhiteSpace(prUrl))
+        {
+            throw new ApplicationFailureException(
+                "Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
+        }
+
+        return await MergePullRequestAsync(prUrl);
+    }
+
     [Activity]
     public async Task<string> MergePullRequestAsync(string prUrl)
     {
