@@ -48,6 +48,23 @@ public class JobTaskDto
     /// <summary>When <see cref="Status"/> last changed, independent of <see cref="CompletedAt"/>.</summary>
     public DateTimeOffset? StatusChangedAt { get; set; }
 
+    /// <summary>
+    /// The condition that makes this item done, written when the task was created.
+    /// </summary>
+    /// <remarks>
+    /// Advisory and never parsed for control flow — the workflow parks on <see cref="Status"/>, not on
+    /// this. It exists because the prompt stack renders it into the turn-0 envelope: an agent that can
+    /// see the bar it is being held to stops guessing at scope, and the two failures this platform keeps
+    /// re-diagnosing (an agent declaring a task complete on a passing build, an agent escalating a
+    /// question the task description already answered) are both scope-guessing failures.
+    /// <para>
+    /// Additive and stored inside the <c>tasks_json</c> blob like <see cref="Status"/>, so it needs no
+    /// migration and every pre-existing payload still deserialises, with this field null. Renderers must
+    /// omit the line when it is absent rather than print an empty heading.
+    /// </para>
+    /// </remarks>
+    public string? AcceptanceCriteria { get; set; }
+
     /// <summary><see cref="Status"/> resolved against <see cref="IsCompleted"/>.</summary>
     public string EffectiveStatus => JobTaskStatus.Effective(Status, IsCompleted);
 }

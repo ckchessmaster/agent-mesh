@@ -1,5 +1,6 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Models;
 
@@ -71,6 +72,18 @@ public class PromptReceivedEvent
 
     [JsonPropertyName("prompt")]
     public string Prompt { get; set; } = string.Empty;
+
+    /// <summary>
+    /// The layered prompt stack composed by the worker, when the dispatch carried one.
+    /// </summary>
+    /// <remarks>
+    /// Null for a dispatch from an API that predates the split, or on a path with no composer (job
+    /// chat, handoff). Every adapter treats null as "use <see cref="Prompt"/> and build your own
+    /// system prompt", which is the behaviour that shipped before this field existed — so a new runner
+    /// against an old API is no worse off than it is today.
+    /// </remarks>
+    [JsonPropertyName("promptStack")]
+    public PromptStackWirePayload? PromptStack { get; set; }
 
     [JsonPropertyName("sender")]
     public string Sender { get; set; } = "operator";

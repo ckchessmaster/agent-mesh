@@ -7,6 +7,7 @@ using AgentMesh.Infrastructure.Repositories;
 using AgentMesh.Infrastructure.Services;
 using AgentMesh.Infrastructure.Storage;
 using AgentMesh.Worker.Activities;
+using AgentMesh.Worker.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -38,7 +39,7 @@ builder.Services.TryAddSingleton<IWorkspaceReconciler>(sp =>
             .CreateLogger("AgentMesh.Worker.WorkspaceReconciler")
             .LogWarning("{Message}", message)));
 
-builder.Services.TryAddScoped<ITurnContextAssembler, TurnContextAssembler>();
+builder.Services.TryAddScoped<IPromptStackBuilder, PromptStackBuilder>();
 builder.Services.TryAddScoped<IAgentTurnRunner, HttpAgentTurnRunner>();
 
 // The worker dispatches turns over HTTP to the API's dispatcher and observes them in Postgres.

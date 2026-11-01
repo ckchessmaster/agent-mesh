@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Models;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
@@ -6,6 +6,7 @@ using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Repositories;
 using AgentMesh.Tests.Helpers;
 using AgentMesh.Worker.Activities;
+using AgentMesh.Worker.Services;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -31,7 +32,7 @@ namespace AgentMesh.Tests.Workflows;
 /// into <c>StuckLoopDetected</c> while doing no work.
 /// </description></item>
 /// <item><description>
-/// <see cref="TurnContextAssembler.ResolveTurnSessionIdAsync"/> read the workflow-start value before the
+/// <see cref="PromptStackBuilder.ResolveTurnSessionIdAsync"/> read the workflow-start value before the
 /// checkpoint, pinning the sliding context window to turn 1's conversation for the life of the run —
 /// contradicting its own documented order.
 /// </description></item>
@@ -89,7 +90,7 @@ public class TurnSessionResolutionTests
         await SeedSessionAsync(db, StartSession, status: "completed");
 
         var runner = NewRunner(db);
-        var request = Request(turnSessionId: StartSession);
+        var request = Request(StartSession);
 
         var resolved = await runner.ResolveExistingSessionAsync(request, CancellationToken.None);
 
@@ -114,7 +115,7 @@ public class TurnSessionResolutionTests
 
         var runner = NewRunner(db);
 
-        var resolved = await runner.ResolveExistingSessionAsync(Request(turnSessionId: StartSession), CancellationToken.None);
+        var resolved = await runner.ResolveExistingSessionAsync(Request(StartSession), CancellationToken.None);
 
         resolved.Should().Be(StartSession);
     }
@@ -139,7 +140,7 @@ public class TurnSessionResolutionTests
         var runner = NewRunner(db);
 
         var resolved = await runner.ResolveExistingSessionAsync(
-            Request(turnSessionId: StartSession), CancellationToken.None);
+            Request(StartSession), CancellationToken.None);
 
         resolved.Should().Be(CheckpointSession,
             "the checkpoint is written mid-turn by the runner and is therefore fresher than a value " +
@@ -166,7 +167,7 @@ public class TurnSessionResolutionTests
 
         var runner = NewRunner(db);
 
-        var resolved = await runner.ResolveExistingSessionAsync(Request(turnSessionId: StartSession), CancellationToken.None);
+        var resolved = await runner.ResolveExistingSessionAsync(Request(StartSession), CancellationToken.None);
 
         resolved.Should().BeNull();
     }
@@ -186,7 +187,7 @@ public class TurnSessionResolutionTests
 
         var runner = NewRunner(db);
 
-        var resolved = await runner.ResolveExistingSessionAsync(Request(turnSessionId: StartSession), CancellationToken.None);
+        var resolved = await runner.ResolveExistingSessionAsync(Request(StartSession), CancellationToken.None);
 
         resolved.Should().BeNull(
             "a closed session in the checkpoint means the last turn finished; falling back to the older live session " +
@@ -230,7 +231,7 @@ public class TurnSessionResolutionTests
         var runner = NewRunner(db);
 
         var resolved = await runner.ResolveExistingSessionAsync(
-            Request(turnSessionId: null) with { TurnSessionId = rawTurnSessionId }, CancellationToken.None);
+            Request(null) with { TurnSessionId = rawTurnSessionId }, CancellationToken.None);
 
         resolved.Should().BeNull();
     }
@@ -260,7 +261,7 @@ public class TurnSessionResolutionTests
 
         var runner = NewRunner(db);
 
-        var resolved = await runner.ResolveExistingSessionAsync(Request(turnSessionId: StartSession), CancellationToken.None);
+        var resolved = await runner.ResolveExistingSessionAsync(Request(StartSession), CancellationToken.None);
 
         resolved.Should().Be(expectAttach ? StartSession : null,
             $"'{status}' is {(expectAttach ? "in-flight, so re-attaching is correct" : "terminal, so attaching would re-observe a finished transcript")}");
@@ -292,7 +293,7 @@ public class TurnSessionResolutionTests
         var assembler = NewAssembler(db);
 
         var resolved = await assembler.ResolveTurnSessionIdAsync(
-            Input(turnSessionId: StartSession.ToString()), CancellationToken.None);
+            Context(StartSession.ToString()), await LoadedCheckpointAsync(db), CancellationToken.None);
 
         resolved.Should().Be(CheckpointSession);
     }
@@ -310,7 +311,7 @@ public class TurnSessionResolutionTests
         var assembler = NewAssembler(db);
 
         var resolved = await assembler.ResolveTurnSessionIdAsync(
-            Input(turnSessionId: StartSession.ToString()), CancellationToken.None);
+            Context(StartSession.ToString()), null, CancellationToken.None);
 
         resolved.Should().Be(StartSession);
     }
@@ -327,8 +328,7 @@ public class TurnSessionResolutionTests
 
         var assembler = NewAssembler(db);
 
-        var resolved = await assembler.ResolveTurnSessionIdAsync(
-            Input(turnSessionId: null), CancellationToken.None);
+        var resolved = await assembler.ResolveTurnSessionIdAsync(Context(null), null, CancellationToken.None);
 
         resolved.Should().Be(FreshSession);
     }
@@ -355,11 +355,15 @@ public class TurnSessionResolutionTests
 
         var assembler = NewAssembler(db);
 
-        var context = await assembler.AssembleAsync(
-            Input(turnSessionId: StartSession.ToString()), pendingReply: null);
+        var context = await assembler.BuildPromptStackAsync(
+            Context(StartSession.ToString()));
 
-        context.Prompt.Should().Contain("NEW-MARKER");
-        context.Prompt.Should().NotContain("OLD-MARKER",
+        // Asserted against the structured window rather than the flattened text: the window now
+        // travels as its own messages so the runner can emit real turns, and the envelope only states
+        // how many there were.
+        var transcript = string.Join("\n", context.History.Select(h => h.Content));
+        transcript.Should().Contain("NEW-MARKER");
+        transcript.Should().NotContain("OLD-MARKER",
             "the window must advance to the current session; pinning it to turn 1 is the defect");
     }
 
@@ -401,12 +405,12 @@ public class TurnSessionResolutionTests
             NullLogger<ExecutionActivities>.Instance,
             storageService: null,
             config: null,
-            assembler: new StubAssembler(),
+            promptStackBuilder: new StubAssembler(),
             checkpoints: checkpoints,
             turnRunner: runner,
             reconciler: new NoProbeReconciler());
 
-        await activities.RunAgentCodingTurnAsync(Input(turnSessionId: null), pendingReply: null);
+        await activities.RunAgentCodingTurnAsync(Input(null), pendingReply: null);
 
         var saved = await checkpoints.GetCheckpointAsync(JobId.ToString(), TaskId.ToString());
 
@@ -437,12 +441,12 @@ public class TurnSessionResolutionTests
             NullLogger<ExecutionActivities>.Instance,
             storageService: null,
             config: null,
-            assembler: new StubAssembler(),
+            promptStackBuilder: new StubAssembler(),
             checkpoints: checkpoints,
             turnRunner: runner,
             reconciler: new FixedReconciler("fix/macro-turns", "a1b2c3d implement macro turns"));
 
-        await activities.RunAgentCodingTurnAsync(Input(turnSessionId: null), pendingReply: null);
+        await activities.RunAgentCodingTurnAsync(Input(null), pendingReply: null);
 
         var saved = await checkpoints.GetCheckpointAsync(JobId.ToString(), TaskId.ToString());
 
@@ -472,12 +476,12 @@ public class TurnSessionResolutionTests
             NullLogger<ExecutionActivities>.Instance,
             storageService: null,
             config: null,
-            assembler: new StubAssembler(),
+            promptStackBuilder: new StubAssembler(),
             checkpoints: new ThrowingReadRepository(checkpoints),
             turnRunner: runner,
             reconciler: new FixedReconciler("fix/macro-turns", "a1b2c3d implement macro turns"));
 
-        var act = () => activities.RunAgentCodingTurnAsync(Input(turnSessionId: null), pendingReply: null);
+        var act = () => activities.RunAgentCodingTurnAsync(Input(null), pendingReply: null);
 
         await act.Should().NotThrowAsync("a failed re-read must degrade, not abort the turn");
 
@@ -498,12 +502,35 @@ public class TurnSessionResolutionTests
         new Microsoft.Extensions.Configuration.ConfigurationManager(),
         NullLogger<HttpAgentTurnRunner>.Instance);
 
-    private static TurnContextAssembler NewAssembler(AgentMeshDbContext db) => new(
+    private static PromptStackBuilder NewAssembler(AgentMeshDbContext db) => new(
         db,
         new WorkspaceStateRepository(db),
         new NoProbeReconciler(),
         null,
         null);
+
+    /// <summary>
+    /// Maps the workflow input onto a composer context.
+    /// </summary>
+    /// <remarks>
+    /// Goes through <see cref="PromptStackContext.FromTaskInput"/> rather than constructing the record
+    /// directly, so these tests exercise the same mapping production uses: a field added to
+    /// <see cref="TaskExecutionInput"/> and not mapped would fail here instead of silently vanishing.
+    /// </remarks>
+    private static PromptStackContext Context(string? turnSessionId) =>
+        PromptStackContext.FromTaskInput(Input(turnSessionId));
+
+    /// <summary>
+    /// Reads back the checkpoint the way the composer does.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="PromptStackBuilder.ResolveTurnSessionIdAsync"/> takes the checkpoint as a parameter
+    /// rather than re-reading it, because the composer already loaded it for the envelope and a second
+    /// read inside one assembly could disagree with the first. Loading it here keeps the test on the
+    /// same value production would pass.
+    /// </remarks>
+    private static async Task<TaskWorkingCheckpoint?> LoadedCheckpointAsync(AgentMeshDbContext db) =>
+        await new WorkspaceStateRepository(db).GetCheckpointAsync(JobId.ToString(), TaskId.ToString());
 
     private static TaskExecutionInput Input(string? turnSessionId) => new(
         JobId: JobId.ToString(),
@@ -517,7 +544,11 @@ public class TurnSessionResolutionTests
 
     private static AgentTurnRequest Request(Guid? turnSessionId) => new(
         Input: Input(turnSessionId?.ToString("D")),
-        Prompt: "do the thing",
+        Stack: new AssembledPromptStack(
+            CachedSystemPrompt: "[LAYER 1: PLATFORM INVARIANTS] stub prefix",
+            UserTaskEnvelope: "[TASK ENVELOPE & WORKING ENVIRONMENT] do the thing",
+            History: Array.Empty<TurnHistoryMessage>(),
+            WorkspacePath: "/workspace/repos/agent-mesh"),
         WorkspacePath: "/workspace/repos/agent-mesh",
         PersonaId: "rook",
         AgentId: "driver-rook",
@@ -626,16 +657,17 @@ public class TurnSessionResolutionTests
         }
     }
 
-    /// <summary>An assembler that supplies a prompt without touching the database.</summary>
-    private sealed class StubAssembler : ITurnContextAssembler
+    /// <summary>A composer that supplies a stack without touching the database.</summary>
+    private sealed class StubAssembler : IPromptStackBuilder
     {
-        public Task<AssembledTurnContext> AssembleAsync(
-            TaskExecutionInput input,
-            ChatMessageSignal? pendingReply = null,
+        public Task<AssembledPromptStack> BuildPromptStackAsync(
+            PromptStackContext context,
             CancellationToken ct = default) =>
-            Task.FromResult(new AssembledTurnContext(
-                Prompt: "[TASK ENVELOPE] stub prompt",
-                WorkspacePath: input.WorkspacePath,
+            Task.FromResult(new AssembledPromptStack(
+                CachedSystemPrompt: "[LAYER 1: PLATFORM INVARIANTS] stub prefix",
+                UserTaskEnvelope: "[TASK ENVELOPE & WORKING ENVIRONMENT] stub prompt",
+                History: Array.Empty<TurnHistoryMessage>(),
+                WorkspacePath: context.WorkspacePath,
                 EnvironmentNote: null,
                 // Deliberately null: this is the pre-turn snapshot, and on turn 1 there is nothing to
                 // snapshot. A non-null value here would mask the clobber.

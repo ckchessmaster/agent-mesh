@@ -3,6 +3,7 @@ using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
+using AgentMesh.Worker.Services;
 using Temporalio.Activities;
 using Temporalio.Exceptions;
 
@@ -78,13 +79,16 @@ public partial class ExecutionActivities
         // Outside the runner's try/catch below: if assembly itself fails there is no turn to report
         // on, and the right answer is for the activity to fail so Temporal retries it. Returning
         // Failed would halt the task on a transient outage.
-        var context = await ResolveAssembler().AssembleAsync(input, pendingReply, cancellationToken);
+        var context = await ResolvePromptBuilder()
+            .BuildPromptStackAsync(PromptStackContext.FromTaskInput(input, pendingReply), cancellationToken);
 
         logger.LogInformation(
-            "Turn context assembled for task {TaskId}: {Chars} chars, {History} history message(s), " +
-            "{Memories} memories, environment note {NoteState}, checkpoint {CheckpointState}",
+            "Prompt stack composed for task {TaskId}: {Cached} cached chars, {Envelope} envelope " +
+            "chars, {History} history message(s), {Memories} memories, environment note {NoteState}, " +
+            "checkpoint {CheckpointState}",
             input.TaskId,
-            context.Prompt.Length,
+            context.CachedSystemPrompt.Length,
+            context.UserTaskEnvelope.Length,
             context.HistoryMessageCount,
             context.MemoryCount,
             context.EnvironmentNote is null ? "omitted" : "present",
@@ -92,7 +96,7 @@ public partial class ExecutionActivities
 
         var request = new AgentTurnRequest(
             Input: input,
-            Prompt: context.Prompt,
+            Stack: context,
             WorkspacePath: context.WorkspacePath,
             PersonaId: input.PersonaId,
             AgentId: input.AgentId,
@@ -145,7 +149,7 @@ public partial class ExecutionActivities
     /// <remarks>
     /// <para>
     /// <strong>Why the branch and file list come from a fresh probe rather than from
-    /// <see cref="AssembledTurnContext.EnvironmentNote"/>.</strong> The note was taken <em>before</em>
+    /// <see cref="AssembledPromptStack.EnvironmentNote"/>.</strong> The note was taken <em>before</em>
     /// the turn ran. After a turn that edited files and committed them, the pre-turn state is not
     /// merely stale, it is actively wrong: it would report the files the agent just committed as still
     /// uncommitted, and the next turn would open with a warning not to reset work that is already safe.
@@ -159,7 +163,7 @@ public partial class ExecutionActivities
     /// </remarks>
     private async Task WriteCheckpointAsync(
         TaskExecutionInput input,
-        AssembledTurnContext context,
+        AssembledPromptStack context,
         TurnOutcome outcome,
         CancellationToken ct)
     {
@@ -268,7 +272,7 @@ public partial class ExecutionActivities
     /// the marker says what was dropped, rather than in the repository where it would be an ellipsis
     /// with no explanation.
     /// </remarks>
-    internal static string BuildSummary(TurnOutcome outcome, AssembledTurnContext context)
+    internal static string BuildSummary(TurnOutcome outcome, AssembledPromptStack context)
     {
         var parts = new List<string>();
 
@@ -312,11 +316,11 @@ public partial class ExecutionActivities
     // an agent that is simply not making progress.
     // ──────────────────────────────────────────────────────────────────────────────
 
-    private ITurnContextAssembler ResolveAssembler() =>
-        assembler ?? throw new InvalidOperationException(
-            $"No {nameof(ITurnContextAssembler)} is registered on this worker, so a macro turn has no " +
+    private IPromptStackBuilder ResolvePromptBuilder() =>
+        promptStackBuilder ?? throw new InvalidOperationException(
+            $"No {nameof(IPromptStackBuilder)} is registered on this worker, so a macro turn has no " +
             "prompt to dispatch. Register the worker's database (connection string 'agentdb') so " +
-            $"{nameof(TurnContextAssembler)} can be resolved.");
+            $"{nameof(PromptStackBuilder)} can be resolved.");
 
     private IAgentTurnRunner ResolveTurnRunner() =>
         turnRunner ?? throw new InvalidOperationException(

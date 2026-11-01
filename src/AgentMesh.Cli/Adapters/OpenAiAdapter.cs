@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
@@ -297,16 +297,153 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return (false, null, null);
     }
 
+    /// <summary>
+    /// True when the dispatch carried a prompt stack complete enough to build a payload from.
+    /// </summary>
+    /// <remarks>
+    /// Both halves are required. A stack with a prefix but no envelope would leave the agent with
+    /// identity and conventions and nothing to do; one with an envelope but no prefix would leave it
+    /// with a task and no persona. Either is worse than falling back to the legacy single-prompt path,
+    /// which is the behaviour that shipped before this field existed.
+    /// </remarks>
+    internal static bool HasUsableStack(PromptStackWirePayload? stack) =>
+        stack is not null &&
+        !string.IsNullOrWhiteSpace(stack.CachedSystemPrompt) &&
+        !string.IsNullOrWhiteSpace(stack.UserTaskEnvelope);
+
+    /// <summary>
+    /// The first line of the turn-0 task envelope, used to recognise it after a disk round trip.
+    /// </summary>
+    /// <remarks>
+    /// Matched on the composer's own literal rather than on a marker we add, because the history list is
+    /// serialised to disk and reloaded between turns: instance identity, object tags and any
+    /// out-of-band flag are gone by then, and a content prefix is the only thing that survives the
+    /// round trip. It costs no extra bytes, which matters because it is compared against the leading
+    /// characters of a message that is already in every cached prefix.
+    /// </remarks>
+    internal const string TaskEnvelopeMarker = "[TASK ENVELOPE & WORKING ENVIRONMENT]";
+
+    /// <summary>True when this message is the turn-0 task envelope.</summary>
+    internal static bool IsTaskEnvelope(OpenAiMessage? message) =>
+        message is { Role: "user" } &&
+        message.Content != null &&
+        message.Content.StartsWith(TaskEnvelopeMarker, StringComparison.Ordinal);
+
+    /// <summary>True when this message is a model-written compaction summary.</summary>
+    internal static bool IsPinnedSummary(OpenAiMessage? message) =>
+        message is { Role: "system" } &&
+        message.Content != null &&
+        message.Content.StartsWith(SummaryMarker, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The first message compaction is allowed to prune.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Index 0 is the cached system prefix and is already skipped by the existing code. What it did
+    /// <em>not</em> skip is index 1 — which, before the split, was always a prunable conversation turn,
+    /// and which is now the task envelope.
+    /// </para>
+    /// <para>
+    /// That made the pre-existing compaction pass actively hostile to this job's purpose:
+    /// <c>CompactHistory</c> truncates messages from index 1 down to a 200–400 character snippet and
+    /// then deletes them outright, and <c>TrySummarizeOldTurnsAsync</c> issues
+    /// <c>RemoveRange(1, cutoff - 1)</c>. On a long turn — the turns where compaction actually fires —
+    /// the envelope holding the task id, the acceptance criteria, the working root and the git recovery
+    /// note would be the first casualty. The agent would then be mid-session with no task, which is the
+    /// precise "waiting for the user's question" idle loop this feature exists to eliminate, arriving
+    /// later in the session than the bug it replaced and with a cleaner-looking transcript.
+    /// </para>
+    /// <para>
+    /// Scanning forward past both the envelope and any pinned summary keeps the protection correct in
+    /// either order: the summariser inserts at index 1, which shifts an envelope that was there to
+    /// index 2.
+    /// </para>
+    /// </remarks>
+    internal static int FirstPrunableIndex(List<OpenAiMessage> history)
+    {
+        var index = 1;
+        while (index < history.Count && (IsTaskEnvelope(history[index]) || IsPinnedSummary(history[index])))
+        {
+            index++;
+        }
+
+        return index;
+    }
+
+    /// <summary>
+    /// Repairs a payload that would end on a system message, returning how many messages moved.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The strict boundary rule: the final message before generation must be <c>user</c> or
+    /// <c>tool</c>. An instruction-tuned model that reads a system message last concludes that
+    /// environment setup has <em>just</em> completed and that nobody has asked it anything yet, so it
+    /// replies that it is waiting for instructions and the turn burns itself doing nothing.
+    /// </para>
+    /// <para>
+    /// Repairing rather than throwing is deliberate. A trailing system message is a defect in the
+    /// payload, not in the task: failing the turn converts a malformed prompt into a halted workflow
+    /// and a retried agent, while the model never got a chance to do the work it was given. Merging the
+    /// stray text into the leading system prefix keeps every byte of the instruction, keeps it in the
+    /// position a system instruction belongs, and leaves the array ending on a real turn.
+    /// </para>
+    /// <para>
+    /// Appending to the end of <c>history[0]</c> is also the cheapest place for the cache to put it: a
+    /// prefix cache matches on leading tokens, so the whole of layers 1–5 still hits and only the
+    /// appended text misses. Relocating the message to the front of the array, or promoting it to its
+    /// own second system message, would diverge earlier and cost more.
+    /// </para>
+    /// <para>
+    /// The count is returned so the caller can log it. Silently relocating would hide the producer that
+    /// appended the message in the first place, and the whole point of the guard is to make that
+    /// producer findable.
+    /// </para>
+    /// </remarks>
+    internal static int SanitizeMessageOrder(List<OpenAiMessage> history)
+    {
+        var relocated = 0;
+
+        // Loop rather than a single pass: two appended system messages would otherwise leave the second
+        // one trailing after the first is moved, and the rule is about the last message, not about how
+        // many were wrong.
+        while (history.Count > 1 && history[^1].Role == "system")
+        {
+            var stray = history[^1];
+            history.RemoveAt(history.Count - 1);
+
+            if (history[0].Role == "system")
+            {
+                history[0].Content = string.IsNullOrEmpty(history[0].Content)
+                    ? stray.Content
+                    : history[0].Content + "\n\n" + stray.Content;
+            }
+            else
+            {
+                history.Insert(0, stray);
+            }
+
+            relocated++;
+        }
+
+        return relocated;
+    }
+
     public static bool CompactHistory(List<OpenAiMessage> history, int targetMaxTokens, bool forceAggressive = false)
     {
         if (history.Count <= 1) return false;
 
         var modified = false;
         var protectedTailCount = forceAggressive ? 2 : 4;
-        var cutoff = Math.Max(1, history.Count - protectedTailCount);
+
+        // Everything at or before FirstPrunableIndex is pinned: the cached system prefix and, since the
+        // split, the turn-0 task envelope sitting at index 1. The tail bound is computed from that
+        // floor, so a short history cannot have its envelope swallowed by the protected tail either.
+        var floor = FirstPrunableIndex(history);
+        var cutoff = Math.Max(floor, history.Count - protectedTailCount);
 
         // Phase 1: Truncate older tool output messages
-        for (int i = 1; i < cutoff; i++)
+        for (int i = floor; i < cutoff; i++)
         {
             var msg = history[i];
             var maxLen = forceAggressive ? 200 : 400;
@@ -329,9 +466,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         if (EstimateTotalTokens(history) <= targetMaxTokens && modified && !forceAggressive)
             return true;
 
-        // Phase 2: If still over limit, slide older message turns atomically
-        // Keep an existing model-written summary pinned right after the system prompt.
-        var first = history.Count > 1 && history[1].Role == "system" && history[1].Content != null && history[1].Content.StartsWith(SummaryMarker, StringComparison.Ordinal) ? 2 : 1;
+        // Phase 2: If still over limit, slide older message turns atomically.
+        // `floor` already accounts for a pinned summary and for the task envelope, both of which are
+        // re-derived above rather than re-detected here — one definition of "pinned" is the point.
+        var first = floor;
         var prunedTurns = 0;
         while (history.Count > (protectedTailCount + first) && EstimateTotalTokens(history) > targetMaxTokens)
         {
@@ -392,7 +530,15 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return modified;
     }
 
-    private const string SummaryMarker = "[Conversation Summary";
+    /// <summary>
+    /// Prefix of a model-written compaction summary pinned after the system prompt.
+    /// </summary>
+    /// <remarks>
+    /// Internal rather than private so a test can build a history in the exact shape the summariser
+    /// leaves behind. Repeating the literal in the test would make it pass against a stale copy of the
+    /// string while the real pairing silently broke.
+    /// </remarks>
+    internal const string SummaryMarker = "[Conversation Summary";
     private const int SummaryTranscriptMaxChars = 120_000;
 
     /// <summary>
@@ -412,12 +558,19 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     {
         if (history.Count <= 2) return false;
 
-        var cutoff = Math.Max(1, history.Count - protectedTailCount);
-        // Never start the kept tail on a tool message (would orphan it from its assistant tool call).
-        while (cutoff > 1 && cutoff < history.Count && history[cutoff].Role == "tool") cutoff--;
-        if (cutoff <= 1) return false;
+        // Same floor as CompactHistory: the cached prefix, the task envelope and any existing summary
+        // are all pinned. Without this, the summariser would fold the envelope into its own summary
+        // text and then delete the original — leaving the agent with a prose paraphrase of its task in
+        // place of the task id, the acceptance criteria and the working root it is supposed to use.
+        var floor = FirstPrunableIndex(history);
+        if (history.Count - floor <= protectedTailCount) return false;
 
-        var middle = history.GetRange(1, cutoff - 1);
+        var cutoff = Math.Max(floor, history.Count - protectedTailCount);
+        // Never start the kept tail on a tool message (would orphan it from its assistant tool call).
+        while (cutoff > floor && cutoff < history.Count && history[cutoff].Role == "tool") cutoff--;
+        if (cutoff <= floor) return false;
+
+        var middle = history.GetRange(floor, cutoff - floor);
 
         // Build a bounded transcript. Prior summaries come first; recent turns are favored over old ones.
         static string Clip(string? s, int max) =>
@@ -499,8 +652,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             var summary = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
             if (string.IsNullOrWhiteSpace(summary)) return false;
 
-            history.RemoveRange(1, cutoff - 1);
-            history.Insert(1, new OpenAiMessage
+            // Rebuild from `floor`, not from index 1: the pinned prefix, envelope and prior summary must
+            // survive the fold. Inserting the new summary at `floor` keeps it directly after the
+            // envelope, which is where CompactHistory expects to find it on the next pass.
+            history.RemoveRange(floor, cutoff - floor);
+            history.Insert(floor, new OpenAiMessage
             {
                 Role = "system",
                 Content = $"{SummaryMarker} — {middle.Count} earlier messages were compacted into this summary]\n{summary.Trim()}"
@@ -570,15 +726,90 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var history = SessionHistories.GetOrAdd(promptEvent.SessionId, sid => LoadHistoryFromDisk(sid) ?? new List<OpenAiMessage>());
         if (history.Count == 0)
         {
-            var systemPrompt = BuildSystemPrompt(preset, promptEvent, cwd);
+            // Two system-prompt sources, in order of authority.
+            //
+            // The composed stack wins because it is built against the database: it carries the persona
+            // row, the project manifest, the job roster, the agent's saved memories and the platform
+            // invariants, in volatility order so the leading bytes are reusable. The locally built
+            // prompt has the persona text the dispatcher happened to put on the wire and nothing else —
+            // which is why an agent resumed on a new pod forgot every convention it had been told.
+            //
+            // The local builder stays as the fallback rather than being deleted: a dispatch from an API
+            // that predates the split, or from a path with no composer (job chat, handoff), still has
+            // to produce a usable prompt, and an agent with no system message at all is worse than one
+            // with a thinner one.
+            var stack = promptEvent.PromptStack;
+            var systemPrompt = HasUsableStack(stack)
+                ? stack!.CachedSystemPrompt
+                : BuildSystemPrompt(preset, promptEvent, cwd);
+
             history.Add(new OpenAiMessage { Role = "system", Content = systemPrompt });
+
+            // Seed the sliding window the composer sent.
+            //
+            // This is not an optimisation, it is the only continuity a macro turn has. Every macro turn
+            // mints a brand-new turn session, so `history` here is empty at the start of turn 2, 3 and
+            // 4 — the agent's own previous turns are in `session_messages` under a session id this turn
+            // will never look at. Without the seed, turn N reads as turn 1 every time: the agent
+            // re-reads the file it already fixed, re-runs the test it already watched fail, and reports
+            // progress as if nothing preceded it.
+            //
+            // Seeded before the envelope is appended so the envelope stays the last user turn, which is
+            // what makes it the thing the model answers.
+            if (HasUsableStack(stack))
+            {
+                foreach (var message in stack!.History ?? Array.Empty<TurnHistoryMessage>())
+                {
+                    if (string.IsNullOrWhiteSpace(message.Content)) continue;
+
+                    // Roles are coerced to the two the window is allowed to occupy. The ordering rule is
+                    // "system first, envelope second", which means exactly one system message and it
+                    // leads the array — so a window row may not be one either.
+                    //
+                    // `tool` is never emitted by the composer: tool results are excluded from the window
+                    // precisely because the harness stores no tool_call_id, and an orphan tool message is
+                    // a 400 from every OpenAI-compatible server.
+                    //
+                    // `system` is likewise excluded upstream, as harness bookkeeping rather than
+                    // conversation. Coercing rather than dropping keeps the guard at the boundary
+                    // deterministic across composer versions: a window written by an older build that
+                    // leaked a system row still produces a legal payload here, and the text survives as
+                    // a user turn instead of vanishing from the transcript.
+                    var role = message.Role?.ToLowerInvariant() switch
+                    {
+                        "assistant" => "assistant",
+                        "user" => "user",
+                        null or "" => "user",
+                        _ => "user",
+                    };
+
+                    history.Add(new OpenAiMessage { Role = role, Content = message.Content });
+                }
+            }
+
             SaveHistoryToDisk(promptEvent.SessionId, history);
         }
 
         var attachedBlock = AgentAdapterFactory.FormatAttachedFilesBlock(promptEvent.Attachments);
+
+        // The user turn's body depends on which prompt shape arrived.
+        //
+        // With a stack, the body is Layer 6 alone. `promptEvent.Prompt` in that case is the *flattened*
+        // stack — layers 1 through 6 concatenated, because that is the shape the session row stores and
+        // the shape a pre-split binary needs — so using it here would resend layers 1–5 a second time,
+        // inside the user turn, immediately after sending them as the system message. The agent would
+        // read its own persona and project manifest twice, and the byte-for-byte duplicate would sit
+        // right where the model puts most of its attention.
+        //
+        // Without a stack, `promptEvent.Prompt` is all there is, and it goes in whole.
+        var stackForUserTurn = promptEvent.PromptStack;
+        var promptBody = HasUsableStack(stackForUserTurn)
+            ? stackForUserTurn!.UserTaskEnvelope
+            : promptEvent.Prompt;
+
         var fullUserPrompt = string.IsNullOrWhiteSpace(attachedBlock)
-            ? promptEvent.Prompt
-            : $"{attachedBlock}{promptEvent.Prompt}";
+            ? promptBody
+            : $"{attachedBlock}{promptBody}";
 
         var imageParts = new List<object>();
         if (promptEvent.Attachments != null && promptEvent.Attachments.Count > 0)
@@ -701,10 +932,39 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             {
                 ct.ThrowIfCancellationRequested();
 
+                // Strict boundary rule, enforced at the last moment before serialisation.
+                //
+                // Applied to a snapshot rather than to `history` itself: the relocation merges a stray
+                // system message into the leading prefix, and mutating the live list would compound
+                // that merge on every retry of the same request and on every tool-loop iteration. The
+                // snapshot is what gets serialised, so repairing it is what the model actually sees.
+                //
+                // Inside the loop, not before it, because `history` grows during the tool round-trips
+                // and a system message can be appended by any of them — which is exactly how the
+                // original defect reached the wire.
+                var dispatchMessages = history.Select(m => m.Clone()).ToList();
+                var relocated = SanitizeMessageOrder(dispatchMessages);
+                if (relocated > 0)
+                {
+                    // Emitted as a thought rather than swallowed: the guard's value is in making
+                    // whichever producer appended the message findable. The turn still runs — a
+                    // malformed payload is a defect in the prompt, not a reason to halt a workflow and
+                    // re-run an agent.
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = $"[@{preset.Id}] [Harness guard] Relocated {relocated} trailing " +
+                                  "system message(s) into the leading system block before dispatch. A " +
+                                  "system message at the tail makes instruction-tuned models wait for a " +
+                                  "user prompt instead of driving the task — report this as a producer " +
+                                  "defect."
+                    });
+                }
+
                 var reqBody = new Dictionary<string, object?>
                 {
                     ["model"] = effectiveModel,
-                    ["messages"] = history.Select(m => m.ToSerializableObject()).ToList(),
+                    ["messages"] = dispatchMessages.Select(m => m.ToSerializableObject()).ToList(),
                     ["stream"] = true
                 };
 
@@ -1895,6 +2155,24 @@ public class OpenAiMessage
     [JsonPropertyName("tool_calls")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<OpenAiToolCall>? ToolCalls { get; set; }
+
+    /// <summary>
+    /// Shallow copy for the dispatch snapshot.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ContentParts"/> is shared by reference rather than deep-copied: the guard only ever
+    /// rewrites <see cref="Content"/> on the copy, and the parts list is built once per multimodal turn
+    /// and never mutated afterwards. Deep-copying a base64 image payload on every retry would be the
+    /// most expensive line in the file to add for a defensive path that never runs.
+    /// </remarks>
+    public OpenAiMessage Clone() => new()
+    {
+        Role = Role,
+        Content = Content,
+        ContentParts = ContentParts,
+        ToolCallId = ToolCallId,
+        ToolCalls = ToolCalls,
+    };
 
     public object ToSerializableObject()
     {
