@@ -1,6 +1,7 @@
-﻿using System.Net.Http.Headers;
+using System.Net.Http.Headers;
 using System.Text.Json;
 using AgentMesh.Api.Services;
+using AgentMesh.Api.Tools;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
@@ -150,7 +151,7 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         var properties = root.RootElement.GetProperty("properties");
 
         properties.EnumerateObject().Select(p => p.Name)
-            .Should().BeEquivalentTo("action", "task_id", "status", "notes", "job_id");
+            .Should().BeEquivalentTo("action", "task_id", "status", "notes", "job_id", "tasks", "progress_note");
 
         root.RootElement.GetProperty("required").EnumerateArray().Select(e => e.GetString())
             .Should().Equal("action");
@@ -160,7 +161,7 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         // injected by PlatformToolSchema at tools/list time, because the handler takes them as
         // strings precisely so a bad value produces an actionable error.
         properties.GetProperty("action").GetProperty("enum").EnumerateArray().Select(e => e.GetString())
-            .Should().Equal("get_details", "set_status", "list_all");
+            .Should().Equal(PlatformToolSchema.AllActions);
 
         properties.GetProperty("status").GetProperty("enum").EnumerateArray().Select(e => e.GetString())
             .Should().Equal("todo", "in_progress", "awaiting_review", "completed");
