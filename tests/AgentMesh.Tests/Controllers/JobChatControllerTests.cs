@@ -134,7 +134,7 @@ public class JobChatControllerTests
 
         var controller = new JobChatController(
             db,
-            _mockTemporalClient.Object,
+            null,
             _mockHubContext.Object,
             NullLogger<JobChatController>.Instance
         );
@@ -182,7 +182,7 @@ public class JobChatControllerTests
 
         var controller = new JobChatController(
             db,
-            _mockTemporalClient.Object,
+            null,
             _mockHubContext.Object,
             NullLogger<JobChatController>.Instance
         );
@@ -210,5 +210,240 @@ public class JobChatControllerTests
         var forbidden = result.Should().BeOfType<ObjectResult>().Subject;
         forbidden.StatusCode.Should().Be(403);
         forbidden.Value.ToString().Should().Contain("human_only_policy");
+    }
+
+    [Fact]
+    public async Task ApprovePlan_Returns401_WhenCallerIdentityIsMissing()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Mission Critical Job",
+            ApprovalPolicy = PlanApprovalPolicy.HumanOnly,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new JobChatController(
+            db,
+            null,
+            _mockHubContext.Object,
+            NullLogger<JobChatController>.Instance
+        );
+
+        // Authenticated principal without any identity claims
+        var unidentifiableUser = new ClaimsPrincipal(new ClaimsIdentity([], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = unidentifiableUser }
+        };
+
+        var request = new ApprovePlanRequest(ApproverId: null, ApproverRole: null, Comments: "Sneaky approval");
+
+        // Act
+        var result = await controller.ApprovePlan(jobId.ToString(), request);
+
+        // Assert: 401 Unauthorized
+        var unauthorized = result.Should().BeOfType<UnauthorizedObjectResult>().Subject;
+        unauthorized.StatusCode.Should().Be(StatusCodes.Status401Unauthorized);
+    }
+
+    [Fact]
+    public async Task ApprovePlan_RejectsCallerClaimingOperatorId_WithoutOperatorRole_WhenPolicyIsHumanOnly()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Mission Critical Job",
+            ApprovalPolicy = PlanApprovalPolicy.HumanOnly,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new JobChatController(
+            db,
+            null,
+            _mockHubContext.Object,
+            NullLogger<JobChatController>.Instance
+        );
+
+        // Caller claims agent_id is "operator" but has no Operator role claim
+        var impersonatingUser = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "operator"),
+            new Claim("agent_id", "operator")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = impersonatingUser }
+        };
+
+        var request = new ApprovePlanRequest(ApproverId: "operator", ApproverRole: "operator", Comments: "I claim to be operator");
+
+        // Act
+        var result = await controller.ApprovePlan(jobId.ToString(), request);
+
+        // Assert: 403 Forbidden under HumanOnly policy (cannot claim operator role from ID alone)
+        var forbidden = result.Should().BeOfType<ObjectResult>().Subject;
+        forbidden.StatusCode.Should().Be(StatusCodes.Status403Forbidden);
+        forbidden.Value.ToString().Should().Contain("human_only_policy");
+    }
+
+    [Fact]
+    public async Task ApprovePlan_RejectsAssignedImplementer_SelfApproval()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Lead Job",
+            AssignedAgentId = "tech-lead-1",
+            ApprovalPolicy = PlanApprovalPolicy.LeadOrHuman,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new JobChatController(
+            db,
+            null,
+            _mockHubContext.Object,
+            NullLogger<JobChatController>.Instance
+        );
+
+        // Implementer is also a tech lead
+        var implementerLead = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "tech-lead-1"),
+            new Claim("agent_id", "tech-lead-1"),
+            new Claim(ClaimTypes.Role, "tech_lead")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = implementerLead }
+        };
+
+        var request = new ApprovePlanRequest(ApproverId: "tech-lead-1", Comments: "Self approval from assigned lead");
+
+        // Act
+        var result = await controller.ApprovePlan(jobId.ToString(), request);
+
+        // Assert: 403 Forbidden (implementer cannot approve their own plan)
+        var forbidden = result.Should().BeOfType<ObjectResult>().Subject;
+        forbidden.StatusCode.Should().Be(StatusCodes.Status403Forbidden);
+        forbidden.Value.ToString().Should().Contain("self_approval_not_allowed");
+    }
+
+    [Fact]
+    public async Task SubmitReview_RejectsSelfReview_WhenAuthorIsUnset_AndReviewerIsAgent()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Autonomous Job Without Explicit Author",
+            AssignedAgentId = null,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new JobChatController(
+            db,
+            null,
+            _mockHubContext.Object,
+            NullLogger<JobChatController>.Instance
+        );
+
+        // An agent attempts to review PR when author is unrecorded
+        var agentReviewer = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "any-agent"),
+            new Claim("agent_id", "any-agent")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = agentReviewer }
+        };
+
+        var request = new SubmitJobPrReviewRequest(ReviewerId: "any-agent", IsApproved: true, ReviewComments: "Agent review", PrNumber: 42);
+
+        // Act
+        var result = await controller.SubmitReview(jobId.ToString(), request);
+
+        // Assert: 403 Forbidden (unverifiable author requires operator sign-off)
+        var forbidden = result.Should().BeOfType<ObjectResult>().Subject;
+        forbidden.StatusCode.Should().Be(StatusCodes.Status403Forbidden);
+        forbidden.Value.ToString().Should().Contain("unverifiable_author");
+    }
+
+    [Fact]
+    public async Task SubmitReview_AllowsOperator_WhenAuthorIsUnset()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Autonomous Job Without Explicit Author",
+            AssignedAgentId = null,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new JobChatController(
+            db,
+            null,
+            _mockHubContext.Object,
+            NullLogger<JobChatController>.Instance
+        );
+
+        // Operator reviews PR when author is unrecorded
+        var operatorUser = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "human-operator"),
+            new Claim(ClaimTypes.Role, "Operator")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = operatorUser }
+        };
+
+        var request = new SubmitJobPrReviewRequest(ReviewerId: "human-operator", IsApproved: true, ReviewComments: "Operator approval", PrNumber: 42);
+
+        // Act
+        var result = await controller.SubmitReview(jobId.ToString(), request);
+
+        // Assert: 200 OK
+        result.Should().BeOfType<OkObjectResult>();
     }
 }

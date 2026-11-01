@@ -34,7 +34,6 @@ import {
   HelpCircle,
   Sliders,
   Activity,
-  Loader2,
   ShieldCheck
 } from 'lucide-react';
 import type { AgentSession, AskQuestionItem, JobMessage, JobTask, Persona, Project, ProjectJob, QuestionAnswerPayload, SessionAttachment } from '../types';
@@ -357,8 +356,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const isAwaitingApproval =
     !planApproved &&
     (job.lifecycleStatus === JobLifecycleStatus.AwaitingApproval ||
-     job.status === 'awaiting_approval' ||
-     job.status === 'AwaitingApproval');
+     (job.status as any) === 'awaiting_approval' ||
+     (job.status as any) === 'AwaitingApproval');
 
   const handleApprovePlan = async () => {
     setIsApprovingPlan(true);

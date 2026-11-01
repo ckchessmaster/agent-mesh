@@ -66,10 +66,8 @@ public class GitActivities(
         var prUrl = input.PrUrl;
         if (string.IsNullOrWhiteSpace(prUrl))
         {
-            var (repository, _) = await ResolveMergeContextAsync(cancellationToken);
-            prUrl = repository is not null
-                ? $"https://github.com/{repository}/pull/{input.JobId}"
-                : $"job-{input.JobId}";
+            throw new ApplicationFailureException(
+                "Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
         }
 
         return await MergePullRequestAsync(prUrl);

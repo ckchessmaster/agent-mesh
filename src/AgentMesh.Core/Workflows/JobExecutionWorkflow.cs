@@ -1,6 +1,7 @@
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
 using Temporalio.Common;
+using Temporalio.Exceptions;
 using Temporalio.Workflows;
 
 namespace AgentMesh.Core.Workflows;
@@ -13,7 +14,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
         StartToCloseTimeout = TimeSpan.FromHours(2),
         RetryPolicy = new RetryPolicy
         {
-            MaximumAttempts = 1
+            InitialInterval = TimeSpan.FromSeconds(5),
+            BackoffCoefficient = 2.0f,
+            MaximumInterval = TimeSpan.FromMinutes(1),
+            MaximumAttempts = 3,
+            NonRetryableErrorTypes = ["deliberate_halt", "invalid_input", "unauthorized"]
         }
     };
 
@@ -186,25 +191,21 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
         // 5. Final Server-Side Merge Activity (reached ONLY when prApproved == true)
         _currentHeartbeat = "Merging pull request";
-        var mergePrUrl = activePrUrl;
-        if (string.IsNullOrWhiteSpace(mergePrUrl) && _prReview?.PrNumber != null)
+        var mergePrRef = activePrUrl;
+        if (string.IsNullOrWhiteSpace(mergePrRef) && _prReview?.PrNumber != null)
         {
-            mergePrUrl = $"https://github.com/ckchessmaster/agent-mesh/pull/{_prReview.PrNumber}";
+            mergePrRef = _prReview.PrNumber.Value.ToString();
         }
 
-        string mergeSummary;
-        if (!string.IsNullOrWhiteSpace(mergePrUrl))
+        if (string.IsNullOrWhiteSpace(mergePrRef))
         {
-            mergeSummary = await Workflow.ExecuteActivityAsync(
-                (IGitActivities act) => act.MergePullRequestAsync(mergePrUrl),
-                GitActivityOptions);
+            throw new ApplicationFailureException(
+                "Merge requested without a pull request URL or number.", nonRetryable: true, errorType: "no_pr_url");
         }
-        else
-        {
-            mergeSummary = await Workflow.ExecuteActivityAsync(
-                (IGitActivities act) => act.MergeJobPullRequestAsync(new MergePullRequestInput(input.JobId, input.TargetBranch, mergePrUrl)),
-                GitActivityOptions);
-        }
+
+        var mergeSummary = await Workflow.ExecuteActivityAsync(
+            (IGitActivities act) => act.MergePullRequestAsync(mergePrRef),
+            GitActivityOptions);
 
         _currentHeartbeat = "Job completed and merged";
         return new JobExecutionResult(Success: true, Summary: mergeSummary ?? "Job completed and merged.");

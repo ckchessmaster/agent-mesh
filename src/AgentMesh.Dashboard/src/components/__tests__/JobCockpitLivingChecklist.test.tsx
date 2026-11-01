@@ -1,10 +1,9 @@
-import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { JobCockpit } from '../JobCockpit';
 import { api } from '../../services/api';
 import type { JobTask, Project, ProjectJob } from '../../types';
-import { PlanApprovalPolicy, JobLifecycleStatus } from '../../types';
+import { ProjectJobStatus, PlanApprovalPolicy, JobLifecycleStatus } from '../../types';
 
 vi.mock('../../services/api', () => ({
   api: {
@@ -15,21 +14,24 @@ vi.mock('../../services/api', () => ({
 }));
 
 describe('JobCockpit - Living Checklist & Autonomous Lifecycle Gates', () => {
-  const mockProject: Project = {
+  const mockProject = {
     id: 'proj-1',
     name: 'Agent Mesh',
-    gitRepoPath: '/workspace',
+    description: 'Autonomous mesh',
+    workspaceType: 0,
+    gitBaseBranch: 'main',
+    projectInstructions: '',
     activeBranch: 'main',
     gitStatusSummary: 'clean',
     team: [{ personaId: 'astra', personaName: 'Astra', role: 'Tech Lead', color: 'sky' }]
-  };
+  } as unknown as Project;
 
   const mockJob: ProjectJob = {
     id: 'job-autonomous-1',
     projectId: 'proj-1',
     title: 'Autonomous Feature Job',
     description: 'Implement autonomous lifecycle',
-    status: 'active',
+    status: ProjectJobStatus.Active,
     lifecycleStatus: JobLifecycleStatus.InProgress,
     approvalPolicy: PlanApprovalPolicy.LeadOrHuman,
     gitBranchName: 'feat/autonomous-lifecycle',
@@ -37,7 +39,8 @@ describe('JobCockpit - Living Checklist & Autonomous Lifecycle Gates', () => {
     progressHeartbeat: 'Configuring temporal approval gate and signals.',
     tasks: [],
     messageCount: 0,
-    activeTurnSessionId: null
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
   };
 
   const mockTasks: JobTask[] = [
@@ -89,7 +92,7 @@ describe('JobCockpit - Living Checklist & Autonomous Lifecycle Gates', () => {
   it('renders Plan Approval Action Bar during AwaitingApproval stage and triggers approvePlan API', async () => {
     const awaitingApprovalJob: ProjectJob = {
       ...mockJob,
-      status: 'awaiting_approval',
+      status: ProjectJobStatus.Active,
       lifecycleStatus: JobLifecycleStatus.AwaitingApproval,
       approvalPolicy: PlanApprovalPolicy.LeadOrHuman
     };
@@ -115,7 +118,7 @@ describe('JobCockpit - Living Checklist & Autonomous Lifecycle Gates', () => {
   it('enforces HumanOnly approval policy on Plan Approval button when user is not operator', () => {
     const humanOnlyJob: ProjectJob = {
       ...mockJob,
-      status: 'awaiting_approval',
+      status: ProjectJobStatus.Active,
       lifecycleStatus: JobLifecycleStatus.AwaitingApproval,
       approvalPolicy: PlanApprovalPolicy.HumanOnly
     };

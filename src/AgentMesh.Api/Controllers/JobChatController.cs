@@ -33,9 +33,23 @@ public class JobChatController(
     IHubContext<AgentMeshHub>? hubContext = null,
     ILogger<JobChatController>? logger = null) : ControllerBase
 {
-    private string CurrentUserId => ResolveCallerId();
+    private static readonly HashSet<string> TechLeadRoles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Tech Lead",
+        "tech_lead",
+        "TechLead",
+        "Technical Lead"
+    };
 
-    private string ResolveCallerId()
+    private static readonly HashSet<string> OperatorRoles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Operator",
+        "operator",
+        "Admin",
+        "admin"
+    };
+
+    private string? ResolveCallerId()
     {
         var claim = User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
                     ?? User?.FindFirst("AgentId")?.Value
@@ -48,32 +62,28 @@ public class JobChatController(
             return claim.Trim();
         }
 
-        return "operator";
+        return null;
     }
 
     private async Task<string> ResolveCallerRoleAsync(string callerId)
     {
         // 1. Check roles/claims on the authenticated principal
-        if (User.IsInRole("Operator") || User.IsInRole("Admin") || User.HasClaim("IsMasterKey", "true") ||
-            string.Equals(callerId, "operator", StringComparison.OrdinalIgnoreCase))
+        if (User.IsInRole("Operator") || User.IsInRole("Admin") ||
+            User.HasClaim("IsMasterKey", "true") ||
+            User.Claims.Any(c => c.Type == ClaimTypes.Role && OperatorRoles.Contains(c.Value)))
         {
             return "operator";
         }
 
         if (User.IsInRole("TechLead") || User.IsInRole("tech_lead") ||
-            User.HasClaim(ClaimTypes.Role, "tech_lead") || User.HasClaim(ClaimTypes.Role, "TechLead"))
+            User.Claims.Any(c => c.Type == ClaimTypes.Role && TechLeadRoles.Contains(c.Value)))
         {
             return "tech_lead";
         }
 
         // 2. Check persona in database to determine if they hold the tech_lead role
         var persona = await dbContext.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == callerId.ToLowerInvariant());
-        if (persona != null && (persona.Role.Contains("lead", StringComparison.OrdinalIgnoreCase) || persona.Role.Contains("tech_lead", StringComparison.OrdinalIgnoreCase)))
-        {
-            return "tech_lead";
-        }
-
-        if (string.Equals(callerId, "astra", StringComparison.OrdinalIgnoreCase))
+        if (persona != null && !string.IsNullOrWhiteSpace(persona.Role) && TechLeadRoles.Contains(persona.Role.Trim()))
         {
             return "tech_lead";
         }
@@ -109,7 +119,11 @@ public class JobChatController(
             return NotFound(new { error = $"Job '{jobId}' not found." });
         }
 
-        var senderId = CurrentUserId;
+        var senderId = ResolveCallerId();
+        if (string.IsNullOrWhiteSpace(senderId))
+        {
+            return Unauthorized(new { error = "unauthorized", message = "Caller identity claim is missing." });
+        }
 
         // 1. Record message to job_messages ledger and broadcast via SignalR group
         var messageRecord = new JobMessageRecord(jobId, senderId, request.Content, DateTimeOffset.UtcNow);
@@ -215,11 +229,25 @@ public class JobChatController(
             return NotFound(new { error = $"Job '{jobId}' not found." });
         }
 
-        var policy = agentJob?.ApprovalPolicy ?? projectJob?.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman;
+        var approverId = ResolveCallerId();
+        if (string.IsNullOrWhiteSpace(approverId))
+        {
+            return Unauthorized(new { error = "unauthorized", message = "Caller identity claim is missing." });
+        }
 
-        // Identity and Role are derived strictly from the authenticated principal
-        var approverId = CurrentUserId;
+        var policy = agentJob?.ApprovalPolicy ?? projectJob?.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman;
         var approverRole = await ResolveCallerRoleAsync(approverId);
+
+        // Self-approval guard: an implementer cannot approve their own plan
+        var implementer = (agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId)?.Trim().ToLowerInvariant();
+        if (!string.IsNullOrEmpty(implementer) && string.Equals(approverId.ToLowerInvariant(), implementer, StringComparison.OrdinalIgnoreCase))
+        {
+            return StatusCode(StatusCodes.Status403Forbidden, new
+            {
+                error = "self_approval_not_allowed",
+                message = $"'{approverId}' is the assigned implementer of this job and cannot approve its own plan."
+            });
+        }
 
         if (policy == PlanApprovalPolicy.HumanOnly && approverRole != "operator")
         {
@@ -287,11 +315,18 @@ public class JobChatController(
     }
 
     [HttpPost("{jobId}/reviews")]
+    [HttpPost("{jobId}/pr-review")]
     public async Task<IActionResult> SubmitReview(string jobId, [FromBody] SubmitJobPrReviewRequest request)
     {
         if (request is null)
         {
             return BadRequest(new { error = "Review request body is required." });
+        }
+
+        var reviewer = ResolveCallerId()?.ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(reviewer))
+        {
+            return Unauthorized(new { error = "unauthorized", message = "Caller identity claim is missing." });
         }
 
         Guid? parsedGuid = Guid.TryParse(jobId, out var g) ? g : null;
@@ -313,17 +348,41 @@ public class JobChatController(
             return NotFound(new { error = $"Job '{jobId}' not found." });
         }
 
-        // Reviewer identity is derived strictly from the authenticated principal
-        var reviewer = CurrentUserId.ToLowerInvariant();
-        var author = (agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId ?? "implementer").ToLowerInvariant();
+        var author = (agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId)?.Trim().ToLowerInvariant();
+
+        if (string.IsNullOrEmpty(author) && parsedGuid.HasValue)
+        {
+            var openPrMessage = await dbContext.JobMessages
+                .AsNoTracking()
+                .Where(m => m.JobId == parsedGuid.Value && m.SenderType == "persona" && m.SenderId != null)
+                .OrderByDescending(m => m.CreatedAt)
+                .FirstOrDefaultAsync();
+
+            if (openPrMessage != null && !string.IsNullOrWhiteSpace(openPrMessage.SenderId))
+            {
+                author = openPrMessage.SenderId.Trim().ToLowerInvariant();
+            }
+        }
+
+        var reviewerRole = await ResolveCallerRoleAsync(reviewer);
 
         // Self-review guard
-        if (string.Equals(reviewer, author, StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrEmpty(author) && string.Equals(reviewer, author, StringComparison.OrdinalIgnoreCase))
         {
             return StatusCode(StatusCodes.Status403Forbidden, new
             {
                 error = "self_review_not_allowed",
                 message = $"'{reviewer}' is the author of this pull request and cannot approve its own merge."
+            });
+        }
+
+        // If author is unrecorded and caller is not an operator, reject to enforce two-man review
+        if (string.IsNullOrEmpty(author) && reviewerRole != "operator")
+        {
+            return StatusCode(StatusCodes.Status403Forbidden, new
+            {
+                error = "unverifiable_author",
+                message = "The author of this pull request could not be determined to verify two-man review. Only an operator can approve when author is unrecorded."
             });
         }
 

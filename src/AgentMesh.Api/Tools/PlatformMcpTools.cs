@@ -517,13 +517,22 @@ public class PlatformMcpTools(
             if (workflows is not null)
             {
                 var checklistItems = args.Tasks.Select(t => new ChecklistTaskItem(t.Title, t.TargetFile, t.VerificationMethod)).ToList();
+                SignalDelivery delivery;
                 try
                 {
-                    await workflows.SendSetChecklistAsync(job.Id, checklistItems, ct);
+                    delivery = await workflows.SendSetChecklistAsync(job.Id, checklistItems, ct);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogWarning(ex, "Failed to signal workflow with checklist for job {JobId}", job.Id);
+                    logger.LogError(ex, "Failed to signal workflow with checklist for job {JobId}", job.Id);
+                    return Error("workflow_signal_failed",
+                        $"Failed to signal workflow with checklist for job {job.Id}: {ex.Message}");
+                }
+
+                if (!delivery.Delivered && delivery.Status != SignalDeliveryStatus.NoRunningWorkflow)
+                {
+                    return Error("workflow_signal_rejected",
+                        $"Checklist signal to workflow was rejected: {delivery.Detail ?? delivery.Status.ToString()}");
                 }
             }
 
@@ -567,6 +576,15 @@ public class PlatformMcpTools(
             }, JsonOptions);
         }
 
+        if (normalizedAction is PlatformToolSchema.ActionSetStatus or PlatformToolSchema.ActionUpdateTaskStatus)
+        {
+            if (IsJobInDiscoveryPhase(job, context.Context))
+            {
+                return Error("discovery_phase_read_only",
+                    "Task status updates are disabled during Stage 1 Discovery. Complete discovery using set_checklist and receive plan approval before starting implementation.");
+            }
+        }
+
         var (target, notFound) = ResolveTask(tasks, task_id, callerPersona, normalizedAction);
         if (target is null)
         {
@@ -586,12 +604,6 @@ public class PlatformMcpTools(
         }
 
         // set_status or update_task_status
-        if (context.Context.IsDiscoveryPhase)
-        {
-            return Error("discovery_phase_read_only",
-                "Task status updates are disabled during Stage 1 Discovery. Complete discovery using set_checklist and receive plan approval before starting implementation.");
-        }
-
         if (!JobTaskStatus.TryNormalize(status, out var nextStatus))
         {
             return Error("invalid_status",
@@ -743,6 +755,32 @@ public class PlatformMcpTools(
     }
 
     /// <summary>
+    /// Determines whether the job is currently in Stage 1 Discovery or Stage 2 Awaiting Plan Approval,
+    /// enforcing read-only discovery restrictions on task updates and PR creation.
+    /// </summary>
+    private static bool IsJobInDiscoveryPhase(ProjectJob job, PlatformCallContext context)
+    {
+        if (context.IsDiscoveryPhase)
+        {
+            return true;
+        }
+
+        if (string.Equals(job.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var heartbeat = job.ProgressHeartbeat ?? string.Empty;
+        if (heartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase) ||
+            heartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Enforce that a persona only moves its own work.
     /// </summary>
     /// <remarks>
@@ -874,7 +912,7 @@ public class PlatformMcpTools(
             return rejection!;
         }
 
-        if (context.Context.IsDiscoveryPhase)
+        if (IsJobInDiscoveryPhase(job, context.Context))
         {
             return Error("discovery_phase_read_only",
                 "Cannot open pull request during Stage 1 Discovery. You must first decompose the job into checklist tasks and receive plan approval.");

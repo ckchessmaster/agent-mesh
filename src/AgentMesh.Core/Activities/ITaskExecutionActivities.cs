@@ -98,5 +98,7 @@ public interface IGitActivities
 
     [Activity("MergeJobPullRequest")]
     Task<string> MergeJobPullRequestAsync(AgentMesh.Core.Workflows.MergePullRequestInput input) =>
-        MergePullRequestAsync(input.PrUrl ?? $"job-{input.JobId}");
+        !string.IsNullOrWhiteSpace(input.PrUrl)
+            ? MergePullRequestAsync(input.PrUrl)
+            : throw new Temporalio.Exceptions.ApplicationFailureException("Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
 }
