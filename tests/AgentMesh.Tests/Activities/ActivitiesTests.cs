@@ -76,4 +76,30 @@ public class ActivitiesTests
         ex.Which.NonRetryable.Should().BeTrue();
         ex.Which.ErrorType.Should().Be("no_pr_url");
     }
+
+    [Fact]
+    public void Worker_AllRegisteredActivities_HaveUniqueNames()
+    {
+        var exec = new ExecutionActivities(NullLogger<ExecutionActivities>.Instance);
+        var git = new GitActivities(
+            NullLogger<GitActivities>.Instance,
+            new Moq.Mock<AgentMesh.Infrastructure.Services.IGitHubPullRequestService>().Object,
+            new ConfigurationBuilder().Build());
+        var notif = new NotificationActivities(
+            new HttpClient(),
+            new ConfigurationBuilder().Build(),
+            NullLogger<NotificationActivities>.Instance);
+
+        var db = AgentMesh.Tests.Helpers.TestDbContextFactory.Create();
+        var dbAct = new DatabaseActivities(db, NullLogger<DatabaseActivities>.Instance);
+
+        var allDefs = new List<Temporalio.Activities.ActivityDefinition>();
+        allDefs.AddRange(Temporalio.Activities.ActivityDefinition.CreateAll(exec));
+        allDefs.AddRange(Temporalio.Activities.ActivityDefinition.CreateAll(git));
+        allDefs.AddRange(Temporalio.Activities.ActivityDefinition.CreateAll(notif));
+        allDefs.AddRange(Temporalio.Activities.ActivityDefinition.CreateAll(dbAct));
+
+        var names = allDefs.Select(d => d.Name).ToList();
+        names.Should().OnlyHaveUniqueItems();
+    }
 }

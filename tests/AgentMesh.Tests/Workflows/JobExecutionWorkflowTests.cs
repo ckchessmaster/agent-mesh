@@ -25,7 +25,7 @@ public class JobExecutionWorkflowTests
 
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity(execution.RunAgentDiscoveryTurnAsync)
-            .AddActivity(execution.RunAgentCodingTurnAsync)
+            .AddActivity(execution.RunJobCodingTurnAsync)
             .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
             .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>();
@@ -101,7 +101,7 @@ public class JobExecutionWorkflowTests
 
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity(execution.RunAgentDiscoveryTurnAsync)
-            .AddActivity(execution.RunAgentCodingTurnAsync)
+            .AddActivity(execution.RunJobCodingTurnAsync)
             .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
             .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>();
@@ -183,7 +183,7 @@ public class JobExecutionWorkflowTests
 
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity(execution.RunAgentDiscoveryTurnAsync)
-            .AddActivity(execution.RunAgentCodingTurnAsync)
+            .AddActivity(execution.RunJobCodingTurnAsync)
             .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
             .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>();
@@ -303,7 +303,7 @@ public class JobExecutionWorkflowTests
         }
 
         [Activity]
-        public Task<TurnOutcome> RunAgentCodingTurnAsync(CodingTurnInput input)
+        public Task<TurnOutcome> RunJobCodingTurnAsync(CodingTurnInput input)
         {
             CodingTurnCount++;
             CodingInputs.Add(input);

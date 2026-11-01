@@ -46,5 +46,5 @@ public interface IExecutionActivities
     Task<TurnOutcome> RunAgentDiscoveryTurnAsync(AgentMesh.Core.Workflows.DiscoveryTurnInput input);
 
     [Activity]
-    Task<TurnOutcome> RunAgentCodingTurnAsync(AgentMesh.Core.Workflows.CodingTurnInput input);
+    Task<TurnOutcome> RunJobCodingTurnAsync(AgentMesh.Core.Workflows.CodingTurnInput input);
 }

@@ -429,7 +429,7 @@ public partial class ExecutionActivities
     }
 
     [Activity]
-    public async Task<TurnOutcome> RunAgentCodingTurnAsync(CodingTurnInput input)
+    public async Task<TurnOutcome> RunJobCodingTurnAsync(CodingTurnInput input)
     {
         var cancellationToken = ActivityExecutionContext.HasCurrent
             ? ActivityExecutionContext.Current.CancellationToken
