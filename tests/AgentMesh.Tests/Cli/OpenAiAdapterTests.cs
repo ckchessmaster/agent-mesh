@@ -7,6 +7,14 @@ using FluentAssertions;
 
 namespace AgentMesh.Tests.Cli;
 
+/// <remarks>
+/// Shares the <c>OpenAiAdapterStaticSeams</c> collection with
+/// <see cref="OpenAiAdapterMessageOrderingTests"/>. Both drive the adapter through its static test
+/// seams — <c>SetHttpClientForTest</c>, <c>HistoryDirectoryPath</c> — which are process-wide. xUnit
+/// parallelises distinct classes by default, so two classes swapping the same static under test would
+/// intermittently send each other's requests to each other's stub endpoints.
+/// </remarks>
+[Collection("OpenAiAdapterStaticSeams")]
 public class OpenAiAdapterTests
 {
     [Theory]
