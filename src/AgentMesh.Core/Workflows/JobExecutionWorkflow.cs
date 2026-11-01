@@ -101,7 +101,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             ChatMessageSignal? pendingMessage = _chatInbox.Count > 0 ? _chatInbox.Dequeue() : null;
 
             var turnOutcome = await Workflow.ExecuteActivityAsync(
-                (IExecutionActivities act) => act.RunAgentCodingTurnAsync(new CodingTurnInput(
+                (IExecutionActivities act) => act.RunJobCodingTurnAsync(new CodingTurnInput(
                     input.JobId,
                     currentTask,
                     pendingMessage,
@@ -168,7 +168,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 );
 
                 var fixOutcome = await Workflow.ExecuteActivityAsync(
-                    (IExecutionActivities act) => act.RunAgentCodingTurnAsync(new CodingTurnInput(
+                    (IExecutionActivities act) => act.RunJobCodingTurnAsync(new CodingTurnInput(
                         input.JobId,
                         reviewFixTask,
                         reviewFeedback,
