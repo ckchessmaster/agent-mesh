@@ -404,32 +404,25 @@ public partial class ExecutionActivities
             JobId: input.JobId,
             TaskId: "stage-1-discovery",
             AgentId: input.AssignedAgentId,
-            ProjectId: "agent-mesh",
+            ProjectId: input.ProjectId ?? "default",
             WorkspacePath: input.WorkspacePath,
-            TargetBranch: "main",
+            TargetBranch: input.TargetBranch ?? "main",
             PersonaId: input.AssignedAgentId
         );
 
-        if (turnRunner is not null || promptStackBuilder is not null)
+        if (turnRunner is not null && promptStackBuilder is not null)
         {
-            try
-            {
-                var context = await ResolvePromptBuilder()
-                    .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, null), cancellationToken);
+            var context = await ResolvePromptBuilder()
+                .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, null), cancellationToken);
 
-                var request = new AgentTurnRequest(
-                    Input: taskInput,
-                    Stack: context,
-                    WorkspacePath: context.WorkspacePath,
-                    PersonaId: taskInput.PersonaId,
-                    AgentId: taskInput.AgentId);
+            var request = new AgentTurnRequest(
+                Input: taskInput,
+                Stack: context,
+                WorkspacePath: context.WorkspacePath,
+                PersonaId: taskInput.PersonaId,
+                AgentId: taskInput.AgentId);
 
-                return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Discovery turn execution hit runner exception; pausing for plan approval");
-            }
+            return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
         }
 
         return TurnOutcome.Awaiting("operator", "Discovery complete; checklist proposed for approval.");
@@ -448,39 +441,32 @@ public partial class ExecutionActivities
         }
 
         logger.LogInformation(
-            "Coding turn starting: job={JobId} task={TaskTitle} hasPendingMessage={HasPending}",
-            input.JobId, input.CurrentTask.Title, input.PendingMessage is not null);
+            "Coding turn starting: job={JobId} task={TaskTitle} agent={Agent} hasPendingMessage={HasPending}",
+            input.JobId, input.CurrentTask.Title, input.AssignedAgentId, input.PendingMessage is not null);
 
         var taskInput = new TaskExecutionInput(
             JobId: input.JobId,
             TaskId: input.CurrentTask.Title,
-            AgentId: "implementer",
-            ProjectId: "agent-mesh",
-            WorkspacePath: "/workspace/repos/agent-mesh",
-            TargetBranch: "main",
-            PersonaId: "implementer"
+            AgentId: input.AssignedAgentId,
+            ProjectId: input.ProjectId,
+            WorkspacePath: input.WorkspacePath,
+            TargetBranch: input.TargetBranch,
+            PersonaId: input.AssignedAgentId
         );
 
-        if (turnRunner is not null || promptStackBuilder is not null)
+        if (turnRunner is not null && promptStackBuilder is not null)
         {
-            try
-            {
-                var context = await ResolvePromptBuilder()
-                    .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, input.PendingMessage), cancellationToken);
+            var context = await ResolvePromptBuilder()
+                .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, input.PendingMessage), cancellationToken);
 
-                var request = new AgentTurnRequest(
-                    Input: taskInput,
-                    Stack: context,
-                    WorkspacePath: context.WorkspacePath,
-                    PersonaId: taskInput.PersonaId,
-                    AgentId: taskInput.AgentId);
+            var request = new AgentTurnRequest(
+                Input: taskInput,
+                Stack: context,
+                WorkspacePath: context.WorkspacePath,
+                PersonaId: taskInput.PersonaId,
+                AgentId: taskInput.AgentId);
 
-                return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Coding turn execution hit runner exception");
-            }
+            return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
         }
 
         return TurnOutcome.Completed($"Task '{input.CurrentTask.Title}' completed.");

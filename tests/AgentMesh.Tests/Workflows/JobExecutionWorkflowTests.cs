@@ -26,7 +26,8 @@ public class JobExecutionWorkflowTests
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity(execution.RunAgentDiscoveryTurnAsync)
             .AddActivity(execution.RunAgentCodingTurnAsync)
-            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>();
         workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
 
@@ -101,7 +102,8 @@ public class JobExecutionWorkflowTests
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity(execution.RunAgentDiscoveryTurnAsync)
             .AddActivity(execution.RunAgentCodingTurnAsync)
-            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>();
         workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
 
@@ -163,6 +165,105 @@ public class JobExecutionWorkflowTests
         }
     }
 
+    [Fact]
+    public async Task JobWorkflow_EndToEnd_FullLifecycle_ChatDiscoveryApprovalCodingRejectRecodeApproveMerge()
+    {
+        // End-to-end lifecycle:
+        // 1. Chat input starts workflow
+        // 2. Discovery executes and registers checklist
+        // 3. Approval gate releases
+        // 4. Tasks execute sequentially
+        // 5. PR review is rejected with feedback
+        // 6. Workflow re-enters coding turn to address feedback without merging
+        // 7. PR review is approved
+        // 8. Server-side merge succeeds
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity(execution.RunAgentDiscoveryTurnAsync)
+            .AddActivity(execution.RunAgentCodingTurnAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+            .AddWorkflow<JobExecutionWorkflow>();
+        workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "driver-implementer",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace/repos/mesh-core",
+                InitialPrompt: "Build full lifecycle end to end",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.LeadOrHuman
+            );
+
+            // Step 1: Start workflow (simulating chat trigger)
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            // Step 2: Discovery turn executes
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
+            execution.DiscoveryTurnCount.Should().Be(1);
+            execution.CodingTurnCount.Should().Be(0);
+
+            // Decompose into 3 atomic checklist tasks (simulating manage_task set_checklist)
+            var tasks = new List<ChecklistTaskItem>
+            {
+                new("1. Discovery & Models", "src/Models.cs", "dotnet test"),
+                new("2. Temporal Workflow", "src/Workflow.cs", "dotnet test"),
+                new("3. Verification Gate", "src/Gate.cs", "dotnet test")
+            };
+            await handle.SignalAsync(wf => wf.ReceiveSetChecklistAsync(tasks));
+
+            // Step 3: Approve plan as tech_lead
+            await handle.SignalAsync(wf => wf.ReceivePlanApprovalAsync(
+                new PlanApprovedSignal("astra", "tech_lead", "Plan approved. Proceed with implementation.", DateTimeOffset.UtcNow)));
+
+            // Step 4: Coding turns execute for each task
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting pull request review"));
+            execution.CodingTurnCount.Should().Be(3, "all 3 tasks must run to completion");
+            git.MergeUrls.Should().BeEmpty("merge must NOT execute while awaiting PR review");
+
+            // Step 5: Reject PR review with requested changes
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("sorren", false, "Please handle null check in router before merge.", DateTimeOffset.UtcNow, 77)));
+
+            // Step 6: Verify workflow loops back to re-code the review feedback
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting pull request review") && execution.CodingTurnCount == 4);
+            execution.CodingTurnCount.Should().Be(4, "an extra coding turn must execute to address rejected review feedback");
+            git.MergeUrls.Should().BeEmpty("rejected review MUST NEVER fall through to merge");
+
+            // Verify the feedback message was passed to the fix turn
+            execution.CodingInputs.Last().PendingMessage.Should().NotBeNull();
+            execution.CodingInputs.Last().PendingMessage!.Content.Should().Contain("Please handle null check in router");
+
+            // Step 7: Now approve the revised PR
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("sorren", true, "Fix confirmed, approved for merge.", DateTimeOffset.UtcNow, 77)));
+
+            // Step 8: PR merged successfully
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+            git.MergeUrls.Should().ContainSingle();
+            git.MergeUrls[0].Should().Contain("77");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     private static async Task WaitUntilAsync(
         WorkflowHandle<JobExecutionWorkflow, JobExecutionResult> handle,
         Func<JobWorkflowState, bool> predicate,
@@ -206,7 +307,10 @@ public class JobExecutionWorkflowTests
         {
             CodingTurnCount++;
             CodingInputs.Add(input);
-            return Task.FromResult(TurnOutcome.Completed("Task completed"));
+            return Task.FromResult(TurnOutcome.Completed(
+                $"Task completed: {input.CurrentTask.Title}",
+                prUrl: "https://github.com/ckchessmaster/agent-mesh/pull/77",
+                prNumber: 77));
         }
 
         public Task<string> ExecuteSubsystemAction(string targetService, string actionVerb, string payloadJson, Guid? jobId = null) =>
@@ -225,17 +329,19 @@ public class JobExecutionWorkflowTests
     {
         public List<string> MergeUrls { get; } = [];
 
+        [Activity]
         public Task<string> MergePullRequestAsync(string prUrl)
         {
             MergeUrls.Add(prUrl);
             return Task.FromResult($"merged {prUrl}");
         }
 
-        [Activity]
-        public Task<string> MergePullRequestAsync(MergePullRequestInput input)
+        [Activity("MergeJobPullRequest")]
+        public Task<string> MergeJobPullRequestAsync(MergePullRequestInput input)
         {
-            MergeUrls.Add($"job-{input.JobId}");
-            return Task.FromResult($"merged job-{input.JobId}");
+            var url = input.PrUrl ?? $"job-{input.JobId}";
+            MergeUrls.Add(url);
+            return Task.FromResult($"merged {url}");
         }
     }
 }

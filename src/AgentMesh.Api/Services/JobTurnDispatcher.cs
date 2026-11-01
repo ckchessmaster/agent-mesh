@@ -1,4 +1,4 @@
-﻿using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -36,7 +36,8 @@ public record JobTurnRequest(
     /// behaviour, which is why this is trailing and optional.
     /// </para>
     /// </remarks>
-    PromptStackWirePayload? PromptStack = null);
+    PromptStackWirePayload? PromptStack = null,
+    string? TaskId = null);
 
 public record JobWorkspaceHydration(
     string? GitRemoteUrl,
@@ -119,6 +120,7 @@ public class JobTurnDispatcher(
         var turnMetadata = new Dictionary<string, object?>
         {
             ["jobId"] = job.Id.ToString(),
+            ["taskId"] = req.TaskId,
             ["projectId"] = project.Id,
             ["projectName"] = project.Name,
             ["workspaceType"] = project.WorkspaceType.ToString(),

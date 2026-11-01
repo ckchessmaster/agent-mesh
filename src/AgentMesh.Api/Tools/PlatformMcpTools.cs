@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Services;
@@ -513,11 +514,27 @@ public class PlatformMcpTools(
                 await db.SaveChangesAsync(ct);
             }
 
+            if (workflows is not null)
+            {
+                var checklistItems = args.Tasks.Select(t => new ChecklistTaskItem(t.Title, t.TargetFile, t.VerificationMethod)).ToList();
+                try
+                {
+                    await workflows.SendSetChecklistAsync(job.Id, checklistItems, ct);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to signal workflow with checklist for job {JobId}", job.Id);
+                }
+            }
+
             await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
+            await hubContext.Clients.Group(job.Id.ToString()).SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
             await hubContext.Clients.All.SendAsync("ChecklistUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
+            await hubContext.Clients.Group(job.Id.ToString()).SendAsync("ChecklistUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
             if (!string.IsNullOrWhiteSpace(job.ProgressHeartbeat))
             {
                 await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
+                await hubContext.Clients.Group(job.Id.ToString()).SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
             }
 
             return JsonSerializer.Serialize(new
@@ -569,6 +586,12 @@ public class PlatformMcpTools(
         }
 
         // set_status or update_task_status
+        if (context.Context.IsDiscoveryPhase)
+        {
+            return Error("discovery_phase_read_only",
+                "Task status updates are disabled during Stage 1 Discovery. Complete discovery using set_checklist and receive plan approval before starting implementation.");
+        }
+
         if (!JobTaskStatus.TryNormalize(status, out var nextStatus))
         {
             return Error("invalid_status",
@@ -849,6 +872,12 @@ public class PlatformMcpTools(
         if (job is null)
         {
             return rejection!;
+        }
+
+        if (context.Context.IsDiscoveryPhase)
+        {
+            return Error("discovery_phase_read_only",
+                "Cannot open pull request during Stage 1 Discovery. You must first decompose the job into checklist tasks and receive plan approval.");
         }
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId, ct);

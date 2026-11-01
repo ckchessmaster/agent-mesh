@@ -52,8 +52,8 @@ public class GitActivities(
     /// </para>
     /// </remarks>
     /// <returns>A summary naming the merged PR, for the workflow's result.</returns>
-    [Activity]
-    public async Task<string> MergePullRequestAsync(MergePullRequestInput input)
+    [Activity("MergeJobPullRequest")]
+    public async Task<string> MergeJobPullRequestAsync(MergePullRequestInput input)
     {
         var cancellationToken = ActivityExecutionContext.HasCurrent
             ? ActivityExecutionContext.Current.CancellationToken
@@ -63,7 +63,16 @@ public class GitActivities(
             "Merging PR for job {JobId} into target branch {Branch}",
             input.JobId, input.TargetBranch);
 
-        return $"Pull request for job {input.JobId} merged into {input.TargetBranch}.";
+        var prUrl = input.PrUrl;
+        if (string.IsNullOrWhiteSpace(prUrl))
+        {
+            var (repository, _) = await ResolveMergeContextAsync(cancellationToken);
+            prUrl = repository is not null
+                ? $"https://github.com/{repository}/pull/{input.JobId}"
+                : $"job-{input.JobId}";
+        }
+
+        return await MergePullRequestAsync(prUrl);
     }
 
     [Activity]

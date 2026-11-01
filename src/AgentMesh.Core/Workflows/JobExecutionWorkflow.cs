@@ -8,16 +8,25 @@ namespace AgentMesh.Core.Workflows;
 [Workflow]
 public class JobExecutionWorkflow : IJobExecutionWorkflow
 {
-    private static readonly ActivityOptions ActivityOptions = new()
+    private static readonly ActivityOptions TurnActivityOptions = new()
     {
         StartToCloseTimeout = TimeSpan.FromHours(2),
         RetryPolicy = new RetryPolicy
         {
-            InitialInterval = TimeSpan.FromSeconds(1),
+            MaximumAttempts = 1
+        }
+    };
+
+    private static readonly ActivityOptions GitActivityOptions = new()
+    {
+        StartToCloseTimeout = TimeSpan.FromMinutes(5),
+        RetryPolicy = new RetryPolicy
+        {
+            InitialInterval = TimeSpan.FromSeconds(2),
             BackoffCoefficient = 2.0f,
             MaximumInterval = TimeSpan.FromSeconds(30),
             MaximumAttempts = 3,
-            NonRetryableErrorTypes = ["script_exhausted", "halt"]
+            NonRetryableErrorTypes = ["merge_failed", "no_pr_url"]
         }
     };
 
@@ -29,32 +38,53 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     private string _currentHeartbeat = "Initializing job";
 
     [WorkflowRun]
-    [WorkflowMethod]
     public async Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input)
     {
         // 1. Stage 1: Discovery Turn
         _currentHeartbeat = "Exploring codebase and generating checklist";
         var discoveryOutcome = await Workflow.ExecuteActivityAsync(
-            (IExecutionActivities act) => act.RunAgentDiscoveryTurnAsync(new DiscoveryTurnInput(input.JobId, input.AssignedAgentId, input.WorkspacePath, input.InitialPrompt)),
-            ActivityOptions);
+            (IExecutionActivities act) => act.RunAgentDiscoveryTurnAsync(new DiscoveryTurnInput(
+                input.JobId,
+                input.AssignedAgentId,
+                input.WorkspacePath,
+                input.InitialPrompt,
+                input.ProjectId,
+                input.TargetBranch)),
+            TurnActivityOptions);
+
+        // Discovery turn consumed the initial prompt; clear inbox so it is not re-processed in Stage 3
+        _chatInbox.Clear();
 
         _currentHeartbeat = "Awaiting plan approval";
 
         // 2. Stage 2: Plan Approval Gate
         await Workflow.WaitConditionAsync(() =>
         {
-            if (_planApproval == null) return false;
-            return input.ApprovalPolicy switch
+            if (_tasks.Count == 0 || _planApproval == null) return false;
+            var isApproved = input.ApprovalPolicy switch
             {
-                PlanApprovalPolicy.LeadOrHuman => 
+                PlanApprovalPolicy.LeadOrHuman =>
                     _planApproval.ApproverRole is "operator" or "tech_lead",
-                PlanApprovalPolicy.HumanOnly => 
+                PlanApprovalPolicy.HumanOnly =>
                     _planApproval.ApproverRole == "operator",
                 _ => false
             };
+
+            if (!isApproved)
+            {
+                // Explicitly discard rejected approval signal so it does not linger
+                var rejectedRole = _planApproval.ApproverRole;
+                _planApproval = null;
+                _currentHeartbeat = $"Plan approval rejected: role '{rejectedRole}' is not permitted by policy {input.ApprovalPolicy}";
+                return false;
+            }
+
+            return true;
         });
 
         _currentHeartbeat = "Plan approved. Starting implementation";
+
+        string? activePrUrl = null;
 
         // 3. Stage 3: Autonomous Task Iteration Loop
         while (_currentTaskIndex < _tasks.Count)
@@ -66,8 +96,20 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             ChatMessageSignal? pendingMessage = _chatInbox.Count > 0 ? _chatInbox.Dequeue() : null;
 
             var turnOutcome = await Workflow.ExecuteActivityAsync(
-                (IExecutionActivities act) => act.RunAgentCodingTurnAsync(new CodingTurnInput(input.JobId, currentTask, pendingMessage)),
-                ActivityOptions);
+                (IExecutionActivities act) => act.RunAgentCodingTurnAsync(new CodingTurnInput(
+                    input.JobId,
+                    currentTask,
+                    pendingMessage,
+                    input.AssignedAgentId,
+                    input.ProjectId,
+                    input.WorkspacePath,
+                    input.TargetBranch)),
+                TurnActivityOptions);
+
+            if (!string.IsNullOrWhiteSpace(turnOutcome.PrUrl))
+            {
+                activePrUrl = turnOutcome.PrUrl;
+            }
 
             if (turnOutcome.Status == TurnOutcomeStatus.AwaitingInput)
             {
@@ -83,7 +125,13 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 continue;
             }
 
-            if (turnOutcome.Status == TurnOutcomeStatus.Continue || turnOutcome.Status == TurnOutcomeStatus.TaskCompleted)
+            if (turnOutcome.Status == TurnOutcomeStatus.Failed)
+            {
+                _currentHeartbeat = $"Task failed: {turnOutcome.Message ?? currentTask.Title}";
+                return new JobExecutionResult(Success: false, Summary: $"Task failed: {turnOutcome.Message}");
+            }
+
+            if (turnOutcome.Status is TurnOutcomeStatus.Continue or TurnOutcomeStatus.TaskCompleted or TurnOutcomeStatus.PrOpenedAwaitingReview)
             {
                 _currentHeartbeat = $"Completed task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
                 _currentTaskIndex++;
@@ -91,29 +139,78 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
         }
 
         // 4. Stage 4: Pull Request & Mandatory Review Gate
-        _currentHeartbeat = "Awaiting pull request review";
-        await Workflow.WaitConditionAsync(() => _prReview != null);
-
-        if (!_prReview!.IsApproved)
+        bool prApproved = false;
+        while (!prApproved)
         {
-            // Changes requested; re-enter coding turn
-            _currentHeartbeat = "Changes requested on PR; resuming coding turn";
-            _chatInbox.Enqueue(new ChatMessageSignal(_prReview.ReviewerId, _prReview.ReviewComments ?? "Changes requested", Workflow.UtcNow));
-            // Loop back to coding activities...
+            _currentHeartbeat = "Awaiting pull request review";
+            await Workflow.WaitConditionAsync(() => _prReview != null);
+
+            if (!_prReview!.IsApproved)
+            {
+                // Changes requested; re-enter coding turn
+                _currentHeartbeat = "Changes requested on PR; resuming coding turn";
+                var reviewFeedback = new ChatMessageSignal(
+                    _prReview.ReviewerId,
+                    $"Review feedback on pull request:\n{_prReview.ReviewComments ?? "Changes requested."}",
+                    Workflow.UtcNow
+                );
+                _prReview = null;
+
+                var reviewFixTask = new ChecklistTaskItem(
+                    Title: "Address PR review feedback",
+                    TargetFile: null,
+                    VerificationMethod: "dotnet test"
+                );
+
+                var fixOutcome = await Workflow.ExecuteActivityAsync(
+                    (IExecutionActivities act) => act.RunAgentCodingTurnAsync(new CodingTurnInput(
+                        input.JobId,
+                        reviewFixTask,
+                        reviewFeedback,
+                        input.AssignedAgentId,
+                        input.ProjectId,
+                        input.WorkspacePath,
+                        input.TargetBranch)),
+                    TurnActivityOptions);
+
+                if (!string.IsNullOrWhiteSpace(fixOutcome.PrUrl))
+                {
+                    activePrUrl = fixOutcome.PrUrl;
+                }
+
+                continue;
+            }
+
+            prApproved = true;
         }
 
-        // 5. Final Server-Side Merge Activity
+        // 5. Final Server-Side Merge Activity (reached ONLY when prApproved == true)
         _currentHeartbeat = "Merging pull request";
-        await Workflow.ExecuteActivityAsync(
-            (IGitActivities act) => act.MergePullRequestAsync(new MergePullRequestInput(input.JobId, input.TargetBranch)),
-            ActivityOptions);
+        var mergePrUrl = activePrUrl;
+        if (string.IsNullOrWhiteSpace(mergePrUrl) && _prReview?.PrNumber != null)
+        {
+            mergePrUrl = $"https://github.com/ckchessmaster/agent-mesh/pull/{_prReview.PrNumber}";
+        }
+
+        string mergeSummary;
+        if (!string.IsNullOrWhiteSpace(mergePrUrl))
+        {
+            mergeSummary = await Workflow.ExecuteActivityAsync(
+                (IGitActivities act) => act.MergePullRequestAsync(mergePrUrl),
+                GitActivityOptions);
+        }
+        else
+        {
+            mergeSummary = await Workflow.ExecuteActivityAsync(
+                (IGitActivities act) => act.MergeJobPullRequestAsync(new MergePullRequestInput(input.JobId, input.TargetBranch, mergePrUrl)),
+                GitActivityOptions);
+        }
 
         _currentHeartbeat = "Job completed and merged";
-        return new JobExecutionResult(Success: true, Summary: "Job completed and merged.");
+        return new JobExecutionResult(Success: true, Summary: mergeSummary ?? "Job completed and merged.");
     }
 
     [WorkflowSignal]
-    [SignalMethod]
     public Task ReceiveChatMessageAsync(ChatMessageSignal signal)
     {
         _chatInbox.Enqueue(signal);
@@ -121,7 +218,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     }
 
     [WorkflowSignal]
-    [SignalMethod]
     public Task ReceivePlanApprovalAsync(PlanApprovedSignal signal)
     {
         _planApproval = signal;
@@ -129,7 +225,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     }
 
     [WorkflowSignal]
-    [SignalMethod]
     public Task ReceivePrReviewAsync(PrReviewSignal signal)
     {
         _prReview = signal;
@@ -151,7 +246,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     }
 
     [WorkflowQuery]
-    [QueryMethod]
     public JobWorkflowState GetCurrentState() =>
         new(_currentTaskIndex, _tasks.Count, _currentHeartbeat);
 }

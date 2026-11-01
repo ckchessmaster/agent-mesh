@@ -74,10 +74,21 @@ public class AgentJobConfiguration : IEntityTypeConfiguration<AgentJob>
             .HasColumnName("progress_heartbeat")
             .HasColumnType("text");
 
-        builder.Ignore(j => j.AssignedAgentId);
-        builder.Ignore(j => j.ProjectId);
-        builder.Ignore(j => j.WorkingDirectory);
-        builder.Ignore(j => j.TargetBranch);
+        builder.Property(j => j.AssignedAgentId)
+            .HasColumnName("assigned_agent_id")
+            .HasMaxLength(64);
+
+        builder.Property(j => j.ProjectId)
+            .HasColumnName("project_id")
+            .HasMaxLength(64);
+
+        builder.Property(j => j.WorkingDirectory)
+            .HasColumnName("working_directory")
+            .HasMaxLength(512);
+
+        builder.Property(j => j.TargetBranch)
+            .HasColumnName("target_branch")
+            .HasMaxLength(128);
 
         builder.Property(j => j.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")

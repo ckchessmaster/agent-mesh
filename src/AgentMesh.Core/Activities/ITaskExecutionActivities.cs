@@ -96,7 +96,7 @@ public interface IGitActivities
     [Activity]
     Task<string> MergePullRequestAsync(string prUrl);
 
-    [Activity]
-    Task<string> MergePullRequestAsync(AgentMesh.Core.Workflows.MergePullRequestInput input) =>
-        MergePullRequestAsync($"job-{input.JobId}");
+    [Activity("MergeJobPullRequest")]
+    Task<string> MergeJobPullRequestAsync(AgentMesh.Core.Workflows.MergePullRequestInput input) =>
+        MergePullRequestAsync(input.PrUrl ?? $"job-{input.JobId}");
 }

@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Models;
+using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Data.Configurations;
 using AgentMesh.Infrastructure.Migrations;
@@ -245,7 +245,7 @@ public class AgentMemorySchemaTests
     /// <see cref="TipMigrationId"/> is the tripwire's current value, updated by whoever stacks the next
     /// migration. See <see cref="MigrationSequence_KeepsMigrationsInOrder"/>.
     /// </remarks>
-    private const string TipMigrationId = "20261030171746_AddMultiRepoPathsAndTaskCheckpoints";
+    private const string TipMigrationId = "20261101174906_AddJobFirstLifecycleSchema";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()

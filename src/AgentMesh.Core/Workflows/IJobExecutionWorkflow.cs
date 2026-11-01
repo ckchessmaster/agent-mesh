@@ -3,18 +3,6 @@ using Temporalio.Workflows;
 
 namespace AgentMesh.Core.Workflows;
 
-[AttributeUsage(AttributeTargets.Interface | AttributeTargets.Class)]
-public class WorkflowInterfaceAttribute : Attribute { }
-
-[AttributeUsage(AttributeTargets.Method)]
-public class WorkflowMethodAttribute : Attribute { }
-
-[AttributeUsage(AttributeTargets.Method)]
-public class SignalMethodAttribute : Attribute { }
-
-[AttributeUsage(AttributeTargets.Method)]
-public class QueryMethodAttribute : Attribute { }
-
 public record JobExecutionInput(
     string JobId,
     string AssignedAgentId,
@@ -29,18 +17,25 @@ public record DiscoveryTurnInput(
     string JobId,
     string AssignedAgentId,
     string WorkspacePath,
-    string InitialPrompt
+    string InitialPrompt,
+    string? ProjectId = null,
+    string? TargetBranch = null
 );
 
 public record CodingTurnInput(
     string JobId,
     ChecklistTaskItem CurrentTask,
-    ChatMessageSignal? PendingMessage
+    ChatMessageSignal? PendingMessage,
+    string AssignedAgentId,
+    string ProjectId,
+    string WorkspacePath,
+    string TargetBranch
 );
 
 public record MergePullRequestInput(
     string JobId,
-    string TargetBranch
+    string TargetBranch,
+    string? PrUrl = null
 );
 
 public record JobExecutionResult(
@@ -54,27 +49,27 @@ public record JobWorkflowState(
     string CurrentHeartbeat
 );
 
-[WorkflowInterface]
 [Workflow]
 public interface IJobExecutionWorkflow
 {
-    [WorkflowMethod]
     [WorkflowRun]
     Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input);
 
-    [SignalMethod]
     [WorkflowSignal]
     Task ReceiveChatMessageAsync(ChatMessageSignal signal);
 
-    [SignalMethod]
     [WorkflowSignal]
     Task ReceivePlanApprovalAsync(PlanApprovedSignal signal);
 
-    [SignalMethod]
     [WorkflowSignal]
     Task ReceivePrReviewAsync(PrReviewSignal signal);
 
-    [QueryMethod]
+    [WorkflowSignal]
+    Task ReceiveSetChecklistAsync(List<ChecklistTaskItem> tasks);
+
+    [WorkflowSignal]
+    Task UpdateHeartbeatAsync(string heartbeat);
+
     [WorkflowQuery]
     JobWorkflowState GetCurrentState();
 }

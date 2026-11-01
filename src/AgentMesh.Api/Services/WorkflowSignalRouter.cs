@@ -48,6 +48,15 @@ public interface IWorkflowSignalRouter
         CancellationToken ct = default);
 
     /// <summary>
+    /// Delivers the living checklist into the job execution workflow.
+    /// </summary>
+    Task<SignalDelivery> SendSetChecklistAsync(
+        Guid jobId,
+        List<AgentMesh.Core.Models.ChecklistTaskItem> tasks,
+        CancellationToken ct = default) =>
+        Task.FromResult(new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow));
+
+    /// <summary>
     /// Starts a macro task workflow for one checklist task.
     /// </summary>
     /// <remarks>
@@ -188,6 +197,38 @@ public class WorkflowSignalRouter(
     {
         ArgumentNullException.ThrowIfNull(signal);
 
+        // Check if a job-level execution workflow is running first
+        var jobWorkflowIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}" };
+        foreach (var jobWfId in jobWorkflowIds.Distinct())
+        {
+            var jobDesc = await DescribeAsync(jobWfId, ct);
+            if (jobDesc is not null && jobDesc.Status == WorkflowExecutionStatus.Running)
+            {
+                try
+                {
+                    var jobHandle = temporal.GetWorkflowHandle<IJobExecutionWorkflow>(jobWfId);
+                    await jobHandle.SignalAsync(
+                        w => w.ReceiveChatMessageAsync(signal),
+                        new WorkflowSignalOptions { Rpc = Rpc(ct) });
+
+                    logger?.LogInformation(
+                        "Signalled job execution workflow {WorkflowId} with a chat reply from {SenderId}",
+                        jobWfId, signal.SenderId);
+
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Delivered);
+                }
+                catch (RpcException ex)
+                {
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, Describe(ex));
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+                {
+                    logger?.LogWarning(ex, "Signal for {WorkflowId} was rejected", jobWfId);
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, ex.Message);
+                }
+            }
+        }
+
         var workflowId = WorkflowIdFor(jobId);
 
         // Read the live state before signalling. Two reasons, both about the human's experience:
@@ -254,6 +295,38 @@ public class WorkflowSignalRouter(
     {
         ArgumentNullException.ThrowIfNull(signal);
 
+        // Check if a job-level execution workflow is running first
+        var jobWorkflowIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}" };
+        foreach (var jobWfId in jobWorkflowIds.Distinct())
+        {
+            var jobDesc = await DescribeAsync(jobWfId, ct);
+            if (jobDesc is not null && jobDesc.Status == WorkflowExecutionStatus.Running)
+            {
+                try
+                {
+                    var jobHandle = temporal.GetWorkflowHandle<IJobExecutionWorkflow>(jobWfId);
+                    await jobHandle.SignalAsync(
+                        w => w.ReceivePrReviewAsync(signal),
+                        new WorkflowSignalOptions { Rpc = Rpc(ct) });
+
+                    logger?.LogInformation(
+                        "Signalled job execution workflow {WorkflowId} with a {Decision} review from {ReviewerId}",
+                        jobWfId, signal.IsApproved ? "approving" : "changes-requested", signal.ReviewerId);
+
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Delivered);
+                }
+                catch (RpcException ex)
+                {
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, Describe(ex));
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+                {
+                    logger?.LogWarning(ex, "Review signal for {WorkflowId} was rejected", jobWfId);
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, ex.Message);
+                }
+            }
+        }
+
         var workflowId = WorkflowIdFor(jobId);
         var description = await DescribeAsync(workflowId, ct);
 
@@ -286,6 +359,48 @@ public class WorkflowSignalRouter(
         {
             return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, Describe(ex));
         }
+    }
+
+    public async Task<SignalDelivery> SendSetChecklistAsync(
+        Guid jobId,
+        List<AgentMesh.Core.Models.ChecklistTaskItem> tasks,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(tasks);
+
+        var candidateIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}", WorkflowIdFor(jobId) };
+        foreach (var workflowId in candidateIds.Distinct())
+        {
+            var description = await DescribeAsync(workflowId, ct);
+            if (description is not null && description.Status == WorkflowExecutionStatus.Running)
+            {
+                try
+                {
+                    var handle = temporal.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId);
+                    await handle.SignalAsync(
+                        w => w.ReceiveSetChecklistAsync(tasks),
+                        new WorkflowSignalOptions { Rpc = Rpc(ct) });
+
+                    logger?.LogInformation(
+                        "Signalled workflow {WorkflowId} with living checklist ({Count} tasks)",
+                        workflowId, tasks.Count);
+
+                    return new SignalDelivery(workflowId, SignalDeliveryStatus.Delivered);
+                }
+                catch (RpcException ex)
+                {
+                    return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, Describe(ex));
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+                {
+                    logger?.LogWarning(ex, "Checklist signal for {WorkflowId} was rejected", workflowId);
+                    return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, ex.Message);
+                }
+            }
+        }
+
+        return new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow,
+            "No running workflow found for this job; checklist saved to database only.");
     }
 
     public async Task<WorkflowStartResult> StartTaskWorkflowAsync(

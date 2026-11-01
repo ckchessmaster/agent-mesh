@@ -524,6 +524,14 @@ public class PromptStackBuilder(
             sb.Append("* Job: ").Append(job.Title.Trim()).Append(" — ").Append(CollapseWhitespace(job.Description)).Append('\n');
         }
 
+        if (context.TaskId == "stage-1-discovery")
+        {
+            sb.Append("\n[STAGE 1: DISCOVERY & DECOMPOSITION]\n");
+            sb.Append("* Phase: Read-only Discovery. Inspect the codebase (grep, find, read_file, git log).\n");
+            sb.Append("* Objective: Decompose the job into 3 to 6 atomic tasks and register them with manage_task(set_checklist).\n");
+            sb.Append("* Post plan & questions via post_job_message(requires_reply: true), then conclude your turn. Do not begin implementation.\n");
+        }
+
         AppendChecklist(sb, job, context.TaskId);
 
         // The live probe, not the checkpoint: this is the section that stops a resumed agent from

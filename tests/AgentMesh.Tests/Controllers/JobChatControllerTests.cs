@@ -187,7 +187,21 @@ public class JobChatControllerTests
             NullLogger<JobChatController>.Instance
         );
 
-        var request = new ApprovePlanRequest("tech_lead", "Plan LGTM from tech lead");
+        // Tech lead attempts to approve a HumanOnly plan
+        var techLead = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "astra"),
+            new Claim("agent_id", "astra"),
+            new Claim(ClaimTypes.Role, "tech_lead")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = techLead }
+        };
+
+        // Even if client attempts to assert approverRole = "operator", role is derived from ClaimsPrincipal
+        var request = new ApprovePlanRequest(ApproverId: "astra", ApproverRole: "operator", Comments: "Plan LGTM from tech lead");
 
         // Act
         var result = await controller.ApprovePlan(jobId.ToString(), request);
@@ -195,5 +209,6 @@ public class JobChatControllerTests
         // Assert: 403 Forbidden under HumanOnly policy
         var forbidden = result.Should().BeOfType<ObjectResult>().Subject;
         forbidden.StatusCode.Should().Be(403);
+        forbidden.Value.ToString().Should().Contain("human_only_policy");
     }
 }

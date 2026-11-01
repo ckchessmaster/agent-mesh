@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -176,7 +176,8 @@ public class MacroTurnController(
             // attachments into the prompt text, and re-staging them here would duplicate them into the
             // turn session's directory under a second id.
             Attachments: null,
-            Hydration: null), ct);
+            Hydration: null,
+            TaskId: req.TaskId), ct);
 
         // The lease has to follow the task, not just the job. DispatchAsync takes the job-level lease;
         // re-acquiring on the task row here is what keeps two concurrent macro turns on two tasks of
