@@ -3,8 +3,6 @@ import {
   GitBranch,
   CheckCircle2,
   Circle,
-  Plus,
-  Trash2,
   Send,
   Sparkles,
   Bot,
@@ -29,7 +27,6 @@ import {
   Archive,
   RotateCcw,
   Clock,
-  MessageSquareQuote,
   Play,
   HelpCircle,
   Sliders,
@@ -261,15 +258,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   messages,
   personas = [],
   sessions = [],
-  allowManualTaskCreation,
   userRole = 'operator',
   onStartJob,
   onSendMessage,
-  onAddTask,
-  onToggleTask,
   onUpdateTask,
   onAssignTask,
-  onDeleteTask,
   onCompleteJob,
   onArchiveJob,
   onReopenJob,
@@ -285,11 +278,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onAnswerQuestion
 }) => {
   const [prompt, setPrompt] = useState('');
-  const [newTaskTitle, setNewTaskTitle] = useState('');
-  const [newTaskRequiresDiscussion, setNewTaskRequiresDiscussion] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [showJobSettingsModal, setShowJobSettingsModal] = useState(false);
-  const [isAddingTask, setIsAddingTask] = useState(false);
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
   const [resultSummary, setResultSummary] = useState('');
@@ -324,17 +314,12 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  // Task Attachment State
-  const [newTaskAttachments, setNewTaskAttachments] = useState<StagedJobAttachmentItem[]>([]);
-  const newTaskFileInputRef = useRef<HTMLInputElement>(null);
   const existingTaskFileInputRef = useRef<HTMLInputElement>(null);
   const [targetTaskForUpload, setTargetTaskForUpload] = useState<string | null>(null);
 
   // Assignment: which row is mid-request, and the last failure to surface inline.
   const [assigningTaskId, setAssigningTaskId] = useState<string | null>(null);
   const [assignError, setAssignError] = useState<string | null>(null);
-  const [isUploadingTaskAttachment, setIsUploadingTaskAttachment] = useState<string | null>(null);
 
   // Team Member Autocomplete Palette State
   const [mentionState, setMentionState] = useState<{
@@ -354,12 +339,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   // Question answering state
   const [submittingQuestionId, setSubmittingQuestionId] = useState<string | null>(null);
   const [answeredQuestionIds, setAnsweredQuestionIds] = useState<string[]>([]);
-
-  // Autonomous job vs manual task flow
-  const isAutonomousJob = allowManualTaskCreation !== undefined
-    ? !allowManualTaskCreation
-    : (job.approvalPolicy !== undefined || job.lifecycleStatus !== undefined || Boolean(job.progressHeartbeat));
-  const showManualAddTaskForm = !isAutonomousJob;
 
   // Plan approval state (Stage 2 Gate)
   const [isApprovingPlan, setIsApprovingPlan] = useState(false);
@@ -1026,7 +1005,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const isPending = job.status === ProjectJobStatus.Pending;
   const isCompleted = job.status === ProjectJobStatus.Completed;
   const isArchived = job.status === ProjectJobStatus.Archived;
-  const isActive = job.status === ProjectJobStatus.Active;
   const isClosed = isArchived;
   const canSend = Boolean(prompt.trim() || readyStagedAttachments.length > 0) && !hasPendingUploads && !isSending && !isClosed;
 
@@ -1077,51 +1055,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
-  const handleNewTaskFiles = async (rawFiles: FileList | File[] | null) => {
-    const incoming = Array.from(rawFiles || []);
-    if (incoming.length === 0) return;
-
-    const newItems: StagedJobAttachmentItem[] = incoming.map((f, idx) => ({
-      localId: `new-task-${Date.now()}-${idx}`,
-      file: f,
-      name: f.name,
-      sizeBytes: f.size,
-      contentType: f.type,
-      uploading: true
-    }));
-
-    setNewTaskAttachments((prev) => [...prev, ...newItems]);
-
-    try {
-      const uploaded = onUploadAttachments
-        ? await onUploadAttachments(incoming)
-        : await api.uploadJobAttachments(job.id, incoming);
-
-      setNewTaskAttachments((prev) =>
-        prev.map((item) => {
-          const match = uploaded.find((u) => u.fileName === item.name);
-          return match ? { ...item, uploading: false, uploaded: match } : item;
-        })
-      );
-    } catch (err: any) {
-      setNewTaskAttachments((prev) =>
-        prev.map((item) => {
-          const isIncoming = incoming.some((f) => f.name === item.name);
-          return isIncoming ? { ...item, uploading: false, error: err?.message || 'Upload failed' } : item;
-        })
-      );
-    }
-  };
-
-  const removeNewTaskAttachment = (localId: string) => {
-    setNewTaskAttachments((prev) => prev.filter((a) => a.localId !== localId));
-  };
-
   const handleUploadExistingTaskFiles = async (taskId: string, rawFiles: FileList | File[] | null) => {
     const incoming = Array.from(rawFiles || []);
     if (incoming.length === 0) return;
 
-    setIsUploadingTaskAttachment(taskId);
     try {
       const uploaded = await api.uploadTaskAttachments(job.id, taskId, incoming);
       if (onUpdateTask) {
@@ -1138,48 +1075,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     } catch (err: any) {
       setAttachmentError(err?.message || 'Failed to upload task attachment');
     } finally {
-      setIsUploadingTaskAttachment(null);
       setTargetTaskForUpload(null);
-    }
-  };
-
-  const handleAddTaskSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newTaskTitle.trim() || isAddingTask) return;
-    const t = newTaskTitle.trim();
-    const reqDisc = newTaskRequiresDiscussion;
-    const uploadedAttachments = newTaskAttachments
-      .map((a) => a.uploaded)
-      .filter((u): u is SessionAttachment => Boolean(u));
-
-    setNewTaskTitle('');
-    setNewTaskRequiresDiscussion(false);
-    setNewTaskAttachments([]);
-    setIsAddingTask(true);
-    try {
-      if (uploadedAttachments.length > 0) {
-        await onAddTask(t, reqDisc, uploadedAttachments);
-      } else {
-        await onAddTask(t, reqDisc);
-      }
-    } finally {
-      setIsAddingTask(false);
-    }
-  };
-
-  const handleAssignTask = async (taskId: string, rawValue: string) => {
-    if (!onAssignTask) return;
-    const personaId = rawValue ? rawValue : null;
-    setAssigningTaskId(taskId);
-    setAssignError(null);
-    try {
-      await onAssignTask(taskId, personaId);
-    } catch (err) {
-      // Keep the failure inline on the row that caused it: a silent revert looks like the
-      // click did nothing, which is how people end up clicking assign three times.
-      setAssignError(err instanceof Error ? err.message : 'Failed to assign task');
-    } finally {
-      setAssigningTaskId(null);
     }
   };
 
@@ -1470,6 +1366,43 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   </button>
                 )}
               </div>
+
+              {onArchiveJob && (
+                <div>
+                  {showArchiveConfirm ? (
+                    <div className="flex items-center gap-2 bg-slate-900 border border-amber-500/40 p-1.5 rounded-xl">
+                      <span className="text-xs text-amber-200">Archive job?</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowArchiveConfirm(false)}
+                        className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConfirmArchive}
+                        disabled={isArchiving}
+                        className="px-3 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm cursor-pointer"
+                        data-testid="cockpit-confirm-archive-btn"
+                      >
+                        {isArchiving ? 'Archiving...' : 'Confirm Archive'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowArchiveConfirm(true)}
+                      title="Archive and close this job"
+                      className="px-3.5 py-1.5 bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                      data-testid="cockpit-archive-job-btn"
+                    >
+                      <Archive className="w-3.5 h-3.5" />
+                      <span>Archive</span>
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -2149,21 +2082,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             onChange={(e) => {
               if (e.target.files && e.target.files.length > 0) {
                 void stageFiles(e.target.files);
-                e.target.value = '';
-              }
-            }}
-          />
-
-          {/* Hidden File Input for New Task Attachments */}
-          <input
-            ref={newTaskFileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            data-testid="new-task-file-input"
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) {
-                void handleNewTaskFiles(e.target.files);
                 e.target.value = '';
               }
             }}

@@ -2,7 +2,6 @@ import { render, screen, fireEvent, within, waitFor } from '@testing-library/rea
 import { describe, it, expect, vi } from 'vitest';
 import { JobCockpit, getActiveMentionQuery, resolveTargetTaskId } from '../JobCockpit';
 import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment, type AgentSession } from '../../types';
-import { api } from '../../services/api';
 
 vi.mock('../../services/api', () => ({
   api: {

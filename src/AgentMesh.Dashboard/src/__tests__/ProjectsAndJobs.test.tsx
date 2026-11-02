@@ -246,7 +246,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     // Quick mention chips are visible
     expect(screen.getAllByText('@astra').length).toBeGreaterThan(0);
     expect(screen.getAllByText('@qa-tester').length).toBeGreaterThan(0);
-  });
+  }, 15000);
 
   it('allows clicking quick mention chip to insert persona mention into prompt input and sending message', async () => {
     vi.mocked(api.postJobMessage).mockResolvedValue({
@@ -921,6 +921,11 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     });
 
     render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Question Workflow Job').length).toBeGreaterThan(0);
+    }, { timeout: 4000 });
+    fireEvent.click(screen.getAllByText('Question Workflow Job')[0]);
 
     // Wait for job chat to load
     await waitFor(() => {

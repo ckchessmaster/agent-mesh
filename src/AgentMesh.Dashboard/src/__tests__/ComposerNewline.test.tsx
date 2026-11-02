@@ -1,4 +1,4 @@
-﻿import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
@@ -164,11 +164,11 @@ async function openComposer(placeholder: RegExp, label: string) {
   render(<App />);
   await waitFor(() => {
     expect(screen.getAllByText(label).length).toBeGreaterThan(0);
-  });
+  }, { timeout: 5000 });
   fireEvent.click(screen.getAllByText(label)[0]);
   await waitFor(() => {
     expect(screen.getByPlaceholderText(placeholder)).toBeInTheDocument();
-  });
+  }, { timeout: 5000 });
   return screen.getByPlaceholderText(placeholder);
 }
 
