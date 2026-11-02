@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { X, Briefcase, Plus, AlertCircle } from 'lucide-react';
+import { X, Briefcase, Plus, AlertCircle, ShieldCheck } from 'lucide-react';
 import type { Project } from '../types';
+import { PlanApprovalPolicy } from '../types';
 
 interface NewJobModalProps {
   isOpen: boolean;
@@ -9,9 +10,10 @@ interface NewJobModalProps {
   onCreate: (req: {
     title: string;
     description?: string;
+    priority?: number;
+    approvalPolicy?: number;
     gitBranchName?: string;
     initialTasks?: string[];
-    priority?: number;
   }) => Promise<void>;
 }
 
@@ -23,9 +25,8 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
 }) => {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
-  const [gitBranch, setGitBranch] = useState('');
   const [priority, setPriority] = useState<number>(1);
-  const [tasksText, setTasksText] = useState('');
+  const [approvalPolicy, setApprovalPolicy] = useState<number>(PlanApprovalPolicy.LeadOrHuman);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -40,17 +41,11 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
     setIsSubmitting(true);
     setError(null);
     try {
-      const initialTasks = tasksText
-        .split('\n')
-        .map((t) => t.trim())
-        .filter((t) => t.length > 0);
-
       await onCreate({
         title: title.trim(),
         description: description.trim() || undefined,
-        gitBranchName: gitBranch.trim() || undefined,
-        initialTasks: initialTasks.length > 0 ? initialTasks : undefined,
-        priority
+        priority,
+        approvalPolicy
       });
       onClose();
     } catch (err: any) {
@@ -111,56 +106,45 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
               Description / Objective
             </label>
             <textarea
-              rows={2}
+              rows={3}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Brief summary of feature scope or bug to resolve..."
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition"
+              placeholder="Brief summary of feature scope or bug to resolve. The assigned implementer will autonomously explore the codebase and decompose this into tasks."
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition leading-relaxed"
             />
           </div>
 
-          {project.workspaceType === 0 && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                Git Branch Name <span className="text-slate-500 font-normal">(auto-generated if empty)</span>
+                Priority
               </label>
-              <input
-                type="text"
-                value={gitBranch}
-                onChange={(e) => setGitBranch(e.target.value)}
-                placeholder="e.g. mesh/job-auth-oauth2"
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition font-mono"
-              />
+              <select
+                value={priority}
+                onChange={(e) => setPriority(Number(e.target.value))}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
+              >
+                <option value={0}>Low</option>
+                <option value={1}>Normal</option>
+                <option value={2}>High</option>
+                <option value={3}>Urgent</option>
+              </select>
             </div>
-          )}
 
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              Priority
-            </label>
-            <select
-              value={priority}
-              onChange={(e) => setPriority(Number(e.target.value))}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
-            >
-              <option value={0}>Low</option>
-              <option value={1}>Normal</option>
-              <option value={2}>High</option>
-              <option value={3}>Urgent</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              Initial Tasks / Checklist <span className="text-slate-500 font-normal">(one per line)</span>
-            </label>
-            <textarea
-              rows={3}
-              value={tasksText}
-              onChange={(e) => setTasksText(e.target.value)}
-              placeholder={"Scaffold controller endpoints\nWrite unit test coverage\nRun security & regression check"}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition font-mono leading-relaxed"
-            />
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5 flex items-center gap-1">
+                <ShieldCheck className="w-3.5 h-3.5 text-sky-400" />
+                <span>Plan Approval Policy</span>
+              </label>
+              <select
+                value={approvalPolicy}
+                onChange={(e) => setApprovalPolicy(Number(e.target.value))}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
+              >
+                <option value={PlanApprovalPolicy.LeadOrHuman}>Lead or Human (Default)</option>
+                <option value={PlanApprovalPolicy.HumanOnly}>Human Operator Only</option>
+              </select>
+            </div>
           </div>
 
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
@@ -175,10 +159,11 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
             <button
               type="submit"
               disabled={isSubmitting}
-              className="px-5 py-2 bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-slate-950 text-xs font-bold rounded-xl shadow-md transition flex items-center gap-1.5"
+              className="px-5 py-2 bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-slate-950 text-xs font-bold rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer"
+              data-testid="create-job-submit-btn"
             >
               <Plus className="w-4 h-4" />
-              <span>{isSubmitting ? 'Creating...' : 'Start Job'}</span>
+              <span>{isSubmitting ? 'Creating...' : 'Create Job'}</span>
             </button>
           </div>
         </form>

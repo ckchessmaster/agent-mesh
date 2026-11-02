@@ -669,13 +669,18 @@ public class PromptStackBuilder(
         var tasks = ParseTasks(job.TasksJson);
         if (tasks.Count == 0) return null;
 
-        if (Guid.TryParse(taskId.Trim(), out var parsed))
+        var trimmed = taskId.Trim();
+        if (Guid.TryParse(trimmed, out var parsed))
         {
             var match = tasks.FirstOrDefault(t => t.Id == parsed);
             if (match is not null) return match;
         }
 
-        // No match by id. Returning null rather than "the first incomplete task" is deliberate: this
+        // Fall back to matching title case-insensitively
+        var matchByTitle = tasks.FirstOrDefault(t => string.Equals(t.Title?.Trim(), trimmed, StringComparison.OrdinalIgnoreCase));
+        if (matchByTitle is not null) return matchByTitle;
+
+        // No match by id or title. Returning null rather than "the first incomplete task" is deliberate: this
         // workflow was started for a specific task, and labelling a different task as its focus would
         // put the wrong acceptance criteria in front of an agent that is working on the right one.
         return null;
@@ -691,10 +696,14 @@ public class PromptStackBuilder(
         sb.Append("\nChecklist (").Append(tasks.Count(t => t.IsCompleted)).Append('/').Append(tasks.Count)
           .Append(" complete):\n");
 
+        var trimmed = taskId?.Trim() ?? string.Empty;
+        var hasGuid = Guid.TryParse(trimmed, out var parsed);
+
         for (var i = 0; i < tasks.Count; i++)
         {
             var task = tasks[i];
-            var isFocus = Guid.TryParse(taskId.Trim(), out var parsed) && task.Id == parsed;
+            var isFocus = (hasGuid && task.Id == parsed) ||
+                          (!hasGuid && string.Equals(task.Title?.Trim(), trimmed, StringComparison.OrdinalIgnoreCase));
 
             sb.Append("  ").Append(task.IsCompleted ? "[x]" : "[ ]")
               .Append(' ').Append(i + 1).Append(". ").Append(task.Title);

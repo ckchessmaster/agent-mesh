@@ -166,7 +166,8 @@ public class JobChatController(
             var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue)
             {
                 StartSignal = "ReceiveChatMessage",
-                StartSignalArgs = new object?[] { chatSignal }
+                StartSignalArgs = new object?[] { chatSignal },
+                Memo = new Dictionary<string, object> { ["personaId"] = assignedAgentId }
             };
 
             try
@@ -304,6 +305,24 @@ public class JobChatController(
         if (hubContext is not null)
         {
             await hubContext.Clients.Group(jobId).SendAsync("JobPlanApproved", new { jobId, approverId, approverRole });
+
+            var lifecycleStatus = projectJob != null ? ProjectJobsController.DeriveLifecycleStatus(projectJob) : "InProgress";
+            var currentTaskId = projectJob?.CurrentTaskId ?? agentJob?.CurrentTaskId;
+            await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+            {
+                jobId = parsedGuid ?? (Guid.TryParse(jobId, out var parsedJid) ? parsedJid : Guid.Empty),
+                progressHeartbeat = "Plan approved. Starting implementation",
+                currentTaskId = currentTaskId,
+                lifecycleStatus = lifecycleStatus
+            });
+
+            if (projectJob != null)
+            {
+                var project = await dbContext.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == projectJob.ProjectId);
+                var msgCount = await dbContext.JobMessages.CountAsync(m => m.JobId == projectJob.Id);
+                var dto = ProjectJobsController.ToDto(projectJob, project?.Name, msgCount);
+                await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+            }
         }
 
         return Ok(new { success = true, approverId, approverRole });

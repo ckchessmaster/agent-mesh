@@ -5,6 +5,7 @@ using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -12,6 +13,7 @@ using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Temporalio.Client;
 
 namespace AgentMesh.Api.Controllers;
 
@@ -30,7 +32,11 @@ public record ProjectJobDto(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     ProjectJobPriority Priority = ProjectJobPriority.Normal,
-    List<QueuedJobTurnDto>? QueuedTurns = null
+    List<QueuedJobTurnDto>? QueuedTurns = null,
+    PlanApprovalPolicy ApprovalPolicy = PlanApprovalPolicy.LeadOrHuman,
+    string? CurrentTaskId = null,
+    string? ProgressHeartbeat = null,
+    string? LifecycleStatus = null
 );
 
 public record QueuedJobTurnDto(
@@ -53,7 +59,8 @@ public record CreateProjectJobRequest(
     string? Description = null,
     string? GitBranchName = null,
     List<string>? InitialTasks = null,
-    ProjectJobPriority? Priority = null
+    ProjectJobPriority? Priority = null,
+    PlanApprovalPolicy? ApprovalPolicy = null
 );
 
 public record UpdateProjectJobRequest(
@@ -62,7 +69,8 @@ public record UpdateProjectJobRequest(
     string? GitBranchName = null,
     ProjectJobStatus? Status = null,
     string? ResultSummary = null,
-    ProjectJobPriority? Priority = null
+    ProjectJobPriority? Priority = null,
+    PlanApprovalPolicy? ApprovalPolicy = null
 );
 
 public record CreateJobTaskRequest(
@@ -236,8 +244,9 @@ public class ProjectJobsController(
             ProjectId = normId,
             Title = req.Title.Trim(),
             Description = req.Description?.Trim() ?? string.Empty,
-            Status = ProjectJobStatus.Active,
+            Status = ProjectJobStatus.Pending,
             Priority = req.Priority ?? ProjectJobPriority.Normal,
+            ApprovalPolicy = req.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman,
             GitBranchName = branch,
             S3ArchiveKey = project.WorkspaceType == WorkspaceType.S3Archive
                 ? $"projects/{normId}/jobs/{jobId}/workspace.tar.gz"
@@ -276,6 +285,7 @@ public class ProjectJobsController(
         if (!string.IsNullOrWhiteSpace(req.GitBranchName)) job.GitBranchName = req.GitBranchName.Trim();
         if (req.Status.HasValue) job.Status = req.Status.Value;
         if (req.Priority.HasValue) job.Priority = req.Priority.Value;
+        if (req.ApprovalPolicy.HasValue) job.ApprovalPolicy = req.ApprovalPolicy.Value;
         if (req.ResultSummary != null) job.ResultSummary = req.ResultSummary.Trim();
 
         job.UpdatedAt = DateTimeOffset.UtcNow;
@@ -1508,8 +1518,8 @@ public class ProjectJobsController(
         }
     }
 
-    [HttpPost("api/project-jobs/{id}/complete")]
-    public async Task<IActionResult> CompleteJob(Guid id, [FromBody] CompleteJobRequest? req = null)
+    [HttpPost("api/project-jobs/{id}/start")]
+    public async Task<IActionResult> StartJob(Guid id, [FromServices] ITemporalClient? temporalClient = null)
     {
         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
         if (job == null)
@@ -1517,7 +1527,94 @@ public class ProjectJobsController(
             return NotFound(new { error = $"Job '{id}' not found." });
         }
 
-        job.Status = ProjectJobStatus.Completed;
+        job.Status = ProjectJobStatus.Active;
+        job.CurrentTaskId = "stage-1-discovery";
+        job.ProgressHeartbeat = "Exploring codebase and generating checklist";
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+
+        if (temporalClient != null)
+        {
+            var workflowId = $"job-{id}";
+            var assignedAgentId = job.AssignedAgentId ?? project?.DefaultLeadPersonaId ?? "implementer";
+            var workspacePath = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
+                ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
+                : (project?.GetResolvedWorkingDirectory() ?? $"/workspace/repos/{job.ProjectId}");
+            var targetBranch = !string.IsNullOrWhiteSpace(job.GitBranchName) ? job.GitBranchName : "main";
+            var initialPrompt = !string.IsNullOrWhiteSpace(job.Description)
+                ? $"{job.Title}\n\n{job.Description}"
+                : job.Title;
+
+            var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue)
+            {
+                Memo = new Dictionary<string, object> { ["personaId"] = assignedAgentId }
+            };
+
+            try
+            {
+                await temporalClient.StartWorkflowAsync(
+                    (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                        JobId: id.ToString(),
+                        AssignedAgentId: assignedAgentId,
+                        ProjectId: job.ProjectId,
+                        WorkspacePath: workspacePath,
+                        InitialPrompt: initialPrompt,
+                        TargetBranch: targetBranch,
+                        ApprovalPolicy: job.ApprovalPolicy
+                    )),
+                    options
+                );
+            }
+            catch (Temporalio.Exceptions.WorkflowAlreadyStartedException)
+            {
+                // Workflow is already active
+            }
+            catch (Exception ex)
+            {
+                logger?.LogWarning(ex, "Failed to start Temporal workflow for job {JobId}", id);
+            }
+        }
+
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(dto);
+    }
+
+    [HttpPost("api/project-jobs/{id}/complete")]
+    public async Task<IActionResult> CompleteJob(
+        Guid id,
+        [FromBody] CompleteJobRequest? req = null,
+        [FromServices] ITemporalClient? temporalClient = null)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        if (temporalClient != null)
+        {
+            var workflowId = $"job-{id}";
+            try
+            {
+                var handle = temporalClient.GetWorkflowHandle(workflowId);
+                await handle.CancelAsync();
+            }
+            catch (Exception ex)
+            {
+                logger?.LogInformation(ex, "Workflow {WorkflowId} could not be cancelled or was not running.", workflowId);
+            }
+        }
+
+        job.Status = ProjectJobStatus.Archived;
         if (!string.IsNullOrWhiteSpace(req?.ResultSummary))
         {
             job.ResultSummary = req.ResultSummary.Trim();
@@ -1915,7 +2012,7 @@ public class ProjectJobsController(
         return null;
     }
 
-    private static ProjectJobDto ToDto(ProjectJob j, string? projectName, int msgCount)
+    internal static ProjectJobDto ToDto(ProjectJob j, string? projectName, int msgCount)
     {
         return new ProjectJobDto(
             j.Id,
@@ -1932,8 +2029,31 @@ public class ProjectJobsController(
             j.CreatedAt,
             j.UpdatedAt,
             j.Priority,
-            ParseQueuedTurns(j.QueuedTurnsJson)
+            ParseQueuedTurns(j.QueuedTurnsJson),
+            j.ApprovalPolicy,
+            j.CurrentTaskId,
+            j.ProgressHeartbeat,
+            DeriveLifecycleStatus(j)
         );
+    }
+
+    internal static string? DeriveLifecycleStatus(ProjectJob j)
+    {
+        if (j.Status == ProjectJobStatus.Archived) return "Completed";
+        if (j.Status == ProjectJobStatus.Pending) return null;
+        if (!string.IsNullOrEmpty(j.ProgressHeartbeat))
+        {
+            if (j.ProgressHeartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase))
+                return "AwaitingApproval";
+            if (j.ProgressHeartbeat.Contains("Awaiting pull request review", StringComparison.OrdinalIgnoreCase))
+                return "AwaitingReview";
+            if (j.ProgressHeartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase))
+                return "Planning";
+            if (j.ProgressHeartbeat.Contains("Executing task", StringComparison.OrdinalIgnoreCase) ||
+                j.ProgressHeartbeat.Contains("Plan approved", StringComparison.OrdinalIgnoreCase))
+                return "InProgress";
+        }
+        return "InProgress";
     }
 
     public static string GetAttachmentDirectory(Guid jobId)

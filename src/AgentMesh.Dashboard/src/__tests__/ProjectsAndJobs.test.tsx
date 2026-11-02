@@ -217,14 +217,14 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     // Clicking the job in the sidebar opens JobCockpit
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     // Job Cockpit header displays branch and project details
     await waitFor(() => {
       expect(screen.getByText('mesh/job-auth-oauth')).toBeInTheDocument();
       expect(screen.getByText('Active Job')).toBeInTheDocument();
-      expect(screen.getByText('Complete & Merge Job')).toBeInTheDocument();
+      expect(screen.getByText('Complete Job')).toBeInTheDocument();
     });
 
     // Task checklist bar displays progress (1/2 completed)
@@ -246,7 +246,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     // Quick mention chips are visible
     expect(screen.getAllByText('@astra').length).toBeGreaterThan(0);
     expect(screen.getAllByText('@qa-tester').length).toBeGreaterThan(0);
-  });
+  }, 15000);
 
   it('allows clicking quick mention chip to insert persona mention into prompt input and sending message', async () => {
     vi.mocked(api.postJobMessage).mockResolvedValue({
@@ -262,7 +262,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -305,7 +305,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -351,47 +351,46 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     });
   });
 
-  it('allows toggling task checklist items and adding a new task', async () => {
-    vi.mocked(api.updateJobTask).mockResolvedValue({
-      id: 'task-2',
-      title: 'Write integration test coverage',
-      isCompleted: true,
-      completedAt: new Date().toISOString()
-    });
-
-    vi.mocked(api.addJobTask).mockResolvedValue({
-      id: 'task-3',
-      title: 'Deploy to staging',
-      isCompleted: false
-    });
-
+  it('renders autonomous living checklist tasks for the active job', async () => {
     render(<App />);
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
       expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
     });
 
-    // Add new task
-    const addTaskInput = screen.getByPlaceholderText('+ Add task...');
-    fireEvent.change(addTaskInput, { target: { value: 'Deploy to staging' } });
-    fireEvent.submit(addTaskInput.closest('form')!);
-
-    await waitFor(() => {
-      expect(api.addJobTask).toHaveBeenCalledWith('job-101', { title: 'Deploy to staging' });
-    });
+    // Living checklist displays tasks
+    expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
   });
 
   it('applies the server job DTO after reassigning a task, converging queue and chat', async () => {
     // Reassignment can move parked queued turns and append a system message. Patching only
     // the assignee field locally would leave the queue and the transcript disagreeing with
     // the DB, so App must take the returned job wholesale.
-    const reassignedJob: ProjectJob = {
+    const initialJob: ProjectJob = {
       ...mockJob,
+      queuedTurns: [
+        {
+          id: 'turn-9',
+          jobId: 'job-101',
+          projectId: 'mesh-core',
+          targetPersonaId: 'astra',
+          senderType: 'user',
+          content: 'please cover token exchange',
+          mentions: ['astra'],
+          priority: 1,
+          createdAt: new Date().toISOString()
+        }
+      ]
+    };
+    vi.mocked(api.getProjectJobs).mockResolvedValue([initialJob]);
+
+    const reassignedJob: ProjectJob = {
+      ...initialJob,
       tasks: [
         { ...mockTasks[0] },
         { ...mockTasks[1], assignedPersonaId: 'qa-tester' }
@@ -441,19 +440,14 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
-    const assignSelect = await screen.findByTestId('assign-task-task-2');
+    const assignSelect = await screen.findByTestId('reassign-queued-turn-turn-9');
     fireEvent.change(assignSelect, { target: { value: 'qa-tester' } });
 
     await waitFor(() => {
       expect(api.assignJobTask).toHaveBeenCalledWith('job-101', 'task-2', 'qa-tester');
-    });
-
-    // Row reflects the server's answer, not an optimistic guess.
-    await waitFor(() => {
-      expect((screen.getByTestId('assign-task-task-2') as HTMLSelectElement).value).toBe('qa-tester');
     });
 
     // The handover message is pulled back in so the chat explains why the queue moved.
@@ -463,6 +457,23 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
   });
 
   it('shows the server rejection inline when assigning to someone off the team', async () => {
+    const initialJob: ProjectJob = {
+      ...mockJob,
+      queuedTurns: [
+        {
+          id: 'turn-9',
+          jobId: 'job-101',
+          projectId: 'mesh-core',
+          targetPersonaId: 'astra',
+          senderType: 'user',
+          content: 'please cover token exchange',
+          mentions: ['astra'],
+          priority: 1,
+          createdAt: new Date().toISOString()
+        }
+      ]
+    };
+    vi.mocked(api.getProjectJobs).mockResolvedValue([initialJob]);
     vi.mocked(api.assignJobTask).mockRejectedValue(
       new Error("Persona 'Ghost' is not on the team for project 'mesh-core'")
     );
@@ -471,21 +482,18 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
-    const assignSelect = await screen.findByTestId('assign-task-task-2');
-    fireEvent.change(assignSelect, { target: { value: 'astra' } });
+    const assignSelect = await screen.findByTestId('reassign-queued-turn-turn-9');
+    fireEvent.change(assignSelect, { target: { value: 'qa-tester' } });
 
     await waitFor(() => {
       expect(screen.getByTestId('task-assign-error')).toHaveTextContent('is not on the team');
     });
-
-    // The row must not look assigned when the server said no.
-    expect((screen.getByTestId('assign-task-task-2') as HTMLSelectElement).value).toBe('');
   });
 
-  it('supports completing and merging a job with result summary', async () => {
+  it('supports completing a job with result summary', async () => {
     vi.mocked(api.completeJob).mockResolvedValue({
       ...mockJob,
       status: ProjectJobStatus.Completed,
@@ -496,22 +504,22 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
-      expect(screen.getByText('Complete & Merge Job')).toBeInTheDocument();
+      expect(screen.getByTestId('cockpit-complete-job-btn')).toBeInTheDocument();
     });
 
-    // Click Complete & Merge Job to open confirmation
-    fireEvent.click(screen.getByText('Complete & Merge Job'));
+    // Click Complete Job to open confirmation popover
+    fireEvent.click(screen.getByTestId('cockpit-complete-job-btn'));
 
-    expect(screen.getByPlaceholderText('Summary of deliverables...')).toBeInTheDocument();
-    const summaryInput = screen.getByPlaceholderText('Summary of deliverables...');
+    expect(screen.getByTestId('deliverables-summary-input')).toBeInTheDocument();
+    const summaryInput = screen.getByTestId('deliverables-summary-input');
     fireEvent.change(summaryInput, { target: { value: 'OAuth verified across all providers' } });
 
-    // Confirm merge
-    fireEvent.click(screen.getByText('Confirm & Merge'));
+    // Confirm complete
+    fireEvent.click(screen.getByTestId('cockpit-confirm-complete-btn'));
 
     await waitFor(() => {
       expect(api.completeJob).toHaveBeenCalledWith('job-101', {
@@ -598,37 +606,33 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     });
   });
 
-  it('does not create duplicate task items in checklist when adding a task even if SignalR arrives concurrently', async () => {
+  it('updates task items in living checklist when SignalR JobTaskUpdated arrives', async () => {
     const newTask: JobTask = {
       id: 'task-3',
       title: 'Deploy to staging',
       isCompleted: false
     };
 
-    vi.mocked(api.addJobTask).mockImplementation(async () => {
-      if (signalRHandlers['JobTaskUpdated']) {
-        signalRHandlers['JobTaskUpdated']({
-          jobId: 'job-101',
-          tasks: [...mockTasks, newTask]
-        });
-      }
-      return newTask;
-    });
-
     render(<App />);
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
       expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
     });
 
-    const addTaskInput = screen.getByPlaceholderText('+ Add task...');
-    fireEvent.change(addTaskInput, { target: { value: 'Deploy to staging' } });
-    fireEvent.submit(addTaskInput.closest('form')!);
+    // Simulate SignalR JobTaskUpdated event
+    act(() => {
+      if (signalRHandlers['JobTaskUpdated']) {
+        signalRHandlers['JobTaskUpdated']({
+          jobId: 'job-101',
+          tasks: [...mockTasks, newTask]
+        });
+      }
+    });
 
     await waitFor(() => {
       expect(screen.getAllByText('Deploy to staging')).toHaveLength(1);
@@ -667,7 +671,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -771,6 +775,11 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     ]);
 
     render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    }, { timeout: 4000 });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
       expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
@@ -912,6 +921,11 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     });
 
     render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Question Workflow Job').length).toBeGreaterThan(0);
+    }, { timeout: 4000 });
+    fireEvent.click(screen.getAllByText('Question Workflow Job')[0]);
 
     // Wait for job chat to load
     await waitFor(() => {

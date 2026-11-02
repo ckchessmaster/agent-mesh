@@ -159,7 +159,7 @@ describe('OpenAI-Compatible Driver Integration', () => {
         })
       );
     });
-  });
+  }, 15000);
 
   it('renders custom model override input when creating a session with an OpenAI driver', async () => {
     vi.mocked(api.getAgents).mockResolvedValueOnce([

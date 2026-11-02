@@ -3,8 +3,6 @@ import {
   GitBranch,
   CheckCircle2,
   Circle,
-  Plus,
-  Trash2,
   Send,
   Sparkles,
   Bot,
@@ -29,7 +27,6 @@ import {
   Archive,
   RotateCcw,
   Clock,
-  MessageSquareQuote,
   Play,
   HelpCircle,
   Sliders,
@@ -220,13 +217,14 @@ interface JobCockpitProps {
   personas?: Persona[];
   allowManualTaskCreation?: boolean;
   userRole?: string;
+  onStartJob?: () => Promise<void>;
   onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
-  onAddTask: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
-  onToggleTask: (taskId: string, isCompleted: boolean) => Promise<void>;
+  onAddTask?: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
+  onToggleTask?: (taskId: string, isCompleted: boolean) => Promise<void>;
   onUpdateTask?: (taskId: string, updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }) => Promise<void>;
   /** Assign/reassign a task. Passing null clears the assignee. */
   onAssignTask?: (taskId: string, personaId: string | null) => Promise<void>;
-  onDeleteTask: (taskId: string) => Promise<void>;
+  onDeleteTask?: (taskId: string) => Promise<void>;
   onCompleteJob: (resultSummary?: string) => Promise<void>;
   onArchiveJob?: () => Promise<void>;
   onReopenJob?: () => Promise<void>;
@@ -260,14 +258,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   messages,
   personas = [],
   sessions = [],
-  allowManualTaskCreation,
   userRole = 'operator',
+  onStartJob,
   onSendMessage,
-  onAddTask,
-  onToggleTask,
   onUpdateTask,
   onAssignTask,
-  onDeleteTask,
   onCompleteJob,
   onArchiveJob,
   onReopenJob,
@@ -283,16 +278,24 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onAnswerQuestion
 }) => {
   const [prompt, setPrompt] = useState('');
-  const [newTaskTitle, setNewTaskTitle] = useState('');
-  const [newTaskRequiresDiscussion, setNewTaskRequiresDiscussion] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [showJobSettingsModal, setShowJobSettingsModal] = useState(false);
-  const [isAddingTask, setIsAddingTask] = useState(false);
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
   const [resultSummary, setResultSummary] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
   const [isArchiving, setIsArchiving] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+
+  const handleStartJob = async () => {
+    if (!onStartJob) return;
+    setIsStarting(true);
+    try {
+      await onStartJob();
+    } finally {
+      setIsStarting(false);
+    }
+  };
 
   // Task checklist presentation state
   const [isTasksExpanded, setIsTasksExpanded] = useState(() =>
@@ -311,17 +314,12 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  // Task Attachment State
-  const [newTaskAttachments, setNewTaskAttachments] = useState<StagedJobAttachmentItem[]>([]);
-  const newTaskFileInputRef = useRef<HTMLInputElement>(null);
   const existingTaskFileInputRef = useRef<HTMLInputElement>(null);
   const [targetTaskForUpload, setTargetTaskForUpload] = useState<string | null>(null);
 
   // Assignment: which row is mid-request, and the last failure to surface inline.
   const [assigningTaskId, setAssigningTaskId] = useState<string | null>(null);
   const [assignError, setAssignError] = useState<string | null>(null);
-  const [isUploadingTaskAttachment, setIsUploadingTaskAttachment] = useState<string | null>(null);
 
   // Team Member Autocomplete Palette State
   const [mentionState, setMentionState] = useState<{
@@ -342,16 +340,15 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [submittingQuestionId, setSubmittingQuestionId] = useState<string | null>(null);
   const [answeredQuestionIds, setAnsweredQuestionIds] = useState<string[]>([]);
 
-  // Autonomous job vs manual task flow
-  const isAutonomousJob = allowManualTaskCreation !== undefined
-    ? !allowManualTaskCreation
-    : (job.approvalPolicy !== undefined || job.lifecycleStatus !== undefined || Boolean(job.progressHeartbeat));
-  const showManualAddTaskForm = !isAutonomousJob;
-
   // Plan approval state (Stage 2 Gate)
   const [isApprovingPlan, setIsApprovingPlan] = useState(false);
   const [planApproved, setPlanApproved] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPlanApproved(false);
+    setApprovalError(null);
+  }, [job.id]);
 
   const isAwaitingApproval =
     !planApproved &&
@@ -1005,6 +1002,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   );
 
   const hasPendingUploads = stagedAttachments.some((a) => a.uploading);
+  const isPending = job.status === ProjectJobStatus.Pending;
   const isCompleted = job.status === ProjectJobStatus.Completed;
   const isArchived = job.status === ProjectJobStatus.Archived;
   const isClosed = isArchived;
@@ -1057,51 +1055,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
-  const handleNewTaskFiles = async (rawFiles: FileList | File[] | null) => {
-    const incoming = Array.from(rawFiles || []);
-    if (incoming.length === 0) return;
-
-    const newItems: StagedJobAttachmentItem[] = incoming.map((f, idx) => ({
-      localId: `new-task-${Date.now()}-${idx}`,
-      file: f,
-      name: f.name,
-      sizeBytes: f.size,
-      contentType: f.type,
-      uploading: true
-    }));
-
-    setNewTaskAttachments((prev) => [...prev, ...newItems]);
-
-    try {
-      const uploaded = onUploadAttachments
-        ? await onUploadAttachments(incoming)
-        : await api.uploadJobAttachments(job.id, incoming);
-
-      setNewTaskAttachments((prev) =>
-        prev.map((item) => {
-          const match = uploaded.find((u) => u.fileName === item.name);
-          return match ? { ...item, uploading: false, uploaded: match } : item;
-        })
-      );
-    } catch (err: any) {
-      setNewTaskAttachments((prev) =>
-        prev.map((item) => {
-          const isIncoming = incoming.some((f) => f.name === item.name);
-          return isIncoming ? { ...item, uploading: false, error: err?.message || 'Upload failed' } : item;
-        })
-      );
-    }
-  };
-
-  const removeNewTaskAttachment = (localId: string) => {
-    setNewTaskAttachments((prev) => prev.filter((a) => a.localId !== localId));
-  };
-
   const handleUploadExistingTaskFiles = async (taskId: string, rawFiles: FileList | File[] | null) => {
     const incoming = Array.from(rawFiles || []);
     if (incoming.length === 0) return;
 
-    setIsUploadingTaskAttachment(taskId);
     try {
       const uploaded = await api.uploadTaskAttachments(job.id, taskId, incoming);
       if (onUpdateTask) {
@@ -1118,48 +1075,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     } catch (err: any) {
       setAttachmentError(err?.message || 'Failed to upload task attachment');
     } finally {
-      setIsUploadingTaskAttachment(null);
       setTargetTaskForUpload(null);
-    }
-  };
-
-  const handleAddTaskSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newTaskTitle.trim() || isAddingTask) return;
-    const t = newTaskTitle.trim();
-    const reqDisc = newTaskRequiresDiscussion;
-    const uploadedAttachments = newTaskAttachments
-      .map((a) => a.uploaded)
-      .filter((u): u is SessionAttachment => Boolean(u));
-
-    setNewTaskTitle('');
-    setNewTaskRequiresDiscussion(false);
-    setNewTaskAttachments([]);
-    setIsAddingTask(true);
-    try {
-      if (uploadedAttachments.length > 0) {
-        await onAddTask(t, reqDisc, uploadedAttachments);
-      } else {
-        await onAddTask(t, reqDisc);
-      }
-    } finally {
-      setIsAddingTask(false);
-    }
-  };
-
-  const handleAssignTask = async (taskId: string, rawValue: string) => {
-    if (!onAssignTask) return;
-    const personaId = rawValue ? rawValue : null;
-    setAssigningTaskId(taskId);
-    setAssignError(null);
-    try {
-      await onAssignTask(taskId, personaId);
-    } catch (err) {
-      // Keep the failure inline on the row that caused it: a silent revert looks like the
-      // click did nothing, which is how people end up clicking assign three times.
-      setAssignError(err instanceof Error ? err.message : 'Failed to assign task');
-    } finally {
-      setAssigningTaskId(null);
     }
   };
 
@@ -1273,11 +1189,15 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   <Archive className="w-3 h-3" /> Archived
                 </span>
               ) : isCompleted ? (
-                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
-                  <Check className="w-3 h-3" /> Completed
+                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                  Completed
+                </span>
+              ) : isPending ? (
+                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 border border-slate-700/60 flex items-center gap-1" data-testid="job-status-pending">
+                  <Clock className="w-3 h-3 text-slate-400" /> Pending Start
                 </span>
               ) : (
-                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40">
+                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40" data-testid="job-status-active">
                   Active Job
                 </span>
               )}
@@ -1382,60 +1302,70 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 <span>{isArchiving ? 'Reopening...' : 'Reopen Job'}</span>
               </button>
             )
+          ) : isPending ? (
+            onStartJob && (
+              <button
+                type="button"
+                onClick={handleStartJob}
+                disabled={isStarting}
+                className="px-4 py-1.5 bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-md"
+                data-testid="cockpit-start-job-btn"
+              >
+                {isStarting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Starting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <span>Start Job</span>
+                  </>
+                )}
+              </button>
+            )
           ) : (
             <div className="flex items-center gap-2">
-              {!isCompleted ? (
-                <div>
-                  {showCompleteConfirm ? (
-                    <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl">
-                      <input
-                        type="text"
-                        value={resultSummary}
-                        onChange={(e) => setResultSummary(e.target.value)}
-                        placeholder="Summary of deliverables..."
-                        className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none w-48"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowCompleteConfirm(false)}
-                        className="px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleConfirmComplete}
-                        disabled={isCompleting}
-                        className="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm"
-                      >
-                        {isCompleting ? 'Merging...' : 'Confirm & Merge'}
-                      </button>
-                    </div>
-                  ) : (
+              <div>
+                {showCompleteConfirm ? (
+                  <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl">
+                    <input
+                      type="text"
+                      value={resultSummary}
+                      onChange={(e) => setResultSummary(e.target.value)}
+                      placeholder="Summary of deliverables (optional)..."
+                      data-testid="deliverables-summary-input"
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none w-48 sm:w-56"
+                    />
                     <button
                       type="button"
-                      onClick={() => setShowCompleteConfirm(true)}
-                      className="px-3.5 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                      onClick={() => setShowCompleteConfirm(false)}
+                      className="px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200"
                     >
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      <span>Complete & Merge Job</span>
+                      Cancel
                     </button>
-                  )}
-                </div>
-              ) : (
-                onReopenJob && (
+                    <button
+                      type="button"
+                      onClick={handleConfirmComplete}
+                      disabled={isCompleting}
+                      className="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm"
+                      data-testid="cockpit-confirm-complete-btn"
+                    >
+                      {isCompleting ? 'Completing...' : 'Confirm Complete'}
+                    </button>
+                  </div>
+                ) : (
                   <button
                     type="button"
-                    onClick={handleConfirmReopen}
-                    disabled={isArchiving}
-                    className="px-3.5 py-1.5 bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/40 text-sky-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
-                    data-testid="cockpit-reopen-job-btn"
+                    onClick={() => setShowCompleteConfirm(true)}
+                    className="px-3.5 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                    data-testid="cockpit-complete-job-btn"
                   >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span>{isArchiving ? 'Reopening...' : 'Reopen Job'}</span>
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Complete Job</span>
                   </button>
-                )
-              )}
+                )}
+              </div>
 
               {onArchiveJob && (
                 <div>
@@ -1445,7 +1375,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                       <button
                         type="button"
                         onClick={() => setShowArchiveConfirm(false)}
-                        className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200"
+                        className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
                       >
                         Cancel
                       </button>
@@ -1453,7 +1383,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                         type="button"
                         onClick={handleConfirmArchive}
                         disabled={isArchiving}
-                        className="px-3 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm"
+                        className="px-3 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm cursor-pointer"
                         data-testid="cockpit-confirm-archive-btn"
                       >
                         {isArchiving ? 'Archiving...' : 'Confirm Archive'}
@@ -1464,10 +1394,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                       type="button"
                       onClick={() => setShowArchiveConfirm(true)}
                       title="Archive and close this job"
-                      className="px-3 py-1.5 bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                      className="px-3.5 py-1.5 bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
                       data-testid="cockpit-archive-job-btn"
                     >
-                      <Archive className="w-3.5 h-3.5 text-slate-400" />
+                      <Archive className="w-3.5 h-3.5" />
                       <span>Archive</span>
                     </button>
                   )}
@@ -1639,11 +1569,13 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           <div className="space-y-2 mt-2">
             {/* Task Item Rows */}
             {filteredTasks.length === 0 ? (
-              <div className="py-3 px-4 rounded-xl bg-slate-950/40 border border-slate-800/60 text-center text-xs text-slate-500">
+              <div className="py-4 px-4 rounded-xl bg-slate-950/40 border border-slate-800/60 text-center text-xs text-slate-400">
                 {uniqueTasks.length === 0
-                  ? 'No tasks yet. Add an objective below to track deliverables for this job.'
+                  ? isPending
+                    ? "Job pending. Click 'Start Job' to begin Stage 1 discovery and task breakdown."
+                    : "Autonomous implementer exploring repository to decompose tasks into living checklist..."
                   : taskFilter === 'pending' && completedCount === uniqueTasks.length
-                  ? `All ${uniqueTasks.length} tasks completed! Switch to All or Done to review.`
+                  ? `All ${uniqueTasks.length} tasks completed!`
                   : `No ${taskFilter} tasks found.`}
               </div>
             ) : (
@@ -1656,38 +1588,31 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   return (
                     <div
                       key={task.id}
-                      className={`flex flex-col gap-1.5 px-3 py-2 rounded-xl border text-xs transition group ${
+                      className={`flex flex-col gap-1.5 px-3 py-2 rounded-xl border text-xs transition ${
                         isTaskCompleted
                           ? 'bg-emerald-950/15 border-emerald-500/25 text-emerald-300/80'
                           : isTaskInProgress
                           ? 'bg-sky-950/25 border-sky-500/40 text-slate-100 shadow-sm ring-1 ring-sky-500/20'
-                          : 'bg-slate-950/60 border-slate-800/80 text-slate-300 hover:border-slate-700/80'
+                          : 'bg-slate-950/60 border-slate-800/80 text-slate-300'
                       }`}
+                      data-testid={`task-row-${task.id}`}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                          <button
-                            type="button"
-                            onClick={() => onToggleTask(task.id, !task.isCompleted)}
-                            className="cursor-pointer text-slate-400 hover:text-sky-400 transition shrink-0 p-0.5"
-                            title={isTaskCompleted ? 'Mark as incomplete' : 'Mark as complete'}
-                            data-testid={`toggle-task-${task.id}`}
-                          >
-                            {isTaskCompleted ? (
-                              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                            ) : isTaskInProgress ? (
-                              <div className="relative flex items-center justify-center w-4 h-4" data-testid={`task-progress-indicator-${task.id}`}>
-                                <span className="animate-ping absolute inline-flex h-3 w-3 rounded-full bg-sky-400 opacity-75"></span>
-                                <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-500"></span>
-                              </div>
-                            ) : (
-                              <Circle className="w-4 h-4 text-slate-500 hover:text-sky-400" />
-                            )}
-                          </button>
+                          {isTaskCompleted ? (
+                            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" data-testid={`task-completed-icon-${task.id}`} />
+                          ) : isTaskInProgress ? (
+                            <div className="relative flex items-center justify-center w-4 h-4 shrink-0" data-testid={`task-progress-indicator-${task.id}`}>
+                              <span className="animate-ping absolute inline-flex h-3 w-3 rounded-full bg-sky-400 opacity-75"></span>
+                              <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-500"></span>
+                            </div>
+                          ) : (
+                            <Circle className="w-4 h-4 text-slate-500 shrink-0" data-testid={`task-todo-icon-${task.id}`} />
+                          )}
                           <span className={`font-mono text-[10px] shrink-0 ${isTaskInProgress ? 'text-sky-400 font-semibold' : 'text-slate-500'}`}>
                             #{idx + 1}
                           </span>
-                          <div className="min-w-0 flex-1">
+                          <div className="min-w-0 flex-1 flex flex-wrap items-center gap-2">
                             <span
                               className={`break-words leading-relaxed ${
                                 isTaskCompleted
@@ -1699,182 +1624,54 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                             >
                               {task.title}
                             </span>
-                            {/* Task Attachments Badge List */}
-                            {task.attachments && task.attachments.length > 0 && (
-                              <div className="flex flex-wrap gap-1.5 mt-1" data-testid={`task-attachments-${task.id}`}>
-                                {task.attachments.map((att) => {
-                                  const isImg = isImageAttachment(att.contentType, att.fileName);
-                                  return (
-                                    <div
-                                      key={att.id}
-                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-[10px] text-slate-300 group/taskatt"
-                                      data-testid={`task-att-${att.id}`}
-                                    >
-                                      {isImg ? (
-                                        <button
-                                          type="button"
-                                          onClick={() => handleOpenLightbox({ url: att.downloadUrl, fileName: att.fileName, sizeBytes: att.sizeBytes })}
-                                          className="cursor-pointer flex items-center gap-1 hover:text-sky-300"
-                                          title="View image"
-                                        >
-                                          <ImageIcon className="w-3 h-3 text-sky-400 shrink-0" />
-                                          <span className="truncate max-w-[110px]">{att.fileName}</span>
-                                        </button>
-                                      ) : (
-                                        <a
-                                          href={att.downloadUrl}
-                                          target="_blank"
-                                          rel="noreferrer"
-                                          className="flex items-center gap-1 text-slate-300 hover:text-sky-300"
-                                          title="Download attachment"
-                                        >
-                                          <Paperclip className="w-3 h-3 text-slate-400 shrink-0" />
-                                          <span className="truncate max-w-[110px]">{att.fileName}</span>
-                                        </a>
-                                      )}
-                                      {att.sizeBytes > 0 && (
-                                        <span className="text-[9px] text-slate-500 font-mono">
-                                          ({formatAttachmentSize(att.sizeBytes)})
-                                        </span>
-                                      )}
-                                      {!task.isCompleted && onUpdateTask && (
-                                        <button
-                                          type="button"
-                                          onClick={async (e) => {
-                                            e.stopPropagation();
-                                            try {
-                                              await api.deleteTaskAttachment(job.id, task.id, att.id);
-                                            } catch { }
-                                            const remaining = (task.attachments || []).filter((a) => a.id !== att.id);
-                                            await onUpdateTask(task.id, { attachments: remaining });
-                                          }}
-                                          className="text-slate-500 hover:text-rose-400 p-0.5 rounded transition cursor-pointer ml-0.5 opacity-0 group-hover/taskatt:opacity-100"
-                                          title="Remove attachment"
-                                          data-testid={`delete-task-att-${att.id}`}
-                                        >
-                                          <X className="w-2.5 h-2.5" />
-                                        </button>
-                                      )}
-                                    </div>
-                                  );
-                                })}
-                              </div>
+                            {task.targetFile && (
+                              <span
+                                className="font-mono text-[10px] text-sky-300 bg-sky-950/50 px-1.5 py-0.5 rounded border border-sky-800/50 truncate max-w-[200px]"
+                                title={`Target file: ${task.targetFile}`}
+                                data-testid={`task-target-file-${task.id}`}
+                              >
+                                {task.targetFile}
+                              </span>
+                            )}
+                            {task.verificationMethod && (
+                              <span
+                                className="font-mono text-[10px] text-emerald-300 bg-emerald-950/50 px-1.5 py-0.5 rounded border border-emerald-800/50 truncate max-w-[180px]"
+                                title={`Verification method: ${task.verificationMethod}`}
+                                data-testid={`task-verification-${task.id}`}
+                              >
+                                {task.verificationMethod}
+                              </span>
                             )}
                           </div>
                         </div>
 
                         <div className="flex items-center gap-2 shrink-0">
-                          {!task.isCompleted && onAssignTask ? (
-                            <select
-                              value={task.assignedPersonaId || ''}
-                              disabled={assigningTaskId === task.id}
-                              onChange={(e) => handleAssignTask(task.id, e.target.value)}
-                              onClick={(e) => e.stopPropagation()}
-                              aria-label={`Assignee for task ${task.title}`}
-                              data-testid={`assign-task-${task.id}`}
-                              title={
-                                task.assignedPersonaId
-                                  ? `Assigned to @${memberNameFor(task.assignedPersonaId)} — change assignee`
-                                  : 'Unassigned — pick who owns this task'
-                              }
-                              className={`max-w-[130px] rounded-md border px-1.5 py-1 text-[10px] transition focus:outline-none focus:border-sky-500 disabled:opacity-50 cursor-pointer ${
-                                task.assignedPersonaId
-                                  ? 'bg-sky-500/10 border-sky-500/30 text-sky-200'
-                                  : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                              }`}
-                            >
-                              <option value="">Unassigned</option>
-                              {teamMembers.map((m) => (
-                                <option key={m.id} value={m.id}>
-                                  {m.name}
-                                </option>
-                              ))}
-                            </select>
-                          ) : task.assignedPersonaId ? (
-                            // Completed rows keep the assignee as read-only history: reassigning
-                            // work that is already done would move nothing but the label.
+                          {task.assignedPersonaId && (
                             <span
                               className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/60 text-slate-400 border border-slate-700/50 truncate max-w-[110px]"
-                              title={`Was handled by @${memberNameFor(task.assignedPersonaId)}`}
+                              title={`Assigned to @${memberNameFor(task.assignedPersonaId)}`}
                               data-testid={`task-assignee-static-${task.id}`}
                             >
                               @{memberNameFor(task.assignedPersonaId)}
                             </span>
-                          ) : null}
+                          )}
                           {isTaskCompleted ? (
                             <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
                               Completed
                             </span>
+                          ) : isTaskInProgress ? (
+                            <span
+                              className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
+                              data-testid={`task-focus-${task.id}`}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+                              In Progress
+                            </span>
                           ) : (
-                            <>
-                              {task.requiresDiscussion && (
-                                <span
-                                  className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 font-semibold"
-                                  data-testid={`task-discuss-${task.id}`}
-                                  title="Discussion required before starting coding"
-                                >
-                                  <MessageSquareQuote className="w-3 h-3 text-amber-400 shrink-0" />
-                                  Discuss First
-                                </span>
-                              )}
-                              {isTaskInProgress ? (
-                                <span
-                                  className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
-                                  data-testid={`task-focus-${task.id}`}
-                                >
-                                  <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
-                                  In Progress
-                                </span>
-                              ) : (
-                                <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
-                                  Queued
-                                </span>
-                              )}
-                            </>
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
+                              Queued
+                            </span>
                           )}
-                          {!task.isCompleted && onUpdateTask && (
-                            <button
-                              type="button"
-                              disabled={isUploadingTaskAttachment === task.id}
-                              onClick={() => {
-                                setTargetTaskForUpload(task.id);
-                                existingTaskFileInputRef.current?.click();
-                              }}
-                              className="p-1 rounded text-slate-500 hover:text-sky-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer disabled:opacity-50"
-                              title="Attach file to task"
-                              data-testid={`attach-task-${task.id}`}
-                            >
-                              {isUploadingTaskAttachment === task.id ? (
-                                <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
-                              ) : (
-                                <Paperclip className="w-3.5 h-3.5" />
-                              )}
-                            </button>
-                          )}
-                          {!task.isCompleted && onUpdateTask && (
-                            <button
-                              type="button"
-                              onClick={() => onUpdateTask(task.id, { requiresDiscussion: !task.requiresDiscussion })}
-                              className={`p-1 rounded transition cursor-pointer ${
-                                task.requiresDiscussion
-                                  ? 'text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30'
-                                  : 'text-slate-500 hover:text-amber-400 hover:bg-slate-800 opacity-0 group-hover:opacity-100'
-                              }`}
-                              title={task.requiresDiscussion ? 'Discussion required before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
-                              data-testid={`toggle-discuss-task-${task.id}`}
-                            >
-                              <MessageSquareQuote className="w-3.5 h-3.5" />
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => onDeleteTask(task.id)}
-                            className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100 cursor-pointer"
-                            title="Delete task"
-                            data-testid={`delete-task-${task.id}`}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
                         </div>
                       </div>
 
@@ -1892,113 +1689,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   );
                 })}
               </div>
-            )}
-
-            {assignError && (
-              <div
-                role="alert"
-                className="flex items-start gap-2 px-3 py-2 rounded-xl bg-rose-950/40 border border-rose-500/40 text-[11px] text-rose-200"
-                data-testid="task-assign-error"
-              >
-                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-400" />
-                <span className="min-w-0 flex-1 break-words">{assignError}</span>
-                <button
-                  type="button"
-                  onClick={() => setAssignError(null)}
-                  className="text-rose-300 hover:text-white p-0.5 rounded transition cursor-pointer shrink-0"
-                  title="Dismiss"
-                  data-testid="task-assign-error-dismiss"
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              </div>
-            )}
-
-            {/* Inline Add Task Form (Autonomous implementers own task decomposition during discovery) */}
-            {showManualAddTaskForm && (
-              <form onSubmit={handleAddTaskSubmit} className="space-y-1.5 pt-1">
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={newTaskTitle}
-                    onChange={(e) => setNewTaskTitle(e.target.value)}
-                    placeholder="+ Add task..."
-                    className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition shadow-inner"
-                    data-testid="new-task-input"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => newTaskFileInputRef.current?.click()}
-                    className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
-                      newTaskAttachments.length > 0
-                        ? 'bg-sky-500/20 border-sky-500/40 text-sky-300 font-semibold shadow-sm'
-                        : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                    title="Attach files to task"
-                    data-testid="new-task-attach-btn"
-                  >
-                    <Paperclip className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">
-                      Attach{newTaskAttachments.length > 0 ? ` (${newTaskAttachments.length})` : ''}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setNewTaskRequiresDiscussion((prev) => !prev)}
-                    className={`px-2.5 py-1.5 rounded-xl border transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer ${
-                      newTaskRequiresDiscussion
-                        ? 'bg-amber-500/20 border-amber-500/40 text-amber-300 font-semibold shadow-sm'
-                        : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                    title={newTaskRequiresDiscussion ? 'Flagged for discussion before coding (click to toggle off)' : 'Flag for discussion before coding (click to toggle on)'}
-                    data-testid="new-task-discuss-toggle"
-                  >
-                    <MessageSquareQuote className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Discuss</span>
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={!newTaskTitle.trim() || isAddingTask}
-                    className="px-3.5 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 shrink-0 cursor-pointer shadow-sm"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Add Task</span>
-                  </button>
-                </div>
-
-                {/* Staged attachments for new task */}
-                {newTaskAttachments.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5 px-1" data-testid="new-task-staged-attachments">
-                    {newTaskAttachments.map((att) => (
-                      <div
-                        key={att.localId}
-                        className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800 text-[10px] text-slate-300"
-                      >
-                        {att.uploading ? (
-                          <RefreshCw className="w-3 h-3 text-sky-400 animate-spin" />
-                        ) : (
-                          <Paperclip className="w-3 h-3 text-sky-400" />
-                        )}
-                        <span className="truncate max-w-[120px]">{att.name}</span>
-                        {att.sizeBytes && (
-                          <span className="text-[9px] text-slate-500 font-mono">
-                            ({formatAttachmentSize(att.sizeBytes)})
-                          </span>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => removeNewTaskAttachment(att.localId)}
-                          className="text-slate-500 hover:text-rose-400 p-0.5 rounded cursor-pointer"
-                          title="Remove file"
-                          data-testid={`remove-new-task-att-${att.localId}`}
-                        >
-                          <X className="w-2.5 h-2.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </form>
             )}
           </div>
         )}
@@ -2397,21 +2087,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             }}
           />
 
-          {/* Hidden File Input for New Task Attachments */}
-          <input
-            ref={newTaskFileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            data-testid="new-task-file-input"
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) {
-                void handleNewTaskFiles(e.target.files);
-                e.target.value = '';
-              }
-            }}
-          />
-
           {/* Hidden File Input for Existing Task Attachments */}
           <input
             ref={existingTaskFileInputRef}
@@ -2623,6 +2298,23 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     </p>
                   </div>
                 </div>
+
+                {assignError && (
+                  <div
+                    data-testid="task-assign-error"
+                    className="flex items-center justify-between text-xs text-rose-300 bg-rose-950/60 border border-rose-500/40 rounded-lg px-2.5 py-1.5"
+                  >
+                    <span className="truncate">{assignError}</span>
+                    <button
+                      type="button"
+                      data-testid="task-assign-error-dismiss"
+                      onClick={() => setAssignError(null)}
+                      className="text-rose-400 hover:text-rose-200 shrink-0 ml-2"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
 
                 {/* Individual Queued Turns */}
                 <div className="space-y-1.5 pt-1.5 border-t border-amber-500/20">

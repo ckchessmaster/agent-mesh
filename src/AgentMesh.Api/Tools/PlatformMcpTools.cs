@@ -495,7 +495,7 @@ public class PlatformMcpTools(
 
             if (workflows is not null)
             {
-                var checklistItems = args.Tasks.Select(t => new ChecklistTaskItem(t.Title, t.TargetFile, t.VerificationMethod)).ToList();
+                var checklistItems = newTasks.Select(t => new ChecklistTaskItem(t.Title, t.TargetFile, t.VerificationMethod, t.Id.ToString())).ToList();
                 SignalDelivery delivery;
                 try
                 {
@@ -536,10 +536,14 @@ public class PlatformMcpTools(
 
             await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
             await hubContext.Clients.All.SendAsync("ChecklistUpdated", new { jobId = job.Id, tasks = newTasks }, ct);
-            if (!string.IsNullOrWhiteSpace(job.ProgressHeartbeat))
+            var checklistLifecycleStatus = ProjectJobsController.DeriveLifecycleStatus(job);
+            await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
             {
-                await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
-            }
+                jobId = job.Id,
+                progressHeartbeat = job.ProgressHeartbeat,
+                currentTaskId = job.CurrentTaskId,
+                lifecycleStatus = checklistLifecycleStatus
+            }, ct);
 
             return JsonSerializer.Serialize(new
             {
@@ -657,10 +661,14 @@ public class PlatformMcpTools(
             job.Id, target.Id, previousStatus, nextStatus, callerPersona ?? "(unknown)");
 
         await hubContext.Clients.All.SendAsync("JobTaskUpdated", new { jobId = job.Id, tasks }, ct);
-        if (!string.IsNullOrWhiteSpace(job.ProgressHeartbeat))
+        var taskLifecycleStatus = ProjectJobsController.DeriveLifecycleStatus(job);
+        await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
         {
-            await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new { jobId = job.Id, progressHeartbeat = job.ProgressHeartbeat }, ct);
-        }
+            jobId = job.Id,
+            progressHeartbeat = job.ProgressHeartbeat,
+            currentTaskId = job.CurrentTaskId,
+            lifecycleStatus = taskLifecycleStatus
+        }, ct);
 
         return JsonSerializer.Serialize(new
         {

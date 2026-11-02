@@ -397,7 +397,8 @@ export type WorkspaceType = (typeof WorkspaceType)[keyof typeof WorkspaceType];
 export const ProjectJobStatus = {
   Active: 0,
   Completed: 1,
-  Archived: 2
+  Archived: 2,
+  Pending: 3
 } as const;
 export type ProjectJobStatus = (typeof ProjectJobStatus)[keyof typeof ProjectJobStatus];
 
