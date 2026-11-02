@@ -366,6 +366,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [planApproved, setPlanApproved] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
 
+  useEffect(() => {
+    setPlanApproved(false);
+    setApprovalError(null);
+  }, [job.id]);
+
   const isAwaitingApproval =
     !planApproved &&
     (job.lifecycleStatus === JobLifecycleStatus.AwaitingApproval ||

@@ -446,7 +446,7 @@ public partial class ExecutionActivities
 
         var taskInput = new TaskExecutionInput(
             JobId: input.JobId,
-            TaskId: input.CurrentTask.Title,
+            TaskId: !string.IsNullOrWhiteSpace(input.CurrentTask.Id) ? input.CurrentTask.Id : input.CurrentTask.Title,
             AgentId: input.AssignedAgentId,
             ProjectId: input.ProjectId,
             WorkspacePath: input.WorkspacePath,

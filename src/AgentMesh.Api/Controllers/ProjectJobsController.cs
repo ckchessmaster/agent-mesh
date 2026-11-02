@@ -69,7 +69,8 @@ public record UpdateProjectJobRequest(
     string? GitBranchName = null,
     ProjectJobStatus? Status = null,
     string? ResultSummary = null,
-    ProjectJobPriority? Priority = null
+    ProjectJobPriority? Priority = null,
+    PlanApprovalPolicy? ApprovalPolicy = null
 );
 
 public record CreateJobTaskRequest(
@@ -284,6 +285,7 @@ public class ProjectJobsController(
         if (!string.IsNullOrWhiteSpace(req.GitBranchName)) job.GitBranchName = req.GitBranchName.Trim();
         if (req.Status.HasValue) job.Status = req.Status.Value;
         if (req.Priority.HasValue) job.Priority = req.Priority.Value;
+        if (req.ApprovalPolicy.HasValue) job.ApprovalPolicy = req.ApprovalPolicy.Value;
         if (req.ResultSummary != null) job.ResultSummary = req.ResultSummary.Trim();
 
         job.UpdatedAt = DateTimeOffset.UtcNow;
@@ -1526,6 +1528,8 @@ public class ProjectJobsController(
         }
 
         job.Status = ProjectJobStatus.Active;
+        job.CurrentTaskId = "stage-1-discovery";
+        job.ProgressHeartbeat = "Exploring codebase and generating checklist";
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
@@ -1535,13 +1539,18 @@ public class ProjectJobsController(
         {
             var workflowId = $"job-{id}";
             var assignedAgentId = job.AssignedAgentId ?? project?.DefaultLeadPersonaId ?? "implementer";
-            var workspacePath = job.WorkingDirectory ?? $"/workspace/repos/{job.ProjectId}";
+            var workspacePath = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
+                ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
+                : (project?.GetResolvedWorkingDirectory() ?? $"/workspace/repos/{job.ProjectId}");
             var targetBranch = !string.IsNullOrWhiteSpace(job.GitBranchName) ? job.GitBranchName : "main";
             var initialPrompt = !string.IsNullOrWhiteSpace(job.Description)
                 ? $"{job.Title}\n\n{job.Description}"
                 : job.Title;
 
-            var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue);
+            var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue)
+            {
+                Memo = new Dictionary<string, object> { ["personaId"] = assignedAgentId }
+            };
 
             try
             {
@@ -2003,7 +2012,7 @@ public class ProjectJobsController(
         return null;
     }
 
-    private static ProjectJobDto ToDto(ProjectJob j, string? projectName, int msgCount)
+    internal static ProjectJobDto ToDto(ProjectJob j, string? projectName, int msgCount)
     {
         return new ProjectJobDto(
             j.Id,
@@ -2028,7 +2037,7 @@ public class ProjectJobsController(
         );
     }
 
-    private static string? DeriveLifecycleStatus(ProjectJob j)
+    internal static string? DeriveLifecycleStatus(ProjectJob j)
     {
         if (j.Status == ProjectJobStatus.Archived) return "Completed";
         if (j.Status == ProjectJobStatus.Pending) return null;

@@ -383,6 +383,9 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       expect(screen.getByText('high')).toBeInTheDocument();
       expect(screen.getByText('plan')).toBeInTheDocument();
       expect(screen.getByText('2,850 tokens (4.2s)')).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
       expect(screen.getByText('⚡ 2,850 tokens (4.2s)')).toBeInTheDocument();
     });
   });

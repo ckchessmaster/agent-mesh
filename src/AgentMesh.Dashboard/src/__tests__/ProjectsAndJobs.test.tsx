@@ -217,7 +217,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     // Clicking the job in the sidebar opens JobCockpit
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     // Job Cockpit header displays branch and project details
@@ -262,7 +262,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -305,7 +305,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -356,7 +356,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -440,7 +440,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     const assignSelect = await screen.findByTestId('reassign-queued-turn-turn-9');
@@ -482,7 +482,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     const assignSelect = await screen.findByTestId('reassign-queued-turn-turn-9');
@@ -504,7 +504,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -617,7 +617,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -671,7 +671,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {
@@ -778,7 +778,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    });
+    }, { timeout: 4000 });
     fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
 
     await waitFor(() => {

@@ -604,6 +604,30 @@ public class WorkflowSignalRouter(
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
             deadline.CancelAfter(ProbeTimeout);
 
+            // Check running job-level execution workflows first
+            var jobWorkflowIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}" };
+            foreach (var jobWfId in jobWorkflowIds.Distinct())
+            {
+                var jobDesc = await DescribeAsync(jobWfId, deadline.Token);
+                if (jobDesc is not null && jobDesc.Status == WorkflowExecutionStatus.Running)
+                {
+                    if (string.IsNullOrWhiteSpace(targetPersonaId))
+                    {
+                        return true;
+                    }
+
+                    if (jobDesc.Memo != null &&
+                        jobDesc.Memo.TryGetValue("personaId", out var jobRaw) &&
+                        jobRaw != null &&
+                        await jobRaw.ToValueAsync<string>() is { Length: > 0 } jobDriving)
+                    {
+                        return string.Equals(NormalizePersona(jobDriving), NormalizePersona(targetPersonaId), StringComparison.Ordinal);
+                    }
+
+                    return true;
+                }
+            }
+
             var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(WorkflowIdFor(jobId));
             var description = await handle.DescribeAsync(
                 new WorkflowDescribeOptions { Rpc = new RpcOptions { CancellationToken = deadline.Token } });

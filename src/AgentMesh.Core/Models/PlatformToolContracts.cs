@@ -32,7 +32,8 @@ public record PostJobMessageArgs(
 public record ChecklistTaskItem(
     string Title,
     string? TargetFile = null,
-    string? VerificationMethod = null
+    string? VerificationMethod = null,
+    string? Id = null
 );
 
 public record ManageTaskArgs(

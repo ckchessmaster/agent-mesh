@@ -894,6 +894,7 @@ export const api = {
     status?: number;
     resultSummary?: string;
     priority?: number;
+    approvalPolicy?: number;
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
       method: 'PUT',

@@ -875,6 +875,7 @@ export default function App() {
     priority?: number;
     status?: ProjectJobStatus;
     resultSummary?: string;
+    approvalPolicy?: number;
   }) => {
     if (!selectedJobId) return;
     const updated = await api.updateProjectJob(selectedJobId, updates);
@@ -1317,6 +1318,32 @@ export default function App() {
       });
     };
 
+    const handleProgressHeartbeatUpdated = (data: {
+      jobId: string;
+      progressHeartbeat?: string;
+      currentTaskId?: string;
+      lifecycleStatus?: string;
+    }) => {
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          if (next[pId]?.some((j) => j.id === data.jobId)) {
+            next[pId] = next[pId].map((j) =>
+              j.id === data.jobId
+                ? {
+                    ...j,
+                    progressHeartbeat: data.progressHeartbeat !== undefined ? data.progressHeartbeat : j.progressHeartbeat,
+                    currentTaskId: data.currentTaskId !== undefined ? data.currentTaskId : j.currentTaskId,
+                    lifecycleStatus: data.lifecycleStatus !== undefined ? (data.lifecycleStatus as any) : j.lifecycleStatus
+                  }
+                : j
+            );
+          }
+        }
+        return next;
+      });
+    };
+
     const handleJobCreated = (job: ProjectJob) => {
       setJobsByProject((prev) => ({
         ...prev,
@@ -1383,6 +1410,7 @@ export default function App() {
     connection.on('JobMessageAdded', handleJobMessageAdded);
     connection.on('JobMessageCreated', handleJobMessageAdded);
     connection.on('JobTaskUpdated', handleJobTaskUpdated);
+    connection.on('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
     connection.on('JobCreated', handleJobCreated);
     connection.on('JobUpdated', handleJobUpdated);
     connection.on('JobDeleted', handleJobDeleted);
@@ -1409,6 +1437,7 @@ export default function App() {
       connection.off('JobMessageAdded', handleJobMessageAdded);
       connection.off('JobMessageCreated', handleJobMessageAdded);
       connection.off('JobTaskUpdated', handleJobTaskUpdated);
+      connection.off('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
       connection.off('JobCreated', handleJobCreated);
       connection.off('JobUpdated', handleJobUpdated);
       connection.off('JobDeleted', handleJobDeleted);
@@ -4985,8 +5014,7 @@ export default function App() {
                                   className="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/25"
                                   title={`In: ${usage.inputTokens || 0} | Out: ${usage.outputTokens || 0} | Think: ${usage.thinkingTokens || 0}`}
                                 >
-                                  ⚡ {(usage.totalTokens || ((usage.inputTokens || 0) + (usage.outputTokens || 0))).toLocaleString()} tokens
-                                  {usage.durationSeconds ? ` (${usage.durationSeconds.toFixed(1)}s)` : ''}
+                                  {`⚡ ${(usage.totalTokens || ((usage.inputTokens || 0) + (usage.outputTokens || 0))).toLocaleString()} tokens${usage.durationSeconds ? ` (${usage.durationSeconds.toFixed(1)}s)` : ''}`}
                                 </span>
                               )}
                               <span className="text-slate-500">
