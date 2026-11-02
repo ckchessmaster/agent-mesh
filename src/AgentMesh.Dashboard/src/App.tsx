@@ -265,6 +265,8 @@ export default function App() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [jobsByProject, setJobsByProject] = useState<Record<string, ProjectJob[]>>({});
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const selectedJobIdRef = useRef<string | null>(null);
+  selectedJobIdRef.current = selectedJobId;
   const [isMobile, setIsMobile] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
   );
@@ -990,6 +992,18 @@ export default function App() {
     setJobTasks((prev) => prev.filter((t) => t.id !== taskId));
   };
 
+  const handleStartJob = async () => {
+    if (!selectedJobId) return;
+    const updated = await api.startJob(selectedJobId);
+    setJobsByProject((prev) => {
+      const next = { ...prev };
+      for (const pId of Object.keys(next)) {
+        next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+      }
+      return next;
+    });
+  };
+
   const handleCompleteJob = async (resultSummary?: string) => {
     if (!selectedJobId) return;
     const updated = await api.completeJob(selectedJobId, { resultSummary });
@@ -1275,7 +1289,7 @@ export default function App() {
 
     const handleJobMessageAdded = (msg: JobMessage) => {
       setJobMessages((prev) => {
-        if (msg.jobId === selectedJobId) {
+        if (msg.jobId === selectedJobIdRef.current) {
           if (prev.some((m) => m.id === msg.id)) return prev;
           return [...prev, msg];
         }
@@ -1284,7 +1298,7 @@ export default function App() {
     };
 
     const handleJobTaskUpdated = (data: { jobId: string; tasks: JobTask[] }) => {
-      if (data.jobId === selectedJobId) {
+      if (data.jobId === selectedJobIdRef.current) {
         const unique = (data.tasks || []).filter(
           (t, idx, self) => idx === self.findIndex((x) => x.id === t.id)
         );
@@ -3549,6 +3563,7 @@ export default function App() {
                       messages={jobMessages}
                       personas={personas}
                       sessions={sessions}
+                      onStartJob={handleStartJob}
                       onSendMessage={handleSendJobMessage}
                       onAddTask={handleAddTask}
                       onToggleTask={handleToggleTask}

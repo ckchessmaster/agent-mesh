@@ -26,7 +26,7 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
             .IsRequired();
 
         builder.Property(j => j.Status)
-            .HasDefaultValue(ProjectJobStatus.Active)
+            .HasDefaultValue(ProjectJobStatus.Pending)
             .IsRequired();
 
         builder.Property(j => j.Priority)

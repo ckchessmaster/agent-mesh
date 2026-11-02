@@ -876,6 +876,7 @@ export const api = {
     gitBranchName?: string;
     initialTasks?: string[];
     priority?: number;
+    approvalPolicy?: number;
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
       method: 'POST',
@@ -1090,6 +1091,15 @@ export const api = {
       body: JSON.stringify({ approverRole, comments })
     });
     if (!res.ok) throw new Error(`Failed to approve plan: ${res.statusText}`);
+    return res.json();
+  },
+
+  async startJob(id: string): Promise<ProjectJob> {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/start`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to start job: ${res.statusText}`);
     return res.json();
   },
 

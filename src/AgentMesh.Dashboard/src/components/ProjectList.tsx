@@ -228,6 +228,7 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                             const isJobSelected = selectedJobId === job.id;
                             const isJobDone = job.status === ProjectJobStatus.Completed;
                             const isJobArchived = job.status === ProjectJobStatus.Archived;
+                            const isJobPending = job.status === ProjectJobStatus.Pending;
 
                             return (
                               <div key={job.id}>
@@ -246,12 +247,19 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                                       <Archive className="w-3.5 h-3.5 text-amber-400/80 shrink-0" />
                                     ) : isJobDone ? (
                                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                                    ) : isJobPending ? (
+                                      <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                                     ) : (
                                       <Clock className="w-3.5 h-3.5 text-sky-400 shrink-0" />
                                     )}
                                     <span className={`truncate font-medium ${isJobArchived ? 'text-slate-400' : ''}`}>
                                       {job.title}
                                     </span>
+                                    {isJobPending && (
+                                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/50 shrink-0">
+                                        Pending
+                                      </span>
+                                    )}
                                     {isJobArchived && (
                                       <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/90 border border-amber-500/25 shrink-0">
                                         Archived

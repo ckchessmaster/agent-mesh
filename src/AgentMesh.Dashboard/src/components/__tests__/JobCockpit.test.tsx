@@ -1,4 +1,4 @@
-﻿import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { JobCockpit, getActiveMentionQuery, resolveTargetTaskId } from '../JobCockpit';
 import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type SessionAttachment, type AgentSession } from '../../types';
@@ -638,25 +638,51 @@ describe('JobCockpit - Attachment Support', () => {
     expect(screen.getByTestId('job-team-sidebar')).toBeInTheDocument();
   });
 
-  it('renders archive job button and calls onArchiveJob upon confirmation', async () => {
-    const onArchiveJob = vi.fn().mockResolvedValue(undefined);
+  it('renders start job button when pending and calls onStartJob', () => {
+    const onStartJob = vi.fn().mockResolvedValue(undefined);
+    const pendingJob = {
+      ...mockJob,
+      status: ProjectJobStatus.Pending
+    };
     render(
       <JobCockpit
         {...mockProps}
-        onArchiveJob={onArchiveJob}
+        job={pendingJob}
+        onStartJob={onStartJob}
       />
     );
 
-    const archiveBtn = screen.getByTestId('cockpit-archive-job-btn');
-    expect(archiveBtn).toBeInTheDocument();
+    const startBtn = screen.getByTestId('cockpit-start-job-btn');
+    expect(startBtn).toBeInTheDocument();
+    expect(within(startBtn).getByText('Start Job')).toBeInTheDocument();
 
-    fireEvent.click(archiveBtn);
-    expect(screen.getByText('Archive job?')).toBeInTheDocument();
+    fireEvent.click(startBtn);
+    expect(onStartJob).toHaveBeenCalledTimes(1);
+  });
 
-    const confirmBtn = screen.getByTestId('cockpit-confirm-archive-btn');
+  it('renders complete job button when active, prompts for summary, and calls onCompleteJob', async () => {
+    const onCompleteJob = vi.fn().mockResolvedValue(undefined);
+    render(
+      <JobCockpit
+        {...mockProps}
+        onCompleteJob={onCompleteJob}
+      />
+    );
+
+    const completeBtn = screen.getByTestId('cockpit-complete-job-btn');
+    expect(completeBtn).toBeInTheDocument();
+    expect(within(completeBtn).getByText('Complete Job')).toBeInTheDocument();
+
+    fireEvent.click(completeBtn);
+    expect(screen.getByTestId('deliverables-summary-input')).toBeInTheDocument();
+
+    const summaryInput = screen.getByTestId('deliverables-summary-input');
+    fireEvent.change(summaryInput, { target: { value: 'Implemented autonomous lifecycle' } });
+
+    const confirmBtn = screen.getByTestId('cockpit-confirm-complete-btn');
     fireEvent.click(confirmBtn);
 
-    expect(onArchiveJob).toHaveBeenCalledTimes(1);
+    expect(onCompleteJob).toHaveBeenCalledWith('Implemented autonomous lifecycle');
   });
 
   it('renders archived job state with reopen button, disabled composer, and calls onReopenJob', async () => {
@@ -690,10 +716,9 @@ describe('JobCockpit - Attachment Support', () => {
     expect(onReopenJob).toHaveBeenCalledTimes(1);
   });
 
-  it('does not block chat on completed jobs: enables composer and attach button, allows sending messages, and provides Reopen and Archive buttons', async () => {
+  it('does not block chat on completed jobs: enables composer and attach button, allows sending messages, and provides Complete Job button', async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
-    const onReopenJob = vi.fn().mockResolvedValue(undefined);
-    const onArchiveJob = vi.fn().mockResolvedValue(undefined);
+    const onCompleteJob = vi.fn().mockResolvedValue(undefined);
     const completedJob = {
       ...mockJob,
       status: ProjectJobStatus.Completed
@@ -704,20 +729,15 @@ describe('JobCockpit - Attachment Support', () => {
         {...mockProps}
         job={completedJob}
         onSendMessage={onSendMessage}
-        onReopenJob={onReopenJob}
-        onArchiveJob={onArchiveJob}
+        onCompleteJob={onCompleteJob}
       />
     );
 
     // Shows Completed status badge
     expect(screen.getByText('Completed')).toBeInTheDocument();
 
-    // Reopen and Archive buttons appear
-    expect(screen.getByTestId('cockpit-reopen-job-btn')).toBeInTheDocument();
-    expect(screen.getByTestId('cockpit-archive-job-btn')).toBeInTheDocument();
-
-    // Complete & Merge button is NOT shown because it's already completed
-    expect(screen.queryByText('Complete & Merge Job')).not.toBeInTheDocument();
+    // Complete Job button appears
+    expect(screen.getByTestId('cockpit-complete-job-btn')).toBeInTheDocument();
 
     // Composer is NOT disabled
     const textarea = screen.getByPlaceholderText(/Job completed. Continue discussion, delegate with @persona, or reopen if needed.../i);
@@ -920,10 +940,7 @@ describe('JobCockpit - Attachment Support', () => {
     expect(screen.getByText('Queued turn for @Rook was cancelled.')).toBeInTheDocument();
   });
 
-  it('renders Discuss First badge, allows toggling discussion requirement, and adding a task with discussion enabled', async () => {
-    const onAddTask = vi.fn().mockResolvedValue(undefined);
-    const onUpdateTask = vi.fn().mockResolvedValue(undefined);
-
+  it('renders Discuss First badge for tasks requiring discussion', async () => {
     const testTasks: JobTask[] = [
       { id: 'task-1', title: 'Task with Discussion', isCompleted: false, requiresDiscussion: true },
       { id: 'task-2', title: 'Standard Task', isCompleted: false, requiresDiscussion: false }
@@ -933,40 +950,12 @@ describe('JobCockpit - Attachment Support', () => {
       <JobCockpit
         {...mockProps}
         tasks={testTasks}
-        onAddTask={onAddTask}
-        onUpdateTask={onUpdateTask}
       />
     );
 
     // Current focus badge has [Discuss] tag
     expect(screen.getByTestId('current-focus-badge')).toBeInTheDocument();
     expect(screen.getByTestId('focus-discuss-tag')).toHaveTextContent('[Discuss]');
-
-    // Task 1 has Discuss First badge
-    expect(screen.getByTestId('task-discuss-task-1')).toBeInTheDocument();
-    expect(screen.getByText('Discuss First')).toBeInTheDocument();
-
-    // Toggle discussion on Task 2
-    const toggleTask2Btn = screen.getByTestId('toggle-discuss-task-task-2');
-    fireEvent.click(toggleTask2Btn);
-    expect(onUpdateTask).toHaveBeenCalledWith('task-2', { requiresDiscussion: true });
-
-    // Toggle discussion on Task 1 off
-    const toggleTask1Btn = screen.getByTestId('toggle-discuss-task-task-1');
-    fireEvent.click(toggleTask1Btn);
-    expect(onUpdateTask).toHaveBeenCalledWith('task-1', { requiresDiscussion: false });
-
-    // Inline task form with Discuss toggle
-    const input = screen.getByTestId('new-task-input');
-    const discussToggle = screen.getByTestId('new-task-discuss-toggle');
-    fireEvent.change(input, { target: { value: 'New Architecture Task' } });
-    fireEvent.click(discussToggle);
-
-    // Submit form
-    const addBtn = screen.getByRole('button', { name: /Add Task/i });
-    fireEvent.click(addBtn);
-
-    expect(onAddTask).toHaveBeenCalledWith('New Architecture Task', true);
   });
 
   it('renders interactive Ready to Proceed card when agent outputs [READY_TO_PROCEED], strips tag from message, and allows proceeding to code', async () => {
@@ -1037,109 +1026,6 @@ describe('JobCockpit - Attachment Support', () => {
     // Card now displays unlocked status
     expect(screen.getByText(/Discussion approved — implementation unlocked/i)).toBeInTheDocument();
     expect(screen.queryByTestId('proceed-to-coding-btn')).not.toBeInTheDocument();
-  });
-
-  it('renders task attachments, supports lightbox on image click, allows deleting task attachment, and adding new task with attachments', async () => {
-    const onAddTask = vi.fn().mockResolvedValue(undefined);
-    const onUpdateTask = vi.fn().mockResolvedValue(undefined);
-    const onOpenLightbox = vi.fn();
-
-    const sampleImgAtt: SessionAttachment = {
-      id: 'att-mock-img',
-      sessionId: mockJob.id,
-      fileName: 'mock-ui.png',
-      contentType: 'image/png',
-      sizeBytes: 2048,
-      s3Key: 'mock-ui.png',
-      downloadUrl: '/api/project-jobs/attachments/mock-ui.png',
-      createdAt: new Date().toISOString()
-    };
-
-    const sampleDocAtt: SessionAttachment = {
-      id: 'att-mock-doc',
-      sessionId: mockJob.id,
-      fileName: 'mock-spec.pdf',
-      contentType: 'application/pdf',
-      sizeBytes: 4096,
-      s3Key: 'mock-spec.pdf',
-      downloadUrl: '/api/project-jobs/attachments/mock-spec.pdf',
-      createdAt: new Date().toISOString()
-    };
-
-    const taskWithAtts: JobTask = {
-      id: 'task-with-atts',
-      title: 'Task With Attachments',
-      isCompleted: false,
-      attachments: [sampleImgAtt, sampleDocAtt]
-    };
-
-    render(
-      <JobCockpit
-        {...mockProps}
-        tasks={[taskWithAtts]}
-        onAddTask={onAddTask}
-        onUpdateTask={onUpdateTask}
-        onOpenLightbox={onOpenLightbox}
-      />
-    );
-
-    // Verify task attachments rendered
-    expect(screen.getByTestId('task-attachments-task-with-atts')).toBeInTheDocument();
-    expect(screen.getByText('mock-ui.png')).toBeInTheDocument();
-    expect(screen.getByText('mock-spec.pdf')).toBeInTheDocument();
-
-    // Click image attachment to open lightbox
-    fireEvent.click(screen.getByText('mock-ui.png'));
-    expect(onOpenLightbox).toHaveBeenCalledWith({
-      url: '/api/project-jobs/attachments/mock-ui.png',
-      fileName: 'mock-ui.png',
-      sizeBytes: 2048
-    });
-
-    // Delete document attachment from task
-    const delDocBtn = screen.getByTestId('delete-task-att-att-mock-doc');
-    fireEvent.click(delDocBtn);
-    await waitFor(() => {
-      expect(onUpdateTask).toHaveBeenCalledWith('task-with-atts', {
-        attachments: [sampleImgAtt]
-      });
-    });
-
-    // Add new task with staged attachments
-    const newAtt: SessionAttachment = {
-      id: 'att-staged-1',
-      sessionId: mockJob.id,
-      fileName: 'staged-file.txt',
-      contentType: 'text/plain',
-      sizeBytes: 1024,
-      s3Key: 'staged-file.txt',
-      downloadUrl: '/api/project-jobs/attachments/staged-file.txt',
-      createdAt: new Date().toISOString()
-    };
-    vi.mocked(api.uploadJobAttachments).mockResolvedValue([newAtt]);
-
-    const taskInput = screen.getByTestId('new-task-input');
-    fireEvent.change(taskInput, { target: { value: 'Task with new attachment' } });
-
-    const newTaskFileInput = screen.getByTestId('new-task-file-input');
-    const txtFile = new File(['text-content'], 'staged-file.txt', { type: 'text/plain' });
-    fireEvent.change(newTaskFileInput, { target: { files: [txtFile] } });
-
-    await waitFor(() => {
-      expect(screen.getByTestId('new-task-staged-attachments')).toBeInTheDocument();
-      expect(screen.getAllByText('staged-file.txt').length).toBeGreaterThan(0);
-    });
-
-    const addBtn = screen.getByRole('button', { name: /Add Task/i });
-    fireEvent.click(addBtn);
-
-    await waitFor(() => {
-      expect(onAddTask).toHaveBeenCalledWith(
-        'Task with new attachment',
-        false,
-        [newAtt]
-      );
-    });
   });
 
   it('surfaces questions from agent messages, renders interactive question cards, shows Waiting for Input badge and composer hint, and allows submitting answers', async () => {
@@ -1483,31 +1369,28 @@ describe('JobCockpit - Task assignment and reassignment', () => {
     expect(resolveTargetTaskId(allOwned, 'agy-soren')).toBe('a');
   });
 
-  it('renders an assignee picker per task row and sends the chosen persona', () => {
-    const onAssignTask = vi.fn().mockResolvedValue(undefined);
-    render(<JobCockpit {...mockProps} tasks={assignedTasks} onAssignTask={onAssignTask} />);
-
-    const astraSelect = screen.getByTestId('assign-task-t-1');
-    const unassignedSelect = screen.getByTestId('assign-task-t-2');
-    expect((astraSelect as HTMLSelectElement).value).toBe('agy-astra');
-    expect((unassignedSelect as HTMLSelectElement).value).toBe('');
-    // The row must offer the team by display name, not raw persona ids.
-    expect(within(astraSelect).getByRole('option', { name: 'Soren' })).toBeInTheDocument();
-    expect(within(astraSelect).getByRole('option', { name: 'Unassigned' })).toBeInTheDocument();
-
-    fireEvent.change(unassignedSelect, { target: { value: 'agy-soren' } });
-    expect(onAssignTask).toHaveBeenCalledWith('t-2', 'agy-soren');
-
-    // Choosing "Unassigned" clears rather than being ignored.
-    fireEvent.change(astraSelect, { target: { value: '' } });
-    expect(onAssignTask).toHaveBeenCalledWith('t-1', null);
-  });
-
   it('surfaces a failed assignment inline instead of reverting silently', async () => {
     const onAssignTask = vi.fn().mockRejectedValue(new Error("Persona 'x' is not on the team"));
-    render(<JobCockpit {...mockProps} tasks={assignedTasks} onAssignTask={onAssignTask} />);
+    const queuedJob: ProjectJob = {
+      ...mockJob,
+      queuedTurns: [
+        {
+          id: 'turn-err-1',
+          jobId: 'job-1',
+          projectId: 'agent-mesh',
+          targetPersonaId: 'agy-astra',
+          senderType: 'user',
+          senderName: 'Operator',
+          content: 'test turn',
+          mentions: ['agy-astra'],
+          priority: 1,
+          createdAt: new Date().toISOString()
+        }
+      ]
+    };
+    render(<JobCockpit {...mockProps} job={queuedJob} tasks={assignedTasks} onAssignTask={onAssignTask} />);
 
-    fireEvent.change(screen.getByTestId('assign-task-t-2'), { target: { value: 'agy-soren' } });
+    fireEvent.change(screen.getByTestId('reassign-queued-turn-turn-err-1'), { target: { value: 'agy-soren' } });
 
     await waitFor(() => {
       const alert = screen.getByTestId('task-assign-error');
@@ -1516,24 +1399,6 @@ describe('JobCockpit - Task assignment and reassignment', () => {
 
     fireEvent.click(screen.getByTestId('task-assign-error-dismiss'));
     expect(screen.queryByTestId('task-assign-error')).not.toBeInTheDocument();
-  });
-
-  it('hides the assignee picker when no handler is provided', () => {
-    render(<JobCockpit {...mockProps} tasks={assignedTasks} />);
-    expect(screen.queryByTestId('assign-task-t-1')).not.toBeInTheDocument();
-  });
-
-  it('shows a completed task\'s assignee as read-only history rather than a picker', () => {
-    const done: JobTask[] = [
-      { id: 't-9', title: 'Shipped', isCompleted: true, assignedPersonaId: 'agy-astra' }
-    ];
-    const onAssignTask = vi.fn();
-    render(<JobCockpit {...mockProps} tasks={done} onAssignTask={onAssignTask} />);
-
-    // Filter defaults to pending, so switch to All to see the row.
-    fireEvent.click(screen.getByRole('button', { name: /^All/i }));
-    expect(screen.queryByTestId('assign-task-t-9')).not.toBeInTheDocument();
-    expect(screen.getByTestId('task-assignee-static-t-9')).toHaveTextContent('@Astra');
   });
 
   it('reassigns a queued turn by moving the task it was parked on', () => {

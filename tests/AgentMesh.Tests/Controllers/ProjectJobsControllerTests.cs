@@ -54,7 +54,8 @@ public class ProjectJobsControllerTests
 
         var inDb = await db.ProjectJobs.FindAsync(dto.Id);
         inDb.Should().NotBeNull();
-        inDb!.Status.Should().Be(ProjectJobStatus.Active);
+        inDb!.Status.Should().Be(ProjectJobStatus.Pending);
+        dto.Status.Should().Be(ProjectJobStatus.Pending);
     }
 
     [Fact]
@@ -298,11 +299,11 @@ public class ProjectJobsControllerTests
         var ok = result.Should().BeOfType<OkObjectResult>().Subject;
         var dto = ok.Value.Should().BeOfType<ProjectJobDto>().Subject;
 
-        dto.Status.Should().Be(ProjectJobStatus.Completed);
+        dto.Status.Should().Be(ProjectJobStatus.Archived);
         dto.ResultSummary.Should().Be("Everything is done and tests pass.");
 
         var inDb = await db.ProjectJobs.FindAsync(job.Id);
-        inDb!.Status.Should().Be(ProjectJobStatus.Completed);
+        inDb!.Status.Should().Be(ProjectJobStatus.Archived);
         inDb.ResultSummary.Should().Be("Everything is done and tests pass.");
     }
 

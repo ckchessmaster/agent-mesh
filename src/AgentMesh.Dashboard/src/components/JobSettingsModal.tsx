@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { X, Sliders, Save, AlertCircle, Trash2 } from 'lucide-react';
+import { X, Sliders, Save, AlertCircle, Trash2, ShieldCheck } from 'lucide-react';
 import type { Project, ProjectJob } from '../types';
-import { ProjectJobStatus } from '../types';
+import { ProjectJobStatus, PlanApprovalPolicy } from '../types';
 
 interface JobSettingsModalProps {
   isOpen: boolean;
@@ -14,6 +14,7 @@ interface JobSettingsModalProps {
     gitBranchName?: string;
     priority?: number;
     status?: ProjectJobStatus;
+    approvalPolicy?: number;
     resultSummary?: string;
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
@@ -32,6 +33,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
   const [gitBranch, setGitBranch] = useState(job.gitBranchName || '');
   const [priority, setPriority] = useState<number>(job.priority ?? 1);
   const [status, setStatus] = useState<ProjectJobStatus>((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
+  const [approvalPolicy, setApprovalPolicy] = useState<number>(job.approvalPolicy ?? PlanApprovalPolicy.LeadOrHuman);
   const [resultSummary, setResultSummary] = useState(job.resultSummary || '');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -45,6 +47,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
       setGitBranch(job.gitBranchName || '');
       setPriority(job.priority ?? 1);
       setStatus((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
+      setApprovalPolicy(job.approvalPolicy ?? PlanApprovalPolicy.LeadOrHuman);
       setResultSummary(job.resultSummary || '');
       setConfirmDelete(false);
       setError(null);
@@ -68,6 +71,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
         gitBranchName: gitBranch.trim() || undefined,
         priority,
         status,
+        approvalPolicy,
         resultSummary: resultSummary.trim() || undefined
       });
       onClose();
@@ -184,6 +188,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
                 data-testid="job-settings-status-select"
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
               >
+                <option value={ProjectJobStatus.Pending}>Pending</option>
                 <option value={ProjectJobStatus.Active}>Active</option>
                 <option value={ProjectJobStatus.Completed}>Completed</option>
                 <option value={ProjectJobStatus.Archived}>Archived</option>
@@ -191,18 +196,36 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
             </div>
           </div>
 
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              Git Branch Name
-            </label>
-            <input
-              type="text"
-              value={gitBranch}
-              onChange={(e) => setGitBranch(e.target.value)}
-              placeholder="e.g. mesh/feature-branch"
-              data-testid="job-settings-branch-input"
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition font-mono"
-            />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5 flex items-center gap-1">
+                <ShieldCheck className="w-3.5 h-3.5 text-sky-400" />
+                <span>Plan Approval Policy</span>
+              </label>
+              <select
+                value={approvalPolicy}
+                onChange={(e) => setApprovalPolicy(Number(e.target.value))}
+                data-testid="job-settings-policy-select"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
+              >
+                <option value={PlanApprovalPolicy.LeadOrHuman}>Lead or Human (Default)</option>
+                <option value={PlanApprovalPolicy.HumanOnly}>Human Operator Only</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                Git Branch Name
+              </label>
+              <input
+                type="text"
+                value={gitBranch}
+                onChange={(e) => setGitBranch(e.target.value)}
+                placeholder="e.g. mesh/feature-branch"
+                data-testid="job-settings-branch-input"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition font-mono"
+              />
+            </div>
           </div>
 
           <div>

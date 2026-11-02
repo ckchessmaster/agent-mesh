@@ -81,7 +81,7 @@ public class ProjectJob
 
     public string Title { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
-    public ProjectJobStatus Status { get; set; } = ProjectJobStatus.Active;
+    public ProjectJobStatus Status { get; set; } = ProjectJobStatus.Pending;
     public ProjectJobPriority Priority { get; set; } = ProjectJobPriority.Normal;
 
     public string GitBranchName { get; set; } = string.Empty;
