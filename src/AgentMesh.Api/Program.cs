@@ -18,7 +18,11 @@ using Temporalio.Extensions.Hosting;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.AddServiceDefaults();
-builder.AddNpgsqlDbContext<AgentMeshDbContext>("agentdb", configureDbContextOptions: options => options.UseSnakeCaseNamingConvention());
+builder.AddNpgsqlDbContext<AgentMeshDbContext>("agentdb", configureDbContextOptions: options =>
+{
+    options.UseSnakeCaseNamingConvention();
+    options.ConfigureWarnings(w => w.Log(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning));
+});
 builder.AddRedisClient("redis");
 
 // Configure Temporal Client

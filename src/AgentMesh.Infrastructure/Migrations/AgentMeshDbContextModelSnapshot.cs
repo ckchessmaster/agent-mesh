@@ -985,7 +985,7 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Property<int>("Status")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("integer")
-                        .HasDefaultValue(0)
+                        .HasDefaultValue(3)
                         .HasColumnName("status");
 
                     b.Property<string>("TasksJson")

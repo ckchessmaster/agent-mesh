@@ -1,5 +1,6 @@
 using AgentMesh.Core.Models;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 
 namespace AgentMesh.Infrastructure.Data;
 
@@ -26,6 +27,7 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
         {
             optionsBuilder.UseSnakeCaseNamingConvention();
         }
+        optionsBuilder.ConfigureWarnings(w => w.Log(RelationalEventId.PendingModelChangesWarning));
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)

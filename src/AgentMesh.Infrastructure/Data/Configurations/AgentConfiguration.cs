@@ -37,6 +37,7 @@ public class AgentConfiguration : IEntityTypeConfiguration<Agent>
 
         builder.Property(a => a.TrustTier)
             .HasDefaultValue(TrustTier.Intern)
+            .HasSentinel((TrustTier)0)
             .IsRequired();
 
         builder.Property(a => a.PersonaPrompt)

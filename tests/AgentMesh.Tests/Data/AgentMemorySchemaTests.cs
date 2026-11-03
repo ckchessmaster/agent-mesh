@@ -245,7 +245,7 @@ public class AgentMemorySchemaTests
     /// <see cref="TipMigrationId"/> is the tripwire's current value, updated by whoever stacks the next
     /// migration. See <see cref="MigrationSequence_KeepsMigrationsInOrder"/>.
     /// </remarks>
-    private const string TipMigrationId = "20261101174906_AddJobFirstLifecycleSchema";
+    private const string TipMigrationId = "20261102230722_UpdateProjectJobStatusDefaultAndSentinels";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()

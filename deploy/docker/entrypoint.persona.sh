@@ -79,9 +79,9 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
 fi
 
 # Ensure persistent workspace state directories exist with restricted permissions
-mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude
+mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.local/bin
 chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
-chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude 2>/dev/null || true
+chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.local 2>/dev/null || true
 
 # Ensure ~/.bashrc exports PATH for all interactive shells
 if ! grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null; then
@@ -93,7 +93,7 @@ if [ -L /root/.config ]; then rm -f /root/.config; fi
 if [ -L /root/.aip ]; then rm -f /root/.aip; fi
 if [ -L /root/.gemini ]; then rm -f /root/.gemini; fi
 if [ -L /root/.claude ]; then rm -f /root/.claude; fi
-mkdir -p /root/.config /root/.aip /root/.gemini /root/.claude
+mkdir -p /root/.config /root/.aip /root/.gemini /root/.claude /root/.local/bin
 chmod 700 /root/.config /root/.aip /root/.gemini /root/.claude 2>/dev/null || true
 
 # Restore persistent state from workspace volume into local directories
@@ -107,6 +107,11 @@ if [ -d /workspace/.agentmesh/state ]; then
             chmod 700 "/root/$bname" 2>/dev/null || true
         fi
     done
+fi
+if [ -d /workspace/.agentmesh/state/.local/bin ]; then
+    mkdir -p /root/.local/bin
+    cp -a /workspace/.agentmesh/state/.local/bin/. /root/.local/bin/ 2>/dev/null || true
+    chmod 755 /root/.local/bin/* 2>/dev/null || true
 fi
 
 # Ensure Google AI Pro OAuth token is in place if mounted from Secret volume or passed via environment
@@ -138,6 +143,11 @@ sync_persona_state() {
         mkdir -p /workspace/.agentmesh/state/.claude
         cp -a /root/.claude/. /workspace/.agentmesh/state/.claude/ 2>/dev/null || true
     fi
+    if [ -d /root/.local/bin ]; then
+        mkdir -p /workspace/.agentmesh/state/.local/bin
+        cp -a /root/.local/bin/. /workspace/.agentmesh/state/.local/bin/ 2>/dev/null || true
+        chmod 700 /workspace/.agentmesh/state/.local 2>/dev/null || true
+    fi
     # Also synchronize all existing state directories in /workspace/.agentmesh/state
     if [ -d /workspace/.agentmesh/state ]; then
         for sdir in /workspace/.agentmesh/state/.*; do
@@ -152,10 +162,30 @@ sync_persona_state() {
 }
 
 # Run companion setup script if configured (e.g. install helper CLI)
-if [ -n "$COMPANION_SETUP" ]; then
+run_companion_setup() {
+    if [ -z "$COMPANION_SETUP" ]; then
+        return 0
+    fi
     echo "Executing companion setup script..."
-    eval "$COMPANION_SETUP" || echo "Warning: Companion setup exited with code $?"
+    local setup_ok=0
+    for attempt in {1..15}; do
+        if ( set -o pipefail; eval "$COMPANION_SETUP" ); then
+            setup_ok=1
+            hash -r 2>/dev/null || true
+            echo "Companion setup completed successfully."
+            break
+        fi
+        echo "Companion setup attempt $attempt/15 failed. Retrying in 2s..."
+        sleep 2
+    done
+    if [ "$setup_ok" -ne 1 ]; then
+        echo "Warning: Companion setup failed after 15 attempts. Proceeding..."
+    fi
     sync_persona_state
+}
+
+if [ -n "$COMPANION_SETUP" ]; then
+    run_companion_setup
 fi
 
 # Start background periodic state synchronization worker
@@ -171,7 +201,24 @@ SYNC_PID=$!
 if [ -n "$COMPANION_COMMAND" ]; then
     echo "Starting companion daemon supervisor: $COMPANION_COMMAND"
     (
+        COMPANION_BIN=$(echo "$COMPANION_COMMAND" | awk '{print $1}')
         while true; do
+            # If the companion executable is not on PATH, attempt setup/recovery instead of crash looping
+            if [ -n "$COMPANION_BIN" ] && ! command -v "$COMPANION_BIN" >/dev/null 2>&1; then
+                if [ -n "$COMPANION_SETUP" ]; then
+                    echo "Companion binary '$COMPANION_BIN' not found on PATH. Attempting companion setup..."
+                    ( set -o pipefail; eval "$COMPANION_SETUP" ) || true
+                    hash -r 2>/dev/null || true
+                    sync_persona_state 2>/dev/null || true
+                fi
+                if ! command -v "$COMPANION_BIN" >/dev/null 2>&1; then
+                    echo "Waiting for companion binary '$COMPANION_BIN' to become available..."
+                    sleep 5
+                    continue
+                fi
+                echo "Companion binary '$COMPANION_BIN' is now available."
+            fi
+
             eval "$COMPANION_COMMAND" || true
             sleep 2
         done
