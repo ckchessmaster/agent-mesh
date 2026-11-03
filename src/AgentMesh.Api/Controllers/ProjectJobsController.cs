@@ -36,7 +36,8 @@ public record ProjectJobDto(
     PlanApprovalPolicy ApprovalPolicy = PlanApprovalPolicy.LeadOrHuman,
     string? CurrentTaskId = null,
     string? ProgressHeartbeat = null,
-    string? LifecycleStatus = null
+    string? LifecycleStatus = null,
+    string? AssignedAgentId = null
 );
 
 public record QueuedJobTurnDto(
@@ -60,7 +61,8 @@ public record CreateProjectJobRequest(
     string? GitBranchName = null,
     List<string>? InitialTasks = null,
     ProjectJobPriority? Priority = null,
-    PlanApprovalPolicy? ApprovalPolicy = null
+    PlanApprovalPolicy? ApprovalPolicy = null,
+    string? AssignedAgentId = null
 );
 
 public record UpdateProjectJobRequest(
@@ -70,7 +72,8 @@ public record UpdateProjectJobRequest(
     ProjectJobStatus? Status = null,
     string? ResultSummary = null,
     ProjectJobPriority? Priority = null,
-    PlanApprovalPolicy? ApprovalPolicy = null
+    PlanApprovalPolicy? ApprovalPolicy = null,
+    string? AssignedAgentId = null
 );
 
 public record CreateJobTaskRequest(
@@ -238,6 +241,10 @@ public class ProjectJobsController(
             }
         }
 
+        var assignedId = !string.IsNullOrWhiteSpace(req.AssignedAgentId)
+            ? req.AssignedAgentId.Trim().ToLowerInvariant()
+            : project.DefaultLeadPersonaId;
+
         var job = new ProjectJob
         {
             Id = jobId,
@@ -247,6 +254,7 @@ public class ProjectJobsController(
             Status = ProjectJobStatus.Pending,
             Priority = req.Priority ?? ProjectJobPriority.Normal,
             ApprovalPolicy = req.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman,
+            AssignedAgentId = assignedId,
             GitBranchName = branch,
             S3ArchiveKey = project.WorkspaceType == WorkspaceType.S3Archive
                 ? $"projects/{normId}/jobs/{jobId}/workspace.tar.gz"
@@ -287,6 +295,12 @@ public class ProjectJobsController(
         if (req.Priority.HasValue) job.Priority = req.Priority.Value;
         if (req.ApprovalPolicy.HasValue) job.ApprovalPolicy = req.ApprovalPolicy.Value;
         if (req.ResultSummary != null) job.ResultSummary = req.ResultSummary.Trim();
+        if (req.AssignedAgentId != null)
+        {
+            job.AssignedAgentId = string.IsNullOrWhiteSpace(req.AssignedAgentId)
+                ? null
+                : req.AssignedAgentId.Trim().ToLowerInvariant();
+        }
 
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
@@ -2033,7 +2047,8 @@ public class ProjectJobsController(
             j.ApprovalPolicy,
             j.CurrentTaskId,
             j.ProgressHeartbeat,
-            DeriveLifecycleStatus(j)
+            DeriveLifecycleStatus(j),
+            j.AssignedAgentId
         );
     }
 

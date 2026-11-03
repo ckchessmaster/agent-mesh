@@ -1,7 +1,8 @@
-﻿using AgentMesh.Core.Models;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Worker.Activities;
 using FluentAssertions;
+using Microsoft.Extensions.Configuration;
 using Xunit;
 
 namespace AgentMesh.Tests.Workflows;
@@ -294,5 +295,29 @@ public class TurnOutcomeDerivationTests
     {
         HttpAgentTurnRunner.PollInterval.Should().BeLessThan(TimeSpan.FromSeconds(5));
         HttpAgentTurnRunner.PollInterval.Should().BeGreaterThan(TimeSpan.Zero);
+    }
+
+    [Fact]
+    public void ResolveApiBaseUrl_FallsBackThroughKubernetesAndAspire()
+    {
+        var emptyConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
+        HttpAgentTurnRunner.ResolveApiBaseUrl(emptyConfig).Should().BeNull();
+
+        var k8sConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Kubernetes:ApiUrl"] = "http://mesh-api:5000"
+            })
+            .Build();
+        HttpAgentTurnRunner.ResolveApiBaseUrl(k8sConfig).Should().Be("http://mesh-api:5000");
+
+        var platformConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Platform:ApiBaseUrl"] = "http://direct-platform:5000",
+                ["Kubernetes:ApiUrl"] = "http://mesh-api:5000"
+            })
+            .Build();
+        HttpAgentTurnRunner.ResolveApiBaseUrl(platformConfig).Should().Be("http://direct-platform:5000");
     }
 }

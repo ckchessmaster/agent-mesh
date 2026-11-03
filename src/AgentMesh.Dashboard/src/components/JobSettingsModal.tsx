@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { X, Sliders, Save, AlertCircle, Trash2, ShieldCheck } from 'lucide-react';
-import type { Project, ProjectJob } from '../types';
+import React, { useState, useEffect, useMemo } from 'react';
+import { X, Sliders, Save, AlertCircle, Trash2, ShieldCheck, Users } from 'lucide-react';
+import type { Project, ProjectJob, Persona } from '../types';
 import { ProjectJobStatus, PlanApprovalPolicy } from '../types';
 
 interface JobSettingsModalProps {
@@ -8,6 +8,7 @@ interface JobSettingsModalProps {
   onClose: () => void;
   project: Project;
   job: ProjectJob;
+  availablePersonas?: Persona[];
   onSave: (req: {
     title?: string;
     description?: string;
@@ -16,6 +17,7 @@ interface JobSettingsModalProps {
     status?: ProjectJobStatus;
     approvalPolicy?: number;
     resultSummary?: string;
+    assignedAgentId?: string | null;
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
 }
@@ -25,11 +27,32 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
   onClose,
   project,
   job,
+  availablePersonas = [],
   onSave,
   onDelete
 }) => {
+  const teamOptions = useMemo(() => {
+    const list: Array<{ id: string; name: string; role: string }> = [];
+    const seen = new Set<string>();
+
+    for (const p of project.assignedPersonas || []) {
+      if (!seen.has(p.id)) {
+        seen.add(p.id);
+        list.push({ id: p.id, name: p.name, role: p.role });
+      }
+    }
+    for (const p of availablePersonas || []) {
+      if (!seen.has(p.id)) {
+        seen.add(p.id);
+        list.push({ id: p.id, name: p.name, role: p.role });
+      }
+    }
+    return list;
+  }, [project.assignedPersonas, availablePersonas]);
+
   const [title, setTitle] = useState(job.title || '');
   const [description, setDescription] = useState(job.description || '');
+  const [assignedAgentId, setAssignedAgentId] = useState(job.assignedAgentId || '');
   const [gitBranch, setGitBranch] = useState(job.gitBranchName || '');
   const [priority, setPriority] = useState<number>(job.priority ?? 1);
   const [status, setStatus] = useState<ProjectJobStatus>((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
@@ -44,6 +67,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
     if (isOpen) {
       setTitle(job.title || '');
       setDescription(job.description || '');
+      setAssignedAgentId(job.assignedAgentId || '');
       setGitBranch(job.gitBranchName || '');
       setPriority(job.priority ?? 1);
       setStatus((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
@@ -72,7 +96,8 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
         priority,
         status,
         approvalPolicy,
-        resultSummary: resultSummary.trim() || undefined
+        resultSummary: resultSummary.trim() || undefined,
+        assignedAgentId: assignedAgentId.trim() || null
       });
       onClose();
     } catch (err: any) {
@@ -158,6 +183,27 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
               data-testid="job-settings-desc-input"
               className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition leading-relaxed"
             />
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1.5 flex items-center gap-1">
+              <Users className="w-3.5 h-3.5 text-sky-400" />
+              <span>Assigned Team Member</span>
+            </label>
+            <select
+              value={assignedAgentId}
+              onChange={(e) => setAssignedAgentId(e.target.value)}
+              aria-label="Assigned Team Member"
+              data-testid="job-settings-assigned-agent"
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
+            >
+              <option value="">Default (@{project.defaultLeadPersonaId || 'implementer'})</option>
+              {teamOptions.map((p) => (
+                <option key={p.id} value={p.id}>
+                  @{p.id} — {p.name} ({p.role})
+                </option>
+              ))}
+            </select>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
