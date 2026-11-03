@@ -9,7 +9,9 @@ using AgentMesh.Worker.Activities;
 using AgentMesh.Worker.Services;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using Xunit;
 
 namespace AgentMesh.Tests.Workflows;
@@ -719,5 +721,99 @@ public class TurnSessionResolutionTests
     private sealed class StubHttpClientFactory : System.Net.Http.IHttpClientFactory
     {
         public System.Net.Http.HttpClient CreateClient(string name) => new();
+    }
+
+    private sealed class MockHttpMessageHandler(System.Net.HttpStatusCode statusCode, string responseBody) : HttpMessageHandler
+    {
+        public HttpRequestMessage? LastRequest { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            LastRequest = request;
+            var response = new HttpResponseMessage(statusCode)
+            {
+                Content = new StringContent(responseBody, System.Text.Encoding.UTF8, "application/json")
+            };
+            return Task.FromResult(response);
+        }
+    }
+
+    [Fact]
+    public async Task DispatchAsync_ExtractsTurnSessionId_AndRecordsPairing()
+    {
+        using var db = TestDbContextFactory.Create();
+        var handler = new MockHttpMessageHandler(
+            System.Net.HttpStatusCode.OK,
+            "{\"turnSessionId\":\"7fe7c45d-e466-4783-b6fa-7c9446f411c0\",\"driverId\":\"spence-ai\",\"personaId\":\"rook\",\"dispatchedAt\":\"2026-11-03T17:50:24.4862634+00:00\",\"alreadyRunning\":false}"
+        );
+        var client = new HttpClient(handler);
+        var factoryMock = new Mock<IHttpClientFactory>();
+        factoryMock.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(client);
+
+        var config = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Platform:ApiBaseUrl"] = "http://localhost:5000",
+                ["Auth:StaticApiKey"] = "test-key"
+            })
+            .Build();
+
+        var repo = new WorkspaceStateRepository(db);
+        var runner = new HttpAgentTurnRunner(
+            db,
+            repo,
+            factoryMock.Object,
+            config,
+            NullLogger<HttpAgentTurnRunner>.Instance);
+
+        var jobId = Guid.NewGuid();
+        db.Projects.Add(new Project { Id = "proj-1", Name = "Project 1" });
+        db.ProjectJobs.Add(new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "proj-1",
+            Title = "Test Job",
+            TasksJson = "[]",
+        });
+        await db.SaveChangesAsync();
+
+        var input = new TaskExecutionInput(
+            JobId: jobId.ToString(),
+            TaskId: "stage-1-discovery",
+            AgentId: "rook",
+            ProjectId: "proj-1",
+            WorkspacePath: "/workspace",
+            TargetBranch: "main",
+            PersonaId: "rook"
+        );
+        var stack = new AssembledPromptStack("system", "envelope", [], "/workspace");
+        var request = new AgentTurnRequest(
+            Input: input,
+            Stack: stack,
+            WorkspacePath: "/workspace",
+            PersonaId: "rook",
+            AgentId: "rook"
+        );
+
+        var dispatchMethod = typeof(HttpAgentTurnRunner).GetMethod("DispatchAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(dispatchMethod);
+
+        var resultTask = (Task<Guid?>)dispatchMethod.Invoke(runner, [request, CancellationToken.None])!;
+        var result = await resultTask;
+
+        result.Should().Be(Guid.Parse("7fe7c45d-e466-4783-b6fa-7c9446f411c0"));
+
+        // Verify pairing was recorded
+        var checkpoint = await repo.GetCheckpointAsync(jobId.ToString(), "stage-1-discovery");
+        checkpoint.Should().NotBeNull();
+        checkpoint!.TurnSessionId.Should().Be("7fe7c45d-e466-4783-b6fa-7c9446f411c0");
+
+        // Verify auth headers were sent
+        handler.LastRequest.Should().NotBeNull();
+        handler.LastRequest!.Headers.Contains("X-Api-Key").Should().BeTrue();
+        handler.LastRequest.Headers.GetValues("X-Api-Key").First().Should().Be("test-key");
+        handler.LastRequest.Headers.Contains("X-Agent-Id").Should().BeTrue();
+        handler.LastRequest.Headers.GetValues("X-Agent-Id").First().Should().Be("temporal-worker");
     }
 }

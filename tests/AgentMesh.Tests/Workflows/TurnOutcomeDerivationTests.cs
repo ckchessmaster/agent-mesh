@@ -352,4 +352,21 @@ public class TurnOutcomeDerivationTests
             .Build();
         HttpAgentTurnRunner.ResolveApiKey(platformConfig).Should().Be("custom-platform-key");
     }
+
+    [Fact]
+    public void TryReadGuidProperty_ParsesExactDispatchPayload_AndCaseVariations()
+    {
+        var json = "{\"turnSessionId\":\"7fe7c45d-e466-4783-b6fa-7c9446f411c0\",\"driverId\":\"spence-ai\",\"personaId\":\"rook\",\"dispatchedAt\":\"2026-11-03T17:50:24.4862634+00:00\",\"alreadyRunning\":false}";
+        var expected = Guid.Parse("7fe7c45d-e466-4783-b6fa-7c9446f411c0");
+
+        HttpAgentTurnRunner.TryReadGuidProperty(json, "turnSessionId").Should().Be(expected);
+        HttpAgentTurnRunner.TryReadGuidProperty(json, "TurnSessionId").Should().Be(expected);
+
+        var pascalJson = "{\"TurnSessionId\":\"7fe7c45d-e466-4783-b6fa-7c9446f411c0\"}";
+        HttpAgentTurnRunner.TryReadGuidProperty(pascalJson, "turnSessionId").Should().Be(expected);
+
+        HttpAgentTurnRunner.TryReadGuidProperty(json, "nonExistent").Should().BeNull();
+        HttpAgentTurnRunner.TryReadGuidProperty("not json", "turnSessionId").Should().BeNull();
+        HttpAgentTurnRunner.TryReadGuidProperty(null, "turnSessionId").Should().BeNull();
+    }
 }
