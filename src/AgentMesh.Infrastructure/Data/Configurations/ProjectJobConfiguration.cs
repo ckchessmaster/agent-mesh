@@ -27,10 +27,12 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
 
         builder.Property(j => j.Status)
             .HasDefaultValue(ProjectJobStatus.Pending)
+            .HasSentinel((ProjectJobStatus)(-1))
             .IsRequired();
 
         builder.Property(j => j.Priority)
             .HasDefaultValue(ProjectJobPriority.Normal)
+            .HasSentinel((ProjectJobPriority)(-1))
             .IsRequired();
 
         builder.Property(j => j.GitBranchName)

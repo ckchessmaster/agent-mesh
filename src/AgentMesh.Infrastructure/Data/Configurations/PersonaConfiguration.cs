@@ -60,6 +60,7 @@ public class PersonaConfiguration : IEntityTypeConfiguration<Persona>
 
         builder.Property(p => p.TrustTier)
             .HasDefaultValue(TrustTier.Intern)
+            .HasSentinel((TrustTier)0)
             .IsRequired();
 
         builder.Property(p => p.CreatedAt)
