@@ -340,23 +340,25 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     }
 
     /// <summary>
-    /// Resolves the platform API key from configuration or environment, falling back to
-    /// standard mesh auth keys and the default development key.
+    /// Resolves the platform API key from configuration or environment, prioritizing
+    /// shared cluster secrets (Auth:StaticApiKey / AGENTMESH_TOKEN) and falling back
+    /// to development defaults.
     /// </summary>
     internal static string ResolveApiKey(IConfiguration config)
     {
-        return config[ApiKeyConfigKey]
-            ?? config["Platform:ApiKey"]
-            ?? config["Platform__ApiKey"]
-            ?? config["PLATFORM_APIKEY"]
-            ?? config["Auth:StaticApiKey"]
+        return config["Auth:StaticApiKey"]
             ?? config["Auth__StaticApiKey"]
             ?? config["AUTH_STATICAPIKEY"]
             ?? config["AGENTMESH_TOKEN"]
             ?? config["AgentMesh_Token"]
-            ?? Environment.GetEnvironmentVariable("PLATFORM_APIKEY")
             ?? Environment.GetEnvironmentVariable("AUTH_STATICAPIKEY")
+            ?? Environment.GetEnvironmentVariable("Auth__StaticApiKey")
             ?? Environment.GetEnvironmentVariable("AGENTMESH_TOKEN")
+            ?? config[ApiKeyConfigKey]
+            ?? config["Platform:ApiKey"]
+            ?? config["Platform__ApiKey"]
+            ?? config["PLATFORM_APIKEY"]
+            ?? Environment.GetEnvironmentVariable("PLATFORM_APIKEY")
             ?? "mesh-default-secret-key";
     }
 
@@ -403,6 +405,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         if (!string.IsNullOrWhiteSpace(apiKey))
         {
             message.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);
+            message.Headers.TryAddWithoutValidation("X-Agent-Key", apiKey);
+            message.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             message.Headers.TryAddWithoutValidation("X-Agent-Id", "temporal-worker");
         }
 

@@ -51,8 +51,13 @@ public class ApiKeyAuthenticationHandler(
         }
 
         // 2. Check Master Dev Key for backwards compatibility / local developer access
-        var staticApiKey = configuration["Auth:StaticApiKey"];
-        var agentMeshToken = configuration["AGENTMESH_TOKEN"];
+        var staticApiKey = configuration["Auth:StaticApiKey"]
+            ?? configuration["Auth__StaticApiKey"]
+            ?? configuration["AUTH_STATICAPIKEY"]
+            ?? configuration["Platform:ApiKey"]
+            ?? configuration["Platform__ApiKey"];
+        var agentMeshToken = configuration["AGENTMESH_TOKEN"]
+            ?? configuration["AgentMesh_Token"];
         var isMasterKey = (!string.IsNullOrEmpty(staticApiKey) && string.Equals(providedKey, staticApiKey, StringComparison.Ordinal)) ||
                           (!string.IsNullOrEmpty(agentMeshToken) && string.Equals(providedKey, agentMeshToken, StringComparison.Ordinal)) ||
                           (string.IsNullOrEmpty(staticApiKey) && string.IsNullOrEmpty(agentMeshToken) && string.Equals(providedKey, "mesh-default-secret-key", StringComparison.Ordinal));
