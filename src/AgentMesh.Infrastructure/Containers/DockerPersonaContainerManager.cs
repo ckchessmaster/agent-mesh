@@ -171,6 +171,21 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 var updateAvailable = !string.IsNullOrWhiteSpace(currentImage) &&
                                       !string.Equals(currentImage, _defaultImage, StringComparison.OrdinalIgnoreCase);
 
+                if (!updateAvailable && _dockerClient != null)
+                {
+                    try
+                    {
+                        var localImage = await _dockerClient.Images.InspectImageAsync(_defaultImage, ct);
+                        if (!string.IsNullOrWhiteSpace(localImage?.ID) &&
+                            !string.IsNullOrWhiteSpace(inspect.Image) &&
+                            !string.Equals(localImage.ID, inspect.Image, StringComparison.OrdinalIgnoreCase))
+                        {
+                            updateAvailable = true;
+                        }
+                    }
+                    catch { }
+                }
+
                 return new PersonaEnvironmentStatus(
                     PersonaId: personaId,
                     Status: isRunning ? "running" : "stopped",

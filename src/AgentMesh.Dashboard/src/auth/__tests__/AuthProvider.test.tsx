@@ -219,4 +219,81 @@ describe('AppAuthProvider & AuthGate', () => {
       expect(mockSigninRedirect).not.toHaveBeenCalled();
     });
   });
+
+  it('preserves return URL in localStorage before redirecting to login on 401', async () => {
+    const originalPathname = window.location.pathname;
+    try {
+      window.history.pushState({}, '', '/?project=proj-123&job=job-456');
+
+      mockUseOidcAuth.mockReturnValue({
+        isLoading: false,
+        isAuthenticated: true,
+        error: null,
+        signinRedirect: mockSigninRedirect,
+        signinSilent: mockSigninSilent.mockRejectedValue(new Error('Silent renew failed')),
+        removeUser: mockRemoveUser,
+        activeNavigator: null,
+        user: {
+          access_token: 'expired-token',
+          profile: { email: 'admin@agentmesh.local' }
+        }
+      });
+
+      render(
+        <AppAuthProvider>
+          <div>Protected App Content</div>
+        </AppAuthProvider>
+      );
+
+      await capturedUnauthorizedHandler!();
+
+      await waitFor(() => {
+        expect(localStorage.getItem('agentmesh_auth_return_url')).toBe('/?project=proj-123&job=job-456');
+        expect(mockSigninRedirect).toHaveBeenCalled();
+      });
+    } finally {
+      window.history.pushState({}, '', originalPathname);
+      localStorage.removeItem('agentmesh_auth_return_url');
+    }
+  });
+
+  it('triggers silent renewal when access token expires without forcefully logging out', async () => {
+    let tokenExpiredCallback: (() => void) | null = null;
+    mockUseOidcAuth.mockReturnValue({
+      isLoading: false,
+      isAuthenticated: true,
+      error: null,
+      signinRedirect: mockSigninRedirect,
+      signinSilent: mockSigninSilent.mockRejectedValue(new Error('IFrame blocked')),
+      removeUser: mockRemoveUser,
+      activeNavigator: null,
+      events: {
+        addAccessTokenExpired: vi.fn((cb) => {
+          tokenExpiredCallback = cb;
+          return () => {};
+        }),
+        addSilentRenewError: vi.fn(() => () => {})
+      },
+      user: {
+        access_token: 'expiring-token',
+        profile: { email: 'admin@agentmesh.local' }
+      }
+    });
+
+    render(
+      <AppAuthProvider>
+        <div>Protected App Content</div>
+      </AppAuthProvider>
+    );
+
+    expect(tokenExpiredCallback).toBeDefined();
+    // When token expires and silent renew fails, it should NOT boot user to login redirect
+    tokenExpiredCallback!();
+
+    await waitFor(() => {
+      expect(mockSigninSilent).toHaveBeenCalled();
+      expect(mockRemoveUser).not.toHaveBeenCalled();
+      expect(mockSigninRedirect).not.toHaveBeenCalled();
+    });
+  });
 });

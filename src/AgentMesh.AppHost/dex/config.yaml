@@ -21,6 +21,9 @@ expiry:
   signingKeys: "720h"
   idTokens: "24h"
   authCodes: "10m"
+  refreshTokens:
+    validIfNotUsedFor: "720h"
+    absoluteLifetime: "2160h"
 
 staticClients:
   - id: agentmesh-dashboard

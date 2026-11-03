@@ -8,6 +8,13 @@ interface AuthGateProps {
   children: ReactNode;
 }
 
+const saveReturnLocation = () => {
+  if (typeof window !== 'undefined' && window.location && !window.location.pathname.startsWith('/auth/callback')) {
+    const fullPath = window.location.pathname + window.location.search + window.location.hash;
+    localStorage.setItem('agentmesh_auth_return_url', fullPath);
+  }
+};
+
 function AuthGate({ children }: AuthGateProps) {
   const auth = useOidcAuth();
 
@@ -37,6 +44,7 @@ function AuthGate({ children }: AuthGateProps) {
         console.warn('Silent session renewal failed after 401:', err);
       }
 
+      saveReturnLocation();
       try {
         await auth.removeUser?.();
       } catch (err) {
@@ -59,16 +67,10 @@ function AuthGate({ children }: AuthGateProps) {
     if (!auth.events) return;
 
     const onTokenExpired = () => {
-      console.warn('OIDC access token expired. Triggering renewal or redirect.');
+      console.warn('OIDC access token expired. Triggering silent renewal.');
       if (auth.signinSilent) {
-        auth.signinSilent().catch(() => {
-          auth.removeUser?.().finally(() => {
-            auth.signinRedirect?.();
-          });
-        });
-      } else {
-        auth.removeUser?.().finally(() => {
-          auth.signinRedirect?.();
+        auth.signinSilent().catch((err) => {
+          console.warn('Silent renewal on token expiration failed; waiting for active API re-auth:', err);
         });
       }
     };
@@ -104,6 +106,7 @@ function AuthGate({ children }: AuthGateProps) {
   useEffect(() => {
     // If not authenticated, not loading, no error, and not handling callback, automatically redirect to OIDC provider
     if (!auth.isAuthenticated && !auth.isLoading && !auth.error && !auth.activeNavigator && !hasAuthParams() && !isCallback) {
+      saveReturnLocation();
       auth.signinRedirect?.()?.catch((err: unknown) => {
         console.error('Failed to initiate OIDC login redirect:', err);
       });
@@ -122,6 +125,7 @@ function AuthGate({ children }: AuthGateProps) {
               if (typeof window !== 'undefined' && window.location.search) {
                 window.history.replaceState({}, document.title, window.location.pathname.replace('/auth/callback', '') || '/');
               }
+              saveReturnLocation();
               auth.signinRedirect?.();
             }}
             className="mt-5 w-full bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs py-2 rounded-lg transition"
@@ -157,7 +161,10 @@ function AuthGate({ children }: AuthGateProps) {
 
 const handleSigninCallback = () => {
   if (typeof window !== 'undefined') {
-    window.history.replaceState({}, document.title, window.location.pathname.replace('/auth/callback', '') || '/');
+    const returnUrl = localStorage.getItem('agentmesh_auth_return_url');
+    localStorage.removeItem('agentmesh_auth_return_url');
+    const target = returnUrl && !returnUrl.includes('/auth/callback') ? returnUrl : '/';
+    window.history.replaceState({}, document.title, target);
   }
 };
 
