@@ -1164,34 +1164,35 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         }
     }
 
-    private static Guid? TryReadGuidProperty(string? json, string property)
+    internal static Guid? TryReadGuidProperty(string? json, string property)
     {
         if (string.IsNullOrWhiteSpace(json)) return null;
 
         try
         {
-            var node = JsonNode.Parse(json);
-            if (node?[property] is null)
+            var root = JsonNode.Parse(json);
+            if (root is null) return null;
+
+            JsonNode? targetNode = root[property];
+            if (targetNode is null && root is JsonObject obj)
             {
-                // Fall back to a case-insensitive scan; the response is serialized camelCase today but
-                // an anonymous-object default would be PascalCase.
-                if (node is JsonObject obj)
+                foreach (var pair in obj)
                 {
-                    foreach (var pair in obj)
+                    if (string.Equals(pair.Key, property, StringComparison.OrdinalIgnoreCase))
                     {
-                        if (!string.Equals(pair.Key, property, StringComparison.OrdinalIgnoreCase)) continue;
-                        node = pair.Value;
+                        targetNode = pair.Value;
                         break;
                     }
                 }
-                else
-                {
-                    return null;
-                }
             }
 
-            var raw = node?.GetValueKind() == JsonValueKind.String ? node?.GetValue<string>() : node?.ToString();
-            return Guid.TryParse(raw?.Trim('"'), out var parsed) ? parsed : null;
+            if (targetNode is null) return null;
+
+            var raw = targetNode.GetValueKind() == JsonValueKind.String
+                ? targetNode.GetValue<string>()
+                : targetNode.ToString();
+
+            return Guid.TryParse(raw?.Trim('"', ' '), out var parsed) ? parsed : null;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
