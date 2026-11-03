@@ -6301,6 +6301,7 @@ export default function App() {
           isOpen={showJobModal}
           onClose={() => setShowJobModal(false)}
           project={jobModalProject}
+          availablePersonas={personas}
           onCreate={handleCreateJob}
         />
       )}

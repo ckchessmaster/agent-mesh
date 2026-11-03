@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
@@ -319,13 +319,45 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     private static bool TryLiveId(string? value, out Guid id) =>
         Guid.TryParse(value?.Trim(), out id) && id != Guid.Empty;
 
+    /// <summary>
+    /// Resolves the API base URL from configuration, with fallbacks to Kubernetes API URL,
+    /// Aspire service discovery, and standard environment variables.
+    /// </summary>
+    internal static string? ResolveApiBaseUrl(IConfiguration config)
+    {
+        return config[ApiBaseUrlConfigKey]
+            ?? config["Platform:ApiBaseUrl"]
+            ?? config["Platform__ApiBaseUrl"]
+            ?? config["PLATFORM_APIBASEURL"]
+            ?? config["Kubernetes:ApiUrl"]
+            ?? config["Kubernetes__ApiUrl"]
+            ?? config["KUBERNETES_APIURL"]
+            ?? config["services:api:http:0"]
+            ?? config["services:api:https:0"]
+            ?? config["services:api:default:0"]
+            ?? Environment.GetEnvironmentVariable("PLATFORM_APIBASEURL")
+            ?? Environment.GetEnvironmentVariable("KUBERNETES_APIURL");
+    }
+
+    /// <summary>
+    /// Resolves the optional platform API key from configuration or environment.
+    /// </summary>
+    internal static string? ResolveApiKey(IConfiguration config)
+    {
+        return config[ApiKeyConfigKey]
+            ?? config["Platform:ApiKey"]
+            ?? config["Platform__ApiKey"]
+            ?? config["PLATFORM_APIKEY"]
+            ?? Environment.GetEnvironmentVariable("PLATFORM_APIKEY");
+    }
+
     private async Task<Guid?> DispatchAsync(AgentTurnRequest request, CancellationToken ct)
     {
-        var baseUrl = config[ApiBaseUrlConfigKey];
+        var baseUrl = ResolveApiBaseUrl(config);
         if (string.IsNullOrWhiteSpace(baseUrl))
         {
             throw new InvalidOperationException(
-                $"'{ApiBaseUrlConfigKey}' is not configured on the worker, so a coding turn cannot be " +
+                $"'{ApiBaseUrlConfigKey}' is not configured on the worker (checked {ApiBaseUrlConfigKey}, Kubernetes:ApiUrl, and services:api), so a coding turn cannot be " +
                 "dispatched. The worker holds no LLM client by design: turns run in a persona " +
                 "container, started by the API's turn dispatcher over this endpoint.");
         }
@@ -358,7 +390,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             Content = new StringContent(JsonSerializer.Serialize(payload, JsonOpts), Encoding.UTF8, "application/json"),
         };
 
-        var apiKey = config[ApiKeyConfigKey];
+        var apiKey = ResolveApiKey(config);
         if (!string.IsNullOrWhiteSpace(apiKey))
         {
             message.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);

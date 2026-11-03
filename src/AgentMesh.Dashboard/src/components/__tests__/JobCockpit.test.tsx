@@ -1441,4 +1441,27 @@ describe('JobCockpit - Task assignment and reassignment', () => {
     // Astra's focus task is t-1, so that is the task whose queue must move.
     expect(onAssignTask).toHaveBeenCalledWith('t-1', 'agy-soren');
   });
+
+  it('renders the job assignee select and triggers onUpdateJob when changed', () => {
+    const onUpdateJob = vi.fn().mockResolvedValue(undefined);
+    const assignedJob: ProjectJob = {
+      ...mockJob,
+      assignedAgentId: 'agy-astra'
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={assignedJob}
+        onUpdateJob={onUpdateJob}
+      />
+    );
+
+    const assigneeSelect = screen.getByTestId('cockpit-assigned-agent-select');
+    expect(assigneeSelect).toBeInTheDocument();
+    expect((assigneeSelect as HTMLSelectElement).value).toBe('agy-astra');
+
+    fireEvent.change(assigneeSelect, { target: { value: 'agy-soren' } });
+    expect(onUpdateJob).toHaveBeenCalledWith({ assignedAgentId: 'agy-soren' });
+  });
 });

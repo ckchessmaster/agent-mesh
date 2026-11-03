@@ -893,6 +893,7 @@ export const api = {
     initialTasks?: string[];
     priority?: number;
     approvalPolicy?: number;
+    assignedAgentId?: string | null;
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
       method: 'POST',
@@ -911,6 +912,7 @@ export const api = {
     resultSummary?: string;
     priority?: number;
     approvalPolicy?: number;
+    assignedAgentId?: string | null;
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
       method: 'PUT',

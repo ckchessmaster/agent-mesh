@@ -512,6 +512,7 @@ export interface ProjectJob {
   currentTaskId?: string | null;
   progressHeartbeat?: string | null;
   lifecycleStatus?: JobLifecycleStatus | string | null;
+  assignedAgentId?: string | null;
   queuedTurns?: QueuedJobTurnDto[];
   messageCount: number;
   createdAt: string;

@@ -59,6 +59,83 @@ public class ProjectJobsControllerTests
     }
 
     [Fact]
+    public async Task CreateJob_WithAssignedAgentId_SavesAndExposesAssignedAgentId()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project
+        {
+            Id = "core-app",
+            Name = "Core App",
+            WorkspaceType = WorkspaceType.Git,
+            DefaultLeadPersonaId = "lead-persona"
+        };
+        db.Projects.Add(project);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        // 1. When explicit AssignedAgentId is supplied
+        var req1 = new CreateProjectJobRequest(
+            Title: "Build Auth Provider",
+            AssignedAgentId: "astra"
+        );
+        var result1 = await controller.CreateJob("core-app", req1);
+        var dto1 = (result1.Should().BeOfType<CreatedAtActionResult>().Subject.Value as ProjectJobDto)!;
+        dto1.AssignedAgentId.Should().Be("astra");
+
+        var inDb1 = await db.ProjectJobs.FindAsync(dto1.Id);
+        inDb1!.AssignedAgentId.Should().Be("astra");
+
+        // 2. When AssignedAgentId is omitted, falls back to DefaultLeadPersonaId
+        var req2 = new CreateProjectJobRequest(Title: "Fix UI Glitch");
+        var result2 = await controller.CreateJob("core-app", req2);
+        var dto2 = (result2.Should().BeOfType<CreatedAtActionResult>().Subject.Value as ProjectJobDto)!;
+        dto2.AssignedAgentId.Should().Be("lead-persona");
+
+        var inDb2 = await db.ProjectJobs.FindAsync(dto2.Id);
+        inDb2!.AssignedAgentId.Should().Be("lead-persona");
+    }
+
+    [Fact]
+    public async Task UpdateJob_ChangingAssignedAgentId_UpdatesJob()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "app", Name = "App" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "app",
+            Title = "Job 1",
+            AssignedAgentId = "lead-persona",
+            TasksJson = "[]"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        var updateRes = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(
+            AssignedAgentId: "astra"
+        ));
+
+        var updated = (updateRes.Should().BeOfType<OkObjectResult>().Subject.Value as ProjectJobDto)!;
+        updated.AssignedAgentId.Should().Be("astra");
+
+        var inDb = await db.ProjectJobs.FindAsync(job.Id);
+        inDb!.AssignedAgentId.Should().Be("astra");
+
+        // Reassign to null / empty string
+        var clearRes = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(
+            AssignedAgentId: ""
+        ));
+        var cleared = (clearRes.Should().BeOfType<OkObjectResult>().Subject.Value as ProjectJobDto)!;
+        cleared.AssignedAgentId.Should().BeNull();
+    }
+
+    [Fact]
     public async Task TaskManagement_CanAddToggleAndDeleteTasks()
     {
         using var db = TestDbContextFactory.Create();

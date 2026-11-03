@@ -239,6 +239,7 @@ interface JobCockpitProps {
     priority?: number;
     status?: ProjectJobStatus;
     resultSummary?: string;
+    assignedAgentId?: string | null;
   }) => Promise<void>;
   onDeleteJob?: () => Promise<void>;
   onStopTurn?: (sessionId: string) => Promise<void>;
@@ -1234,6 +1235,30 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
         {/* Assigned Personas & Actions */}
         <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+          {/* Job Assignee Dropdown */}
+          <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl text-xs">
+            <span className="text-[11px] font-semibold text-slate-400">Assignee:</span>
+            <select
+              value={job.assignedAgentId || project.defaultLeadPersonaId || ''}
+              onChange={async (e) => {
+                if (onUpdateJob) {
+                  await onUpdateJob({ assignedAgentId: e.target.value || null });
+                }
+              }}
+              title="Assign this job to a team member"
+              aria-label="Assigned Team Member"
+              data-testid="cockpit-assigned-agent-select"
+              className="bg-slate-900 border border-slate-700/70 rounded-md px-2 py-0.5 text-xs text-sky-300 font-medium focus:outline-none focus:border-sky-500 cursor-pointer"
+            >
+              <option value="">Default (@{project.defaultLeadPersonaId || 'implementer'})</option>
+              {teamMembers.map((m) => (
+                <option key={m.id} value={m.id}>
+                  @{m.id} ({m.name})
+                </option>
+              ))}
+            </select>
+          </div>
+
           <div className="hidden lg:flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl">
             <span className="text-[11px] font-semibold text-slate-400 mr-1">Team:</span>
             {project.assignedPersonas?.map((p) => (
@@ -2587,6 +2612,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           onClose={() => setShowJobSettingsModal(false)}
           project={project}
           job={job}
+          availablePersonas={personas}
           onSave={async (updates) => {
             if (onUpdateJob) await onUpdateJob(updates);
           }}
