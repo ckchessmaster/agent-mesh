@@ -2360,4 +2360,49 @@ public class ProjectJobsControllerTests
         public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
             Task.FromException<bool>(new InvalidOperationException("simulated Temporal outage"));
     }
+
+    [Fact]
+    public async Task ResetJob_ResetsJobToPending_ClearsHeartbeat_AndStopsDanglingSessions()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "proj-reset",
+            Title = "Stuck Job",
+            Status = ProjectJobStatus.Active,
+            CurrentTaskId = "stage-1-discovery",
+            ProgressHeartbeat = "Exploring codebase and generating checklist"
+        };
+        db.ProjectJobs.Add(job);
+
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Turn Session",
+            Status = "thinking",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new { jobId = job.Id.ToString() })
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+        var result = await controller.ResetJob(job.Id, temporalClient: null);
+
+        var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+        var dto = ok.Value.Should().BeOfType<ProjectJobDto>().Subject;
+
+        dto.Status.Should().Be(ProjectJobStatus.Pending);
+        dto.CurrentTaskId.Should().BeNull();
+        dto.ProgressHeartbeat.Should().BeNull();
+
+        var updatedJob = await db.ProjectJobs.FindAsync(job.Id);
+        updatedJob!.Status.Should().Be(ProjectJobStatus.Pending);
+        updatedJob.CurrentTaskId.Should().BeNull();
+        updatedJob.ProgressHeartbeat.Should().BeNull();
+
+        var updatedSession = await db.AgentSessions.FindAsync(session.Id);
+        updatedSession!.Status.Should().Be("stopped");
+    }
 }

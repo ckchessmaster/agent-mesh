@@ -1464,4 +1464,27 @@ describe('JobCockpit - Task assignment and reassignment', () => {
     fireEvent.change(assigneeSelect, { target: { value: 'agy-soren' } });
     expect(onUpdateJob).toHaveBeenCalledWith({ assignedAgentId: 'agy-soren' });
   });
+
+  it('renders the reset job button for active job and calls onResetJob upon confirmation', async () => {
+    const onResetJob = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={{ ...mockJob, status: ProjectJobStatus.Active }}
+        onResetJob={onResetJob}
+      />
+    );
+
+    const resetBtn = screen.getByTestId('cockpit-reset-job-btn');
+    expect(resetBtn).toBeInTheDocument();
+
+    fireEvent.click(resetBtn);
+
+    const confirmBtn = screen.getByTestId('cockpit-confirm-reset-btn');
+    expect(confirmBtn).toBeInTheDocument();
+
+    fireEvent.click(confirmBtn);
+    expect(onResetJob).toHaveBeenCalledTimes(1);
+  });
 });

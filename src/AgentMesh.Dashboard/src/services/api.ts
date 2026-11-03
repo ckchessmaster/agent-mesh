@@ -1150,6 +1150,15 @@ export const api = {
     return res.json();
   },
 
+  async resetJob(id: string): Promise<ProjectJob> {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/reset`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to reset job: ${res.statusText}`);
+    return res.json();
+  },
+
   async cancelQueuedJobTurn(jobId: string, turnId: string): Promise<ProjectJob | undefined> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/queued-turns/${encodeURIComponent(turnId)}`, {
       method: 'DELETE',

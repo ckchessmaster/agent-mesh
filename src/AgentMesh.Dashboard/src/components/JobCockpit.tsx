@@ -228,6 +228,7 @@ interface JobCockpitProps {
   onCompleteJob: (resultSummary?: string) => Promise<void>;
   onArchiveJob?: () => Promise<void>;
   onReopenJob?: () => Promise<void>;
+  onResetJob?: () => Promise<void>;
   onSelectTurnSession?: (sessionId: string) => void;
   onOpenLightbox?: (item: { url: string; fileName: string; sizeBytes?: number }) => void;
   onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
@@ -267,6 +268,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onCompleteJob,
   onArchiveJob,
   onReopenJob,
+  onResetJob,
   onSelectTurnSession,
   onOpenLightbox,
   onUploadAttachments,
@@ -283,10 +285,25 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [showJobSettingsModal, setShowJobSettingsModal] = useState(false);
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resultSummary, setResultSummary] = useState('');
   const [isCompleting, setIsCompleting] = useState(false);
   const [isArchiving, setIsArchiving] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+
+  const handleConfirmReset = async () => {
+    if (!onResetJob) return;
+    setIsResetting(true);
+    try {
+      await onResetJob();
+      setShowResetConfirm(false);
+    } catch (err: any) {
+      console.error('Failed to reset job:', err);
+    } finally {
+      setIsResetting(false);
+    }
+  };
 
   const handleStartJob = async () => {
     if (!onStartJob) return;
@@ -1424,6 +1441,43 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     >
                       <Archive className="w-3.5 h-3.5" />
                       <span>Archive</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {onResetJob && (
+                <div>
+                  {showResetConfirm ? (
+                    <div className="flex items-center gap-2 bg-slate-900 border border-rose-500/40 p-1.5 rounded-xl">
+                      <span className="text-xs text-rose-200">Reset to pending &amp; stop workflow?</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowResetConfirm(false)}
+                        className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConfirmReset}
+                        disabled={isResetting}
+                        className="px-3 py-1 bg-rose-500 hover:bg-rose-400 text-slate-950 text-xs font-bold rounded-lg shadow-sm cursor-pointer"
+                        data-testid="cockpit-confirm-reset-btn"
+                      >
+                        {isResetting ? 'Resetting...' : 'Confirm Reset'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowResetConfirm(true)}
+                      title="Terminate running workflow and reset job to pending so it can be restarted"
+                      className="px-3.5 py-1.5 bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/40 text-rose-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                      data-testid="cockpit-reset-job-btn"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Reset Job</span>
                     </button>
                   )}
                 </div>

@@ -1698,6 +1698,63 @@ public class ProjectJobsController(
         return Ok(dto);
     }
 
+    [HttpPost("api/project-jobs/{id}/reset")]
+    public async Task<IActionResult> ResetJob(
+        Guid id,
+        [FromServices] ITemporalClient? temporalClient = null)
+    {
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
+        if (job == null)
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        if (temporalClient != null)
+        {
+            var workflowId = $"job-{id}";
+            try
+            {
+                var handle = temporalClient.GetWorkflowHandle(workflowId);
+                await handle.TerminateAsync("Reset by operator");
+            }
+            catch (Exception ex)
+            {
+                logger?.LogInformation(ex, "Workflow {WorkflowId} could not be terminated or was not running.", workflowId);
+            }
+        }
+
+        // Cancel / stop any dangling turn sessions associated with this job
+        var activeSessions = await db.AgentSessions
+            .Where(s => s.Status == "thinking" || s.Status == "busy")
+            .ToListAsync();
+
+        foreach (var session in activeSessions)
+        {
+            if (ExtractJobId(session.MetadataJson) == id)
+            {
+                session.Status = "stopped";
+                session.UpdatedAt = DateTimeOffset.UtcNow;
+            }
+        }
+
+        job.Status = ProjectJobStatus.Pending;
+        job.CurrentTaskId = null;
+        job.ProgressHeartbeat = null;
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
+        var dto = ToDto(job, project?.Name, msgCount);
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("JobUpdated", dto);
+        }
+
+        return Ok(dto);
+    }
+
     [HttpDelete("api/project-jobs/{id}/queued-turns/{turnId}")]
     public async Task<IActionResult> CancelQueuedTurn(Guid id, Guid turnId)
     {
