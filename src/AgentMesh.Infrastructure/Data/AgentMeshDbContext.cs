@@ -26,8 +26,8 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
         if (!optionsBuilder.IsConfigured)
         {
             optionsBuilder.UseSnakeCaseNamingConvention();
+            optionsBuilder.ConfigureWarnings(w => w.Log(RelationalEventId.PendingModelChangesWarning));
         }
-        optionsBuilder.ConfigureWarnings(w => w.Log(RelationalEventId.PendingModelChangesWarning));
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
