@@ -1,4 +1,5 @@
 using AgentMesh.Api.Hubs;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -12,6 +13,7 @@ public class PersonaIdleReaperService : BackgroundService
     private readonly ILogger<PersonaIdleReaperService> _logger;
     private readonly TimeSpan _idleTimeout;
     private readonly TimeSpan _checkInterval;
+    private readonly bool _autoUpdateIdleRunners;
 
     public PersonaIdleReaperService(
         IServiceProvider serviceProvider,
@@ -28,12 +30,14 @@ public class PersonaIdleReaperService : BackgroundService
 
         var checkSeconds = config.GetValue<int>("PersonaContainer:ReaperCheckIntervalSeconds", 60);
         _checkInterval = TimeSpan.FromSeconds(Math.Max(5, checkSeconds));
+
+        _autoUpdateIdleRunners = config.GetValue<bool>("PersonaContainer:AutoUpdateIdleRunners", true);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("PersonaIdleReaperService started (Timeout: {Timeout}, Interval: {Interval})",
-            _idleTimeout, _checkInterval);
+        _logger.LogInformation("PersonaIdleReaperService started (Timeout: {Timeout}, Interval: {Interval}, AutoUpdateIdleRunners: {AutoUpdate})",
+            _idleTimeout, _checkInterval, _autoUpdateIdleRunners);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -83,6 +87,26 @@ public class PersonaIdleReaperService : BackgroundService
                 if (hasActiveThinking)
                 {
                     continue;
+                }
+
+                // Auto-update runner if an update is available and persona is idle
+                if (_autoUpdateIdleRunners && status.UpdateAvailable)
+                {
+                    var hasActiveJob = await db.ProjectJobs
+                        .AsNoTracking()
+                        .AnyAsync(j => j.AssignedAgentId == personaId && j.Status == ProjectJobStatus.Active, ct);
+
+                    // Safety grace period: if the container started within the last 60 seconds, do not immediately restart
+                    var startedRecently = status.StartedAt.HasValue && (now - status.StartedAt.Value) < TimeSpan.FromSeconds(60);
+
+                    if (!hasActiveJob && !startedRecently)
+                    {
+                        _logger.LogInformation("Persona @{PersonaId} is idle and has an update available ({Current} -> {Configured}). Auto-updating runner...",
+                            personaId, status.Image, status.ConfiguredImage);
+
+                        await _containerManager.RestartAsync(personaId, ct);
+                        continue;
+                    }
                 }
 
                 // Find last activity time across sessions for this persona

@@ -26,6 +26,7 @@ data:
   PersonaContainer__ImagePullSecret: {{ .Values.config.personaRunner.imagePullSecret | quote }}
 {{- end }}
   PersonaContainer__IdleTimeoutMinutes: {{ .Values.config.personaRunner.idleTimeoutMinutes | quote }}
+  PersonaContainer__AutoUpdateIdleRunners: {{ .Values.config.personaRunner.autoUpdateIdleRunners | default true | quote }}
   PersonaContainer__WorkspaceSize: {{ .Values.config.personaRunner.storage.size | default "10Gi" | quote }}
 {{- if .Values.config.personaRunner.storage.storageClassName }}
   PersonaContainer__StorageClassName: {{ .Values.config.personaRunner.storage.storageClassName | quote }}

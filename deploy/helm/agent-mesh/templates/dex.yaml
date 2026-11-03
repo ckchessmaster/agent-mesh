@@ -25,6 +25,9 @@ data:
       signingKeys: "720h"
       idTokens: "24h"
       authCodes: "10m"
+      refreshTokens:
+        validIfNotUsedFor: "720h"
+        absoluteLifetime: "2160h"
     staticClients:
       - id: {{ .Values.config.oidc.clientId | quote }}
         redirectURIs:

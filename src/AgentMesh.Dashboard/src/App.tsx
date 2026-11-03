@@ -253,24 +253,88 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [sessions, setSessions] = useState<AgentSession[]>([]);
-  const [activeTab, setActiveTab] = useState<'projects' | 'personas' | 'drivers'>('personas');
-  const hasUserSwitchedTabRef = useRef(false);
-  const [selectedPersonaId, setSelectedPersonaId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'projects' | 'personas' | 'drivers'>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('agentmesh_active_tab');
+      if (saved === 'projects' || saved === 'personas' || saved === 'drivers') {
+        return saved;
+      }
+    }
+    return 'personas';
+  });
+  const hasUserSwitchedTabRef = useRef(
+    typeof window !== 'undefined' && !!localStorage.getItem('agentmesh_active_tab')
+  );
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string | null>(() => {
+    return typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_persona_id') : null;
+  });
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(() => {
+    return typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_session_id') : null;
+  });
   const [events, setEvents] = useState<SessionMessage[]>([]);
 
   // Projects & Jobs state
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => {
+    return typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_project_id') : null;
+  });
   const [jobsByProject, setJobsByProject] = useState<Record<string, ProjectJob[]>>({});
-  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(() => {
+    return typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_job_id') : null;
+  });
   const selectedJobIdRef = useRef<string | null>(null);
   selectedJobIdRef.current = selectedJobId;
   const [isMobile, setIsMobile] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
   );
   const [isMobileDetailView, setIsMobileDetailView] = useState(false);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('agentmesh_active_tab', activeTab);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (selectedPersonaId) {
+        localStorage.setItem('agentmesh_selected_persona_id', selectedPersonaId);
+      } else {
+        localStorage.removeItem('agentmesh_selected_persona_id');
+      }
+    }
+  }, [selectedPersonaId]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (selectedSessionId) {
+        localStorage.setItem('agentmesh_selected_session_id', selectedSessionId);
+      } else {
+        localStorage.removeItem('agentmesh_selected_session_id');
+      }
+    }
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (selectedProjectId) {
+        localStorage.setItem('agentmesh_selected_project_id', selectedProjectId);
+      } else {
+        localStorage.removeItem('agentmesh_selected_project_id');
+      }
+    }
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (selectedJobId) {
+        localStorage.setItem('agentmesh_selected_job_id', selectedJobId);
+      } else {
+        localStorage.removeItem('agentmesh_selected_job_id');
+      }
+    }
+  }, [selectedJobId]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -654,8 +718,13 @@ export default function App() {
       }
       setApiError(null);
 
-      // If user hasn't manually switched tab, select initial tab
-      if (!hasUserSwitchedTabRef.current) {
+      // Reconcile tab: prefer user's selected tab if it has items, otherwise select first populated section
+      const isCurrentTabPopulated =
+        (activeTab === 'projects' && projectsRes && projectsRes.length > 0) ||
+        (activeTab === 'personas' && personasRes && personasRes.length > 0) ||
+        (activeTab === 'drivers' && agentsRes && agentsRes.length > 0);
+
+      if (!hasUserSwitchedTabRef.current || !isCurrentTabPopulated) {
         if (projectsRes && projectsRes.length > 0) {
           setActiveTab('projects');
         } else if (personasRes.length > 0) {
@@ -670,6 +739,10 @@ export default function App() {
         setSelectedProjectId((prevProj) => {
           if (prevProj && projectsRes.some((p) => p.id === prevProj)) {
             return prevProj;
+          }
+          const savedProj = typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_project_id') : null;
+          if (savedProj && projectsRes.some((p) => p.id === savedProj)) {
+            return savedProj;
           }
           return projectsRes[0]?.id || null;
         });
@@ -694,6 +767,10 @@ export default function App() {
         if (prevPersona && personasRes.some((p) => p.id === prevPersona)) {
           return prevPersona;
         }
+        const savedPersona = typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_persona_id') : null;
+        if (savedPersona && personasRes.some((p) => p.id === savedPersona)) {
+          return savedPersona;
+        }
         return personasRes[0]?.id || null;
       });
 
@@ -707,6 +784,10 @@ export default function App() {
       setSelectedSessionId((prevSession) => {
         if (prevSession && sessionsRes.some((s) => s.id === prevSession)) {
           return prevSession;
+        }
+        const savedSession = typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_session_id') : null;
+        if (savedSession && sessionsRes.some((s) => s.id === savedSession)) {
+          return savedSession;
         }
         if (prevSession) {
           return prevSession;
@@ -780,7 +861,12 @@ export default function App() {
       fetchJobsForProject(selectedProjectId).then((jobs) => {
         if (jobs && jobs.length > 0) {
           const nonArchived = jobs.filter((j) => j.status !== ProjectJobStatus.Archived);
-          setSelectedJobId((cur) => (cur && jobs.some((j) => j.id === cur) ? cur : (nonArchived[0]?.id ?? jobs[0].id)));
+          setSelectedJobId((cur) => {
+            if (cur && jobs.some((j) => j.id === cur)) return cur;
+            const savedJob = typeof window !== 'undefined' ? localStorage.getItem('agentmesh_selected_job_id') : null;
+            if (savedJob && jobs.some((j) => j.id === savedJob)) return savedJob;
+            return nonArchived[0]?.id ?? jobs[0].id;
+          });
         } else {
           setSelectedJobId(null);
         }
@@ -1259,6 +1345,15 @@ export default function App() {
       setSelectedPersonaId(null);
       setSelectedAgentId(null);
       setSelectedSessionId(null);
+      setSelectedProjectId(null);
+      setSelectedJobId(null);
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('agentmesh_selected_persona_id');
+        localStorage.removeItem('agentmesh_selected_session_id');
+        localStorage.removeItem('agentmesh_selected_project_id');
+        localStorage.removeItem('agentmesh_selected_job_id');
+        localStorage.removeItem('agentmesh_active_tab');
+      }
     };
 
     const handleQueueUpdated = (data: { sessionId: string; queue: QueuedPromptItem[] }) => {
@@ -2809,7 +2904,17 @@ export default function App() {
             <span className="font-mono text-slate-300 max-w-[90px] sm:max-w-[140px] truncate">{userEmail}</span>
             {auth?.signoutRedirect && (
               <button
-                onClick={() => auth.signoutRedirect()}
+                onClick={() => {
+                  if (typeof window !== 'undefined') {
+                    localStorage.removeItem('agentmesh_selected_persona_id');
+                    localStorage.removeItem('agentmesh_selected_session_id');
+                    localStorage.removeItem('agentmesh_selected_project_id');
+                    localStorage.removeItem('agentmesh_selected_job_id');
+                    localStorage.removeItem('agentmesh_active_tab');
+                    localStorage.removeItem('agentmesh_auth_return_url');
+                  }
+                  auth.signoutRedirect();
+                }}
                 className="text-slate-500 hover:text-rose-400 ml-1 transition cursor-pointer"
                 title="Sign out"
               >

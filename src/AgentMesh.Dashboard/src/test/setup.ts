@@ -1,8 +1,17 @@
 import '@testing-library/jest-dom/vitest';
 import { configure } from '@testing-library/react';
-import { vi } from 'vitest';
+import { vi, afterEach } from 'vitest';
 
 configure({ asyncUtilTimeout: 5000 });
+
+afterEach(() => {
+  if (typeof localStorage !== 'undefined') {
+    localStorage.clear();
+  }
+  if (typeof sessionStorage !== 'undefined') {
+    sessionStorage.clear();
+  }
+});
 
 vi.mock('mermaid', () => ({
   default: {
