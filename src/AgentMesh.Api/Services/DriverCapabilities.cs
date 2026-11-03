@@ -142,9 +142,9 @@ public static class DriverCapabilities
             if (value is null) continue; // absent, not cleared
 
             if (key.Equals("sidecar", StringComparison.OrdinalIgnoreCase) &&
-                value is JsonObject incomingSidecar &&
-                existingObj[key] is JsonObject existingSidecar)
+                value is JsonObject incomingSidecar)
             {
+                var existingSidecar = existingObj[key] as JsonObject ?? new JsonObject();
                 var mergedSidecar = existingSidecar.DeepClone().AsObject();
                 foreach (var (sKey, sVal) in incomingSidecar)
                 {
@@ -152,6 +152,17 @@ public static class DriverCapabilities
                     if (sKey.Equals("authKey", StringComparison.OrdinalIgnoreCase) &&
                         string.IsNullOrWhiteSpace(sVal.GetValue<string?>()))
                     {
+                        continue;
+                    }
+                    if (sVal is JsonValue jVal && jVal.TryGetValue<string>(out var strVal) && string.IsNullOrWhiteSpace(strVal))
+                    {
+                        mergedSidecar.Remove(sKey);
+                        continue;
+                    }
+                    if (sKey.Equals("companionPort", StringComparison.OrdinalIgnoreCase) &&
+                        sVal is JsonValue pVal && pVal.TryGetValue<int>(out var portNum) && portNum <= 0)
+                    {
+                        mergedSidecar.Remove(sKey);
                         continue;
                     }
                     mergedSidecar[sKey] = sVal.DeepClone();
@@ -171,6 +182,16 @@ public static class DriverCapabilities
                     mergedLimits[lKey] = lVal.DeepClone();
                 }
                 existingObj[key] = mergedLimits;
+                continue;
+            }
+
+            if (value is JsonValue topJVal && topJVal.TryGetValue<string>(out var topStrVal) && string.IsNullOrWhiteSpace(topStrVal))
+            {
+                if (key.Equals("apiKey", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                existingObj.Remove(key);
                 continue;
             }
 
