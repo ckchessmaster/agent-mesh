@@ -69,6 +69,8 @@ public interface IPersonaContainerManager
     Task<PersonaAuthSubmitResult> SubmitAuthCodeAsync(string personaId, string code, CancellationToken ct = default);
     Task<PersonaAuthSubmitResult> ConfigureApiKeyAsync(string personaId, string apiKey, string? provider = null, CancellationToken ct = default);
     Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(string personaId, string command, CancellationToken ct = default);
+    Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(string personaId, string command, string? container, CancellationToken ct = default)
+        => ExecInContainerAsync(personaId, command, ct);
     Task<IPersonaTerminalSession> AttachTerminalAsync(
         string personaId,
         int cols,

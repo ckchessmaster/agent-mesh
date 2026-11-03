@@ -14,7 +14,8 @@ import {
   CheckCircle2,
   XCircle,
   ExternalLink,
-  RefreshCw
+  RefreshCw,
+  RotateCw
 } from 'lucide-react';
 import type {
   Agent,
@@ -129,6 +130,22 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       setError(err?.message || 'Failed to verify driver.');
     } finally {
       setVerifying(false);
+    }
+  };
+
+  const [restarting, setRestarting] = useState(false);
+
+  const handleRestartRunners = async () => {
+    try {
+      setRestarting(true);
+      setError(null);
+      const res = await api.restartDriverRunners(agent.id);
+      setAuthSuccessMessage(`Restarted ${res.restarted || 1} runner(s) with fresh configuration!`);
+      await handleVerifyDriver();
+    } catch (err: any) {
+      setError(err?.message || 'Failed to restart driver runner.');
+    } finally {
+      setRestarting(false);
     }
   };
 
@@ -360,47 +377,47 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         if (parsed.state === 'empty' || parsed.value === effective) continue;
         (patch as Record<string, number>)[key] = parsed.value as number;
       }
+    }
 
-      if (
-        sidecarEnabled !== (config.sidecar?.enabled ?? false) ||
-        sidecarType !== (config.sidecar?.type ?? 'tailscale') ||
-        sidecarAuthKey.trim() ||
-        sidecarHostname.trim() !== (config.sidecar?.hostname ?? '') ||
-        sidecarTags.trim() !== (config.sidecar?.tags ?? '') ||
-        sidecarUserspace !== (config.sidecar?.userspaceMode ?? false) ||
-        sidecarExtraArgs.trim() !== (config.sidecar?.extraArgs ?? '') ||
-        sidecarImage.trim() !== (config.sidecar?.image ?? '') ||
-        sidecarCommand.trim() !== (config.sidecar?.command ?? '') ||
-        companionSetup.trim() !== (config.sidecar?.companionSetup ?? '') ||
-        companionCommand.trim() !== (config.sidecar?.companionCommand ?? '') ||
-        (companionPort.trim() ? Number(companionPort.trim()) : undefined) !== (config.sidecar?.companionPort ?? undefined) ||
-        loginCommand.trim() !== (config.sidecar?.loginCommand ?? '') ||
-        authCheckCommand.trim() !== (config.sidecar?.authCheckCommand ?? '')
-      ) {
-        patch.sidecar = {
-          enabled: sidecarEnabled,
-          type: sidecarType,
-          authKey: sidecarAuthKey.trim() || undefined,
-          hostname: sidecarHostname.trim() || undefined,
-          tags: sidecarTags.trim() || undefined,
-          userspaceMode: sidecarUserspace,
-          extraArgs: sidecarExtraArgs.trim() || undefined,
-          image: sidecarImage.trim() || undefined,
-          command: sidecarCommand.trim() || undefined,
-          companionSetup: companionSetup.trim() || undefined,
-          companionCommand: companionCommand.trim() || undefined,
-          companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined,
-          loginCommand: loginCommand.trim() || undefined,
-          authCheckCommand: authCheckCommand.trim() || undefined
-        };
-      }
+    if (
+      sidecarEnabled !== (config.sidecar?.enabled ?? false) ||
+      sidecarType !== (config.sidecar?.type ?? 'tailscale') ||
+      sidecarAuthKey.trim() ||
+      sidecarHostname.trim() !== (config.sidecar?.hostname ?? '') ||
+      sidecarTags.trim() !== (config.sidecar?.tags ?? '') ||
+      sidecarUserspace !== (config.sidecar?.userspaceMode ?? false) ||
+      sidecarExtraArgs.trim() !== (config.sidecar?.extraArgs ?? '') ||
+      sidecarImage.trim() !== (config.sidecar?.image ?? '') ||
+      sidecarCommand.trim() !== (config.sidecar?.command ?? '') ||
+      companionSetup.trim() !== (config.sidecar?.companionSetup ?? '') ||
+      companionCommand.trim() !== (config.sidecar?.companionCommand ?? '') ||
+      (companionPort.trim() ? Number(companionPort.trim()) : undefined) !== (config.sidecar?.companionPort ?? undefined) ||
+      loginCommand.trim() !== (config.sidecar?.loginCommand ?? '') ||
+      authCheckCommand.trim() !== (config.sidecar?.authCheckCommand ?? '')
+    ) {
+      patch.sidecar = {
+        enabled: sidecarEnabled,
+        type: sidecarType,
+        authKey: sidecarAuthKey.trim() || undefined,
+        hostname: sidecarHostname.trim() || undefined,
+        tags: sidecarTags.trim() || undefined,
+        userspaceMode: sidecarUserspace,
+        extraArgs: sidecarExtraArgs.trim() || undefined,
+        image: sidecarImage.trim() || undefined,
+        command: sidecarCommand.trim() || undefined,
+        companionSetup: companionSetup.trim() || undefined,
+        companionCommand: companionCommand.trim() || undefined,
+        companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined,
+        loginCommand: loginCommand.trim() || undefined,
+        authCheckCommand: authCheckCommand.trim() || undefined
+      };
+    }
 
-      if (loginCommand.trim() !== (config.loginCommand ?? '')) {
-        patch.loginCommand = loginCommand.trim();
-      }
-      if (authCheckCommand.trim() !== (config.authCheckCommand ?? '')) {
-        patch.authCheckCommand = authCheckCommand.trim();
-      }
+    if (loginCommand.trim() !== (config.loginCommand ?? '')) {
+      patch.loginCommand = loginCommand.trim();
+    }
+    if (authCheckCommand.trim() !== (config.authCheckCommand ?? '')) {
+      patch.authCheckCommand = authCheckCommand.trim();
     }
 
     if (Object.keys(patch).length === 0) {
@@ -487,6 +504,16 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                 >
                   <RefreshCw className={`w-3 h-3 ${verifying ? 'animate-spin' : ''}`} />
                   <span>{verifying ? 'Verifying...' : 'Verify & Refresh Models'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRestartRunners}
+                  disabled={restarting}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/40 text-[11px] font-medium flex items-center gap-1 transition disabled:opacity-50 cursor-pointer"
+                  title="Restart runner and sidecar containers to reload configuration immediately"
+                >
+                  <RotateCw className={`w-3 h-3 ${restarting ? 'animate-spin' : ''}`} />
+                  <span>{restarting ? 'Restarting...' : 'Restart Runner'}</span>
                 </button>
                 <button
                   type="button"
@@ -866,6 +893,15 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                                   className={`${fieldClass} pl-7 font-mono`}
                                 />
                               </div>
+                              <p className="text-[10px] text-slate-500 mt-1">
+                                Requires a <strong className="text-slate-300">Reusable</strong> Tailscale Auth Key (<code className="text-sky-400">tskey-auth-...</code>). If using tags, ensure the key is generated with the matching tag in Tailscale.
+                              </p>
+                              {sidecarAuthKey.trim() && !sidecarAuthKey.trim().startsWith('tskey-') && (
+                                <p className="text-[10px] text-amber-400 mt-1 flex items-center gap-1">
+                                  <AlertTriangle className="w-3 h-3 shrink-0" />
+                                  <span>Tailscale auth keys usually start with &quot;tskey-auth-&quot;. Be sure to copy the full key generated, not just the Key ID.</span>
+                                </p>
+                              )}
                             </div>
 
                             <div className="grid grid-cols-2 gap-2">
