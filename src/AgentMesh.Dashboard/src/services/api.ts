@@ -458,6 +458,22 @@ export const api = {
     return res.json();
   },
 
+  async restartDriverRunners(driverId: string): Promise<{ driverId: string; restarted: number; runners: PersonaEnvironmentStatus[] }> {
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(driverId)}/restart-runners`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      let errMsg = `Failed to restart driver runners: ${res.statusText}`;
+      try {
+        const b = await res.json();
+        if (b?.error) errMsg = b.error;
+      } catch {}
+      throw new Error(errMsg);
+    }
+    return res.json();
+  },
+
   async getJobs(approvalStatus?: string): Promise<StagedJob[]> {
     const query = approvalStatus ? `?approvalStatus=${encodeURIComponent(approvalStatus)}` : '';
     const res = await apiFetch(`/api/jobs${query}`, { headers: getHeaders() });

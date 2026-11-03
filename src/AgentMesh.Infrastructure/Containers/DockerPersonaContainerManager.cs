@@ -923,15 +923,29 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         return "No container logs available.";
     }
 
-    public async Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(
+    public Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(
         string personaId,
         string command,
         CancellationToken ct = default)
+        => ExecInContainerAsync(personaId, command, null, ct);
+
+    public async Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(
+        string personaId,
+        string command,
+        string? container,
+        CancellationToken ct = default)
     {
-        var containerName = GetContainerName(personaId);
+        var baseContainerName = GetContainerName(personaId);
+        var targetContainer = string.Equals(container, "driver-sidecar", StringComparison.OrdinalIgnoreCase)
+            ? $"{baseContainerName}-sidecar"
+            : (!string.IsNullOrWhiteSpace(container) ? container : baseContainerName);
         var cli = _detectedCli ?? "docker";
         var escaped = command.Replace("\"", "\\\"");
-        return await RunCliAsync(cli, $"exec {containerName} /bin/bash -c \"export PATH=\\\"/root/.local/bin:/usr/local/bin:$PATH\\\"; {escaped}\"", ct);
+        var shell = string.Equals(container, "driver-sidecar", StringComparison.OrdinalIgnoreCase) ? "/bin/sh" : "/bin/bash";
+        var cmdWithEnv = string.Equals(container, "driver-sidecar", StringComparison.OrdinalIgnoreCase)
+            ? escaped
+            : $"export PATH=\\\"/root/.local/bin:/usr/local/bin:$PATH\\\"; {escaped}";
+        return await RunCliAsync(cli, $"exec {targetContainer} {shell} -c \"{cmdWithEnv}\"", ct);
     }
 
     public async Task<PersonaDriverVerificationResult> VerifyDriverAsync(string personaId, CancellationToken ct = default)
@@ -968,19 +982,31 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             if (string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase))
             {
                 var (tsExit, tsOut, tsErr) = await ExecInContainerAsync(normPersonaId, "test -d /sys/class/net/tailscale0 || grep -q 'tailscale0:' /proc/net/dev || (command -v ip >/dev/null 2>&1 && ip addr show tailscale0)", ct);
-                if (tsExit == 0)
+                if (tsExit == 0 || sidecar.UserspaceMode)
                 {
-                    steps.Add(new PersonaDriverVerificationStep(
-                        "Sidecar Connectivity",
-                        "success",
-                        "Tailscale network interface (tailscale0) is active"));
-                }
-                else if (sidecar.UserspaceMode)
-                {
-                    steps.Add(new PersonaDriverVerificationStep(
-                        "Sidecar Connectivity",
-                        "success",
-                        "Tailscale sidecar is configured in userspace mode"));
+                    var (statExit, statOut, statErr) = await ExecInContainerAsync(normPersonaId, "tailscale status", "driver-sidecar", ct);
+                    if (statExit == 0 && !string.IsNullOrWhiteSpace(statOut) && !statOut.Contains("Logged out", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var firstLine = statOut.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? "online";
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Sidecar Connectivity",
+                            "success",
+                            $"Tailscale network active and authenticated ({firstLine})"));
+                    }
+                    else if (statOut.Contains("Logged out", StringComparison.OrdinalIgnoreCase) || statErr.Contains("invalid key", StringComparison.OrdinalIgnoreCase))
+                    {
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Sidecar Connectivity",
+                            "failed",
+                            "Tailscale sidecar is running but NOT authenticated. Check Tailscale Auth Key (must be Reusable)."));
+                    }
+                    else
+                    {
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Sidecar Connectivity",
+                            "success",
+                            sidecar.UserspaceMode ? "Tailscale sidecar active in userspace mode" : "Tailscale network interface (tailscale0) is active"));
+                    }
                 }
                 else
                 {

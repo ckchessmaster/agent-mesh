@@ -2,6 +2,7 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { DriverConfigModal, DRIVER_LIMIT_DEFAULTS } from '../DriverConfigModal';
 import type { Agent } from '../../types';
+import { api } from '../../services/api';
 
 const openAiAgent: Agent = {
   id: 'spence-ai',
@@ -262,5 +263,41 @@ describe('DriverConfigModal', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Authenticate Driver/i }));
     expect(screen.getByRole('button', { name: /Interactive OAuth Login/i })).toBeInTheDocument();
+  });
+
+  it('renders Restart Runner button and calls restartDriverRunners API', async () => {
+    const restartSpy = vi.spyOn(api, 'restartDriverRunners').mockResolvedValue({
+      driverId: 'spence-ai',
+      restarted: 1,
+      runners: []
+    });
+
+    renderModal();
+
+    const restartBtn = screen.getByRole('button', { name: /Restart Runner/i });
+    expect(restartBtn).toBeInTheDocument();
+    fireEvent.click(restartBtn);
+
+    await waitFor(() => {
+      expect(restartSpy).toHaveBeenCalledWith('spence-ai');
+    });
+  });
+
+  it('warns operator if typed Tailscale auth key does not start with tskey-', async () => {
+    renderModal({
+      initialConfig: {
+        ...openAiAgent.config,
+        sidecar: {
+          enabled: true,
+          type: 'tailscale',
+          hostname: 'node-01'
+        }
+      }
+    });
+
+    const authKeyInput = screen.getByLabelText(/Tailscale Auth Key/i);
+    fireEvent.change(authKeyInput, { target: { value: 'kmQkbizA1921CNTRL' } });
+
+    expect(screen.getByText(/Tailscale auth keys usually start with "tskey-auth-"/i)).toBeInTheDocument();
   });
 });

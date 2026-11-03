@@ -8,6 +8,7 @@ using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Mvc;
 using System.Text.Json;
+using Moq;
 using Xunit;
 
 namespace AgentMesh.Tests.Controllers;
@@ -344,5 +345,91 @@ public class AgentsControllerConfigTests
         var sc = doc.RootElement.GetProperty("sidecar");
         sc.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret-test");
         sc.GetProperty("hostname").GetString().Should().Be("mesh-private-llm");
+    }
+
+    [Fact]
+    public async Task UpdateDriverConfig_WithSidecar_AutoRestartsActiveBoundPersonaRunners()
+    {
+        var db = TestDbContextFactory.Create();
+        db.Agents.Add(new Agent
+        {
+            Id = "spence-ai",
+            Name = "Spence Private AI",
+            Role = "Autonomous Agent",
+            Status = "online",
+            RuntimeType = RuntimeType.OpenAiCompatible,
+            TrustTier = TrustTier.SeniorManager,
+            CapabilitiesJson = FullOpenAiCaps
+        });
+        db.Personas.Add(new Persona
+        {
+            Id = "spence",
+            Name = "Spence",
+            DriverId = "spence-ai"
+        });
+        db.SaveChanges();
+
+        var containerManagerMock = new Mock<IPersonaContainerManager>();
+        containerManagerMock
+            .Setup(m => m.GetStatusAsync("spence", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("spence", "running", "kubernetes"));
+        containerManagerMock
+            .Setup(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var controller = new AgentsController(db, _apiKeyService, containerManager: containerManagerMock.Object);
+
+        var sidecarReq = new DriverSidecarConfig
+        {
+            Enabled = true,
+            Type = "tailscale",
+            AuthKey = "tskey-auth-reusable-key",
+            Hostname = "spence-node"
+        };
+
+        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+            Sidecar: sidecarReq
+        ));
+
+        result.Should().BeOfType<OkObjectResult>();
+        containerManagerMock.Verify(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RestartBoundRunners_RestartsAllPersonasBoundToDriver()
+    {
+        var db = TestDbContextFactory.Create();
+        db.Agents.Add(new Agent
+        {
+            Id = "spence-ai",
+            Name = "Spence Private AI",
+            Role = "Autonomous Agent",
+            Status = "online",
+            RuntimeType = RuntimeType.OpenAiCompatible,
+            TrustTier = TrustTier.SeniorManager,
+            CapabilitiesJson = FullOpenAiCaps
+        });
+        db.Personas.Add(new Persona
+        {
+            Id = "spence",
+            Name = "Spence",
+            DriverId = "spence-ai"
+        });
+        db.SaveChanges();
+
+        var containerManagerMock = new Mock<IPersonaContainerManager>();
+        containerManagerMock
+            .Setup(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        containerManagerMock
+            .Setup(m => m.GetStatusAsync("spence", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("spence", "running", "kubernetes"));
+
+        var controller = new AgentsController(db, _apiKeyService, containerManager: containerManagerMock.Object);
+
+        var result = await controller.RestartBoundRunners("spence-ai");
+
+        result.Should().BeOfType<OkObjectResult>();
+        containerManagerMock.Verify(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()), Times.Once);
     }
 }

@@ -27,7 +27,8 @@ public class AgentsController(
     IHubContext<AgentMeshHub>? hubContext = null,
     IDriverQuotaProbe? quotaProbe = null,
     IPersonaContainerManager? containerManager = null,
-    IDriverCapabilityProbe? capabilityProbe = null) : ControllerBase
+    IDriverCapabilityProbe? capabilityProbe = null,
+    ILogger<AgentsController>? logger = null) : ControllerBase
 {
     private IDriverQuotaProbe QuotaProbe => quotaProbe ?? NullDriverQuotaProbe.Instance;
     private IDriverCapabilityProbe CapabilityProbe => capabilityProbe ?? NullDriverCapabilityProbe.Instance;
@@ -310,6 +311,39 @@ public class AgentsController(
             await SyncDriverCapabilitiesFromProbeAsync(agent, HttpContext?.RequestAborted ?? CancellationToken.None);
         }
 
+        // Auto-restart active persona runners if sidecar configuration was updated so fresh env & keys take effect immediately
+        if (containerManager != null && req.Sidecar != null)
+        {
+            try
+            {
+                var affectedPersonas = await db.Personas.AsNoTracking()
+                    .Where(p => p.DriverId == normalizedId || p.Id == normalizedId)
+                    .Select(p => p.Id)
+                    .ToListAsync();
+
+                foreach (var personaId in affectedPersonas)
+                {
+                    try
+                    {
+                        var status = await containerManager.GetStatusAsync(personaId);
+                        if (status.Status is "running" or "starting" or "error")
+                        {
+                            logger?.LogInformation("Auto-restarting persona environment @{PersonaId} after driver sidecar update", personaId);
+                            await containerManager.RestartAsync(personaId);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger?.LogWarning(ex, "Failed to auto-restart persona @{PersonaId} after driver sidecar update", personaId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogWarning(ex, "Failed to check bound personas for driver {DriverId}", normalizedId);
+            }
+        }
+
         var sessionCount = await db.AgentSessions.CountAsync(s => s.DriverId == normalizedId || s.CreatorAgentId == normalizedId);
         var personas = await GetDriverPersonasSummaryAsync(normalizedId);
         var dto = ToDto(agent, sessionCount, personas);
@@ -320,6 +354,48 @@ public class AgentsController(
         }
 
         return Ok(DriverCapabilities.Parse(agent.CapabilitiesJson));
+    }
+
+    /// <summary>
+    /// Restarts all active persona runners bound to this driver, reloading sidecars and credentials.
+    /// </summary>
+    [HttpPost("{id}/restart-runners")]
+    public async Task<IActionResult> RestartBoundRunners(string id, CancellationToken ct = default)
+    {
+        var normalizedId = id.Trim().TrimStart('@').ToLowerInvariant();
+        var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+        if (agent == null)
+        {
+            return NotFound(new { error = $"Driver '{id}' not found." });
+        }
+
+        if (containerManager == null)
+        {
+            return BadRequest(new { error = "Container manager is not available." });
+        }
+
+        var affectedPersonas = await db.Personas.AsNoTracking()
+            .Where(p => p.DriverId == normalizedId || p.Id == normalizedId)
+            .Select(p => p.Id)
+            .ToListAsync(ct);
+
+        var results = new List<PersonaEnvironmentStatus>();
+        foreach (var personaId in affectedPersonas)
+        {
+            try
+            {
+                await containerManager.RestartAsync(personaId, ct);
+                var status = await containerManager.GetStatusAsync(personaId, ct);
+                results.Add(status);
+            }
+            catch (Exception ex)
+            {
+                logger?.LogWarning(ex, "Failed to restart runner for @{PersonaId}", personaId);
+                results.Add(new PersonaEnvironmentStatus(personaId, "error", containerManager.RuntimeName, ErrorMessage: ex.Message));
+            }
+        }
+
+        return Ok(new { driverId = normalizedId, restarted = results.Count, runners = results });
     }
 
     [HttpPost("{id}/context-limit")]

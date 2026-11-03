@@ -161,6 +161,20 @@ sync_persona_state() {
     chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
 }
 
+# Ensure MagicDNS is added to /etc/resolv.conf if tailscale network interface exists
+ensure_tailscale_dns() {
+    if [ "$SIDECAR_ENABLED" = "true" ] && ([ -d /sys/class/net/tailscale0 ] || grep -q "tailscale0:" /proc/net/dev 2>/dev/null); then
+        if ! grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+            CURRENT_RESOLV=$(cat /etc/resolv.conf 2>/dev/null || true)
+            {
+                echo "nameserver 100.100.100.100"
+                echo "$CURRENT_RESOLV"
+            } > /etc/resolv.conf 2>/dev/null || true
+            echo "Configured Tailscale MagicDNS resolver (100.100.100.100) in /etc/resolv.conf."
+        fi
+    fi
+}
+
 # Run companion setup script if configured (e.g. install helper CLI)
 run_companion_setup() {
     if [ -z "$COMPANION_SETUP" ]; then
@@ -169,6 +183,7 @@ run_companion_setup() {
     echo "Executing companion setup script..."
     local setup_ok=0
     for attempt in {1..15}; do
+        ensure_tailscale_dns
         if ( set -o pipefail; eval "$COMPANION_SETUP" ); then
             setup_ok=1
             hash -r 2>/dev/null || true
@@ -205,9 +220,18 @@ if [ -n "$COMPANION_COMMAND" ]; then
         while true; do
             # If the companion executable is not on PATH, attempt setup/recovery instead of crash looping
             if [ -n "$COMPANION_BIN" ] && ! command -v "$COMPANION_BIN" >/dev/null 2>&1; then
+                ensure_tailscale_dns
                 if [ -n "$COMPANION_SETUP" ]; then
                     echo "Companion binary '$COMPANION_BIN' not found on PATH. Attempting companion setup..."
-                    ( set -o pipefail; eval "$COMPANION_SETUP" ) || true
+                    SETUP_OUT=$(eval "$COMPANION_SETUP" 2>&1) && SETUP_OK=1 || SETUP_OK=0
+                    if [ "$SETUP_OK" -eq 1 ]; then
+                        echo "Companion setup succeeded."
+                    else
+                        echo "Companion setup failed: $SETUP_OUT"
+                        if echo "$SETUP_OUT" | grep -qi "Could not resolve host"; then
+                            echo "Note: Host resolution failed. Verify Tailscale sidecar connection and MagicDNS."
+                        fi
+                    fi
                     hash -r 2>/dev/null || true
                     sync_persona_state 2>/dev/null || true
                 fi

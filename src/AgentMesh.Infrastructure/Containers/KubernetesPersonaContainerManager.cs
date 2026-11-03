@@ -192,6 +192,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     {
                         var runnerStatus = activePod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == "persona-runner")
                                            ?? activePod.Status.ContainerStatuses.FirstOrDefault();
+                        var sidecarStatus = activePod.Status.ContainerStatuses.FirstOrDefault(c => c.Name == "driver-sidecar");
 
                         if (runnerStatus?.State?.Waiting != null)
                         {
@@ -206,6 +207,30 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         {
                             status = "error";
                             errorMessage = runnerStatus.State.Terminated.Message ?? $"Container exited with code {runnerStatus.State.Terminated.ExitCode}";
+                        }
+
+                        // Also detect if the connectivity sidecar is failing or crash looping
+                        if (status != "error" && sidecarStatus != null)
+                        {
+                            if (sidecarStatus.State?.Waiting != null)
+                            {
+                                var reason = sidecarStatus.State.Waiting.Reason;
+                                if (reason == "CrashLoopBackOff" || reason == "ImagePullBackOff" || reason == "ErrImagePull" || reason == "Error")
+                                {
+                                    status = "error";
+                                    errorMessage = $"Sidecar container error: {sidecarStatus.State.Waiting.Message ?? reason}";
+                                }
+                            }
+                            else if (sidecarStatus.State?.Terminated != null && sidecarStatus.State.Terminated.ExitCode != 0)
+                            {
+                                status = "error";
+                                errorMessage = $"Sidecar container exited with code {sidecarStatus.State.Terminated.ExitCode}: {sidecarStatus.State.Terminated.Message ?? sidecarStatus.State.Terminated.Reason}";
+                            }
+                            else if (sidecarStatus.LastState?.Terminated != null && sidecarStatus.LastState.Terminated.ExitCode != 0 && sidecarStatus.RestartCount > 0 && !sidecarStatus.Ready)
+                            {
+                                status = "error";
+                                errorMessage = $"Sidecar container failing: {sidecarStatus.LastState.Terminated.Message ?? $"exit code {sidecarStatus.LastState.Terminated.ExitCode}"}";
+                            }
                         }
                     }
                 }
@@ -348,6 +373,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                  !string.Equals(currentPersonaEnv, normPersonaId, StringComparison.OrdinalIgnoreCase) ||
                                  !string.Equals(currentUrlEnv, meshUrl, StringComparison.OrdinalIgnoreCase) ||
                                  !string.Equals(currentTokenEnv, agentToken, StringComparison.Ordinal);
+            if (!needsEnvUpdate && runnerContainer != null)
+            {
+                var curRunnerEnv = runnerContainer.Env?.ToDictionary(e => e.Name, e => e.Value ?? "", StringComparer.OrdinalIgnoreCase)
+                                   ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var desRunnerEnv = env.ToDictionary(e => e.Name, e => e.Value ?? "", StringComparer.OrdinalIgnoreCase);
+                if (desRunnerEnv.Any(kv => !curRunnerEnv.TryGetValue(kv.Key, out var cv) || cv != kv.Value))
+                {
+                    needsEnvUpdate = true;
+                }
+            }
             var needsVolumeUpdate = !hasWorkspaceMount || !hasWorkspacePvc || !hasCredsMount || !hasCredsVolume;
 
             // Query status to detect crashed/error pods that need a kick
@@ -803,9 +838,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
     }
 
+    public Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(
+        string personaId,
+        string command,
+        CancellationToken ct = default)
+        => ExecInContainerAsync(personaId, command, null, ct);
+
     public async Task<(int ExitCode, string StdOut, string StdErr)> ExecInContainerAsync(
         string personaId,
         string command,
+        string? container,
         CancellationToken ct = default)
     {
         var normPersonaId = personaId.Trim().ToLowerInvariant();
@@ -829,13 +871,17 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var stdOutBuilder = new StringBuilder();
             var stdErrBuilder = new StringBuilder();
 
-            var wrappedCommand = $"export PATH=\"/root/.local/bin:/usr/local/bin:$PATH\"; {command}";
+            var targetContainer = !string.IsNullOrWhiteSpace(container) ? container : "persona-runner";
+            var shell = targetContainer == "persona-runner" ? "/bin/bash" : "/bin/sh";
+            var wrappedCommand = targetContainer == "persona-runner"
+                ? $"export PATH=\"/root/.local/bin:/usr/local/bin:$PATH\"; {command}"
+                : command;
 
             var exitCode = await _client.NamespacedPodExecAsync(
                 name: pod.Metadata.Name,
                 @namespace: _namespace,
-                container: "persona-runner",
-                command: new[] { "/bin/bash", "-c", wrappedCommand },
+                container: targetContainer,
+                command: new[] { shell, "-c", wrappedCommand },
                 tty: false,
                 action: async (stdIn, stdOut, stdError) =>
                 {
@@ -916,27 +962,69 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             if (string.Equals(sidecar.Type, "tailscale", StringComparison.OrdinalIgnoreCase))
             {
-                var (tsExit, tsOut, tsErr) = await ExecInContainerAsync(normPersonaId, "test -d /sys/class/net/tailscale0 || grep -q 'tailscale0:' /proc/net/dev || (command -v ip >/dev/null 2>&1 && ip addr show tailscale0)", ct);
-                if (tsExit == 0)
+                // Inspect sidecar container status on pod to detect authentication / crash loops
+                V1ContainerStatus? sidecarStatus = null;
+                try
                 {
-                    steps.Add(new PersonaDriverVerificationStep(
-                        "Sidecar Connectivity",
-                        "success",
-                        "Tailscale network interface (tailscale0) is active"));
+                    var checkPods = await _client.CoreV1.ListNamespacedPodAsync(
+                        _namespace,
+                        labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
+                        cancellationToken: ct);
+                    var activePod = checkPods.Items.OrderByDescending(p => p.Metadata.CreationTimestamp).FirstOrDefault();
+                    sidecarStatus = activePod?.Status?.ContainerStatuses?.FirstOrDefault(c => c.Name == "driver-sidecar");
                 }
-                else if (sidecar.UserspaceMode)
+                catch { }
+
+                if (sidecarStatus?.State?.Waiting != null && sidecarStatus.State.Waiting.Reason is "CrashLoopBackOff" or "Error" or "ErrImagePull")
                 {
                     steps.Add(new PersonaDriverVerificationStep(
                         "Sidecar Connectivity",
-                        "success",
-                        "Tailscale sidecar is configured in userspace mode"));
+                        "failed",
+                        $"Tailscale sidecar container is crashing ({sidecarStatus.State.Waiting.Reason}). Check Tailscale Reusable Auth Key."));
+                }
+                else if (sidecarStatus?.LastState?.Terminated != null && sidecarStatus.LastState.Terminated.ExitCode != 0 && sidecarStatus.RestartCount > 0 && !sidecarStatus.Ready)
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Sidecar Connectivity",
+                        "failed",
+                        $"Tailscale sidecar container exited with code {sidecarStatus.LastState.Terminated.ExitCode}. Ensure Auth Key is valid and Reusable."));
                 }
                 else
                 {
-                    steps.Add(new PersonaDriverVerificationStep(
-                        "Sidecar Connectivity",
-                        "warning",
-                        "Tailscale sidecar is starting up or tailscale0 interface is not yet ready"));
+                    var (tsExit, tsOut, tsErr) = await ExecInContainerAsync(normPersonaId, "test -d /sys/class/net/tailscale0 || grep -q 'tailscale0:' /proc/net/dev || (command -v ip >/dev/null 2>&1 && ip addr show tailscale0)", ct);
+                    if (tsExit == 0 || sidecar.UserspaceMode)
+                    {
+                        var (statExit, statOut, statErr) = await ExecInContainerAsync(normPersonaId, "tailscale status", "driver-sidecar", ct);
+                        if (statExit == 0 && !string.IsNullOrWhiteSpace(statOut) && !statOut.Contains("Logged out", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var firstLine = statOut.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? "online";
+                            steps.Add(new PersonaDriverVerificationStep(
+                                "Sidecar Connectivity",
+                                "success",
+                                $"Tailscale network active and authenticated ({firstLine})"));
+                        }
+                        else if (statOut.Contains("Logged out", StringComparison.OrdinalIgnoreCase) || statErr.Contains("invalid key", StringComparison.OrdinalIgnoreCase))
+                        {
+                            steps.Add(new PersonaDriverVerificationStep(
+                                "Sidecar Connectivity",
+                                "failed",
+                                "Tailscale sidecar is running but NOT authenticated. Check Tailscale Auth Key (must be Reusable)."));
+                        }
+                        else
+                        {
+                            steps.Add(new PersonaDriverVerificationStep(
+                                "Sidecar Connectivity",
+                                "success",
+                                sidecar.UserspaceMode ? "Tailscale sidecar active in userspace mode" : "Tailscale network interface (tailscale0) is active"));
+                        }
+                    }
+                    else
+                    {
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Sidecar Connectivity",
+                            "warning",
+                            "Tailscale sidecar is starting up or tailscale0 interface is not yet ready"));
+                    }
                 }
             }
             else
