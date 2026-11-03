@@ -335,11 +335,19 @@ public class TurnOutcomeDerivationTests
             .Build();
         HttpAgentTurnRunner.ResolveApiKey(tokenConfig).Should().Be("token-secret");
 
+        var authKeyConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Auth:StaticApiKey"] = "cluster-master-key",
+                ["AGENTMESH_TOKEN"] = "token-secret"
+            })
+            .Build();
+        HttpAgentTurnRunner.ResolveApiKey(authKeyConfig).Should().Be("cluster-master-key");
+
         var platformConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["Platform:ApiKey"] = "custom-platform-key",
-                ["AGENTMESH_TOKEN"] = "token-secret"
+                ["Platform:ApiKey"] = "custom-platform-key"
             })
             .Build();
         HttpAgentTurnRunner.ResolveApiKey(platformConfig).Should().Be("custom-platform-key");
