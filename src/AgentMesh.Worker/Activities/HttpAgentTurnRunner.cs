@@ -340,15 +340,24 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     }
 
     /// <summary>
-    /// Resolves the optional platform API key from configuration or environment.
+    /// Resolves the platform API key from configuration or environment, falling back to
+    /// standard mesh auth keys and the default development key.
     /// </summary>
-    internal static string? ResolveApiKey(IConfiguration config)
+    internal static string ResolveApiKey(IConfiguration config)
     {
         return config[ApiKeyConfigKey]
             ?? config["Platform:ApiKey"]
             ?? config["Platform__ApiKey"]
             ?? config["PLATFORM_APIKEY"]
-            ?? Environment.GetEnvironmentVariable("PLATFORM_APIKEY");
+            ?? config["Auth:StaticApiKey"]
+            ?? config["Auth__StaticApiKey"]
+            ?? config["AUTH_STATICAPIKEY"]
+            ?? config["AGENTMESH_TOKEN"]
+            ?? config["AgentMesh_Token"]
+            ?? Environment.GetEnvironmentVariable("PLATFORM_APIKEY")
+            ?? Environment.GetEnvironmentVariable("AUTH_STATICAPIKEY")
+            ?? Environment.GetEnvironmentVariable("AGENTMESH_TOKEN")
+            ?? "mesh-default-secret-key";
     }
 
     private async Task<Guid?> DispatchAsync(AgentTurnRequest request, CancellationToken ct)
@@ -394,6 +403,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         if (!string.IsNullOrWhiteSpace(apiKey))
         {
             message.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);
+            message.Headers.TryAddWithoutValidation("X-Agent-Id", "temporal-worker");
         }
 
         using var response = await httpClient.SendAsync(message, ct);

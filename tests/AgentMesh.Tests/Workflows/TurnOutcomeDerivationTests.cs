@@ -320,4 +320,28 @@ public class TurnOutcomeDerivationTests
             .Build();
         HttpAgentTurnRunner.ResolveApiBaseUrl(platformConfig).Should().Be("http://direct-platform:5000");
     }
+
+    [Fact]
+    public void ResolveApiKey_FallsBackThroughMeshDefaults()
+    {
+        var emptyConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
+        HttpAgentTurnRunner.ResolveApiKey(emptyConfig).Should().Be("mesh-default-secret-key");
+
+        var tokenConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["AGENTMESH_TOKEN"] = "token-secret"
+            })
+            .Build();
+        HttpAgentTurnRunner.ResolveApiKey(tokenConfig).Should().Be("token-secret");
+
+        var platformConfig = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Platform:ApiKey"] = "custom-platform-key",
+                ["AGENTMESH_TOKEN"] = "token-secret"
+            })
+            .Build();
+        HttpAgentTurnRunner.ResolveApiKey(platformConfig).Should().Be("custom-platform-key");
+    }
 }

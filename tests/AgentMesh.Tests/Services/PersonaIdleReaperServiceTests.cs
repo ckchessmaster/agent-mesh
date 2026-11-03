@@ -226,4 +226,74 @@ public class PersonaIdleReaperServiceTests
         // Assert
         _containerManagerMock.Verify(m => m.RestartAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
     }
+
+    [Fact]
+    public async Task ReapCycle_AutoUpdatesIdleRunner_WhenContainerIsInErrorState()
+    {
+        // Arrange
+        var persona = new Persona { Id = "agent-smith", Name = "Agent Smith", DriverId = "agy" };
+        _db.Personas.Add(persona);
+        await _db.SaveChangesAsync();
+
+        var status = new PersonaEnvironmentStatus(
+            PersonaId: "agent-smith",
+            Status: "error",
+            Runtime: "kubernetes",
+            StartedAt: DateTimeOffset.UtcNow.AddMinutes(-10),
+            Image: "runner:1.9.4",
+            ConfiguredImage: "runner:1.9.5",
+            UpdateAvailable: true);
+
+        _containerManagerMock.Setup(m => m.GetStatusAsync("agent-smith", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(status);
+
+        var service = CreateService();
+        var method = typeof(PersonaIdleReaperService).GetMethod("ReapIdlePersonasAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+        // Act
+        await (Task)method.Invoke(service, [CancellationToken.None])!;
+
+        // Assert
+        _containerManagerMock.Verify(m => m.RestartAsync("agent-smith", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ReapCycle_AutoUpdates_WhenThinkingSessionIsStale()
+    {
+        // Arrange
+        var persona = new Persona { Id = "agent-smith", Name = "Agent Smith", DriverId = "agy" };
+        _db.Personas.Add(persona);
+        _db.AgentSessions.Add(new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            PersonaId = "agent-smith",
+            Status = "thinking",
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-30),
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-15) // stale thinking session
+        });
+        await _db.SaveChangesAsync();
+
+        var status = new PersonaEnvironmentStatus(
+            PersonaId: "agent-smith",
+            Status: "running",
+            Runtime: "docker",
+            StartedAt: DateTimeOffset.UtcNow.AddMinutes(-10),
+            Image: "runner:1.9.4",
+            ConfiguredImage: "runner:1.9.5",
+            UpdateAvailable: true);
+
+        _containerManagerMock.Setup(m => m.GetStatusAsync("agent-smith", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(status);
+
+        var service = CreateService();
+        var method = typeof(PersonaIdleReaperService).GetMethod("ReapIdlePersonasAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+        // Act
+        await (Task)method.Invoke(service, [CancellationToken.None])!;
+
+        // Assert - should restart because session is stale
+        _containerManagerMock.Verify(m => m.RestartAsync("agent-smith", It.IsAny<CancellationToken>()), Times.Once);
+    }
 }

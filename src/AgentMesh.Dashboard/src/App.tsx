@@ -1139,6 +1139,24 @@ export default function App() {
     }
   };
 
+  const handleResetJob = async (jobId?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const updated = await api.resetJob(targetId);
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          next[pId] = next[pId].map((j) => (j.id === updated.id ? updated : j));
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to reset job:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to reset job');
+    }
+  };
+
   const applyJobFromServer = useCallback((job?: ProjectJob) => {
     if (!job) return;
     setJobsByProject((prev) => ({
@@ -3707,6 +3725,7 @@ export default function App() {
                       onCompleteJob={handleCompleteJob}
                       onArchiveJob={handleArchiveJob}
                       onReopenJob={handleReopenJob}
+                      onResetJob={handleResetJob}
                       onOpenLightbox={setLightboxAttachment}
                       onStopTurn={handleStopSession}
                       onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}

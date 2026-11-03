@@ -39,6 +39,18 @@ public class PersonaIdleReaperService : BackgroundService
         _logger.LogInformation("PersonaIdleReaperService started (Timeout: {Timeout}, Interval: {Interval}, AutoUpdateIdleRunners: {AutoUpdate})",
             _idleTimeout, _checkInterval, _autoUpdateIdleRunners);
 
+        // Run an initial quick check shortly after startup to process any pending idle updates
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            await ReapIdlePersonasAsync(stoppingToken);
+        }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Error in initial PersonaIdleReaperService cycle: {Error}", ex.Message);
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -74,15 +86,18 @@ public class PersonaIdleReaperService : BackgroundService
             try
             {
                 var status = await _containerManager.GetStatusAsync(personaId, ct);
-                if (status.Status != "running")
+                // Allow running or errored containers to be examined for updates (broken runners need updates most)
+                if (status.Status != "running" && status.Status != "error")
                 {
                     continue;
                 }
 
-                // Check if any active thinking session exists for this persona
+                // Check if any genuinely active thinking session exists for this persona within the last 5 minutes.
+                // Stale sessions from hours ago must not permanently block auto-updating.
+                var recentSessionThreshold = now.AddMinutes(-5);
                 var hasActiveThinking = await db.AgentSessions
                     .AsNoTracking()
-                    .AnyAsync(s => s.PersonaId == personaId && s.Status == "thinking", ct);
+                    .AnyAsync(s => s.PersonaId == personaId && s.Status == "thinking" && s.UpdatedAt > recentSessionThreshold, ct);
 
                 if (hasActiveThinking)
                 {
@@ -92,9 +107,10 @@ public class PersonaIdleReaperService : BackgroundService
                 // Auto-update runner if an update is available and persona is idle
                 if (_autoUpdateIdleRunners && status.UpdateAvailable)
                 {
+                    var recentJobThreshold = now.AddMinutes(-30);
                     var hasActiveJob = await db.ProjectJobs
                         .AsNoTracking()
-                        .AnyAsync(j => j.AssignedAgentId == personaId && j.Status == ProjectJobStatus.Active, ct);
+                        .AnyAsync(j => j.AssignedAgentId == personaId && j.Status == ProjectJobStatus.Active && (j.UpdatedAt > recentJobThreshold || j.CreatedAt > recentJobThreshold), ct);
 
                     // Safety grace period: if the container started within the last 60 seconds, do not immediately restart
                     var startedRecently = status.StartedAt.HasValue && (now - status.StartedAt.Value) < TimeSpan.FromSeconds(60);
@@ -107,6 +123,17 @@ public class PersonaIdleReaperService : BackgroundService
                         await _containerManager.RestartAsync(personaId, ct);
                         continue;
                     }
+                    else
+                    {
+                        _logger.LogInformation("Persona @{PersonaId} has update available ({Current} -> {Configured}) but auto-update was skipped: hasActiveJob={HasActiveJob}, startedRecently={StartedRecently}, status={Status}",
+                            personaId, status.Image, status.ConfiguredImage, hasActiveJob, startedRecently, status.Status);
+                    }
+                }
+
+                // Only running containers are eligible to be stopped for idle timeout
+                if (status.Status != "running")
+                {
+                    continue;
                 }
 
                 // Find last activity time across sessions for this persona
