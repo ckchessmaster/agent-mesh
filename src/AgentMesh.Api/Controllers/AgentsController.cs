@@ -293,7 +293,14 @@ public class AgentsController(
         if (req.Adapter is not null) patch["adapter"] = req.Adapter;
         if (req.LoginCommand is not null) patch["loginCommand"] = req.LoginCommand;
         if (req.AuthCheckCommand is not null) patch["authCheckCommand"] = req.AuthCheckCommand;
-        if (req.Sidecar is not null) patch["sidecar"] = JsonSerializer.SerializeToNode(req.Sidecar);
+        if (req.Sidecar is not null)
+        {
+            var sidecarOptions = new JsonSerializerOptions
+            {
+                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            };
+            patch["sidecar"] = JsonSerializer.SerializeToNode(req.Sidecar, sidecarOptions);
+        }
 
         if (patch.Count == 0)
         {

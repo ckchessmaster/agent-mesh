@@ -404,4 +404,106 @@ public class DriverCapabilitiesTests
         mergedParsed.Sidecar.CompanionCommand.Should().Be("aip proxy");
         mergedParsed.Sidecar.CompanionPort.Should().Be(11436);
     }
+
+    [Fact]
+    public void Merge_Sidecar_ClearsEmptyStringFieldsSuchAsTagsAndExtraArgs()
+    {
+        var existing = """
+        {
+          "adapter": "openai",
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "tskey-auth-secret",
+            "hostname": "mesh-agent",
+            "tags": "tag:agentmesh",
+            "extraArgs": "--accept-routes"
+          }
+        }
+        """;
+
+        var patch = """
+        {
+          "sidecar": {
+            "tags": "",
+            "extraArgs": "   "
+          }
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        var parsed = DriverCapabilities.Parse(merged);
+
+        parsed.Sidecar.Should().NotBeNull();
+        parsed.Sidecar!.Tags.Should().BeNull();
+        parsed.Sidecar.ExtraArgs.Should().BeNull();
+        parsed.Sidecar.Hostname.Should().Be("mesh-agent");
+        parsed.HasSidecarAuthKey.Should().BeTrue();
+
+        using var doc = JsonDocument.Parse(merged!);
+        var sc = doc.RootElement.GetProperty("sidecar");
+        sc.TryGetProperty("tags", out _).Should().BeFalse("tags must be completely removed from JSON when cleared");
+        sc.TryGetProperty("extraArgs", out _).Should().BeFalse("extraArgs must be completely removed from JSON when cleared");
+        sc.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret");
+    }
+
+    [Fact]
+    public void Merge_Sidecar_ClearsCompanionPortWhenZeroOrNegative()
+    {
+        var existing = """
+        {
+          "adapter": "openai",
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "companionPort": 11434
+          }
+        }
+        """;
+
+        var patch = """
+        {
+          "sidecar": {
+            "companionPort": 0
+          }
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        var parsed = DriverCapabilities.Parse(merged);
+
+        parsed.Sidecar.Should().NotBeNull();
+        parsed.Sidecar!.CompanionPort.Should().BeNull();
+
+        using var doc = JsonDocument.Parse(merged!);
+        var sc = doc.RootElement.GetProperty("sidecar");
+        sc.TryGetProperty("companionPort", out _).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Merge_TopLevel_ClearsEmptyStringFieldsExceptApiKey()
+    {
+        var existing = """
+        {
+          "adapter": "openai",
+          "apiKey": "stored-secret-key",
+          "loginCommand": "old-login-cmd",
+          "authCheckCommand": "old-check-cmd"
+        }
+        """;
+
+        var patch = """
+        {
+          "loginCommand": "",
+          "authCheckCommand": "  ",
+          "apiKey": ""
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        using var doc = JsonDocument.Parse(merged!);
+        doc.RootElement.TryGetProperty("loginCommand", out _).Should().BeFalse();
+        doc.RootElement.TryGetProperty("authCheckCommand", out _).Should().BeFalse();
+        doc.RootElement.GetProperty("apiKey").GetString().Should().Be("stored-secret-key");
+    }
 }

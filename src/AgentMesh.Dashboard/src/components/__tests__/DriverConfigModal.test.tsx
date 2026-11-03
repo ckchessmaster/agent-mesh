@@ -300,4 +300,30 @@ describe('DriverConfigModal', () => {
 
     expect(screen.getByText(/Tailscale auth keys usually start with "tskey-auth-"/i)).toBeInTheDocument();
   });
+
+  it('sends empty string for tags when operator clears advertise tags input', async () => {
+    const { onSave } = renderModal({
+      initialConfig: {
+        ...openAiAgent.config,
+        sidecar: {
+          enabled: true,
+          type: 'tailscale',
+          hostname: 'kingdom-agent-mesh-01',
+          tags: 'tag:agentmesh'
+        }
+      }
+    });
+
+    const tagsInput = screen.getByLabelText(/Advertise Tags/i);
+    expect(tagsInput).toHaveValue('tag:agentmesh');
+
+    fireEvent.change(tagsInput, { target: { value: '' } });
+    fireEvent.submit(screen.getByRole('button', { name: /Save/i }).closest('form')!);
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    const savedPatch = onSave.mock.calls[0][0];
+    expect(savedPatch.sidecar).toBeDefined();
+    expect(savedPatch.sidecar.tags).toBe('');
+    expect(savedPatch.sidecar.hostname).toBe('kingdom-agent-mesh-01');
+  });
 });

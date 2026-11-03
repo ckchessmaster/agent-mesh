@@ -432,4 +432,53 @@ public class AgentsControllerConfigTests
         result.Should().BeOfType<OkObjectResult>();
         containerManagerMock.Verify(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()), Times.Once);
     }
+
+    [Fact]
+    public async Task UpdateDriverConfig_ClearingSidecarTags_RemovesTagsFromStoredJsonAndReturnsNullTags()
+    {
+        var existingCapsWithSidecar = """
+        {
+          "adapter": "openai",
+          "endpoint": "http://127.0.0.1:11434/v1",
+          "sidecar": {
+            "enabled": true,
+            "type": "tailscale",
+            "authKey": "tskey-auth-secret-test",
+            "hostname": "kingdom-agent-mesh-01",
+            "tags": "tag:agentmesh",
+            "extraArgs": "--accept-routes"
+          }
+        }
+        """;
+
+        var (controller, db) = Arrange(existingCapsWithSidecar);
+
+        var patchSidecar = new DriverSidecarConfig
+        {
+            Enabled = true,
+            Type = "tailscale",
+            Hostname = "kingdom-agent-mesh-01",
+            Tags = "", // explicitly cleared by operator
+            ExtraArgs = "--accept-routes"
+        };
+
+        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+            Sidecar: patchSidecar
+        ));
+
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        var view = okResult.Value.Should().BeOfType<DriverCapabilitiesView>().Subject;
+
+        view.Sidecar.Should().NotBeNull();
+        view.Sidecar!.Tags.Should().BeNull("cleared tags must be null in returned capabilities view");
+        view.Sidecar.Hostname.Should().Be("kingdom-agent-mesh-01");
+        view.HasSidecarAuthKey.Should().BeTrue("stored authKey should survive when not updated");
+
+        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        using var doc = JsonDocument.Parse(stored);
+        var sc = doc.RootElement.GetProperty("sidecar");
+        sc.TryGetProperty("tags", out _).Should().BeFalse("tags property must be absent from stored sidecar JSON");
+        sc.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret-test");
+        sc.GetProperty("hostname").GetString().Should().Be("kingdom-agent-mesh-01");
+    }
 }

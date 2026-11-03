@@ -399,17 +399,17 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         enabled: sidecarEnabled,
         type: sidecarType,
         authKey: sidecarAuthKey.trim() || undefined,
-        hostname: sidecarHostname.trim() || undefined,
-        tags: sidecarTags.trim() || undefined,
+        hostname: sidecarHostname.trim(),
+        tags: sidecarTags.trim(),
         userspaceMode: sidecarUserspace,
-        extraArgs: sidecarExtraArgs.trim() || undefined,
-        image: sidecarImage.trim() || undefined,
-        command: sidecarCommand.trim() || undefined,
-        companionSetup: companionSetup.trim() || undefined,
-        companionCommand: companionCommand.trim() || undefined,
-        companionPort: companionPort.trim() ? Number(companionPort.trim()) : undefined,
-        loginCommand: loginCommand.trim() || undefined,
-        authCheckCommand: authCheckCommand.trim() || undefined
+        extraArgs: sidecarExtraArgs.trim(),
+        image: sidecarImage.trim(),
+        command: sidecarCommand.trim(),
+        companionSetup: companionSetup.trim(),
+        companionCommand: companionCommand.trim(),
+        companionPort: companionPort.trim() ? Number(companionPort.trim()) : 0,
+        loginCommand: loginCommand.trim(),
+        authCheckCommand: authCheckCommand.trim()
       };
     }
 
