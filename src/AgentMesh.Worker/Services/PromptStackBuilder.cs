@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using AgentMesh.Core.Models;
@@ -163,6 +163,7 @@ public class PromptStackBuilder(
         // queries through it throws "A second operation was started on this context", which would make
         // the degraded-layer guarantee above fire on every turn under load.
         var project = await SafeLoadProjectAsync(context, ct);
+        var documentLibrary = await SafeLoadDocumentsAsync(context, ct);
         var persona = await SafeLoadPersonaAsync(context, ct);
         var job = await SafeLoadJobAsync(context, ct);
         var roster = await SafeLoadRosterAsync(context, ct);
@@ -182,7 +183,9 @@ public class PromptStackBuilder(
             persona,
             roster,
             memoryLines,
-            workspacePath);
+            workspacePath,
+            documentLibrary.ToEntries(),
+            documentLibrary.TotalCount);
 
         var envelope = BuildTaskEnvelope(
             context,
@@ -224,13 +227,15 @@ public class PromptStackBuilder(
         Persona? persona,
         IReadOnlyList<RosterMember> roster,
         IReadOnlyList<string> memoryLines,
-        string workspacePath)
+        string workspacePath,
+        IReadOnlyList<ProjectDocumentEntry>? documents = null,
+        int? documentTotalCount = null)
     {
         var layers = new List<string>(5)
         {
             PlatformPrompt(),
             PersonaPrompt(persona, context),
-            ProjectPrompt(project, workspacePath),
+            ProjectPrompt(project, workspacePath, documents, documentTotalCount),
             TeamPrompt(roster, context),
             MemoryPrompt(memoryLines, context),
         };
@@ -325,8 +330,25 @@ public class PromptStackBuilder(
     /// in the cached block costs nothing and lets the envelope's git block stay about git. The envelope
     /// still names the directory, because the envelope is the part that survives context compaction and
     /// has to be readable on its own.
+    /// <para>
+    /// <strong>Why the document index belongs here too.</strong> A project's library changes when someone
+    /// attaches or removes a document, which is the same cadence as <c>ProjectInstructions</c> — an
+    /// operator edit, not a per-turn value. So it costs the cache nothing it was not already paying, and
+    /// it is the layer whose job is "what is true about this repository". The formatter that renders it
+    /// emits no timestamps and orders by title-then-id for exactly this reason; a <c>CreatedAt</c> in
+    /// that block would invalidate every layer below it on every read.
+    /// </para>
+    /// <para>
+    /// The index is a table of contents, not the documents. Bodies stay out of the prompt: the library cap
+    /// times the per-file cap is far more than a cached prefix should carry, and an agent that needs a
+    /// spec fetches the one it needs. See <see cref="ProjectDocumentIndexFormatter"/>.
+    /// </para>
     /// </remarks>
-    internal static string ProjectPrompt(Project? project, string workspacePath)
+    internal static string ProjectPrompt(
+        Project? project,
+        string workspacePath,
+        IReadOnlyList<ProjectDocumentEntry>? documents = null,
+        int? documentTotalCount = null)
     {
         var sb = new StringBuilder();
         sb.Append("[LAYER 3: PROJECT MANIFEST]\n");
@@ -361,6 +383,16 @@ public class PromptStackBuilder(
             sb.Append("\nNo project instructions are recorded. Discover the contract from the " +
                       "repository itself (README, AGENTS.md, CI workflow, solution/task files) and " +
                       "save what you learn with save_memory so the next turn does not re-derive it.\n");
+        }
+
+        // Rendered by the same formatter the legacy envelope sites in the Api call, so an agent on the
+        // layered path and an agent on the flat path are told about the same library in the same words.
+        // Omitted entirely when the project has no documents — a header announcing an empty library is
+        // noise the agent has to read to learn there is nothing to read.
+        var index = ProjectDocumentIndexFormatter.FormatDocumentIndex(documents, project.Id, documentTotalCount);
+        if (index is not null)
+        {
+            sb.Append('\n').Append(index);
         }
 
         return sb.ToString();
@@ -1325,6 +1357,38 @@ public class PromptStackBuilder(
             logger?.LogWarning(ex, "Could not load project {ProjectId}", context.ProjectId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Loads the project's supporting-document library as index entries.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Bounded by <see cref="ProjectDocumentIndexFormatter.MaxRenderedDocuments"/> rather than reading the
+    /// whole library: the renderer caps at the same number, so pulling 50 rows to print 25 pays a read of
+    /// bodies the prompt will never reach. The <c>(project_id, title)</c> index is what makes that bounded
+    /// read a range scan rather than a sort.
+    /// </para>
+    /// <para>
+    /// No try/catch here, unlike its <c>SafeLoad*</c> siblings, because the degrade policy already lives
+    /// one level down in <c>ProjectDocumentQueries.LoadIndexPageSafeAsync</c> — and it has to live there,
+    /// since the Api's four legacy envelope sites need the identical policy without the identical wrapper.
+    /// Two nested catches over the same exception list would be a safety net that can never fire, and a
+    /// reader would have to work out which of the two is real.
+    /// </para>
+    /// <para>
+    /// The observable behaviour is the same as every other layer's: an empty list renders no index section
+    /// at all, so a document table that is unreachable costs one shorter Layer 3 and the turn still runs.
+    /// </para>
+    /// </remarks>
+    private async Task<ProjectDocumentQueries.IndexPage> SafeLoadDocumentsAsync(
+        PromptStackContext context,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(context.ProjectId)) return new ProjectDocumentQueries.IndexPage([], 0);
+
+        return await db.LoadIndexPageSafeAsync(
+            context.ProjectId, ProjectDocumentIndexFormatter.MaxRenderedDocuments, ct);
     }
 
     private async Task<Persona?> SafeLoadPersonaAsync(PromptStackContext context, CancellationToken ct)

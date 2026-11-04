@@ -1,4 +1,4 @@
-using AgentMesh.Api.Hubs;
+﻿using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -94,11 +94,37 @@ public class JobTurnDispatcher(
 
         var turnSessionId = Guid.NewGuid();
 
+        // Two prompt shapes travel together, and the reason is deployment order rather than taste. See the
+        // remark on JobTurnRequest.PromptStack: when the worker composed a layered stack, that stack's own
+        // turn-0 envelope is authoritative and this method must not prepend a second one. When it did not,
+        // the legacy envelope below is the only context the runner will ever get.
+        //
+        // Resolved here rather than at the prompt composition because it also decides whether the project
+        // preamble needs building at all — see PrepareAsync's composePreamble.
+        var hasLayeredStack = req.PromptStack is not null;
+
         var attachments = req.Attachments ?? new List<JobAttachmentDto>();
         if (attachments.Count > 0)
         {
             StageAttachments(job.Id, turnSessionId, attachments);
         }
+
+        // The project's own uploaded documents travel with every turn of the project, not just with the
+        // message that attached them: a spec is attached once to the project and consulted by every job
+        // after it. Files are staged into the same directory and merged into the same payload as job
+        // attachments, so the CLI's [Attached Files in Workspace] block names them identically; the
+        // preamble is built from the same single load, which is what keeps the index and the staged files
+        // about the same set of documents. Best-effort by contract — see ProjectDocumentStaging.
+        var library = await ProjectDocumentStaging.PrepareAsync(
+            db,
+            project.Id,
+            turnSessionId,
+            existing: attachments,
+            projectInstructions: project.ProjectInstructions,
+            composePreamble: !hasLayeredStack,
+            ct: ct);
+
+        attachments = library.Attachments.ToList();
 
         // The workspace pointer is the handoff contract: it tells the incoming runner which commit
         // it is expected to be standing on. Without it, two machines can each "finish" the job
@@ -164,20 +190,14 @@ public class JobTurnDispatcher(
         };
         db.AgentSessions.Add(turnSession);
 
-        // Two prompt shapes travel together, and the reason is deployment order rather than taste. See
-        // the remark on JobTurnRequest.PromptStack: when the worker composed a layered stack, that
-        // stack's own turn-0 envelope is authoritative and this method must not prepend a second one.
-        // When it did not, the legacy envelope below is the only context the runner will ever get.
-        var hasLayeredStack = req.PromptStack is not null;
-
+        // The two prompt shapes and the reason for the split are documented at hasLayeredStack, where the
+        // project library was loaded for whichever of the two this turn is composing.
         var promptWithContext = hasLayeredStack
             ? req.Prompt + (string.IsNullOrWhiteSpace(req.PreflightContext)
                 ? string.Empty
                 : "\n" + req.PreflightContext)
             : $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
-              (!string.IsNullOrWhiteSpace(project.ProjectInstructions)
-                  ? $"[Project Guidelines: {project.ProjectInstructions}]\n"
-                  : "") +
+              library.ProjectPreamble +
               $"[Job Context: {job.Title} - {job.Description}]\n" +
               (req.PreflightContext ?? string.Empty) +
               "\n" +
