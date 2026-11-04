@@ -19,7 +19,8 @@ public record DiscoveryTurnInput(
     string WorkspacePath,
     string InitialPrompt,
     string? ProjectId = null,
-    string? TargetBranch = null
+    string? TargetBranch = null,
+    ChatMessageSignal? PendingMessage = null
 );
 
 public record CodingTurnInput(

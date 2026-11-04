@@ -1564,7 +1564,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             >
               Task {uniqueTasks.length === 0 ? 0 : (firstPendingTaskIndex >= 0 ? firstPendingTaskIndex + 1 : uniqueTasks.length)} of {uniqueTasks.length} ({progressPercent}% complete)
             </span>
-            {firstPendingTask && (
+            {firstPendingTask ? (
               <div className="hidden xl:flex flex-col gap-0.5 max-w-xs truncate">
                 <span
                   className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg border max-w-xs truncate ${
@@ -1593,7 +1593,16 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   </div>
                 )}
               </div>
-            )}
+            ) : job.progressHeartbeat ? (
+              <div
+                className="hidden xl:flex items-center gap-1.5 text-[11px] text-sky-300/90 italic pl-1 max-w-sm truncate"
+                title={`Heartbeat: ${job.progressHeartbeat}`}
+                data-testid="job-progress-heartbeat"
+              >
+                <Activity className="w-3 h-3 text-sky-400 shrink-0 animate-pulse" />
+                <span className="truncate">{job.progressHeartbeat}</span>
+              </div>
+            ) : null}
           </div>
 
           <div className="flex items-center gap-3 shrink-0">
@@ -1652,7 +1661,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 {uniqueTasks.length === 0
                   ? isPending
                     ? "Job pending. Click 'Start Job' to begin Stage 1 discovery and task breakdown."
-                    : "Autonomous implementer exploring repository to decompose tasks into living checklist..."
+                    : (job.progressHeartbeat || "Autonomous implementer exploring repository to decompose tasks into living checklist...")
                   : taskFilter === 'pending' && completedCount === uniqueTasks.length
                   ? `All ${uniqueTasks.length} tasks completed!`
                   : `No ${taskFilter} tasks found.`}
@@ -2320,7 +2329,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     <p className="text-[11px] text-slate-400 leading-relaxed mt-0.5">
                       {activeTurnInfo.isOffline
                         ? `Starting environment & waiting for runner connection (@${activeTurnInfo.driverId || 'agy'})...`
-                        : 'Executing workspace commands, tests, and active persona logic.'}
+                        : (job.currentTaskId === 'stage-1-discovery' || (uniqueTasks.length === 0 && !isPending)
+                            ? 'Exploring codebase and discussing plan...'
+                            : 'Executing workspace commands, tests, and active persona logic.')}
                     </p>
                   </div>
                 </div>

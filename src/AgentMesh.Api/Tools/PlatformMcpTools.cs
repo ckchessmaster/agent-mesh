@@ -247,6 +247,25 @@ public class PlatformMcpTools(
         db.JobMessages.Add(message);
 
         var parkedSession = requires_reply ? await ParkSessionAsync(context.Context.SessionId, ct) : null;
+        if (requires_reply && IsJobInDiscoveryPhase(job, context.Context))
+        {
+            job.ProgressHeartbeat = string.IsNullOrWhiteSpace(target)
+                ? "Awaiting user input on planning questions"
+                : $"Awaiting input from @{target} on planning questions";
+
+            var agentJob = await db.AgentJobs.FindAsync([job.Id], ct);
+            if (agentJob is not null)
+            {
+                agentJob.ProgressHeartbeat = job.ProgressHeartbeat;
+                agentJob.UpdatedAt = DateTimeOffset.UtcNow;
+            }
+            await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+            {
+                jobId = job.Id,
+                progressHeartbeat = job.ProgressHeartbeat,
+                currentTaskId = job.CurrentTaskId
+            }, ct);
+        }
         job.UpdatedAt = DateTimeOffset.UtcNow;
 
         await db.SaveChangesAsync(ct);
