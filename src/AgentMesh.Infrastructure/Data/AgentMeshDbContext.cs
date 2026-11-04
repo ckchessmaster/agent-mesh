@@ -1,4 +1,4 @@
-using AgentMesh.Core.Models;
+﻿using AgentMesh.Core.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 
@@ -19,6 +19,7 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     public DbSet<JobWorkspaceState> JobWorkspaceStates => Set<JobWorkspaceState>();
     public DbSet<JobHandoff> JobHandoffs => Set<JobHandoff>();
     public DbSet<AgentMemory> AgentMemories => Set<AgentMemory>();
+    public DbSet<ProjectDocument> ProjectDocuments => Set<ProjectDocument>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
