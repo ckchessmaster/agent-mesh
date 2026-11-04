@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
@@ -764,6 +764,7 @@ public class ProjectsController(
 
         if (formFiles is not null)
         {
+            var fileIndex = 0;
             foreach (var file in formFiles)
             {
                 var documentId = Guid.NewGuid();
@@ -773,11 +774,12 @@ public class ProjectsController(
                     ? file.ContentType.Trim()
                     : SessionsController.GuessContentTypeFromExtension(safeFileName);
 
+                var fileTitle = !hasText && fileIndex == 0 ? title : null;
                 var document = new ProjectDocument
                 {
                     Id = documentId,
                     ProjectId = normId,
-                    Title = FileTitle(title, safeFileName),
+                    Title = FileTitle(fileTitle, safeFileName),
                     Kind = ProjectDocumentKind.File,
                     FileName = safeFileName,
                     ContentType = contentType,
@@ -816,6 +818,7 @@ public class ProjectsController(
 
                 db.ProjectDocuments.Add(document);
                 created.Add(document);
+                fileIndex++;
             }
         }
 

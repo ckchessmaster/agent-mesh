@@ -1,4 +1,4 @@
-﻿using AgentMesh.Api.Controllers;
+using AgentMesh.Api.Controllers;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -352,10 +352,37 @@ public class ProjectsControllerDocumentTests : IDisposable
 
         var list = result.Should().BeOfType<OkObjectResult>().Subject.Value as List<ProjectDocumentDto>;
         list.Should().HaveCount(2);
-        list.Should().ContainSingle(d => d.Kind == ProjectDocumentKind.Text).Which.Content.Should().BeNull();
-        list.Should().ContainSingle(d => d.Kind == ProjectDocumentKind.File).Which.FileName.Should().Be("diagram.svg");
+        var textDoc = list.Should().ContainSingle(d => d.Kind == ProjectDocumentKind.Text).Subject;
+        textDoc.Title.Should().Be("Context notes");
+        textDoc.Content.Should().BeNull();
+        var fileDoc = list.Should().ContainSingle(d => d.Kind == ProjectDocumentKind.File).Subject;
+        fileDoc.Title.Should().Be("diagram.svg", "the file must not inherit the text note's title");
+        fileDoc.FileName.Should().Be("diagram.svg");
 
         (await db.ProjectDocuments.CountAsync(d => d.ProjectId == id)).Should().Be(2);
+    }
+
+    [Fact]
+    public async Task CreateProjectDocuments_MultipleFiles_TitleAppliesToFirstOnly_SubsequentFallbackToFilenames()
+    {
+        var id = NewProjectId();
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(NewProject(id));
+        await db.SaveChangesAsync();
+
+        var result = await Controller(db).CreateProjectDocuments(
+            id,
+            Files(("arch.png", "image/png", Bytes(8)), ("readme.txt", "text/plain", "hello"u8.ToArray())),
+            "Main Architecture",
+            null,
+            default);
+
+        var list = result.Should().BeOfType<OkObjectResult>().Subject.Value as List<ProjectDocumentDto>;
+        list.Should().HaveCount(2);
+        list![0].Title.Should().Be("Main Architecture");
+        list[0].FileName.Should().Be("arch.png");
+        list[1].Title.Should().Be("readme.txt");
+        list[1].FileName.Should().Be("readme.txt");
     }
 
     [Fact]
