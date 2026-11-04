@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { X, FolderGit2, Check, AlertCircle } from 'lucide-react';
 import type { Persona, Project } from '../types';
 import { WorkspaceType } from '../types';
+import { ProjectDocumentsSection } from './ProjectDocumentsSection';
 
 interface ProjectModalProps {
   isOpen: boolean;
@@ -360,6 +361,18 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
               className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition font-mono leading-relaxed"
             />
           </div>
+
+          {/*
+            The document library is rendered only for an existing project. A new project has no id yet,
+            and its documents are addressed by project id in both the storage key and the download URL, so
+            there is nowhere to put a file before the row exists. The section says so rather than showing a
+            disabled control, because "Save this project first to attach documents" is an instruction, while
+            a greyed-out upload is a mystery.
+
+            It lives inside the <form> because that is where the project's own fields are, and every control
+            in it is type="button" so adding a document cannot submit (and close) the project form.
+          */}
+          <ProjectDocumentsSection projectId={editingProject?.id ?? null} />
 
           <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-800">
             <button
