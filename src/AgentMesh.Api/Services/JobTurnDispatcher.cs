@@ -1,4 +1,4 @@
-﻿using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -301,6 +301,38 @@ public class JobTurnDispatcher(
             await group.SendAsync("PromptReceived", payload, ct);
         }
         await hubContext.Clients.All.SendAsync("PromptReceived", payload, ct);
+
+        // Broadcast session lifecycle so dashboards reflect active turns in real-time
+        var summary = new Controllers.SessionSummaryDto(
+            session.Id,
+            session.Title,
+            session.Status,
+            session.MetadataJson,
+            driverId,
+            1,
+            session.CreatedAt,
+            session.UpdatedAt,
+            DriverId: driverId,
+            DriverName: driver.Name,
+            PersonaId: persona.Id,
+            PersonaName: persona.Name
+        );
+        await hubContext.Clients.All.SendAsync("SessionCreated", summary, ct);
+
+        var promptDto = new Controllers.SessionMessageDto(
+            promptMsg.Id,
+            promptMsg.SessionId,
+            promptMsg.SenderAgentId,
+            promptMsg.TargetAgentId,
+            promptMsg.Content,
+            promptMsg.StructuredPayloadJson,
+            promptMsg.CreatedAt,
+            promptMsg.EventType,
+            promptMsg.ToolName,
+            promptMsg.ToolArgsJson,
+            promptMsg.ToolResultJson
+        );
+        await hubContext.Clients.All.SendAsync("ReceiveMessage", promptDto, ct);
     }
 
     /// <summary>

@@ -1487,4 +1487,41 @@ describe('JobCockpit - Task assignment and reassignment', () => {
     fireEvent.click(confirmBtn);
     expect(onResetJob).toHaveBeenCalledTimes(1);
   });
+
+  it('shows active turn indicator, Working status, and View Live Trajectory card when job has started with 0 chat messages', async () => {
+    const onSelectTurnSession = vi.fn();
+    const liveSession: AgentSession = {
+      id: 'sess-turn-active-1',
+      title: 'Job Turn: Assignment Interface Test (@Astra)',
+      status: 'thinking',
+      personaId: 'agy-astra',
+      personaName: 'Astra',
+      metadataJson: JSON.stringify({ jobId: 'job-assign-1' }),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        messages={[]}
+        sessions={[liveSession]}
+        onSelectTurnSession={onSelectTurnSession}
+      />
+    );
+
+    // Active state empty card in center
+    expect(screen.getByTestId('cockpit-active-turn-empty-state')).toBeInTheDocument();
+    expect(screen.getByText('Astra is actively working')).toBeInTheDocument();
+
+    // View live trajectory button
+    const trajectoryBtn = screen.getByTestId('cockpit-view-active-turn-trajectory');
+    expect(trajectoryBtn).toBeInTheDocument();
+    fireEvent.click(trajectoryBtn);
+    expect(onSelectTurnSession).toHaveBeenCalledWith('sess-turn-active-1');
+
+    // Right sidebar activity indicator
+    expect(screen.getByText(/Astra is actively working on this turn/i)).toBeInTheDocument();
+    expect(screen.getAllByText('Working').length).toBeGreaterThanOrEqual(1);
+  });
 });

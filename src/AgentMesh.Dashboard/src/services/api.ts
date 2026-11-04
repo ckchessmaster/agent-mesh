@@ -580,8 +580,9 @@ export const api = {
     return res.json();
   },
 
-  async getSession(id: string): Promise<AgentSession> {
-    const res = await apiFetch(`/api/sessions/${id}`, { headers: getHeaders() });
+  async getSession(id: string, includeMessages: boolean = true): Promise<AgentSession> {
+    const query = includeMessages ? '' : '?includeMessages=false';
+    const res = await apiFetch(`/api/sessions/${id}${query}`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load session details: ${res.statusText}`);
     return res.json();
   },

@@ -47,6 +47,9 @@ public class SessionMessageConfiguration : IEntityTypeConfiguration<SessionMessa
         builder.HasIndex(m => m.SessionId)
             .HasDatabaseName("idx_session_messages_session");
 
+        builder.HasIndex(m => new { m.SessionId, m.CreatedAt })
+            .HasDatabaseName("ix_session_messages_session_id_created_at");
+
         builder.HasOne(m => m.Session)
             .WithMany(s => s.Messages)
             .HasForeignKey(m => m.SessionId)
