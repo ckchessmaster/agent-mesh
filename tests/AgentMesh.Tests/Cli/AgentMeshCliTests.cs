@@ -231,8 +231,8 @@ public class AgentMeshCliTests
         var json = """
         {
             "sessionId": "a0000000-0000-0000-0000-000000000001",
-            "agentId": "spence-ai",
-            "personaId": "rook",
+            "agentId": "mock-driver",
+            "personaId": "test-engineer",
             "reason": "Operator clicked stop"
         }
         """;
@@ -240,8 +240,8 @@ public class AgentMeshCliTests
         var ev = System.Text.Json.JsonSerializer.Deserialize<StopExecutionEvent>(json);
         ev.Should().NotBeNull();
         ev!.SessionId.Should().Be(Guid.Parse("a0000000-0000-0000-0000-000000000001"));
-        ev.AgentId.Should().Be("spence-ai");
-        ev.PersonaId.Should().Be("rook");
+        ev.AgentId.Should().Be("mock-driver");
+        ev.PersonaId.Should().Be("test-engineer");
         ev.Reason.Should().Be("Operator clicked stop");
     }
 

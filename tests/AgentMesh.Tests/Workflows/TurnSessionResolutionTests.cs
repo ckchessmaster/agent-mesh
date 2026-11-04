@@ -253,6 +253,7 @@ public class TurnSessionResolutionTests
     [InlineData("idle", false)]
     [InlineData("waiting_for_input", false)]
     [InlineData("COMPLETED", false)]
+    [InlineData("active", false)]
     [InlineData("thinking", true)]
     [InlineData("busy", true)]
     [InlineData("queued", true)]
@@ -744,7 +745,7 @@ public class TurnSessionResolutionTests
         using var db = TestDbContextFactory.Create();
         var handler = new MockHttpMessageHandler(
             System.Net.HttpStatusCode.OK,
-            "{\"turnSessionId\":\"7fe7c45d-e466-4783-b6fa-7c9446f411c0\",\"driverId\":\"spence-ai\",\"personaId\":\"rook\",\"dispatchedAt\":\"2026-11-03T17:50:24.4862634+00:00\",\"alreadyRunning\":false}"
+            "{\"turnSessionId\":\"7fe7c45d-e466-4783-b6fa-7c9446f411c0\",\"driverId\":\"mock-driver\",\"personaId\":\"test-engineer\",\"dispatchedAt\":\"2026-11-03T17:50:24.4862634+00:00\",\"alreadyRunning\":false}"
         );
         var client = new HttpClient(handler);
         var factoryMock = new Mock<IHttpClientFactory>();

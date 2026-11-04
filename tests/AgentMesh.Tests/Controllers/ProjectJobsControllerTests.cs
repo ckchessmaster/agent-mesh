@@ -992,10 +992,10 @@ public class ProjectJobsControllerTests
         var project = new Project { Id = "proj-queued", Name = "Queued Turn Project" };
         var persona = new Persona
         {
-            Id = "spence-ai-rook",
+            Id = "mock-driver-engineer",
             Name = "Rook",
             Role = "Software Engineer",
-            DriverId = "spence-ai",
+            DriverId = "mock-driver",
             PersonaPrompt = "Code"
         };
 
@@ -1123,7 +1123,7 @@ public class ProjectJobsControllerTests
             QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(all)
         };
 
-        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "spence-ai", PersonaPrompt = "Code" });
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", Role = "Engineer", DriverId = "mock-driver", PersonaPrompt = "Code" });
         db.Projects.Add(project);
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();

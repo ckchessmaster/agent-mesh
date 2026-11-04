@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Historical Document**: This document outlines an early development milestone (Phases 1–7) preserved for historical context. For the current canonical architecture and living system specifications, see [Master Architecture Plan](../../architecture-plan.md) and [System Specifications](../../specs/).
+
 # Phase 7: SeaweedFS S3 Artifact Storage & Large Payload Offload
 
 ## 1. Phase Objective & Scope

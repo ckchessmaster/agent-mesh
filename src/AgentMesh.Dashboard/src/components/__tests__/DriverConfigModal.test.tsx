@@ -5,8 +5,8 @@ import type { Agent } from '../../types';
 import { api } from '../../services/api';
 
 const openAiAgent: Agent = {
-  id: 'spence-ai',
-  name: 'Spence Private AI',
+  id: 'mock-driver',
+  name: 'Mock Driver',
   role: 'Autonomous Agent',
   status: 'online',
   runtimeType: 3,
@@ -267,7 +267,7 @@ describe('DriverConfigModal', () => {
 
   it('renders Restart Runner button and calls restartDriverRunners API', async () => {
     const restartSpy = vi.spyOn(api, 'restartDriverRunners').mockResolvedValue({
-      driverId: 'spence-ai',
+      driverId: 'mock-driver',
       restarted: 1,
       runners: []
     });
@@ -279,7 +279,7 @@ describe('DriverConfigModal', () => {
     fireEvent.click(restartBtn);
 
     await waitFor(() => {
-      expect(restartSpy).toHaveBeenCalledWith('spence-ai');
+      expect(restartSpy).toHaveBeenCalledWith('mock-driver');
     });
   });
 

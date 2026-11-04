@@ -243,7 +243,7 @@ public class SessionTools(
     [McpServerTool(Name = "get_persona_sessions")]
     [Description("Lists sessions created for or by a specific persona, including session IDs, titles, status, message count, artifact count, and timestamps so past work and decisions can be referenced.")]
     public async Task<string> GetPersonaSessions(
-        [Description("The persona ID, e.g. 'system-architect', 'astra', etc.")] string personaId,
+        [Description("The persona ID, e.g. 'system-architect', 'test-engineer', etc.")] string personaId,
         [Description("Optional filter: 'active', 'completed', or 'all' (default is 'all')")] string? status = "all",
         CancellationToken ct = default)
     {
