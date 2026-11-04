@@ -388,6 +388,18 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.HasIndex("PersonaId")
                         .HasDatabaseName("ix_agent_sessions_persona_id");
 
+                    b.HasIndex("Status")
+                        .HasDatabaseName("ix_agent_sessions_status");
+
+                    b.HasIndex("UpdatedAt")
+                        .HasDatabaseName("ix_agent_sessions_updated_at");
+
+                    b.HasIndex("DriverId", "UpdatedAt")
+                        .HasDatabaseName("ix_agent_sessions_driver_id_updated_at");
+
+                    b.HasIndex("PersonaId", "UpdatedAt")
+                        .HasDatabaseName("ix_agent_sessions_persona_id_updated_at");
+
                     b.ToTable("agent_sessions", (string)null);
                 });
 
@@ -1191,6 +1203,9 @@ namespace AgentMesh.Infrastructure.Migrations
 
                     b.HasIndex("SessionId")
                         .HasDatabaseName("idx_session_messages_session");
+
+                    b.HasIndex("SessionId", "CreatedAt")
+                        .HasDatabaseName("ix_session_messages_session_id_created_at");
 
                     b.ToTable("session_messages", (string)null);
                 });

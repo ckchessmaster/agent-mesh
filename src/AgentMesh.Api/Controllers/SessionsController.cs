@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -199,16 +199,26 @@ public class SessionsController(
 
     [HttpGet("{id:guid}")]
     [AllowAnonymous]
-    public async Task<IActionResult> GetSession(Guid id)
+    public async Task<IActionResult> GetSession(Guid id, [FromQuery] bool includeMessages = true)
     {
         var session = await db.AgentSessions
             .AsNoTracking()
-            .Include(s => s.Messages.OrderBy(m => m.CreatedAt))
             .FirstOrDefaultAsync(s => s.Id == id);
 
         if (session == null)
         {
             return NotFound(new { error = $"Session '{id}' not found." });
+        }
+
+        List<SessionMessageDto> messagesList = [];
+        if (includeMessages)
+        {
+            var msgs = await db.SessionMessages
+                .AsNoTracking()
+                .Where(m => m.SessionId == id)
+                .OrderBy(m => m.CreatedAt)
+                .ToListAsync();
+            messagesList = msgs.Select(ToMessageDto).ToList();
         }
 
         var effectiveDriverId = session.DriverId ?? session.CreatorAgentId;
@@ -242,7 +252,7 @@ public class SessionsController(
             creatorAgentName,
             session.CreatedAt,
             session.UpdatedAt,
-            session.Messages.Select(ToMessageDto).ToList(),
+            messagesList,
             DriverId: effectiveDriverId,
             DriverName: creatorAgentName ?? effectiveDriverId,
             PersonaId: session.PersonaId,

@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronUp, MessageSquare, RefreshCw, Trash2 } from 'lucide-react';
 import { api } from '../services/api';
 import type { AgentSession } from '../types';
@@ -49,7 +49,7 @@ const rowSignature = (sessions: AgentSession[]) => sessions.map((s) => s.id).joi
  * Expansion state is deliberately not persisted: it lives in this component and is dropped whenever
  * the card unmounts (tab switch, reload) or the owner's row set changes underneath us.
  */
-export function SessionListSection({
+export const SessionListSection = memo(function SessionListSection({
   ownerKind,
   ownerId,
   sessions,
@@ -285,4 +285,4 @@ export function SessionListSection({
       )}
     </div>
   );
-}
+});

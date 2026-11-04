@@ -92,7 +92,7 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { DriverConfigModal } from './components/DriverConfigModal';
 import { PersonaEnvironmentModal } from './components/PersonaEnvironmentModal';
 import { SessionListSection } from './components/SessionListSection';
-import { sortSessionsByRecency } from './utils/sessionDisplay';
+import { isJobTurnSession, sortSessionsByRecency } from './utils/sessionDisplay';
 
 interface StagedAttachmentItem {
   localId: string;
@@ -289,6 +289,39 @@ export default function App() {
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
   );
   const [isMobileDetailView, setIsMobileDetailView] = useState(false);
+
+  const personaSessionsMap = useMemo(() => {
+    const map = new Map<string, AgentSession[]>();
+    for (const session of sessions) {
+      if (session.personaId) {
+        const list = map.get(session.personaId);
+        if (list) list.push(session);
+        else map.set(session.personaId, [session]);
+      }
+    }
+    const sorted = new Map<string, AgentSession[]>();
+    for (const [id, list] of map.entries()) {
+      sorted.set(id, sortSessionsByRecency(list));
+    }
+    return sorted;
+  }, [sessions]);
+
+  const agentSessionsMap = useMemo(() => {
+    const map = new Map<string, AgentSession[]>();
+    for (const session of sessions) {
+      const dId = session.driverId || session.creatorAgentId;
+      if (dId) {
+        const list = map.get(dId);
+        if (list) list.push(session);
+        else map.set(dId, [session]);
+      }
+    }
+    const sorted = new Map<string, AgentSession[]>();
+    for (const [id, list] of map.entries()) {
+      sorted.set(id, sortSessionsByRecency(list));
+    }
+    return sorted;
+  }, [sessions]);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -805,12 +838,9 @@ export default function App() {
     try {
       const [msgs, latestSession] = await Promise.all([
         api.getSessionMessages(sessionId),
-        api.getSession ? api.getSession(sessionId).catch(() => null) : Promise.resolve(null)
+        api.getSession ? api.getSession(sessionId, false).catch(() => null) : Promise.resolve(null)
       ]);
-      const finalMsgs = (latestSession?.messages && Array.isArray(latestSession.messages) && latestSession.messages.length > msgs.length)
-        ? latestSession.messages
-        : msgs;
-      setEvents(finalMsgs);
+      setEvents(msgs);
       if (latestSession) {
         setSessions((prev) =>
           prev.some((s) => s.id === latestSession.id)
@@ -1313,12 +1343,16 @@ export default function App() {
         if (prev.some((s) => s.id === session.id)) return prev;
         return [session, ...prev];
       });
-      setSelectedSessionId(session.id);
-      if (session.personaId) {
-        setSelectedPersonaId(session.personaId);
-      }
-      if (session.driverId || session.creatorAgentId) {
-        setSelectedAgentId(session.driverId || session.creatorAgentId || null);
+      // Do not steal focus for automated job turns
+      const isJobTurn = isJobTurnSession(session);
+      if (!isJobTurn) {
+        setSelectedSessionId(session.id);
+        if (session.personaId) {
+          setSelectedPersonaId(session.personaId);
+        }
+        if (session.driverId || session.creatorAgentId) {
+          setSelectedAgentId(session.driverId || session.creatorAgentId || null);
+        }
       }
     };
 
@@ -3046,9 +3080,7 @@ export default function App() {
                   </div>
                 ) : (
                   personas.map((persona) => {
-                    // Ordered by the shared recency comparator so the auto-selected row below is
-                    // always the same row the bounded preview puts on top.
-                    const personaSessions = sortSessionsByRecency(sessions.filter((s) => s.personaId === persona.id));
+                    const personaSessions = personaSessionsMap.get(persona.id) || [];
                     const isPersonaSelected = selectedPersona?.id === persona.id;
                     const linkedDriver = agents.find((a) => a.id === persona.driverId);
                     const driverStatus = linkedDriver?.status || persona.driverStatus || 'offline';
@@ -3437,9 +3469,7 @@ export default function App() {
                   </div>
                 ) : (
                   agents.map((agent) => {
-                    const agentSessions = sortSessionsByRecency(
-                      sessions.filter((s) => s.driverId === agent.id || s.creatorAgentId === agent.id)
-                    );
+                    const agentSessions = agentSessionsMap.get(agent.id) || [];
                     const driverPersonas = personas.filter((p) => p.driverId === agent.id);
                     const isAgentSelected = selectedAgent?.id === agent.id;
                     const isOffline = agent.status === 'offline';
@@ -3751,7 +3781,7 @@ export default function App() {
                           }
                         }
                         try {
-                          const fetched = await api.getSession(sessionId);
+                          const fetched = await api.getSession(sessionId, false);
                           if (fetched) {
                             setSessions((prev) =>
                               prev.some((s) => s.id === fetched.id)
@@ -4810,7 +4840,7 @@ export default function App() {
                     );
                   };
 
-                  return events.map((ev) => {
+                  return events.map((ev, index) => {
                     const type = ev.eventType || 'response';
 
                     if (type === 'system') {
@@ -5027,11 +5057,12 @@ export default function App() {
                       }
 
                       const outputText = ev.toolResultJson || '';
+                      const isRecentTool = index >= events.length - 2;
 
                       return (
                         <details
                           key={ev.id}
-                          open
+                          open={isRecentTool || undefined}
                           className="bg-slate-900/80 border border-slate-800 rounded-xl overflow-hidden shadow-sm"
                         >
                           <summary className="px-4 py-2 cursor-pointer flex items-center justify-between text-xs text-slate-300 hover:bg-slate-900/90 select-none">

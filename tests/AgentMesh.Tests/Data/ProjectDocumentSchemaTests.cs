@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Models;
+using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Data.Configurations;
 using AgentMesh.Infrastructure.Migrations;
@@ -329,7 +329,7 @@ public class ProjectDocumentSchemaTests
     /// means the next migration stacked on top shows up as a failure to re-check rather than a silent
     /// assumption that the snapshot is current.
     /// </remarks>
-    private const string TipMigrationId = MigrationId;
+    private const string TipMigrationId = "20261104210849_AddSessionPerformanceIndices";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()
