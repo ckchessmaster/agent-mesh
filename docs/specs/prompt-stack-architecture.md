@@ -1,4 +1,4 @@
-# Prompt Stack Architecture & Context Layering
+﻿# Prompt Stack Architecture & Context Layering
 
 ## 1. Problem Statement: Prefix Caching & Prompt Volatility
 
@@ -49,6 +49,11 @@ flowchart TD
 * **Volatility**: Static per Repository / Project.
 * **Scope**: Scoped to `Project.Id`.
 * **Contents**: Authoritative project metadata: repository name, primary language conventions, framework configurations, and team-specific instructions.
+* **Supporting-Document Index**: A bounded table of contents over `project_documents` (title, kind, filename, media type, size, document id, content URL), rendered by `ProjectDocumentIndexFormatter` — the same formatter the legacy `[Project Guidelines]` envelope sites in the API call, so the layered and flat prompt paths cannot describe one library differently.
+  * **Cap Guardrail**: Bounded by `MaxRenderedDocuments = 25`, with an explicit "N more document(s) not listed" line carrying the library's true total. The index is a table of contents, not the documents: the per-project cap times the per-file cap is far more than a cached prefix may carry.
+  * **Byte Stability**: Emits no timestamps and orders by `Title` then `Id`. `CreatedAt`/`UpdatedAt` would change the block on every read and invalidate every layer below it, which is the cost this layer exists to avoid.
+  * **Degrade Rule**: An unreadable library (e.g. the API deployed ahead of its migration) renders no section at all, identical to a project with no documents. The turn proceeds on the layers that did load.
+  * **Staging**: Uploaded documents are additionally copied into the turn session's attachment directory (`ProjectDocumentStaging`), so the agent can `read_file` them at `.agentmesh/attachments/{id}_{fileName}`. Pasted text documents are referenced only — their body is a column, not a file.
 
 ### Layer 4: Team Topology & Escalation Paths
 * **Volatility**: Semi-Dynamic per Project Roster.

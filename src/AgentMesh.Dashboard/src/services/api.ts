@@ -14,6 +14,7 @@ import type {
   PersonaAuthSubmitResult,
   Project,
   ProjectJob,
+  ProjectDocument,
   ProjectPersonaSummary,
   QueuedPromptItem,
   SessionAttachment,
@@ -59,6 +60,48 @@ const readTotalCount = (res: Response): number | null => {
   if (!raw) return null;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
+/**
+ * Normalizes one project document from the API onto the `ProjectDocument` shape.
+ *
+ * The camelCase-or-PascalCase fallbacks are the convention every attachment mapper in this file already
+ * follows (`uploadJobAttachments`, `uploadTaskAttachments`), and they are load-bearing rather than
+ * defensive theatre: the API serializes camelCase, but a proxied or older build that leaves the naming
+ * policy unset would emit PascalCase, and a modal that read only one of the two would render an empty
+ * library with no error — the user would conclude their upload vanished.
+ *
+ * `downloadUrl` is rebuilt from the id when the response omits it, for the same reason the job-attachment
+ * mapper does: without a URL the row cannot be opened, so a missing field should degrade to a derived one
+ * rather than to a dead row.
+ */
+const mapProjectDocument = (item: any): ProjectDocument => {
+  const id = item?.id || item?.Id || '';
+  const projectId = item?.projectId || item?.ProjectId || '';
+  const fileName = item?.fileName || item?.FileName || null;
+  const downloadUrl = item?.downloadUrl || item?.DownloadUrl
+    || (id && projectId
+      ? `/api/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(id)}/content`
+      : '');
+
+  return {
+    id,
+    projectId,
+    title: item?.title || item?.Title || fileName || 'Untitled document',
+    kind: typeof item?.kind === 'number' ? item.kind : (typeof item?.Kind === 'number' ? item.Kind : 0),
+    fileName,
+    contentType: item?.contentType || item?.ContentType || null,
+    sizeBytes: typeof item?.sizeBytes === 'number'
+      ? item.sizeBytes
+      : (typeof item?.SizeBytes === 'number' ? item.SizeBytes : 0),
+    s3Key: item?.s3Key || item?.S3Key || null,
+    downloadUrl,
+    forceDownloadUrl: item?.forceDownloadUrl || item?.ForceDownloadUrl
+      || (downloadUrl ? `${downloadUrl}?download=true` : ''),
+    createdAt: item?.createdAt || item?.CreatedAt || new Date().toISOString(),
+    updatedAt: item?.updatedAt || item?.UpdatedAt || new Date().toISOString(),
+    content: item?.content ?? item?.Content ?? null
+  };
 };
 
 const getAuthHeadersOnly = (): Record<string, string> => {
@@ -869,6 +912,89 @@ export const api = {
       headers: getHeaders()
     });
     if (!res.ok) throw new Error(`Failed to remove persona: ${res.statusText}`);
+    return res.json();
+  },
+
+  // ── Project supporting documents ──────────────────────────────────────────────
+  //
+  // A project's library of specs, contracts and screenshots. The endpoints accept a multipart form
+  // carrying files, a pasted text document, or both in one submit, which is why addProjectDocument takes
+  // an options bag rather than being two methods: the modal's "Add documents" flow lets a user type notes
+  // and attach a screenshot in the same action, and sequencing two calls would leave a half-saved library
+  // if the second one failed.
+
+  async getProjectDocuments(projectId: string): Promise<ProjectDocument[]> {
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/documents`, {
+      headers: getHeaders()
+    });
+    if (!res.ok) throw new Error(`Failed to load project documents: ${res.statusText}`);
+    const raw = await res.json();
+    return (Array.isArray(raw) ? raw : []).map(mapProjectDocument);
+  },
+
+  /**
+   * Adds one pasted text document, one or more uploaded files, or both.
+   *
+   * `title` and `content` create the text document; `files` create the uploads. A request with neither is
+   * rejected by the API with a 400, and the message is surfaced rather than swallowed because it is the
+   * user's own "I clicked Add but typed nothing" case.
+   */
+  async addProjectDocument(
+    projectId: string,
+    options: { title?: string; content?: string; files?: File[] }
+  ): Promise<ProjectDocument[]> {
+    const formData = new FormData();
+    (options.files ?? []).forEach((f) => formData.append('files', f, f.name));
+    if (options.title) formData.append('title', options.title);
+    if (options.content) formData.append('content', options.content);
+
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/documents`, {
+      method: 'POST',
+      // getAuthHeadersOnly, not getHeaders: setting Content-Type by hand would overwrite the multipart
+      // boundary the browser generates, and the API would read an empty form. Same reason
+      // uploadJobAttachments above does the same.
+      headers: getAuthHeadersOnly(),
+      body: formData
+    });
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errBody = await res.json();
+        if (errBody?.error) errMsg = errBody.error;
+      } catch {
+        // Ignore JSON parse error
+      }
+      throw new Error(`Failed to add document: ${errMsg}`);
+    }
+    const raw = await res.json();
+    return (Array.isArray(raw) ? raw : []).map(mapProjectDocument);
+  },
+
+  /** Reads one document including its text body. Uploads still have no body in the row. */
+  async getProjectDocument(projectId: string, docId: string): Promise<ProjectDocument> {
+    const res = await apiFetch(
+      `/api/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(docId)}`,
+      { headers: getHeaders() }
+    );
+    if (!res.ok) throw new Error(`Failed to load document: ${res.statusText}`);
+    return mapProjectDocument(await res.json());
+  },
+
+  async deleteProjectDocument(projectId: string, docId: string): Promise<{ status: string }> {
+    const res = await apiFetch(
+      `/api/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(docId)}`,
+      { method: 'DELETE', headers: getHeaders() }
+    );
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errBody = await res.json();
+        if (errBody?.error) errMsg = errBody.error;
+      } catch {
+        // Ignore JSON parse error
+      }
+      throw new Error(`Failed to remove document: ${errMsg}`);
+    }
     return res.json();
   },
 

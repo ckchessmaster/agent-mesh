@@ -388,6 +388,46 @@ export interface SessionAttachment {
   createdAt: string;
 }
 
+/**
+ * How a project document got into the library.
+ *
+ * Mirrors `AgentMesh.Core.Models.ProjectDocumentKind`, which crosses the wire as a number because the
+ * API registers no `JsonStringEnumConverter` — the same reason `WorkspaceType` above is a numeric const
+ * object rather than a string union.
+ */
+export const ProjectDocumentKind = {
+  /** Pasted or typed prose; its body is stored on the row and returned by the single-document read. */
+  Text: 0,
+  /** An uploaded document or image; its bytes live on disk and in the object store. */
+  File: 1
+} as const;
+
+export type ProjectDocumentKind = (typeof ProjectDocumentKind)[keyof typeof ProjectDocumentKind];
+
+/**
+ * A supporting document attached to a project — a spec, a contract, a screenshot — that outlives any
+ * single job or message.
+ *
+ * `content` is populated only by `getProjectDocument`, and only for a text document. The list endpoint
+ * deliberately omits it: a library of fifty pasted specs is not something the modal should receive to
+ * draw fifty rows.
+ */
+export interface ProjectDocument {
+  id: string;
+  projectId: string;
+  title: string;
+  kind: ProjectDocumentKind | number;
+  fileName?: string | null;
+  contentType?: string | null;
+  sizeBytes: number;
+  s3Key?: string | null;
+  downloadUrl: string;
+  forceDownloadUrl: string;
+  createdAt: string;
+  updatedAt: string;
+  content?: string | null;
+}
+
 export const WorkspaceType = {
   Git: 0,
   S3Archive: 1

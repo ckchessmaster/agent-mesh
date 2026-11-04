@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -1216,6 +1216,17 @@ public class ProjectJobsController(
                     }
                 }
 
+                // The project's own uploaded documents travel with every turn of the project, not just
+                // with the message that attached them: a spec is attached once to the project and then
+                // consulted by every job. Files are staged into the same directory and merged into the
+                // same attachment list as job attachments, so the CLI's [Attached Files in Workspace]
+                // block names them identically, and the [Project Guidelines] + document index come out of
+                // the same single load — which is what keeps the index and the staged files about the
+                // same set of documents. Best-effort by contract; see ProjectDocumentStaging.
+                var library = await ProjectDocumentStaging.PrepareAsync(
+                    db, project.Id, turnSessionId, combinedAttachments, project.ProjectInstructions);
+                combinedAttachments = library.Attachments.ToList();
+
                 // Create turn metadata
                 var turnMetadata = new Dictionary<string, object?>
                 {
@@ -1260,7 +1271,7 @@ public class ProjectJobsController(
 
                 // Format prompt context for runner
                 var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
-                                        (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
+                                        library.ProjectPreamble +
                                         $"[Job Context: {job.Title} - {job.Description}]\n\n" +
                                         taskContext +
                                         effectiveContent;
@@ -2319,6 +2330,13 @@ public class ProjectJobsController(
                 }
             }
 
+            // The project's own uploaded documents travel with every turn of the project, not just with
+            // the message that attached them. Same single-load contract as PostJobMessage: files staged
+            // and index rendered from one read, so the two cannot disagree about this turn's documents.
+            var library = await ProjectDocumentStaging.PrepareAsync(
+                db, project.Id, turnSessionId, combinedAttachments, project.ProjectInstructions);
+            combinedAttachments = library.Attachments.ToList();
+
             var turnMetadata = new Dictionary<string, object?>
             {
                 ["jobId"] = job.Id.ToString(),
@@ -2359,7 +2377,7 @@ public class ProjectJobsController(
             var taskContext = FormatTaskContext(tasks, persona.Id, assigneeNames);
 
             var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
-                                    (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
+                                    library.ProjectPreamble +
                                     $"[Job Context: {job.Title} - {job.Description}]\n\n" +
                                     taskContext +
                                     turnToDispatch.Content;

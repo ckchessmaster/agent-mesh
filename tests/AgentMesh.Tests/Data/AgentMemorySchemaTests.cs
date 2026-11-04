@@ -1,4 +1,4 @@
-using AgentMesh.Core.Models;
+﻿using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Data.Configurations;
 using AgentMesh.Infrastructure.Migrations;
@@ -245,7 +245,7 @@ public class AgentMemorySchemaTests
     /// <see cref="TipMigrationId"/> is the tripwire's current value, updated by whoever stacks the next
     /// migration. See <see cref="MigrationSequence_KeepsMigrationsInOrder"/>.
     /// </remarks>
-    private const string TipMigrationId = "20261102230722_UpdateProjectJobStatusDefaultAndSentinels";
+    private const string TipMigrationId = "20261104134515_AddProjectDocumentsTable";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()
@@ -256,8 +256,10 @@ public class AgentMemorySchemaTests
         // The tripwire fired when AddMultiRepoPathsAndTaskCheckpoints was added, and re-checking it is
         // what produced the assertions below: agent_memories is no longer the tip, so "is the tip" is no
         // longer the invariant worth holding. What is still worth holding is that it is present, that it
-        // is ordered after the tables its foreign keys read, and that exactly one migration sits above it
-        // — so a fifth migration trips this test again rather than sliding in unnoticed.
+        // is ordered after the tables its foreign keys read, and that the tip is still the tip — so a new
+        // migration trips this test again rather than sliding in unnoticed. It fired a second time for
+        // AddProjectDocumentsTable, and re-checking it is what confirmed nothing above agent_memories
+        // re-orders it or touches its table.
         using var db = TestDbContextFactory.Postgres();
         var migrations = db.GetService<IMigrationsAssembly>().Migrations.Keys.ToList();
 
@@ -271,7 +273,7 @@ public class AgentMemorySchemaTests
             $"{TipMigrationId} is the expected tip; if a new migration was added, update TipMigrationId " +
             "and re-check that agent_memories' position is still correct");
         agentMemoriesIndex.Should().BeLessThan(tipIndex,
-            "the memories table predates the multi-repo migration and must not be re-ordered after it");
+            "the memories table predates the migrations stacked on top of it and must not be re-ordered after them");
 
         // The dependency that ordering actually protects: agent_memories' read path and the checkpoint's
         // create path both resolve a project, so projects must exist first.
@@ -347,11 +349,14 @@ public class AgentMemorySchemaTests
         {
             "agents", "personas", "agent_sessions", "session_messages", "agent_jobs",
             "projects", "project_personas", "project_jobs", "job_messages",
-            "job_handoffs", "job_workspace_states",
+            "job_handoffs", "job_workspace_states", "project_documents",
         };
 
         // Word-boundary matching so 'agent_memories' is not read as a hit for 'agent_sessions' and a
-        // shared prefix does not match everything.
+        // shared prefix does not match everything. project_documents is listed because
+        // AddProjectDocumentsTable is the migration stacked on top of this one; if this migration ever
+        // grew a statement that named it, that would be exactly the scope creep this check exists to
+        // catch.
         return !otherTables.Any(other =>
             System.Text.RegularExpressions.Regex.IsMatch(
                 statement,

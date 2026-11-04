@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -2892,8 +2892,18 @@ public class SessionsController(
                         };
                         db.AgentSessions.Add(nextTurnSession);
 
+                        // The handoff turn is exactly where the incoming persona needs the project's
+                        // specs, and it previously carried neither guidelines formatting nor any
+                        // documents at all. Same shared formatter and same single load as the other three
+                        // envelope sites, so a handoff cannot drift from a job-chat turn. Staged files are
+                        // put on the prompt message's payload here too — this site had no attachment
+                        // payload before, and staging bytes without naming their path would leave them
+                        // discoverable only by an agent that thinks to run ls.
+                        var library = await AgentMesh.Api.Services.ProjectDocumentStaging.PrepareAsync(
+                            db, project.Id, nextTurnSession.Id, null, project.ProjectInstructions);
+
                         var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
-                                                (!string.IsNullOrWhiteSpace(project.ProjectInstructions) ? $"[Project Guidelines: {project.ProjectInstructions}]\n" : "") +
+                                                library.ProjectPreamble +
                                                 $"[Job Context: {job.Title} - {job.Description}]\n" +
                                                 $"[Previous Handoff from @{pName ?? pId}]:\n{responseMessage.Content}";
 
@@ -2904,6 +2914,9 @@ public class SessionsController(
                             TargetAgentId = driverId,
                             EventType = "prompt",
                             Content = promptWithContext,
+                            StructuredPayloadJson = library.Attachments.Count > 0
+                                ? JsonSerializer.Serialize(new { attachments = library.Attachments }, JsonOptions)
+                                : null,
                             CreatedAt = DateTimeOffset.UtcNow
                         };
                         db.SessionMessages.Add(promptMsg);
