@@ -45,28 +45,66 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     [WorkflowRun]
     public async Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input)
     {
-        // 1. Stage 1: Discovery Turn
+        // 1. Stage 1: Discovery & Planning Loop
         _currentHeartbeat = "Exploring codebase and generating checklist";
-        var discoveryOutcome = await Workflow.ExecuteActivityAsync(
-            (IExecutionActivities act) => act.RunAgentDiscoveryTurnAsync(new DiscoveryTurnInput(
-                input.JobId,
-                input.AssignedAgentId,
-                input.WorkspacePath,
-                input.InitialPrompt,
-                input.ProjectId,
-                input.TargetBranch)),
-            TurnActivityOptions);
+        int discoveryTurns = 0;
+        const int maxDiscoveryTurns = 15;
 
-        if (discoveryOutcome.Status == TurnOutcomeStatus.Failed)
+        while (_tasks.Count == 0 && discoveryTurns < maxDiscoveryTurns)
         {
-            _currentHeartbeat = $"Discovery failed: {discoveryOutcome.Message}";
-            return new JobExecutionResult(Success: false, Summary: $"Discovery failed: {discoveryOutcome.Message}");
+            discoveryTurns++;
+            ChatMessageSignal? pendingDiscoveryMessage = _chatInbox.Count > 0 ? _chatInbox.Dequeue() : null;
+
+            var discoveryOutcome = await Workflow.ExecuteActivityAsync(
+                (IExecutionActivities act) => act.RunAgentDiscoveryTurnAsync(new DiscoveryTurnInput(
+                    input.JobId,
+                    input.AssignedAgentId,
+                    input.WorkspacePath,
+                    input.InitialPrompt,
+                    input.ProjectId,
+                    input.TargetBranch,
+                    pendingDiscoveryMessage)),
+                TurnActivityOptions);
+
+            if (discoveryOutcome.Status == TurnOutcomeStatus.Failed)
+            {
+                _currentHeartbeat = $"Discovery failed: {discoveryOutcome.Message}";
+                return new JobExecutionResult(Success: false, Summary: $"Discovery failed: {discoveryOutcome.Message}");
+            }
+
+            if (_tasks.Count > 0)
+            {
+                break;
+            }
+
+            if (discoveryOutcome.Status == TurnOutcomeStatus.AwaitingInput)
+            {
+                _currentHeartbeat = string.IsNullOrWhiteSpace(discoveryOutcome.Message)
+                    ? "Awaiting user input on planning questions"
+                    : $"Awaiting user input: {discoveryOutcome.Message}";
+
+                await Workflow.WaitConditionAsync(() => _chatInbox.Count > 0 || _tasks.Count > 0);
+                _currentHeartbeat = "Resuming discovery with user feedback";
+                continue;
+            }
+
+            if (discoveryOutcome.Status == TurnOutcomeStatus.StuckLoopDetected)
+            {
+                _currentHeartbeat = $"Stuck loop detected during discovery: {discoveryOutcome.Message}";
+                await Workflow.WaitConditionAsync(() => _chatInbox.Count > 0 || _tasks.Count > 0);
+                continue;
+            }
+
+            // Completed or Continue without setting checklist yet
+            break;
         }
 
-        // Discovery turn consumed the initial prompt; clear inbox so it is not re-processed in Stage 3
-        _chatInbox.Clear();
-
-        _currentHeartbeat = "Awaiting plan approval";
+        if (_currentHeartbeat.StartsWith("Exploring", StringComparison.OrdinalIgnoreCase) ||
+            _currentHeartbeat.StartsWith("Awaiting user input", StringComparison.OrdinalIgnoreCase) ||
+            _currentHeartbeat.StartsWith("Resuming", StringComparison.OrdinalIgnoreCase))
+        {
+            _currentHeartbeat = "Awaiting plan approval";
+        }
 
         // 2. Stage 2: Plan Approval Gate
         await Workflow.WaitConditionAsync(() =>

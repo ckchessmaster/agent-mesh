@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -22,7 +23,9 @@ namespace AgentMesh.Api.Controllers;
 public class SessionsController(
     AgentMeshDbContext db,
     IHubContext<AgentMeshHub> hubContext,
-    IStorageService? storageService = null) : ControllerBase
+    IStorageService? storageService = null,
+    IWorkflowSignalRouter? workflows = null,
+    ILogger<SessionsController>? logger = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -2127,6 +2130,8 @@ public class SessionsController(
 
         await hubContext.Clients.All.SendAsync("SessionUpdated", session);
 
+        bool isJobDrivenByWorkflow = false;
+
         // If this session is part of a project job turn, forward the answer to JobMessages
         if (!string.IsNullOrWhiteSpace(session.MetadataJson))
         {
@@ -2138,6 +2143,18 @@ public class SessionsController(
                     var jobIdStr = jElem.GetString();
                     if (!string.IsNullOrWhiteSpace(jobIdStr) && Guid.TryParse(jobIdStr, out var jobId))
                     {
+                        if (workflows is not null)
+                        {
+                            try
+                            {
+                                isJobDrivenByWorkflow = await workflows.IsWorkflowDrivingAsync(jobId, session.PersonaId, HttpContext.RequestAborted);
+                            }
+                            catch (Exception ex)
+                            {
+                                logger?.LogWarning(ex, "Failed to probe workflow driving status for job {JobId}", jobId);
+                            }
+                        }
+
                         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
                         if (job != null)
                         {
@@ -2177,14 +2194,33 @@ public class SessionsController(
                             );
 
                             await hubContext.Clients.All.SendAsync("JobMessageAdded", answerDto);
+
+                            if (isJobDrivenByWorkflow && workflows is not null)
+                            {
+                                var delivery = await workflows.SendChatMessageAsync(
+                                    jobId,
+                                    new Core.Workflows.ChatMessageSignal(
+                                        SenderId: senderId,
+                                        Content: answerMsg.Content,
+                                        Timestamp: answerMsg.CreatedAt,
+                                        MessageId: answerMsg.Id.ToString()),
+                                    HttpContext.RequestAborted);
+
+                                logger?.LogInformation(
+                                    "Routed question answer for job {JobId} to Temporal workflow ({Status}: {Detail})",
+                                    jobId, delivery.Status, delivery.Detail);
+                            }
                         }
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                logger?.LogWarning(ex, "Error processing job message link for session answer {SessionId}", id);
+            }
         }
 
-        if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
+        if (!isJobDrivenByWorkflow && !string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);

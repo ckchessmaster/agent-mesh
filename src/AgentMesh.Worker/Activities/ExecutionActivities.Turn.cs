@@ -413,7 +413,7 @@ public partial class ExecutionActivities
         if (turnRunner is not null && promptStackBuilder is not null)
         {
             var context = await ResolvePromptBuilder()
-                .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, null), cancellationToken);
+                .BuildPromptStackAsync(PromptStackContext.FromTaskInput(taskInput, input.PendingMessage), cancellationToken);
 
             var request = new AgentTurnRequest(
                 Input: taskInput,

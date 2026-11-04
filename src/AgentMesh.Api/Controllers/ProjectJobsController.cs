@@ -1528,7 +1528,26 @@ public class ProjectJobsController(
                     TargetPersonaIds: targetPersonaIds),
                 ct);
 
-            if (!delivery.Delivered)
+            if (delivery.Delivered)
+            {
+                var targetJob = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId, ct);
+                if (targetJob != null && (string.Equals(targetJob.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase) ||
+                    (targetJob.ProgressHeartbeat?.Contains("Awaiting", StringComparison.OrdinalIgnoreCase) ?? false)))
+                {
+                    targetJob.ProgressHeartbeat = "Exploring codebase and generating checklist";
+                    await db.SaveChangesAsync(ct);
+                    if (hubContext != null)
+                    {
+                        await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+                        {
+                            jobId = targetJob.Id,
+                            progressHeartbeat = targetJob.ProgressHeartbeat,
+                            currentTaskId = targetJob.CurrentTaskId
+                        }, ct);
+                    }
+                }
+            }
+            else
             {
                 log.LogInformation(
                     "Chat reply on job {JobId} was not routed to a workflow ({Status}: {Detail}); " +

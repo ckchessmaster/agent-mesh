@@ -166,6 +166,111 @@ public class JobExecutionWorkflowTests
     }
 
     [Fact]
+    public async Task JobWorkflow_SupportsIterativeDiscoveryAndQuestionRounds()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity(execution.RunAgentDiscoveryTurnAsync)
+            .AddActivity(execution.RunJobCodingTurnAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+            .AddWorkflow<JobExecutionWorkflow>();
+        workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "rook",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace",
+                InitialPrompt: "Add document upload support",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.LeadOrHuman
+            );
+
+            // Handler for discovery turns: Turn 1 asks questions; Turn 2 asks follow-up; Turn 3 registers checklist
+            execution.CustomDiscoveryHandler = (turnInput) =>
+            {
+                if (execution.DiscoveryTurnCount == 1)
+                {
+                    return Task.FromResult(TurnOutcome.Awaiting("operator", "Should we use Option A or Option B for persistence?"));
+                }
+                if (execution.DiscoveryTurnCount == 2)
+                {
+                    turnInput.PendingMessage.Should().NotBeNull();
+                    turnInput.PendingMessage!.Content.Should().Contain("Option A");
+                    return Task.FromResult(TurnOutcome.Awaiting("operator", "Should we include React UI in this PR?"));
+                }
+                turnInput.PendingMessage.Should().NotBeNull();
+                turnInput.PendingMessage!.Content.Should().Contain("Full stack");
+                return Task.FromResult(TurnOutcome.Completed("Decomposition finished and checklist registered."));
+            };
+
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            // Wait until turn 1 finishes and workflow parks awaiting user input
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting user input"));
+            execution.DiscoveryTurnCount.Should().Be(1);
+            execution.CodingTurnCount.Should().Be(0);
+
+            // User replies to first question round
+            await handle.SignalAsync(wf => wf.ReceiveChatMessageAsync(
+                new ChatMessageSignal("operator", "Please use Option A (project_documents table)", DateTimeOffset.UtcNow)));
+
+            // Wait until turn 2 finishes and workflow parks on second question round
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting user input") && execution.DiscoveryTurnCount == 2);
+            execution.DiscoveryTurnCount.Should().Be(2);
+
+            // User replies to second question round
+            await handle.SignalAsync(wf => wf.ReceiveChatMessageAsync(
+                new ChatMessageSignal("operator", "Yes, Full stack: include React UI", DateTimeOffset.UtcNow)));
+
+            // Register checklist before turn 3 completes (simulating manage_task(set_checklist))
+            var tasks = new List<ChecklistTaskItem>
+            {
+                new("Task 1: Add DB migration", "src/Migration.cs", "dotnet test"),
+                new("Task 2: Add API endpoints", "src/Controller.cs", "dotnet test"),
+                new("Task 3: Add React UI", "src/Dashboard.tsx", "npm test")
+            };
+            await handle.SignalAsync(wf => wf.ReceiveSetChecklistAsync(tasks));
+
+            // Wait until Stage 1 discovery completes and workflow parks at Stage 2
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
+            execution.DiscoveryTurnCount.Should().Be(3);
+            execution.CodingTurnCount.Should().Be(0);
+
+            // Tech lead approves plan
+            await handle.SignalAsync(wf => wf.ReceivePlanApprovalAsync(
+                new PlanApprovedSignal("astra", "tech_lead", "Approved. Proceed with implementation.", DateTimeOffset.UtcNow)));
+
+            // PR Review approval
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("sorren", true, "LGTM", DateTimeOffset.UtcNow, 42)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+            execution.CodingTurnCount.Should().Be(3);
+            git.MergeUrls.Should().ContainSingle();
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [Fact]
     public async Task JobWorkflow_EndToEnd_FullLifecycle_ChatDiscoveryApprovalCodingRejectRecodeApproveMerge()
     {
         // End-to-end lifecycle:
@@ -293,12 +398,17 @@ public class JobExecutionWorkflowTests
         public int CodingTurnCount { get; private set; }
         public List<DiscoveryTurnInput> DiscoveryInputs { get; } = [];
         public List<CodingTurnInput> CodingInputs { get; } = [];
+        public Func<DiscoveryTurnInput, Task<TurnOutcome>>? CustomDiscoveryHandler { get; set; }
 
         [Activity]
         public Task<TurnOutcome> RunAgentDiscoveryTurnAsync(DiscoveryTurnInput input)
         {
             DiscoveryTurnCount++;
             DiscoveryInputs.Add(input);
+            if (CustomDiscoveryHandler is not null)
+            {
+                return CustomDiscoveryHandler(input);
+            }
             return Task.FromResult(TurnOutcome.Completed("Discovery completed. Checklist prepared."));
         }
 
