@@ -121,7 +121,7 @@ public class PlatformMcpTools(
     public Task<string> PostJobMessage(
         [Description("The message body in Markdown. Use the 3-R format (Result / Reasoning / Risk) for escalations so the reviewer can act without opening the transcript.")]
         string content,
-        [Description("Target recipient: 'operator' for the human, or a persona id such as 'astra' (tech lead), 'sorren' (architect), or 'vane' (security). The recipient must be a persona assigned to this project.")]
+        [Description("Target recipient: 'operator' for the human, or a persona id assigned to this project (consult Layer 4: Team Topology & Escalation Paths in your prompt).")]
         string target_persona,
         [Description("Set to true if you are blocked and waiting for a response before you can proceed. Conclude your turn after calling.")]
         bool requires_reply,

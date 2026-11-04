@@ -34,8 +34,8 @@ public class AgentsControllerConfigTests
         var db = TestDbContextFactory.Create();
         db.Agents.Add(new Agent
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             Role = "Autonomous Agent",
             Status = "online",
             RuntimeType = RuntimeType.OpenAiCompatible,
@@ -58,10 +58,10 @@ public class AgentsControllerConfigTests
             """;
 
         var result = await controller.UpsertAgent(new RegisterAgentRequest(
-            Id: "spence-ai", Name: "Spence Private AI", CapabilitiesJson: dashboardPayload));
+            Id: "test-openai-driver", Name: "Test OpenAI Driver", CapabilitiesJson: dashboardPayload));
 
         result.Should().BeOfType<OkObjectResult>();
-        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        var stored = db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson;
         using var doc = JsonDocument.Parse(stored);
 
         doc.RootElement.GetProperty("maxSteps").GetInt32().Should().Be(100);
@@ -86,10 +86,10 @@ public class AgentsControllerConfigTests
             """;
 
         var result = await controller.UpsertAgent(new RegisterAgentRequest(
-            Id: "spence-ai", Name: "Spence Private AI", CapabilitiesJson: cliPayload));
+            Id: "test-openai-driver", Name: "Test OpenAI Driver", CapabilitiesJson: cliPayload));
 
         result.Should().BeOfType<OkObjectResult>();
-        using var doc = JsonDocument.Parse(db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson);
+        using var doc = JsonDocument.Parse(db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson);
 
         doc.RootElement.GetProperty("maxSteps").GetInt32().Should().Be(100);
         doc.RootElement.GetProperty("timeoutSeconds").GetInt32().Should().Be(300);
@@ -103,9 +103,9 @@ public class AgentsControllerConfigTests
 
         var cliPayload = """{"adapter":"openai","maxSteps":25}""";
         await controller.UpsertAgent(new RegisterAgentRequest(
-            Id: "spence-ai", Name: "Spence Private AI", CapabilitiesJson: cliPayload));
+            Id: "test-openai-driver", Name: "Test OpenAI Driver", CapabilitiesJson: cliPayload));
 
-        using var doc = JsonDocument.Parse(db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson);
+        using var doc = JsonDocument.Parse(db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson);
         doc.RootElement.GetProperty("maxSteps").GetInt32().Should().Be(25);
     }
 
@@ -114,7 +114,7 @@ public class AgentsControllerConfigTests
     {
         var (controller, db) = Arrange(FullOpenAiCaps);
 
-        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+        var result = await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest(
             MaxSteps: 500,
             TimeoutSeconds: 900));
 
@@ -129,7 +129,7 @@ public class AgentsControllerConfigTests
         view.HasApiKey.Should().BeTrue();
 
         // The secret itself must still be intact in the blob even though the patch never carried it.
-        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        var stored = db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson;
         stored.Should().Contain("super-secret");
     }
 
@@ -138,10 +138,10 @@ public class AgentsControllerConfigTests
     {
         var (controller, db) = Arrange(FullOpenAiCaps);
 
-        await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+        await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest(
             ApiKey: "   ", MaxSteps: 12));
 
-        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        var stored = db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson;
         stored.Should().Contain("super-secret");
         using var doc = JsonDocument.Parse(stored);
         doc.RootElement.GetProperty("apiKey").GetString().Should().Be("super-secret");
@@ -152,9 +152,9 @@ public class AgentsControllerConfigTests
     {
         var (controller, db) = Arrange(FullOpenAiCaps);
 
-        await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(ApiKey: "rotated-key"));
+        await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest(ApiKey: "rotated-key"));
 
-        using var doc = JsonDocument.Parse(db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson);
+        using var doc = JsonDocument.Parse(db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson);
         doc.RootElement.GetProperty("apiKey").GetString().Should().Be("rotated-key");
     }
 
@@ -163,10 +163,10 @@ public class AgentsControllerConfigTests
     {
         var (controller, db) = Arrange(FullOpenAiCaps);
 
-        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest());
+        var result = await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest());
 
         result.Should().BeOfType<OkObjectResult>();
-        db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson.Should().Be(FullOpenAiCaps);
+        db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson.Should().Be(FullOpenAiCaps);
     }
 
     [Fact]
@@ -174,9 +174,9 @@ public class AgentsControllerConfigTests
     {
         var (controller, db) = Arrange("""["bash","grep"]""");
 
-        await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(MaxSteps: 33));
+        await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest(MaxSteps: 33));
 
-        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        var stored = db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson;
         using var doc = JsonDocument.Parse(stored);
         doc.RootElement.GetProperty("maxSteps").GetInt32().Should().Be(33);
         doc.RootElement.GetProperty("capabilities").GetArrayLength().Should().Be(2);
@@ -197,7 +197,7 @@ public class AgentsControllerConfigTests
     {
         var (controller, _) = Arrange(FullOpenAiCaps);
 
-        var result = await controller.GetDriverConfig("spence-ai");
+        var result = await controller.GetDriverConfig("test-openai-driver");
 
         var view = result.Should().BeOfType<OkObjectResult>().Subject.Value.Should()
             .BeOfType<DriverCapabilitiesView>().Subject;
@@ -221,7 +221,7 @@ public class AgentsControllerConfigTests
     {
         var (controller, _) = Arrange("""["bash","read_file","grep"]""");
 
-        var view = (await controller.GetDriverConfig("spence-ai")).Should().BeOfType<OkObjectResult>()
+        var view = (await controller.GetDriverConfig("test-openai-driver")).Should().BeOfType<OkObjectResult>()
             .Subject.Value.Should().BeOfType<DriverCapabilitiesView>().Subject;
 
         view.Capabilities.Should().Equal("bash", "read_file", "grep");
@@ -247,7 +247,7 @@ public class AgentsControllerConfigTests
         var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
         var agents = okResult.Value.Should().BeAssignableTo<IEnumerable<AgentDto>>().Subject.ToList();
 
-        var dto = agents.Single(a => a.Id == "spence-ai");
+        var dto = agents.Single(a => a.Id == "test-openai-driver");
         dto.Config.Should().NotBeNull();
         dto.Config!.MaxSteps.Should().Be(100);
         dto.Config.Endpoint.Should().Be("http://127.0.0.1:11435/v1");
@@ -267,7 +267,7 @@ public class AgentsControllerConfigTests
         var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
         var agents = okResult.Value.Should().BeAssignableTo<IEnumerable<AgentDto>>().Subject.ToList();
 
-        var config = agents.Single(a => a.Id == "spence-ai").Config;
+        var config = agents.Single(a => a.Id == "test-openai-driver").Config;
         config.Should().NotBeNull();
         config!.MaxSteps.Should().Be(100);
         config.HasApiKey.Should().BeTrue(); // presence is reportable, the value is not
@@ -326,7 +326,7 @@ public class AgentsControllerConfigTests
             ExtraArgs = "--accept-routes"
         };
 
-        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+        var result = await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest(
             Sidecar: sidecarReq
         ));
 
@@ -340,7 +340,7 @@ public class AgentsControllerConfigTests
         view.Sidecar.AuthKey.Should().BeNull("secret authKey must be masked on returned view");
         view.HasSidecarAuthKey.Should().BeTrue();
 
-        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        var stored = db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson;
         using var doc = JsonDocument.Parse(stored);
         var sc = doc.RootElement.GetProperty("sidecar");
         sc.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret-test");
@@ -353,8 +353,8 @@ public class AgentsControllerConfigTests
         var db = TestDbContextFactory.Create();
         db.Agents.Add(new Agent
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             Role = "Autonomous Agent",
             Status = "online",
             RuntimeType = RuntimeType.OpenAiCompatible,
@@ -363,18 +363,18 @@ public class AgentsControllerConfigTests
         });
         db.Personas.Add(new Persona
         {
-            Id = "spence",
-            Name = "Spence",
-            DriverId = "spence-ai"
+            Id = "test-persona",
+            Name = "Test Persona",
+            DriverId = "test-openai-driver"
         });
         db.SaveChanges();
 
         var containerManagerMock = new Mock<IPersonaContainerManager>();
         containerManagerMock
-            .Setup(m => m.GetStatusAsync("spence", It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new PersonaEnvironmentStatus("spence", "running", "kubernetes"));
+            .Setup(m => m.GetStatusAsync("test-persona", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("test-persona", "running", "kubernetes"));
         containerManagerMock
-            .Setup(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()))
+            .Setup(m => m.RestartAsync("test-persona", It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         var controller = new AgentsController(db, _apiKeyService, containerManager: containerManagerMock.Object);
@@ -384,15 +384,15 @@ public class AgentsControllerConfigTests
             Enabled = true,
             Type = "tailscale",
             AuthKey = "tskey-auth-reusable-key",
-            Hostname = "spence-node"
+            Hostname = "test-persona-node"
         };
 
-        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+        var result = await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest(
             Sidecar: sidecarReq
         ));
 
         result.Should().BeOfType<OkObjectResult>();
-        containerManagerMock.Verify(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()), Times.Once);
+        containerManagerMock.Verify(m => m.RestartAsync("test-persona", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -401,8 +401,8 @@ public class AgentsControllerConfigTests
         var db = TestDbContextFactory.Create();
         db.Agents.Add(new Agent
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             Role = "Autonomous Agent",
             Status = "online",
             RuntimeType = RuntimeType.OpenAiCompatible,
@@ -411,26 +411,26 @@ public class AgentsControllerConfigTests
         });
         db.Personas.Add(new Persona
         {
-            Id = "spence",
-            Name = "Spence",
-            DriverId = "spence-ai"
+            Id = "test-persona",
+            Name = "Test Persona",
+            DriverId = "test-openai-driver"
         });
         db.SaveChanges();
 
         var containerManagerMock = new Mock<IPersonaContainerManager>();
         containerManagerMock
-            .Setup(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()))
+            .Setup(m => m.RestartAsync("test-persona", It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         containerManagerMock
-            .Setup(m => m.GetStatusAsync("spence", It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new PersonaEnvironmentStatus("spence", "running", "kubernetes"));
+            .Setup(m => m.GetStatusAsync("test-persona", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PersonaEnvironmentStatus("test-persona", "running", "kubernetes"));
 
         var controller = new AgentsController(db, _apiKeyService, containerManager: containerManagerMock.Object);
 
-        var result = await controller.RestartBoundRunners("spence-ai");
+        var result = await controller.RestartBoundRunners("test-openai-driver");
 
         result.Should().BeOfType<OkObjectResult>();
-        containerManagerMock.Verify(m => m.RestartAsync("spence", It.IsAny<CancellationToken>()), Times.Once);
+        containerManagerMock.Verify(m => m.RestartAsync("test-persona", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -462,7 +462,7 @@ public class AgentsControllerConfigTests
             ExtraArgs = "--accept-routes"
         };
 
-        var result = await controller.UpdateDriverConfig("spence-ai", new UpdateDriverConfigRequest(
+        var result = await controller.UpdateDriverConfig("test-openai-driver", new UpdateDriverConfigRequest(
             Sidecar: patchSidecar
         ));
 
@@ -474,7 +474,7 @@ public class AgentsControllerConfigTests
         view.Sidecar.Hostname.Should().Be("kingdom-agent-mesh-01");
         view.HasSidecarAuthKey.Should().BeTrue("stored authKey should survive when not updated");
 
-        var stored = db.Agents.Single(a => a.Id == "spence-ai").CapabilitiesJson;
+        var stored = db.Agents.Single(a => a.Id == "test-openai-driver").CapabilitiesJson;
         using var doc = JsonDocument.Parse(stored);
         var sc = doc.RootElement.GetProperty("sidecar");
         sc.TryGetProperty("tags", out _).Should().BeFalse("tags property must be absent from stored sidecar JSON");

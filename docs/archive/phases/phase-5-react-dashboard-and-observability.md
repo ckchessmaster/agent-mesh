@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Historical Document**: This document outlines an early development milestone (Phases 1–7) preserved for historical context. For the current canonical architecture and living system specifications, see [Master Architecture Plan](../../architecture-plan.md) and [System Specifications](../../specs/).
+
 # Phase 5: React 19 Cockpit & Observability Dashboard
 
 ## 1. Phase Objective & Scope

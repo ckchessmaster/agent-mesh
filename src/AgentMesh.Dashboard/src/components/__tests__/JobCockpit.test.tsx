@@ -924,7 +924,7 @@ describe('JobCockpit - Attachment Support', () => {
       senderId: 'operator',
       senderName: 'System',
       content: 'Queued turn for @Rook was cancelled.',
-      mentions: ['spence-ai-rook'],
+      mentions: ['test-engineer'],
       createdAt: new Date().toISOString()
     };
 
@@ -1237,7 +1237,7 @@ describe('JobCockpit - Attachment Support', () => {
       id: 'msg-question-obj-options',
       jobId: mockJob.id,
       senderType: 'persona',
-      senderId: 'spence-ai-rook',
+      senderId: 'test-engineer',
       senderName: 'Rook',
       content: 'I have a question and need your input before proceeding:',
       mentions: [],

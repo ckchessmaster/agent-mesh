@@ -205,14 +205,14 @@ public class OpenAiAdapterTests
         var configStore = new ConfigStore();
         var preset = new AgentPresetConfig
         {
-            Id = "spence-ai",
-            Name = "Agent spence-ai",
+            Id = "test-openai-driver",
+            Name = "Agent test-openai-driver",
             AdapterType = "generic"
         };
 
         var remote = new RemoteAgentDto(
-            Id: "spence-ai",
-            Name: "Spence Private AI",
+            Id: "test-openai-driver",
+            Name: "Test OpenAI Driver",
             Role: "Autonomous Agent",
             Status: "offline",
             SessionCount: 1,
@@ -228,7 +228,7 @@ public class OpenAiAdapterTests
 
         configStore.PopulateFromRemote(preset, remote);
 
-        preset.Name.Should().Be("Spence Private AI");
+        preset.Name.Should().Be("Test OpenAI Driver");
         preset.Role.Should().Be("Autonomous Agent");
         preset.AdapterType.Should().Be("openai");
         preset.Endpoint.Should().Be("http://127.0.0.1:11435/v1");
@@ -242,8 +242,8 @@ public class OpenAiAdapterTests
     {
         var preset = new AgentPresetConfig
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             AdapterType = "openai",
             Endpoint = "http://127.0.0.1:11435/v1",
             ApiKey = "sk-key",
@@ -373,8 +373,8 @@ public class OpenAiAdapterTests
         var adapter = new OpenAiAdapter();
         var preset = new AgentPresetConfig
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             AdapterType = "openai",
             Endpoint = "http://127.0.0.1:11435/v1",
             DefaultModel = "qwen3.8-flash-next",
@@ -386,7 +386,7 @@ public class OpenAiAdapterTests
         {
             SessionId = Guid.NewGuid(),
             MessageId = Guid.NewGuid(),
-            AgentId = "spence-ai",
+            AgentId = "test-openai-driver",
             Prompt = "Hello after retry",
             Sender = "operator"
         };
@@ -438,8 +438,8 @@ public class OpenAiAdapterTests
         var adapter = new OpenAiAdapter();
         var preset = new AgentPresetConfig
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             AdapterType = "openai",
             Endpoint = "http://127.0.0.1:11435/v1",
             DefaultModel = "qwen3.8-flash-next",
@@ -452,7 +452,7 @@ public class OpenAiAdapterTests
         {
             SessionId = sessionId,
             MessageId = Guid.NewGuid(),
-            AgentId = "spence-ai",
+            AgentId = "test-openai-driver",
             Prompt = "Please help me",
             Sender = "operator"
         };
@@ -545,8 +545,8 @@ public class OpenAiAdapterTests
         var adapter = new OpenAiAdapter();
         var preset = new AgentPresetConfig
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             AdapterType = "openai",
             Endpoint = "http://127.0.0.1:11435/v1",
             MaxSteps = 2 // Low step limit for test
@@ -557,7 +557,7 @@ public class OpenAiAdapterTests
         {
             SessionId = sessionId,
             MessageId = Guid.NewGuid(),
-            AgentId = "spence-ai",
+            AgentId = "test-openai-driver",
             Prompt = "Run tasks",
             Sender = "operator"
         };
@@ -616,8 +616,8 @@ public class OpenAiAdapterTests
         var adapter = new OpenAiAdapter();
         var preset = new AgentPresetConfig
         {
-            Id = "spence-ai",
-            Name = "Spence Private AI",
+            Id = "test-openai-driver",
+            Name = "Test OpenAI Driver",
             AdapterType = "openai",
             Endpoint = "http://127.0.0.1:11435/v1"
         };
@@ -627,7 +627,7 @@ public class OpenAiAdapterTests
         {
             SessionId = sessionId,
             MessageId = Guid.NewGuid(),
-            AgentId = "spence-ai",
+            AgentId = "test-openai-driver",
             Prompt = "Hello",
             Sender = "operator"
         };
@@ -816,8 +816,8 @@ public class OpenAiAdapterTests
             var adapter = new OpenAiAdapter();
             var preset = new AgentPresetConfig
             {
-                Id = "spence-ai",
-                Name = "Spence Private AI",
+                Id = "test-openai-driver",
+                Name = "Test OpenAI Driver",
                 AdapterType = "openai",
                 Endpoint = "http://127.0.0.1:11435/v1",
                 DefaultModel = "qwen3.8-flash-next"
@@ -827,7 +827,7 @@ public class OpenAiAdapterTests
             {
                 SessionId = sessionId,
                 MessageId = Guid.NewGuid(),
-                AgentId = "spence-ai",
+                AgentId = "test-openai-driver",
                 Prompt = "What is in this image?",
                 Sender = "operator",
                 WorkingDirectory = tempDir,

@@ -1325,6 +1325,10 @@ public class SessionsController(
         {
             session.Status = "thinking";
         }
+        else if (eventType == "error")
+        {
+            session.Status = "error";
+        }
         else if (eventType == "response")
         {
             if (session.Status != "waiting_for_input")

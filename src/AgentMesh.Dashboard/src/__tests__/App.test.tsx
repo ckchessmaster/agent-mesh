@@ -2251,8 +2251,8 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
   });
   it('opens the driver config modal from the driver row and saves limits through the API', async () => {
     const openAiDriver: Agent = {
-      id: 'spence-ai',
-      name: 'Spence Private AI',
+      id: 'mock-driver',
+      name: 'Mock Driver',
       role: 'Autonomous Agent',
       status: 'online',
       runtimeType: 3,
@@ -2277,14 +2277,14 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText('Spence Private AI')).toBeInTheDocument();
+      expect(screen.getByText('Mock Driver')).toBeInTheDocument();
     });
 
     // The trigger must exist per driver row; before this wiring the modal was built
     // and unit-tested in isolation but nothing in the app could ever open it.
-    fireEvent.click(screen.getByRole('button', { name: 'Configure Spence Private AI driver settings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Configure Mock Driver driver settings' }));
 
-    const dialog = await screen.findByRole('dialog', { name: 'Configure driver Spence Private AI' });
+    const dialog = await screen.findByRole('dialog', { name: 'Configure driver Mock Driver' });
     expect(dialog).toBeInTheDocument();
     expect(screen.getByLabelText(/Max steps per turn/i)).toHaveValue(100);
 
@@ -2292,12 +2292,12 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
 
     await waitFor(() => {
-      expect(api.updateDriverConfig).toHaveBeenCalledWith('spence-ai', { maxSteps: 250 });
+      expect(api.updateDriverConfig).toHaveBeenCalledWith('mock-driver', { maxSteps: 250 });
     });
 
     // Saved config comes back from the API and the modal closes, so a reopen shows the new value.
     await waitFor(() => {
-      expect(screen.queryByRole('dialog', { name: 'Configure driver Spence Private AI' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('dialog', { name: 'Configure driver Mock Driver' })).not.toBeInTheDocument();
     });
   });
 

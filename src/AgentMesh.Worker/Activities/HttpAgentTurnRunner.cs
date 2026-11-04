@@ -130,7 +130,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     /// answer, which is exactly <see cref="TurnOutcomeStatus.AwaitingInput"/>.
     /// </remarks>
     private static readonly string[] TerminalStatuses =
-        ["idle", "completed", "stopped", "error", "archived", "waiting_for_input"];
+        ["active", "idle", "completed", "stopped", "error", "archived", "waiting_for_input"];
 
     /// <summary>
     /// Runs (or re-attaches to) one turn.
@@ -655,7 +655,9 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         /// the same job could be misread as this turn's — which callers must account for before
         /// treating a signal as decisive.
         /// </summary>
-        bool LedgerScopedToSession = true);
+        bool LedgerScopedToSession = true,
+        string? LastSessionMessageContent = null,
+        string? LastSessionMessageType = null);
 
     internal record ToolCallRecord(string ToolName, string? ArgsJson, DateTimeOffset At);
 
@@ -726,6 +728,12 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
 
         DateTimeOffset? lastActivity = session?.UpdatedAt;
 
+        var lastSessionMessage = await db.SessionMessages.AsNoTracking()
+            .Where(m => m.SessionId == sessionId && (m.EventType == "response" || m.EventType == "error"))
+            .OrderByDescending(m => m.CreatedAt)
+            .Select(m => new { m.EventType, m.Content })
+            .FirstOrDefaultAsync(ct);
+
         return new TurnState(
             SessionStatus: session?.Status ?? "unknown",
             ToolCalls: toolCalls
@@ -735,7 +743,9 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                 .Select(m => new JobLedgerRecord(m.StructuredPayloadJson, m.Content, m.CreatedAt))
                 .ToList(),
             LastActivityAt: lastActivity,
-            LedgerScopedToSession: ledgerScopedToSession);
+            LedgerScopedToSession: ledgerScopedToSession,
+            LastSessionMessageContent: lastSessionMessage?.Content,
+            LastSessionMessageType: lastSessionMessage?.EventType);
     }
 
     /// <summary>
@@ -853,13 +863,17 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     {
         var status = state.SessionStatus.ToLowerInvariant();
 
-        if (status is "error" or "stopped")
+        if (status is "error" or "stopped" ||
+            string.Equals(state.LastSessionMessageType, "error", StringComparison.OrdinalIgnoreCase) ||
+            (state.LastSessionMessageContent?.StartsWith("❌") == true))
         {
-            return new TurnOutcome(
-                TurnOutcomeStatus.Failed,
+            var detail = state.LastSessionMessageContent ??
                 $"Turn session ended in status '{state.SessionStatus}' without opening a pull request " +
                 "or requesting input. The runner did not finish cleanly; inspect the transcript before " +
-                "resuming.",
+                "resuming.";
+            return new TurnOutcome(
+                TurnOutcomeStatus.Failed,
+                detail,
                 PrUrl: null);
         }
 

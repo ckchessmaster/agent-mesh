@@ -57,6 +57,12 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 input.TargetBranch)),
             TurnActivityOptions);
 
+        if (discoveryOutcome.Status == TurnOutcomeStatus.Failed)
+        {
+            _currentHeartbeat = $"Discovery failed: {discoveryOutcome.Message}";
+            return new JobExecutionResult(Success: false, Summary: $"Discovery failed: {discoveryOutcome.Message}");
+        }
+
         // Discovery turn consumed the initial prompt; clear inbox so it is not re-processed in Stage 3
         _chatInbox.Clear();
 
