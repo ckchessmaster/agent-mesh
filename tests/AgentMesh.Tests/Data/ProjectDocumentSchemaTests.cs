@@ -329,7 +329,7 @@ public class ProjectDocumentSchemaTests
     /// means the next migration stacked on top shows up as a failure to re-check rather than a silent
     /// assumption that the snapshot is current.
     /// </remarks>
-    private const string TipMigrationId = "20261104210849_AddSessionPerformanceIndices";
+    private const string TipMigrationId = "20261105013316_AddProjectJobArtifacts";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()
@@ -350,6 +350,9 @@ public class ProjectDocumentSchemaTests
         // has no FK, so nothing in the DDL enforces that projects exists first. The application-level
         // contract (upload into a project that is there) does, and it only holds if the table is created
         // after the projects table it points at.
+        //
+        // Re-checked when AddProjectJobArtifacts was stacked on top: it adds a column to project_jobs and
+        // neither creates nor re-orders anything project_documents reads.
         migrations.IndexOf("20261020184553_AddProjectsAndJobs")
             .Should().BeLessThan(documentsIndex,
                 "project_documents is scoped by project_id, so projects must be created first");

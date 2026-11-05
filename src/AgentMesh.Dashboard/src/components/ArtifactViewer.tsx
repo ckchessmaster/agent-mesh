@@ -10,15 +10,32 @@ import {
   Eye,
   Info
 } from 'lucide-react';
-import type { SessionArtifact } from '../types';
+import type { ArtifactLike } from '../types';
 import { MermaidViewer } from './MermaidViewer';
 
 interface ArtifactViewerProps {
-  artifacts: SessionArtifact[];
+  /**
+   * Session or job artifacts. The panel is the same component on both surfaces, so it takes the shape
+   * both satisfy (`ArtifactLike`) rather than one of them plus a cast at the call site. Owner identity is
+   * not part of that shape on purpose: the API sends an explicit `downloadUrl` on both payloads and that
+   * is what this component uses, so it cannot build a URL for an owner it was not given.
+   */
+  artifacts: ArtifactLike[];
   selectedArtifactId: string | null;
   onSelectArtifact: (id: string) => void;
   onClose: () => void;
   onRefresh?: () => void;
+  /**
+   * API path prefix of the surface that owns these artifacts — `api/sessions/{id}` or
+   * `api/project-jobs/{id}`, no leading slash.
+   *
+   * Used only when an artifact arrives without its `downloadUrl`, which older or proxied builds and
+   * hand-written fixtures do. It is a prop rather than a guess because the component cannot tell a
+   * session artifact from a job artifact by looking at it: hardcoding the session route would send a job
+   * artifact to an endpoint that does not know its id, and the failure would be a silent broken image or
+   * an empty preview rather than an error.
+   */
+  ownerPath?: string;
 }
 
 export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
@@ -26,7 +43,8 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
   selectedArtifactId,
   onSelectArtifact,
   onClose,
-  onRefresh
+  onRefresh,
+  ownerPath
 }) => {
   const [viewMode, setViewMode] = useState<'rendered' | 'raw'>('rendered');
   const [copied, setCopied] = useState(false);
@@ -44,26 +62,31 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
     }
   };
 
-  const getArtifactStreamUrl = (artifact: SessionArtifact, download = false) => {
-    const base = artifact.downloadUrl || `/api/sessions/${artifact.sessionId}/artifacts/${encodeURIComponent(artifact.id)}/content`;
+  const getArtifactStreamUrl = (artifact: ArtifactLike, download = false) => {
+    // The API's own URL wins. The derived fallback needs ownerPath because this component serves both
+    // surfaces and cannot tell them apart from the artifact alone.
+    const base = artifact.downloadUrl
+      || (ownerPath
+        ? `/${ownerPath.replace(/^\/+/, '')}/artifacts/${encodeURIComponent(artifact.id)}/content`
+        : '');
     return download ? `${base}${base.includes('?') ? '&' : '?'}download=true` : base;
   };
 
-  const isImageArtifact = (artifact?: SessionArtifact | null) => {
+  const isImageArtifact = (artifact?: ArtifactLike | null) => {
     if (!artifact) return false;
     const ct = (artifact.contentType || '').toLowerCase();
     const name = (artifact.name || '').toLowerCase();
     return ct.startsWith('image/') || /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)$/.test(name);
   };
 
-  const isPdfArtifact = (artifact?: SessionArtifact | null) => {
+  const isPdfArtifact = (artifact?: ArtifactLike | null) => {
     if (!artifact) return false;
     const ct = (artifact.contentType || '').toLowerCase();
     const name = (artifact.name || '').toLowerCase();
     return ct === 'application/pdf' || name.endsWith('.pdf');
   };
 
-  const isMermaidArtifact = (artifact?: SessionArtifact | null) => {
+  const isMermaidArtifact = (artifact?: ArtifactLike | null) => {
     if (!artifact) return false;
     const name = (artifact.name || '').toLowerCase();
     return name.endsWith('.mermaid') || name.endsWith('.mmd');

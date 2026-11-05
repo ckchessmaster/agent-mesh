@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
-import type { Persona, Project, ProjectJob, JobTask, JobMessage, AgentSession } from '../types';
+import type { Persona, Project, ProjectJob, JobTask, JobMessage, AgentSession, JobArtifact } from '../types';
 import { WorkspaceType, ProjectJobStatus } from '../types';
 
 vi.mock('../services/api', () => ({
@@ -34,6 +34,11 @@ vi.mock('../services/api', () => ({
     assignJobTask: vi.fn(),
     deleteJobTask: vi.fn(),
     getJobMessages: vi.fn(),
+    // Job artifacts. Declared here because this file replaces the whole api module: without it,
+    // api.getJobArtifacts is undefined and App's fetch throws into its catch, so every job would render
+    // "Artifacts (0)" and the tests below could not tell a broken panel from an unmocked one.
+    getJobArtifacts: vi.fn(),
+    getJobArtifact: vi.fn(),
     postJobMessage: vi.fn(),
     uploadJobAttachments: vi.fn(),
     completeJob: vi.fn(),
@@ -199,6 +204,9 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob]);
     vi.mocked(api.getJobTasks).mockResolvedValue(mockTasks);
     vi.mocked(api.getJobMessages).mockResolvedValue(mockMessages);
+    // Default: the job has no artifacts. Tests that exercise the panel override this.
+    vi.mocked(api.getJobArtifacts).mockResolvedValue([]);
+    vi.mocked(api.getJobArtifact).mockResolvedValue({} as any);
   });
 
   it('renders Projects & Jobs tab and auto-selects project and job into the Job Cockpit', async () => {
@@ -986,5 +994,285 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     // Verify user remains on Personas tab and is NOT dragged back to projects tab
     expect(screen.getByText('New Persona')).toBeInTheDocument();
     expect(screen.queryByTestId('job-dropzone-overlay')).not.toBeInTheDocument();
+  });
+
+  describe('Job Artifacts panel', () => {
+    const markdownArtifact: JobArtifact = {
+      id: 'job-art-plan',
+      jobId: 'job-101',
+      sourceSessionId: 'sess-turn-456',
+      name: 'architecture_plan.md',
+      summary: 'Architecture specification with Mermaid flow',
+      contentType: 'text/markdown',
+      sizeBytes: 2048,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      // The list endpoint sends no body; the panel fetches it on selection.
+      content: undefined,
+      downloadUrl: '/api/project-jobs/job-101/artifacts/job-art-plan/content'
+    };
+
+    const mermaidArtifact: JobArtifact = {
+      ...markdownArtifact,
+      id: 'job-art-diagram',
+      name: 'diagram.mmd',
+      summary: 'Mermaid Architecture Diagram',
+      contentType: 'text/plain',
+      content: 'graph TD;\n  A[API] --> B[Worker];',
+      downloadUrl: '/api/project-jobs/job-101/artifacts/job-art-diagram/content'
+    };
+
+    const renderJob = async () => {
+      render(<App />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+      }, { timeout: 4000 });
+      fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toBeInTheDocument();
+      });
+    };
+
+    it('shows the artifact count on the toggle and renders the panel with the mirrored files', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact, mermaidArtifact]);
+      vi.mocked(api.getJobArtifact).mockResolvedValue({ ...markdownArtifact, content: '# Architecture Specification\n\nBody text' });
+
+      await renderJob();
+
+      // The count is visible before the panel is opened, which is why artifacts are fetched on job
+      // switch rather than on toggle.
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (2)');
+      });
+      expect(screen.queryByTestId('job-artifact-panel-container')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('job-artifact-panel-container')).toBeInTheDocument();
+        expect(screen.getByTestId('artifact-viewer')).toBeInTheDocument();
+        // Each name renders twice by design: once as a selector tab and once as the active artifact's
+        // header. Asserting membership rather than a single match keeps that viewer detail out of this
+        // test's contract.
+        expect(screen.getAllByText('architecture_plan.md').length).toBeGreaterThan(0);
+        expect(screen.getAllByText('diagram.mmd').length).toBeGreaterThan(0);
+        expect(screen.getByText('Architecture specification with Mermaid flow')).toBeInTheDocument();
+      });
+
+      expect(api.getJobArtifacts).toHaveBeenCalledWith('job-101');
+    });
+
+    it('renders markdown for the selected artifact and switches tabs without a second fetch', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact, mermaidArtifact]);
+      vi.mocked(api.getJobArtifact).mockResolvedValue({ ...markdownArtifact, content: '# Architecture Specification\n\nKeep it simple' });
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: /Architecture Specification/i })).toBeInTheDocument();
+      });
+
+      // The mermaid artifact arrived with a body already folded in from the live event path, so the
+      // panel renders it without asking the server.
+      fireEvent.click(screen.getByText('diagram.mmd'));
+      await waitFor(() => {
+        expect(screen.getByText(/Mermaid Architecture Diagram/i)).toBeInTheDocument();
+      });
+
+      expect(api.getJobArtifact).toHaveBeenCalledTimes(1);
+      expect(api.getJobArtifact).toHaveBeenCalledWith('job-101', 'job-art-plan');
+    });
+
+    it('fetches the body lazily when the list omits it, and does not refetch on reselect', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact]);
+      vi.mocked(api.getJobArtifact).mockResolvedValue({ ...markdownArtifact, content: '# Lazy Body\n\nfetched on demand' });
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: /Lazy Body/i })).toBeInTheDocument();
+      });
+
+      // Close and reopen: the body is already in state, so no second detail request.
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+      await waitFor(() => {
+        expect(screen.queryByTestId('job-artifact-panel-container')).not.toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: /Lazy Body/i })).toBeInTheDocument();
+      });
+      expect(api.getJobArtifact).toHaveBeenCalledTimes(1);
+    });
+
+    it('folds a live JobArtifactCreated event into the panel and bumps the count', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact]);
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (1)');
+      });
+
+      // A turn syncs a new artifact mid-flight: the mirror broadcasts, and the panel shows it without a
+      // refetch of the whole job.
+      await act(async () => {
+        signalRHandlers['JobArtifactCreated']?.({
+          ...mermaidArtifact,
+          content: 'graph TD;\n  X --> Y;'
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (2)');
+        expect(screen.getByText('diagram.mmd')).toBeInTheDocument();
+      });
+    });
+
+    it('replaces on JobArtifactUpdated instead of duplicating the same file', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact]);
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getAllByText('architecture_plan.md')).toHaveLength(1);
+      });
+
+      // Re-sync of an edited file: same name, new size. Two rows for one file is the bug this guards.
+      await act(async () => {
+        signalRHandlers['JobArtifactUpdated']?.({ ...markdownArtifact, sizeBytes: 9000 });
+      });
+
+      await waitFor(() => {
+        expect(screen.getAllByText('architecture_plan.md')).toHaveLength(1);
+      });
+      expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (1)');
+    });
+
+    it('ignores artifact events belonging to another job', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact]);
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (1)');
+      });
+
+      await act(async () => {
+        signalRHandlers['JobArtifactCreated']?.({ ...mermaidArtifact, jobId: 'some-other-job' });
+      });
+
+      expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (1)');
+      expect(screen.queryByText('diagram.mmd')).not.toBeInTheDocument();
+    });
+
+    it('keeps job artifacts and session artifacts in separate state', async () => {
+      // The two surfaces share a component but not an array: opening a session must not push the job's
+      // files out of the job panel, and vice versa.
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact]);
+      vi.mocked(api.getSessionArtifacts).mockResolvedValue([{
+        id: 'sess-art-9',
+        sessionId: 'sess-turn-456',
+        name: 'session_only_note.md',
+        contentType: 'text/markdown',
+        sizeBytes: 12,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        content: '# Session note'
+      }]);
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByText('architecture_plan.md')).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      // Switch to the personas tab and open the session's artifacts.
+      const personasTabBtn = screen.getByRole('button', { name: /personas/i });
+      fireEvent.click(personasTabBtn);
+      await waitFor(() => {
+        expect(screen.getByText('New Persona')).toBeInTheDocument();
+      });
+
+      expect(screen.queryByText('architecture_plan.md')).not.toBeInTheDocument();
+    });
+
+    it('renders Artifacts (0) and no panel content when the job has no artifacts', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([]);
+
+      await renderJob();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (0)');
+      });
+
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+      await waitFor(() => {
+        expect(screen.getByTestId('job-artifact-panel-container')).toBeInTheDocument();
+      });
+      expect(screen.getByText(/No artifacts/i)).toBeInTheDocument();
+    });
+
+    it('degrades to an empty panel when the artifact endpoint is unavailable', async () => {
+      // A dashboard newer than its API is a real deployment state. The cockpit must still render chat and
+      // checklist, with the panel simply empty — not an error boundary and not a rejected Promise.all.
+      vi.mocked(api.getJobArtifacts).mockRejectedValue(new Error('404 Not Found'));
+
+      await renderJob();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (0)');
+      });
+
+      // The rest of the cockpit survived the failed call.
+      expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+      expect(screen.getByText(/please implement the OAuth endpoints/i)).toBeInTheDocument();
+    });
+
+    it('clears artifacts when switching to a job with none', async () => {
+      // Both jobs are listed from the start so the switch is a click in the job list. getProjectJobs is
+      // mocked before render rather than mid-test: re-mocking it after mount triggers a refetch that
+      // duplicates the rows this test navigates by.
+      const secondJob: ProjectJob = {
+        ...mockJob,
+        id: 'job-202',
+        title: 'Second Job',
+        messageCount: 0
+      };
+      vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob, secondJob]);
+      vi.mocked(api.getJobArtifacts).mockImplementation(async (jobId: string) =>
+        jobId === 'job-101' ? [markdownArtifact] : []
+      );
+
+      render(<App />);
+
+      // The app auto-selects the first job, whose artifacts load.
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (1)');
+      }, { timeout: 4000 });
+
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+      await waitFor(() => {
+        expect(screen.getByTestId('job-artifact-panel-container')).toBeInTheDocument();
+      });
+
+      // Switch jobs. 'Second Job' is unique to the list until it becomes the selection.
+      fireEvent.click(screen.getByText('Second Job'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (0)');
+      });
+      expect(screen.queryByText('architecture_plan.md')).not.toBeInTheDocument();
+      expect(api.getJobArtifacts).toHaveBeenCalledWith('job-202');
+    });
   });
 });

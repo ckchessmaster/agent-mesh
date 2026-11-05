@@ -943,6 +943,166 @@ public class ProjectJobsController(
         return File(contentStream, contentType);
     }
 
+    /// <summary>
+    /// The job's artifacts — the job-side twin of <c>GET /api/sessions/{id}/artifacts</c>.
+    /// </summary>
+    /// <remarks>
+    /// Returns the stored manifest folded with everything the job's turn sessions recorded and any loose
+    /// file in the job's artifact directory, then persists that fold. The mirror rules and the reason a
+    /// read writes are in <see cref="JobArtifactMirror.RefreshAsync"/>; the shape is
+    /// <see cref="JobArtifactDto"/>, which is field-compatible with the session artifact the Cockpit
+    /// already renders so <c>ArtifactViewer</c> can show both without a second component.
+    /// <para>
+    /// Bodies are omitted here on purpose (see <see cref="JobArtifactDto.Content"/>); the panel opens one
+    /// artifact at a time and fetches its body from the detail endpoint.
+    /// </para>
+    /// </remarks>
+    [HttpGet("api/project-jobs/{id}/artifacts")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetJobArtifacts(Guid id, CancellationToken ct = default)
+    {
+        if (!await db.ProjectJobs.AnyAsync(j => j.Id == id, ct))
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var artifacts = await JobArtifactMirror.RefreshAsync(db, id, ct);
+        return Ok(artifacts);
+    }
+
+    /// <summary>
+    /// One job artifact with its body inlined, for the text/markdown/mermaid view.
+    /// </summary>
+    /// <remarks>
+    /// Resolves by id first, then by name: a mirrored entry keeps the id the session gave it, and the
+    /// disk-discovered entries are keyed by filename, so a caller that only knows one of the two still
+    /// works. Same fallback order the session endpoint uses.
+    /// </remarks>
+    [HttpGet("api/project-jobs/{id}/artifacts/{artifactId}")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetJobArtifact(
+        Guid id,
+        string artifactId,
+        [FromServices] IStorageService? storage = null,
+        CancellationToken ct = default)
+    {
+        if (!await db.ProjectJobs.AnyAsync(j => j.Id == id, ct))
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var artifacts = await JobArtifactMirror.RefreshAsync(db, id, ct);
+        var artifact = FindArtifact(artifacts, artifactId);
+        if (artifact == null)
+        {
+            return NotFound(new { error = $"Artifact '{artifactId}' not found in job '{id}'." });
+        }
+
+        var safeName = Path.GetFileName(artifact.Name);
+        await using var stream = await JobArtifactMirror.OpenContentStreamAsync(
+            artifact, id, safeName, storage, ct);
+
+        string? content = null;
+        if (stream != null && !IsBinaryContentType(artifact.ContentType))
+        {
+            using var reader = new StreamReader(stream);
+            content = await reader.ReadToEndAsync(ct);
+        }
+
+        return Ok(artifact with
+        {
+            Content = content,
+            DownloadUrl = JobArtifactManifest.BuildContentUrl(id, artifact.Id)
+        });
+    }
+
+    /// <summary>
+    /// Streams one job artifact's bytes — images, PDFs and other binaries the JSON detail endpoint will
+    /// not inline.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors the session content endpoint's contract exactly, including <c>?download=true</c> forcing
+    /// an attachment disposition, because <c>ArtifactViewer</c> builds its <c>&lt;img src&gt;</c> and its
+    /// save-link from the same helper for both surfaces.
+    /// </remarks>
+    [HttpGet("api/project-jobs/{id}/artifacts/{artifactId}/content")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetJobArtifactContent(
+        Guid id,
+        string artifactId,
+        [FromQuery] bool download = false,
+        [FromServices] IStorageService? storage = null,
+        CancellationToken ct = default)
+    {
+        if (!await db.ProjectJobs.AnyAsync(j => j.Id == id, ct))
+        {
+            return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var artifacts = await JobArtifactMirror.RefreshAsync(db, id, ct);
+        var artifact = FindArtifact(artifacts, artifactId);
+
+        // A caller may address an artifact by name even if it was never recorded in a manifest, so long as
+        // the bytes are on disk — the same leniency the session content endpoint gives.
+        var name = artifact?.Name ?? Path.GetFileName(artifactId);
+        var safeName = Path.GetFileName(name);
+        if (string.IsNullOrWhiteSpace(safeName))
+        {
+            return NotFound(new { error = $"Artifact '{artifactId}' not found in job '{id}'." });
+        }
+
+        var stream = await JobArtifactMirror.OpenContentStreamAsync(artifact, id, safeName, storage, ct);
+        if (stream == null)
+        {
+            return NotFound(new { error = $"Artifact '{artifactId}' not found in job '{id}'." });
+        }
+
+        var contentType = artifact?.ContentType ?? SessionsController.GuessContentTypeFromExtension(safeName);
+        var isInlineRenderable = !download && (
+            contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+            contentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) ||
+            contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase));
+
+        var disposition = isInlineRenderable ? "inline" : "attachment";
+        if (Response != null)
+        {
+            Response.Headers.ContentDisposition =
+                $"{disposition}; filename=\"{SessionsController.SanitizeFileName(safeName)}\"";
+        }
+
+        return File(stream, contentType);
+    }
+
+    /// <summary>Id first, then name, case-insensitively — see <see cref="GetJobArtifact"/>.</summary>
+    private static JobArtifactDto? FindArtifact(List<JobArtifactDto> artifacts, string artifactId)
+    {
+        var byId = artifacts.FirstOrDefault(a =>
+            string.Equals(a.Id, artifactId, StringComparison.OrdinalIgnoreCase));
+        if (byId != null) return byId;
+
+        var safeName = Path.GetFileName(artifactId);
+        return artifacts.FirstOrDefault(a =>
+            string.Equals(a.Name, artifactId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.Name, safeName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// True for the types the detail endpoint must not read as text.
+    /// </summary>
+    /// <remarks>
+    /// Same set the session detail endpoint treats as binary, plus the images the viewer renders from the
+    /// content URL rather than from an inlined body. Reading a PNG into a JSON string field would produce
+    /// mojibake in the panel and inflate the response for no reader's benefit.
+    /// </remarks>
+    private static bool IsBinaryContentType(string? contentType) =>
+        !string.IsNullOrEmpty(contentType) && (
+            contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+            contentType.StartsWith("video/", StringComparison.OrdinalIgnoreCase) ||
+            contentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase) ||
+            contentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase) ||
+            contentType.Equals("application/zip", StringComparison.OrdinalIgnoreCase) ||
+            contentType.Equals("application/octet-stream", StringComparison.OrdinalIgnoreCase));
+
     [HttpPost("api/project-jobs/{id}/messages")]
     public async Task<IActionResult> PostJobMessage(
         Guid id,

@@ -245,7 +245,7 @@ public class AgentMemorySchemaTests
     /// <see cref="TipMigrationId"/> is the tripwire's current value, updated by whoever stacks the next
     /// migration. See <see cref="MigrationSequence_KeepsMigrationsInOrder"/>.
     /// </remarks>
-    private const string TipMigrationId = "20261104210849_AddSessionPerformanceIndices";
+    private const string TipMigrationId = "20261105013316_AddProjectJobArtifacts";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()
@@ -277,6 +277,10 @@ public class AgentMemorySchemaTests
 
         // The dependency that ordering actually protects: agent_memories' read path and the checkpoint's
         // create path both resolve a project, so projects must exist first.
+        //
+        // Re-checked when AddProjectJobArtifacts was stacked on top: that migration is an
+        // ALTER TABLE project_jobs ADD COLUMN and touches neither agent_memories nor the projects table,
+        // so nothing above agent_memories re-orders it or drops a dependency it reads.
         migrations.IndexOf("20261020184553_AddProjectsAndJobs")
             .Should().BeLessThan(agentMemoriesIndex,
                 "agent_memories is scoped by project, so the projects table must be created first");
