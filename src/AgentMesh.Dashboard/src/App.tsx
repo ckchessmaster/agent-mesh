@@ -76,6 +76,7 @@ import type {
   SessionAttachment,
   SessionMessage,
   SessionArtifact,
+  JobArtifact,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from './types';
@@ -475,6 +476,17 @@ export default function App() {
   const [showArtifactsPanel, setShowArtifactsPanel] = useState(false);
   const [artifactPanelWidth, setArtifactPanelWidth] = useState(480);
   const [isResizingArtifacts, setIsResizingArtifacts] = useState(false);
+
+  // Job artifacts: the same panel, the same viewer, a different owner.
+  //
+  // Separate state from the session arrays above rather than shared, because a session and a job can be
+  // open at the same time in this app (the projects tab keeps the cockpit mounted while the personas tab
+  // holds the selected session), and one `artifacts` array would mean switching tabs showed the other
+  // surface's files. The panel *width* is shared on purpose: it is one panel, and a user who drags it
+  // wide in a job should not have it snap back when they open a session.
+  const [jobArtifacts, setJobArtifacts] = useState<JobArtifact[]>([]);
+  const [selectedJobArtifactId, setSelectedJobArtifactId] = useState<string | null>(null);
+  const [showJobArtifactsPanel, setShowJobArtifactsPanel] = useState(false);
 
   // Slash command palette state
   const [slashPaletteOpen, setSlashPaletteOpen] = useState(false);
@@ -904,6 +916,100 @@ export default function App() {
     }
   }, [selectedProjectId, fetchJobsForProject]);
 
+  /**
+   * Loads a job's artifacts.
+   *
+   * Fetched on job switch whether or not the panel is open, exactly as session artifacts are. The reason
+   * is the toggle button itself: it shows a count, so the number has to exist before the panel is opened.
+   * The payload is the index only — the server omits artifact bodies from the list — so this is a small
+   * read, not a transcript-sized one.
+   */
+  const fetchJobArtifacts = useCallback(async (jobId: string) => {
+    try {
+      const list = await api.getJobArtifacts(jobId);
+      setJobArtifacts(list);
+      if (list.length > 0) {
+        setSelectedJobArtifactId((prev) =>
+          prev && list.some((a) => a.id === prev) ? prev : list[0].id
+        );
+      } else {
+        setSelectedJobArtifactId(null);
+      }
+    } catch {
+      // A job with no artifacts, or a server that predates the endpoint, reads as an empty panel rather
+      // than an error toast: the artifact list is supplementary to the chat, and failing to render it
+      // must not look like the job itself failed.
+      setJobArtifacts([]);
+      setSelectedJobArtifactId(null);
+    }
+  }, []);
+
+  /**
+   * Fetches the body of the selected job artifact.
+   *
+   * Needed because the job list endpoint deliberately omits bodies (a job can mirror a multi-megabyte
+   * transcript, and the panel refetches the list on every job switch and artifact event). Session
+   * artifacts do not need this: their bodies are small enough that the API already stores them inline in
+   * the session manifest and returns them in the list.
+   *
+   * `jobArtifactBodyAttempts` records the revision of each artifact whose body has already been asked
+   * for, keyed per job+artifact. A guard on the response alone would loop: a body that comes back null (a
+   * file deleted from disk, a type the server refuses to inline) leaves the entry looking exactly as it
+   * did before the fetch, and an effect that depends on the artifact list would fire again immediately.
+   * Attempting once per artifact revision is what makes a missing body a dead end rather than a request
+   * storm.
+   *
+   * Storing the *revision* (`updatedAt`) rather than a bare flag is what keeps a live re-sync honest. The
+   * mirror broadcasts `JobArtifactUpdated` with no body — the list shape, stripped server-side — and
+   * folding it in replaces the open entry and blanks its loaded content. Guarded on id alone, that
+   * re-fetch would be suppressed forever and the operator would watch an open file go blank mid-turn until
+   * they switched jobs. Guarded on the revision, the same artifact is fetchable once per revision.
+   *
+   * A Map from key to revision, rather than a Set of key+revision strings, so the entry is overwritten
+   * instead of accumulating: a long-lived dashboard tab with an agent re-syncing one file every few
+   * seconds would otherwise grow the set for the lifetime of the page.
+   */
+  const jobArtifactBodyAttempts = useRef<Map<string, string>>(new Map());
+
+  useEffect(() => {
+    if (!selectedJobId) {
+      jobArtifactBodyAttempts.current.clear();
+      return;
+    }
+    if (!selectedJobArtifactId) return;
+
+    const current = jobArtifacts.find((a) => a.id === selectedJobArtifactId);
+    if (!current || current.content != null) return;
+    // Images and PDFs are rendered from the content URL, never inlined as text.
+    if (/^(image|video|audio)\//.test(current.contentType) ||
+        current.contentType === 'application/pdf') return;
+
+    const attemptKey = `${selectedJobId}:${current.id}`;
+    if (jobArtifactBodyAttempts.current.get(attemptKey) === current.updatedAt) return;
+    jobArtifactBodyAttempts.current.set(attemptKey, current.updatedAt);
+
+    const jobId = selectedJobId;
+    let cancelled = false;
+    api.getJobArtifact(jobId, current.id)
+      .then((full) => {
+        if (cancelled || !full?.id) return;
+        setJobArtifacts((prev) =>
+          prev.map((a) => a.id === full.id || a.name === full.name ? full : a)
+        );
+      })
+      .catch(() => {
+        // Allow a retry if the panel is reopened: a network blip should not permanently deny a body that
+        // is there.
+        jobArtifactBodyAttempts.current.delete(attemptKey);
+        // Otherwise leave the row selected with no body: the panel still shows the file's metadata and
+        // offers the download link, which beats clearing the user's selection on a failed fetch.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedJobId, selectedJobArtifactId, jobArtifacts]);
+
   useEffect(() => {
     if (selectedJobId) {
       Promise.all([
@@ -915,11 +1021,17 @@ export default function App() {
       }).catch((err) => {
         console.error('Failed to load job details:', err);
       });
+      // Deliberately not in the Promise.all above: a server without the artifact endpoint would reject
+      // the whole group and take the messages and checklist down with it, leaving the cockpit empty
+      // rather than just the panel. fetchJobArtifacts swallows its own failure.
+      fetchJobArtifacts(selectedJobId);
     } else {
       setJobMessages([]);
       setJobTasks([]);
+      setJobArtifacts([]);
+      setSelectedJobArtifactId(null);
     }
-  }, [selectedJobId]);
+  }, [selectedJobId, fetchJobArtifacts]);
 
   const handleSaveProject = async (req: any) => {
     if (editingProject) {
@@ -1435,6 +1547,37 @@ export default function App() {
       }
     };
 
+    // Job artifacts arrive over their own events, emitted by the mirror that runs when a turn session
+    // syncs an artifact (Api: JobArtifactMirror.MirrorAsync). Keyed on selectedJobIdRef rather than a
+    // captured id, matching every other job handler in this effect: the effect re-subscribes on
+    // connection change, not on job change, so a captured value would be stale after a job switch.
+    //
+    // Matched by id *or* name for the same reason the session handlers do — a re-sync keeps its name and
+    // may be re-keyed server-side, and appending instead of replacing would show two rows for one file.
+    const handleJobArtifactCreated = (artifact: JobArtifact) => {
+      if (artifact.jobId !== selectedJobIdRef.current) return;
+      setJobArtifacts((prev) => {
+        const exists = prev.some((a) => a.id === artifact.id || a.name === artifact.name);
+        return exists
+          ? prev.map((a) => (a.id === artifact.id || a.name === artifact.name ? artifact : a))
+          : [artifact, ...prev];
+      });
+      setSelectedJobArtifactId((prev) => prev ?? artifact.id);
+    };
+
+    const handleJobArtifactUpdated = (artifact: JobArtifact) => {
+      if (artifact.jobId !== selectedJobIdRef.current) return;
+      setJobArtifacts((prev) => {
+        const exists = prev.some((a) => a.id === artifact.id || a.name === artifact.name);
+        // An update for something the panel never saw (opened mid-turn, then the sync landed) is folded
+        // in as a creation rather than dropped — dropping it would leave the count and the list
+        // disagreeing until the next job switch.
+        return exists
+          ? prev.map((a) => (a.id === artifact.id || a.name === artifact.name ? artifact : a))
+          : [artifact, ...prev];
+      });
+    };
+
     const handleJobMessageAdded = (msg: JobMessage) => {
       setJobMessages((prev) => {
         if (msg.jobId === selectedJobIdRef.current) {
@@ -1547,6 +1690,8 @@ export default function App() {
     connection.on('QueueUpdated', handleQueueUpdated);
     connection.on('ArtifactCreated', handleArtifactCreated);
     connection.on('ArtifactUpdated', handleArtifactUpdated);
+    connection.on('JobArtifactCreated', handleJobArtifactCreated);
+    connection.on('JobArtifactUpdated', handleJobArtifactUpdated);
     connection.on('AgentRegistered', handleSessionUpdated);
     connection.on('AgentUpdated', handleSessionUpdated);
     connection.on('AgentDeleted', handleSessionUpdated);
@@ -1574,6 +1719,8 @@ export default function App() {
       connection.off('QueueUpdated', handleQueueUpdated);
       connection.off('ArtifactCreated', handleArtifactCreated);
       connection.off('ArtifactUpdated', handleArtifactUpdated);
+      connection.off('JobArtifactCreated', handleJobArtifactCreated);
+      connection.off('JobArtifactUpdated', handleJobArtifactUpdated);
       connection.off('AgentRegistered', handleSessionUpdated);
       connection.off('AgentUpdated', handleSessionUpdated);
       connection.off('AgentDeleted', handleSessionUpdated);
@@ -3737,6 +3884,7 @@ export default function App() {
 
               if (activeProj && activeJ) {
                 return (
+                  <div className="flex-1 flex min-h-0 overflow-hidden" data-testid="job-workspace-row">
                   <ErrorBoundary fallbackTitle="Job Cockpit Error">
                     <JobCockpit
                       project={activeProj}
@@ -3761,6 +3909,9 @@ export default function App() {
                       onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}
                       onCancelQueuedTurns={(personaId) => handleCancelQueuedJobTurns(personaId, activeJ.id)}
                       onAnswerQuestion={handleJobQuestionAnswer}
+                      jobArtifactCount={jobArtifacts.length}
+                      showJobArtifactsPanel={showJobArtifactsPanel}
+                      onToggleJobArtifactsPanel={() => setShowJobArtifactsPanel((prev) => !prev)}
                       onUpdateJob={handleUpdateJob}
                       onDeleteJob={() => handleDeleteJob(activeJ.id)}
                       onEditProject={() => {
@@ -3799,6 +3950,40 @@ export default function App() {
                       }}
                     />
                   </ErrorBoundary>
+
+                  {/* Resizable Split Divider: Desktop Only. Shares artifactPanelWidth with the session
+                      panel on purpose — one panel, one width, whichever surface opened it. */}
+                  {showJobArtifactsPanel && !isMobile && (
+                    <div
+                      onMouseDown={() => setIsResizingArtifacts(true)}
+                      className="w-1.5 hover:w-2 bg-slate-800 hover:bg-indigo-500 transition-colors cursor-col-resize select-none shrink-0"
+                      title="Drag to resize artifacts panel"
+                      data-testid="job-artifact-resize-divider"
+                    />
+                  )}
+
+                  {/* Right: Job Artifacts Split Panel (Desktop) or Full-screen Drawer (Mobile) */}
+                  {showJobArtifactsPanel && (
+                    <div
+                      style={isMobile ? undefined : { width: `${artifactPanelWidth}px` }}
+                      className={
+                        isMobile
+                          ? 'fixed inset-0 z-50 bg-slate-950 flex flex-col'
+                          : 'flex shrink-0 flex-col min-h-0 bg-slate-950 border-l border-slate-800 overflow-hidden'
+                      }
+                      data-testid="job-artifact-panel-container"
+                    >
+                      <ArtifactViewer
+                        artifacts={jobArtifacts}
+                        selectedArtifactId={selectedJobArtifactId}
+                        onSelectArtifact={(id) => setSelectedJobArtifactId(id)}
+                        onClose={() => setShowJobArtifactsPanel(false)}
+                        onRefresh={() => selectedJobId && fetchJobArtifacts(selectedJobId)}
+                        ownerPath={`api/project-jobs/${encodeURIComponent(selectedJobId || '')}`}
+                      />
+                    </div>
+                  )}
+                  </div>
                 );
               }
 
@@ -5554,6 +5739,7 @@ export default function App() {
                   onSelectArtifact={(id) => setSelectedArtifactId(id)}
                   onClose={() => setShowArtifactsPanel(false)}
                   onRefresh={() => selectedSessionId && fetchSessionArtifacts(selectedSessionId)}
+                  ownerPath={`api/sessions/${encodeURIComponent(selectedSessionId || '')}`}
                 />
               </div>
             )}
