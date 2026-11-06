@@ -157,6 +157,12 @@ public static class JobArtifactMirror
     /// loose file in the job's own artifact directory, folded into the stored manifest and persisted.
     /// </summary>
     /// <remarks>
+    /// Called on every list read, and on a detail or content read only when the stored manifest does not
+    /// already name the requested artifact — <c>ProjectJobsController.GetJobArtifact</c> and
+    /// <c>GetJobArtifactContent</c> try <see cref="JobArtifactManifest.Read"/> first, because the Cockpit
+    /// pairs one list fetch with a detail (or an <c>&lt;img src&gt;</c>) milliseconds later and this method
+    /// is the expensive half of that exchange.
+    /// <para>
     /// Persisting on a read is deliberate and matches what the session endpoint already does
     /// (<c>SessionsController.GetArtifacts</c> writes discovered disk files back into the session
     /// manifest). The alternative is a background sweep, which would need a new scheduler and would leave

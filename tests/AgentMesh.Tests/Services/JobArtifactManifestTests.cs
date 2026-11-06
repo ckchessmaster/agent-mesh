@@ -25,11 +25,12 @@ public class JobArtifactManifestTests
         DateTimeOffset? updated = null,
         string? content = null,
         long size = 10,
-        string? s3Key = null) =>
+        string? s3Key = null,
+        Guid? session = null) =>
         new(
             Id: id ?? name,
             JobId: JobId,
-            SourceSessionId: SessionId,
+            SourceSessionId: session ?? SessionId,
             Name: name,
             Summary: null,
             ContentType: "text/markdown",
@@ -160,6 +161,162 @@ public class JobArtifactManifestTests
             new[] { Artifact("plan.md", updated: newer) });
 
         merged.Single().UpdatedAt.Should().BeCloseTo(newer, TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public void Merge_WhenIncomingIsOlder_KeepsTheNewerEntriesLocationAndSize()
+    {
+        // The regression this guards: RefreshAsync folds a job's turn sessions in CreatedAt ascending
+        // order, so an entry can arrive from a session older than the one that last wrote it — and an
+        // older turn re-syncing a file late is normal here (a persona resumed on turn 1 after turn 2
+        // already rewrote plan.md). Overwriting unconditionally would repoint the S3 key and the source
+        // session at the stale location and the panel would serve the wrong bytes, or none.
+        var older = DateTimeOffset.UtcNow.AddDays(-2);
+        var newer = DateTimeOffset.UtcNow;
+        var newerSession = Guid.Parse("44444444-4444-4444-4444-444444444444");
+
+        var stored = Artifact("plan.md", updated: newer, size: 99,
+            s3Key: "sessions/newer/artifacts/a1/plan.md", session: newerSession);
+        var staleIncoming = Artifact("plan.md", updated: older, size: 10,
+            s3Key: "sessions/older/artifacts/a0/plan.md");
+
+        var merged = JobArtifactManifest.Merge(new[] { stored }, new[] { staleIncoming });
+
+        var entry = merged.Single();
+        entry.S3Key.Should().Be("sessions/newer/artifacts/a1/plan.md");
+        entry.SourceSessionId.Should().Be(newerSession);
+        entry.SizeBytes.Should().Be(99);
+        entry.UpdatedAt.Should().BeCloseTo(newer, TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public void Merge_WhenIncomingIsOlder_StillFillsFieldsTheStoredEntryLeavesEmpty()
+    {
+        // A stale record of a summary beats no record of it: the guard is about not *overwriting* newer
+        // facts, not about discarding the older entry wholesale.
+        var stored = Artifact("plan.md", updated: DateTimeOffset.UtcNow, size: 0, s3Key: null)
+            with { Summary = null };
+        var olderIncoming = Artifact("plan.md", updated: DateTimeOffset.UtcNow.AddDays(-3), size: 42,
+            s3Key: "sessions/older/artifacts/a0/plan.md") with { Summary = "draft notes" };
+
+        var entry = JobArtifactManifest.Merge(new[] { stored }, new[] { olderIncoming }).Single();
+
+        entry.Summary.Should().Be("draft notes");
+        entry.SizeBytes.Should().Be(42);
+        entry.S3Key.Should().Be("sessions/older/artifacts/a0/plan.md");
+    }
+
+    [Fact]
+    public void Merge_WhenIncomingHasNoTimestamp_TreatedAsStaleButStillFillsGaps()
+    {
+        // DateTimeOffset.MinValue is what GetDate returns for a missing or unparseable updatedAt, i.e.
+        // "unknown". Such an entry must never claim the clock or displace a real location, but it can
+        // still contribute content the stored row lacks.
+        var stored = Artifact("plan.md", updated: DateTimeOffset.UtcNow.AddDays(-1), s3Key: "k/new");
+        var timestampless = Artifact("plan.md", updated: DateTimeOffset.MinValue, content: "recovered body",
+            s3Key: "k/old");
+
+        var entry = JobArtifactManifest.Merge(new[] { stored }, new[] { timestampless }).Single();
+
+        entry.UpdatedAt.Should().BeCloseTo(DateTimeOffset.UtcNow.AddDays(-1), TimeSpan.FromSeconds(2));
+        entry.S3Key.Should().Be("k/new");
+        entry.Content.Should().Be("recovered body");
+    }
+
+    [Fact]
+    public void Merge_WhenIncomingIsOlder_KeepsTheStoredContentTypeAndBody()
+    {
+        var stored = Artifact("plan.md", updated: DateTimeOffset.UtcNow, content: "# v2")
+            with { ContentType = "text/markdown" };
+        var olderIncoming = Artifact("plan.md", updated: DateTimeOffset.UtcNow.AddDays(-5),
+            content: "# v1") with { ContentType = "text/plain" };
+
+        var entry = JobArtifactManifest.Merge(new[] { stored }, new[] { olderIncoming }).Single();
+
+        entry.ContentType.Should().Be("text/markdown");
+        entry.Content.Should().Be("# v2");
+    }
+
+    [Fact]
+    public void Merge_WhenSecondTurnSessionResyncsTheSameName_KeepsOneAddressableIdentityAndUrl()
+    {
+        // SessionsController.SyncArtifact mints a fresh artifact id when a *different* session writes the
+        // same filename, while the merge deliberately keeps the original identity so the panel's open
+        // selection survives. The download URL has to address the identity that survived, not the id the
+        // incoming entry carried — otherwise the stored link points at an id FindArtifact cannot resolve
+        // and the viewer's download link and <img src> 404.
+        var firstTurn = DateTimeOffset.UtcNow.AddDays(-1);
+        var secondTurn = DateTimeOffset.UtcNow;
+        var secondSession = Guid.Parse("55555555-5555-5555-5555-555555555555");
+
+        var stored = Artifact("plan.md", id: "id-first", updated: firstTurn,
+            s3Key: "sessions/first/artifacts/id-first/plan.md");
+        var resyncFromNewerTurn = Artifact("plan.md", id: "id-second", updated: secondTurn,
+            s3Key: "sessions/second/artifacts/id-second/plan.md", session: secondSession);
+
+        var entry = JobArtifactManifest.Merge(new[] { stored }, new[] { resyncFromNewerTurn }).Single();
+
+        entry.Id.Should().Be("id-first");
+        entry.S3Key.Should().Be("sessions/second/artifacts/id-second/plan.md");
+        entry.SourceSessionId.Should().Be(secondSession);
+        entry.DownloadUrl.Should().Be(JobArtifactManifest.BuildContentUrl(JobId, "id-first"));
+    }
+
+    [Fact]
+    public void Merge_WhenStoredEntryHasNoDownloadUrl_BuildsTheCanonicalOne()
+    {
+        // Rows written before the URL was stored, or hand-edited manifests, must still render a working
+        // link rather than an empty href.
+        var stored = Artifact("plan.md", id: "a1") with { DownloadUrl = null };
+
+        var entry = JobArtifactManifest.Merge(new[] { stored }, new[] { Artifact("plan.md", id: "a1") })
+            .Single();
+
+        entry.DownloadUrl.Should().Be(JobArtifactManifest.BuildContentUrl(JobId, "a1"));
+    }
+
+    [Fact]
+    public void Merge_WhenBothSidesAreEquallyFresh_IncomingWins()
+    {
+        // Ties happen: two entries folded from the same session metadata carry the same updatedAt. The
+        // incoming one is the fresher read of the two (it came from the row or disk right now), so it
+        // wins — and asserting the tie direction pins it against a future "<" vs "<=" refactor.
+        var same = DateTimeOffset.UtcNow;
+        var stored = Artifact("plan.md", size: 10, s3Key: "k/old", updated: same);
+        var incoming = Artifact("plan.md", size: 77, s3Key: "k/new", updated: same);
+
+        var entry = JobArtifactManifest.Merge(new[] { stored }, new[] { incoming }).Single();
+
+        entry.SizeBytes.Should().Be(77);
+        entry.S3Key.Should().Be("k/new");
+    }
+
+    [Fact]
+    public void Merge_WhenSessionsFoldOldestFirst_EndsWithTheNewestTurnsLocation()
+    {
+        // The exact ordering RefreshAsync produces: turn 1, then turn 2, both writing plan.md, with the
+        // stored row already holding turn 2's answer. Folding in ascending order must not walk the
+        // pointer back to turn 1.
+        var turn1 = DateTimeOffset.UtcNow.AddDays(-2);
+        var turn2 = DateTimeOffset.UtcNow.AddDays(-1);
+        var session1 = Guid.Parse("66666666-6666-6666-6666-666666666666");
+        var session2 = Guid.Parse("77777777-7777-7777-7777-777777777777");
+
+        var stored = new[]
+        {
+            Artifact("plan.md", id: "a2", updated: turn2, size: 200, s3Key: "k/turn2", session: session2)
+        };
+        var foldedInOrder = new[]
+        {
+            Artifact("plan.md", id: "a1", updated: turn1, size: 100, s3Key: "k/turn1", session: session1),
+            Artifact("plan.md", id: "a2", updated: turn2, size: 200, s3Key: "k/turn2", session: session2)
+        };
+
+        var entry = JobArtifactManifest.Merge(stored, foldedInOrder).Single();
+
+        entry.S3Key.Should().Be("k/turn2");
+        entry.SourceSessionId.Should().Be(session2);
+        entry.SizeBytes.Should().Be(200);
     }
 
     [Fact]

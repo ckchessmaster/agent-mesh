@@ -1154,6 +1154,82 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       expect(screen.getByTestId('toggle-job-artifacts-btn')).toHaveTextContent('Artifacts (1)');
     });
 
+    it('re-fetches the body when a live JobArtifactUpdated brings a newer revision', async () => {
+      // The bug this guards: the mirror broadcasts JobArtifactUpdated with the list shape — no body, by
+      // design, so a 2 MB transcript never rides a SignalR push. Folding it in blanks the body the panel
+      // had already loaded. If the body fetch is then keyed on job+id alone, the guard sees that id as
+      // already attempted and refuses to re-fetch: the operator watches an open plan.md go blank mid-turn
+      // and cannot get it back without switching jobs. Keying on the revision makes it fetchable again.
+      const v1 = '2026-11-05T10:00:00.000Z';
+      const v2 = '2026-11-05T10:05:00.000Z';
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([{ ...markdownArtifact, updatedAt: v1 }]);
+      vi.mocked(api.getJobArtifact).mockResolvedValue({
+        ...markdownArtifact,
+        updatedAt: v1,
+        content: '# First Revision\n\noriginal body'
+      });
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: /First Revision/i })).toBeInTheDocument();
+      });
+      expect(api.getJobArtifact).toHaveBeenCalledTimes(1);
+
+      // The agent edits and re-syncs the same file: same id (so the selection survives), newer updatedAt,
+      // and no body in the payload.
+      vi.mocked(api.getJobArtifact).mockResolvedValue({
+        ...markdownArtifact,
+        updatedAt: v2,
+        sizeBytes: 9000,
+        content: '# Second Revision\n\nedited body'
+      });
+
+      await act(async () => {
+        signalRHandlers['JobArtifactUpdated']?.({
+          ...markdownArtifact,
+          updatedAt: v2,
+          sizeBytes: 9000,
+          content: undefined
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: /Second Revision/i })).toBeInTheDocument();
+      });
+      expect(api.getJobArtifact).toHaveBeenCalledTimes(2);
+      expect(api.getJobArtifact).toHaveBeenLastCalledWith('job-101', 'job-art-plan');
+      expect(screen.queryByText(/First Revision/i)).not.toBeInTheDocument();
+    });
+
+    it('does not re-fetch a body for a revision it already tried', async () => {
+      // The other half of the guard: a body that comes back null (file deleted from disk, a type the
+      // server refuses to inline) leaves the entry looking exactly as it did, so without the attempt key
+      // an effect depending on the artifact list would fire again immediately. Adding the revision to the
+      // key must not turn a dead end into a request storm — same revision, one attempt only.
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact]);
+      // The server sends a JSON null body; the client type models both as "no body" and the effect's
+      // `content != null` check treats them identically, so undefined is the type-correct spelling here.
+      vi.mocked(api.getJobArtifact).mockResolvedValue({ ...markdownArtifact, content: undefined });
+
+      await renderJob();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+
+      await waitFor(() => {
+        expect(api.getJobArtifact).toHaveBeenCalledTimes(1);
+      });
+
+      // Three events for the same revision (a duplicate broadcast, a re-render, a refresh button press).
+      for (let i = 0; i < 3; i++) {
+        await act(async () => {
+          signalRHandlers['JobArtifactUpdated']?.({ ...markdownArtifact, sizeBytes: 9000 + i });
+        });
+      }
+
+      expect(api.getJobArtifact).toHaveBeenCalledTimes(1);
+    });
+
     it('ignores artifact events belonging to another job', async () => {
       vi.mocked(api.getJobArtifacts).mockResolvedValue([markdownArtifact]);
 

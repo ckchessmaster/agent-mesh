@@ -35,8 +35,10 @@ namespace AgentMesh.Core.Services;
 /// agent that re-syncs <c>plan.md</c> after editing it updates one row in both places. Keying the mirror
 /// by id instead would append a second entry for the same file on every re-sync and the panel would fill
 /// with near-duplicates. The cost is that two different turn sessions that both produce <c>plan.md</c>
-/// collapse to one entry, last writer wins — which matches what the session side already does, and is
-/// what the file on disk does too, since both write to the same artifact directory name.
+/// collapse to one entry — which matches what the session side already does, and is what the file on disk
+/// does too, since both write to the same artifact directory name. "Collapse" does not mean "whatever the
+/// backfill happened to read last": the freshest entry wins the fields that describe where the bytes live,
+/// per <see cref="Merge"/>, so a later read of an older turn cannot repoint the survivor at stale bytes.
 /// </para>
 /// </remarks>
 public static class JobArtifactManifest
@@ -96,6 +98,18 @@ public static class JobArtifactManifest
     /// only about the artifact just written. A replace from either side would delete entries the other
     /// side legitimately added. Existing entries keep their <see cref="JobArtifactDto.Id"/> when an
     /// incoming entry updates them, so a selection in the Cockpit survives a refresh.
+    /// <para>
+    /// <strong>Freshness decides who owns a field.</strong> The read-time backfill walks a job's turn
+    /// sessions in <c>CreatedAt</c> ascending order and folds every artifact it finds, so an entry can
+    /// arrive from a session that is <em>older</em> than the one that last wrote it — and an older turn
+    /// that re-synced a file late is normal here, not an edge case (a persona resumed on turn 1 while
+    /// turn 2 already rewrote <c>plan.md</c>). An unconditional overwrite would then repoint
+    /// <see cref="S3Key"/> and <see cref="SourceSessionId"/> at the stale location and the panel would
+    /// serve, or fail to serve, the wrong bytes. So the incoming entry may only replace fields it is at
+    /// least as fresh as; an older one may only fill gaps the stored entry left empty. See
+    /// <see cref="Pick{T}"/> for the per-field rule and <see cref="ResolveDownloadUrl"/> for the one field
+    /// that is derived rather than picked.
+    /// </para>
     /// </remarks>
     public static List<JobArtifactDto> Merge(
         IEnumerable<JobArtifactDto> existing,
@@ -117,28 +131,86 @@ public static class JobArtifactManifest
             }
 
             var current = merged[index];
+            var incomingOwnsFields = item.UpdatedAt >= current.UpdatedAt;
+
             merged[index] = current with
             {
                 // Keep the original identity so the panel's selection is stable across re-syncs.
-                Summary = item.Summary ?? current.Summary,
-                ContentType = string.IsNullOrWhiteSpace(item.ContentType)
-                    ? current.ContentType
-                    : item.ContentType,
-                SizeBytes = item.SizeBytes > 0 ? item.SizeBytes : current.SizeBytes,
+                Summary = Pick(item.Summary, current.Summary, incomingOwnsFields, IsEmpty),
+                ContentType = Pick(item.ContentType, current.ContentType, incomingOwnsFields, IsEmpty),
+                SizeBytes = Pick(item.SizeBytes, current.SizeBytes, incomingOwnsFields, IsUnknownSize),
+                // The moment this file first appeared in the job is a fact about the job, not about the
+                // entry that happened to be folded in first, so the earliest known value wins either way.
                 CreatedAt = current.CreatedAt == default ? item.CreatedAt : current.CreatedAt,
-                UpdatedAt = item.UpdatedAt == default ? current.UpdatedAt : item.UpdatedAt,
+                // Never rewound: an older incoming entry cannot move the clock backwards, and an
+                // incoming entry with no timestamp of its own cannot claim one either.
+                UpdatedAt = Pick(item.UpdatedAt, current.UpdatedAt, incomingOwnsFields, IsUnset),
                 // A list-shaped incoming entry carries no body; do not blank a body we already have.
-                Content = item.Content ?? current.Content,
-                S3Key = item.S3Key ?? current.S3Key,
-                DownloadUrl = string.IsNullOrWhiteSpace(item.DownloadUrl)
-                    ? current.DownloadUrl
-                    : item.DownloadUrl,
-                SourceSessionId = item.SourceSessionId ?? current.SourceSessionId
+                Content = Pick(item.Content, current.Content, incomingOwnsFields, IsEmpty),
+                S3Key = Pick(item.S3Key, current.S3Key, incomingOwnsFields, IsEmpty),
+                // Rebuilt from the identity that survives the merge rather than copied: the incoming
+                // entry's own URL addresses <em>its</em> id, and a second turn session re-syncing
+                // "plan.md" mints a fresh one (SessionsController.SyncArtifact). Copying it would store
+                // a URL for an id this entry does not have, which the content endpoint cannot resolve.
+                DownloadUrl = ResolveDownloadUrl(current, item, incomingOwnsFields),
+                SourceSessionId = Pick(
+                    item.SourceSessionId, current.SourceSessionId, incomingOwnsFields, IsEmptyGuid)
             };
         }
 
         return SortForDisplay(merged);
     }
+
+    /// <summary>
+    /// Chooses the value one merged field ends up with.
+    /// </summary>
+    /// <param name="incoming">The value the entry being folded in carries.</param>
+    /// <param name="existing">The value already stored on the job row.</param>
+    /// <param name="incomingOwnsFields">
+    /// True when the incoming entry is at least as fresh as the stored one, so it may replace what is
+    /// there. False means the stored entry wins everywhere it already has a value, and the incoming one
+    /// is reduced to filling gaps — which is still worth doing, because a stale record of a size or a
+    /// summary beats no record of it.
+    /// </param>
+    /// <param name="isEmpty">The field's own notion of "carries no information".</param>
+    private static T Pick<T>(T incoming, T existing, bool incomingOwnsFields, Func<T, bool> isEmpty) =>
+        incomingOwnsFields
+            ? isEmpty(incoming) ? existing : incoming
+            : isEmpty(existing) ? incoming : existing;
+
+    /// <summary>
+    /// The content URL of a merged entry, always addressing the id the merge kept.
+    /// </summary>
+    /// <remarks>
+    /// Rebuilt rather than picked from either side, because neither stored URL is necessarily the one the
+    /// surviving identity needs: a second turn session re-syncing <c>plan.md</c> is minted a fresh
+    /// session-side artifact id (<c>SessionsController.SyncArtifact</c>) while this merge deliberately keeps
+    /// the original identity, so copying the incoming URL would store a link to an id this entry does not
+    /// have. <c>FindArtifact</c> then resolves neither that id nor a guid-shaped name and the panel's
+    /// download link and <c>&lt;img src&gt;</c> 404. The detail endpoint already re-derives this same URL
+    /// from the entry it returns, so canonicalising it here keeps the list and the detail in agreement.
+    /// </remarks>
+    private static string? ResolveDownloadUrl(
+        JobArtifactDto current,
+        JobArtifactDto item,
+        bool incomingOwnsFields)
+    {
+        if (current.JobId != Guid.Empty)
+        {
+            var id = string.IsNullOrWhiteSpace(current.Id) ? current.Name : current.Id;
+            return BuildContentUrl(current.JobId, id);
+        }
+
+        // A stored entry with no job of its own (hand-written or pre-migration row): there is no correct
+        // URL to build, so fall back to whichever side carries one.
+        var kept = Pick(item.DownloadUrl, current.DownloadUrl, incomingOwnsFields, IsEmpty);
+        return string.IsNullOrWhiteSpace(kept) ? null : kept;
+    }
+
+    private static bool IsEmpty(string? value) => string.IsNullOrWhiteSpace(value);
+    private static bool IsEmptyGuid(Guid? value) => !value.HasValue || value.Value == Guid.Empty;
+    private static bool IsUnknownSize(long value) => value <= 0;
+    private static bool IsUnset(DateTimeOffset value) => value == default;
 
     /// <summary>
     /// Newest first, then by name so the order does not depend on wall-clock ties.

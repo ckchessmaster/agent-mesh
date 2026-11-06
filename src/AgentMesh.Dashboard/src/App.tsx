@@ -952,13 +952,24 @@ export default function App() {
    * artifacts do not need this: their bodies are small enough that the API already stores them inline in
    * the session manifest and returns them in the list.
    *
-   * `jobArtifactBodyAttempts` records what has already been asked for, keyed per job. A guard on the
-   * response alone would loop: a body that comes back null (a file deleted from disk, a type the server
-   * refuses to inline) leaves the entry looking exactly as it did before the fetch, and an effect that
-   * depends on the artifact list would fire again immediately. Attempting once per job+artifact is what
-   * makes a missing body a dead end rather than a request storm.
+   * `jobArtifactBodyAttempts` records the revision of each artifact whose body has already been asked
+   * for, keyed per job+artifact. A guard on the response alone would loop: a body that comes back null (a
+   * file deleted from disk, a type the server refuses to inline) leaves the entry looking exactly as it
+   * did before the fetch, and an effect that depends on the artifact list would fire again immediately.
+   * Attempting once per artifact revision is what makes a missing body a dead end rather than a request
+   * storm.
+   *
+   * Storing the *revision* (`updatedAt`) rather than a bare flag is what keeps a live re-sync honest. The
+   * mirror broadcasts `JobArtifactUpdated` with no body — the list shape, stripped server-side — and
+   * folding it in replaces the open entry and blanks its loaded content. Guarded on id alone, that
+   * re-fetch would be suppressed forever and the operator would watch an open file go blank mid-turn until
+   * they switched jobs. Guarded on the revision, the same artifact is fetchable once per revision.
+   *
+   * A Map from key to revision, rather than a Set of key+revision strings, so the entry is overwritten
+   * instead of accumulating: a long-lived dashboard tab with an agent re-syncing one file every few
+   * seconds would otherwise grow the set for the lifetime of the page.
    */
-  const jobArtifactBodyAttempts = useRef<Set<string>>(new Set());
+  const jobArtifactBodyAttempts = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
     if (!selectedJobId) {
@@ -974,8 +985,8 @@ export default function App() {
         current.contentType === 'application/pdf') return;
 
     const attemptKey = `${selectedJobId}:${current.id}`;
-    if (jobArtifactBodyAttempts.current.has(attemptKey)) return;
-    jobArtifactBodyAttempts.current.add(attemptKey);
+    if (jobArtifactBodyAttempts.current.get(attemptKey) === current.updatedAt) return;
+    jobArtifactBodyAttempts.current.set(attemptKey, current.updatedAt);
 
     const jobId = selectedJobId;
     let cancelled = false;

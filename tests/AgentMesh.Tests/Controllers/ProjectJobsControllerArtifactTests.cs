@@ -79,7 +79,23 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
         ["personaId"] = "rook"
     });
 
-    private static string SessionMetadataWithArtifacts(Guid jobId, params (string Id, string Name, string ContentType, long Size)[] artifacts)
+    private static string SessionMetadataWithArtifacts(Guid jobId, params (string Id, string Name, string ContentType, long Size)[] artifacts) =>
+        SessionMetadataWithArtifacts(jobId, DateTimeOffset.UtcNow.AddMinutes(-30),
+            DateTimeOffset.UtcNow.AddMinutes(-5), artifacts);
+
+    /// <summary>
+    /// Session metadata carrying artifacts with explicit timestamps.
+    /// </summary>
+    /// <remarks>
+    /// The timestamp-blind overload above is enough for aggregation tests, but the merge rules are
+    /// freshness-driven, so the tests that assert which turn session a pointer ends up following have to
+    /// control <c>updatedAt</c> per fold rather than take "five minutes ago".
+    /// </remarks>
+    private static string SessionMetadataWithArtifacts(
+        Guid jobId,
+        DateTimeOffset createdAt,
+        DateTimeOffset updatedAt,
+        params (string Id, string Name, string ContentType, long Size)[] artifacts)
     {
         var list = artifacts.Select(a => new Dictionary<string, object?>
         {
@@ -87,8 +103,8 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
             ["name"] = a.Name,
             ["contentType"] = a.ContentType,
             ["sizeBytes"] = a.Size,
-            ["createdAt"] = DateTimeOffset.UtcNow.AddMinutes(-30),
-            ["updatedAt"] = DateTimeOffset.UtcNow.AddMinutes(-5),
+            ["createdAt"] = createdAt,
+            ["updatedAt"] = updatedAt,
             ["s3Key"] = $"sessions/x/artifacts/{a.Id}/{a.Name}"
         }).Cast<object?>().ToList();
 
@@ -128,6 +144,167 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
     /// </summary>
     private static ProjectJobsController Controller(
         AgentMesh.Infrastructure.Data.AgentMeshDbContext db) => new(db);
+
+    [Fact]
+    public async Task RefreshAsync_WhenAnOlderTurnSessionReSyncedLater_KeepsTheFreshestPointer()
+    {
+        // The ordering hazard the merge guard exists for, driven through the real read path.
+        //
+        // Turn 1 (created first, so TurnSessionsAsync's CreatedAt-ascending sort folds it first) was
+        // resumed and re-synced plan.md AFTER turn 2 had already written its own version. The stored row
+        // therefore describes turn 1's newer bytes, while the fold walks a strictly older turn-2 entry in
+        // afterwards. Without a freshness guard that older entry repoints S3Key / SourceSessionId /
+        // SizeBytes at turn 2's stale location and rewinds UpdatedAt, so the panel serves — or fails to
+        // serve — bytes the job has since moved on from.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        var firstTurnSession = Guid.NewGuid();
+        var secondTurnSession = Guid.NewGuid();
+        var lateResync = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var earlySync = DateTimeOffset.UtcNow.AddDays(-2);
+
+        db.AgentSessions.Add(new AgentSession
+        {
+            Id = firstTurnSession,
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-3),
+            // Turn 1 resumed and re-synced plan.md most recently: 400 bytes at its own key.
+            MetadataJson = SessionMetadataWithArtifacts(
+                jobId, earlySync, lateResync, ("a1", "plan.md", "text/markdown", 400))
+        });
+        db.AgentSessions.Add(new AgentSession
+        {
+            Id = secondTurnSession,
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-2),
+            // Turn 2 ran earlier and its copy is the stale one.
+            MetadataJson = SessionMetadataWithArtifacts(
+                jobId, earlySync, earlySync, ("a2", "plan.md", "text/markdown", 100))
+        });
+        db.ProjectJobs.Add(new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "core-app",
+            Title = "Build it",
+            // What MirrorAsync left behind after turn 1's late re-sync: the freshest location.
+            ArtifactsJson = JobArtifactManifest.Write(new[]
+            {
+                new JobArtifactDto("a1", jobId, firstTurnSession, "plan.md", "final plan", "text/markdown", 400,
+                    earlySync, lateResync, null, "sessions/x/artifacts/a1/plan.md",
+                    JobArtifactManifest.BuildContentUrl(jobId, "a1"))
+            })
+        });
+        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = firstTurnSession, Content = "turn 1" });
+        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = secondTurnSession, Content = "turn 2" });
+        await db.SaveChangesAsync();
+
+        var artifacts = await JobArtifactMirror.RefreshAsync(db, jobId);
+
+        var plan = artifacts.Should().ContainSingle(a => a.Name == "plan.md").Subject;
+        plan.Id.Should().Be("a1", "the identity the panel already holds survives the fold");
+        plan.S3Key.Should().Be("sessions/x/artifacts/a1/plan.md");
+        plan.SourceSessionId.Should().Be(firstTurnSession);
+        plan.SizeBytes.Should().Be(400);
+        plan.UpdatedAt.Should().BeCloseTo(lateResync, TimeSpan.FromSeconds(1),
+            "an older incoming entry must not rewind the clock");
+
+        // And the recovery is not just in the returned list: the row must not be walked backwards either.
+        var stored = JobArtifactManifest.Read((await db.ProjectJobs.FirstAsync(j => j.Id == jobId)).ArtifactsJson);
+        var storedPlan = stored.Should().ContainSingle(a => a.Name == "plan.md").Subject;
+        storedPlan.S3Key.Should().Be("sessions/x/artifacts/a1/plan.md");
+        storedPlan.Summary.Should().Be("final plan", "an older entry may not blank a summary the newer one set");
+    }
+
+    [Fact]
+    public async Task GetJobArtifact_WhenTheStoredManifestAlreadyNamesIt_ServesWithoutReRunningTheBackfill()
+    {
+        // The steady-state read is one row. The observable consequence of that is what is NOT persisted:
+        // RefreshAsync folds loose disk files and session artifacts into the row as a side effect, so a
+        // detail read that hit the stored manifest must leave an un-backfilled loose file out of it. The
+        // panel always calls the list endpoint first, which does the fold, so nothing is lost to the user;
+        // this pins that the detail read stopped paying for it.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        db.ProjectJobs.Add(new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "core-app",
+            Title = "Build it",
+            ArtifactsJson = JobArtifactManifest.Write(new[]
+            {
+                new JobArtifactDto("a1", jobId, null, "plan.md", null, "text/markdown", 12,
+                    DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(-1), null, null,
+                    JobArtifactManifest.BuildContentUrl(jobId, "a1"))
+            })
+        });
+        await db.SaveChangesAsync();
+        WriteJobFile(jobId, "plan.md", "# stored manifest read");
+        var looseFile = WriteJobFile(jobId, "loose.md", "# never folded in");
+
+        var detail = Ok<JobArtifactDto>(await Controller(db).GetJobArtifact(jobId, "a1"));
+        detail.Name.Should().Be("plan.md");
+        detail.Content.Should().Contain("stored manifest read");
+
+        var stored = JobArtifactManifest.Read((await db.ProjectJobs.FirstAsync(j => j.Id == jobId)).ArtifactsJson);
+        stored.Should().NotContain(a => a.Name == "loose.md",
+            "a detail read that hit the manifest must not pay for the backfill");
+        File.Exists(looseFile).Should().BeTrue("the file is still there, just not folded by this read");
+    }
+
+    [Fact]
+    public async Task GetJobArtifact_WhenTheStoredManifestMisses_StillBackfillsAndServes()
+    {
+        // The other half of the fast path: a miss must fall through to the full derivation, which is what
+        // recovers artifacts written before the column existed and entries lost to a racing write.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        var sessionId = Guid.NewGuid();
+        db.AgentSessions.Add(new AgentSession
+        {
+            Id = sessionId,
+            MetadataJson = SessionMetadataWithArtifacts(jobId, ("a1", "recovered.md", "text/markdown", 7))
+        });
+        db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
+        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        await db.SaveChangesAsync();
+        WriteJobFile(jobId, "recovered.md", "# recovered through the backfill");
+
+        var detail = Ok<JobArtifactDto>(await Controller(db).GetJobArtifact(jobId, "a1"));
+
+        detail.Name.Should().Be("recovered.md");
+        detail.Content.Should().Contain("recovered through the backfill");
+    }
+
+    [Fact]
+    public async Task GetJobArtifactContent_WhenTheStoredManifestAlreadyNamesIt_ServesWithoutReRunningTheBackfill()
+    {
+        // Same fast path on the byte-streaming endpoint, where it matters most: an <img src> is re-fetched
+        // on every repaint of an open job.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        db.ProjectJobs.Add(new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "core-app",
+            Title = "Build it",
+            ArtifactsJson = JobArtifactManifest.Write(new[]
+            {
+                new JobArtifactDto("a1", jobId, null, "diagram.png", null, "image/png", 13,
+                    DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(-1), null, null,
+                    JobArtifactManifest.BuildContentUrl(jobId, "a1"))
+            })
+        });
+        await db.SaveChangesAsync();
+        WriteJobFile(jobId, "diagram.png", "fake-png-bytes");
+        WriteJobFile(jobId, "loose.md", "# never folded in");
+
+        var controller = Controller(db);
+        controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() };
+
+        var result = await controller.GetJobArtifactContent(jobId, "a1");
+        result.Should().BeOfType<FileStreamResult>();
+
+        var stored = JobArtifactManifest.Read((await db.ProjectJobs.FirstAsync(j => j.Id == jobId)).ArtifactsJson);
+        stored.Should().NotContain(a => a.Name == "loose.md");
+    }
 
     [Fact]
     public async Task GetJobArtifacts_WhenJobUnknown_ReturnsNotFound()

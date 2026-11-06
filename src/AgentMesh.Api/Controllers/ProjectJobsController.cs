@@ -977,6 +977,16 @@ public class ProjectJobsController(
     /// Resolves by id first, then by name: a mirrored entry keeps the id the session gave it, and the
     /// disk-discovered entries are keyed by filename, so a caller that only knows one of the two still
     /// works. Same fallback order the session endpoint uses.
+    /// <para>
+    /// <strong>The stored manifest is tried before the backfill.</strong> The Cockpit opens a list and then
+    /// a detail (or a content stream) milliseconds apart, and <see cref="JobArtifactMirror.RefreshAsync"/>
+    /// is not free: it queries <c>job_messages</c>, <c>agent_sessions</c>, and scans the job's artifact
+    /// directory. The mirror already folds every sync into the row as it happens, so in steady state the
+    /// row <em>is</em> the index and one row read answers the request. The backfill stays as the fallback
+    /// for a manifest miss, which is exactly the case it exists for: entries written before the column
+    /// existed, entries lost to the racing write documented in <see cref="JobArtifactMirror"/>, and loose
+    /// files no session ever recorded.
+    /// </para>
     /// </remarks>
     [HttpGet("api/project-jobs/{id}/artifacts/{artifactId}")]
     [AllowAnonymous]
@@ -986,13 +996,14 @@ public class ProjectJobsController(
         [FromServices] IStorageService? storage = null,
         CancellationToken ct = default)
     {
-        if (!await db.ProjectJobs.AnyAsync(j => j.Id == id, ct))
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id, ct);
+        if (job == null)
         {
             return NotFound(new { error = $"Job '{id}' not found." });
         }
 
-        var artifacts = await JobArtifactMirror.RefreshAsync(db, id, ct);
-        var artifact = FindArtifact(artifacts, artifactId);
+        var artifact = FindArtifact(JobArtifactManifest.Read(job.ArtifactsJson), artifactId)
+                       ?? FindArtifact(await JobArtifactMirror.RefreshAsync(db, id, ct), artifactId);
         if (artifact == null)
         {
             return NotFound(new { error = $"Artifact '{artifactId}' not found in job '{id}'." });
@@ -1024,6 +1035,12 @@ public class ProjectJobsController(
     /// Mirrors the session content endpoint's contract exactly, including <c>?download=true</c> forcing
     /// an attachment disposition, because <c>ArtifactViewer</c> builds its <c>&lt;img src&gt;</c> and its
     /// save-link from the same helper for both surfaces.
+    /// <para>
+    /// Same stored-manifest-first read as <see cref="GetJobArtifact"/>, and it matters more here: an image
+    /// in the panel costs one list fetch plus one <c>&lt;img src&gt;</c> per render, so without it every
+    /// repaint of an open job re-ran the whole turn-session backfill to serve bytes that were already
+    /// addressable from the row.
+    /// </para>
     /// </remarks>
     [HttpGet("api/project-jobs/{id}/artifacts/{artifactId}/content")]
     [AllowAnonymous]
@@ -1034,13 +1051,14 @@ public class ProjectJobsController(
         [FromServices] IStorageService? storage = null,
         CancellationToken ct = default)
     {
-        if (!await db.ProjectJobs.AnyAsync(j => j.Id == id, ct))
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id, ct);
+        if (job == null)
         {
             return NotFound(new { error = $"Job '{id}' not found." });
         }
 
-        var artifacts = await JobArtifactMirror.RefreshAsync(db, id, ct);
-        var artifact = FindArtifact(artifacts, artifactId);
+        var artifact = FindArtifact(JobArtifactManifest.Read(job.ArtifactsJson), artifactId)
+                       ?? FindArtifact(await JobArtifactMirror.RefreshAsync(db, id, ct), artifactId);
 
         // A caller may address an artifact by name even if it was never recorded in a manifest, so long as
         // the bytes are on disk — the same leniency the session content endpoint gives.
