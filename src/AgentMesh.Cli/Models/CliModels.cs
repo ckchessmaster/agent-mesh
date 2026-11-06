@@ -1,4 +1,4 @@
-﻿using System.Text.Json.Serialization;
+using System.Text.Json.Serialization;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 
@@ -8,6 +8,7 @@ public class CliConfig
 {
     public string MeshUrl { get; set; } = "http://localhost:5000";
     public string MasterToken { get; set; } = "mesh-default-secret-key";
+    public int? DefaultMaxSteps { get; set; }
     public Dictionary<string, AgentPresetConfig> Agents { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 

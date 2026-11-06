@@ -49,6 +49,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
         _currentHeartbeat = "Exploring codebase and generating checklist";
         int discoveryTurns = 0;
         const int maxDiscoveryTurns = 15;
+        string? activePrUrl = null;
 
         while (_tasks.Count == 0 && discoveryTurns < maxDiscoveryTurns)
         {
@@ -70,6 +71,13 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             {
                 _currentHeartbeat = $"Discovery failed: {discoveryOutcome.Message}";
                 return new JobExecutionResult(Success: false, Summary: $"Discovery failed: {discoveryOutcome.Message}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(discoveryOutcome.PrUrl) || discoveryOutcome.Status == TurnOutcomeStatus.PrOpenedAwaitingReview)
+            {
+                activePrUrl = discoveryOutcome.PrUrl;
+                _currentHeartbeat = "Pull request active; awaiting code review";
+                break;
             }
 
             if (_tasks.Count > 0)
@@ -99,91 +107,98 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             break;
         }
 
-        if (_currentHeartbeat.StartsWith("Exploring", StringComparison.OrdinalIgnoreCase) ||
-            _currentHeartbeat.StartsWith("Awaiting user input", StringComparison.OrdinalIgnoreCase) ||
-            _currentHeartbeat.StartsWith("Resuming", StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrWhiteSpace(activePrUrl))
         {
-            _currentHeartbeat = "Awaiting plan approval";
+            // Fast-track: if a pull request was already opened during discovery, skip planning approval
+            // and task execution loops to enter the review gate directly.
+            _currentHeartbeat = "Pull request active; awaiting code review";
         }
-
-        // 2. Stage 2: Plan Approval Gate
-        await Workflow.WaitConditionAsync(() =>
+        else
         {
-            if (_tasks.Count == 0 || _planApproval == null) return false;
-            var isApproved = input.ApprovalPolicy switch
+            if (_currentHeartbeat.StartsWith("Exploring", StringComparison.OrdinalIgnoreCase) ||
+                _currentHeartbeat.StartsWith("Awaiting user input", StringComparison.OrdinalIgnoreCase) ||
+                _currentHeartbeat.StartsWith("Resuming", StringComparison.OrdinalIgnoreCase))
             {
-                PlanApprovalPolicy.LeadOrHuman =>
-                    _planApproval.ApproverRole is "operator" or "tech_lead",
-                PlanApprovalPolicy.HumanOnly =>
-                    _planApproval.ApproverRole == "operator",
-                _ => false
-            };
-
-            if (!isApproved)
-            {
-                // Explicitly discard rejected approval signal so it does not linger
-                var rejectedRole = _planApproval.ApproverRole;
-                _planApproval = null;
-                _currentHeartbeat = $"Plan approval rejected: role '{rejectedRole}' is not permitted by policy {input.ApprovalPolicy}";
-                return false;
+                _currentHeartbeat = "Awaiting plan approval";
             }
 
-            return true;
-        });
-
-        _currentHeartbeat = "Plan approved. Starting implementation";
-
-        string? activePrUrl = null;
-
-        // 3. Stage 3: Autonomous Task Iteration Loop
-        while (_currentTaskIndex < _tasks.Count)
-        {
-            var currentTask = _tasks[_currentTaskIndex];
-            _currentHeartbeat = $"Executing task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
-
-            // Check for inbound chat interjections
-            ChatMessageSignal? pendingMessage = _chatInbox.Count > 0 ? _chatInbox.Dequeue() : null;
-
-            var turnOutcome = await Workflow.ExecuteActivityAsync(
-                (IExecutionActivities act) => act.RunJobCodingTurnAsync(new CodingTurnInput(
-                    input.JobId,
-                    currentTask,
-                    pendingMessage,
-                    input.AssignedAgentId,
-                    input.ProjectId,
-                    input.WorkspacePath,
-                    input.TargetBranch)),
-                TurnActivityOptions);
-
-            if (!string.IsNullOrWhiteSpace(turnOutcome.PrUrl))
+            // 2. Stage 2: Plan Approval Gate
+            await Workflow.WaitConditionAsync(() =>
             {
-                activePrUrl = turnOutcome.PrUrl;
-            }
+                if (_tasks.Count == 0 || _planApproval == null) return false;
+                var isApproved = input.ApprovalPolicy switch
+                {
+                    PlanApprovalPolicy.LeadOrHuman =>
+                        _planApproval.ApproverRole is "operator" or "tech_lead",
+                    PlanApprovalPolicy.HumanOnly =>
+                        _planApproval.ApproverRole == "operator",
+                    _ => false
+                };
 
-            if (turnOutcome.Status == TurnOutcomeStatus.AwaitingInput)
-            {
-                _currentHeartbeat = $"Awaiting input for task: {currentTask.Title}";
-                await Workflow.WaitConditionAsync(() => _chatInbox.Count > 0);
-                continue;
-            }
+                if (!isApproved)
+                {
+                    // Explicitly discard rejected approval signal so it does not linger
+                    var rejectedRole = _planApproval.ApproverRole;
+                    _planApproval = null;
+                    _currentHeartbeat = $"Plan approval rejected: role '{rejectedRole}' is not permitted by policy {input.ApprovalPolicy}";
+                    return false;
+                }
 
-            if (turnOutcome.Status == TurnOutcomeStatus.StuckLoopDetected)
-            {
-                _currentHeartbeat = $"Stuck loop detected on task: {currentTask.Title}";
-                await Workflow.WaitConditionAsync(() => _chatInbox.Count > 0);
-                continue;
-            }
+                return true;
+            });
 
-            if (turnOutcome.Status == TurnOutcomeStatus.Failed)
-            {
-                _currentHeartbeat = $"Task failed: {turnOutcome.Message ?? currentTask.Title}";
-                return new JobExecutionResult(Success: false, Summary: $"Task failed: {turnOutcome.Message}");
-            }
+            _currentHeartbeat = "Plan approved. Starting implementation";
 
-            if (turnOutcome.Status is TurnOutcomeStatus.Continue or TurnOutcomeStatus.TaskCompleted or TurnOutcomeStatus.PrOpenedAwaitingReview)
+            // 3. Stage 3: Autonomous Task Iteration Loop
+            while (_currentTaskIndex < _tasks.Count)
             {
-                _currentHeartbeat = $"Completed task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
-                _currentTaskIndex++;
+                var currentTask = _tasks[_currentTaskIndex];
+                _currentHeartbeat = $"Executing task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
+
+                // Check for inbound chat interjections
+                ChatMessageSignal? pendingMessage = _chatInbox.Count > 0 ? _chatInbox.Dequeue() : null;
+
+                var turnOutcome = await Workflow.ExecuteActivityAsync(
+                    (IExecutionActivities act) => act.RunJobCodingTurnAsync(new CodingTurnInput(
+                        input.JobId,
+                        currentTask,
+                        pendingMessage,
+                        input.AssignedAgentId,
+                        input.ProjectId,
+                        input.WorkspacePath,
+                        input.TargetBranch)),
+                    TurnActivityOptions);
+
+                if (!string.IsNullOrWhiteSpace(turnOutcome.PrUrl))
+                {
+                    activePrUrl = turnOutcome.PrUrl;
+                }
+
+                if (turnOutcome.Status == TurnOutcomeStatus.AwaitingInput)
+                {
+                    _currentHeartbeat = $"Awaiting input for task: {currentTask.Title}";
+                    await Workflow.WaitConditionAsync(() => _chatInbox.Count > 0);
+                    continue;
+                }
+
+                if (turnOutcome.Status == TurnOutcomeStatus.StuckLoopDetected)
+                {
+                    _currentHeartbeat = $"Stuck loop detected on task: {currentTask.Title}";
+                    await Workflow.WaitConditionAsync(() => _chatInbox.Count > 0);
+                    continue;
+                }
+
+                if (turnOutcome.Status == TurnOutcomeStatus.Failed)
+                {
+                    _currentHeartbeat = $"Task failed: {turnOutcome.Message ?? currentTask.Title}";
+                    return new JobExecutionResult(Success: false, Summary: $"Task failed: {turnOutcome.Message}");
+                }
+
+                if (turnOutcome.Status is TurnOutcomeStatus.Continue or TurnOutcomeStatus.TaskCompleted or TurnOutcomeStatus.PrOpenedAwaitingReview)
+                {
+                    _currentHeartbeat = $"Completed task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
+                    _currentTaskIndex++;
+                }
             }
         }
 
