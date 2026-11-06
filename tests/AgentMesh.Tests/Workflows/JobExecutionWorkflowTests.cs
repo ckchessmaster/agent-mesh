@@ -369,6 +369,70 @@ public class JobExecutionWorkflowTests
         }
     }
 
+    [Fact]
+    public async Task JobWorkflow_WhenPrOpenedDuringDiscovery_FastTracksDirectlyToReviewGate()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity(execution.RunAgentDiscoveryTurnAsync)
+            .AddActivity(execution.RunJobCodingTurnAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+            .AddWorkflow<JobExecutionWorkflow>();
+        workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "rook",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace",
+                InitialPrompt: "Job Artifact Support",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.LeadOrHuman
+            );
+
+            // Simulate agent creating PR directly during discovery (e.g. out-of-band PR #41)
+            execution.CustomDiscoveryHandler = _ => Task.FromResult(
+                TurnOutcome.AwaitingReview(
+                    "https://github.com/ckchessmaster/agent-mesh/pull/41",
+                    41,
+                    "PR opened during discovery turn"));
+
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            // Fast-tracks past Stage 2 (Plan Approval) & Stage 3 (Task Iteration) straight to Stage 4 (Review Gate)
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting pull request review"));
+            execution.DiscoveryTurnCount.Should().Be(1);
+            execution.CodingTurnCount.Should().Be(0, "tasks should be bypassed when PR was already opened in discovery");
+
+            // Operator approves PR
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("operator", true, "PR #41 looks good", DateTimeOffset.UtcNow, 41)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+            git.MergeUrls.Should().ContainSingle();
+            git.MergeUrls[0].Should().Contain("41");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     private static async Task WaitUntilAsync(
         WorkflowHandle<JobExecutionWorkflow, JobExecutionResult> handle,
         Func<JobWorkflowState, bool> predicate,

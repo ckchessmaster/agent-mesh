@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using AgentMesh.Core.Models;
@@ -560,6 +560,7 @@ public class PromptStackBuilder(
         {
             sb.Append("\n[STAGE 1: DISCOVERY & DECOMPOSITION]\n");
             sb.Append("* Phase: Read-only Discovery. Inspect the codebase (grep, find, read_file, git log).\n");
+            sb.Append("* Guardrail: File modification tools (write_file, edit_file) and git mutations are disabled during discovery.\n");
             sb.Append("* Objective: Decompose the job into 3 to 6 atomic tasks and register them with manage_task(set_checklist).\n");
             sb.Append("* Post plan & questions via post_job_message(requires_reply: true), then conclude your turn. Do not begin implementation.\n");
         }

@@ -333,6 +333,9 @@ public class AgentRunnerInstance : IAsyncDisposable
         OpenAiAdapter.LearnedContextLimitReporter = (driverId, model, maxContextTokens) =>
             _meshClient.ReportLearnedContextLimitAsync(driverId, _agentToken, model, maxContextTokens, _cts.Token);
 
+        OpenAiAdapter.PlatformToolExecutor = async (toolName, argsJson, sessionId, personaId, agentId, ct) =>
+            await _meshClient.CallPlatformMcpToolAsync(toolName, argsJson, sessionId, personaId, agentId, ct);
+
         // Process any prompts that were queued while this agent was offline
         await CheckAndProcessPendingPromptsAsync(_cts.Token);
 
@@ -955,6 +958,11 @@ public class AgentProcessManager : IAsyncDisposable
 
         _configStore.Save(_config);
 
+        if (preset.MaxSteps == null && _config.DefaultMaxSteps.HasValue)
+        {
+            preset.MaxSteps = _config.DefaultMaxSteps;
+        }
+
         var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog, () => OnStateChanged?.Invoke());
         _runners[normalizedId] = runner;
 
@@ -1031,6 +1039,11 @@ public class AgentProcessManager : IAsyncDisposable
         {
             preset.Capabilities = new List<string> { "run_command", "read_file", "write_file", "edit_file", "ask_question" };
             preset.Command = null;
+        }
+
+        if (preset.MaxSteps == null && _config.DefaultMaxSteps.HasValue)
+        {
+            preset.MaxSteps = _config.DefaultMaxSteps;
         }
 
         var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog, () => OnStateChanged?.Invoke());
