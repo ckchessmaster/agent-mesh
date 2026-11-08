@@ -1006,6 +1006,13 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDefaultValue("LeadOrHuman")
                         .HasColumnName("approval_policy");
 
+                    b.Property<string>("ArtifactsJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("[]")
+                        .HasColumnName("artifacts");
+
                     b.Property<string>("AssignedAgentId")
                         .HasColumnType("text")
                         .HasColumnName("assigned_agent_id");

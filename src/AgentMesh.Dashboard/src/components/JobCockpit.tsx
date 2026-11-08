@@ -248,6 +248,18 @@ interface JobCockpitProps {
   onCancelQueuedTurn?: (turnId: string) => Promise<void> | void;
   onCancelQueuedTurns?: (personaId: string) => Promise<void> | void;
   sessions?: AgentSession[];
+  /**
+   * How many artifacts this job has, for the header toggle's badge.
+   *
+   * Passed in rather than fetched here because the artifacts belong to the same store the SignalR
+   * handlers write into (App.tsx), and a second copy fetched inside this component would drift from the
+   * one the panel renders the moment a live artifact event landed.
+   */
+  jobArtifactCount?: number;
+  /** Whether the job Artifacts panel is open. Drives the toggle's pressed style. */
+  showJobArtifactsPanel?: boolean;
+  /** Opens/closes the job Artifacts panel, which the parent renders beside this cockpit. */
+  onToggleJobArtifactsPanel?: () => void;
   onAnswerQuestion?: (
     sessionIdOrTargetId: string,
     payload: { toolCallId: string; answers: QuestionAnswerPayload[]; answerSummary: string }
@@ -279,7 +291,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onStopTurn,
   onCancelQueuedTurn,
   onCancelQueuedTurns,
-  onAnswerQuestion
+  onAnswerQuestion,
+  jobArtifactCount = 0,
+  showJobArtifactsPanel = false,
+  onToggleJobArtifactsPanel
 }) => {
   const [prompt, setPrompt] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -1387,6 +1402,28 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               <span className="w-2 h-2 rounded-full bg-sky-400 animate-ping shrink-0" />
             )}
           </button>
+
+          {/* Artifacts panel toggle — the job twin of the session header's Artifacts button, styled to
+              match this header's Team toggle so the two side-by-side controls read as one group.
+              Rendered only when the parent actually owns a panel: a toggle that toggles nothing is worse
+              than no toggle. */}
+          {onToggleJobArtifactsPanel && (
+            <button
+              type="button"
+              onClick={onToggleJobArtifactsPanel}
+              title={showJobArtifactsPanel ? 'Hide Artifacts panel' : 'Show Artifacts panel'}
+              aria-pressed={showJobArtifactsPanel}
+              data-testid="toggle-job-artifacts-btn"
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition cursor-pointer ${
+                showJobArtifactsPanel
+                  ? 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300'
+                  : 'bg-slate-950/80 border-slate-800 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Artifacts ({jobArtifactCount})</span>
+            </button>
+          )}
 
           {isArchived ? (
             onReopenJob && (

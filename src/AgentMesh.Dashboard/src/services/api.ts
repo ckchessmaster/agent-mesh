@@ -21,6 +21,7 @@ import type {
   SessionMessage,
   SessionPage,
   SessionArtifact,
+  JobArtifact,
   StagedJob,
   SubmitAnswerRequest,
   SystemCapabilitiesResponse,
@@ -75,8 +76,46 @@ const readTotalCount = (res: Response): number | null => {
  * mapper does: without a URL the row cannot be opened, so a missing field should degrade to a derived one
  * rather than to a dead row.
  */
-const mapProjectDocument = (item: any): ProjectDocument => {
+/**
+ * Normalizes one job artifact from the API onto the `JobArtifact` shape.
+ *
+ * Same camelCase-or-PascalCase tolerance as `mapProjectDocument` and the attachment mappers, for the same
+ * reason: the API writes camelCase, a proxied or older build may not, and a panel that read only one form
+ * would render an empty list with no error.
+ *
+ * `downloadUrl` is rebuilt from the job id and artifact id when the response omits it. Without a URL the
+ * row cannot be opened, so a missing field degrades to a derived one rather than to a dead row — and
+ * unlike a session artifact, a job artifact's URL is fully derivable from the two ids the panel already
+ * has, because the server resolves the bytes itself.
+ */
+const mapJobArtifact = (item: any): JobArtifact => {
   const id = item?.id || item?.Id || '';
+  const jobId = item?.jobId || item?.JobId || '';
+  const name = item?.name || item?.Name || '';
+  const downloadUrl = item?.downloadUrl || item?.DownloadUrl
+    || (jobId && id
+      ? `/api/project-jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(id)}/content`
+      : '');
+
+  return {
+    id,
+    jobId,
+    sourceSessionId: item?.sourceSessionId || item?.SourceSessionId || null,
+    name,
+    summary: item?.summary || item?.Summary || undefined,
+    contentType: item?.contentType || item?.ContentType || 'text/plain',
+    sizeBytes: typeof item?.sizeBytes === 'number'
+      ? item.sizeBytes
+      : (typeof item?.SizeBytes === 'number' ? item.SizeBytes : 0),
+    createdAt: item?.createdAt || item?.CreatedAt || new Date().toISOString(),
+    updatedAt: item?.updatedAt || item?.UpdatedAt || new Date().toISOString(),
+    content: item?.content ?? item?.Content ?? undefined,
+    s3Key: item?.s3Key || item?.S3Key || null,
+    downloadUrl
+  };
+};
+
+const mapProjectDocument = (item: any): ProjectDocument => {  const id = item?.id || item?.Id || '';
   const projectId = item?.projectId || item?.ProjectId || '';
   const fileName = item?.fileName || item?.FileName || null;
   const downloadUrl = item?.downloadUrl || item?.DownloadUrl
@@ -1165,6 +1204,30 @@ export const api = {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load job messages: ${res.statusText}`);
     return res.json();
+  },
+
+  /**
+   * A job's artifacts — the job twin of `getSessionArtifacts`.
+   *
+   * The server folds the manifest stored on the job row with everything its turn sessions recorded and
+   * any loose file in the job's artifact directory, so this is the one call the panel needs; there is no
+   * client-side aggregation of per-session lists to do here.
+   */
+  async getJobArtifacts(jobId: string): Promise<JobArtifact[]> {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/artifacts`, { headers: getHeaders() });
+    if (!res.ok) throw new Error(`Failed to load job artifacts: ${res.statusText}`);
+    const raw = await res.json();
+    return (Array.isArray(raw) ? raw : []).map(mapJobArtifact);
+  },
+
+  /** One job artifact with its body inlined, for the rendered/raw text view. */
+  async getJobArtifact(jobId: string, artifactId: string): Promise<JobArtifact> {
+    const res = await apiFetch(
+      `/api/project-jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifactId)}`,
+      { headers: getHeaders() }
+    );
+    if (!res.ok) throw new Error(`Failed to load job artifact details: ${res.statusText}`);
+    return mapJobArtifact(await res.json());
   },
 
   async uploadJobAttachments(jobId: string, files: File[]): Promise<SessionAttachment[]> {

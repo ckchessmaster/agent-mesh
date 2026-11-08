@@ -615,9 +615,20 @@ export interface SubmitAnswerRequest {
   answers: QuestionAnswerPayload[];
 }
 
-export interface SessionArtifact {
+/**
+ * What the Artifacts panel needs to know about an artifact, whichever surface produced it.
+ *
+ * Sessions and jobs both have artifacts and both render them through `ArtifactViewer`, and the two
+ * payloads are field-for-field compatible on every property the viewer reads. Naming that shared shape
+ * once is what lets the viewer take either without a cast at the call site or a second component that
+ * has to be kept in step with the first.
+ *
+ * The owner identity is deliberately *not* here. A session artifact belongs to a session and a job
+ * artifact belongs to a job, and the viewer must not be able to build a URL for an owner it was not
+ * given — the API sends an explicit `downloadUrl` on both, and that is what the viewer uses.
+ */
+export interface ArtifactLike {
   id: string;
-  sessionId: string;
   name: string;
   summary?: string;
   contentType: string;
@@ -627,6 +638,22 @@ export interface SessionArtifact {
   content?: string;
   s3Key?: string | null;
   downloadUrl?: string | null;
+}
+
+export interface SessionArtifact extends ArtifactLike {
+  sessionId: string;
+}
+
+/**
+ * One artifact of a job — the mirror of whatever its turn sessions produced.
+ *
+ * `sourceSessionId` is the turn session whose sync created the entry, and is null for a file found in
+ * the job's own artifact directory. It is display metadata only: the bytes are fetched through
+ * `downloadUrl`, which the job endpoint resolves from the source session's directory on the server.
+ */
+export interface JobArtifact extends ArtifactLike {
+  jobId: string;
+  sourceSessionId?: string | null;
 }
 
 

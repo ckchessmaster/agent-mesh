@@ -55,6 +55,16 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
             .HasDefaultValue("[]")
             .IsRequired();
 
+        // Mirrors agent_jobs.artifacts (same column name, same jsonb type, same '{}'→'[]' shape rule):
+        // a job's artifact index is read whole and written whole by one caller at a time, so it belongs
+        // in a column the way tasks and queued turns do, not in a table the way the project document
+        // library does. See AgentMesh.Core.Models.ProjectJob.ArtifactsJson.
+        builder.Property(j => j.ArtifactsJson)
+            .HasColumnName("artifacts")
+            .HasColumnType("jsonb")
+            .HasDefaultValue("[]")
+            .IsRequired();
+
         builder.Property(j => j.ResultSummary);
 
         builder.Property(j => j.ApprovalPolicy)

@@ -2794,6 +2794,27 @@ public class SessionsController(
         await hubContext.Clients.All.SendAsync(eventName, artifactDto);
         await hubContext.Clients.All.SendAsync("SessionUpdated", session);
 
+        // Mirror into the owning job, if this session is a job turn. Agents produce artifacts against the
+        // session they are inside, but the operator reads them off the job, so the job's manifest is a
+        // projection of this row rather than a second write path an agent has to know about. Best-effort by
+        // design: the session save above is the durable event, and the job's read endpoint backfills
+        // anything missed here. See AgentMesh.Api.Services.JobArtifactMirror.
+        await JobArtifactMirror.MirrorAsync(
+            db,
+            hubContext,
+            session,
+            artifactId: artifactDto.Id,
+            name: artifactDto.Name,
+            summary: artifactDto.Summary,
+            contentType: artifactDto.ContentType,
+            sizeBytes: artifactDto.SizeBytes,
+            createdAt: artifactDto.CreatedAt,
+            updatedAt: artifactDto.UpdatedAt,
+            s3Key: artifactDto.S3Key,
+            isNew: isNew,
+            logger: logger,
+            ct: HttpContext?.RequestAborted ?? CancellationToken.None);
+
         return Ok(artifactDto);
     }
 

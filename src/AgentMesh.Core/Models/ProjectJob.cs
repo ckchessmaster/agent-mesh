@@ -91,6 +91,28 @@ public class ProjectJob
     public string QueuedTurnsJson { get; set; } = "[]";
     public string? ResultSummary { get; set; }
 
+    /// <summary>
+    /// The job's artifact manifest: a JSON array of <see cref="JobArtifactDto"/>.
+    /// </summary>
+    /// <remarks>
+    /// A mirror, not a second store of the bytes. The file itself still lives where the session that
+    /// produced it put it (<c>~/.agentmesh/artifacts/{sessionId}/</c>, mirrored to S3); this row holds the
+    /// index that makes it reachable from the job, which is what the Cockpit's Artifacts panel reads.
+    /// <para>
+    /// A column rather than a derivation over the job's turn sessions because the read is on the hot path
+    /// — the panel refetches on every job switch and on every artifact event — and a job accumulates one
+    /// turn session per chat message, so deriving means parsing N <c>jsonb</c> documents to render one
+    /// list. The derivation still happens, as a backfill for rows written before this column existed; see
+    /// <see cref="Services.JobArtifactManifest"/> for why the fold is a merge and not a replace.
+    /// </para>
+    /// <para>
+    /// Not surfaced on <c>ProjectJobDto</c>: the job list endpoint returns one row per job and would ship
+    /// every manifest in the project to render a list of titles. The panel fetches
+    /// <c>GET /api/project-jobs/{id}/artifacts</c> when it is opened.
+    /// </para>
+    /// </remarks>
+    public string ArtifactsJson { get; set; } = "[]";
+
     public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.LeadOrHuman;
     public string? CurrentTaskId { get; set; }
     public string? ProgressHeartbeat { get; set; }
