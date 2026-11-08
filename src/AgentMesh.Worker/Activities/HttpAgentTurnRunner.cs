@@ -620,7 +620,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                     var finalSignal = ClassifySignals(finalSnapshot);
                     if (finalSignal is not null) return finalSignal;
 
-                    return DeriveFromCompletion(input, finalSnapshot);
+                    return await DeriveFromCompletionAsync(input, finalSnapshot, sessionId, ct);
                 }
             }
             else
@@ -880,7 +880,11 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     /// burn the full turn budget against the same fault.
     /// </para>
     /// </remarks>
-    private TurnOutcome DeriveFromCompletion(TaskExecutionInput input, TurnState state)
+    private async Task<TurnOutcome> DeriveFromCompletionAsync(
+        TaskExecutionInput input,
+        TurnState state,
+        Guid sessionId,
+        CancellationToken ct)
     {
         var status = state.SessionStatus.ToLowerInvariant();
 
@@ -892,10 +896,10 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                 $"Turn session ended in status '{state.SessionStatus}' without opening a pull request " +
                 "or requesting input. The runner did not finish cleanly; inspect the transcript before " +
                 "resuming.";
-            return new TurnOutcome(
-                TurnOutcomeStatus.Failed,
-                detail,
-                PrUrl: null);
+
+            await EscalateErrorToJobChatAsync(input, sessionId, detail, ct);
+
+            return TurnOutcome.Awaiting("operator", detail);
         }
 
         if (status == "waiting_for_input")
@@ -912,6 +916,90 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         return TurnOutcome.ContinueTurn(
             $"Turn concluded (session status '{state.SessionStatus}') with no PR and no pending " +
             "question; continuing to the next step.");
+    }
+
+    private async Task EscalateErrorToJobChatAsync(
+        TaskExecutionInput input,
+        Guid sessionId,
+        string detail,
+        CancellationToken ct)
+    {
+        if (!Guid.TryParse(input.JobId.Trim(), out var jobId)) return;
+
+        try
+        {
+            // Avoid duplicate escalations for the same session
+            var alreadyPosted = await db.JobMessages.AnyAsync(
+                m => m.JobId == jobId && m.TurnSessionId == sessionId && m.Content.Contains("⚠️"), ct);
+            if (alreadyPosted) return;
+
+            var personaName = input.PersonaId ?? input.AgentId ?? "implementer";
+            var escalationContent = $"⚠️ **Agent @{personaName} encountered an error and paused for assistance:**\n\n> {detail}\n\nPlease reply in Job Chat to provide guidance or resolve the blocker.";
+
+            var baseUrl = ResolveApiBaseUrl(config);
+            var postedViaHttp = false;
+
+            if (!string.IsNullOrWhiteSpace(baseUrl))
+            {
+                try
+                {
+                    var payload = new
+                    {
+                        content = escalationContent,
+                        senderType = "system",
+                        senderName = "AgentMesh Platform",
+                        turnSessionId = sessionId
+                    };
+
+                    using var message = new HttpRequestMessage(
+                        HttpMethod.Post,
+                        $"{baseUrl.TrimEnd('/')}/api/project-jobs/{jobId}/messages")
+                    {
+                        Content = new StringContent(JsonSerializer.Serialize(payload, JsonOpts), Encoding.UTF8, "application/json")
+                    };
+
+                    var apiKey = ResolveApiKey(config);
+                    if (!string.IsNullOrWhiteSpace(apiKey))
+                    {
+                        message.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);
+                        message.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+                    }
+
+                    using var res = await httpClient.SendAsync(message, ct);
+                    if (res.IsSuccessStatusCode)
+                    {
+                        postedViaHttp = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to post error escalation via HTTP for job {JobId}", jobId);
+                }
+            }
+
+            if (!postedViaHttp)
+            {
+                var jobMsg = new JobMessage
+                {
+                    Id = Guid.NewGuid(),
+                    JobId = jobId,
+                    SenderType = "system",
+                    SenderId = "temporal-worker",
+                    SenderName = "AgentMesh Platform",
+                    Content = escalationContent,
+                    TurnSessionId = sessionId,
+                    StructuredPayloadJson = JsonSerializer.Serialize(new { requiresReply = true, targetPersona = "operator" }, JsonOpts),
+                    CreatedAt = DateTimeOffset.UtcNow
+                };
+
+                db.JobMessages.Add(jobMsg);
+                await db.SaveChangesAsync(ct);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to escalate error to Job Chat for job {JobId} session {SessionId}", jobId, sessionId);
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────────

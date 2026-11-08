@@ -1033,6 +1033,59 @@ export default function App() {
     }
   }, [selectedJobId, fetchJobArtifacts]);
 
+  // Active job polling effect: keeps job messages, tasks, and sessions live every 3s while job is active
+  useEffect(() => {
+    if (!selectedJobId) return;
+
+    const activeProject = projects.find((p) => p.id === selectedProjectId) || projects[0] || null;
+    const currentJob = (jobsByProject[activeProject?.id || ''] || []).find((j) => j.id === selectedJobId);
+    const isJobActive =
+      currentJob?.status === ProjectJobStatus.Active ||
+      currentJob?.status === ProjectJobStatus.Pending ||
+      (currentJob?.status as unknown as string) === 'active' ||
+      (currentJob?.status as unknown as string) === 'in_progress';
+
+    if (!isJobActive) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const [msgs, tasks] = await Promise.all([
+          api.getJobMessages(selectedJobId),
+          api.getJobTasks(selectedJobId)
+        ]);
+        setJobMessages((prev) => {
+          if (prev.length === msgs.length && prev[prev.length - 1]?.id === msgs[msgs.length - 1]?.id) {
+            return prev;
+          }
+          return msgs;
+        });
+        setJobTasks((prev) => {
+          if (JSON.stringify(prev) === JSON.stringify(tasks)) {
+            return prev;
+          }
+          return tasks;
+        });
+        const currentSessions = await api.getSessions();
+        setSessions((prev) => {
+          if (
+            prev.length !== currentSessions.length ||
+            currentSessions.some((cs) => {
+              const match = prev.find((p) => p.id === cs.id);
+              return !match || match.status !== cs.status || match.messageCount !== cs.messageCount;
+            })
+          ) {
+            return currentSessions;
+          }
+          return prev;
+        });
+      } catch (err) {
+        console.error('Error polling active job data:', err);
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [selectedJobId, selectedProjectId, projects, jobsByProject]);
+
   const handleSaveProject = async (req: any) => {
     if (editingProject) {
       const updated = await api.updateProject(editingProject.id, req);
@@ -1231,6 +1284,10 @@ export default function App() {
       }
       return next;
     });
+    // Immediately pull latest sessions, tasks, and messages
+    fetchAllData();
+    api.getJobMessages(selectedJobId).then(setJobMessages).catch(console.error);
+    api.getJobTasks(selectedJobId).then(setJobTasks).catch(console.error);
   };
 
   const handleCompleteJob = async (resultSummary?: string) => {
