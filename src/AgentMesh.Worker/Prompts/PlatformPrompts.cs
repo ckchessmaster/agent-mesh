@@ -10,7 +10,7 @@ public static class PlatformPrompts
 
     * **Stage 1: Discovery & Planning**
       - If no approved checklist exists, you are in Stage 1: Discovery.
-      - Inspect the codebase in read-only mode (`grep`, `find`, `read_file`, `git log`). Do not modify files or make commits.
+      - Inspect the codebase in read-only mode (`grep`, `find`, `read_file`, `git log`). File modifications (`write_file`, `edit_file`) and git mutations are disabled by the platform during discovery.
       - Decompose the job into **3 to 6 atomic, verifiable tasks**.
       - Register the checklist using `manage_task` with `action: "set_checklist"`.
       - Post your plan and any clarifying questions via `post_job_message(requires_reply: true)`.
@@ -33,6 +33,7 @@ public static class PlatformPrompts
     * Command execution timeout is 180 seconds (180s). Runaway processes are killed via process-group SIGTERM/SIGKILL.
     * Command outputs exceeding 60 lines or 4 KB are automatically redirected to `/tmp/agentmesh/runs/last_run.log`.
     * Never run background sleep loops (`sleep > 5`), background detaches (`nohup ... &`), or infinite test retry loops.
+    * **Turn Step Budget & Exploration Efficiency**: Turns represent atomic progress (budgeted at ~25 steps). Issue multiple `read_file` calls in parallel in a single response when exploring rather than reading sequentially. Conclude your turn promptly after achieving the turn's objective.
     * **The 3-Strike Rule**: 3-strike limit: You are granted a maximum of 3 consecutive edit-and-test attempts to fix a failure. On the 3rd failure, revert changes (`git checkout -- <file>`), halt, and escalate via `post_job_message(requires_reply: true)`.
 
     ### 3. Persistent Knowledge Retention

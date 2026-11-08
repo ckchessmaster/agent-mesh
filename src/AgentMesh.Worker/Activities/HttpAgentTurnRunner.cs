@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
@@ -657,7 +658,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         /// </summary>
         bool LedgerScopedToSession = true,
         string? LastSessionMessageContent = null,
-        string? LastSessionMessageType = null);
+        string? LastSessionMessageType = null,
+        string? DiscoveredPrUrl = null);
 
     internal record ToolCallRecord(string ToolName, string? ArgsJson, DateTimeOffset At);
 
@@ -734,6 +736,12 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             .Select(m => new { m.EventType, m.Content })
             .FirstOrDefaultAsync(ct);
 
+        var discoveredPrMessage = await db.SessionMessages.AsNoTracking()
+            .Where(m => m.SessionId == sessionId && m.Content != null && m.Content.Contains("/pull/"))
+            .OrderByDescending(m => m.CreatedAt)
+            .Select(m => m.Content)
+            .FirstOrDefaultAsync(ct);
+
         return new TurnState(
             SessionStatus: session?.Status ?? "unknown",
             ToolCalls: toolCalls
@@ -745,7 +753,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             LastActivityAt: lastActivity,
             LedgerScopedToSession: ledgerScopedToSession,
             LastSessionMessageContent: lastSessionMessage?.Content,
-            LastSessionMessageType: lastSessionMessage?.EventType);
+            LastSessionMessageType: lastSessionMessage?.EventType,
+            DiscoveredPrUrl: discoveredPrMessage);
     }
 
     /// <summary>
@@ -806,6 +815,18 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                     $"Pull request {(number is null ? url : $"#{number.Value.ToString(CultureInfo.InvariantCulture)}")} " +
                     "opened; awaiting code review.");
             }
+        }
+
+        // Out-of-band PR detection: An agent that opened a pull request using the GitHub CLI (`gh pr create`)
+        // or shell commands within run_command rather than the open_pull_request MCP tool.
+        var outOfBandPr = DetectOutOfBandPr(state);
+        if (outOfBandPr is not null)
+        {
+            return TurnOutcome.AwaitingReview(
+                outOfBandPr.Value.Url,
+                outOfBandPr.Value.Number,
+                $"Pull request {(outOfBandPr.Value.Number is null ? outOfBandPr.Value.Url : $"#{outOfBandPr.Value.Number.Value.ToString(CultureInfo.InvariantCulture)}")} " +
+                "detected via shell execution; awaiting code review.");
         }
 
         // requires_reply: read from the ledger row the tool wrote, not from the call's arguments. The
@@ -935,6 +956,54 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                      ?? ReadIntProperty(toolArgsJson, "pr_number");
 
         return (url, number);
+    }
+
+    private static readonly Regex GitHubPrRegex = new(
+        @"https?://github\.com/[^/\s""']+/[^/\s""']+/pull/(?<pr>\d+)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    internal static (string Url, int? Number)? DetectOutOfBandPr(TurnState state)
+    {
+        // 1. Check discovered PR URL message from session transcript (e.g. tool_result from gh pr create)
+        if (!string.IsNullOrWhiteSpace(state.DiscoveredPrUrl))
+        {
+            var match = GitHubPrRegex.Match(state.DiscoveredPrUrl);
+            if (match.Success)
+            {
+                var url = match.Value;
+                int? num = int.TryParse(match.Groups["pr"].Value, out var n) ? n : null;
+                return (url, num);
+            }
+        }
+
+        // 2. Check last session message content (assistant response / summary)
+        if (!string.IsNullOrWhiteSpace(state.LastSessionMessageContent))
+        {
+            var match = GitHubPrRegex.Match(state.LastSessionMessageContent);
+            if (match.Success)
+            {
+                var url = match.Value;
+                int? num = int.TryParse(match.Groups["pr"].Value, out var n) ? n : null;
+                return (url, num);
+            }
+        }
+
+        // 3. Check tool call arguments (e.g. run_command args containing gh pr create or PR URL)
+        foreach (var call in state.ToolCalls.OrderByDescending(t => t.At))
+        {
+            if (!string.IsNullOrWhiteSpace(call.ArgsJson))
+            {
+                var match = GitHubPrRegex.Match(call.ArgsJson);
+                if (match.Success)
+                {
+                    var url = match.Value;
+                    int? num = int.TryParse(match.Groups["pr"].Value, out var n) ? n : null;
+                    return (url, num);
+                }
+            }
+        }
+
+        return null;
     }
 
     /// <summary>

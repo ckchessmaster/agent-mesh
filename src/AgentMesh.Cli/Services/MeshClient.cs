@@ -751,6 +751,98 @@ public class MeshClient
         }
     }
 
+    public async Task<string> CallPlatformMcpToolAsync(
+        string toolName,
+        string argsJson,
+        Guid? sessionId = null,
+        string? personaId = null,
+        string? agentId = null,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var token = _config.MasterToken;
+            using var req = CreateRequest(HttpMethod.Post, "mcp", token, agentId);
+            if (sessionId.HasValue && sessionId.Value != Guid.Empty)
+            {
+                req.Headers.TryAddWithoutValidation("X-Session-Id", sessionId.Value.ToString());
+            }
+            if (!string.IsNullOrWhiteSpace(personaId))
+            {
+                req.Headers.TryAddWithoutValidation("X-Persona-Id", personaId);
+            }
+
+            JsonElement parsedArgs;
+            try
+            {
+                using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+                parsedArgs = doc.RootElement.Clone();
+            }
+            catch
+            {
+                using var doc = JsonDocument.Parse("{}");
+                parsedArgs = doc.RootElement.Clone();
+            }
+
+            var rpcPayload = new Dictionary<string, object?>
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = 1,
+                ["method"] = "tools/call",
+                ["params"] = new Dictionary<string, object?>
+                {
+                    ["name"] = toolName,
+                    ["arguments"] = parsedArgs
+                }
+            };
+
+            req.Content = JsonContent.Create(rpcPayload);
+            using var res = await _http.SendAsync(req, ct);
+            var responseBody = await res.Content.ReadAsStringAsync(ct);
+
+            if (!res.IsSuccessStatusCode)
+            {
+                return $"Error: MCP call to '{toolName}' failed with HTTP status {(int)res.StatusCode} ({res.ReasonPhrase}): {responseBody}";
+            }
+
+            using var resDoc = JsonDocument.Parse(responseBody);
+            var root = resDoc.RootElement;
+            if (root.TryGetProperty("error", out var errorProp))
+            {
+                var errMsg = errorProp.TryGetProperty("message", out var m) ? m.GetString() : errorProp.ToString();
+                return $"Error: MCP tool '{toolName}' returned error: {errMsg}";
+            }
+
+            if (root.TryGetProperty("result", out var resultProp))
+            {
+                if (resultProp.TryGetProperty("content", out var contentProp) && contentProp.ValueKind == JsonValueKind.Array)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var item in contentProp.EnumerateArray())
+                    {
+                        if (item.TryGetProperty("text", out var textProp))
+                        {
+                            sb.Append(textProp.GetString());
+                        }
+                    }
+                    var text = sb.ToString();
+                    if (!string.IsNullOrWhiteSpace(text)) return text;
+                }
+                return resultProp.ToString();
+            }
+
+            return responseBody;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return $"Error executing platform tool '{toolName}': {ex.Message}";
+        }
+    }
+
     private static HttpRequestMessage CreateRequest(HttpMethod method, string relativeUrl, string token, string? agentId = null)
     {
         var req = new HttpRequestMessage(method, relativeUrl);

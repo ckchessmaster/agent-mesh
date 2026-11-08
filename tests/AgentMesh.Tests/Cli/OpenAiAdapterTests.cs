@@ -54,7 +54,7 @@ public class OpenAiAdapterTests
     public void OpenAiAdapter_GetToolDefinitions_ContainsAllRequiredAutonomousTools()
     {
         var tools = OpenAiAdapter.GetToolDefinitions();
-        tools.Should().HaveCount(5);
+        tools.Should().HaveCount(9);
 
         var toolNames = new List<string>();
         foreach (var t in tools)
@@ -73,6 +73,10 @@ public class OpenAiAdapterTests
         toolNames.Should().Contain("write_file");
         toolNames.Should().Contain("edit_file");
         toolNames.Should().Contain("ask_question");
+        toolNames.Should().Contain("manage_task");
+        toolNames.Should().Contain("post_job_message");
+        toolNames.Should().Contain("open_pull_request");
+        toolNames.Should().Contain("save_memory");
     }
 
     [Fact]
@@ -507,19 +511,25 @@ public class OpenAiAdapterTests
     }
 
     [Fact]
-    public void ResolveMaxSteps_ReturnsDefault100WhenUnset()
+    public void ResolveMaxSteps_ReturnsDefaultWhenUnset()
     {
         var preset = new AgentPresetConfig();
         var origEnv = Environment.GetEnvironmentVariable("OPENAI_MAX_STEPS");
+        var origMeshEnv = Environment.GetEnvironmentVariable("AGENTMESH_MAX_STEPS");
+        var origAgentEnv = Environment.GetEnvironmentVariable("AGENT_MAX_STEPS");
         try
         {
             Environment.SetEnvironmentVariable("OPENAI_MAX_STEPS", null);
+            Environment.SetEnvironmentVariable("AGENTMESH_MAX_STEPS", null);
             Environment.SetEnvironmentVariable("AGENT_MAX_STEPS", null);
-            OpenAiAdapter.ResolveMaxSteps(preset).Should().Be(100);
+            OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false).Should().Be(25);
+            OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true).Should().Be(15);
         }
         finally
         {
             Environment.SetEnvironmentVariable("OPENAI_MAX_STEPS", origEnv);
+            Environment.SetEnvironmentVariable("AGENTMESH_MAX_STEPS", origMeshEnv);
+            Environment.SetEnvironmentVariable("AGENT_MAX_STEPS", origAgentEnv);
         }
     }
 
@@ -917,6 +927,132 @@ public class OpenAiAdapterTests
         liveOutput.Should().NotBeNull();
         liveOutput.Should().Contain("Compiling project...");
         liveOutput.Should().Contain("Build succeeded.");
+    }
+
+    [Fact]
+    public void ResolveMaxSteps_HonorsPresetExplicitValue_OverDefaultsAndDiscovery()
+    {
+        var preset = new AgentPresetConfig { MaxSteps = 42 };
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true).Should().Be(42);
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false).Should().Be(42);
+    }
+
+    [Fact]
+    public void ResolveMaxSteps_HonorsGlobalDefault_WhenPresetUnset()
+    {
+        var preset = new AgentPresetConfig { MaxSteps = null };
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false, globalDefault: 35).Should().Be(35);
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true, globalDefault: 35).Should().Be(35);
+    }
+
+    [Fact]
+    public void ResolveMaxSteps_FallsBackToDefaults_BasedOnPhase()
+    {
+        var preset = new AgentPresetConfig { MaxSteps = null };
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true).Should().Be(15);
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false).Should().Be(25);
+    }
+
+    [Fact]
+    public void GetToolDefinitions_MasksMutatingTools_DuringDiscovery()
+    {
+        var discoveryTools = OpenAiAdapter.GetToolDefinitions(isDiscoveryPhase: true);
+        var discoveryNames = discoveryTools
+            .Select(t => ((dynamic)t).function.name as string)
+            .ToList();
+
+        discoveryNames.Should().Contain("run_command");
+        discoveryNames.Should().Contain("read_file");
+        discoveryNames.Should().Contain("ask_question");
+        discoveryNames.Should().Contain("manage_task");
+        discoveryNames.Should().Contain("post_job_message");
+        discoveryNames.Should().Contain("save_memory");
+
+        discoveryNames.Should().NotContain("write_file", "write_file must be hidden during discovery");
+        discoveryNames.Should().NotContain("edit_file", "edit_file must be hidden during discovery");
+        discoveryNames.Should().NotContain("open_pull_request", "open_pull_request must be hidden during discovery");
+
+        var executionTools = OpenAiAdapter.GetToolDefinitions(isDiscoveryPhase: false);
+        var executionNames = executionTools
+            .Select(t => ((dynamic)t).function.name as string)
+            .ToList();
+
+        executionNames.Should().Contain("write_file");
+        executionNames.Should().Contain("edit_file");
+        executionNames.Should().Contain("open_pull_request");
+    }
+
+    [Theory]
+    [InlineData("git commit -m \"fix\"", true)]
+    [InlineData("git push origin main", true)]
+    [InlineData("gh pr create --title \"PR\"", true)]
+    [InlineData("git rebase main", true)]
+    [InlineData("git merge feature", true)]
+    [InlineData("git cherry-pick 12345", true)]
+    [InlineData("git status", false)]
+    [InlineData("git log -n 5", false)]
+    [InlineData("git diff", false)]
+    [InlineData("git branch -a", false)]
+    [InlineData("dotnet test", false)]
+    public void IsMutatingGitCommand_CorrectlyIdentifiesMutations(string cmd, bool expectedMutating)
+    {
+        OpenAiAdapter.IsMutatingGitCommand(cmd).Should().Be(expectedMutating);
+    }
+
+    [Theory]
+    [InlineData("read_file", "{\"path\":\"a.cs\"}", true)]
+    [InlineData("ask_question", "{}", true)]
+    [InlineData("save_memory", "{}", true)]
+    [InlineData("run_command", "{\"command\":\"git status\"}", true)]
+    [InlineData("run_command", "{\"command\":\"git log -n 5\"}", true)]
+    [InlineData("run_command", "{\"command\":\"git diff\"}", true)]
+    [InlineData("write_file", "{\"path\":\"a.cs\"}", false)]
+    [InlineData("edit_file", "{\"path\":\"a.cs\"}", false)]
+    [InlineData("run_command", "{\"command\":\"dotnet build\"}", false)]
+    [InlineData("manage_task", "{\"action\":\"set_checklist\"}", false)]
+    public void IsReadOnlyTool_CategorizesOperationsAccurately(string toolName, string argsJson, bool expectedReadOnly)
+    {
+        OpenAiAdapter.IsReadOnlyTool(toolName, argsJson).Should().Be(expectedReadOnly);
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_RejectsMutations_DuringDiscovery()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "mesh-discovery-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var writeFileRes = await OpenAiAdapter.ExecuteToolLocallyAsync(
+                "write_file",
+                "{\"path\":\"test.txt\",\"content\":\"hello\"}",
+                tempDir,
+                CancellationToken.None,
+                isDiscoveryPhase: true);
+
+            writeFileRes.Should().Contain("File modifications are forbidden during Stage 1 Discovery");
+
+            var gitCommitRes = await OpenAiAdapter.ExecuteToolLocallyAsync(
+                "run_command",
+                "{\"command\":\"git commit -m 'early'\"}",
+                tempDir,
+                CancellationToken.None,
+                isDiscoveryPhase: true);
+
+            gitCommitRes.Should().Contain("forbidden during Stage 1 Discovery");
+
+            var ghPrRes = await OpenAiAdapter.ExecuteToolLocallyAsync(
+                "run_command",
+                "{\"command\":\"gh pr create --title 'early'\"}",
+                tempDir,
+                CancellationToken.None,
+                isDiscoveryPhase: true);
+
+            ghPrRes.Should().Contain("forbidden during Stage 1 Discovery");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
     }
 
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler

@@ -1188,6 +1188,14 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         long lastInputTokens = 0, lastOutputTokens = 0, lastThinkingTokens = 0, lastTotalTokens = 0;
         double lastDuration = 0;
 
+        var isDiscovery = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true);
+        var maxSteps = OpenAiAdapter.ResolveMaxSteps(preset, isDiscovery);
+        var agyStepCount = 0;
+        var agyReadOnlyStreak = 0;
+        var agyWarnedBudget = false;
+
         try
         {
             while (true)
@@ -1357,6 +1365,47 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                     Content = $"Completed in {duration:F2}s",
                                     ToolResultJson = outputText
                                 });
+
+                                bool isReadOnly = OpenAiAdapter.IsReadOnlyTool(toolName, argsJson);
+                                if (isReadOnly)
+                                {
+                                    agyReadOnlyStreak++;
+                                    if (agyReadOnlyStreak % 2 == 0)
+                                    {
+                                        agyStepCount++;
+                                    }
+                                }
+                                else
+                                {
+                                    agyReadOnlyStreak = 0;
+                                    agyStepCount++;
+                                }
+
+                                if (!agyWarnedBudget && agyStepCount >= (int)(maxSteps * 0.8) && maxSteps > 5)
+                                {
+                                    agyWarnedBudget = true;
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "thought",
+                                        Content = $"[@{preset.Id}] [Turn Step Budget Notice] Approaching step budget ({agyStepCount}/{maxSteps}). Please wrap up current verification, update task status via manage_task, and conclude turn."
+                                    });
+                                }
+
+                                if (agyStepCount >= maxSteps)
+                                {
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "thought",
+                                        Content = $"[@{preset.Id}] Reached maximum tool execution steps limit ({maxSteps}). Concluding turn."
+                                    });
+                                    AgentAdapterFactory.KillProcessTree(proc);
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "response",
+                                        Content = $"⚠️ Agent `@{preset.Id}` reached maximum tool execution steps limit ({maxSteps}). Current progress has been preserved in workspace. Please reply with instructions or 'continue' to resume."
+                                    });
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1593,7 +1642,12 @@ public class ClaudeAdapter : IAgentAdapter
             var autocompactArg = !string.IsNullOrWhiteSpace(promptEvent.ContextSize)
                 ? $" --autocompact \"{promptEvent.ContextSize.Trim()}\""
                 : "";
-            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\"{autocompactArg} -p \"{escapedPrompt}\"", cwd, ct);
+            var isDiscovery = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+                || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+                || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true);
+            var maxSteps = OpenAiAdapter.ResolveMaxSteps(preset, isDiscovery);
+            var maxStepsArg = $" --max-steps {maxSteps}";
+            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\"{autocompactArg}{maxStepsArg} -p \"{escapedPrompt}\"", cwd, ct);
             ct.ThrowIfCancellationRequested();
             var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut : stdErr;
 

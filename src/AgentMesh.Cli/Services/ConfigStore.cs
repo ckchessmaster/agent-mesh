@@ -62,6 +62,12 @@ public class ConfigStore
             config.MasterToken = envToken.Trim();
         }
 
+        var envMaxSteps = Environment.GetEnvironmentVariable("AGENTMESH_MAX_STEPS") ?? Environment.GetEnvironmentVariable("AGENT_MAX_STEPS");
+        if (int.TryParse(envMaxSteps, out var maxStepsVal) && maxStepsVal > 0)
+        {
+            config.DefaultMaxSteps = maxStepsVal;
+        }
+
         EnsureBuiltInPresets(config);
         return config;
     }

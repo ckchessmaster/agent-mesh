@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
@@ -38,6 +38,12 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     /// Args: (driverId, modelId, maxContextTokens).
     /// </summary>
     public static Func<string, string, int, Task>? LearnedContextLimitReporter { get; set; }
+
+    /// <summary>
+    /// Optional callback invoked when the agent calls a platform tool (manage_task, post_job_message, open_pull_request, save_memory).
+    /// Args: (toolName, argsJson, sessionId, personaId, agentId, ct).
+    /// </summary>
+    public static Func<string, string, Guid?, string?, string?, CancellationToken, Task<string>>? PlatformToolExecutor { get; set; }
 
     public static string HistoryDirectoryPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -154,10 +160,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return 2; // 2 retries (3 total attempts)
     }
 
-    public static int ResolveMaxSteps(AgentPresetConfig preset)
+    public static int ResolveMaxSteps(AgentPresetConfig preset, bool isDiscoveryPhase = false, int? globalDefault = null)
     {
         if (preset.MaxSteps.HasValue && preset.MaxSteps.Value > 0)
             return preset.MaxSteps.Value;
+
+        if (globalDefault.HasValue && globalDefault.Value > 0)
+            return globalDefault.Value;
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("AGENTMESH_MAX_STEPS"), out var meshSteps) && meshSteps > 0)
+            return meshSteps;
 
         if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_MAX_STEPS"), out var envSteps) && envSteps > 0)
             return envSteps;
@@ -165,7 +177,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         if (int.TryParse(Environment.GetEnvironmentVariable("AGENT_MAX_STEPS"), out var agentSteps) && agentSteps > 0)
             return agentSteps;
 
-        return 100;
+        return isDiscoveryPhase ? 15 : 25;
     }
 
     public static int GetRetryDelayMilliseconds(HttpResponseMessage? response, int attempt, AgentPresetConfig? preset = null)
@@ -881,8 +893,12 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
         SaveHistoryToDisk(promptEvent.SessionId, history);
 
+        var isDiscoveryPhase = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true);
+
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
-        var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
+        var toolsDefinition = isDirectMode ? null : GetToolDefinitions(isDiscoveryPhase);
 
         // Compaction: summarize older turns with the model (lossy fallback to truncation), then persist.
         async Task<(bool Changed, bool Summarized)> CompactAsync(int target, bool aggressive)
@@ -893,8 +909,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             return (changed || summarized, summarized);
         }
 
-        var maxSteps = ResolveMaxSteps(preset);
+        var maxSteps = ResolveMaxSteps(preset, isDiscoveryPhase);
         var stepCount = 0;
+        var readOnlyStreak = 0;
+        var warnedBudget = false;
         var streamRetryAttempt = 0;
         var responseEmitted = false;
         var askedQuestion = false;
@@ -905,7 +923,6 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
         while (stepCount < maxSteps)
         {
-            stepCount++;
             ct.ThrowIfCancellationRequested();
 
             // Proactive history compaction
@@ -1374,7 +1391,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             {
                                 try { await CommandOutputBroadcaster(promptEvent.SessionId, callId, chunk); } catch { }
                             }
-                        });
+                        },
+                        personaId: promptEvent.PersonaId,
+                        agentId: promptEvent.AgentId,
+                        isDiscoveryPhase: isDiscoveryPhase);
                     ct.ThrowIfCancellationRequested();
 
                     await onEvent(new TrajectoryEventPayload
@@ -1386,6 +1406,21 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     });
 
                     toolResults.Add((callId, toolResult));
+
+                    // post_job_message with requires_reply=true parks the turn
+                    if (string.Equals(toolName, "post_job_message", StringComparison.OrdinalIgnoreCase) && IsRequiresReply(toolArgs))
+                    {
+                        askedQuestion = true;
+                        responseEmitted = true;
+                        break;
+                    }
+
+                    // open_pull_request yields the turn to code review
+                    if (string.Equals(toolName, "open_pull_request", StringComparison.OrdinalIgnoreCase))
+                    {
+                        responseEmitted = true;
+                        return;
+                    }
                 }
 
                 if (askedQuestion)
@@ -1412,6 +1447,33 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     });
                 }
                 SaveHistoryToDisk(promptEvent.SessionId, history);
+
+                // Differentiated step budget: pure read-only turns increment step budget every 2 turns,
+                // while mutating commands increment every turn.
+                bool isPureReadOnlyTurn = executedToolCalls.All(c => IsReadOnlyTool(c.Function.Name, c.Function.Arguments));
+                if (isPureReadOnlyTurn)
+                {
+                    readOnlyStreak++;
+                    if (readOnlyStreak % 2 == 0)
+                    {
+                        stepCount++;
+                    }
+                }
+                else
+                {
+                    readOnlyStreak = 0;
+                    stepCount++;
+                }
+
+                if (!warnedBudget && stepCount >= (int)(maxSteps * 0.8) && maxSteps > 5)
+                {
+                    warnedBudget = true;
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = $"[@{preset.Id}] [Turn Step Budget Notice] Approaching step budget ({stepCount}/{maxSteps}). Please wrap up current verification, update task status via manage_task, and conclude turn."
+                    });
+                }
 
                 // Continue loop for next turn with tool results
                 continue;
@@ -1689,9 +1751,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return sb.ToString();
     }
 
-    public static List<object> GetToolDefinitions()
+    public static List<object> GetToolDefinitions(bool isDiscoveryPhase = false)
     {
-        return new List<object>
+        var tools = new List<object>
         {
             new
             {
@@ -1719,7 +1781,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 function = new
                 {
                     name = "read_file",
-                    description = "Read the contents of a text file from the workspace.",
+                    description = "Read the contents of a text file from the workspace. Supports reading files in parallel in a single response.",
                     parameters = new
                     {
                         type = "object",
@@ -1730,45 +1792,6 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             endLine = new { type = "integer", description = "Optional 1-based end line." }
                         },
                         required = new[] { "path" }
-                    }
-                }
-            },
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "write_file",
-                    description = "Create a new file or completely overwrite an existing file with the given content.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
-                            content = new { type = "string", description = "The full content to write to the file." }
-                        },
-                        required = new[] { "path", "content" }
-                    }
-                }
-            },
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "edit_file",
-                    description = "Replace a target string within an existing file with replacement text.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
-                            target = new { type = "string", description = "The exact character sequence in the file to be replaced." },
-                            replacement = new { type = "string", description = "The text to replace target with." }
-                        },
-                        required = new[] { "path", "target", "replacement" }
                     }
                 }
             },
@@ -1803,8 +1826,169 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         required = new[] { "questions" }
                     }
                 }
+            },
+            new
+            {
+                type = "function",
+                function = new
+                {
+                    name = "manage_task",
+                    description = "Manage the living task checklist and task statuses for the active job. In Stage 1 Discovery, decompose the job into 3 to 6 atomic tasks and register them via action='set_checklist'. In Stage 3, update task status with action='update_task_status'.",
+                    parameters = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            action = new
+                            {
+                                type = "string",
+                                description = "The action to perform: 'set_checklist' (to register 3-6 tasks), 'update_task_status', 'get_checklist', or 'get_details'.",
+                                @enum = new[] { "set_checklist", "update_task_status", "get_checklist", "get_details", "set_status", "list_all" }
+                            },
+                            tasks = new
+                            {
+                                type = "array",
+                                description = "List of 3 to 6 atomic tasks when action is 'set_checklist'.",
+                                items = new
+                                {
+                                    type = "object",
+                                    properties = new
+                                    {
+                                        title = new { type = "string", description = "Clear, actionable title of the task." },
+                                        target_file = new { type = "string", description = "Target file or component path." },
+                                        verification_method = new { type = "string", description = "Exact verification command (e.g. 'dotnet test', 'npm test')." }
+                                    },
+                                    required = new[] { "title" }
+                                }
+                            },
+                            task_id = new { type = "string", description = "Identifier of the task being updated." },
+                            status = new
+                            {
+                                type = "string",
+                                description = "Target status when updating task: 'todo', 'in_progress', 'awaiting_review', or 'completed'.",
+                                @enum = new[] { "todo", "in_progress", "awaiting_review", "completed" }
+                            },
+                            progress_note = new { type = "string", description = "1-sentence heartbeat summarizing the state change." },
+                            notes = new { type = "string", description = "Optional context notes." }
+                        },
+                        required = new[] { "action" }
+                    }
+                }
+            },
+            new
+            {
+                type = "function",
+                function = new
+                {
+                    name = "post_job_message",
+                    description = "Post an update, clarifying question, or architectural escalation to the job's shared ledger. Set requires_reply=true to pause execution and await user/lead response.",
+                    parameters = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            content = new { type = "string", description = "Markdown message body." },
+                            target_persona = new { type = "string", description = "Recipient: 'operator' or assigned teammate persona ID." },
+                            requires_reply = new { type = "boolean", description = "If true, halts turn and parks session awaiting response." },
+                            job_id = new { type = "string", description = "Optional job GUID." }
+                        },
+                        required = new[] { "content", "target_persona", "requires_reply" }
+                    }
+                }
+            },
+            new
+            {
+                type = "function",
+                function = new
+                {
+                    name = "save_memory",
+                    description = "Store persistent architectural notes, codebase quirks, or test workarounds for future sessions.",
+                    parameters = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            key = new { type = "string", description = "Unique identifier (e.g. ef-dbcontext-pooling-rule)." },
+                            content = new { type = "string", description = "Concise documentation of the learned knowledge." },
+                            category = new
+                            {
+                                type = "string",
+                                description = "Category of memory.",
+                                @enum = new[] { "architecture", "codebase_gotcha", "environment_quirk", "test_strategy", "general" }
+                            }
+                        },
+                        required = new[] { "key", "content", "category" }
+                    }
+                }
             }
         };
+
+        if (!isDiscoveryPhase)
+        {
+            tools.Add(new
+            {
+                type = "function",
+                function = new
+                {
+                    name = "write_file",
+                    description = "Create a new file or completely overwrite an existing file with the given content.",
+                    parameters = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
+                            content = new { type = "string", description = "The full content to write to the file." }
+                        },
+                        required = new[] { "path", "content" }
+                    }
+                }
+            });
+
+            tools.Add(new
+            {
+                type = "function",
+                function = new
+                {
+                    name = "edit_file",
+                    description = "Replace a target string within an existing file with replacement text.",
+                    parameters = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
+                            target = new { type = "string", description = "The exact character sequence in the file to be replaced." },
+                            replacement = new { type = "string", description = "The text to replace target with." }
+                        },
+                        required = new[] { "path", "target", "replacement" }
+                    }
+                }
+            });
+
+            tools.Add(new
+            {
+                type = "function",
+                function = new
+                {
+                    name = "open_pull_request",
+                    description = "Submit the active branch for review (Stage 4 Two-Man Review Gate). Concludes implementation turn.",
+                    parameters = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            title = new { type = "string", description = "Pull request title following Conventional Commits." },
+                            body = new { type = "string", description = "Summary of changes, verification commands, and test results." },
+                            target_branch = new { type = "string", description = "Base branch to target (defaults to project default branch)." }
+                        },
+                        required = new[] { "title", "body" }
+                    }
+                }
+            });
+        }
+
+        return tools;
     }
 
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -1859,9 +2043,12 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         int? timeoutSeconds = null,
         Guid? sessionId = null,
         string? commandId = null,
-        Func<string, Task>? onOutputChunk = null)
+        Func<string, Task>? onOutputChunk = null,
+        string? personaId = null,
+        string? agentId = null,
+        bool isDiscoveryPhase = false)
     {
-        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId, onOutputChunk);
+        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId, onOutputChunk, personaId, agentId, isDiscoveryPhase);
         var truncated = TruncateToolResult(rawResult);
         return truncated.IndexOf('\0') >= 0 ? truncated.Replace("\0", string.Empty) : truncated;
     }
@@ -1874,15 +2061,54 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         int? timeoutSeconds = null,
         Guid? sessionId = null,
         string? commandId = null,
-        Func<string, Task>? onOutputChunk = null)
+        Func<string, Task>? onOutputChunk = null,
+        string? personaId = null,
+        string? agentId = null,
+        bool isDiscoveryPhase = false)
     {
         try
         {
             using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
             var root = doc.RootElement;
+            var normalizedTool = toolName.ToLowerInvariant();
 
-            switch (toolName.ToLowerInvariant())
+            // Stage 1 Discovery guardrails: strictly read-only
+            if (isDiscoveryPhase)
             {
+                if (normalizedTool is "write_file" or "edit_file" or "replace_file_content")
+                {
+                    return "Error: File modifications are forbidden during Stage 1 Discovery. Your objective is read-only exploration and checklist registration via manage_task(action: 'set_checklist').";
+                }
+
+                if (normalizedTool is "open_pull_request")
+                {
+                    return "Error: Opening pull requests is forbidden during Stage 1 Discovery. Complete discovery using manage_task(action: 'set_checklist') and receive plan approval before starting implementation.";
+                }
+
+                if (normalizedTool is "run_command" or "bash" or "command")
+                {
+                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd") ?? string.Empty;
+                    if (IsMutatingGitCommand(cmd))
+                    {
+                        return "Error: Committing, pushing, or creating pull requests is forbidden during Stage 1 Discovery. Your objective is read-only exploration and checklist registration via manage_task(action: 'set_checklist').";
+                    }
+                }
+            }
+
+            switch (normalizedTool)
+            {
+                case "manage_task":
+                case "post_job_message":
+                case "open_pull_request":
+                case "save_memory":
+                {
+                    if (PlatformToolExecutor != null)
+                    {
+                        return await PlatformToolExecutor(toolName, argsJson, sessionId, personaId, agentId, ct);
+                    }
+                    return $"Error: Platform tool '{toolName}' is not available (no executor registered).";
+                }
+
                 case "run_command":
                 case "bash":
                 case "command":
@@ -2052,6 +2278,17 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     return !string.IsNullOrWhiteSpace(ePath) ? $"Editing file: {Path.GetFileName(ePath)}" : "Editing file";
                 case "ask_question":
                     return "Asking question";
+                case "manage_task":
+                    var action = GetPropertyString(root, "action") ?? "task";
+                    return $"manage_task: {action}";
+                case "post_job_message":
+                    return "post_job_message";
+                case "open_pull_request":
+                    var title = GetPropertyString(root, "title") ?? "PR";
+                    return $"open_pull_request: {title}";
+                case "save_memory":
+                    var key = GetPropertyString(root, "key") ?? "memory";
+                    return $"save_memory: {key}";
                 default:
                     return $"Executing {toolName}";
             }
@@ -2060,6 +2297,56 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         {
             return $"Executing {toolName}";
         }
+    }
+
+    internal static bool IsMutatingGitCommand(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return false;
+        var trimmed = command.Trim();
+        return Regex.IsMatch(trimmed, @"\b(?:git\s+(?:commit|push|merge|rebase|cherry-pick)|gh\s+pr\s+create)\b", RegexOptions.IgnoreCase);
+    }
+
+    internal static bool IsReadOnlyTool(string? toolName, string? argsJson)
+    {
+        if (string.IsNullOrWhiteSpace(toolName)) return true;
+        var name = toolName.Trim().ToLowerInvariant();
+        if (name is "read_file" or "view_file" or "ask_question" or "save_memory") return true;
+        if (name is "manage_task")
+        {
+            if (!string.IsNullOrWhiteSpace(argsJson))
+            {
+                return argsJson.Contains("get_checklist", StringComparison.OrdinalIgnoreCase) ||
+                       argsJson.Contains("get_details", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+        if (name is "run_command" or "bash" or "command")
+        {
+            if (!string.IsNullOrWhiteSpace(argsJson))
+            {
+                var lower = argsJson.ToLowerInvariant();
+                return lower.Contains("git status") || lower.Contains("git log") || lower.Contains("git diff") ||
+                       lower.Contains("git branch") || lower.Contains("grep ") || lower.Contains("find ") ||
+                       lower.Contains("cat ") || lower.Contains("ls ");
+            }
+        }
+        return false;
+    }
+
+    internal static bool IsRequiresReply(string? toolArgs)
+    {
+        if (string.IsNullOrWhiteSpace(toolArgs)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(toolArgs);
+            if (doc.RootElement.TryGetProperty("requires_reply", out var req) ||
+                doc.RootElement.TryGetProperty("requiresReply", out req))
+            {
+                return req.ValueKind == JsonValueKind.True;
+            }
+        }
+        catch { }
+        return false;
     }
 
     private static (bool HasTool, string? Name, string? Args) TryParseFallbackToolCall(string content)

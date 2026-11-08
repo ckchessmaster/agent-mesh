@@ -88,6 +88,53 @@ public class TurnOutcomeDerivationTests
         HttpAgentTurnRunner.ClassifySignals(state).Should().BeNull();
     }
 
+    [Fact]
+    public void Classify_OutOfBandPrInSessionTranscript_PausesForReview()
+    {
+        var state = State() with
+        {
+            DiscoveredPrUrl = "Created PR https://github.com/ckchessmaster/agent-mesh/pull/41 on branch mesh/job-2a84d05c"
+        };
+
+        var outcome = HttpAgentTurnRunner.ClassifySignals(state);
+
+        outcome.Should().NotBeNull();
+        outcome!.Status.Should().Be(TurnOutcomeStatus.PrOpenedAwaitingReview);
+        outcome.PrUrl.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/41");
+        outcome.PrNumber.Should().Be(41);
+    }
+
+    [Fact]
+    public void Classify_OutOfBandPrInLastSessionMessage_PausesForReview()
+    {
+        var state = State() with
+        {
+            LastSessionMessageContent = "PR #41 opened. URL: https://github.com/ckchessmaster/agent-mesh/pull/41"
+        };
+
+        var outcome = HttpAgentTurnRunner.ClassifySignals(state);
+
+        outcome.Should().NotBeNull();
+        outcome!.Status.Should().Be(TurnOutcomeStatus.PrOpenedAwaitingReview);
+        outcome.PrUrl.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/41");
+        outcome.PrNumber.Should().Be(41);
+    }
+
+    [Fact]
+    public void Classify_OutOfBandPrInToolCallArgs_PausesForReview()
+    {
+        var state = State(toolCalls: [
+            Call("run_command", "gh pr create --title \"Feature\" --body \"Details\" --head branch -> https://github.com/ckchessmaster/agent-mesh/pull/41")
+        ]);
+
+        var outcome = HttpAgentTurnRunner.ClassifySignals(state);
+
+        outcome.Should().NotBeNull();
+        outcome!.Status.Should().Be(TurnOutcomeStatus.PrOpenedAwaitingReview);
+        outcome.PrUrl.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/41");
+        outcome.PrNumber.Should().Be(41);
+    }
+
     /// <summary>
     /// A driver that prefixes tool names still resolves to the PR gate.
     /// </summary>
