@@ -1039,7 +1039,11 @@ export default function App() {
 
     const activeProject = projects.find((p) => p.id === selectedProjectId) || projects[0] || null;
     const currentJob = (jobsByProject[activeProject?.id || ''] || []).find((j) => j.id === selectedJobId);
-    const isJobActive = currentJob?.status === 'active' || currentJob?.status === 'in_progress';
+    const isJobActive =
+      currentJob?.status === ProjectJobStatus.Active ||
+      currentJob?.status === ProjectJobStatus.Pending ||
+      (currentJob?.status as unknown as string) === 'active' ||
+      (currentJob?.status as unknown as string) === 'in_progress';
 
     if (!isJobActive) return;
 
