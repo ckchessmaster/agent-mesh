@@ -563,15 +563,24 @@ public class AgentRunnerInstance : IAsyncDisposable
 
             var adapter = AgentAdapterFactory.Create(_preset);
             var terminalEventEmitted = false;
+            string? lastRecordedError = null;
             await adapter.ExecutePromptAsync(_preset, ev, async (trajectoryEv) =>
             {
                 turnToken.ThrowIfCancellationRequested();
 
                 if (string.Equals(trajectoryEv.EventType, "response", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(trajectoryEv.EventType, "error", StringComparison.OrdinalIgnoreCase) ||
                     (string.Equals(trajectoryEv.EventType, "tool_call", StringComparison.OrdinalIgnoreCase) &&
                      string.Equals(trajectoryEv.ToolName, "ask_question", StringComparison.OrdinalIgnoreCase)))
                 {
                     terminalEventEmitted = true;
+                }
+
+                if (string.Equals(trajectoryEv.EventType, "tool_result", StringComparison.OrdinalIgnoreCase) &&
+                    trajectoryEv.ToolResultJson != null &&
+                    trajectoryEv.ToolResultJson.TrimStart().StartsWith("Error:", StringComparison.OrdinalIgnoreCase))
+                {
+                    lastRecordedError = $"{trajectoryEv.ToolName}: {trajectoryEv.ToolResultJson}";
                 }
 
                 if (!string.IsNullOrWhiteSpace(trajectoryEv.StructuredPayloadJson))
@@ -604,17 +613,34 @@ public class AgentRunnerInstance : IAsyncDisposable
 
             if (!terminalEventEmitted && !turnToken.IsCancellationRequested)
             {
-                _onLog(_preset.Id, $"Warning: Turn completed without a terminal response or question event. Emitting fallback completion response.");
-                await _meshClient.PostTrajectoryEventAsync(
-                    ev.SessionId,
-                    _preset.Id,
-                    _agentToken,
-                    new TrajectoryEventPayload
-                    {
-                        EventType = "response",
-                        Content = $"Turn completed by agent `@{_preset.Id}`."
-                    },
-                    turnToken);
+                if (!string.IsNullOrWhiteSpace(lastRecordedError))
+                {
+                    _onLog(_preset.Id, $"Warning: Turn ended with unhandled tool error: {lastRecordedError}. Emitting error response.");
+                    await _meshClient.PostTrajectoryEventAsync(
+                        ev.SessionId,
+                        _preset.Id,
+                        _agentToken,
+                        new TrajectoryEventPayload
+                        {
+                            EventType = "error",
+                            Content = $"❌ Turn halted due to platform tool error: {lastRecordedError}"
+                        },
+                        turnToken);
+                }
+                else
+                {
+                    _onLog(_preset.Id, $"Warning: Turn completed without a terminal response or question event. Emitting fallback completion response.");
+                    await _meshClient.PostTrajectoryEventAsync(
+                        ev.SessionId,
+                        _preset.Id,
+                        _agentToken,
+                        new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = $"Turn completed by agent `@{_preset.Id}`."
+                        },
+                        turnToken);
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(ev.GitBranch))

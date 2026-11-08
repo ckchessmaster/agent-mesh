@@ -1410,16 +1410,29 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     // post_job_message with requires_reply=true parks the turn
                     if (string.Equals(toolName, "post_job_message", StringComparison.OrdinalIgnoreCase) && IsRequiresReply(toolArgs))
                     {
-                        askedQuestion = true;
-                        responseEmitted = true;
-                        break;
+                        var isError = toolResult != null && toolResult.TrimStart().StartsWith("Error:", StringComparison.OrdinalIgnoreCase);
+                        if (!isError)
+                        {
+                            askedQuestion = true;
+                            responseEmitted = true;
+                            await onEvent(new TrajectoryEventPayload
+                            {
+                                EventType = "response",
+                                Content = "Turn paused: plan / question posted to Job Chat awaiting reply."
+                            });
+                            break;
+                        }
                     }
 
                     // open_pull_request yields the turn to code review
                     if (string.Equals(toolName, "open_pull_request", StringComparison.OrdinalIgnoreCase))
                     {
-                        responseEmitted = true;
-                        return;
+                        var isError = toolResult != null && toolResult.TrimStart().StartsWith("Error:", StringComparison.OrdinalIgnoreCase);
+                        if (!isError)
+                        {
+                            responseEmitted = true;
+                            return;
+                        }
                     }
                 }
 
@@ -1739,12 +1752,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
 
         sb.AppendLine();
-        sb.AppendLine("[Autonomous Tool Usage Guidelines]");
+        sb.AppendLine("[Autonomous Tool Usage & Environment Guidelines]");
         sb.AppendLine("You have access to autonomous tools to execute shell commands, read files, write files, and edit files in the workspace.");
         sb.AppendLine("- Use `run_command` to inspect the project, run tests, execute builds, and check git status.");
         sb.AppendLine("- Use `read_file` to inspect code and text files.");
         sb.AppendLine("- Use `write_file` or `edit_file` to implement solutions.");
-        sb.AppendLine("- When you need user clarification or critical architectural decisions, call `ask_question`.");
+        sb.AppendLine("- When you need user clarification or critical architectural decisions, call `post_job_message(requires_reply: true)` or `ask_question`.");
+        sb.AppendLine("- Platform MCP Tools: `manage_task`, `post_job_message`, and `open_pull_request` are control plane tools. In Stage 1 Discovery, file edits and git mutations are blocked: use `manage_task(action: 'set_checklist')` to register tasks and `post_job_message(requires_reply: true)` to post the plan.");
+        sb.AppendLine("- Environment Topology: You run in an isolated Linux container runner. The Control Plane API does not mount /workspace directly; state and diffs are reported through platform tools.");
         sb.AppendLine("- Vision / Image Handling: Attached image files are provided directly to your multimodal visual input when supported. You can inspect, analyze, and describe them visually. However, binary image files on disk cannot be read as plain text via `read_file`. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands.");
         sb.AppendLine("- Be concise and lead with working code and clear implementation.");
 

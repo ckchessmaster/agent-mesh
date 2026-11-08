@@ -763,6 +763,8 @@ public class MeshClient
         {
             var token = _config.MasterToken;
             using var req = CreateRequest(HttpMethod.Post, "mcp", token, agentId);
+            req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
             if (sessionId.HasValue && sessionId.Value != Guid.Empty)
             {
                 req.Headers.TryAddWithoutValidation("X-Session-Id", sessionId.Value.ToString());
@@ -803,6 +805,17 @@ public class MeshClient
             if (!res.IsSuccessStatusCode)
             {
                 return $"Error: MCP call to '{toolName}' failed with HTTP status {(int)res.StatusCode} ({res.ReasonPhrase}): {responseBody}";
+            }
+
+            // If SSE format (data: ...), extract JSON payload:
+            if (responseBody.TrimStart().StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                var line = responseBody.Split('\n').FirstOrDefault(l => l.TrimStart().StartsWith("data:", StringComparison.OrdinalIgnoreCase));
+                if (line != null)
+                {
+                    var dataIdx = line.IndexOf("data:", StringComparison.OrdinalIgnoreCase);
+                    responseBody = line.Substring(dataIdx + 5).Trim();
+                }
             }
 
             using var resDoc = JsonDocument.Parse(responseBody);

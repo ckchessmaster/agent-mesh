@@ -749,12 +749,50 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       };
     }
 
-    if (messages.length === 0) return null;
+    if (messages.length === 0) {
+      if (job.status === 'active' || job.status === 'in_progress') {
+        const personaId = job.assignedAgentId;
+        const personaObj =
+          personas.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase()) ||
+          project.assignedPersonas?.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase());
+        const personaName = personaObj?.name || personaId || 'Assigned Lead';
+        const isOffline = personaObj?.driverStatus === 'offline';
+        return {
+          isActive: true,
+          isOffline,
+          driverId: personaObj?.driverId || undefined,
+          personaName,
+          personaId: personaObj?.id || personaId || undefined,
+          turnSessionId: undefined,
+          statusText: isOffline
+            ? 'is queued (waiting for runner connection)...'
+            : (job.progressHeartbeat || 'is starting discovery & analyzing requirements...')
+        };
+      }
+      return null;
+    }
     const lastMsg = messages[messages.length - 1];
 
     if (lastMsg.turnSessionId && sessions.length > 0) {
       const turnSession = sessions.find((s) => s.id === lastMsg.turnSessionId);
       if (turnSession && turnSession.status !== 'thinking' && turnSession.status !== 'waiting_for_input' && turnSession.status !== 'busy') {
+        if (job.status === 'active' || job.status === 'in_progress') {
+          const personaId = job.assignedAgentId;
+          const personaObj =
+            personas.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase()) ||
+            project.assignedPersonas?.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase());
+          const personaName = personaObj?.name || personaId || 'Assigned Lead';
+          const isOffline = personaObj?.driverStatus === 'offline';
+          return {
+            isActive: true,
+            isOffline,
+            driverId: personaObj?.driverId,
+            personaName,
+            personaId: personaObj?.id || personaId || undefined,
+            turnSessionId: undefined,
+            statusText: isOffline ? 'is queued (waiting for runner connection)...' : (job.progressHeartbeat || 'is actively working on this job...')
+          };
+        }
         return null;
       }
     }
@@ -797,8 +835,26 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       };
     }
 
+    if (job.status === 'active' || job.status === 'in_progress') {
+      const personaId = job.assignedAgentId;
+      const personaObj =
+        personas.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase()) ||
+        project.assignedPersonas?.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase());
+      const personaName = personaObj?.name || personaId || 'Assigned Lead';
+      const isOffline = personaObj?.driverStatus === 'offline';
+      return {
+        isActive: true,
+        isOffline,
+        driverId: personaObj?.driverId || undefined,
+        personaName,
+        personaId: personaObj?.id || personaId || undefined,
+        turnSessionId: undefined,
+        statusText: isOffline ? 'is queued (waiting for runner connection)...' : (job.progressHeartbeat || 'is actively working on this job...')
+      };
+    }
+
     return null;
-  }, [messages, isSending, personas, project.assignedPersonas, sessions, job.id, job.title]);
+  }, [messages, isSending, personas, project.assignedPersonas, sessions, job.id, job.title, job.status, job.progressHeartbeat, job.assignedAgentId]);
 
   // Filtered task items for the structured checklist
   const uniqueTasks = useMemo(() => {

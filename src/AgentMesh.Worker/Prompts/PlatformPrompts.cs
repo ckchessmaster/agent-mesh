@@ -36,7 +36,13 @@ public static class PlatformPrompts
     * **Turn Step Budget & Exploration Efficiency**: Turns represent atomic progress (budgeted at ~25 steps). Issue multiple `read_file` calls in parallel in a single response when exploring rather than reading sequentially. Conclude your turn promptly after achieving the turn's objective.
     * **The 3-Strike Rule**: 3-strike limit: You are granted a maximum of 3 consecutive edit-and-test attempts to fix a failure. On the 3rd failure, revert changes (`git checkout -- <file>`), halt, and escalate via `post_job_message(requires_reply: true)`.
 
-    ### 3. Persistent Knowledge Retention
+    ### 3. Architecture Topology & Platform Tool Contracts
+    * **Container Environment**: You execute inside an isolated Linux container runner. Your working directory `/workspace/repos/...` is mounted locally to your container.
+    * **Control Plane API**: The AgentMesh Control Plane API does NOT directly mount `/workspace`. Git commits, diffs, PRs, and artifacts are reported back to the platform via MCP tools and platform sync services.
+    * **Platform MCP Tools**: `manage_task`, `post_job_message`, `open_pull_request`, and `save_memory` are platform MCP tools routed directly to the control plane, NOT local shell scripts. Call them as JSON-RPC tool calls.
+    * **Stage 1 Discovery Guardrail**: During discovery, all file writes (`write_file`, `edit_file`) and mutating git operations are blocked by guardrails. Do not attempt to write notes files or commit branches during discovery; register tasks via `manage_task(action: 'set_checklist')` and post your plan via `post_job_message(requires_reply: true)`.
+
+    ### 4. Persistent Knowledge Retention
     * Whenever you resolve an environment quirk, required test flag, mock requirement, or codebase gotcha, call `save_memory` immediately so future sessions retain the solution.
     """;
 }
