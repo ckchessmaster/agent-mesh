@@ -135,9 +135,9 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
       <div
         key={`ans-${cardKey}`}
         data-testid={`question-card-answered-${targetId}`}
-        className={`bg-emerald-950/15 border border-emerald-500/30 rounded-2xl p-5 shadow-sm space-y-3 ${className}`}
+        className={`bg-emerald-950/15 border border-emerald-500/30 rounded-2xl p-3.5 sm:p-5 shadow-sm space-y-3 ${className}`}
       >
-        <div className="flex items-center justify-between pb-2.5 border-b border-emerald-500/20">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 pb-2.5 border-b border-emerald-500/20">
           <div className="flex items-center gap-2 text-xs font-semibold text-emerald-300">
             <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
             <span>Agent Question — Answered</span>
@@ -207,9 +207,9 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
     <div
       key={`q-${cardKey}`}
       data-testid={`question-card-${targetId}`}
-      className={`bg-amber-950/20 border border-amber-500/40 rounded-2xl p-5 shadow-lg space-y-4 ${className}`}
+      className={`bg-amber-950/20 border border-amber-500/40 rounded-2xl p-3.5 sm:p-5 shadow-lg space-y-4 ${className}`}
     >
-      <div className="flex items-center justify-between pb-3 border-b border-amber-500/20">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-amber-500/20">
         <div className="flex items-center gap-2">
           <HelpCircle className="w-5 h-5 text-amber-400 shrink-0 animate-pulse" />
           <div>
@@ -221,7 +221,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
             </span>
           </div>
         </div>
-        <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
+        <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse shrink-0 self-start sm:self-auto">
           Pending Input
         </span>
       </div>
@@ -336,7 +336,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
           type="button"
           disabled={!hasAnyAnswerInput || isSubmitting}
           onClick={handleSubmit}
-          className="px-4 py-2 rounded-xl text-xs font-semibold bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white transition flex items-center gap-1.5 shadow-md cursor-pointer"
+          className="w-full sm:w-auto px-4 py-2 rounded-xl text-xs font-semibold bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white transition flex items-center justify-center gap-1.5 shadow-md cursor-pointer"
         >
           {isSubmitting ? (
             <>

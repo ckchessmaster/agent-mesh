@@ -257,7 +257,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
   return (
     <div className="h-full flex flex-col min-h-0 bg-slate-950 border-l border-slate-800 select-text" data-testid="artifact-viewer">
       {/* Top Header */}
-      <div className="p-3 border-b border-slate-800 flex items-center justify-between shrink-0 bg-slate-900/50">
+      <div className="p-3 border-b border-slate-800 flex items-center justify-between shrink-0 bg-slate-900/50 pt-[max(0.75rem,env(safe-area-inset-top))]">
         <div className="flex items-center gap-2 min-w-0">
           <FileText className="w-4 h-4 text-indigo-400 shrink-0" />
           <span className="font-semibold text-xs text-white">Artifacts</span>
@@ -272,7 +272,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
               type="button"
               onClick={onRefresh}
               title="Refresh artifacts list"
-              className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+              className="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
             >
               <RefreshCw className="w-3.5 h-3.5" />
             </button>
@@ -281,7 +281,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
             type="button"
             onClick={onClose}
             title="Close artifacts panel"
-            className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+            className="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer min-w-[32px] min-h-[32px] flex items-center justify-center"
           >
             <X className="w-4 h-4" />
           </button>
@@ -393,7 +393,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
           )}
 
           {/* Artifact Content Area */}
-          <div className="flex-1 overflow-y-auto p-4 min-h-0">
+          <div className="flex-1 overflow-y-auto p-3 sm:p-4 min-h-0 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
             {activeArtifact ? (
               isImageArtifact(activeArtifact) && viewMode === 'rendered' ? (
                 <div className="flex flex-col items-center justify-center p-4 bg-slate-900/60 rounded-xl border border-slate-800/80">

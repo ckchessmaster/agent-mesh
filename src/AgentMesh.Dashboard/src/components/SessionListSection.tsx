@@ -213,8 +213,9 @@ export const SessionListSection = memo(function SessionListSection({
                       e.stopPropagation();
                       onRequestDelete(session.id);
                     }}
-                    className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition cursor-pointer"
+                    className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 sm:p-1 rounded hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition cursor-pointer"
                     title={`Delete session ${session.title}`}
+                    aria-label={`Delete session ${session.title}`}
                   >
                     <Trash2 className="w-3 h-3" />
                   </button>

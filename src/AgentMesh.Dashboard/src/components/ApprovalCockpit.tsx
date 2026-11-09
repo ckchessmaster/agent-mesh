@@ -106,7 +106,7 @@ export const ApprovalCockpit: React.FC<ApprovalCockpitProps> = ({ connection, on
             const isLoading = loadingJobId === job.id;
             return (
               <div key={job.id} className="bg-slate-800/80 border border-slate-700/80 p-5 rounded-lg shadow-md transition hover:border-slate-600">
-                <div className="flex justify-between items-start mb-3">
+                <div className="flex flex-col sm:flex-row justify-between items-start gap-2 mb-3">
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="font-mono text-sm text-sky-400 font-bold bg-sky-950/60 px-2 py-0.5 rounded border border-sky-800/50">
@@ -151,18 +151,18 @@ export const ApprovalCockpit: React.FC<ApprovalCockpitProps> = ({ connection, on
                   </pre>
                 </div>
 
-                <div className="flex justify-end gap-3 pt-2 border-t border-slate-700/50">
+                <div className="flex flex-col sm:flex-row justify-end gap-2 sm:gap-3 pt-2 border-t border-slate-700/50">
                   <button
                     disabled={isLoading}
                     onClick={() => handleDecision(job.id, false)}
-                    className="flex items-center gap-1.5 px-3.5 py-1.5 bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-500/30 rounded-lg text-sm font-medium transition disabled:opacity-50"
+                    className="flex items-center justify-center gap-1.5 px-3.5 py-2 sm:py-1.5 bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-500/30 rounded-lg text-sm font-medium transition disabled:opacity-50 w-full sm:w-auto"
                   >
                     <XCircle className="w-4 h-4 text-red-400" /> Reject
                   </button>
                   <button
                     disabled={isLoading}
                     onClick={() => handleDecision(job.id, true)}
-                    className="flex items-center gap-1.5 px-4 py-1.5 bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 rounded-lg text-sm font-semibold transition disabled:opacity-50 shadow-sm"
+                    className="flex items-center justify-center gap-1.5 px-4 py-2 sm:py-1.5 bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 rounded-lg text-sm font-semibold transition disabled:opacity-50 shadow-sm w-full sm:w-auto"
                   >
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" /> Approve & Execute
                   </button>

@@ -270,7 +270,7 @@ export const ProjectDocumentsSection: React.FC<ProjectDocumentsSectionProps> = (
                   disabled={saving}
                   aria-label={`Remove ${doc.title}`}
                   title="Remove document"
-                  className="p-1 rounded-lg text-slate-500 hover:text-red-400 hover:bg-slate-800 transition disabled:opacity-40 shrink-0"
+                  className="p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-slate-800 transition disabled:opacity-40 shrink-0 min-w-[32px] min-h-[32px] flex items-center justify-center cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>

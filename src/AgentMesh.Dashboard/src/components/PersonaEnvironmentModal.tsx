@@ -422,7 +422,7 @@ export const PersonaEnvironmentModal: React.FC<PersonaEnvironmentModalProps> = (
         </div>
 
         {/* Footer */}
-        <div className="p-3 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-500 bg-slate-900/40">
+        <div className="p-3 border-t border-slate-800/80 flex items-center justify-between gap-2 text-[11px] text-slate-500 bg-slate-900/40 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           <span>Driver authentication &amp; model discovery are managed in Driver Configuration.</span>
           <button
             onClick={onClose}

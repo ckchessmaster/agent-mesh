@@ -43,8 +43,8 @@ export function renderInlineMarkdown(text: string, isUser = false): React.ReactN
           rel="noopener noreferrer"
           className={
             isUser
-              ? 'underline font-medium text-sky-200 hover:text-white transition'
-              : 'underline underline-offset-2 font-medium text-sky-400 hover:text-sky-300 transition'
+              ? 'underline font-medium text-sky-200 hover:text-white transition break-all'
+              : 'underline underline-offset-2 font-medium text-sky-400 hover:text-sky-300 transition break-all'
           }
         >
           {label}
@@ -355,7 +355,7 @@ export const MarkdownMessage: React.FC<MarkdownMessageProps> = ({
     nodes.push(
       <p
         key={`p-${i}`}
-        className={`my-1 text-xs leading-relaxed ${
+        className={`my-1 text-xs leading-relaxed break-words [overflow-wrap:anywhere] ${
           isUser ? 'text-sky-100' : 'text-slate-200'
         }`}
       >
@@ -368,7 +368,7 @@ export const MarkdownMessage: React.FC<MarkdownMessageProps> = ({
   if (inAlert) flushAlert('alert-final');
 
   return (
-    <div className={`space-y-0.5 select-text ${className}`}>
+    <div className={`space-y-0.5 select-text break-words [overflow-wrap:anywhere] ${className}`}>
       {nodes}
     </div>
   );
