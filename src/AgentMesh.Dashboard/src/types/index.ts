@@ -452,7 +452,8 @@ export type ProjectJobPriority = (typeof ProjectJobPriority)[keyof typeof Projec
 
 export const PlanApprovalPolicy = {
   LeadOrHuman: 0,
-  HumanOnly: 1
+  HumanOnly: 1,
+  Autonomous: 2
 } as const;
 export type PlanApprovalPolicy = (typeof PlanApprovalPolicy)[keyof typeof PlanApprovalPolicy];
 

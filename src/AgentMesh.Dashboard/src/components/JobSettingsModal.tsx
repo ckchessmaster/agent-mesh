@@ -56,7 +56,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
   const [gitBranch, setGitBranch] = useState(job.gitBranchName || '');
   const [priority, setPriority] = useState<number>(job.priority ?? 1);
   const [status, setStatus] = useState<ProjectJobStatus>((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
-  const [approvalPolicy, setApprovalPolicy] = useState<number>(job.approvalPolicy ?? PlanApprovalPolicy.LeadOrHuman);
+  const [approvalPolicy, setApprovalPolicy] = useState<number>(job.approvalPolicy ?? PlanApprovalPolicy.Autonomous);
   const [resultSummary, setResultSummary] = useState(job.resultSummary || '');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -71,7 +71,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
       setGitBranch(job.gitBranchName || '');
       setPriority(job.priority ?? 1);
       setStatus((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
-      setApprovalPolicy(job.approvalPolicy ?? PlanApprovalPolicy.LeadOrHuman);
+      setApprovalPolicy(job.approvalPolicy ?? PlanApprovalPolicy.Autonomous);
       setResultSummary(job.resultSummary || '');
       setConfirmDelete(false);
       setError(null);
@@ -254,7 +254,8 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
                 data-testid="job-settings-policy-select"
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
               >
-                <option value={PlanApprovalPolicy.LeadOrHuman}>Lead or Human (Default)</option>
+                <option value={PlanApprovalPolicy.Autonomous}>Autonomous (Default)</option>
+                <option value={PlanApprovalPolicy.LeadOrHuman}>Lead or Human</option>
                 <option value={PlanApprovalPolicy.HumanOnly}>Human Operator Only</option>
               </select>
             </div>

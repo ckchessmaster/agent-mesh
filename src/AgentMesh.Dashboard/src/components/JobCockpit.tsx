@@ -1623,7 +1623,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
                   {job.approvalPolicy === PlanApprovalPolicy.HumanOnly || job.approvalPolicy === 1
                     ? 'Human Only'
-                    : 'Lead or Human'}
+                    : job.approvalPolicy === PlanApprovalPolicy.Autonomous || job.approvalPolicy === 2
+                      ? 'Autonomous'
+                      : 'Lead or Human'}
                 </span>
               </div>
               <p className="text-[11px] text-slate-300">

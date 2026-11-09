@@ -16,7 +16,7 @@ public class AgentJob
     public ApprovalStatus ApprovalStatus { get; set; } = ApprovalStatus.AutoApproved;
     public ExecutionStatus ExecutionStatus { get; set; } = ExecutionStatus.Staged;
     public string? TemporalWorkflowId { get; set; }
-    public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.LeadOrHuman;
+    public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.Autonomous;
     public string? CurrentTaskId { get; set; }
     public string? ProgressHeartbeat { get; set; }
     public string? AssignedAgentId { get; set; }

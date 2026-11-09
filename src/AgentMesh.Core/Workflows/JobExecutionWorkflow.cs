@@ -41,10 +41,13 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     private List<ChecklistTaskItem> _tasks = new();
     private int _currentTaskIndex = 0;
     private string _currentHeartbeat = "Initializing job";
+    private PlanApprovalPolicy _approvalPolicy = PlanApprovalPolicy.Autonomous;
 
     [WorkflowRun]
     public async Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input)
     {
+        _approvalPolicy = input.ApprovalPolicy;
+
         // 1. Stage 1: Discovery & Planning Loop
         _currentHeartbeat = "Exploring codebase and generating checklist";
         int discoveryTurns = 0;
@@ -115,39 +118,46 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
         }
         else
         {
-            if (_currentHeartbeat.StartsWith("Exploring", StringComparison.OrdinalIgnoreCase) ||
-                _currentHeartbeat.StartsWith("Awaiting user input", StringComparison.OrdinalIgnoreCase) ||
-                _currentHeartbeat.StartsWith("Resuming", StringComparison.OrdinalIgnoreCase))
+            if (input.ApprovalPolicy == PlanApprovalPolicy.Autonomous)
             {
-                _currentHeartbeat = "Awaiting plan approval";
+                _currentHeartbeat = "Plan auto-approved. Starting implementation";
             }
-
-            // 2. Stage 2: Plan Approval Gate
-            await Workflow.WaitConditionAsync(() =>
+            else
             {
-                if (_tasks.Count == 0 || _planApproval == null) return false;
-                var isApproved = input.ApprovalPolicy switch
+                if (_currentHeartbeat.StartsWith("Exploring", StringComparison.OrdinalIgnoreCase) ||
+                    _currentHeartbeat.StartsWith("Awaiting user input", StringComparison.OrdinalIgnoreCase) ||
+                    _currentHeartbeat.StartsWith("Resuming", StringComparison.OrdinalIgnoreCase))
                 {
-                    PlanApprovalPolicy.LeadOrHuman =>
-                        _planApproval.ApproverRole is "operator" or "tech_lead",
-                    PlanApprovalPolicy.HumanOnly =>
-                        _planApproval.ApproverRole == "operator",
-                    _ => false
-                };
-
-                if (!isApproved)
-                {
-                    // Explicitly discard rejected approval signal so it does not linger
-                    var rejectedRole = _planApproval.ApproverRole;
-                    _planApproval = null;
-                    _currentHeartbeat = $"Plan approval rejected: role '{rejectedRole}' is not permitted by policy {input.ApprovalPolicy}";
-                    return false;
+                    _currentHeartbeat = "Awaiting plan approval";
                 }
 
-                return true;
-            });
+                // 2. Stage 2: Plan Approval Gate
+                await Workflow.WaitConditionAsync(() =>
+                {
+                    if (_tasks.Count == 0 || _planApproval == null) return false;
+                    var isApproved = input.ApprovalPolicy switch
+                    {
+                        PlanApprovalPolicy.LeadOrHuman =>
+                            _planApproval.ApproverRole is "operator" or "tech_lead",
+                        PlanApprovalPolicy.HumanOnly =>
+                            _planApproval.ApproverRole == "operator",
+                        _ => false
+                    };
 
-            _currentHeartbeat = "Plan approved. Starting implementation";
+                    if (!isApproved)
+                    {
+                        // Explicitly discard rejected approval signal so it does not linger
+                        var rejectedRole = _planApproval.ApproverRole;
+                        _planApproval = null;
+                        _currentHeartbeat = $"Plan approval rejected: role '{rejectedRole}' is not permitted by policy {input.ApprovalPolicy}";
+                        return false;
+                    }
+
+                    return true;
+                });
+
+                _currentHeartbeat = "Plan approved. Starting implementation";
+            }
 
             // 3. Stage 3: Autonomous Task Iteration Loop
             while (_currentTaskIndex < _tasks.Count)
@@ -194,10 +204,14 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                     return new JobExecutionResult(Success: false, Summary: $"Task failed: {turnOutcome.Message}");
                 }
 
-                if (turnOutcome.Status is TurnOutcomeStatus.Continue or TurnOutcomeStatus.TaskCompleted or TurnOutcomeStatus.PrOpenedAwaitingReview)
+                if (turnOutcome.Status is TurnOutcomeStatus.TaskCompleted or TurnOutcomeStatus.PrOpenedAwaitingReview)
                 {
                     _currentHeartbeat = $"Completed task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
                     _currentTaskIndex++;
+                }
+                else if (turnOutcome.Status == TurnOutcomeStatus.Continue)
+                {
+                    _currentHeartbeat = $"Continuing task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
                 }
             }
         }
@@ -295,7 +309,9 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     public Task ReceiveSetChecklistAsync(List<ChecklistTaskItem> tasks)
     {
         _tasks = tasks ?? new();
-        _currentHeartbeat = "Checklist registered. Awaiting plan approval.";
+        _currentHeartbeat = _approvalPolicy == PlanApprovalPolicy.Autonomous
+            ? "Checklist registered. Auto-approving plan."
+            : "Checklist registered. Awaiting plan approval.";
         return Task.CompletedTask;
     }
 

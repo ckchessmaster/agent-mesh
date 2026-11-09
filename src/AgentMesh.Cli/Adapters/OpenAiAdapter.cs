@@ -177,7 +177,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         if (int.TryParse(Environment.GetEnvironmentVariable("AGENT_MAX_STEPS"), out var agentSteps) && agentSteps > 0)
             return agentSteps;
 
-        return isDiscoveryPhase ? 15 : 25;
+        return 50;
     }
 
     public static int GetRetryDelayMilliseconds(HttpResponseMessage? response, int attempt, AgentPresetConfig? preset = null)
@@ -1623,7 +1623,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             await onEvent(new TrajectoryEventPayload
             {
                 EventType = "thought",
-                Content = $"[@{preset.Id}] Reached maximum tool execution steps limit ({maxSteps}). Requesting final summary..."
+                Content = $"[@{preset.Id}] Reached progress checkpoint ({maxSteps} steps). Generating status summary..."
             });
 
             string? summaryContent = null;
@@ -1634,7 +1634,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     new OpenAiMessage
                     {
                         Role = "user",
-                        Content = $"[System Notice: You have reached the maximum allowed tool execution steps limit ({maxSteps}) for this turn. Please summarize what you have accomplished so far, the current status of your changes, and what next steps remain so the operator can review and continue.]"
+                        Content = $"[System Notice: You have reached the {maxSteps}-step progress checkpoint for this turn. Please summarize what you have accomplished so far, the current status of your changes, and what next steps remain.]"
                     }
                 };
 
@@ -1684,9 +1684,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 // Fall back to canned summary if completion call fails
             }
 
-            var finalMsg = !string.IsNullOrWhiteSpace(summaryContent)
+            var summaryBody = !string.IsNullOrWhiteSpace(summaryContent)
                 ? summaryContent.Trim()
-                : $"⚠️ Agent `@{preset.Id}` reached maximum tool execution steps limit ({maxSteps}). Current progress has been preserved in workspace. Please reply with instructions or 'continue' to resume.";
+                : $"Agent `@{preset.Id}` reached the {maxSteps}-step progress checkpoint. Progress has been preserved in workspace.";
+
+            var finalMsg = $"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n\n{summaryBody}\n\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*";
 
             sw.Stop();
             var duration = sw.Elapsed.TotalSeconds;

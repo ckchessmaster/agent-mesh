@@ -1396,13 +1396,13 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                     await onEvent(new TrajectoryEventPayload
                                     {
                                         EventType = "thought",
-                                        Content = $"[@{preset.Id}] Reached maximum tool execution steps limit ({maxSteps}). Concluding turn."
+                                        Content = $"[@{preset.Id}] Reached progress checkpoint ({maxSteps} steps). Concluding turn to roll over."
                                     });
                                     AgentAdapterFactory.KillProcessTree(proc);
                                     await onEvent(new TrajectoryEventPayload
                                     {
                                         EventType = "response",
-                                        Content = $"⚠️ Agent `@{preset.Id}` reached maximum tool execution steps limit ({maxSteps}). Current progress has been preserved in workspace. Please reply with instructions or 'continue' to resume."
+                                        Content = $"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n\nAgent `@{preset.Id}` reached the {maxSteps}-step progress limit. Current progress has been preserved in workspace.\n\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*"
                                     });
                                     return;
                                 }
