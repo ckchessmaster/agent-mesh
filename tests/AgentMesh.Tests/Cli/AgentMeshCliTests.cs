@@ -603,4 +603,91 @@ public class AgentMeshCliTests
         var extracted = AgentMesh.Api.Controllers.SessionsController.ExtractConversationId(updated);
         extracted.Should().Be("conv-test-1234");
     }
+
+    private static AgentRunnerInstance CreateTestRunner(string agentId = "spence-ai", string? personaId = "rook")
+    {
+        var preset = new AgentPresetConfig
+        {
+            Id = agentId,
+            Name = agentId,
+            Role = "engineer",
+            AdapterType = "openai",
+            PersonaId = personaId
+        };
+        var tempConfigPath = Path.Combine(Path.GetTempPath(), $"cfg-{Guid.NewGuid()}.json");
+        var store = new ConfigStore(tempConfigPath);
+        var client = new MeshClient(new CliConfig { MeshUrl = "http://localhost:5000", MasterToken = "test" }, store);
+        return new AgentRunnerInstance(preset, client, "http://localhost:5000", (_, _) => { }, () => { });
+    }
+
+    [Fact]
+    public void HandleStopExecution_WhenTargetSessionDiffers_DoesNotCancelActiveTurn()
+    {
+        var runner = CreateTestRunner("spence-ai", "rook");
+        var activeSid = Guid.NewGuid();
+        var otherSid = Guid.NewGuid();
+        using var cts = new CancellationTokenSource();
+        runner.SetActiveTurnForTesting(activeSid, cts);
+
+        // StopExecution for a completely different session, even with matching agent/persona
+        runner.HandleStopExecution(otherSid, "spence-ai", "rook", "Operator clicked stop");
+
+        cts.IsCancellationRequested.Should().BeFalse("stopping another session must not cancel active turn of different session");
+    }
+
+    [Fact]
+    public void HandleStopExecution_WhenTargetSessionMatches_CancelsActiveTurn()
+    {
+        var runner = CreateTestRunner("spence-ai", "rook");
+        var activeSid = Guid.NewGuid();
+        using var cts = new CancellationTokenSource();
+        runner.SetActiveTurnForTesting(activeSid, cts);
+
+        runner.HandleStopExecution(activeSid, "spence-ai", "rook", "Operator clicked stop");
+
+        cts.IsCancellationRequested.Should().BeTrue("stopping the active session must cancel active turn");
+    }
+
+    [Fact]
+    public void HandleStopExecution_WhenNoSessionSpecified_IgnoresEmptyOrDifferentAgent()
+    {
+        var runner = CreateTestRunner("spence-ai", "rook");
+        var activeSid = Guid.NewGuid();
+        using var cts = new CancellationTokenSource();
+        runner.SetActiveTurnForTesting(activeSid, cts);
+
+        // Blank agent/persona should not match all runners
+        runner.HandleStopExecution(null, null, null, "Operator clicked stop");
+        cts.IsCancellationRequested.Should().BeFalse();
+
+        // Different agent should not cancel
+        runner.HandleStopExecution(null, "other-agent", "other-persona", "Operator clicked stop");
+        cts.IsCancellationRequested.Should().BeFalse();
+    }
+
+    [Fact]
+    public void HandleStopExecution_WhenNoSessionSpecified_CancelsIfAgentMatchesExplicitly()
+    {
+        var runner = CreateTestRunner("spence-ai", "rook");
+        var activeSid = Guid.NewGuid();
+        using var cts = new CancellationTokenSource();
+        runner.SetActiveTurnForTesting(activeSid, cts);
+
+        runner.HandleStopExecution(null, "@spence-ai", null, "Operator clicked stop");
+        cts.IsCancellationRequested.Should().BeTrue();
+    }
+
+    [Fact]
+    public void HandleStopCommand_WhenTargetSessionDiffers_DoesNotCancelActiveTurn()
+    {
+        var runner = CreateTestRunner("spence-ai", "rook");
+        var activeSid = Guid.NewGuid();
+        var otherSid = Guid.NewGuid();
+        using var cts = new CancellationTokenSource();
+        runner.SetActiveTurnForTesting(activeSid, cts);
+
+        runner.HandleStopCommand(otherSid, "cmd-123", "spence-ai");
+
+        cts.IsCancellationRequested.Should().BeFalse("stopping a command in another session must not cancel active turn");
+    }
 }

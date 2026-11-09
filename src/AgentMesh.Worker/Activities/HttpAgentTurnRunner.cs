@@ -890,7 +890,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
 
         if (status is "error" or "stopped" ||
             string.Equals(state.LastSessionMessageType, "error", StringComparison.OrdinalIgnoreCase) ||
-            (state.LastSessionMessageContent?.StartsWith("❌") == true))
+            (state.LastSessionMessageContent?.StartsWith("❌") == true) ||
+            (state.LastSessionMessageContent?.StartsWith("🛑") == true))
         {
             var detail = state.LastSessionMessageContent ??
                 $"Turn session ended in status '{state.SessionStatus}' without opening a pull request " +
