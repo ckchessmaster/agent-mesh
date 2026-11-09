@@ -106,8 +106,24 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 continue;
             }
 
-            // Completed or Continue without setting checklist yet
+            if (discoveryOutcome.Status == TurnOutcomeStatus.Continue)
+            {
+                _currentHeartbeat = $"Continuing discovery turn {discoveryTurns + 1}/{maxDiscoveryTurns}";
+                continue;
+            }
+
+            // Completed or other status without setting checklist yet
             break;
+        }
+
+        if (_tasks.Count == 0 && string.IsNullOrWhiteSpace(activePrUrl))
+        {
+            // If discovery completed without setting a checklist, provide a fallback task
+            // so the workflow proceeds to implementation rather than stalling at the review gate.
+            _tasks.Add(new ChecklistTaskItem(
+                Title: !string.IsNullOrWhiteSpace(input.InitialPrompt) ? input.InitialPrompt : "Execute job implementation",
+                TargetFile: null,
+                VerificationMethod: null));
         }
 
         if (!string.IsNullOrWhiteSpace(activePrUrl))

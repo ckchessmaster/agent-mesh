@@ -916,6 +916,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var streamRetryAttempt = 0;
         var responseEmitted = false;
         var askedQuestion = false;
+        var filesInspected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var filesModified = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var commandsRun = new List<string>();
+        string? lastActionSummary = null;
         long totalInputTokens = 0;
         long totalOutputTokens = 0;
         long totalTokens = 0;
@@ -1365,6 +1369,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                     // Normal tool execution
                     var summary = FormatToolSummary(toolName, toolArgs);
+                    lastActionSummary = summary;
+                    TrackToolActivity(toolName, toolArgs, filesInspected, filesModified, commandsRun);
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "tool_call",
@@ -1511,6 +1517,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 }
 
                 var summary = FormatToolSummary(fbName, fbArgs ?? "{}");
+                lastActionSummary = summary;
+                TrackToolActivity(fbName, fbArgs ?? "{}", filesInspected, filesModified, commandsRun);
                 await onEvent(new TrajectoryEventPayload
                 {
                     EventType = "tool_call",
@@ -1684,11 +1692,46 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 // Fall back to canned summary if completion call fails
             }
 
-            var summaryBody = !string.IsNullOrWhiteSpace(summaryContent)
-                ? summaryContent.Trim()
-                : $"Agent `@{preset.Id}` reached the {maxSteps}-step progress checkpoint. Progress has been preserved in workspace.";
+            var detailsSb = new StringBuilder();
+            detailsSb.AppendLine($"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n");
+            if (!string.IsNullOrWhiteSpace(summaryContent))
+            {
+                detailsSb.AppendLine(summaryContent.Trim());
+                detailsSb.AppendLine();
+            }
+            else
+            {
+                detailsSb.AppendLine($"Agent `@{preset.Id}` reached the {maxSteps}-step progress checkpoint.");
+                if (!string.IsNullOrWhiteSpace(lastActionSummary))
+                {
+                    detailsSb.AppendLine($"**Current Activity**: {lastActionSummary}");
+                }
+                detailsSb.AppendLine();
+            }
 
-            var finalMsg = $"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n\n{summaryBody}\n\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*";
+            detailsSb.AppendLine("**Turn Progress & Workspace Activity**:");
+            detailsSb.AppendLine($"- **Steps**: {stepCount} completed");
+            if (filesModified.Count > 0)
+            {
+                var modFiles = string.Join(", ", filesModified.Select(f => $"`{Path.GetFileName(f)}`"));
+                detailsSb.AppendLine($"- **Files Modified** ({filesModified.Count}): {modFiles}");
+            }
+            if (filesInspected.Count > 0)
+            {
+                var inspFiles = string.Join(", ", filesInspected.Take(5).Select(f => $"`{Path.GetFileName(f)}`"));
+                var extra = filesInspected.Count > 5 ? $" (+{filesInspected.Count - 5} more)" : "";
+                detailsSb.AppendLine($"- **Files Inspected** ({filesInspected.Count}): {inspFiles}{extra}");
+            }
+            if (commandsRun.Count > 0)
+            {
+                var cmds = string.Join(", ", commandsRun.Take(3).Select(c => $"`{(c.Length > 40 ? c[..37] + "..." : c)}`"));
+                var extraCmds = commandsRun.Count > 3 ? $" (+{commandsRun.Count - 3} more)" : "";
+                detailsSb.AppendLine($"- **Commands Run** ({commandsRun.Count}): {cmds}{extraCmds}");
+            }
+
+            detailsSb.Append("\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*");
+
+            var finalMsg = detailsSb.ToString();
 
             sw.Stop();
             var duration = sw.Elapsed.TotalSeconds;
@@ -2314,6 +2357,37 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         {
             return $"Executing {toolName}";
         }
+    }
+
+    private static void TrackToolActivity(
+        string toolName,
+        string argsJson,
+        HashSet<string> filesInspected,
+        HashSet<string> filesModified,
+        List<string> commandsRun)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+            var root = doc.RootElement;
+            var tnLower = toolName.ToLowerInvariant();
+            if (tnLower is "run_command" or "bash")
+            {
+                var cmd = GetPropertyString(root, "command", "CommandLine", "cmd");
+                if (!string.IsNullOrWhiteSpace(cmd)) commandsRun.Add(cmd);
+            }
+            else if (tnLower.Contains("write") || tnLower.Contains("edit") || tnLower.Contains("replace") || tnLower.Contains("modify") || tnLower.Contains("patch"))
+            {
+                var path = GetPropertyString(root, "path", "Path", "file_path", "TargetFile", "AbsolutePath");
+                if (!string.IsNullOrWhiteSpace(path)) filesModified.Add(path);
+            }
+            else if (tnLower.Contains("read") || tnLower.Contains("view") || tnLower.Contains("inspect"))
+            {
+                var path = GetPropertyString(root, "path", "Path", "file_path", "TargetFile", "AbsolutePath");
+                if (!string.IsNullOrWhiteSpace(path)) filesInspected.Add(path);
+            }
+        }
+        catch { }
     }
 
     internal static bool IsMutatingGitCommand(string command)

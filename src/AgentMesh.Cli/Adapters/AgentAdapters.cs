@@ -1195,6 +1195,11 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var agyStepCount = 0;
         var agyReadOnlyStreak = 0;
         var agyWarnedBudget = false;
+        var agyFilesInspected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var agyFilesModified = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var agyCommandsRun = new List<string>();
+        string? agyLastActionSummary = null;
+        string? agyLatestThought = null;
 
         try
         {
@@ -1327,13 +1332,37 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                 if (tiProp.TryGetProperty("parameters", out var paramsProp))
                                 {
                                     argsJson = paramsProp.GetRawText();
-                                    if (paramsProp.TryGetProperty("CommandLine", out var cmdProp))
+                                    if (paramsProp.TryGetProperty("CommandLine", out var cmdProp) ||
+                                        paramsProp.TryGetProperty("command", out cmdProp) ||
+                                        paramsProp.TryGetProperty("cmd", out cmdProp))
                                     {
-                                        summary = $"Running command: {cmdProp.GetString()}";
+                                        var cmdVal = cmdProp.GetString();
+                                        if (!string.IsNullOrWhiteSpace(cmdVal))
+                                        {
+                                            summary = $"Running command: {cmdVal}";
+                                            agyCommandsRun.Add(cmdVal);
+                                        }
                                     }
-                                    else if (paramsProp.TryGetProperty("AbsolutePath", out var pathProp))
+                                    else if (paramsProp.TryGetProperty("AbsolutePath", out var pathProp) ||
+                                             paramsProp.TryGetProperty("TargetFile", out pathProp) ||
+                                             paramsProp.TryGetProperty("path", out pathProp) ||
+                                             paramsProp.TryGetProperty("file_path", out pathProp))
                                     {
-                                        summary = $"Inspecting file: {Path.GetFileName(pathProp.GetString())}";
+                                        var pVal = pathProp.GetString();
+                                        if (!string.IsNullOrWhiteSpace(pVal))
+                                        {
+                                            var tnLower = toolName.ToLowerInvariant();
+                                            if (tnLower.Contains("write") || tnLower.Contains("edit") || tnLower.Contains("replace") || tnLower.Contains("modify") || tnLower.Contains("patch"))
+                                            {
+                                                agyFilesModified.Add(pVal);
+                                                summary = $"Modifying file: {Path.GetFileName(pVal)}";
+                                            }
+                                            else
+                                            {
+                                                agyFilesInspected.Add(pVal);
+                                                summary = $"Inspecting file: {Path.GetFileName(pVal)}";
+                                            }
+                                        }
                                     }
                                 }
                                 if (tiProp.TryGetProperty("output", out var outProp))
@@ -1343,6 +1372,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                         : outProp.GetRawText();
                                 }
                             }
+                            agyLastActionSummary = summary;
 
                             ct.ThrowIfCancellationRequested();
                             if (state == "ACTIVE")
@@ -1399,10 +1429,53 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                         Content = $"[@{preset.Id}] Reached progress checkpoint ({maxSteps} steps). Concluding turn to roll over."
                                     });
                                     AgentAdapterFactory.KillProcessTree(proc);
+
+                                    var detailsSb = new StringBuilder();
+                                    detailsSb.AppendLine($"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n");
+                                    detailsSb.AppendLine($"Agent `@{preset.Id}` reached the {maxSteps}-step progress limit for this turn and is rolling over.\n");
+
+                                    if (!string.IsNullOrWhiteSpace(agyLastActionSummary))
+                                    {
+                                        detailsSb.AppendLine($"**Current Activity**: {agyLastActionSummary}");
+                                    }
+
+                                    var partialText = streamedResponseBuilder.ToString().Trim();
+                                    if (!string.IsNullOrWhiteSpace(partialText))
+                                    {
+                                        var clippedText = partialText.Length > 400 ? partialText[..400] + "..." : partialText;
+                                        detailsSb.AppendLine($"**Agent Status Output**:\n{clippedText}\n");
+                                    }
+                                    else if (!string.IsNullOrWhiteSpace(agyLatestThought))
+                                    {
+                                        detailsSb.AppendLine($"**Recent Thought**: \"{agyLatestThought}\"\n");
+                                    }
+
+                                    detailsSb.AppendLine("**Turn Progress & Workspace Activity**:");
+                                    detailsSb.AppendLine($"- **Steps**: {agyStepCount} completed");
+                                    if (agyFilesModified.Count > 0)
+                                    {
+                                        var modFiles = string.Join(", ", agyFilesModified.Select(f => $"`{Path.GetFileName(f)}`"));
+                                        detailsSb.AppendLine($"- **Files Modified** ({agyFilesModified.Count}): {modFiles}");
+                                    }
+                                    if (agyFilesInspected.Count > 0)
+                                    {
+                                        var inspFiles = string.Join(", ", agyFilesInspected.Take(5).Select(f => $"`{Path.GetFileName(f)}`"));
+                                        var extra = agyFilesInspected.Count > 5 ? $" (+{agyFilesInspected.Count - 5} more)" : "";
+                                        detailsSb.AppendLine($"- **Files Inspected** ({agyFilesInspected.Count}): {inspFiles}{extra}");
+                                    }
+                                    if (agyCommandsRun.Count > 0)
+                                    {
+                                        var cmds = string.Join(", ", agyCommandsRun.Take(3).Select(c => $"`{(c.Length > 40 ? c[..37] + "..." : c)}`"));
+                                        var extraCmds = agyCommandsRun.Count > 3 ? $" (+{agyCommandsRun.Count - 3} more)" : "";
+                                        detailsSb.AppendLine($"- **Commands Run** ({agyCommandsRun.Count}): {cmds}{extraCmds}");
+                                    }
+
+                                    detailsSb.Append("\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*");
+
                                     await onEvent(new TrajectoryEventPayload
                                     {
                                         EventType = "response",
-                                        Content = $"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n\nAgent `@{preset.Id}` reached the {maxSteps}-step progress limit. Current progress has been preserved in workspace.\n\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*"
+                                        Content = detailsSb.ToString()
                                     });
                                     return;
                                 }

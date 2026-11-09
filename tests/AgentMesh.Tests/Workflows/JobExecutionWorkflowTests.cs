@@ -580,6 +580,86 @@ public class JobExecutionWorkflowTests
         }
     }
 
+    [Fact]
+    public async Task JobWorkflow_ContinuesDiscovery_WhenOutcomeIsContinueTurn()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity((Func<DiscoveryTurnInput, Task<TurnOutcome>>)execution.RunAgentDiscoveryTurnAsync)
+            .AddActivity((Func<CodingTurnInput, Task<TurnOutcome>>)execution.RunJobCodingTurnAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+            .AddWorkflow<JobExecutionWorkflow>();
+        workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "autonomous-agent",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace",
+                InitialPrompt: "Multi-turn discovery job",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.Autonomous
+            );
+
+            int discoveryTurns = 0;
+            execution.CustomDiscoveryHandler = async _ =>
+            {
+                discoveryTurns++;
+                if (discoveryTurns == 1)
+                {
+                    // Discovery turn 1 reaches 50 steps limit and rolls over with Continue
+                    return TurnOutcome.ContinueTurn("Reached 50 steps checkpoint during discovery.");
+                }
+
+                // Discovery turn 2 completes and registers checklist
+                var handle = env.Client.GetWorkflowHandle<JobExecutionWorkflow>($"job-{jobId}");
+                await handle.SignalAsync(wf => wf.ReceiveSetChecklistAsync(new List<ChecklistTaskItem>
+                {
+                    new("Task 1: Implementation", "src/Impl.cs", "dotnet test")
+                }));
+                return TurnOutcome.Completed("Discovery completed.");
+            };
+
+            execution.CustomCodingHandler = inputParam =>
+            {
+                return Task.FromResult(TurnOutcome.Completed(
+                    $"Completed: {inputParam.CurrentTask.Title}",
+                    prUrl: "https://github.com/ckchessmaster/agent-mesh/pull/99",
+                    prNumber: 99));
+            };
+
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting pull request review"));
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("lead", true, "LGTM", DateTimeOffset.UtcNow, 99)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+
+            execution.DiscoveryTurnCount.Should().Be(2, "Workflow must continue discovery to turn 2 after TurnOutcome.ContinueTurn");
+            execution.CodingTurnCount.Should().Be(1);
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     private static async Task WaitUntilAsync(
         WorkflowHandle<JobExecutionWorkflow, JobExecutionResult> handle,
         Func<JobWorkflowState, bool> predicate,

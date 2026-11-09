@@ -161,7 +161,7 @@ describe('DriverConfigModal', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('hides step limits for CLI-backed drivers, since those adapters have no step loop', () => {
+  it('shows turn limits for CLI-backed drivers (e.g. agy / claude)', () => {
     render(
       <DriverConfigModal
         agent={cliAgent}
@@ -171,12 +171,13 @@ describe('DriverConfigModal', () => {
       />
     );
 
-    expect(screen.queryByLabelText(/Max steps per turn/i)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/Request timeout/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/controlled by that tool/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Max steps per turn/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Request timeout/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Max retries/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Endpoint URL/i)).not.toBeInTheDocument();
   });
 
-  it('does not send limit fields for a CLI driver even if endpoint is edited', async () => {
+  it('allows saving maxSteps for CLI drivers', async () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     render(
       <DriverConfigModal
@@ -187,8 +188,10 @@ describe('DriverConfigModal', () => {
       />
     );
 
+    fireEvent.change(screen.getByLabelText(/Max steps per turn/i), { target: { value: '80' } });
     fireEvent.submit(screen.getByRole('button', { name: /Save/i }).closest('form')!);
-    await waitFor(() => expect(onSave).not.toHaveBeenCalled());
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith({ maxSteps: 80 }));
   });
 
   it('shows stored capabilities read-only', () => {

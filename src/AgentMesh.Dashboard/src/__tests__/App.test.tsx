@@ -2301,7 +2301,7 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     });
   });
 
-  it('does not offer turn limits for CLI drivers, which have no step loop to configure', async () => {
+  it('offers turn limits for CLI drivers while hiding endpoint and connection settings', async () => {
     const cliDriver: Agent = {
       id: 'claude',
       name: 'Claude Code CLI',
@@ -2327,8 +2327,10 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     fireEvent.click(screen.getByRole('button', { name: 'Configure Claude Code CLI driver settings' }));
     await screen.findByRole('dialog', { name: 'Configure driver Claude Code CLI' });
 
-    expect(screen.queryByLabelText(/Max steps per turn/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/Max steps per turn/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Request timeout/i)).toBeInTheDocument();
     expect(screen.queryByLabelText(/Endpoint URL/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^API Key$/i)).not.toBeInTheDocument();
   });
 });
 
