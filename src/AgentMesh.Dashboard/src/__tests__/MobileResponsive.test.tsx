@@ -3,6 +3,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import App from '../App';
 import { JobCockpit } from '../components/JobCockpit';
+import { ProjectList } from '../components/ProjectList';
+import { QuestionCard } from '../components/QuestionCard';
+import { SlashCommandPalette } from '../components/SlashCommandPalette';
+import { TeamMentionPalette } from '../components/TeamMentionPalette';
 import { api } from '../services/api';
 import type { Persona, Project, ProjectJob, AgentUsageResponse } from '../types';
 import { WorkspaceType, ProjectJobStatus } from '../types';
@@ -277,5 +281,160 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     // Clicking backdrop closes drawer
     fireEvent.click(backdrop);
     expect(screen.queryByTestId('job-team-sidebar')).not.toBeInTheDocument();
+  });
+
+  it('renders responsive mobile header and tasks checklist at 375px without breaking or clipping controls', () => {
+    window.innerWidth = 375;
+
+    render(
+      <JobCockpit
+        project={mockProject}
+        job={mockJob}
+        tasks={[
+          {
+            id: 't-1',
+            title: 'Refactor responsive mobile layout',
+            isCompleted: false,
+            status: 'in_progress',
+            assignedPersonaId: 'astra',
+            targetFile: 'src/components/JobCockpit.tsx',
+            verificationMethod: 'vitest test'
+          }
+        ]}
+        messages={[]}
+        personas={[mockPersona]}
+        sessions={[]}
+        onSendMessage={vi.fn()}
+        onAddTask={vi.fn()}
+        onToggleTask={vi.fn()}
+        onDeleteTask={vi.fn()}
+        onCompleteJob={vi.fn()}
+        onUpdateJob={vi.fn()}
+        onToggleJobArtifactsPanel={vi.fn()}
+        jobArtifactCount={2}
+      />
+    );
+
+    // Job title and project badges are present
+    expect(screen.getByText('Mobile Navigation Polish')).toBeInTheDocument();
+    expect(screen.getByText('Mobile Core')).toBeInTheDocument();
+
+    // All mobile header action controls are accessible
+    expect(screen.getByTestId('cockpit-assigned-agent-select')).toBeInTheDocument();
+    expect(screen.getByTestId('cockpit-edit-job-btn')).toBeInTheDocument();
+    expect(screen.getByTestId('toggle-team-sidebar-btn')).toBeInTheDocument();
+    expect(screen.getByTestId('toggle-job-artifacts-btn')).toBeInTheDocument();
+    expect(screen.getByTestId('cockpit-complete-job-btn')).toBeInTheDocument();
+
+    // Deterministic progress meter and task objectives
+    expect(screen.getByTestId('deterministic-progress-meter')).toHaveTextContent(/Task 1 of 1/);
+    expect(screen.getByTestId('toggle-tasks-btn')).toBeInTheDocument();
+  });
+
+  it('renders touch-accessible action buttons in ProjectList on mobile without requiring mouse hover', () => {
+    const onEditProject = vi.fn();
+    const onDeleteProject = vi.fn().mockResolvedValue(undefined);
+    const onDeleteJob = vi.fn().mockResolvedValue(undefined);
+    const onArchiveJob = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ProjectList
+        projects={[mockProject]}
+        selectedProjectId="proj-1"
+        selectedJobId="job-1"
+        jobsByProject={{ 'proj-1': [mockJob] }}
+        onSelectProject={vi.fn()}
+        onSelectJob={vi.fn()}
+        onOpenNewProjectModal={vi.fn()}
+        onOpenNewJobModal={vi.fn()}
+        onEditProject={onEditProject}
+        onDeleteProject={onDeleteProject}
+        onDeleteJob={onDeleteJob}
+        onArchiveJob={onArchiveJob}
+      />
+    );
+
+    // Project delete button is present in DOM with accessible title/label and visible mobile styling
+    const deleteProjectBtn = screen.getByTestId('edit-project-btn-proj-1').parentElement?.querySelector('button[title="Delete Project"]') as HTMLElement;
+    expect(deleteProjectBtn).toBeInTheDocument();
+    expect(deleteProjectBtn.className).toContain('opacity-100');
+
+    // Job action buttons (Archive, Delete) are rendered and touch-visible
+    const archiveBtn = screen.getByTitle('Archive Job');
+    expect(archiveBtn).toBeInTheDocument();
+    expect(archiveBtn.className).toContain('opacity-100');
+
+    const deleteJobBtn = screen.getByTitle('Delete Job');
+    expect(deleteJobBtn).toBeInTheDocument();
+    expect(deleteJobBtn.className).toContain('opacity-100');
+  });
+
+  it('renders responsive QuestionCard with touch-friendly option selection and submission on mobile', async () => {
+    const onSubmit = vi.fn();
+
+    render(
+      <QuestionCard
+        cardKey="test-card"
+        targetId="target-1"
+        parsedQuestions={[
+          {
+            question: 'Which mobile navigation pattern should we use?',
+            options: ['Bottom Navigation Bar', 'Side Hamburger Drawer'],
+            is_multi_select: false
+          }
+        ]}
+        onSubmit={onSubmit}
+      />
+    );
+
+    expect(screen.getByText('Agent Question — Human Input Required')).toBeInTheDocument();
+
+    const bottomNavOption = screen.getByText('Bottom Navigation Bar');
+    expect(bottomNavOption).toBeInTheDocument();
+
+    // Select the option on mobile tap
+    fireEvent.click(bottomNavOption);
+
+    // Submit answer
+    const submitBtn = screen.getByRole('button', { name: /submit answer/i });
+    expect(submitBtn).toBeEnabled();
+    expect(submitBtn.className).toContain('w-full sm:w-auto');
+
+    fireEvent.click(submitBtn);
+    expect(onSubmit).toHaveBeenCalledWith([
+      expect.objectContaining({
+        question: 'Which mobile navigation pattern should we use?',
+        selectedOptions: ['Bottom Navigation Bar']
+      })
+    ]);
+  });
+
+  it('enforces responsive bounded max-width on SlashCommandPalette and TeamMentionPalette', () => {
+    const { rerender } = render(
+      <SlashCommandPalette
+        query="/mesh"
+        isOpen={true}
+        highlightedIndex={0}
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />
+    );
+
+    const slashPalette = screen.getByTestId('slash-command-palette');
+    expect(slashPalette.className).toContain('max-w-[calc(100vw-2rem)]');
+
+    rerender(
+      <TeamMentionPalette
+        members={[{ id: 'astra', name: 'Astra', role: 'Tech Lead', driverId: 'agy' }]}
+        query="ast"
+        isOpen={true}
+        highlightedIndex={0}
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />
+    );
+
+    const mentionPalette = screen.getByTestId('team-mention-palette');
+    expect(mentionPalette.className).toContain('max-w-[calc(100vw-2rem)]');
   });
 });
