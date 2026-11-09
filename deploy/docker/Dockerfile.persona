@@ -5,7 +5,7 @@ ENV NODE_VERSION=22
 ENV PATH="/root/.local/bin:/usr/local/bin:${PATH}"
 ENV TERM="xterm-256color"
 
-# 1. Install base utilities and Python 3
+# 1. Install base utilities, Python 3, GitHub CLI, Node.js, and CLIs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gzip \
     unzip \
     ca-certificates \
+    gnupg \
     procps \
     iproute2 \
     dnsutils \
@@ -23,27 +24,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
-    && rm -rf /var/lib/apt/lists/*
-
-# 2. Install GitHub CLI (gh)
-RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && mkdir -p -m 755 /etc/apt/keyrings \
     && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
     && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/*
-
-# 3. Install Node.js 22 LTS, pnpm, and Claude Code CLI
-RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get update && apt-get install -y --no-install-recommends gh nodejs \
     && npm install -g pnpm @anthropic-ai/claude-code \
+    && curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+    && chmod +x /usr/local/bin/agy \
     && rm -rf /var/lib/apt/lists/*
 
-# 4. Install Antigravity CLI (agy)
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
-    && chmod +x /usr/local/bin/agy
-
-# 5. Build AgentMesh CLI binary
+# 2. Build AgentMesh CLI binary
 WORKDIR /src
 COPY . .
 RUN dotnet publish src/AgentMesh.Cli/AgentMesh.Cli.csproj \
@@ -57,7 +49,7 @@ RUN dotnet publish src/AgentMesh.Cli/AgentMesh.Cli.csproj \
     && chmod +x /usr/local/bin/agentmesh \
     && rm -rf /src
 
-# 6. Prepare workspace, home config dirs & entrypoint
+# 3. Prepare workspace, home config dirs & entrypoint
 RUN mkdir -p /workspace /root/.gemini/antigravity-cli /root/.claude /root/.config \
     && git config --global --add safe.directory '*'
 
