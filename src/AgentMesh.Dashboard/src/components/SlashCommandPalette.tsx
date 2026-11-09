@@ -244,7 +244,7 @@ export const SlashCommandPalette: React.FC<SlashCommandPaletteProps> = ({
   return (
     <div
       ref={containerRef}
-      className="absolute left-0 bottom-full mb-2 w-full min-w-[320px] sm:min-w-[500px] max-w-xl max-h-80 overflow-y-auto rounded-xl bg-slate-900 border border-slate-700 shadow-2xl z-50 p-2 text-xs divide-y divide-slate-800"
+      className="absolute left-0 bottom-full mb-2 w-full min-w-[280px] max-w-[calc(100vw-2rem)] sm:min-w-[500px] sm:max-w-xl max-h-80 overflow-y-auto rounded-xl bg-slate-900 border border-slate-700 shadow-2xl z-50 p-2 text-xs divide-y divide-slate-800"
       data-testid="slash-command-palette"
     >
       <div className="px-2 py-1 flex items-center justify-between text-[11px] font-mono text-slate-400">

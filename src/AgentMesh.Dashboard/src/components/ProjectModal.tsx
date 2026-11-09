@@ -374,7 +374,7 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
           */}
           <ProjectDocumentsSection projectId={editingProject?.id ?? null} />
 
-          <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-800">
+          <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-800 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
             <button
               type="button"
               onClick={onClose}

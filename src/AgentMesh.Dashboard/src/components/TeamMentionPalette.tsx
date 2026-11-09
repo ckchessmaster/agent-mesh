@@ -79,7 +79,7 @@ export const TeamMentionPalette: React.FC<TeamMentionPaletteProps> = ({
   return (
     <div
       ref={containerRef}
-      className="absolute left-0 bottom-full mb-2 w-full min-w-[320px] sm:min-w-[460px] max-w-xl max-h-80 overflow-y-auto rounded-xl bg-slate-900 border border-slate-700 shadow-2xl z-50 p-2 text-xs divide-y divide-slate-800"
+      className="absolute left-0 bottom-full mb-2 w-full min-w-[280px] max-w-[calc(100vw-2rem)] sm:min-w-[460px] sm:max-w-xl max-h-80 overflow-y-auto rounded-xl bg-slate-900 border border-slate-700 shadow-2xl z-50 p-2 text-xs divide-y divide-slate-800"
       data-testid="team-mention-palette"
       role="listbox"
       aria-label="Team member mentions"

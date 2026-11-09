@@ -1258,8 +1258,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       )}
 
       {/* Header Bar */}
-      <div className="px-3 sm:px-6 py-2.5 sm:py-4 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-sm flex items-center justify-between gap-2.5 sm:gap-4 shrink-0">
-        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+      <div className="px-3 sm:px-6 py-2.5 sm:py-3.5 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-sm flex flex-col md:flex-row md:items-center justify-between gap-2.5 sm:gap-4 shrink-0">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 w-full md:w-auto">
           <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-sky-500/15 text-sky-400 border border-sky-500/30 flex items-center justify-center shrink-0">
             <Briefcase className="w-4 h-4" />
           </div>
@@ -1323,7 +1323,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         </div>
 
         {/* Assigned Personas & Actions */}
-        <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+        <div className="flex items-center flex-wrap gap-1.5 sm:gap-2.5 shrink-0 w-full md:w-auto">
           {/* Job Assignee Dropdown */}
           <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl text-xs">
             <span className="text-[11px] font-semibold text-slate-400">Assignee:</span>
@@ -1464,14 +1464,14 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             <div className="flex items-center gap-2">
               <div>
                 {showCompleteConfirm ? (
-                  <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl">
+                  <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl flex-wrap">
                     <input
                       type="text"
                       value={resultSummary}
                       onChange={(e) => setResultSummary(e.target.value)}
                       placeholder="Summary of deliverables (optional)..."
                       data-testid="deliverables-summary-input"
-                      className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none w-48 sm:w-56"
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none w-full sm:w-56"
                     />
                     <button
                       type="button"
@@ -1506,7 +1506,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               {onArchiveJob && (
                 <div>
                   {showArchiveConfirm ? (
-                    <div className="flex items-center gap-2 bg-slate-900 border border-amber-500/40 p-1.5 rounded-xl">
+                    <div className="flex items-center gap-2 bg-slate-900 border border-amber-500/40 p-1.5 rounded-xl flex-wrap">
                       <span className="text-xs text-amber-200">Archive job?</span>
                       <button
                         type="button"
@@ -1543,7 +1543,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               {onResetJob && (
                 <div>
                   {showResetConfirm ? (
-                    <div className="flex items-center gap-2 bg-slate-900 border border-rose-500/40 p-1.5 rounded-xl">
+                    <div className="flex items-center gap-2 bg-slate-900 border border-rose-500/40 p-1.5 rounded-xl flex-wrap">
                       <span className="text-xs text-rose-200">Reset to pending &amp; stop workflow?</span>
                       <button
                         type="button"
@@ -1632,8 +1632,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       {/* Redesigned Task Checklist */}
       <div className="px-3 sm:px-6 py-2 sm:py-3 border-b border-slate-800/60 bg-slate-900/50">
         {/* Task Header & Progress Bar */}
-        <div className="flex items-center justify-between gap-4 mb-2">
-          <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 sm:gap-4 mb-2">
+          <div className="flex items-center flex-wrap gap-2 sm:gap-2.5 min-w-0">
             <button
               type="button"
               onClick={() => setIsTasksExpanded((prev) => !prev)}
@@ -1699,7 +1699,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             ) : null}
           </div>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center justify-between sm:justify-end gap-2 sm:gap-3 w-full sm:w-auto shrink-0">
             {isTasksExpanded && (
               <div className="flex items-center bg-slate-950/80 border border-slate-800 rounded-lg p-0.5 text-[11px]">
                 <button
@@ -1737,7 +1737,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 </button>
               </div>
             )}
-            <div className="w-32 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
+            <div className="w-20 sm:w-32 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
               <div
                 className="h-full bg-emerald-500 transition-all duration-300 rounded-full"
                 style={{ width: `${progressPercent}%` }}
@@ -2388,7 +2388,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             data-testid="job-team-sidebar"
           >
             {/* Sidebar Header */}
-            <div className="p-4 border-b border-slate-800/80 flex items-center justify-between shrink-0 bg-slate-900/40">
+            <div className="p-4 border-b border-slate-800/80 flex items-center justify-between shrink-0 bg-slate-900/40 pt-[max(1rem,env(safe-area-inset-top))]">
               <div className="flex items-center gap-2">
                 <Users className="w-4 h-4 text-sky-400" />
                 <h3 className="text-xs font-bold text-slate-100 uppercase tracking-wider">
@@ -2402,7 +2402,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 <button
                   type="button"
                   onClick={() => setShowTeamSidebar(false)}
-                  className="md:hidden p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                  className="md:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer min-w-[36px] min-h-[36px] flex items-center justify-center"
                   title="Close Team & Activity Sidebar"
                 >
                   <X className="w-4 h-4" />
@@ -2410,7 +2410,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               </div>
             </div>
 
-          <div className="p-4 space-y-4 flex-1">
+          <div className="p-4 space-y-4 flex-1 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
             {/* Active Turn Real-Time Feedback Card (inside sidebar) */}
             {activeTurnInfo?.isActive && (
               <div

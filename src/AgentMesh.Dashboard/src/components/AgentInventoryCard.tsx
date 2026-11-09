@@ -30,7 +30,7 @@ export const AgentInventoryCard: React.FC<{ agent: Agent }> = ({ agent }) => {
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 text-white hover:border-slate-700 transition shadow-lg flex flex-col justify-between">
       <div>
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
           <div className="flex items-center gap-2.5">
             <div className="p-2 bg-sky-950/60 border border-sky-800/40 rounded-lg text-sky-400">
               <Bot className="w-5 h-5" />

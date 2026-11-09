@@ -168,7 +168,9 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                         e.stopPropagation();
                         setConfirmDeleteProjectId(project.id);
                       }}
-                      className="p-1 rounded-md text-slate-500 hover:text-red-400 hover:bg-slate-800 transition opacity-0 group-hover:opacity-100"
+                      title="Delete Project"
+                      aria-label={`Delete project ${project.name}`}
+                      className="p-1 sm:p-1 rounded-md text-slate-500 hover:text-red-400 hover:bg-slate-800 transition opacity-100 sm:opacity-0 sm:group-hover:opacity-100 cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -277,11 +279,12 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                                       <button
                                         type="button"
                                         title="Archive Job"
+                                        aria-label={`Archive job ${job.title}`}
                                         onClick={async (e) => {
                                           e.stopPropagation();
                                           await onArchiveJob(job.id);
                                         }}
-                                        className="p-0.5 text-slate-500 hover:text-amber-400 opacity-0 group-hover/job:opacity-100 transition cursor-pointer"
+                                        className="p-1 sm:p-0.5 text-slate-500 hover:text-amber-400 opacity-100 sm:opacity-0 sm:group-hover/job:opacity-100 transition cursor-pointer"
                                       >
                                         <Archive className="w-3 h-3" />
                                       </button>
@@ -292,7 +295,9 @@ export const ProjectList: React.FC<ProjectListProps> = ({
                                         e.stopPropagation();
                                         setConfirmDeleteJobId(job.id);
                                       }}
-                                      className="p-0.5 text-slate-500 hover:text-red-400 opacity-0 group-hover/job:opacity-100 transition cursor-pointer"
+                                      title="Delete Job"
+                                      aria-label={`Delete job ${job.title}`}
+                                      className="p-1 sm:p-0.5 text-slate-500 hover:text-red-400 opacity-100 sm:opacity-0 sm:group-hover/job:opacity-100 transition cursor-pointer"
                                     >
                                       <Trash2 className="w-3 h-3" />
                                     </button>
