@@ -130,6 +130,20 @@ public class MacroTurnController(
             .FirstOrDefaultAsync(p => p.Id == req.PersonaId.Trim().ToLowerInvariant(), ct);
         if (persona is null)
         {
+            if (!string.IsNullOrWhiteSpace(job.AssignedAgentId))
+            {
+                persona = await db.Personas.AsNoTracking()
+                    .FirstOrDefaultAsync(p => p.Id == job.AssignedAgentId.Trim().ToLowerInvariant(), ct);
+            }
+            if (persona is null && !string.IsNullOrWhiteSpace(project.DefaultLeadPersonaId))
+            {
+                persona = await db.Personas.AsNoTracking()
+                    .FirstOrDefaultAsync(p => p.Id == project.DefaultLeadPersonaId.Trim().ToLowerInvariant(), ct);
+            }
+            persona ??= await db.Personas.AsNoTracking().FirstOrDefaultAsync(ct);
+        }
+        if (persona is null)
+        {
             return NotFound(new { error = $"Persona '{req.PersonaId}' not found." });
         }
 
