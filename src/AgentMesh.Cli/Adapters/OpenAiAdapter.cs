@@ -1694,6 +1694,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             var detailsSb = new StringBuilder();
             detailsSb.AppendLine($"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n");
+            var agentTag = !string.IsNullOrWhiteSpace(promptEvent.PersonaId) ? promptEvent.PersonaId : preset.Id;
+            var personaDisplay = !string.IsNullOrWhiteSpace(promptEvent.PersonaName) ? $" ({promptEvent.PersonaName})" : "";
+            detailsSb.AppendLine($"Agent `@{agentTag}`{personaDisplay} reached the {maxSteps}-step progress limit for this turn and is rolling over.\n");
+
+            var goal = ExtractGoal(promptEvent);
+            if (!string.IsNullOrWhiteSpace(goal))
+            {
+                detailsSb.AppendLine($"**Active Goal**: {goal}\n");
+            }
+
             if (!string.IsNullOrWhiteSpace(summaryContent))
             {
                 detailsSb.AppendLine(summaryContent.Trim());
@@ -1701,7 +1711,6 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             }
             else
             {
-                detailsSb.AppendLine($"Agent `@{preset.Id}` reached the {maxSteps}-step progress checkpoint.");
                 if (!string.IsNullOrWhiteSpace(lastActionSummary))
                 {
                     detailsSb.AppendLine($"**Current Activity**: {lastActionSummary}");
@@ -1713,20 +1722,22 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             detailsSb.AppendLine($"- **Steps**: {stepCount} completed");
             if (filesModified.Count > 0)
             {
-                var modFiles = string.Join(", ", filesModified.Select(f => $"`{Path.GetFileName(f)}`"));
-                detailsSb.AppendLine($"- **Files Modified** ({filesModified.Count}): {modFiles}");
+                var modFiles = string.Join(", ", filesModified.Take(8).Select(f => $"`{Path.GetFileName(f)}`"));
+                var extraMod = filesModified.Count > 8 ? $" (+{filesModified.Count - 8} more)" : "";
+                detailsSb.AppendLine($"- **Files Modified** ({filesModified.Count}): {modFiles}{extraMod}");
             }
             if (filesInspected.Count > 0)
             {
-                var inspFiles = string.Join(", ", filesInspected.Take(5).Select(f => $"`{Path.GetFileName(f)}`"));
-                var extra = filesInspected.Count > 5 ? $" (+{filesInspected.Count - 5} more)" : "";
+                var inspFiles = string.Join(", ", filesInspected.Take(8).Select(f => $"`{Path.GetFileName(f)}`"));
+                var extra = filesInspected.Count > 8 ? $" (+{filesInspected.Count - 8} more)" : "";
                 detailsSb.AppendLine($"- **Files Inspected** ({filesInspected.Count}): {inspFiles}{extra}");
             }
             if (commandsRun.Count > 0)
             {
-                var cmds = string.Join(", ", commandsRun.Take(3).Select(c => $"`{(c.Length > 40 ? c[..37] + "..." : c)}`"));
-                var extraCmds = commandsRun.Count > 3 ? $" (+{commandsRun.Count - 3} more)" : "";
-                detailsSb.AppendLine($"- **Commands Run** ({commandsRun.Count}): {cmds}{extraCmds}");
+                var distinctCmds = commandsRun.Distinct().ToList();
+                var cmds = string.Join(", ", distinctCmds.Take(5).Select(c => $"`{(c.Length > 45 ? c[..42] + "..." : c)}`"));
+                var extraCmds = distinctCmds.Count > 5 ? $" (+{distinctCmds.Count - 5} more)" : "";
+                detailsSb.AppendLine($"- **Commands Run** ({distinctCmds.Count}): {cmds}{extraCmds}");
             }
 
             detailsSb.Append("\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*");
@@ -2325,16 +2336,20 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             {
                 case "run_command":
                 case "bash":
-                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd");
-                    return !string.IsNullOrWhiteSpace(cmd) ? $"Running command: {cmd}" : "Running command";
+                case "command":
+                    var cmd = GetPropertyString(root, "command", "CommandLine", "commandLine", "cmd", "script", "shell_command");
+                    return !string.IsNullOrWhiteSpace(cmd) ? $"Running command: {(cmd.Length > 60 ? cmd[..57] + "..." : cmd)}" : "Running command";
                 case "read_file":
-                    var rPath = GetPropertyString(root, "path", "Path", "file_path");
+                case "view_file":
+                    var rPath = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "uri");
                     return !string.IsNullOrWhiteSpace(rPath) ? $"Reading file: {Path.GetFileName(rPath)}" : "Reading file";
                 case "write_file":
-                    var wPath = GetPropertyString(root, "path", "Path", "file_path");
+                case "write_to_file":
+                    var wPath = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
                     return !string.IsNullOrWhiteSpace(wPath) ? $"Writing file: {Path.GetFileName(wPath)}" : "Writing file";
                 case "edit_file":
-                    var ePath = GetPropertyString(root, "path", "Path", "file_path");
+                case "replace_file_content":
+                    var ePath = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
                     return !string.IsNullOrWhiteSpace(ePath) ? $"Editing file: {Path.GetFileName(ePath)}" : "Editing file";
                 case "ask_question":
                     return "Asking question";
@@ -2371,19 +2386,19 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
             var root = doc.RootElement;
             var tnLower = toolName.ToLowerInvariant();
-            if (tnLower is "run_command" or "bash")
+            if (tnLower is "run_command" or "bash" or "command")
             {
-                var cmd = GetPropertyString(root, "command", "CommandLine", "cmd");
+                var cmd = GetPropertyString(root, "command", "CommandLine", "commandLine", "cmd", "script", "shell_command");
                 if (!string.IsNullOrWhiteSpace(cmd)) commandsRun.Add(cmd);
             }
             else if (tnLower.Contains("write") || tnLower.Contains("edit") || tnLower.Contains("replace") || tnLower.Contains("modify") || tnLower.Contains("patch"))
             {
-                var path = GetPropertyString(root, "path", "Path", "file_path", "TargetFile", "AbsolutePath");
+                var path = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "target_file", "source_file", "uri");
                 if (!string.IsNullOrWhiteSpace(path)) filesModified.Add(path);
             }
             else if (tnLower.Contains("read") || tnLower.Contains("view") || tnLower.Contains("inspect"))
             {
-                var path = GetPropertyString(root, "path", "Path", "file_path", "TargetFile", "AbsolutePath");
+                var path = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "target_file", "source_file", "uri");
                 if (!string.IsNullOrWhiteSpace(path)) filesInspected.Add(path);
             }
         }
@@ -2488,8 +2503,21 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return (false, null, null);
     }
 
-    private static string? GetPropertyString(JsonElement root, params string[] names)
+    internal static string? GetPropertyString(JsonElement root, params string[] names)
     {
+        if (root.ValueKind == JsonValueKind.String)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(root.GetString()!);
+                return GetPropertyString(doc.RootElement, names);
+            }
+            catch { return null; }
+        }
+
+        if (root.ValueKind != JsonValueKind.Object) return null;
+
+        // Try exact match first for performance
         foreach (var name in names)
         {
             if (root.TryGetProperty(name, out var prop))
@@ -2498,7 +2526,41 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 if (prop.ValueKind != JsonValueKind.Null && prop.ValueKind != JsonValueKind.Undefined) return prop.GetRawText();
             }
         }
+
+        // Case-insensitive fallback
+        foreach (var name in names)
+        {
+            foreach (var prop in root.EnumerateObject())
+            {
+                if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.String) return prop.Value.GetString();
+                    if (prop.Value.ValueKind != JsonValueKind.Null && prop.Value.ValueKind != JsonValueKind.Undefined) return prop.Value.GetRawText();
+                }
+            }
+        }
         return null;
+    }
+
+    internal static string ExtractGoal(PromptReceivedEvent promptEvent)
+    {
+        if (!string.IsNullOrWhiteSpace(promptEvent.Prompt))
+        {
+            var rawPrompt = promptEvent.Prompt.Trim();
+            var match = Regex.Match(rawPrompt, @"\[Job Context:\s*([^\]\n]+)", RegexOptions.IgnoreCase);
+            if (match.Success) return match.Groups[1].Value.Trim();
+
+            match = Regex.Match(rawPrompt, @"(?:Task|Title|Goal):\s*([^\n]+)", RegexOptions.IgnoreCase);
+            if (match.Success) return match.Groups[1].Value.Trim();
+
+            var firstLine = rawPrompt.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault(l => !l.StartsWith("[") && !l.StartsWith("#"));
+            if (!string.IsNullOrWhiteSpace(firstLine))
+            {
+                return firstLine.Length > 120 ? firstLine[..117] + "..." : firstLine;
+            }
+        }
+        return "Autonomous Job Implementation";
     }
 
     private static int? GetPropertyInt(JsonElement root, params string[] names)

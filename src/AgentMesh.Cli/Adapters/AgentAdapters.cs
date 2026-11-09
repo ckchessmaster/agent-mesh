@@ -890,6 +890,58 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return max;
     }
 
+    public static string? GetLatestThoughtFromTranscript(string? transcriptPath)
+    {
+        if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath)) return null;
+        try
+        {
+            var lines = new List<string>();
+            using (var fs = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(fs))
+            {
+                string? l;
+                while ((l = reader.ReadLine()) != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(l)) lines.Add(l);
+                }
+            }
+
+            lines.Reverse();
+            foreach (var line in lines.Take(40))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+                    if (root.TryGetProperty("thinking", out var thinkingProp) && thinkingProp.ValueKind == JsonValueKind.String)
+                    {
+                        var thinking = thinkingProp.GetString()?.Trim();
+                        if (!string.IsNullOrWhiteSpace(thinking))
+                        {
+                            var clean = Regex.Replace(thinking, @"\s+", " ");
+                            return clean.Length > 250 ? clean[..247] + "..." : clean;
+                        }
+                    }
+                    if (root.TryGetProperty("content", out var contentProp) &&
+                        contentProp.ValueKind == JsonValueKind.String &&
+                        root.TryGetProperty("type", out var typeProp) &&
+                        typeProp.GetString() == "PLANNER_RESPONSE")
+                    {
+                        var content = contentProp.GetString()?.Trim();
+                        if (!string.IsNullOrWhiteSpace(content))
+                        {
+                            var clean = Regex.Replace(content, @"\s+", " ");
+                            return clean.Length > 250 ? clean[..247] + "..." : clean;
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return null;
+    }
+
     public record AskQuestionDetection(TrajectoryEventPayload ToolCallEvent, string? PriorResponseContent)
     {
         public string EventType => ToolCallEvent.EventType;
@@ -1297,6 +1349,17 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                 }
                             }
 
+                            if (step.TryGetProperty("thought", out var thProp) && thProp.ValueKind == JsonValueKind.String)
+                            {
+                                var th = thProp.GetString()?.Trim();
+                                if (!string.IsNullOrWhiteSpace(th)) agyLatestThought = th;
+                            }
+                            else if (step.TryGetProperty("reasoning", out var rsProp) && rsProp.ValueKind == JsonValueKind.String)
+                            {
+                                var rs = rsProp.GetString()?.Trim();
+                                if (!string.IsNullOrWhiteSpace(rs)) agyLatestThought = rs;
+                            }
+
                             if (state == "DONE" && step.TryGetProperty("usage", out var usageProp))
                             {
                                 var thinkingTokens = usageProp.TryGetProperty("thinking_tokens", out var ttProp) ? ttProp.GetInt32() : 0;
@@ -1329,38 +1392,41 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                             if (step.TryGetProperty("tool_info", out var tiProp))
                             {
-                                if (tiProp.TryGetProperty("parameters", out var paramsProp))
+                                JsonElement paramsElem = default;
+                                bool hasParams = false;
+                                if (tiProp.TryGetProperty("parameters", out var p1)) { paramsElem = p1; hasParams = true; }
+                                else if (tiProp.TryGetProperty("arguments", out var p2)) { paramsElem = p2; hasParams = true; }
+                                else if (tiProp.TryGetProperty("args", out var p3)) { paramsElem = p3; hasParams = true; }
+                                else if (tiProp.TryGetProperty("input", out var p4)) { paramsElem = p4; hasParams = true; }
+
+                                if (hasParams)
                                 {
-                                    argsJson = paramsProp.GetRawText();
-                                    if (paramsProp.TryGetProperty("CommandLine", out var cmdProp) ||
-                                        paramsProp.TryGetProperty("command", out cmdProp) ||
-                                        paramsProp.TryGetProperty("cmd", out cmdProp))
+                                    argsJson = paramsElem.ValueKind == JsonValueKind.String
+                                        ? paramsElem.GetString()
+                                        : paramsElem.GetRawText();
+
+                                    var cmdVal = OpenAiAdapter.GetPropertyString(paramsElem, "command", "CommandLine", "commandLine", "cmd", "script", "shell_command");
+                                    if (!string.IsNullOrWhiteSpace(cmdVal))
                                     {
-                                        var cmdVal = cmdProp.GetString();
-                                        if (!string.IsNullOrWhiteSpace(cmdVal))
-                                        {
-                                            summary = $"Running command: {cmdVal}";
-                                            agyCommandsRun.Add(cmdVal);
-                                        }
+                                        summary = $"Running command: {(cmdVal.Length > 60 ? cmdVal[..57] + "..." : cmdVal)}";
+                                        agyCommandsRun.Add(cmdVal);
                                     }
-                                    else if (paramsProp.TryGetProperty("AbsolutePath", out var pathProp) ||
-                                             paramsProp.TryGetProperty("TargetFile", out pathProp) ||
-                                             paramsProp.TryGetProperty("path", out pathProp) ||
-                                             paramsProp.TryGetProperty("file_path", out pathProp))
+                                    else
                                     {
-                                        var pVal = pathProp.GetString();
+                                        var pVal = OpenAiAdapter.GetPropertyString(paramsElem, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "target_file", "source_file", "uri");
                                         if (!string.IsNullOrWhiteSpace(pVal))
                                         {
+                                            var fileName = Path.GetFileName(pVal);
                                             var tnLower = toolName.ToLowerInvariant();
                                             if (tnLower.Contains("write") || tnLower.Contains("edit") || tnLower.Contains("replace") || tnLower.Contains("modify") || tnLower.Contains("patch"))
                                             {
                                                 agyFilesModified.Add(pVal);
-                                                summary = $"Modifying file: {Path.GetFileName(pVal)}";
+                                                summary = $"Modifying file: {fileName}";
                                             }
                                             else
                                             {
                                                 agyFilesInspected.Add(pVal);
-                                                summary = $"Inspecting file: {Path.GetFileName(pVal)}";
+                                                summary = $"Inspecting file: {fileName}";
                                             }
                                         }
                                     }
@@ -1432,42 +1498,58 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                                     var detailsSb = new StringBuilder();
                                     detailsSb.AppendLine($"🔄 **Progress Checkpoint ({maxSteps} steps)**:\n");
-                                    detailsSb.AppendLine($"Agent `@{preset.Id}` reached the {maxSteps}-step progress limit for this turn and is rolling over.\n");
+                                    var agentTag = !string.IsNullOrWhiteSpace(promptEvent.PersonaId) ? promptEvent.PersonaId : preset.Id;
+                                    var personaDisplay = !string.IsNullOrWhiteSpace(promptEvent.PersonaName) ? $" ({promptEvent.PersonaName})" : "";
+                                    detailsSb.AppendLine($"Agent `@{agentTag}`{personaDisplay} reached the {maxSteps}-step progress limit for this turn and is rolling over.\n");
+
+                                    var goal = OpenAiAdapter.ExtractGoal(promptEvent);
+                                    if (!string.IsNullOrWhiteSpace(goal))
+                                    {
+                                        detailsSb.AppendLine($"**Active Goal**: {goal}\n");
+                                    }
 
                                     if (!string.IsNullOrWhiteSpace(agyLastActionSummary))
                                     {
                                         detailsSb.AppendLine($"**Current Activity**: {agyLastActionSummary}");
                                     }
 
+                                    var thought = agyLatestThought;
+                                    if (string.IsNullOrWhiteSpace(thought) && !string.IsNullOrWhiteSpace(transcriptFile))
+                                    {
+                                        thought = GetLatestThoughtFromTranscript(transcriptFile);
+                                    }
+
                                     var partialText = streamedResponseBuilder.ToString().Trim();
                                     if (!string.IsNullOrWhiteSpace(partialText))
                                     {
-                                        var clippedText = partialText.Length > 400 ? partialText[..400] + "..." : partialText;
-                                        detailsSb.AppendLine($"**Agent Status Output**:\n{clippedText}\n");
+                                        var clippedText = partialText.Length > 300 ? partialText[..297] + "..." : partialText;
+                                        detailsSb.AppendLine($"**Agent Output**:\n{clippedText}\n");
                                     }
-                                    else if (!string.IsNullOrWhiteSpace(agyLatestThought))
+                                    else if (!string.IsNullOrWhiteSpace(thought))
                                     {
-                                        detailsSb.AppendLine($"**Recent Thought**: \"{agyLatestThought}\"\n");
+                                        detailsSb.AppendLine($"**Recent Thinking**: \"{thought}\"\n");
                                     }
 
                                     detailsSb.AppendLine("**Turn Progress & Workspace Activity**:");
                                     detailsSb.AppendLine($"- **Steps**: {agyStepCount} completed");
                                     if (agyFilesModified.Count > 0)
                                     {
-                                        var modFiles = string.Join(", ", agyFilesModified.Select(f => $"`{Path.GetFileName(f)}`"));
-                                        detailsSb.AppendLine($"- **Files Modified** ({agyFilesModified.Count}): {modFiles}");
+                                        var modFiles = string.Join(", ", agyFilesModified.Take(8).Select(f => $"`{Path.GetFileName(f)}`"));
+                                        var extraMod = agyFilesModified.Count > 8 ? $" (+{agyFilesModified.Count - 8} more)" : "";
+                                        detailsSb.AppendLine($"- **Files Modified** ({agyFilesModified.Count}): {modFiles}{extraMod}");
                                     }
                                     if (agyFilesInspected.Count > 0)
                                     {
-                                        var inspFiles = string.Join(", ", agyFilesInspected.Take(5).Select(f => $"`{Path.GetFileName(f)}`"));
-                                        var extra = agyFilesInspected.Count > 5 ? $" (+{agyFilesInspected.Count - 5} more)" : "";
+                                        var inspFiles = string.Join(", ", agyFilesInspected.Take(8).Select(f => $"`{Path.GetFileName(f)}`"));
+                                        var extra = agyFilesInspected.Count > 8 ? $" (+{agyFilesInspected.Count - 8} more)" : "";
                                         detailsSb.AppendLine($"- **Files Inspected** ({agyFilesInspected.Count}): {inspFiles}{extra}");
                                     }
                                     if (agyCommandsRun.Count > 0)
                                     {
-                                        var cmds = string.Join(", ", agyCommandsRun.Take(3).Select(c => $"`{(c.Length > 40 ? c[..37] + "..." : c)}`"));
-                                        var extraCmds = agyCommandsRun.Count > 3 ? $" (+{agyCommandsRun.Count - 3} more)" : "";
-                                        detailsSb.AppendLine($"- **Commands Run** ({agyCommandsRun.Count}): {cmds}{extraCmds}");
+                                        var distinctCmds = agyCommandsRun.Distinct().ToList();
+                                        var cmds = string.Join(", ", distinctCmds.Take(5).Select(c => $"`{(c.Length > 45 ? c[..42] + "..." : c)}`"));
+                                        var extraCmds = distinctCmds.Count > 5 ? $" (+{distinctCmds.Count - 5} more)" : "";
+                                        detailsSb.AppendLine($"- **Commands Run** ({distinctCmds.Count}): {cmds}{extraCmds}");
                                     }
 
                                     detailsSb.Append("\n*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*");

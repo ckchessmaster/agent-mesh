@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
@@ -1208,6 +1209,134 @@ public class SessionsControllerTests
         saved.MetadataJson.Should().Be("{\"key\": \"value\"}");
         saved.Title.Should().NotContain("\0");
         saved.MetadataJson.Should().NotContain("\0");
+    }
+
+    [Fact]
+    public async Task PostMessage_ProgressCheckpointRollover_ContinuesAutonomouslyForSamePersona()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        var project = new Project
+        {
+            Id = "test-proj",
+            Name = "Test Project",
+            WorkspaceType = WorkspaceType.Git,
+            GitRepositoryUrl = "https://github.com/org/repo",
+            GitBaseBranch = "main"
+        };
+        db.Projects.Add(project);
+
+        var persona = new Persona
+        {
+            Id = "astra",
+            Name = "Astra",
+            Role = "Autonomous Agent",
+            DriverId = "agy-driver",
+            DefaultModel = "gemini-2.5-pro"
+        };
+        db.Personas.Add(persona);
+
+        var driver = new Agent
+        {
+            Id = "agy-driver",
+            Name = "Agy Driver",
+            RuntimeType = RuntimeType.CliAgy,
+            Status = "online"
+        };
+        db.Agents.Add(driver);
+
+        var projectPersona = new ProjectPersona
+        {
+            ProjectId = project.Id,
+            PersonaId = persona.Id
+        };
+        db.ProjectPersonas.Add(projectPersona);
+
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Implement Autonomous Workflow",
+            Description = "Fix rollover continuation",
+            GitBranchName = "feature/autonomous-rollover",
+            Status = ProjectJobStatus.Active
+        };
+        db.ProjectJobs.Add(job);
+
+        var sessionMetadata = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["jobId"] = job.Id.ToString(),
+            ["projectId"] = project.Id,
+            ["personaId"] = persona.Id,
+            ["personaName"] = persona.Name,
+            ["conversationId"] = "conv-12345"
+        });
+
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = $"Job Turn: {job.Title} (@{persona.Name})",
+            Status = "thinking",
+            MetadataJson = sessionMetadata,
+            PersonaId = persona.Id,
+            DriverId = driver.Id,
+            CreatorAgentId = driver.Id,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var checkpointResponse = "🔄 **Progress Checkpoint (50 steps)**:\n\n" +
+                                 "Agent `@astra` (Astra) reached the 50-step progress limit for this turn and is rolling over.\n\n" +
+                                 "**Active Goal**: Implement Autonomous Workflow\n" +
+                                 "**Current Activity**: Inspecting file: SessionsController.cs\n\n" +
+                                 "**Turn Progress & Workspace Activity**:\n" +
+                                 "- **Steps**: 50 completed\n" +
+                                 "- **Files Inspected** (1): `SessionsController.cs`\n" +
+                                 "- **Commands Run** (1): `git status`\n\n" +
+                                 "*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*";
+
+        var postReq = new PostMessageRequest(
+            SenderAgentId: "agy-driver",
+            TargetAgentId: "operator",
+            EventType: "response",
+            Content: checkpointResponse
+        );
+
+        // Act
+        var result = await controller.PostMessage(session.Id, postReq);
+
+        // Assert
+        result.Should().BeOfType<CreatedAtActionResult>();
+
+        // 1. Verify JobMessage was posted
+        var jobMsg = db.JobMessages.FirstOrDefault(m => m.JobId == job.Id && m.Content == checkpointResponse);
+        jobMsg.Should().NotBeNull();
+        jobMsg!.SenderId.Should().Be(persona.Id);
+
+        // 2. Verify next turn session was dispatched autonomously for the same persona
+        var nextSession = db.AgentSessions.FirstOrDefault(s => s.Id != session.Id && s.PersonaId == persona.Id);
+        nextSession.Should().NotBeNull();
+        nextSession!.Status.Should().Be("thinking");
+        nextSession.Title.Should().Contain("@Astra");
+        nextSession.MetadataJson.Should().Contain("conv-12345");
+
+        // 3. Verify continuation prompt message was created
+        var promptMsg = db.SessionMessages.FirstOrDefault(m => m.SessionId == nextSession.Id && m.EventType == "prompt");
+        promptMsg.Should().NotBeNull();
+        promptMsg!.Content.Should().Contain("[Autonomous Progress Checkpoint Continuation]:");
+        promptMsg.Content.Should().Contain("Please continue working autonomously on the job implementation and tasks.");
+
+        // 4. Verify SignalR events were broadcast
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("SessionCreated", It.Is<object[]>(args => args.Length == 1), default),
+            Times.AtLeastOnce);
+        _mockClientProxy.Verify(
+            p => p.SendCoreAsync("PromptReceived", It.Is<object[]>(args => args.Length == 1), default),
+            Times.AtLeastOnce);
     }
 }
 
