@@ -2405,4 +2405,110 @@ public class ProjectJobsControllerTests
         var updatedSession = await db.AgentSessions.FindAsync(session.Id);
         updatedSession!.Status.Should().Be("stopped");
     }
+
+    [Fact]
+    public async Task StartJob_WhenTemporalUnavailable_DispatchesDirectFallbackTurn()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project
+        {
+            Id = "proj-start-fallback",
+            Name = "Project Start Fallback",
+            WorkspaceType = WorkspaceType.Git,
+            DefaultLeadPersonaId = "astra"
+        };
+        db.Projects.Add(project);
+
+        var persona = new Persona
+        {
+            Id = "astra",
+            Name = "Astra",
+            DriverId = "agy",
+            Role = "Tech Lead"
+        };
+        db.Personas.Add(persona);
+
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Implement Feature X",
+            Description = "Feature X details",
+            Status = ProjectJobStatus.Pending
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var mockDispatcher = new Mock<JobTurnDispatcher>(db, null, null, null);
+        mockDispatcher
+            .Setup(d => d.DispatchAsync(It.IsAny<JobTurnRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DispatchedJobTurn(new AgentSession(), new SessionMessage(), new Agent()));
+
+        var controller = new ProjectJobsController(db, turns: mockDispatcher.Object);
+        var result = await controller.StartJob(job.Id, temporalClient: null);
+
+        var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+        var dto = ok.Value.Should().BeOfType<ProjectJobDto>().Subject;
+        dto.Status.Should().Be(ProjectJobStatus.Active);
+        dto.CurrentTaskId.Should().Be("stage-1-discovery");
+        dto.AssignedAgentId.Should().Be("astra");
+
+        var updatedJob = await db.ProjectJobs.FindAsync(job.Id);
+        updatedJob!.Status.Should().Be(ProjectJobStatus.Active);
+        updatedJob.AssignedAgentId.Should().Be("astra");
+
+        mockDispatcher.Verify(d => d.DispatchAsync(
+            It.Is<JobTurnRequest>(r => r.Job.Id == job.Id && r.TaskId == "stage-1-discovery" && r.Persona.Id == "astra"),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task StartJob_ResolvesAssignedPersona_WhenAssignedAgentIdIsNull()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project
+        {
+            Id = "proj-resolve-persona",
+            Name = "Project Resolve Persona",
+            WorkspaceType = WorkspaceType.Git
+        };
+        db.Projects.Add(project);
+
+        var persona = new Persona
+        {
+            Id = "rook",
+            Name = "Rook",
+            DriverId = "agy",
+            Role = "Security Reviewer"
+        };
+        db.Personas.Add(persona);
+
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Audit Dependencies",
+            Status = ProjectJobStatus.Pending,
+            AssignedAgentId = null
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var mockDispatcher = new Mock<JobTurnDispatcher>(db, null, null, null);
+        mockDispatcher
+            .Setup(d => d.DispatchAsync(It.IsAny<JobTurnRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DispatchedJobTurn(new AgentSession(), new SessionMessage(), new Agent()));
+
+        var controller = new ProjectJobsController(db, turns: mockDispatcher.Object);
+        var result = await controller.StartJob(job.Id, temporalClient: null);
+
+        var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+        var dto = ok.Value.Should().BeOfType<ProjectJobDto>().Subject;
+        dto.AssignedAgentId.Should().Be("rook");
+
+        var updatedJob = await db.ProjectJobs.FindAsync(job.Id);
+        updatedJob!.AssignedAgentId.Should().Be("rook");
+    }
 }

@@ -14,6 +14,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Temporalio.Client;
+using Temporalio.Common;
 
 namespace AgentMesh.Api.Controllers;
 
@@ -143,7 +144,8 @@ public class ProjectJobsController(
     IHubContext<AgentMeshHub>? hubContext = null,
     IStorageService? storageService = null,
     IWorkflowSignalRouter? workflows = null,
-    ILogger<ProjectJobsController>? logger = null) : ControllerBase
+    ILogger<ProjectJobsController>? logger = null,
+    JobTurnDispatcher? turns = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -1741,12 +1743,60 @@ public class ProjectJobsController(
     }
 
     [HttpPost("api/project-jobs/{id}/start")]
-    public async Task<IActionResult> StartJob(Guid id, [FromServices] ITemporalClient? temporalClient = null)
+    public async Task<IActionResult> StartJob(
+        Guid id,
+        [FromServices] ITemporalClient? temporalClient = null,
+        [FromServices] JobTurnDispatcher? dispatcher = null)
     {
         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
         if (job == null)
         {
             return NotFound(new { error = $"Job '{id}' not found." });
+        }
+
+        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+
+        // Safely resolve the assigned persona so discovery doesn't fail with 404
+        Persona? assignedPersona = null;
+        if (!string.IsNullOrWhiteSpace(job.AssignedAgentId))
+        {
+            assignedPersona = await db.Personas.FirstOrDefaultAsync(p => p.Id == job.AssignedAgentId.Trim().ToLowerInvariant());
+        }
+        if (assignedPersona == null && !string.IsNullOrWhiteSpace(project?.DefaultLeadPersonaId))
+        {
+            assignedPersona = await db.Personas.FirstOrDefaultAsync(p => p.Id == project.DefaultLeadPersonaId.Trim().ToLowerInvariant());
+        }
+        if (assignedPersona == null && project != null)
+        {
+            var projectPersonaId = await db.ProjectPersonas
+                .AsNoTracking()
+                .Where(pp => pp.ProjectId == project.Id)
+                .Select(pp => pp.PersonaId)
+                .FirstOrDefaultAsync();
+            if (!string.IsNullOrWhiteSpace(projectPersonaId))
+            {
+                assignedPersona = await db.Personas.FirstOrDefaultAsync(p => p.Id == projectPersonaId.Trim().ToLowerInvariant());
+            }
+        }
+        assignedPersona ??= await db.Personas.FirstOrDefaultAsync();
+        if (assignedPersona == null)
+        {
+            assignedPersona = new Persona
+            {
+                Id = "astra",
+                Name = "Astra",
+                Role = "Lead Architect & Implementer",
+                DriverId = "agy",
+                DefaultModel = "gemini-2.5-pro",
+                PersonaPrompt = "You are Astra, the lead autonomous AI software engineer."
+            };
+            db.Personas.Add(assignedPersona);
+        }
+
+        var assignedAgentId = assignedPersona.Id;
+        if (string.IsNullOrWhiteSpace(job.AssignedAgentId))
+        {
+            job.AssignedAgentId = assignedAgentId;
         }
 
         job.Status = ProjectJobStatus.Active;
@@ -1755,22 +1805,30 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
-        var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+        project ??= new Project
+        {
+            Id = job.ProjectId,
+            Name = job.ProjectId,
+            WorkspaceType = WorkspaceType.Git,
+            GitBaseBranch = "main"
+        };
 
+        var initialPrompt = !string.IsNullOrWhiteSpace(job.Description)
+            ? $"{job.Title}\n\n{job.Description}"
+            : job.Title;
+
+        bool temporalStarted = false;
         if (temporalClient != null)
         {
             var workflowId = $"job-{id}";
-            var assignedAgentId = job.AssignedAgentId ?? project?.DefaultLeadPersonaId ?? "implementer";
             var workspacePath = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
                 ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
-                : (project?.GetResolvedWorkingDirectory() ?? $"/workspace/repos/{job.ProjectId}");
+                : (project.GetResolvedWorkingDirectory() ?? $"/workspace/repos/{job.ProjectId}");
             var targetBranch = !string.IsNullOrWhiteSpace(job.GitBranchName) ? job.GitBranchName : "main";
-            var initialPrompt = !string.IsNullOrWhiteSpace(job.Description)
-                ? $"{job.Title}\n\n{job.Description}"
-                : job.Title;
 
             var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue)
             {
+                IdReusePolicy = Temporalio.Api.Enums.V1.WorkflowIdReusePolicy.AllowDuplicate,
                 Memo = new Dictionary<string, object> { ["personaId"] = assignedAgentId }
             };
 
@@ -1788,14 +1846,57 @@ public class ProjectJobsController(
                     )),
                     options
                 );
+                temporalStarted = true;
             }
             catch (Temporalio.Exceptions.WorkflowAlreadyStartedException)
             {
-                // Workflow is already active
+                // If workflow is already active or closed without AllowDuplicate, terminate and restart
+                try
+                {
+                    var handle = temporalClient.GetWorkflowHandle(workflowId);
+                    await handle.TerminateAsync("Restarted by operator via StartJob");
+                    await temporalClient.StartWorkflowAsync(
+                        (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                            JobId: id.ToString(),
+                            AssignedAgentId: assignedAgentId,
+                            ProjectId: job.ProjectId,
+                            WorkspacePath: workspacePath,
+                            InitialPrompt: initialPrompt,
+                            TargetBranch: targetBranch,
+                            ApprovalPolicy: job.ApprovalPolicy
+                        )),
+                        options
+                    );
+                    temporalStarted = true;
+                }
+                catch
+                {
+                    temporalStarted = true;
+                }
             }
             catch (Exception ex)
             {
                 logger?.LogWarning(ex, "Failed to start Temporal workflow for job {JobId}", id);
+            }
+        }
+
+        var turnDispatcher = dispatcher ?? turns;
+        if (!temporalStarted && turnDispatcher != null && assignedPersona != null)
+        {
+            try
+            {
+                await turnDispatcher.DispatchAsync(new JobTurnRequest(
+                    job,
+                    project,
+                    assignedPersona,
+                    initialPrompt,
+                    Sender: "operator",
+                    TaskId: "stage-1-discovery"
+                ));
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, "Failed to dispatch fallback turn for job {JobId}", id);
             }
         }
 

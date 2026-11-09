@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Temporalio.Client;
+using Temporalio.Common;
 
 namespace AgentMesh.Api.Controllers;
 
@@ -151,8 +152,18 @@ public class JobChatController(
         if (temporalClient is not null)
         {
             var workflowId = $"job-{jobId}";
-            var assignedAgentId = agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId ?? "implementer";
             var projectId = agentJob?.ProjectId ?? projectJob?.ProjectId ?? "default";
+            var assignedAgentId = agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId;
+            if (string.IsNullOrWhiteSpace(assignedAgentId) || assignedAgentId.Equals("implementer", StringComparison.OrdinalIgnoreCase))
+            {
+                var prj = await dbContext.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == projectId);
+                assignedAgentId = prj?.DefaultLeadPersonaId;
+            }
+            if (string.IsNullOrWhiteSpace(assignedAgentId) || assignedAgentId.Equals("implementer", StringComparison.OrdinalIgnoreCase))
+            {
+                var anyPersona = await dbContext.Personas.AsNoTracking().Select(p => p.Id).FirstOrDefaultAsync();
+                assignedAgentId = anyPersona ?? "astra";
+            }
             var workspacePath = agentJob?.WorkingDirectory ?? projectJob?.WorkingDirectory ?? $"/workspace/repos/{projectId}";
             var targetBranch = agentJob?.TargetBranch ?? projectJob?.TargetBranch ?? "main";
             var approvalPolicy = agentJob?.ApprovalPolicy ?? projectJob?.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman;
@@ -165,6 +176,7 @@ public class JobChatController(
 
             var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue)
             {
+                IdReusePolicy = Temporalio.Api.Enums.V1.WorkflowIdReusePolicy.AllowDuplicate,
                 StartSignal = "ReceiveChatMessage",
                 StartSignalArgs = new object?[] { chatSignal },
                 Memo = new Dictionary<string, object> { ["personaId"] = assignedAgentId }

@@ -68,7 +68,7 @@ public class JobTurnDispatcher(
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    public async Task<DispatchedJobTurn> DispatchAsync(
+    public virtual async Task<DispatchedJobTurn> DispatchAsync(
         JobTurnRequest req,
         CancellationToken ct = default)
     {
