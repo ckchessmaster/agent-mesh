@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   X,
   Save,
-  Info,
   KeyRound,
   AlertTriangle,
   Trash2,
@@ -66,9 +65,8 @@ const toText = (value: number | null | undefined, fallback: number) =>
  * Driver runtime configuration.
  *
  * Two rules this component exists to enforce:
- *  1. Limits are only editable for OpenAI-compatible drivers. The agy/claude/copilot adapters
- *     shell out to a third-party CLI and have no step loop, so exposing "max steps" there would
- *     offer a control that does nothing.
+ *  1. Turn Limits (max steps and timeout) apply to all drivers. Retries and API connection
+ *     settings are specific to OpenAI-compatible drivers.
  *  2. The API key is write-only. The server never returns it, so we render presence, not value,
  *     and an empty field means "keep what's stored".
  */
@@ -341,23 +339,26 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
     if ((config.defaultModel ?? '') !== defaultModel.trim()) patch.defaultModel = defaultModel.trim();
     if (apiKey.trim()) patch.apiKey = apiKey.trim();
 
+    const limitFields: Array<{
+      parsed: ParsedLimit;
+      key: 'maxSteps' | 'timeoutSeconds' | 'maxRetries' | 'retryDelayMilliseconds';
+      /** What the adapter will actually use today, defaults included. */
+      effective: number | undefined;
+    }> = [
+      {
+        parsed: parseLimit(maxSteps, 'Max steps', 1),
+        key: 'maxSteps',
+        effective: config.maxSteps ?? DRIVER_LIMIT_DEFAULTS.maxSteps
+      },
+      {
+        parsed: parseLimit(timeoutSeconds, 'Timeout (seconds)', 1),
+        key: 'timeoutSeconds',
+        effective: config.timeoutSeconds ?? DRIVER_LIMIT_DEFAULTS.timeoutSeconds
+      }
+    ];
+
     if (isOpenAiDriver) {
-      const fields: Array<{
-        parsed: ParsedLimit;
-        key: 'maxSteps' | 'timeoutSeconds' | 'maxRetries' | 'retryDelayMilliseconds';
-        /** What the adapter will actually use today, defaults included. */
-        effective: number | undefined;
-      }> = [
-        {
-          parsed: parseLimit(maxSteps, 'Max steps', 1),
-          key: 'maxSteps',
-          effective: config.maxSteps ?? DRIVER_LIMIT_DEFAULTS.maxSteps
-        },
-        {
-          parsed: parseLimit(timeoutSeconds, 'Timeout (seconds)', 1),
-          key: 'timeoutSeconds',
-          effective: config.timeoutSeconds ?? DRIVER_LIMIT_DEFAULTS.timeoutSeconds
-        },
+      limitFields.push(
         {
           parsed: parseLimit(maxRetries, 'Max retries', 0),
           key: 'maxRetries',
@@ -365,18 +366,18 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         },
         // No fixed default: unset means exponential backoff, so only a real number counts as set.
         { parsed: parseLimit(retryDelay, 'Retry delay (ms)', 0), key: 'retryDelayMilliseconds', effective: config.retryDelayMilliseconds ?? undefined }
-      ];
+      );
+    }
 
-      for (const { parsed, key, effective } of fields) {
-        if (parsed.state === 'invalid') {
-          setError(parsed.message);
-          return;
-        }
-        // 'empty' means "leave alone": the server has no way to clear a limit, and for retry
-        // delay blank explicitly means "keep using exponential backoff".
-        if (parsed.state === 'empty' || parsed.value === effective) continue;
-        (patch as Record<string, number>)[key] = parsed.value as number;
+    for (const { parsed, key, effective } of limitFields) {
+      if (parsed.state === 'invalid') {
+        setError(parsed.message);
+        return;
       }
+      // 'empty' means "leave alone": the server has no way to clear a limit, and for retry
+      // delay blank explicitly means "keep using exponential backoff".
+      if (parsed.state === 'empty' || parsed.value === effective) continue;
+      (patch as Record<string, number>)[key] = parsed.value as number;
     }
 
     if (
@@ -468,16 +469,6 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         </div>
 
         <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-5 space-y-4">
-          {!isOpenAiDriver && (
-            <div className="flex items-start gap-2 p-2.5 rounded-lg bg-slate-950/70 border border-slate-800 text-[11px] text-slate-400">
-              <Info className="w-3.5 h-3.5 shrink-0 text-slate-500 mt-0.5" />
-              <span>
-                This driver shells out to an external CLI, so step limits, timeouts and retries are
-                controlled by that tool — not by AgentMesh. Only the display settings below apply.
-              </span>
-            </div>
-          )}
-
           {/* Driver Authentication & Model Discovery */}
           <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -743,47 +734,51 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                   className={`${fieldClass} font-mono`}
                 />
               </div>
+            </>
+          )}
 
-              <div className="pt-1">
-                <div className="text-[10px] uppercase font-bold tracking-wider text-slate-500 mb-2">
-                  Turn Limits
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className={labelClass} htmlFor="driver-max-steps">
-                      Max steps per turn
-                    </label>
-                    <input
-                      id="driver-max-steps"
-                      type="number"
-                      min={1}
-                      step={1}
-                      value={maxSteps}
-                      onChange={(e) => setMaxSteps(e.target.value)}
-                      className={fieldClass}
-                    />
-                    <p className="text-[10px] text-slate-500 mt-1">
-                      Default {DRIVER_LIMIT_DEFAULTS.maxSteps}. On reaching it the agent posts a
-                      progress checkpoint and continues autonomously.
-                    </p>
-                  </div>
-                  <div>
-                    <label className={labelClass} htmlFor="driver-timeout">
-                      Request timeout (s)
-                    </label>
-                    <input
-                      id="driver-timeout"
-                      type="number"
-                      min={1}
-                      step={1}
-                      value={timeoutSeconds}
-                      onChange={(e) => setTimeoutSeconds(e.target.value)}
-                      className={fieldClass}
-                    />
-                    <p className="text-[10px] text-slate-500 mt-1">
-                      Also used as the streaming inactivity ceiling.
-                    </p>
-                  </div>
+          <div className="pt-1">
+            <div className="text-[10px] uppercase font-bold tracking-wider text-slate-500 mb-2">
+              Turn Limits
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className={labelClass} htmlFor="driver-max-steps">
+                  Max steps per turn
+                </label>
+                <input
+                  id="driver-max-steps"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={maxSteps}
+                  onChange={(e) => setMaxSteps(e.target.value)}
+                  className={fieldClass}
+                />
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Default {DRIVER_LIMIT_DEFAULTS.maxSteps}. On reaching it the agent posts a
+                  progress checkpoint and continues autonomously.
+                </p>
+              </div>
+              <div>
+                <label className={labelClass} htmlFor="driver-timeout">
+                  Request timeout (s)
+                </label>
+                <input
+                  id="driver-timeout"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={timeoutSeconds}
+                  onChange={(e) => setTimeoutSeconds(e.target.value)}
+                  className={fieldClass}
+                />
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Also used as the streaming inactivity ceiling.
+                </p>
+              </div>
+              {isOpenAiDriver && (
+                <>
                   <div>
                     <label className={labelClass} htmlFor="driver-max-retries">
                       Max retries
@@ -816,10 +811,13 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                       Blank keeps exponential backoff.
                     </p>
                   </div>
-                </div>
-              </div>
+                </>
+              )}
+            </div>
+          </div>
 
-              <div className="pt-2 border-t border-slate-800">
+          {isOpenAiDriver && (
+            <div className="pt-2 border-t border-slate-800">
                 <button
                   type="button"
                   onClick={() => setSidecarExpanded(!sidecarExpanded)}
@@ -1092,7 +1090,6 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                   </div>
                 )}
               </div>
-            </>
           )}
 
           {config.capabilities && config.capabilities.length > 0 && (
