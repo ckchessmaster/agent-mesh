@@ -398,33 +398,71 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
     }
 
-    private void HandleStopExecution(Guid? parsedSid, string? targetAgent, string? targetPersona = null, string? reason = null)
+    internal void SetActiveTurnForTesting(Guid sessionId, CancellationTokenSource cts)
     {
-        var targetSid = parsedSid ?? State.ActiveSessionId;
+        State.ActiveSessionId = sessionId;
+        State.State = RunnerConnectionState.Busy;
+        _activeTurnCts = cts;
+    }
+
+    internal void HandleStopExecution(Guid? parsedSid, string? targetAgent, string? targetPersona = null, string? reason = null)
+    {
         var isInterrupt = reason?.Contains("Interrupted", StringComparison.OrdinalIgnoreCase) == true;
-        if (targetSid.HasValue)
+
+        if (parsedSid.HasValue)
         {
+            var targetSid = parsedSid.Value;
             if (isInterrupt)
             {
-                _stoppedSessions.TryRemove(targetSid.Value, out _);
+                _stoppedSessions.TryRemove(targetSid, out _);
             }
             else
             {
-                _stoppedSessions[targetSid.Value] = DateTimeOffset.UtcNow;
+                _stoppedSessions[targetSid] = DateTimeOffset.UtcNow;
             }
+
+            // If this runner is currently running a turn, only abort if it matches the stopped session.
+            // Never cancel active turns for unrelated sessions!
+            if (State.ActiveSessionId.HasValue && State.ActiveSessionId.Value == targetSid)
+            {
+                _onLog(_preset.Id ?? string.Empty, $"🛑 StopExecution received for session {targetSid.ToString()[..8]}. Aborting active turn.");
+                try
+                {
+                    _activeTurnCts?.Cancel();
+                }
+                catch { }
+            }
+            return;
         }
 
-        var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
-        var matchesPersona = !string.IsNullOrWhiteSpace(_preset.PersonaId) &&
-                             !string.IsNullOrWhiteSpace(targetPersona) &&
-                             string.Equals(targetPersona.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase);
-        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) ||
-                           string.Equals(targetAgent.Trim().TrimStart('@'), _preset.Id?.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase) ||
-                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase));
+        // When no session ID is provided, an explicit agent or persona match is required to abort.
+        // A null/empty targetAgent must NOT match all runners.
+        var matchesExplicitAgent = !string.IsNullOrWhiteSpace(targetAgent) &&
+            (string.Equals(targetAgent.Trim().TrimStart('@'), _preset.Id?.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase) ||
+             (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase)));
 
-        if (matchesSession || matchesPersona || (matchesAgent && State.ActiveSessionId != null) || (targetSid.HasValue && targetSid == State.ActiveSessionId))
+        var matchesExplicitPersona = !string.IsNullOrWhiteSpace(targetPersona) &&
+            !string.IsNullOrWhiteSpace(_preset.PersonaId) &&
+            string.Equals(targetPersona.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase);
+
+        if (!matchesExplicitAgent && !matchesExplicitPersona)
         {
-            _onLog(_preset.Id ?? string.Empty, $"🛑 StopExecution received for session {targetSid?.ToString()[..8] ?? "unknown"}. Aborting active turn immediately.");
+            return;
+        }
+
+        if (State.ActiveSessionId.HasValue)
+        {
+            var activeSid = State.ActiveSessionId.Value;
+            if (isInterrupt)
+            {
+                _stoppedSessions.TryRemove(activeSid, out _);
+            }
+            else
+            {
+                _stoppedSessions[activeSid] = DateTimeOffset.UtcNow;
+            }
+
+            _onLog(_preset.Id ?? string.Empty, $"🛑 StopExecution received for agent '{targetAgent ?? targetPersona}'. Aborting active turn for session {activeSid.ToString()[..8]}.");
             try
             {
                 _activeTurnCts?.Cancel();
@@ -433,29 +471,38 @@ public class AgentRunnerInstance : IAsyncDisposable
         }
     }
 
-    private void HandleStopCommand(Guid? parsedSid, string? cmdId, string? targetAgent)
+    internal void HandleStopCommand(Guid? parsedSid, string? cmdId, string? targetAgent)
     {
-        var targetSid = parsedSid ?? State.ActiveSessionId;
-        if (!targetSid.HasValue) return;
+        if (!State.ActiveSessionId.HasValue) return;
 
-        var matchesSession = State.ActiveSessionId.HasValue && parsedSid.HasValue && parsedSid.Value == State.ActiveSessionId.Value;
-        var matchesAgent = string.IsNullOrWhiteSpace(targetAgent) ||
-                           string.Equals(targetAgent.Trim().TrimStart('@'), _preset.Id?.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase) ||
-                           (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase));
+        // If a session ID is specified, it MUST match this runner's active session.
+        if (parsedSid.HasValue && parsedSid.Value != State.ActiveSessionId.Value)
+        {
+            return;
+        }
 
-        if (!matchesSession && !matchesAgent && targetSid != State.ActiveSessionId) return;
+        // If no session ID is specified, it must explicitly match this agent or persona.
+        if (!parsedSid.HasValue)
+        {
+            var matchesAgent = !string.IsNullOrWhiteSpace(targetAgent) &&
+                (string.Equals(targetAgent.Trim().TrimStart('@'), _preset.Id?.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase) ||
+                 (!string.IsNullOrWhiteSpace(_preset.PersonaId) && string.Equals(targetAgent.Trim().TrimStart('@'), _preset.PersonaId.Trim().TrimStart('@'), StringComparison.OrdinalIgnoreCase)));
 
-        _onLog(_preset.Id ?? string.Empty, $"🛑 StopCommand received for command '{cmdId}' in session {targetSid.Value.ToString()[..8]}.");
+            if (!matchesAgent) return;
+        }
+
+        var activeSid = State.ActiveSessionId.Value;
+        _onLog(_preset.Id ?? string.Empty, $"🛑 StopCommand received for command '{cmdId}' in session {activeSid.ToString()[..8]}.");
 
         // 1. Try granular command termination first (for local tool executions)
-        if (ActiveCommandRegistry.TryStopCommand(targetSid.Value, cmdId))
+        if (ActiveCommandRegistry.TryStopCommand(activeSid, cmdId))
         {
             _onLog(_preset.Id ?? string.Empty, $"Subprocess for command '{cmdId}' terminated. Tool will return aborted status to model.");
             return;
         }
 
         // 2. Try killing child process of agy (if agy is running a shell command)
-        if (ActiveAgyProcessRegistry.TryKillChildren(targetSid.Value))
+        if (ActiveAgyProcessRegistry.TryKillChildren(activeSid))
         {
             _onLog(_preset.Id ?? string.Empty, $"Child processes of agy runner terminated. Model will receive command abort.");
             return;
@@ -689,7 +736,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                     _agentToken,
                     new TrajectoryEventPayload
                     {
-                        EventType = "response",
+                        EventType = "error",
                         Content = $"🛑 Turn execution halted by operator for agent `@{_preset.Id}`."
                     },
                     CancellationToken.None);
