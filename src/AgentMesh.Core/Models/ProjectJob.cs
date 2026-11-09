@@ -113,7 +113,7 @@ public class ProjectJob
     /// </remarks>
     public string ArtifactsJson { get; set; } = "[]";
 
-    public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.LeadOrHuman;
+    public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.Autonomous;
     public string? CurrentTaskId { get; set; }
     public string? ProgressHeartbeat { get; set; }
     public string? AssignedAgentId { get; set; }

@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -33,7 +33,7 @@ public record ProjectJobDto(
     DateTimeOffset UpdatedAt,
     ProjectJobPriority Priority = ProjectJobPriority.Normal,
     List<QueuedJobTurnDto>? QueuedTurns = null,
-    PlanApprovalPolicy ApprovalPolicy = PlanApprovalPolicy.LeadOrHuman,
+    PlanApprovalPolicy ApprovalPolicy = PlanApprovalPolicy.Autonomous,
     string? CurrentTaskId = null,
     string? ProgressHeartbeat = null,
     string? LifecycleStatus = null,
@@ -253,7 +253,7 @@ public class ProjectJobsController(
             Description = req.Description?.Trim() ?? string.Empty,
             Status = ProjectJobStatus.Pending,
             Priority = req.Priority ?? ProjectJobPriority.Normal,
-            ApprovalPolicy = req.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman,
+            ApprovalPolicy = req.ApprovalPolicy ?? PlanApprovalPolicy.Autonomous,
             AssignedAgentId = assignedId,
             GitBranchName = branch,
             S3ArchiveKey = project.WorkspaceType == WorkspaceType.S3Archive

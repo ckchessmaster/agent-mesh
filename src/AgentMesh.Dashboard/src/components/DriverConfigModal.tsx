@@ -54,7 +54,7 @@ interface DriverConfigModalProps {
  * (1s → 2s → 4s, capped at 15s) rather than a fixed interval, so there is no number to show.
  */
 export const DRIVER_LIMIT_DEFAULTS = {
-  maxSteps: 100,
+  maxSteps: 50,
   timeoutSeconds: 600,
   maxRetries: 2
 } as const;
@@ -763,8 +763,8 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                       className={fieldClass}
                     />
                     <p className="text-[10px] text-slate-500 mt-1">
-                      Default {DRIVER_LIMIT_DEFAULTS.maxSteps}. On reaching it the agent is asked to
-                      summarize rather than stopping silently.
+                      Default {DRIVER_LIMIT_DEFAULTS.maxSteps}. On reaching it the agent posts a
+                      progress checkpoint and continues autonomously.
                     </p>
                   </div>
                   <div>

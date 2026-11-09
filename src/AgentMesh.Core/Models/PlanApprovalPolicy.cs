@@ -3,7 +3,8 @@ namespace AgentMesh.Core.Models;
 public enum PlanApprovalPolicy
 {
     LeadOrHuman = 0,   // Assigned Team Lead or Human Operator can approve the plan
-    HumanOnly = 1      // Strictly requires authenticated Human Operator sign-off
+    HumanOnly = 1,     // Strictly requires authenticated Human Operator sign-off
+    Autonomous = 2     // Automatically approves plan and continues to implementation
 }
 
 public enum JobStatus

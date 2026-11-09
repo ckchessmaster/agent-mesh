@@ -63,7 +63,7 @@ public class AgentJobConfiguration : IEntityTypeConfiguration<AgentJob>
             .HasColumnName("approval_policy")
             .HasConversion<string>()
             .HasMaxLength(32)
-            .HasDefaultValue(PlanApprovalPolicy.LeadOrHuman)
+            .HasDefaultValue(PlanApprovalPolicy.Autonomous)
             .IsRequired();
 
         builder.Property(j => j.CurrentTaskId)

@@ -50,7 +50,7 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
   const [description, setDescription] = useState('');
   const [assignedAgentId, setAssignedAgentId] = useState(defaultAssignee);
   const [priority, setPriority] = useState<number>(1);
-  const [approvalPolicy, setApprovalPolicy] = useState<number>(PlanApprovalPolicy.LeadOrHuman);
+  const [approvalPolicy, setApprovalPolicy] = useState<number>(PlanApprovalPolicy.Autonomous);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -190,7 +190,8 @@ export const NewJobModal: React.FC<NewJobModalProps> = ({
                 onChange={(e) => setApprovalPolicy(Number(e.target.value))}
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-sky-500 transition cursor-pointer"
               >
-                <option value={PlanApprovalPolicy.LeadOrHuman}>Lead or Human (Default)</option>
+                <option value={PlanApprovalPolicy.Autonomous}>Autonomous (Default)</option>
+                <option value={PlanApprovalPolicy.LeadOrHuman}>Lead or Human</option>
                 <option value={PlanApprovalPolicy.HumanOnly}>Human Operator Only</option>
               </select>
             </div>

@@ -100,7 +100,7 @@ describe('DriverConfigModal', () => {
   });
 
   it('does not re-send a default that was merely displayed, not stored', async () => {
-    // Driver has maxSteps unset; the form shows the 100 default. Saving must not pin it.
+    // Driver has maxSteps unset; the form shows the 50 default. Saving must not pin it.
     const { onSave, onClose } = renderModal({
       initialConfig: { adapter: 'openai', endpoint: 'http://h/v1', hasApiKey: false }
     });

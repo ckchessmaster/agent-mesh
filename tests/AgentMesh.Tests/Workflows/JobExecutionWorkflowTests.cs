@@ -433,6 +433,153 @@ public class JobExecutionWorkflowTests
         }
     }
 
+    [Fact]
+    public async Task JobWorkflow_WithAutonomousApprovalPolicy_ProceedsToImplementationWithoutApprovalSignal()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity((Func<DiscoveryTurnInput, Task<TurnOutcome>>)execution.RunAgentDiscoveryTurnAsync)
+            .AddActivity((Func<CodingTurnInput, Task<TurnOutcome>>)execution.RunJobCodingTurnAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+            .AddWorkflow<JobExecutionWorkflow>();
+        workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "autonomous-agent",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace",
+                InitialPrompt: "Autonomous implementation",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.Autonomous
+            );
+
+            // Register checklist during discovery
+            execution.CustomDiscoveryHandler = async _ =>
+            {
+                var handle = env.Client.GetWorkflowHandle<JobExecutionWorkflow>($"job-{jobId}");
+                await handle.SignalAsync(wf => wf.ReceiveSetChecklistAsync(new List<ChecklistTaskItem>
+                {
+                    new("Task 1: Autonomous task", "src/Auto.cs", "dotnet test")
+                }));
+                return TurnOutcome.Completed("Discovery complete; checklist proposed.");
+            };
+
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            // Under Autonomous policy, it auto-approves and transitions directly to Stage 3 and beyond
+            // Provide PR review approval so workflow can complete
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting pull request review") || s.CurrentHeartbeat.Contains("Executing task"));
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("lead", true, "LGTM", DateTimeOffset.UtcNow, 77)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+            execution.CodingTurnCount.Should().Be(1, "autonomous policy must execute coding turn without requiring explicit approval signal");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [Fact]
+    public async Task JobWorkflow_RetainsCurrentTask_WhenTurnOutcomeIsContinue()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity((Func<DiscoveryTurnInput, Task<TurnOutcome>>)execution.RunAgentDiscoveryTurnAsync)
+            .AddActivity((Func<CodingTurnInput, Task<TurnOutcome>>)execution.RunJobCodingTurnAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+            .AddWorkflow<JobExecutionWorkflow>();
+        workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "autonomous-agent",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace",
+                InitialPrompt: "Multi-turn task execution",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.Autonomous
+            );
+
+            execution.CustomDiscoveryHandler = async _ =>
+            {
+                var handle = env.Client.GetWorkflowHandle<JobExecutionWorkflow>($"job-{jobId}");
+                await handle.SignalAsync(wf => wf.ReceiveSetChecklistAsync(new List<ChecklistTaskItem>
+                {
+                    new("Task 1: Large feature", "src/Feature.cs", "dotnet test"),
+                    new("Task 2: Followup task", "src/Followup.cs", "dotnet test")
+                }));
+                return TurnOutcome.Completed("Discovery complete.");
+            };
+
+            int callCount = 0;
+            execution.CustomCodingHandler = inputParam =>
+            {
+                callCount++;
+                if (callCount == 1)
+                {
+                    // First turn rolls over with ContinueTurn (e.g. hit 50 step checkpoint)
+                    return Task.FromResult(TurnOutcome.ContinueTurn("Hit 50 steps; continuing task."));
+                }
+                // Second turn completes Task 1
+                return Task.FromResult(TurnOutcome.Completed(
+                    $"Completed: {inputParam.CurrentTask.Title}",
+                    prUrl: "https://github.com/ckchessmaster/agent-mesh/pull/88",
+                    prNumber: 88));
+            };
+
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting pull request review") || s.CurrentHeartbeat.Contains("Executing task"));
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("lead", true, "LGTM", DateTimeOffset.UtcNow, 88)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+
+            // Verify both turn 1 and turn 2 were for Task 1!
+            execution.CodingInputs.Should().HaveCountGreaterThanOrEqualTo(2);
+            execution.CodingInputs[0].CurrentTask.Title.Should().Be("Task 1: Large feature");
+            execution.CodingInputs[1].CurrentTask.Title.Should().Be("Task 1: Large feature",
+                "Turn 2 must still be on Task 1 because Turn 1 returned ContinueTurn, not TaskCompleted");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     private static async Task WaitUntilAsync(
         WorkflowHandle<JobExecutionWorkflow, JobExecutionResult> handle,
         Func<JobWorkflowState, bool> predicate,
@@ -463,6 +610,7 @@ public class JobExecutionWorkflowTests
         public List<DiscoveryTurnInput> DiscoveryInputs { get; } = [];
         public List<CodingTurnInput> CodingInputs { get; } = [];
         public Func<DiscoveryTurnInput, Task<TurnOutcome>>? CustomDiscoveryHandler { get; set; }
+        public Func<CodingTurnInput, Task<TurnOutcome>>? CustomCodingHandler { get; set; }
 
         [Activity]
         public Task<TurnOutcome> RunAgentDiscoveryTurnAsync(DiscoveryTurnInput input)
@@ -481,6 +629,10 @@ public class JobExecutionWorkflowTests
         {
             CodingTurnCount++;
             CodingInputs.Add(input);
+            if (CustomCodingHandler is not null)
+            {
+                return CustomCodingHandler(input);
+            }
             return Task.FromResult(TurnOutcome.Completed(
                 $"Task completed: {input.CurrentTask.Title}",
                 prUrl: "https://github.com/ckchessmaster/agent-mesh/pull/77",

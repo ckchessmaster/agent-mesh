@@ -522,8 +522,8 @@ public class OpenAiAdapterTests
             Environment.SetEnvironmentVariable("OPENAI_MAX_STEPS", null);
             Environment.SetEnvironmentVariable("AGENTMESH_MAX_STEPS", null);
             Environment.SetEnvironmentVariable("AGENT_MAX_STEPS", null);
-            OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false).Should().Be(25);
-            OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true).Should().Be(15);
+            OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false).Should().Be(50);
+            OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true).Should().Be(50);
         }
         finally
         {
@@ -606,12 +606,13 @@ public class OpenAiAdapterTests
 
             // Verify that it executed 2 tool calls, then hit max steps
             events.Where(e => e.EventType == "tool_call").Should().HaveCount(2);
-            // Must emit thought about reaching max steps
-            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Reached maximum tool execution steps limit (2)"));
+            // Must emit thought about reaching progress checkpoint
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Reached progress checkpoint (2 steps)"));
             // Must emit final response so session does NOT hang in thinking
             var finalResp = events.FirstOrDefault(e => e.EventType == "response");
             finalResp.Should().NotBeNull();
-            finalResp!.Content.Should().Contain("Completed 2 steps");
+            finalResp!.Content.Should().Contain("Progress Checkpoint (2 steps)");
+            finalResp.Content.Should().Contain("Completed 2 steps");
         }
         finally
         {
@@ -946,11 +947,11 @@ public class OpenAiAdapterTests
     }
 
     [Fact]
-    public void ResolveMaxSteps_FallsBackToDefaults_BasedOnPhase()
+    public void ResolveMaxSteps_FallsBackTo50_RegardlessOfPhase()
     {
         var preset = new AgentPresetConfig { MaxSteps = null };
-        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true).Should().Be(15);
-        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false).Should().Be(25);
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: true).Should().Be(50);
+        OpenAiAdapter.ResolveMaxSteps(preset, isDiscoveryPhase: false).Should().Be(50);
     }
 
     [Fact]
