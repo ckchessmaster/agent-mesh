@@ -2885,16 +2885,20 @@ public class SessionsController(
 
             await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
 
-            // Autonomous Handoff Check (Loop Guard: max 5 consecutive persona hops)
+            // Autonomous Handoff & Progress Checkpoint Continuation Check
+            var isCheckpointRollover = responseMessage.Content.Contains("Progress Checkpoint") ||
+                                       responseMessage.Content.Contains("Continuing to next turn autonomously");
+
             var recentMessages = await db.JobMessages
                 .AsNoTracking()
                 .Where(m => m.JobId == jobId)
                 .OrderByDescending(m => m.CreatedAt)
-                .Take(10)
+                .Take(20)
                 .ToListAsync();
 
             var consecutivePersonaCount = recentMessages.TakeWhile(m => m.SenderType == "persona").Count();
-            if (consecutivePersonaCount < 5)
+            var maxAllowedHops = isCheckpointRollover ? 50 : 5;
+            if (consecutivePersonaCount < maxAllowedHops)
             {
                 var assignedPersonaIds = await db.ProjectPersonas
                     .AsNoTracking()
@@ -2903,13 +2907,34 @@ public class SessionsController(
                     .ToListAsync();
 
                 var nextPersonaId = mentions.FirstOrDefault(m => assignedPersonaIds.Contains(m) && !string.Equals(m, pId, StringComparison.OrdinalIgnoreCase));
+                if (nextPersonaId == null && isCheckpointRollover)
+                {
+                    // For autonomous checkpoint rollovers without an explicit handoff to another persona,
+                    // continue the job autonomously with the current persona or primary assigned persona.
+                    nextPersonaId = pId ?? session.PersonaId ?? assignedPersonaIds.FirstOrDefault();
+                }
+
                 if (nextPersonaId != null)
                 {
                     var nextPersona = await db.Personas.FirstOrDefaultAsync(p => p.Id == nextPersonaId);
                     var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == job.ProjectId);
-                    if (nextPersona != null && project != null)
+                    if (project != null)
                     {
-                        var driverId = nextPersona.DriverId.Trim().ToLowerInvariant();
+                        if (nextPersona == null)
+                        {
+                            nextPersona = new Persona
+                            {
+                                Id = nextPersonaId,
+                                Name = pName ?? nextPersonaId,
+                                DriverId = !string.IsNullOrWhiteSpace(session.DriverId) ? session.DriverId : "agy",
+                                Role = "Autonomous Agent"
+                            };
+                        }
+
+                        var driverId = !string.IsNullOrWhiteSpace(nextPersona.DriverId)
+                            ? nextPersona.DriverId.Trim().ToLowerInvariant()
+                            : (!string.IsNullOrWhiteSpace(session.DriverId) ? session.DriverId.Trim().ToLowerInvariant() : "agy");
+
                         var driver = await db.Agents.FirstOrDefaultAsync(d => d.Id == driverId);
                         if (driver == null)
                         {
@@ -2922,6 +2947,9 @@ public class SessionsController(
                             };
                             db.Agents.Add(driver);
                         }
+
+                        var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
+                        var contextSize = ExtractSessionContextSize(session.MetadataJson);
 
                         var turnMetadata = new Dictionary<string, object?>
                         {
@@ -2938,11 +2966,12 @@ public class SessionsController(
                             ["personaName"] = nextPersona.Name,
                             ["personaRole"] = nextPersona.Role,
                             ["personaPrompt"] = nextPersona.PersonaPrompt,
-                            ["model"] = nextPersona.DefaultModel,
-                            ["effort"] = nextPersona.DefaultEffort,
-                            ["mode"] = nextPersona.DefaultMode,
-                            ["tier"] = nextPersona.DefaultTier,
-                            ["contextSize"] = nextPersona.DefaultContextSize
+                            ["model"] = nextPersona.DefaultModel ?? model,
+                            ["effort"] = nextPersona.DefaultEffort ?? effort,
+                            ["mode"] = nextPersona.DefaultMode ?? mode,
+                            ["tier"] = nextPersona.DefaultTier ?? tier,
+                            ["contextSize"] = nextPersona.DefaultContextSize ?? contextSize,
+                            ["conversationId"] = ExtractSessionConversationId(session.MetadataJson)
                         };
 
                         var nextTurnSession = new AgentSession
@@ -2969,10 +2998,22 @@ public class SessionsController(
                         var library = await AgentMesh.Api.Services.ProjectDocumentStaging.PrepareAsync(
                             db, project.Id, nextTurnSession.Id, null, project.ProjectInstructions);
 
-                        var promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
+                        string promptWithContext;
+                        if (isCheckpointRollover)
+                        {
+                            promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
+                                                library.ProjectPreamble +
+                                                $"[Job Context: {job.Title} - {job.Description}]\n\n" +
+                                                $"[Autonomous Progress Checkpoint Continuation]:\n{responseMessage.Content}\n\n" +
+                                                "Please continue working autonomously on the job implementation and tasks. Inspect files, implement changes, verify, and complete remaining tasks.";
+                        }
+                        else
+                        {
+                            promptWithContext = $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
                                                 library.ProjectPreamble +
                                                 $"[Job Context: {job.Title} - {job.Description}]\n" +
                                                 $"[Previous Handoff from @{pName ?? pId}]:\n{responseMessage.Content}";
+                        }
 
                         var promptMsg = new SessionMessage
                         {
@@ -3008,11 +3049,11 @@ public class SessionsController(
                             personaPrompt = nextPersona.PersonaPrompt,
                             prompt = promptMsg.Content,
                             sender = promptMsg.SenderAgentId,
-                            model = nextPersona.DefaultModel,
-                            effort = nextPersona.DefaultEffort,
-                            mode = nextPersona.DefaultMode,
-                            tier = nextPersona.DefaultTier,
-                            contextSize = nextPersona.DefaultContextSize,
+                            model = nextPersona.DefaultModel ?? model,
+                            effort = nextPersona.DefaultEffort ?? effort,
+                            mode = nextPersona.DefaultMode ?? mode,
+                            tier = nextPersona.DefaultTier ?? tier,
+                            contextSize = nextPersona.DefaultContextSize ?? contextSize,
                             jobId = job.Id,
                             projectId = project.Id,
                             gitBranch = job.GitBranchName,
@@ -3020,8 +3061,27 @@ public class SessionsController(
                             createdAt = promptMsg.CreatedAt
                         };
 
-                        await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", promptPayload);
-                        await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                        if (hubContext != null)
+                        {
+                            await hubContext.Clients.All.SendAsync("SessionCreated", new SessionSummaryDto(
+                                nextTurnSession.Id,
+                                nextTurnSession.Title,
+                                nextTurnSession.Status,
+                                nextTurnSession.MetadataJson,
+                                nextTurnSession.DriverId,
+                                1,
+                                nextTurnSession.CreatedAt,
+                                nextTurnSession.UpdatedAt,
+                                DriverId: nextTurnSession.DriverId,
+                                DriverName: driver.Name,
+                                PersonaId: nextPersona.Id,
+                                PersonaName: nextPersona.Name
+                            ));
+
+                            await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", promptPayload);
+                            await hubContext.Clients.Group($"persona-{nextPersona.Id.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
+                            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                        }
                     }
                 }
             }

@@ -145,4 +145,55 @@ public class AgyAdapterArgumentTests
 
         resolved.Should().Be("claude-sonnet-5-5");
     }
+
+    [Theory]
+    [InlineData("{\"filePath\":\"/src/App.cs\"}", "path", "file_path", "filePath", "/src/App.cs")]
+    [InlineData("{\"CommandLine\":\"git status\"}", "command", "CommandLine", "cmd", "git status")]
+    [InlineData("{\"TARGETFILE\":\"/workspace/foo.txt\"}", "TargetFile", "targetFile", "path", "/workspace/foo.txt")]
+    public void GetPropertyString_CaseInsensitiveMatching(string json, string name1, string name2, string name3, string expected)
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var val = OpenAiAdapter.GetPropertyString(doc.RootElement, name1, name2, name3);
+        val.Should().Be(expected);
+    }
+
+    [Fact]
+    public void GetPropertyString_StringEncodedJsonPayload_IsParsedSuccessfully()
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse("\"{\\\"filePath\\\":\\\"/src/Index.tsx\\\"}\"");
+        var val = OpenAiAdapter.GetPropertyString(doc.RootElement, "path", "filePath");
+        val.Should().Be("/src/Index.tsx");
+    }
+
+    [Fact]
+    public void ExtractGoal_ExtractsJobContextOrTaskTitle()
+    {
+        var ev = new PromptReceivedEvent
+        {
+            Prompt = "[Job Context: Fix autonomous rollover in AgentMesh]\nSome task description"
+        };
+        var goal = OpenAiAdapter.ExtractGoal(ev);
+        goal.Should().Be("Fix autonomous rollover in AgentMesh");
+    }
+
+    [Fact]
+    public void GetLatestThoughtFromTranscript_ReadsRecentThinkingFromTranscriptFile()
+    {
+        var tempFile = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllLines(tempFile, new[]
+            {
+                "{\"step_index\": 1, \"type\": \"USER_INPUT\", \"content\": \"hello\"}",
+                "{\"step_index\": 2, \"type\": \"PLANNER_RESPONSE\", \"thinking\": \"Inspecting SessionsController to fix turn rollover...\", \"content\": \"I am reading the file\"}"
+            });
+
+            var thought = AgyAdapter.GetLatestThoughtFromTranscript(tempFile);
+            thought.Should().Be("Inspecting SessionsController to fix turn rollover...");
+        }
+        finally
+        {
+            if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
 }
