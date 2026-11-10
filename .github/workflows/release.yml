@@ -149,11 +149,17 @@ jobs:
           cd dist/release
           sha256sum * > SHA256SUMS.txt
 
-      - name: Create GitHub Release
+      - name: Create or Update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.TAG }}
         run: |
-          gh release create "$TAG" dist/release/* \
-            --title "AgentMesh ${TAG}" \
-            --generate-notes
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading release assets..."
+            gh release upload "$TAG" dist/release/* --clobber
+          else
+            echo "Creating release $TAG..."
+            gh release create "$TAG" dist/release/* \
+              --title "AgentMesh ${TAG}" \
+              --generate-notes
+          fi
