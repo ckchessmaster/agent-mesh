@@ -368,18 +368,21 @@ public class WorkflowSignalRouter(
     {
         ArgumentNullException.ThrowIfNull(tasks);
 
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ProbeTimeout);
+
         var candidateIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}", WorkflowIdFor(jobId) };
         foreach (var workflowId in candidateIds.Distinct())
         {
-            var description = await DescribeAsync(workflowId, ct);
-            if (description is not null && description.Status == WorkflowExecutionStatus.Running)
+            try
             {
-                try
+                var description = await DescribeAsync(workflowId, deadline.Token);
+                if (description is not null && description.Status == WorkflowExecutionStatus.Running)
                 {
                     var handle = temporal.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId);
                     await handle.SignalAsync(
                         w => w.ReceiveSetChecklistAsync(tasks),
-                        new WorkflowSignalOptions { Rpc = Rpc(ct) });
+                        new WorkflowSignalOptions { Rpc = Rpc(deadline.Token) });
 
                     logger?.LogInformation(
                         "Signalled workflow {WorkflowId} with living checklist ({Count} tasks)",
@@ -387,15 +390,22 @@ public class WorkflowSignalRouter(
 
                     return new SignalDelivery(workflowId, SignalDeliveryStatus.Delivered);
                 }
-                catch (RpcException ex)
-                {
-                    return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, Describe(ex));
-                }
-                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
-                {
-                    logger?.LogWarning(ex, "Checklist signal for {WorkflowId} was rejected", workflowId);
-                    return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, ex.Message);
-                }
+            }
+            catch (RpcException ex)
+            {
+                return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, Describe(ex));
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                logger?.LogWarning(ex, "Checklist signal for {WorkflowId} was rejected", workflowId);
+                return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, ex.Message);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                logger?.LogDebug(
+                    "Workflow signal probe for {WorkflowId} timed out after {Timeout}s; falling back to DB state",
+                    workflowId, ProbeTimeout.TotalSeconds);
+                break;
             }
         }
 

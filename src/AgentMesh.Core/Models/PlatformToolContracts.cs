@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AgentMesh.Core.Models;
 
 /// <summary>
@@ -30,10 +32,10 @@ public record PostJobMessageArgs(
 );
 
 public record ChecklistTaskItem(
-    string Title,
-    string? TargetFile = null,
-    string? VerificationMethod = null,
-    string? Id = null
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("target_file")] string? TargetFile = null,
+    [property: JsonPropertyName("verification_method")] string? VerificationMethod = null,
+    [property: JsonPropertyName("id")] string? Id = null
 );
 
 public record ManageTaskArgs(

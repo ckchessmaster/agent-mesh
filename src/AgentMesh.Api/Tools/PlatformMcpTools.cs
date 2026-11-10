@@ -522,9 +522,8 @@ public class PlatformMcpTools(
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "Failed to signal workflow with checklist for job {JobId}", job.Id);
-                    return Error("workflow_signal_failed",
-                        $"Failed to signal workflow with checklist for job {job.Id}: {ex.Message}");
+                    logger.LogWarning(ex, "Failed to signal workflow with checklist for job {JobId}; proceeding with database persistence", job.Id);
+                    delivery = new SignalDelivery($"job-{job.Id:D}", SignalDeliveryStatus.NoRunningWorkflow, ex.Message);
                 }
 
                 if (!delivery.Delivered && delivery.Status != SignalDeliveryStatus.NoRunningWorkflow)
