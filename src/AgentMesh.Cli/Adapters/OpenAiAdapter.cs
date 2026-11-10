@@ -895,7 +895,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
         var isDiscoveryPhase = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
             || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
-            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true);
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true);
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
         var toolsDefinition = isDirectMode ? null : GetToolDefinitions(isDiscoveryPhase);
@@ -2143,17 +2145,17 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             var root = doc.RootElement;
             var normalizedTool = toolName.ToLowerInvariant();
 
-            // Stage 1 Discovery guardrails: strictly read-only
+            // Stage 1 Discovery / Stage 2 Plan Approval guardrails: strictly read-only
             if (isDiscoveryPhase)
             {
                 if (normalizedTool is "write_file" or "edit_file" or "replace_file_content")
                 {
-                    return "Error: File modifications are forbidden during Stage 1 Discovery. Your objective is read-only exploration and checklist registration via manage_task(action: 'set_checklist').";
+                    return "Error: File modifications are forbidden during Stage 1 Discovery and while awaiting plan approval. Complete discovery and receive plan approval before starting implementation.";
                 }
 
                 if (normalizedTool is "open_pull_request")
                 {
-                    return "Error: Opening pull requests is forbidden during Stage 1 Discovery. Complete discovery using manage_task(action: 'set_checklist') and receive plan approval before starting implementation.";
+                    return "Error: Opening pull requests is forbidden during Stage 1 Discovery and while awaiting plan approval. Complete discovery using manage_task(action: 'set_checklist') and receive plan approval before starting implementation.";
                 }
 
                 if (normalizedTool is "run_command" or "bash" or "command")
@@ -2161,7 +2163,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var cmd = GetPropertyString(root, "command", "CommandLine", "cmd") ?? string.Empty;
                     if (IsMutatingGitCommand(cmd))
                     {
-                        return "Error: Committing, pushing, or creating pull requests is forbidden during Stage 1 Discovery. Your objective is read-only exploration and checklist registration via manage_task(action: 'set_checklist').";
+                        return "Error: Committing, pushing, or creating pull requests is forbidden during Stage 1 Discovery and while awaiting plan approval. Your objective is read-only exploration and checklist registration via manage_task(action: 'set_checklist').";
                     }
                 }
             }

@@ -2933,6 +2933,15 @@ public class SessionsController(
                         return;
                     }
 
+                    var isAwaitingPlanApproval = job.ApprovalPolicy != PlanApprovalPolicy.Autonomous &&
+                        (job.ProgressHeartbeat?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true ||
+                         ProjectJobsController.DeriveLifecycleStatus(job) == "AwaitingApproval");
+
+                    if (isAwaitingPlanApproval)
+                    {
+                        return;
+                    }
+
                     var nextPersona = await db.Personas.FirstOrDefaultAsync(p => p.Id == nextPersonaId);
                     var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == job.ProjectId);
                     if (project != null)

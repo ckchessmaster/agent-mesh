@@ -1245,12 +1245,19 @@ public class ProjectJobsController(
         var personasToDispatch = new List<string>();
         if (req.TurnSessionId == null)
         {
-            foreach (var candidateId in candidatePersonas)
+            var isAwaitingPlanApproval = job.ApprovalPolicy != PlanApprovalPolicy.Autonomous &&
+                (job.ProgressHeartbeat?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true ||
+                 DeriveLifecycleStatus(job) == "AwaitingApproval");
+
+            if (!isAwaitingPlanApproval)
             {
-                var workflowOwnsTurn = workflows is not null && await ProbeWorkflowOwnershipAsync(id, candidateId, ct);
-                if (!workflowOwnsTurn)
+                foreach (var candidateId in candidatePersonas)
                 {
-                    personasToDispatch.Add(candidateId);
+                    var workflowOwnsTurn = workflows is not null && await ProbeWorkflowOwnershipAsync(id, candidateId, ct);
+                    if (!workflowOwnsTurn)
+                    {
+                        personasToDispatch.Add(candidateId);
+                    }
                 }
             }
         }
@@ -2522,6 +2529,13 @@ public class ProjectJobsController(
         var candidateJobs = await db.ProjectJobs
             .Where(j => j.Status == ProjectJobStatus.Active && j.QueuedTurnsJson != "[]")
             .ToListAsync();
+
+        if (candidateJobs.Count == 0) return;
+
+        // Plan approval gate required: do not dispatch queued turns while waiting for plan approval
+        candidateJobs = candidateJobs.Where(j => !(j.ApprovalPolicy != PlanApprovalPolicy.Autonomous &&
+            (j.ProgressHeartbeat?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true ||
+             DeriveLifecycleStatus(j) == "AwaitingApproval"))).ToList();
 
         if (candidateJobs.Count == 0) return;
 
