@@ -1711,19 +1711,27 @@ public class ProjectJobsController(
             if (delivery.Delivered)
             {
                 var targetJob = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId, ct);
-                if (targetJob != null && (string.Equals(targetJob.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase) ||
-                    (targetJob.ProgressHeartbeat?.Contains("Awaiting", StringComparison.OrdinalIgnoreCase) ?? false)))
+                if (targetJob != null)
                 {
-                    targetJob.ProgressHeartbeat = "Exploring codebase and generating checklist";
-                    await db.SaveChangesAsync(ct);
-                    if (hubContext != null)
+                    var isDiscovery = string.Equals(targetJob.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase);
+                    var isAwaiting = targetJob.ProgressHeartbeat?.Contains("Awaiting", StringComparison.OrdinalIgnoreCase) ?? false;
+                    if (isDiscovery || isAwaiting)
                     {
-                        await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+                        targetJob.ProgressHeartbeat = isDiscovery
+                            ? "Exploring codebase and generating checklist"
+                            : "Executing task (resumed with feedback)";
+                        targetJob.UpdatedAt = DateTimeOffset.UtcNow;
+                        await db.SaveChangesAsync(ct);
+                        if (hubContext != null)
                         {
-                            jobId = targetJob.Id,
-                            progressHeartbeat = targetJob.ProgressHeartbeat,
-                            currentTaskId = targetJob.CurrentTaskId
-                        }, ct);
+                            await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+                            {
+                                jobId = targetJob.Id,
+                                progressHeartbeat = targetJob.ProgressHeartbeat,
+                                currentTaskId = targetJob.CurrentTaskId,
+                                lifecycleStatus = DeriveLifecycleStatus(targetJob)
+                            }, ct);
+                        }
                     }
                 }
             }

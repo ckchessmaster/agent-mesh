@@ -305,11 +305,23 @@ public class JobChatController(
         if (agentJob is not null)
         {
             agentJob.ProgressHeartbeat = "Plan approved. Starting implementation";
+            if (string.Equals(agentJob.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+            {
+                agentJob.CurrentTaskId = null;
+            }
             agentJob.UpdatedAt = DateTimeOffset.UtcNow;
         }
         if (projectJob is not null)
         {
             projectJob.ProgressHeartbeat = "Plan approved. Starting implementation";
+            if (string.Equals(projectJob.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+            {
+                var parsedTasks = ProjectJobsController.ParseTasks(projectJob.TasksJson);
+                var firstTask = parsedTasks.FirstOrDefault();
+                projectJob.CurrentTaskId = firstTask != null
+                    ? (firstTask.Id != Guid.Empty ? firstTask.Id.ToString("D") : firstTask.Title)
+                    : null;
+            }
             projectJob.UpdatedAt = DateTimeOffset.UtcNow;
         }
         await dbContext.SaveChangesAsync();

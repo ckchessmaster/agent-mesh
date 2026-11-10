@@ -422,7 +422,13 @@ public partial class ExecutionActivities
                 PersonaId: taskInput.PersonaId,
                 AgentId: taskInput.AgentId);
 
-            return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
+            var outcome = await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
+            if (checkpoints is not null && reconciler is not null)
+            {
+                await WriteCheckpointAsync(taskInput, context, outcome, cancellationToken);
+            }
+
+            return outcome;
         }
 
         return TurnOutcome.Awaiting("operator", "Discovery complete; checklist proposed for approval.");
@@ -466,7 +472,13 @@ public partial class ExecutionActivities
                 PersonaId: taskInput.PersonaId,
                 AgentId: taskInput.AgentId);
 
-            return await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
+            var outcome = await ResolveTurnRunner().RunTurnAsync(request, cancellationToken);
+            if (checkpoints is not null && reconciler is not null)
+            {
+                await WriteCheckpointAsync(taskInput, context, outcome, cancellationToken);
+            }
+
+            return outcome;
         }
 
         return TurnOutcome.Completed($"Task '{input.CurrentTask.Title}' completed.");

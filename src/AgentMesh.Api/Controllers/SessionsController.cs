@@ -2916,6 +2916,23 @@ public class SessionsController(
 
                 if (nextPersonaId != null)
                 {
+                    if (workflows != null && await workflows.IsWorkflowDrivingAsync(jobId, nextPersonaId))
+                    {
+                        if (!isCheckpointRollover)
+                        {
+                            await workflows.SendChatMessageAsync(
+                                jobId,
+                                new Core.Workflows.ChatMessageSignal(
+                                    SenderId: pId ?? "agent",
+                                    Content: responseMessage.Content,
+                                    Timestamp: jobMsg.CreatedAt,
+                                    MessageId: jobMsg.Id.ToString(),
+                                    TargetPersonaIds: [nextPersonaId]));
+                        }
+
+                        return;
+                    }
+
                     var nextPersona = await db.Personas.FirstOrDefaultAsync(p => p.Id == nextPersonaId);
                     var project = await db.Projects.FirstOrDefaultAsync(p => p.Id == job.ProjectId);
                     if (project != null)
