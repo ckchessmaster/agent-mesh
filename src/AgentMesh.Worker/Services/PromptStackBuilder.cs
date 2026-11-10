@@ -675,6 +675,14 @@ public class PromptStackBuilder(
             return context.UserPrompt.Trim();
         }
 
+        if (string.Equals(context.TaskId?.Trim(), "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Explore the codebase in read-only mode, decompose the job into 3 to 6 atomic tasks " +
+                   "using manage_task(action='set_checklist'), and post your plan or questions via " +
+                   "post_job_message. Do not reply that you are waiting for instructions — this envelope " +
+                   "is the instruction.";
+        }
+
         if (focus is not null && !string.IsNullOrWhiteSpace(focus.Title))
         {
             return $"Work the checklist item above to completion: {focus.Title.Trim()}\n" +

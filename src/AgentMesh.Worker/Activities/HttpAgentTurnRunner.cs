@@ -585,7 +585,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             // progressing while nothing is executing.
             Heartbeat($"observing session {sessionId} for task {input.TaskId}");
 
-            var snapshot = await ReadTurnStateAsync(jobId, sessionId, ledgerFloor, ct);
+            var snapshot = await ReadTurnStateAsync(jobId, sessionId, ledgerFloor, ct, input.TaskId);
 
             // Outcome signals are checked before the status, and on every iteration rather than only
             // at termination. A turn that opened a PR and then kept working (adding tests, replying to
@@ -615,7 +615,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
 
                 if (DateTimeOffset.UtcNow - terminalSince >= SettleWindow)
                 {
-                    var finalSnapshot = await ReadTurnStateAsync(jobId, sessionId, ledgerFloor, ct);
+                    var finalSnapshot = await ReadTurnStateAsync(jobId, sessionId, ledgerFloor, ct, input.TaskId);
 
                     var finalSignal = ClassifySignals(finalSnapshot);
                     if (finalSignal is not null) return finalSignal;
@@ -659,7 +659,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         bool LedgerScopedToSession = true,
         string? LastSessionMessageContent = null,
         string? LastSessionMessageType = null,
-        string? DiscoveredPrUrl = null);
+        string? DiscoveredPrUrl = null,
+        bool TargetTaskCompleted = false);
 
     internal record ToolCallRecord(string ToolName, string? ArgsJson, DateTimeOffset At);
 
@@ -678,7 +679,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         Guid jobId,
         Guid sessionId,
         DateTimeOffset ledgerFloor,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? taskId = null)
     {
         var session = await db.AgentSessions.AsNoTracking()
             .Where(s => s.Id == sessionId)
@@ -742,6 +744,17 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             .Select(m => m.Content)
             .FirstOrDefaultAsync(ct);
 
+        var targetTaskCompleted = false;
+        if (!string.IsNullOrWhiteSpace(taskId) &&
+            !string.Equals(taskId.Trim(), "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+        {
+            var tasksJson = await db.ProjectJobs.AsNoTracking()
+                .Where(j => j.Id == jobId)
+                .Select(j => j.TasksJson)
+                .FirstOrDefaultAsync(ct);
+            targetTaskCompleted = IsTaskCompletedInTasksJson(tasksJson, taskId);
+        }
+
         return new TurnState(
             SessionStatus: session?.Status ?? "unknown",
             ToolCalls: toolCalls
@@ -754,7 +767,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             LedgerScopedToSession: ledgerScopedToSession,
             LastSessionMessageContent: lastSessionMessage?.Content,
             LastSessionMessageType: lastSessionMessage?.EventType,
-            DiscoveredPrUrl: discoveredPrMessage);
+            DiscoveredPrUrl: discoveredPrMessage,
+            TargetTaskCompleted: targetTaskCompleted);
     }
 
     /// <summary>
@@ -853,7 +867,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         // The checklist is the platform's own definition of done: manage_task writes
         // status='completed' and the Cockpit renders the same four values. Deriving completion from it
         // means the workflow and the dashboard cannot disagree about whether the work is finished.
-        var allTasksCompleted = state.JobMessages.Any(m => ReadTaskCompletedFlag(m.StructuredPayloadJson));
+        var allTasksCompleted = state.TargetTaskCompleted ||
+            state.JobMessages.Any(m => ReadTaskCompletedFlag(m.StructuredPayloadJson));
 
         if (allTasksCompleted && IsSessionFinished(state.SessionStatus))
         {
@@ -1200,6 +1215,49 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             return false;
         }
         catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// True when the target checklist item (matched by GUID id or case-insensitive title) in
+    /// <see cref="ProjectJob.TasksJson"/> is marked completed, or when all checklist items are completed.
+    /// </summary>
+    internal static bool IsTaskCompletedInTasksJson(string? tasksJson, string? taskId)
+    {
+        if (string.IsNullOrWhiteSpace(tasksJson) || string.IsNullOrWhiteSpace(taskId)) return false;
+
+        var trimmedTaskId = taskId.Trim();
+        if (string.Equals(trimmedTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        try
+        {
+            var tasks = JsonSerializer.Deserialize<List<JobTaskDto>>(
+                tasksJson,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+            if (tasks is null || tasks.Count == 0) return false;
+
+            static bool IsCompleted(JobTaskDto t) =>
+                t.IsCompleted || string.Equals(t.Status, JobTaskStatus.Completed, StringComparison.OrdinalIgnoreCase);
+
+            if (Guid.TryParse(trimmedTaskId, out var parsedId))
+            {
+                var byId = tasks.FirstOrDefault(t => t.Id == parsedId);
+                if (byId is not null) return IsCompleted(byId);
+            }
+
+            var byTitle = tasks.FirstOrDefault(t =>
+                string.Equals(t.Title?.Trim(), trimmedTaskId, StringComparison.OrdinalIgnoreCase));
+            if (byTitle is not null) return IsCompleted(byTitle);
+
+            return tasks.All(IsCompleted);
+        }
+        catch (JsonException)
         {
             return false;
         }

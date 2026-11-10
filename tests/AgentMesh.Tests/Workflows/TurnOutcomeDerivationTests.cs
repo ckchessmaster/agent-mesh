@@ -416,4 +416,34 @@ public class TurnOutcomeDerivationTests
         HttpAgentTurnRunner.TryReadGuidProperty("not json", "turnSessionId").Should().BeNull();
         HttpAgentTurnRunner.TryReadGuidProperty(null, "turnSessionId").Should().BeNull();
     }
+
+    [Fact]
+    public void IsTaskCompletedInTasksJson_RecognizesCompletedTaskByIdOrTitle()
+    {
+        var task1Id = Guid.NewGuid();
+        var task2Id = Guid.NewGuid();
+        var tasksJson = $$"""
+        [
+          {"id":"{{task1Id}}","title":"Task 1: Build API","isCompleted":true,"status":"completed"},
+          {"id":"{{task2Id}}","title":"Task 2: Add Tests","isCompleted":false,"status":"in_progress"}
+        ]
+        """;
+
+        HttpAgentTurnRunner.IsTaskCompletedInTasksJson(tasksJson, task1Id.ToString()).Should().BeTrue();
+        HttpAgentTurnRunner.IsTaskCompletedInTasksJson(tasksJson, "Task 1: Build API").Should().BeTrue();
+        HttpAgentTurnRunner.IsTaskCompletedInTasksJson(tasksJson, task2Id.ToString()).Should().BeFalse();
+        HttpAgentTurnRunner.IsTaskCompletedInTasksJson(tasksJson, "Task 2: Add Tests").Should().BeFalse();
+        HttpAgentTurnRunner.IsTaskCompletedInTasksJson(tasksJson, "stage-1-discovery").Should().BeFalse();
+
+        var state = new HttpAgentTurnRunner.TurnState(
+            SessionStatus: "idle",
+            ToolCalls: [],
+            JobMessages: [],
+            LastActivityAt: DateTimeOffset.UtcNow,
+            TargetTaskCompleted: true);
+
+        var signal = HttpAgentTurnRunner.ClassifySignals(state);
+        signal.Should().NotBeNull();
+        signal!.Status.Should().Be(TurnOutcomeStatus.TaskCompleted);
+    }
 }

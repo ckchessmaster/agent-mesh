@@ -36,17 +36,20 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     };
 
     private readonly Queue<ChatMessageSignal> _chatInbox = new();
+    private readonly HashSet<string> _seenMessageIds = new(StringComparer.Ordinal);
     private PlanApprovedSignal? _planApproval;
     private PrReviewSignal? _prReview;
     private List<ChecklistTaskItem> _tasks = new();
     private int _currentTaskIndex = 0;
     private string _currentHeartbeat = "Initializing job";
     private PlanApprovalPolicy _approvalPolicy = PlanApprovalPolicy.Autonomous;
+    private string? _assignedAgentId;
 
     [WorkflowRun]
     public async Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input)
     {
         _approvalPolicy = input.ApprovalPolicy;
+        _assignedAgentId = input.AssignedAgentId;
 
         // 1. Stage 1: Discovery & Planning Loop
         _currentHeartbeat = "Exploring codebase and generating checklist";
@@ -243,7 +246,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             {
                 // Changes requested; re-enter coding turn
                 _currentHeartbeat = "Changes requested on PR; resuming coding turn";
-                var reviewFeedback = new ChatMessageSignal(
+                ChatMessageSignal? reviewFeedback = new ChatMessageSignal(
                     _prReview.ReviewerId,
                     $"Review feedback on pull request:\n{_prReview.ReviewComments ?? "Changes requested."}",
                     Workflow.UtcNow
@@ -256,20 +259,41 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                     VerificationMethod: "dotnet test"
                 );
 
-                var fixOutcome = await Workflow.ExecuteActivityAsync(
-                    (IExecutionActivities act) => act.RunJobCodingTurnAsync(new CodingTurnInput(
-                        input.JobId,
-                        reviewFixTask,
-                        reviewFeedback,
-                        input.AssignedAgentId,
-                        input.ProjectId,
-                        input.WorkspacePath,
-                        input.TargetBranch)),
-                    TurnActivityOptions);
-
-                if (!string.IsNullOrWhiteSpace(fixOutcome.PrUrl))
+                while (true)
                 {
-                    activePrUrl = fixOutcome.PrUrl;
+                    var fixOutcome = await Workflow.ExecuteActivityAsync(
+                        (IExecutionActivities act) => act.RunJobCodingTurnAsync(new CodingTurnInput(
+                            input.JobId,
+                            reviewFixTask,
+                            reviewFeedback,
+                            input.AssignedAgentId,
+                            input.ProjectId,
+                            input.WorkspacePath,
+                            input.TargetBranch)),
+                        TurnActivityOptions);
+
+                    if (!string.IsNullOrWhiteSpace(fixOutcome.PrUrl))
+                    {
+                        activePrUrl = fixOutcome.PrUrl;
+                    }
+
+                    if (fixOutcome.Status == TurnOutcomeStatus.AwaitingInput)
+                    {
+                        _currentHeartbeat = "Awaiting input on PR review fixes";
+                        await Workflow.WaitConditionAsync(() => _chatInbox.Count > 0 || _prReview != null);
+                        if (_prReview != null) break;
+                        reviewFeedback = _chatInbox.Dequeue();
+                        continue;
+                    }
+
+                    if (fixOutcome.Status == TurnOutcomeStatus.Continue)
+                    {
+                        _currentHeartbeat = "Continuing PR review fixes";
+                        reviewFeedback = _chatInbox.Count > 0 ? _chatInbox.Dequeue() : null;
+                        continue;
+                    }
+
+                    break;
                 }
 
                 continue;
@@ -303,8 +327,48 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     [WorkflowSignal]
     public Task ReceiveChatMessageAsync(ChatMessageSignal signal)
     {
+        if (signal is null || string.IsNullOrWhiteSpace(signal.Content))
+        {
+            return Task.CompletedTask;
+        }
+
+        // Self-sent messages (e.g. when the assigned agent calls post_job_message(requires_reply: true))
+        // arrive while the turn is still running and must not be queued into _chatInbox, or they will
+        // immediately unblock the subsequent WaitConditionAsync without waiting for the human/lead reply.
+        if (IsSameAgentIdentity(signal.SenderId, _assignedAgentId))
+        {
+            return Task.CompletedTask;
+        }
+
+        if (!string.IsNullOrWhiteSpace(signal.MessageId) && !_seenMessageIds.Add(signal.MessageId))
+        {
+            return Task.CompletedTask;
+        }
+
         _chatInbox.Enqueue(signal);
         return Task.CompletedTask;
+    }
+
+    private static bool IsSameAgentIdentity(string? senderId, string? assignedAgentId)
+    {
+        if (string.IsNullOrWhiteSpace(senderId) || string.IsNullOrWhiteSpace(assignedAgentId))
+        {
+            return false;
+        }
+
+        var normSender = NormalizeIdentity(senderId);
+        var normAssigned = NormalizeIdentity(assignedAgentId);
+        return normSender.Length > 0 && string.Equals(normSender, normAssigned, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeIdentity(string id)
+    {
+        var trimmed = id.Trim().TrimStart('@');
+        if (trimmed.StartsWith("driver-", StringComparison.OrdinalIgnoreCase) && trimmed.Length > "driver-".Length)
+        {
+            trimmed = trimmed["driver-".Length..];
+        }
+        return trimmed;
     }
 
     [WorkflowSignal]

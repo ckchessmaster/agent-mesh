@@ -729,7 +729,7 @@ public class WorkflowSignalRouter(
     {
         try
         {
-            var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(workflowId);
+            var handle = temporal.GetWorkflowHandle(workflowId);
             return await handle.DescribeAsync(new WorkflowDescribeOptions { Rpc = Rpc(ct) });
         }
         catch (RpcException ex)

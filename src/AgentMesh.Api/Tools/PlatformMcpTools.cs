@@ -1039,10 +1039,18 @@ public class PlatformMcpTools(
             }
         }
 
+        job.ProgressHeartbeat = $"Awaiting pull request review (PR #{result.PrNumber})";
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
 
         await hubContext.Clients.All.SendAsync("JobMessageCreated", ProjectJobsController.ToMessageDto(notification), ct);
+        await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+        {
+            jobId = job.Id,
+            progressHeartbeat = job.ProgressHeartbeat,
+            currentTaskId = job.CurrentTaskId,
+            lifecycleStatus = ProjectJobsController.DeriveLifecycleStatus(job)
+        }, ct);
         if (activeTask is not null)
         {
             await hubContext.Clients.All.SendAsync("JobTaskUpdated",

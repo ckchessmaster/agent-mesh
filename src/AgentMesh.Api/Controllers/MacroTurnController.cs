@@ -1,10 +1,12 @@
 using System.Security.Claims;
+using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 
 namespace AgentMesh.Api.Controllers;
@@ -91,7 +93,8 @@ public record StartMacroTurnResponse(
 public class MacroTurnController(
     AgentMeshDbContext db,
     JobTurnDispatcher turns,
-    IJobWorkspaceService? workspaces = null) : ControllerBase
+    IJobWorkspaceService? workspaces = null,
+    IHubContext<AgentMeshHub>? hubContext = null) : ControllerBase
 {
     /// <summary>
     /// Dispatches one coding turn, or reports the one already running.
@@ -119,7 +122,7 @@ public class MacroTurnController(
             return BadRequest(new { error = "personaId is required: a turn runs as a persona, not as an anonymous agent." });
         }
 
-        var job = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == jobId, ct);
+        var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId, ct);
         if (job is null) return NotFound(new { error = $"Job '{jobId}' not found." });
 
         var project = await db.Projects.AsNoTracking()
@@ -175,6 +178,42 @@ public class MacroTurnController(
                     existing.PersonaId ?? persona.Id,
                     existing.CreatedAt,
                     AlreadyRunning: stillLive));
+            }
+        }
+
+        // Synchronize the database job's task pointer and heartbeat before dispatching so
+        // PlatformMcpTools.IsJobInDiscoveryPhase knows when the workflow has transitioned from
+        // Stage 1/2 (discovery & plan approval) into Stage 3 (coding execution).
+        if (!string.IsNullOrWhiteSpace(req.TaskId))
+        {
+            var trimmedTaskId = req.TaskId.Trim();
+            job.CurrentTaskId = trimmedTaskId;
+            if (string.Equals(trimmedTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+            {
+                job.ProgressHeartbeat = "Exploring codebase and generating checklist";
+            }
+            else
+            {
+                var tasks = ProjectJobsController.ParseTasks(job.TasksJson);
+                var matchedTask = tasks.FirstOrDefault(t =>
+                    (Guid.TryParse(trimmedTaskId, out var parsed) && t.Id == parsed) ||
+                    string.Equals(t.Title?.Trim(), trimmedTaskId, StringComparison.OrdinalIgnoreCase));
+                var taskLabel = matchedTask?.Title ?? trimmedTaskId;
+                job.ProgressHeartbeat = $"Executing task: {taskLabel}";
+            }
+
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+
+            if (hubContext is not null)
+            {
+                await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+                {
+                    jobId = job.Id,
+                    progressHeartbeat = job.ProgressHeartbeat,
+                    currentTaskId = job.CurrentTaskId,
+                    lifecycleStatus = ProjectJobsController.DeriveLifecycleStatus(job)
+                }, ct);
             }
         }
 

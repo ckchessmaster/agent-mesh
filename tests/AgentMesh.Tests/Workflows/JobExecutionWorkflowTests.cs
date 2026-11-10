@@ -660,6 +660,88 @@ public class JobExecutionWorkflowTests
         }
     }
 
+    [Fact]
+    public async Task JobWorkflow_IgnoresSelfSentChatMessage_WhenAwaitingInput()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity((Func<DiscoveryTurnInput, Task<TurnOutcome>>)execution.RunAgentDiscoveryTurnAsync)
+            .AddActivity((Func<CodingTurnInput, Task<TurnOutcome>>)execution.RunJobCodingTurnAsync)
+            .AddActivity((Func<string, Task<string>>)git.MergePullRequestAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+            .AddWorkflow<JobExecutionWorkflow>();
+        workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "persona-lead",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace",
+                InitialPrompt: "Clarify requirements",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.Autonomous
+            );
+
+            int discoveryCalls = 0;
+            execution.CustomDiscoveryHandler = async discInput =>
+            {
+                discoveryCalls++;
+                var handle = env.Client.GetWorkflowHandle<JobExecutionWorkflow>($"job-{jobId}");
+                if (discoveryCalls == 1)
+                {
+                    // Simulate PlatformMcpTools routing the agent's own post_job_message(requires_reply: true)
+                    // signal to ReceiveChatMessageAsync during the turn.
+                    await handle.SignalAsync(wf => wf.ReceiveChatMessageAsync(
+                        new ChatMessageSignal("persona-lead", "Which DB provider should I use?", DateTimeOffset.UtcNow, "msg-self-1")));
+                    return TurnOutcome.Awaiting("operator", "Which DB provider should I use?");
+                }
+
+                await handle.SignalAsync(wf => wf.ReceiveSetChecklistAsync(new List<ChecklistTaskItem>
+                {
+                    new("Task 1: Use PostgreSQL", "src/Db.cs", "dotnet test")
+                }));
+                return TurnOutcome.Completed("Discovery complete.");
+            };
+
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            // Workflow must stay parked at Awaiting user input despite the self-sent signal
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting user input"));
+            execution.DiscoveryTurnCount.Should().Be(1);
+
+            // Now send an actual operator reply
+            await handle.SignalAsync(wf => wf.ReceiveChatMessageAsync(
+                new ChatMessageSignal("operator", "Use PostgreSQL.", DateTimeOffset.UtcNow, "msg-human-1")));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting pull request review"));
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("lead", true, "LGTM", DateTimeOffset.UtcNow, 77)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+            execution.DiscoveryInputs.Should().HaveCount(2);
+            execution.DiscoveryInputs[1].PendingMessage!.SenderId.Should().Be("operator");
+            execution.DiscoveryInputs[1].PendingMessage!.Content.Should().Be("Use PostgreSQL.");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     private static async Task WaitUntilAsync(
         WorkflowHandle<JobExecutionWorkflow, JobExecutionResult> handle,
         Func<JobWorkflowState, bool> predicate,
