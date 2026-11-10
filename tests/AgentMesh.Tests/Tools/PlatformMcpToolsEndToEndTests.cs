@@ -382,6 +382,68 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         (await ReadBackAsync(db => db.JobMessages.CountAsync(m => m.JobId == jobId))).Should().Be(0);
     }
 
+    [Fact]
+    public async Task OpenPullRequest_ThroughTheEndpoint_NormalizesBodyAndTargetBranch()
+    {
+        var (agentId, token) = await RegisterAgentAsync();
+        var jobId = await SeedJobAsync(agentId, tasks: null, personaId: "e2e-lead", branch: "feat/e2e-branch");
+
+        var sessionId = Guid.NewGuid();
+        await SeedTurnSessionAsync(sessionId, jobId, agentId, personaId: "e2e-lead");
+
+        _stubbedPullRequestService.Capture();
+
+        await using var client = await ConnectAsync(CreateAuthenticatedClient(token, sessionId: sessionId));
+
+        var result = await client.CallToolAsync("open_pull_request", new Dictionary<string, object?>
+        {
+            ["title"] = "feat(api): platform mcp tools with body",
+            ["body"] = "Result: Added normalizer for tools.\nReasoning: LLMs send body instead of summary_3r.\nRisk: None identified.",
+            ["target_branch"] = "feat/e2e-branch",
+        });
+
+        NotProtocolError(result);
+        var payload = JsonDocument.Parse(Text(result)).RootElement;
+        payload.GetProperty("success").GetBoolean().Should().BeTrue(payload.ToString());
+        payload.GetProperty("pr_number").GetInt32().Should().Be(4242);
+
+        var sent = _stubbedPullRequestService.LastRequest;
+        sent.Should().NotBeNull();
+        sent!.Title.Should().Be("feat(api): platform mcp tools with body");
+        sent.Summary.Result.Should().Be("Added normalizer for tools.");
+        sent.Summary.Reasoning.Should().Be("LLMs send body instead of summary_3r.");
+        sent.Summary.Risk.Should().Be("None identified.");
+        sent.HeadBranch.Should().Be("feat/e2e-branch");
+    }
+
+    [Fact]
+    public async Task OpenPullRequest_ThroughTheEndpoint_NormalizesPlainStringBody()
+    {
+        var (agentId, token) = await RegisterAgentAsync();
+        var jobId = await SeedJobAsync(agentId, tasks: null, personaId: "e2e-lead", branch: "feat/e2e-branch");
+
+        var sessionId = Guid.NewGuid();
+        await SeedTurnSessionAsync(sessionId, jobId, agentId, personaId: "e2e-lead");
+
+        _stubbedPullRequestService.Capture();
+
+        await using var client = await ConnectAsync(CreateAuthenticatedClient(token, sessionId: sessionId));
+
+        var result = await client.CallToolAsync("open_pull_request", new Dictionary<string, object?>
+        {
+            ["title"] = "feat(api): simple text body",
+            ["body"] = "Implemented file-changes tab in cockpit.",
+        });
+
+        NotProtocolError(result);
+        var payload = JsonDocument.Parse(Text(result)).RootElement;
+        payload.GetProperty("success").GetBoolean().Should().BeTrue(payload.ToString());
+
+        var sent = _stubbedPullRequestService.LastRequest;
+        sent.Should().NotBeNull();
+        sent!.Summary.Result.Should().Be("Implemented file-changes tab in cockpit.");
+    }
+
     // ── Harness ───────────────────────────────────────────────────────────────────
 
     private async Task<JsonElement> SchemaOf(string toolName)

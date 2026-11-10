@@ -1418,7 +1418,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     // post_job_message with requires_reply=true parks the turn
                     if (string.Equals(toolName, "post_job_message", StringComparison.OrdinalIgnoreCase) && IsRequiresReply(toolArgs))
                     {
-                        var isError = toolResult != null && toolResult.TrimStart().StartsWith("Error:", StringComparison.OrdinalIgnoreCase);
+                        var isError = IsToolResultError(toolResult);
                         if (!isError)
                         {
                             askedQuestion = true;
@@ -1435,7 +1435,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     // open_pull_request yields the turn to code review
                     if (string.Equals(toolName, "open_pull_request", StringComparison.OrdinalIgnoreCase))
                     {
-                        var isError = toolResult != null && toolResult.TrimStart().StartsWith("Error:", StringComparison.OrdinalIgnoreCase);
+                        var isError = IsToolResultError(toolResult);
                         if (!isError)
                         {
                             responseEmitted = true;
@@ -1981,16 +1981,17 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         type = "object",
                         properties = new
                         {
-                            key = new { type = "string", description = "Unique identifier (e.g. ef-dbcontext-pooling-rule)." },
-                            content = new { type = "string", description = "Concise documentation of the learned knowledge." },
                             category = new
                             {
                                 type = "string",
-                                description = "Category of memory.",
-                                @enum = new[] { "architecture", "codebase_gotcha", "environment_quirk", "test_strategy", "general" }
-                            }
+                                description = "Category of memory: 'environment' (paths, SDKs, ports, daemon sockets), 'build_and_test' (flags, mocks, test quirks), or 'codebase_gotcha' (domain rules, architectural constraints).",
+                                @enum = new[] { "environment", "build_and_test", "codebase_gotcha" }
+                            },
+                            key = new { type = "string", description = "Unique identifier (e.g. ef-dbcontext-pooling-rule)." },
+                            value = new { type = "string", description = "Concise documentation of the learned knowledge or guideline." },
+                            is_global = new { type = "boolean", description = "True if this memory applies across all projects; false if specific to this project." }
                         },
-                        required = new[] { "key", "content", "category" }
+                        required = new[] { "category", "key", "value" }
                     }
                 }
             }
@@ -2051,11 +2052,22 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         type = "object",
                         properties = new
                         {
-                            title = new { type = "string", description = "Pull request title following Conventional Commits." },
-                            body = new { type = "string", description = "Summary of changes, verification commands, and test results." },
-                            target_branch = new { type = "string", description = "Base branch to target (defaults to project default branch)." }
+                            title = new { type = "string", description = "Pull request title following Conventional Commits (e.g. 'feat(api): add tool X')." },
+                            summary_3r = new
+                            {
+                                type = "object",
+                                description = "The structured 3-R summary that becomes the PR body.",
+                                properties = new
+                                {
+                                    result = new { type = "string", description = "What was built and what verifies it (files modified, test commands, passing test counts)." },
+                                    reasoning = new { type = "string", description = "Why this approach was taken and key architectural trade-offs." },
+                                    risk = new { type = "string", description = "Potential risks, edge cases, regression risks, or operational caveats." }
+                                },
+                                required = new[] { "result", "reasoning", "risk" }
+                            },
+                            branch_name = new { type = "string", description = "The local task branch to push (optional; defaults to the job's git branch)." }
                         },
-                        required = new[] { "title", "body" }
+                        required = new[] { "title", "summary_3r" }
                     }
                 }
             });
@@ -2148,7 +2160,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             // Stage 1 Discovery / Stage 2 Plan Approval guardrails: strictly read-only
             if (isDiscoveryPhase)
             {
-                if (normalizedTool is "write_file" or "edit_file" or "replace_file_content")
+                if (normalizedTool is "write_file" or "write_to_file" or "edit_file" or "replace_file_content")
                 {
                     return "Error: File modifications are forbidden during Stage 1 Discovery and while awaiting plan approval. Complete discovery and receive plan approval before starting implementation.";
                 }
@@ -2160,7 +2172,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                 if (normalizedTool is "run_command" or "bash" or "command")
                 {
-                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd") ?? string.Empty;
+                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd", "commandLine", "script", "shell_command") ?? string.Empty;
                     if (IsMutatingGitCommand(cmd))
                     {
                         return "Error: Committing, pushing, or creating pull requests is forbidden during Stage 1 Discovery and while awaiting plan approval. Your objective is read-only exploration and checklist registration via manage_task(action: 'set_checklist').";
@@ -2186,7 +2198,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 case "bash":
                 case "command":
                 {
-                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd");
+                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd", "commandLine", "script", "shell_command");
                     if (string.IsNullOrWhiteSpace(cmd)) return "Error: 'command' argument is required.";
 
                     var workDir = GetPropertyString(root, "workingDirectory", "cwd", "workDir");
@@ -2238,7 +2250,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 case "read_file":
                 case "view_file":
                 {
-                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath");
+                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "uri");
                     if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' argument is required.";
 
                     var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(cwd, path);
@@ -2256,8 +2268,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
 
                     var lines = await File.ReadAllLinesAsync(fullPath, ct);
-                    int startLine = GetPropertyInt(root, "startLine", "StartLine") ?? 1;
-                    int endLine = GetPropertyInt(root, "endLine", "EndLine") ?? lines.Length;
+                    int startLine = GetPropertyInt(root, "startLine", "StartLine", "start_line") ?? 1;
+                    int endLine = GetPropertyInt(root, "endLine", "EndLine", "end_line") ?? lines.Length;
 
                     startLine = Math.Max(1, startLine);
                     endLine = Math.Min(lines.Length, Math.Max(startLine, endLine));
@@ -2271,11 +2283,12 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 }
 
                 case "write_file":
+                case "write_to_file":
                 {
-                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath");
+                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
                     if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' argument is required.";
 
-                    var content = GetPropertyString(root, "content", "Content", "text");
+                    var content = GetPropertyString(root, "content", "Content", "text", "CodeContent", "code_content");
                     content ??= string.Empty;
 
                     var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(cwd, path);
@@ -2292,11 +2305,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 case "edit_file":
                 case "replace_file_content":
                 {
-                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath");
+                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
                     if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' argument is required.";
 
-                    var target = GetPropertyString(root, "target", "Target", "old_string", "oldText");
-                    var replacement = GetPropertyString(root, "replacement", "Replacement", "new_string", "newText") ?? string.Empty;
+                    var target = GetPropertyString(root, "target", "Target", "old_string", "oldText", "TargetContent", "target_content", "old_content", "search", "find");
+                    var replacement = GetPropertyString(root, "replacement", "Replacement", "new_string", "newText", "ReplacementContent", "replacement_content", "new_content", "replace") ?? string.Empty;
 
                     if (string.IsNullOrEmpty(target)) return "Error: 'target' argument is required.";
 
@@ -2312,6 +2325,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var updatedText = fileText.Replace(target, replacement);
                     await File.WriteAllTextAsync(fullPath, updatedText, Encoding.UTF8, ct);
                     return $"Successfully replaced target in '{path}'.";
+                }
+
+                case "ask_question":
+                {
+                    return "Question submitted to operator. Waiting for response.";
                 }
 
                 default:
@@ -2438,6 +2456,46 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                        lower.Contains("cat ") || lower.Contains("ls ");
             }
         }
+        return false;
+    }
+
+    internal static bool IsToolResultError(string? result)
+    {
+        if (string.IsNullOrWhiteSpace(result)) return true;
+        var trimmed = result.Trim();
+        if (trimmed.StartsWith("Error:", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("Error ", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("Tool execution error:", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("An error occurred", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(trimmed);
+            var root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                if (root.TryGetProperty("success", out var s) && s.ValueKind == JsonValueKind.False)
+                {
+                    return true;
+                }
+                if (root.TryGetProperty("error", out var err) && err.ValueKind != JsonValueKind.Null && !string.IsNullOrWhiteSpace(err.ToString()))
+                {
+                    return true;
+                }
+                if (root.TryGetProperty("isError", out var isErr) && isErr.ValueKind == JsonValueKind.True)
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // Non-JSON string without error prefix is not treated as an error
+        }
+
         return false;
     }
 
