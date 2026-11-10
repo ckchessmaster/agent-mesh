@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
+﻿import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Bot,
   Brain,
@@ -81,8 +81,11 @@ import type {
   SystemStatusResponse
 } from './types';
 import { ProjectJobStatus } from './types';
+import type { JobPanelTab } from './types';
 import { SlashCommandPalette, SLASH_COMMANDS, type SlashCommandItem } from './components/SlashCommandPalette';
 import { ArtifactViewer } from './components/ArtifactViewer';
+import { ChangesPanel } from './components/ChangesPanel';
+import { PanelTabStrip } from './components/PanelTabStrip';
 import { ProjectModal } from './components/ProjectModal';
 import { NewJobModal } from './components/NewJobModal';
 import { JobCockpit } from './components/JobCockpit';
@@ -486,7 +489,25 @@ export default function App() {
   // wide in a job should not have it snap back when they open a session.
   const [jobArtifacts, setJobArtifacts] = useState<JobArtifact[]>([]);
   const [selectedJobArtifactId, setSelectedJobArtifactId] = useState<string | null>(null);
-  const [showJobArtifactsPanel, setShowJobArtifactsPanel] = useState(false);
+
+  // Which tab the job side panel is showing, or null when the column is closed entirely.
+  //
+  // One value rather than a second boolean beside `showJobArtifactsPanel` (which used to be state here):
+  // the panel is a single column with a single width, so "which panel is open" can have exactly one
+  // answer. Two booleans would admit the state where both are true — the render would silently pick a
+  // winner by source order while the header drew both toggles as pressed, which is a panel that lies
+  // about what it is showing. Deriving the two visibility flags from this value makes that state
+  // unrepresentable rather than merely avoided, and the cockpit's published
+  // `showJobArtifactsPanel`/`onToggleJobArtifactsPanel` prop contract is unchanged: it receives the
+  // derived boolean and the toggle that flips it, and its tests keep passing untouched.
+  const [jobPanelTab, setJobPanelTab] = useState<JobPanelTab | null>(null);
+  const showJobArtifactsPanel = jobPanelTab === 'artifacts';
+  const showJobChangesPanel = jobPanelTab === 'changes';
+
+  /** Header toggle: clicking the tab that is already open closes the column; the other one switches. */
+  const selectJobPanelTab = useCallback((tab: JobPanelTab) => {
+    setJobPanelTab((prev) => (prev === tab ? null : tab));
+  }, []);
 
   // Slash command palette state
   const [slashPaletteOpen, setSlashPaletteOpen] = useState(false);
@@ -3968,7 +3989,9 @@ export default function App() {
                       onAnswerQuestion={handleJobQuestionAnswer}
                       jobArtifactCount={jobArtifacts.length}
                       showJobArtifactsPanel={showJobArtifactsPanel}
-                      onToggleJobArtifactsPanel={() => setShowJobArtifactsPanel((prev) => !prev)}
+                      onToggleJobArtifactsPanel={() => selectJobPanelTab('artifacts')}
+                      showJobChangesPanel={showJobChangesPanel}
+                      onToggleJobChangesPanel={() => selectJobPanelTab('changes')}
                       onUpdateJob={handleUpdateJob}
                       onDeleteJob={() => handleDeleteJob(activeJ.id)}
                       onEditProject={() => {
@@ -4009,17 +4032,23 @@ export default function App() {
                   </ErrorBoundary>
 
                   {/* Resizable Split Divider: Desktop Only. Shares artifactPanelWidth with the session
-                      panel on purpose — one panel, one width, whichever surface opened it. */}
-                  {showJobArtifactsPanel && !isMobile && (
+                      panel on purpose — one panel, one width, whichever surface opened it. Keyed on the
+                      column being open (`jobPanelTab`), not on the artifacts flag: a divider that only
+                      appeared for one of the two tabs would make the Changes panel the one column in the
+                      app that cannot be resized. */}
+                  {jobPanelTab && !isMobile && (
                     <div
                       onMouseDown={() => setIsResizingArtifacts(true)}
                       className="w-1.5 hover:w-2 bg-slate-800 hover:bg-indigo-500 transition-colors cursor-col-resize select-none shrink-0"
-                      title="Drag to resize artifacts panel"
+                      title="Drag to resize the side panel"
                       data-testid="job-artifact-resize-divider"
                     />
                   )}
 
-                  {/* Right: Job Artifacts Split Panel (Desktop) or Full-screen Drawer (Mobile) */}
+                  {/* Right: Job side panel (desktop split / mobile full-screen drawer), one tab at a
+                      time. Each tab is mounted only while it is the visible one — ChangesPanel's read is
+                      `git`-backed, so mounting both would pay for a diff nobody is looking at, and the
+                      in-panel tab strip re-mounts the other one on switch. */}
                   {showJobArtifactsPanel && (
                     <div
                       style={isMobile ? undefined : { width: `${artifactPanelWidth}px` }}
@@ -4034,9 +4063,40 @@ export default function App() {
                         artifacts={jobArtifacts}
                         selectedArtifactId={selectedJobArtifactId}
                         onSelectArtifact={(id) => setSelectedJobArtifactId(id)}
-                        onClose={() => setShowJobArtifactsPanel(false)}
+                        onClose={() => setJobPanelTab(null)}
                         onRefresh={() => selectedJobId && fetchJobArtifacts(selectedJobId)}
                         ownerPath={`api/project-jobs/${encodeURIComponent(selectedJobId || '')}`}
+                        headerAccessory={
+                          <PanelTabStrip
+                            active="artifacts"
+                            onSelect={selectJobPanelTab}
+                            counts={{ artifacts: jobArtifacts.length }}
+                          />
+                        }
+                      />
+                    </div>
+                  )}
+
+                  {showJobChangesPanel && (
+                    <div
+                      style={isMobile ? undefined : { width: `${artifactPanelWidth}px` }}
+                      className={
+                        isMobile
+                          ? 'fixed inset-0 z-50 bg-slate-950 flex flex-col'
+                          : 'flex shrink-0 flex-col min-h-0 bg-slate-950 border-l border-slate-800 overflow-hidden'
+                      }
+                      data-testid="job-changes-panel-container"
+                    >
+                      <ChangesPanel
+                        jobId={selectedJobId}
+                        onClose={() => setJobPanelTab(null)}
+                        headerAccessory={
+                          <PanelTabStrip
+                            active="changes"
+                            onSelect={selectJobPanelTab}
+                            counts={{ artifacts: jobArtifacts.length }}
+                          />
+                        }
                       />
                     </div>
                   )}

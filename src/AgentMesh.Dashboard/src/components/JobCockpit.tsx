@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react';
+﻿import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react';
 import {
   GitBranch,
   CheckCircle2,
@@ -31,7 +31,8 @@ import {
   HelpCircle,
   Sliders,
   Activity,
-  ShieldCheck
+  ShieldCheck,
+  FileDiff
 } from 'lucide-react';
 import type { AgentSession, AskQuestionItem, JobMessage, JobTask, Persona, Project, ProjectJob, QuestionAnswerPayload, SessionAttachment } from '../types';
 import { ProjectJobStatus, PlanApprovalPolicy, JobLifecycleStatus } from '../types';
@@ -260,6 +261,18 @@ interface JobCockpitProps {
   showJobArtifactsPanel?: boolean;
   /** Opens/closes the job Artifacts panel, which the parent renders beside this cockpit. */
   onToggleJobArtifactsPanel?: () => void;
+  /**
+   * Whether the job Changes panel is open — the twin of `showJobArtifactsPanel`.
+   *
+   * Both flags are owned by the parent and it enforces that at most one is true: the two panels share
+   * one column of one width, so rendering both would make the header claim two things are open while
+   * showing one. Keeping this header's existing `showJobArtifactsPanel` contract untouched (rather than
+   * replacing the pair with a single tab value) is deliberate — that prop is a documented part of the
+   * cockpit's surface with tests built on it, and the mutual exclusion belongs with the state.
+   */
+  showJobChangesPanel?: boolean;
+  /** Opens/closes the job Changes panel, which the parent renders beside this cockpit. */
+  onToggleJobChangesPanel?: () => void;
   onAnswerQuestion?: (
     sessionIdOrTargetId: string,
     payload: { toolCallId: string; answers: QuestionAnswerPayload[]; answerSummary: string }
@@ -294,7 +307,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onAnswerQuestion,
   jobArtifactCount = 0,
   showJobArtifactsPanel = false,
-  onToggleJobArtifactsPanel
+  onToggleJobArtifactsPanel,
+  showJobChangesPanel = false,
+  onToggleJobChangesPanel
 }) => {
   const [prompt, setPrompt] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -1448,6 +1463,29 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             >
               <FileText className="w-3.5 h-3.5" />
               <span>Artifacts ({jobArtifactCount})</span>
+            </button>
+          )}
+
+          {/* Changes panel toggle — the second tab of the same column.
+              No count badge, unlike Artifacts: the artifact list is an index read the app already makes
+              on job switch, while a change count is a `git`-backed read. Paying for one per job the
+              operator merely clicks through, most of which they will never inspect, has no buyer — so
+              the number appears once the panel is open instead. */}
+          {onToggleJobChangesPanel && (
+            <button
+              type="button"
+              onClick={onToggleJobChangesPanel}
+              title={showJobChangesPanel ? 'Hide Changes panel' : 'Show Changes panel'}
+              aria-pressed={showJobChangesPanel}
+              data-testid="toggle-job-changes-btn"
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition cursor-pointer ${
+                showJobChangesPanel
+                  ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                  : 'bg-slate-950/80 border-slate-800 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <FileDiff className="w-3.5 h-3.5" />
+              <span>Changes</span>
             </button>
           )}
 

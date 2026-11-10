@@ -39,6 +39,11 @@ vi.mock('../services/api', () => ({
     // "Artifacts (0)" and the tests below could not tell a broken panel from an unmocked one.
     getJobArtifacts: vi.fn(),
     getJobArtifact: vi.fn(),
+    // Job file changes. Declared for the same reason as the two above: this file replaces the whole api
+    // module, and without these App's Changes tab would see `undefined` and report a transport fault
+    // rather than the state the test is actually asserting.
+    getJobChanges: vi.fn(),
+    getJobChangePatch: vi.fn(),
     postJobMessage: vi.fn(),
     uploadJobAttachments: vi.fn(),
     completeJob: vi.fn(),
@@ -207,6 +212,10 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     // Default: the job has no artifacts. Tests that exercise the panel override this.
     vi.mocked(api.getJobArtifacts).mockResolvedValue([]);
     vi.mocked(api.getJobArtifact).mockResolvedValue({} as any);
+    // Default: no readable changes. Tests that exercise the Changes tab override this — and must not
+    // depend on the artifacts default, since opening one tab must not fetch the other.
+    vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet({ files: [] }));
+    vi.mocked(api.getJobChangePatch).mockResolvedValue({ found: false, message: 'no patch in default mock' });
   });
 
   it('renders Projects & Jobs tab and auto-selects project and job into the Job Cockpit', async () => {
@@ -1349,6 +1358,354 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       });
       expect(screen.queryByText('architecture_plan.md')).not.toBeInTheDocument();
       expect(api.getJobArtifacts).toHaveBeenCalledWith('job-202');
+    });
+  });
+
+  // ── The Changes tab ─────────────────────────────────────────────────────────
+  //
+  // The integration contract, not the panel's own behaviour (that has its own suite in
+  // components/__tests__/ChangesPanel.test.tsx): what these assert is the wiring — that the tab exists
+  // beside Artifacts in the same column, that opening it costs exactly one change-set read, that
+  // switching tabs does not disturb the other panel's state, and that closing the column is one action
+  // rather than two.
+
+  // Local to this suite: the artifacts fixture is scoped inside the 'Job Artifacts panel' describe, and
+  // hoisting it out to share would edit a passing suite for a change the tab does not need.
+  const anArtifact: JobArtifact = {
+    id: 'job-art-plan',
+    jobId: 'job-101',
+    sourceSessionId: 'sess-turn-456',
+    name: 'architecture_plan.md',
+    summary: 'Architecture specification with Mermaid flow',
+    contentType: 'text/markdown',
+    sizeBytes: 2048,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    content: '# Architecture Specification\n\nbody',
+    downloadUrl: '/api/project-jobs/job-101/artifacts/job-art-plan/content'
+  };
+
+  const makeChangeSet = (over: any = {}) => ({
+    jobId: 'job-101',
+    branch: 'mesh/job-auth-oauth',
+    baseBranch: 'main',
+    headSha: 'c'.repeat(40),
+    baseSha: 'd'.repeat(40),
+    stats: { filesChanged: 2, additions: 30, deletions: 4, omittedFiles: 0 },
+    files: [
+      {
+        path: 'src/AgentMesh.Api/Controllers/OAuthController.cs',
+        status: 'added',
+        previousPath: null,
+        additions: 25,
+        deletions: 0,
+        binary: false,
+        patchAvailable: true
+      },
+      {
+        path: 'src/AgentMesh.Api/Program.cs',
+        status: 'modified',
+        previousPath: null,
+        additions: 5,
+        deletions: 4,
+        binary: false,
+        patchAvailable: true
+      }
+    ],
+    source: {
+      kind: 'localGit',
+      reasonCode: null,
+      message: null,
+      degraded: false,
+      committedOnly: false,
+      truncated: false,
+      repository: null
+    },
+    commits: [],
+    hasUncommittedChanges: false,
+    uncommittedPaths: null,
+    uncommittedCount: null,
+    generatedAt: null,
+    notes: null,
+    ...over
+  });
+
+  const renderChangesTab = async () => {
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+    }, { timeout: 4000 });
+    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+    await waitFor(() => {
+      expect(screen.getByTestId('toggle-job-changes-btn')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('toggle-job-changes-btn'));
+    await waitFor(() => {
+      expect(screen.getByTestId('job-changes-panel-container')).toBeInTheDocument();
+    });
+  };
+
+  describe('Job Changes tab', () => {
+    it('renders a Changes toggle beside Artifacts in the cockpit header', async () => {
+      render(<App />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+      }, { timeout: 4000 });
+      fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-changes-btn')).toBeInTheDocument();
+        expect(screen.getByTestId('toggle-job-artifacts-btn')).toBeInTheDocument();
+      });
+    });
+
+    it('does not read git until the tab is opened, then reads it exactly once', async () => {
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet());
+
+      render(<App />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+      }, { timeout: 4000 });
+      fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+      // The whole reason the count is not on the header badge: a change set is a `git`-backed read, and
+      // the app must not pay for one per job the operator merely clicks through.
+      await waitFor(() => {
+        expect(screen.getByTestId('toggle-job-changes-btn')).toBeInTheDocument();
+      });
+      expect(api.getJobChanges).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId('toggle-job-changes-btn'));
+      await waitFor(() => {
+        expect(api.getJobChanges).toHaveBeenCalledTimes(1);
+      });
+      expect(api.getJobChanges).toHaveBeenCalledWith('job-101', { refresh: false });
+      expect(screen.getByTestId('changes-count')).toHaveTextContent('2');
+    });
+
+    it('shows the file list and the diff of the selected file with +/- line colouring', async () => {
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet());
+      vi.mocked(api.getJobChangePatch).mockResolvedValue({
+        found: true,
+        patch: {
+          jobId: 'job-101',
+          branch: 'mesh/job-auth-oauth',
+          baseBranch: 'main',
+          headSha: 'c'.repeat(40),
+          baseSha: 'd'.repeat(40),
+          patch: [
+            'diff --git a/src/AgentMesh.Api/Controllers/OAuthController.cs b/src/AgentMesh.Api/Controllers/OAuthController.cs',
+            'new file mode 100644',
+            'index 0000000..3a4f1c2',
+            '--- /dev/null',
+            '+++ b/src/AgentMesh.Api/Controllers/OAuthController.cs',
+            '@@ -0,0 +1,3 @@',
+            '+[ApiController]',
+            '+public class OAuthController : ControllerBase',
+            '+  // token exchange'
+          ].join('\n'),
+          path: 'src/AgentMesh.Api/Controllers/OAuthController.cs',
+          previousPath: null,
+          status: 'added',
+          binary: false,
+          empty: false,
+          truncated: false,
+          additions: 3,
+          deletions: 0,
+          contextLines: 3,
+          source: null
+        }
+      });
+
+      await renderChangesTab();
+
+      await waitFor(() => {
+        expect(screen.getAllByTestId('changes-file-row')).toHaveLength(2);
+      });
+      // The patch is a second request per file, so it lands after the list render.
+      await waitFor(() => {
+        expect(screen.getByTestId('changes-diff-body')).toBeInTheDocument();
+      });
+      expect(screen.getByTestId('changes-diff-body').querySelectorAll('[data-diff-kind="add"]')).toHaveLength(3);
+      expect(screen.getByTestId('changes-diff-body').querySelectorAll('[data-diff-kind="del"]')).toHaveLength(0);
+
+      // The row's counts come from the list payload, the diff from the patch endpoint — one request for
+      // the list, one per clicked file, which is what the backend's reuse window is sized for.
+      expect(api.getJobChangePatch).toHaveBeenCalledWith('job-101', expect.objectContaining({
+        path: 'src/AgentMesh.Api/Controllers/OAuthController.cs',
+        baseSha: 'd'.repeat(40),
+        headSha: 'c'.repeat(40)
+      }));
+    });
+
+    it('is the only tab open at a time, and switching tabs keeps the same column width', async () => {
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([anArtifact]);
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet());
+
+      render(<App />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+      }, { timeout: 4000 });
+      fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
+
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+      await waitFor(() => {
+        expect(screen.getByTestId('job-artifact-panel-container')).toBeInTheDocument();
+      });
+
+      // Switching to Changes closes Artifacts: one column, one owner of "what is showing". Two panels
+      // rendered side by side (or stacked in the same column) is the state a single tab value prevents.
+      fireEvent.click(screen.getByTestId('toggle-job-changes-btn'));
+      await waitFor(() => {
+        expect(screen.getByTestId('job-changes-panel-container')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('job-artifact-panel-container')).not.toBeInTheDocument();
+
+      // And back again.
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+      await waitFor(() => {
+        expect(screen.getByTestId('job-artifact-panel-container')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('job-changes-panel-container')).not.toBeInTheDocument();
+    });
+
+    it('switches tabs from inside the panel, where the cockpit header is covered', async () => {
+      // On a phone the panel is a fixed inset-0 drawer over the header, so the header toggles are not
+      // clickable while it is open. The in-panel strip is what makes the other tab reachable there, and
+      // this asserts it exists on both tabs rather than only on the one that needed it.
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet());
+
+      await renderChangesTab();
+
+      const strip = screen.getByTestId('panel-tab-strip');
+      fireEvent.click(within(strip).getByTestId('panel-tab-artifacts'));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('job-artifact-panel-container')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('job-changes-panel-container')).not.toBeInTheDocument();
+    });
+
+    it('closes the column from either toggle when that tab is already open', async () => {
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet());
+
+      await renderChangesTab();
+      expect(screen.getByTestId('job-changes-panel-container')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('toggle-job-changes-btn'));
+      await waitFor(() => {
+        expect(screen.queryByTestId('job-changes-panel-container')).not.toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('job-artifact-panel-container')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('job-artifact-resize-divider')).not.toBeInTheDocument();
+    });
+
+    it('shows the reason, not an error, when no source can read changes', async () => {
+      // The K8s / no-token deployment shape the operator chose behaviour for: explain why, and fall back
+      // to the checkpoint list if there is one. Neither is an error boundary.
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet({
+        files: [],
+        stats: { filesChanged: 0, additions: 0, deletions: 0, omittedFiles: 0 },
+        source: {
+          kind: null,
+          reasonCode: 'no_workspace',
+          message: 'The control plane sees no working directory for this job.',
+          degraded: false,
+          committedOnly: false,
+          truncated: false,
+          repository: null
+        },
+        notes: ['Checkout: no_workspace — the control plane sees no working directory for this job.']
+      }));
+
+      await renderChangesTab();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('changes-empty-reason')).toHaveTextContent(/no working directory/i);
+      });
+      expect(screen.queryByText(/Could not read this job/i)).not.toBeInTheDocument();
+    });
+
+    it('falls back to the checkpoint file list when that is all the server could read', async () => {
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet({
+        files: [
+          {
+            path: 'src/checkpointed/File.cs',
+            status: 'modified',
+            previousPath: null,
+            additions: null,
+            deletions: null,
+            binary: false,
+            patchAvailable: false
+          }
+        ],
+        stats: { filesChanged: 1, additions: 0, deletions: 0, omittedFiles: 0 },
+        source: {
+          kind: 'checkpoint',
+          reasonCode: null,
+          message: 'The working checkpoint written at the last turn boundary.',
+          degraded: true,
+          committedOnly: true,
+          truncated: false,
+          repository: null
+        }
+      }));
+
+      await renderChangesTab();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('changes-file-row')).toHaveTextContent('File.cs');
+      });
+      expect(screen.getByTestId('changes-source-chip')).toHaveTextContent('checkpoint');
+      // No diff link is offered, so the patch endpoint is never called for a source that has no content.
+      expect(screen.getByText('no diff')).toBeInTheDocument();
+      expect(api.getJobChangePatch).not.toHaveBeenCalled();
+    });
+
+    it('leaves artifacts untouched when the changes endpoint fails', async () => {
+      // The two tabs read different endpoints; a newer dashboard against an older API must lose the
+      // Changes tab and keep the rest of the cockpit, exactly as the artifacts panel's own degradation
+      // test asserts for its endpoint.
+      vi.mocked(api.getJobChanges).mockRejectedValue(new Error('Failed to load file changes: 404'));
+      vi.mocked(api.getJobArtifacts).mockResolvedValue([anArtifact]);
+
+      await renderChangesTab();
+
+      await waitFor(() => {
+        expect(screen.getByText(/Could not read this job/i)).toBeInTheDocument();
+      });
+
+      // The cockpit survived it.
+      expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('toggle-job-artifacts-btn'));
+      await waitFor(() => {
+        expect(screen.getByTestId('job-artifact-panel-container')).toBeInTheDocument();
+      });
+      expect(screen.getAllByText('architecture_plan.md').length).toBeGreaterThan(0);
+    });
+
+    it('does not fetch changes when the job has none to ask about', async () => {
+      // Closing the column must not leave a request in flight that repaints a closed panel. The guard is
+      // the list-token check in ChangesPanel.load; here the assertion is the observable half: switching
+      // jobs while the tab is open re-reads for the new job only.
+      const secondJob: ProjectJob = { ...mockJob, id: 'job-202', title: 'Second Job', messageCount: 0 };
+      vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob, secondJob]);
+      vi.mocked(api.getJobChanges).mockResolvedValue(makeChangeSet());
+
+      render(<App />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
+      }, { timeout: 4000 });
+      fireEvent.click(screen.getByTestId('toggle-job-changes-btn'));
+
+      await waitFor(() => {
+        expect(api.getJobChanges).toHaveBeenCalledWith('job-101', { refresh: false });
+      });
+
+      fireEvent.click(screen.getByText('Second Job'));
+      await waitFor(() => {
+        expect(api.getJobChanges).toHaveBeenCalledWith('job-202', { refresh: false });
+      });
     });
   });
 });

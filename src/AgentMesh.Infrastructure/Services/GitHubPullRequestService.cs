@@ -41,6 +41,24 @@ public interface IGitHubPullRequestService
     Task<GitHubMergeResult> MergePullRequestAsync(
         GitHubMergeRequest request,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Reads what a pushed branch changed, from GitHub's comparison endpoint.
+    /// </summary>
+    /// <remarks>
+    /// Declared here rather than on a separate service because the credentials, the repository
+    /// resolution and the versioned HTTP client all live in this class already, and a second copy of
+    /// any of them is a second place a token can leak. See
+    /// <c>GitHubPullRequestService.ReadBranchComparisonAsync</c> for why the comparison endpoint is the
+    /// right one (it answers for a branch with no pull request yet, which is exactly when the Changes
+    /// panel is used) and why there is no simulation path (an invented change set would show files that
+    /// do not exist, and nothing downstream would ever discover it).
+    /// </remarks>
+    Task<GitHubPullRequestService.JobChangeRemoteRead> ReadBranchComparisonAsync(
+        string headRef,
+        string? baseRef,
+        string? repositoryOverride = null,
+        CancellationToken ct = default);
 }
 
 /// <summary>Which merge strategy GitHub should apply.</summary>
@@ -193,7 +211,7 @@ public sealed record GitHubPullRequestOptions(
 /// identity without touching the App settings.
 /// </para>
 /// </remarks>
-public class GitHubPullRequestService(
+public partial class GitHubPullRequestService(
     IHttpClientFactory httpClientFactory,
     IConfiguration configuration,
     ILogger<GitHubPullRequestService> logger,

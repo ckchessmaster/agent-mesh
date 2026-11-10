@@ -583,6 +583,19 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         /// through <c>open_pull_request</c> and merged through a Temporal review signal are two
         /// different trust decisions on two different code paths.
         /// </summary>
+        /// <summary>
+        /// The comparison reader exists for the Cockpit's Changes panel; no MCP tool calls it, so the
+        /// stub answers "there is nothing to read here" rather than throwing — an unstubbed Moq-adjacent
+        /// member would make the fixture fail for a reason unrelated to what a test is asserting.
+        /// </summary>
+        public Task<GitHubPullRequestService.JobChangeRemoteRead> ReadBranchComparisonAsync(
+            string headRef,
+            string? baseRef,
+            string? repositoryOverride = null,
+            CancellationToken ct = default) =>
+            Task.FromResult(GitHubPullRequestService.JobChangeRemoteRead.Fail(
+                "stubbed", "The end-to-end stub performs no remote reads."));
+
         public Task<GitHubMergeResult> MergePullRequestAsync(
             GitHubMergeRequest request,
             CancellationToken ct = default)

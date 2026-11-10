@@ -157,6 +157,30 @@ builder.Services.AddHttpClient(GitHubPullRequestService.HttpClientName, client =
 });
 builder.Services.AddScoped<IGitHubPullRequestService, GitHubPullRequestService>();
 
+// The Cockpit's Changes tab: what files a job touched, and the diff for each.
+//
+// Three sources answer that question and the API picks between them per request (a checkout it can
+// see, the pushed branch on GitHub, the stored working checkpoint), so the precedence and the reason
+// codes live in Core while the reads live here — see JobChangesPolicy and JobChangesService.
+//
+// The git runner is a singleton: it holds no state, and one long-lived object owning process spawn is
+// easier to reason about than one per request. Its timeout is read at composition rather than as a
+// constructor default so a configured value cannot be silently ignored by the container.
+builder.Services.AddSingleton<IJobGitCommandRunner>(sp =>
+    new JobGitCommandRunner(
+        sp.GetService<ILogger<JobGitCommandRunner>>(),
+        JobChangesOptions.From(sp.GetService<IConfiguration>()).GitTimeoutSeconds));
+
+// The reuse window must outlive a request: JobChangesService is scoped because it reads the database,
+// and a dictionary on a scoped service is emptied on every request, so it could never reuse anything.
+builder.Services.AddSingleton<IJobChangesCache, JobChangesCache>();
+
+builder.Services.AddSingleton<IJobWorkspaceLocator>(sp =>
+    new JobWorkspaceLocator(sp.GetService<IConfiguration>()));
+
+builder.Services.AddScoped<JobChangesGitSource>();
+builder.Services.AddScoped<JobChangesService>();
+
 // Dedicated Persona Container Environments & Idle Reaper
 builder.Services.AddPersonaContainerManager(builder.Configuration);
 builder.Services.AddHostedService<PersonaIdleReaperService>();

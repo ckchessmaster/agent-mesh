@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   Agent,
   AgentSession,
   AgentUsageResponse,
@@ -22,11 +22,19 @@ import type {
   SessionPage,
   SessionArtifact,
   JobArtifact,
+  JobChangeSet,
+  JobChangedFile,
+  JobChangeCommit,
+  JobChangeSourceInfo,
+  JobChangeStats,
+  JobChangePatch,
+  JobChangePatchResult,
   StagedJob,
   SubmitAnswerRequest,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from '../types';
+import { JobFileChangeStatus } from '../types';
 
 let tokenProvider: (() => string | null) | null = null;
 let unauthorizedHandler: (() => void | Promise<void>) | null = null;
@@ -61,6 +69,23 @@ const readTotalCount = (res: Response): number | null => {
   if (!raw) return null;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
+/**
+ * Pulls the server's own sentence out of an error response, falling back to `fallback` plus the status
+ * text. The API's job endpoints report faults as `{ error: "…" }`; the change endpoints do the same and
+ * add a `reasonCode`, which is why the patch route has its own handling instead of this helper.
+ */
+const readApiErrorMessage = async (res: Response, fallback: string): Promise<string> => {
+  let detail = res.statusText || String(res.status);
+  try {
+    const body = await res.json();
+    const message = body?.error || body?.Error || body?.message || body?.Message;
+    if (typeof message === 'string' && message.trim()) detail = message.trim();
+  } catch {
+    // A non-JSON error body (a proxy's HTML error page) leaves the status text in place.
+  }
+  return `${fallback}: ${detail}`;
 };
 
 /**
@@ -115,8 +140,7 @@ const mapJobArtifact = (item: any): JobArtifact => {
   };
 };
 
-const mapProjectDocument = (item: any): ProjectDocument => {  const id = item?.id || item?.Id || '';
-  const projectId = item?.projectId || item?.ProjectId || '';
+const mapProjectDocument = (item: any): ProjectDocument => {  const id = item?.id || item?.Id || '';  const projectId = item?.projectId || item?.ProjectId || '';
   const fileName = item?.fileName || item?.FileName || null;
   const downloadUrl = item?.downloadUrl || item?.DownloadUrl
     || (id && projectId
@@ -142,6 +166,142 @@ const mapProjectDocument = (item: any): ProjectDocument => {  const id = item?.i
     content: item?.content ?? item?.Content ?? null
   };
 };
+
+/**
+ * The same camelCase-or-PascalCase tolerance as `mapJobArtifact`, applied to the change-set payload.
+ *
+ * These mappers are defensive about *shape*, not about presence: the server always sends `stats`,
+ * `files`, `source` and `commits`, but the numbers arrive as nullable ints (`additions: null` means
+ * "not countable" for a binary file, which is a different fact from `0`), and coercing a null to zero
+ * here would put a false line count on screen that no later layer could recover. So the mappers keep
+ * nulls as nulls, default *lists* to empty rather than undefined so callers never need a `?? []`, and
+ * read both spellings of every property.
+ */
+const readInt = (item: any, camel: string, pascal: string): number | null => {
+  const value = item?.[camel] ?? item?.[pascal];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+};
+
+const readBool = (item: any, camel: string, pascal: string): boolean => {
+  const value = item?.[camel] ?? item?.[pascal];
+  return value === true;
+};
+
+const readStr = (item: any, camel: string, pascal: string): string | null => {
+  const value = item?.[camel] ?? item?.[pascal];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+};
+
+const readStrList = (item: any, camel: string, pascal: string): string[] | null => {
+  const value = item?.[camel] ?? item?.[pascal];
+  return Array.isArray(value) ? value.filter((v) => typeof v === 'string') : null;
+};
+
+const mapJobChangeSource = (item: any): JobChangeSourceInfo => ({
+  kind: item?.kind ?? item?.Kind ?? null,
+  reasonCode: readStr(item, 'reasonCode', 'ReasonCode'),
+  message: readStr(item, 'message', 'Message'),
+  degraded: readBool(item, 'degraded', 'Degraded'),
+  committedOnly: readBool(item, 'committedOnly', 'CommittedOnly'),
+  truncated: readBool(item, 'truncated', 'Truncated'),
+  repository: readStr(item, 'repository', 'Repository'),
+});
+
+const mapJobChangeStats = (item: any): JobChangeStats => ({
+  filesChanged: readInt(item, 'filesChanged', 'FilesChanged') ?? 0,
+  additions: readInt(item, 'additions', 'Additions') ?? 0,
+  deletions: readInt(item, 'deletions', 'Deletions') ?? 0,
+  omittedFiles: readInt(item, 'omittedFiles', 'OmittedFiles') ?? 0,
+});
+
+const mapJobChangedFile = (item: any): JobChangedFile => {
+  const additions = readInt(item, 'additions', 'Additions');
+  const deletions = readInt(item, 'deletions', 'Deletions');
+  const binary = readBool(item, 'binary', 'Binary');
+
+  return {
+    path: readStr(item, 'path', 'Path') ?? '',
+    status: readStr(item, 'status', 'Status') ?? JobFileChangeStatus.Modified,
+    previousPath: readStr(item, 'previousPath', 'PreviousPath'),
+    // Binary on purpose nulls the counts: git reports `-` in those columns and the server says so with
+    // a null. Rendering `+0 -0` for a PNG claims the file changed by zero lines.
+    additions: binary ? null : additions,
+    deletions: binary ? null : deletions,
+    binary,
+    // Defaults to *false* when the field is missing entirely (an older API build): a row that offers a
+    // patch and 404s on every click is worse than a row that shows counts without a diff link.
+    patchAvailable: item?.patchAvailable ?? item?.PatchAvailable ?? false,
+  };
+};
+
+const mapJobChangeCommit = (item: any): JobChangeCommit => {
+  const sha = readStr(item, 'sha', 'Sha') ?? '';
+  return {
+    sha,
+    shortSha: readStr(item, 'shortSha', 'ShortSha') ?? sha.slice(0, 7),
+    subject: readStr(item, 'subject', 'Subject') ?? '',
+    authorName: readStr(item, 'authorName', 'AuthorName'),
+    authorEmail: readStr(item, 'authorEmail', 'AuthorEmail'),
+    committedAt: readStr(item, 'committedAt', 'CommittedAt'),
+  };
+};
+
+const mapJobChangeSet = (raw: any): JobChangeSet => {
+  // Bound to locals before use. The mappers below read both spellings of a property off a value that
+  // may be undefined, and `(item?.files ?? item?.Files).map(...)` chains a `.map` onto a `??` that can
+  // still short-circuit to undefined when the outer `Array.isArray` is checking a different expression
+  // than the one it dereferences — the linter is right that the safe form is to decide once, locally.
+  const item = raw ?? {};
+  const rawFiles = item.files ?? item.Files;
+  const rawCommits = item.commits ?? item.Commits;
+  const files: any[] = Array.isArray(rawFiles) ? rawFiles : [];
+  const commits: any[] = Array.isArray(rawCommits) ? rawCommits : [];
+  const stats = mapJobChangeStats(item.stats ?? item.Stats);
+  const rows = Array.isArray(item.uncommittedPaths ?? item.UncommittedPaths)
+    ? readStrList(item, 'uncommittedPaths', 'UncommittedPaths')
+    : null;
+
+  return {
+    jobId: readStr(item, 'jobId', 'JobId') ?? '',
+    branch: readStr(item, 'branch', 'Branch'),
+    baseBranch: readStr(item, 'baseBranch', 'BaseBranch'),
+    headSha: readStr(item, 'headSha', 'HeadSha'),
+    baseSha: readStr(item, 'baseSha', 'BaseSha'),
+    // A missing `stats` block still has to agree with the rows on screen, so a zero total is raised to
+    // `files.length` rather than left at zero: "0 files changed" above a list of twelve rows is the
+    // self-contradicting panel this feature exists to prevent.
+    stats: stats.filesChanged === 0 && files.length > 0
+      ? { ...stats, filesChanged: files.length }
+      : stats,
+    files: files.map(mapJobChangedFile),
+    source: mapJobChangeSource(item.source ?? item.Source),
+    commits: commits.map(mapJobChangeCommit),
+    hasUncommittedChanges: readBool(item, 'hasUncommittedChanges', 'HasUncommittedChanges'),
+    uncommittedPaths: rows,
+    uncommittedCount: readInt(item, 'uncommittedCount', 'UncommittedCount'),
+    generatedAt: readStr(item, 'generatedAt', 'GeneratedAt'),
+    notes: readStrList(item, 'notes', 'Notes'),
+  };
+};
+
+const mapJobChangePatch = (item: any): JobChangePatch => ({
+  jobId: readStr(item, 'jobId', 'JobId') ?? '',
+  branch: readStr(item, 'branch', 'Branch'),
+  baseBranch: readStr(item, 'baseBranch', 'BaseBranch'),
+  headSha: readStr(item, 'headSha', 'HeadSha'),
+  baseSha: readStr(item, 'baseSha', 'BaseSha'),
+  patch: typeof item?.patch === 'string' ? item.patch : (typeof item?.Patch === 'string' ? item.Patch : ''),
+  path: readStr(item, 'path', 'Path'),
+  previousPath: readStr(item, 'previousPath', 'PreviousPath'),
+  status: readStr(item, 'status', 'Status'),
+  binary: readBool(item, 'binary', 'Binary'),
+  empty: readBool(item, 'empty', 'Empty'),
+  truncated: readBool(item, 'truncated', 'Truncated'),
+  additions: readInt(item, 'additions', 'Additions'),
+  deletions: readInt(item, 'deletions', 'Deletions'),
+  contextLines: readInt(item, 'contextLines', 'ContextLines') ?? 3,
+  source: item?.source || item?.Source ? mapJobChangeSource(item?.source ?? item?.Source) : null,
+});
 
 const getAuthHeadersOnly = (): Record<string, string> => {
   const token = tokenProvider?.();
@@ -1228,6 +1388,83 @@ export const api = {
     );
     if (!res.ok) throw new Error(`Failed to load job artifact details: ${res.statusText}`);
     return mapJobArtifact(await res.json());
+  },
+
+  // ── Job file changes (the Cockpit's Changes tab) ────────────────────────────
+
+  /**
+   * What a job's branch changed, from the best source the API could reach.
+   *
+   * `refresh` bypasses the server's short reuse window — it is the panel's refresh button, and the
+   * answer to "I know it changed". Note the endpoint's failure contract: only a nonexistent job is a
+   * `404`. "The branch was never pushed" and "this deployment sees no checkout" are `200`s carrying an
+   * explanatory `source`, so the caller renders them as a sentence rather than as an error boundary.
+   */
+  async getJobChanges(jobId: string, opts?: { limit?: number; refresh?: boolean }): Promise<JobChangeSet> {
+    const params = new URLSearchParams();
+    if (opts?.limit && opts.limit > 0) params.append('limit', String(opts.limit));
+    if (opts?.refresh) params.append('refresh', 'true');
+    const query = params.toString() ? `?${params.toString()}` : '';
+
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/changes${query}`, {
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load file changes'));
+    }
+    return mapJobChangeSet(await res.json());
+  },
+
+  /**
+   * One file's unified diff, or the whole change set's when `path` is omitted.
+   *
+   * `previousPath` must be forwarded from the list row for a rename or git reports a two-line edit as a
+   * 60-line new file, and `status` must be forwarded because an untracked file is in no tree — no
+   * two-sided comparison can produce its patch, so the server routes those rows through a one-sided
+   * read instead. `baseSha`/`headSha` pin the request to the exact pair the counts on screen came from;
+   * without them a base branch that moves between the list call and this one silently changes the diff.
+   */
+  async getJobChangePatch(
+    jobId: string,
+    opts?: {
+      path?: string | null;
+      previousPath?: string | null;
+      status?: string | null;
+      context?: number;
+      baseSha?: string | null;
+      headSha?: string | null;
+    }
+  ): Promise<JobChangePatchResult> {
+    const params = new URLSearchParams();
+    if (opts?.path) params.append('path', opts.path);
+    if (opts?.previousPath) params.append('from', opts.previousPath);
+    if (opts?.status) params.append('status', opts.status);
+    if (typeof opts?.context === 'number') params.append('context', String(opts.context));
+    if (opts?.baseSha) params.append('base', opts.baseSha);
+    if (opts?.headSha) params.append('head', opts.headSha);
+    const query = params.toString() ? `?${params.toString()}` : '';
+
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/changes/patch${query}`, {
+      headers: getHeaders()
+    });
+
+    if (res.status === 404) {
+      // A refused patch is a state, not a fault: surface the server's own sentence and reason code so
+      // the panel can distinguish "this path is not in the change set" from "no source here can diff".
+      const body = await res.json().catch(() => ({} as any));
+      return {
+        found: false,
+        reasonCode: readStr(body, 'reasonCode', 'ReasonCode'),
+        message: readStr(body, 'error', 'Error') ?? 'No patch could be produced for this job.',
+        notes: readStrList(body, 'notes', 'Notes'),
+      };
+    }
+
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load the diff'));
+    }
+
+    return { found: true, patch: mapJobChangePatch(await res.json()) };
   },
 
   async uploadJobAttachments(jobId: string, files: File[]): Promise<SessionAttachment[]> {

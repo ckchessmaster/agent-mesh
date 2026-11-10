@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+﻿import React, { useState } from 'react';
 import {
   FileText,
   Copy,
@@ -36,6 +36,16 @@ interface ArtifactViewerProps {
    * an empty preview rather than an error.
    */
   ownerPath?: string;
+  /**
+   * Rendered in the header between the title and the actions — today the job panel's Artifacts/Changes
+   * tab strip.
+   *
+   * Passed in as a node rather than modelled as `activeTab`/`onSelectTab` props because this component
+   * serves three surfaces (session panel, job panel, and anything else that mounts it) and only the job
+   * panel has a second tab. Owning the union of "what tabs exist" here would push job-panel vocabulary
+   * into the session viewer for a control the session surface never renders.
+   */
+  headerAccessory?: React.ReactNode;
 }
 
 export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
@@ -44,7 +54,8 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
   onSelectArtifact,
   onClose,
   onRefresh,
-  ownerPath
+  ownerPath,
+  headerAccessory
 }) => {
   const [viewMode, setViewMode] = useState<'rendered' | 'raw'>('rendered');
   const [copied, setCopied] = useState(false);
@@ -266,7 +277,8 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
           </span>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 min-w-0">
+          {headerAccessory}
           {onRefresh && (
             <button
               type="button"
