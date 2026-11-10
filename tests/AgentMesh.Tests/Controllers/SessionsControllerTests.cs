@@ -1338,6 +1338,112 @@ public class SessionsControllerTests
             p => p.SendCoreAsync("PromptReceived", It.Is<object[]>(args => args.Length == 1), default),
             Times.AtLeastOnce);
     }
+
+    [Fact]
+    public async Task PostMessage_WhenJobAwaitingPlanApproval_DoesNotDispatchContinuationSession()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        var project = new Project
+        {
+            Id = "approval-proj",
+            Name = "Approval Project",
+            WorkspaceType = WorkspaceType.Git,
+            GitRepositoryUrl = "https://github.com/org/repo",
+            GitBaseBranch = "main"
+        };
+        db.Projects.Add(project);
+
+        var persona = new Persona
+        {
+            Id = "astra",
+            Name = "Astra",
+            Role = "Autonomous Agent",
+            DriverId = "agy-driver",
+            DefaultModel = "gemini-2.5-pro"
+        };
+        db.Personas.Add(persona);
+
+        var driver = new Agent
+        {
+            Id = "agy-driver",
+            Name = "Agy Driver",
+            RuntimeType = RuntimeType.CliAgy,
+            Status = "online"
+        };
+        db.Agents.Add(driver);
+
+        var projectPersona = new ProjectPersona
+        {
+            ProjectId = project.Id,
+            PersonaId = persona.Id
+        };
+        db.ProjectPersonas.Add(projectPersona);
+
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Job Awaiting Plan Approval",
+            Description = "Plan needs operator signoff",
+            GitBranchName = "feature/plan-approval",
+            Status = ProjectJobStatus.Active,
+            ApprovalPolicy = PlanApprovalPolicy.HumanOnly,
+            ProgressHeartbeat = "Awaiting plan approval (Stage 2 gate)"
+        };
+        db.ProjectJobs.Add(job);
+
+        var sessionMetadata = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["jobId"] = job.Id.ToString(),
+            ["projectId"] = project.Id,
+            ["personaId"] = persona.Id,
+            ["personaName"] = persona.Name,
+            ["conversationId"] = "conv-approval-test"
+        });
+
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = $"Job Turn: {job.Title} (@{persona.Name})",
+            Status = "thinking",
+            MetadataJson = sessionMetadata,
+            PersonaId = persona.Id,
+            DriverId = driver.Id,
+            CreatorAgentId = driver.Id,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var checkpointResponse = "🔄 **Progress Checkpoint (50 steps)**:\n\n" +
+                                 "Agent `@astra` (Astra) reached the 50-step progress limit for this turn and is rolling over.\n\n" +
+                                 "*Continuing to next turn autonomously. To redirect or interrupt, reply in this chat.*";
+
+        var postReq = new PostMessageRequest(
+            SenderAgentId: "agy-driver",
+            TargetAgentId: "operator",
+            EventType: "response",
+            Content: checkpointResponse
+        );
+
+        // Act
+        var result = await controller.PostMessage(session.Id, postReq);
+
+        // Assert
+        result.Should().BeOfType<CreatedAtActionResult>();
+
+        // 1. Verify JobMessage was posted
+        var jobMsg = db.JobMessages.FirstOrDefault(m => m.JobId == job.Id && m.Content == checkpointResponse);
+        jobMsg.Should().NotBeNull();
+
+        // 2. Verify NO next turn session was dispatched autonomously because plan approval is pending
+        var nextSession = db.AgentSessions.FirstOrDefault(s => s.Id != session.Id && s.PersonaId == persona.Id);
+        nextSession.Should().BeNull();
+    }
 }
 
 

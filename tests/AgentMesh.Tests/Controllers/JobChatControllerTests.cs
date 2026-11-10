@@ -538,4 +538,271 @@ public class JobChatControllerTests
         // Assert: 200 OK
         result.Should().BeOfType<OkObjectResult>();
     }
+
+    [Fact]
+    public async Task ApprovePlan_WhenTemporalIsNull_DispatchesImplementationTurn()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var project = new Project
+        {
+            Id = "proj-1",
+            Name = "Approval Test Project",
+            WorkspaceType = AgentMesh.Core.Enums.WorkspaceType.Git
+        };
+        db.Projects.Add(project);
+
+        var persona = new Persona
+        {
+            Id = "rook",
+            Name = "Rook",
+            Role = "Implementer"
+        };
+        db.Personas.Add(persona);
+
+        var tasks = new List<JobTaskDto>
+        {
+            new()
+            {
+                Id = Guid.NewGuid(),
+                Title = "Implement Feature X",
+                IsCompleted = false
+            }
+        };
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = project.Id,
+            Title = "Mission Critical Job",
+            ApprovalPolicy = PlanApprovalPolicy.HumanOnly,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active,
+            CurrentTaskId = "stage-1-discovery",
+            ProgressHeartbeat = "Awaiting plan approval (Stage 2 gate)",
+            AssignedAgentId = "rook",
+            TasksJson = JsonSerializer.Serialize(tasks)
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var mockDispatcher = new Mock<JobTurnDispatcher>(db, null, null, null);
+        mockDispatcher
+            .Setup(d => d.DispatchAsync(It.IsAny<JobTurnRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DispatchedJobTurn(new AgentSession(), new SessionMessage(), new Agent()));
+
+        var controller = new JobChatController(
+            db,
+            temporalClient: null,
+            hubContext: _mockHubContext.Object,
+            logger: NullLogger<JobChatController>.Instance,
+            turnDispatcher: mockDispatcher.Object,
+            workflows: null
+        );
+
+        var operatorUser = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "human-operator"),
+            new Claim(ClaimTypes.Role, "Operator")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = operatorUser }
+        };
+
+        var request = new ApprovePlanRequest(ApproverId: "human-operator", ApproverRole: "operator", Comments: "LGTM! Ship it.");
+
+        // Act
+        var result = await controller.ApprovePlan(jobId.ToString(), request);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+
+        // Verify job state updated
+        var updatedJob = await db.ProjectJobs.FindAsync(jobId);
+        updatedJob.Should().NotBeNull();
+        updatedJob!.ProgressHeartbeat.Should().Be("Plan approved. Starting implementation");
+        updatedJob.CurrentTaskId.Should().Be(tasks[0].Id.ToString("D"));
+
+        // Verify implementation turn was dispatched
+        mockDispatcher.Verify(d => d.DispatchAsync(
+            It.Is<JobTurnRequest>(r =>
+                r.Job.Id == jobId &&
+                r.Persona.Id == "rook" &&
+                r.TaskId == tasks[0].Id.ToString("D") &&
+                r.Prompt.Contains("Implement Feature X")),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ApprovePlan_AllowsAuthenticatedHumanWithEmail_UnderHumanOnlyPolicy()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var project = new Project
+        {
+            Id = "proj-email-auth",
+            Name = "Email Auth Project",
+            WorkspaceType = AgentMesh.Core.Enums.WorkspaceType.Git
+        };
+        db.Projects.Add(project);
+
+        var persona = new Persona
+        {
+            Id = "rook",
+            Name = "Rook",
+            Role = "Implementer"
+        };
+        db.Personas.Add(persona);
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = project.Id,
+            Title = "Human Only Plan Approval Job",
+            ApprovalPolicy = PlanApprovalPolicy.HumanOnly,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active,
+            CurrentTaskId = "stage-1-discovery",
+            ProgressHeartbeat = "Awaiting plan approval (Stage 2 gate)",
+            AssignedAgentId = "rook"
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new JobChatController(
+            db,
+            temporalClient: null,
+            hubContext: _mockHubContext.Object,
+            logger: NullLogger<JobChatController>.Instance,
+            turnDispatcher: null,
+            workflows: null
+        );
+
+        // User logged in via OIDC with email cdkingston@gmail.com
+        var humanUser = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.NameIdentifier, "cdkingston@gmail.com"),
+            new Claim(ClaimTypes.Email, "cdkingston@gmail.com"),
+            new Claim(ClaimTypes.Name, "cdkingston")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = humanUser }
+        };
+
+        var request = new ApprovePlanRequest(ApproverId: "cdkingston@gmail.com", ApproverRole: "operator", Comments: "Plan approved by operator");
+
+        // Act
+        var result = await controller.ApprovePlan(jobId.ToString(), request);
+
+        // Assert
+        result.Should().BeOfType<OkObjectResult>();
+
+        var updatedJob = await db.ProjectJobs.FindAsync(jobId);
+        updatedJob!.ProgressHeartbeat.Should().Be("Plan approved. Starting implementation");
+    }
+
+    [Fact]
+    public async Task ApprovePlan_WhenTemporalThrows_ProceedsWithDirectDispatchWithout502()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        var jobId = Guid.NewGuid();
+
+        var project = new Project
+        {
+            Id = "proj-fallback",
+            Name = "Fallback Test Project",
+            WorkspaceType = AgentMesh.Core.Enums.WorkspaceType.Git
+        };
+        db.Projects.Add(project);
+
+        var persona = new Persona
+        {
+            Id = "rook",
+            Name = "Rook",
+            Role = "Implementer"
+        };
+        db.Personas.Add(persona);
+
+        var tasks = new List<JobTaskDto>
+        {
+            new()
+            {
+                Id = Guid.NewGuid(),
+                Title = "Implement Feature Y",
+                IsCompleted = false
+            }
+        };
+
+        var job = new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = project.Id,
+            Title = "Mission Critical Job With Temporal Down",
+            ApprovalPolicy = PlanApprovalPolicy.HumanOnly,
+            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active,
+            CurrentTaskId = "stage-1-discovery",
+            ProgressHeartbeat = "Awaiting plan approval (Stage 2 gate)",
+            AssignedAgentId = "rook",
+            TasksJson = JsonSerializer.Serialize(tasks)
+        };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var mockDispatcher = new Mock<JobTurnDispatcher>(db, null, null, null);
+        mockDispatcher
+            .Setup(d => d.DispatchAsync(It.IsAny<JobTurnRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DispatchedJobTurn(new AgentSession(), new SessionMessage(), new Agent()));
+
+        var mockRouter = new Mock<IWorkflowSignalRouter>();
+        mockRouter
+            .Setup(r => r.SendPlanApprovalAsync(It.IsAny<Guid>(), It.IsAny<PlanApprovedSignal>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow));
+        mockRouter
+            .Setup(r => r.IsWorkflowDrivingAsync(It.IsAny<Guid>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        // Note: non-null temporalClient present (like production)
+        var controller = new JobChatController(
+            db,
+            temporalClient: _mockTemporalClient.Object,
+            hubContext: _mockHubContext.Object,
+            logger: NullLogger<JobChatController>.Instance,
+            turnDispatcher: mockDispatcher.Object,
+            workflows: mockRouter.Object
+        );
+
+        var operatorUser = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.Name, "human-operator"),
+            new Claim(ClaimTypes.Role, "Operator")
+        ], "TestAuth"));
+
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext { User = operatorUser }
+        };
+
+        var request = new ApprovePlanRequest(ApproverId: "human-operator", ApproverRole: "operator");
+
+        // Act
+        var result = await controller.ApprovePlan(jobId.ToString(), request);
+
+        // Assert: 200 OK (not 502)
+        result.Should().BeOfType<OkObjectResult>();
+
+        // Verify implementation turn was dispatched directly
+        mockDispatcher.Verify(d => d.DispatchAsync(
+            It.Is<JobTurnRequest>(r =>
+                r.Job.Id == jobId &&
+                r.Persona.Id == "rook" &&
+                r.TaskId == tasks[0].Id.ToString("D")),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
 }

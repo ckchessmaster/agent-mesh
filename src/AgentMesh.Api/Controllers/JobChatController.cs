@@ -34,7 +34,9 @@ public class JobChatController(
     AgentMeshDbContext dbContext,
     ITemporalClient? temporalClient = null,
     IHubContext<AgentMeshHub>? hubContext = null,
-    ILogger<JobChatController>? logger = null) : ControllerBase
+    ILogger<JobChatController>? logger = null,
+    JobTurnDispatcher? turnDispatcher = null,
+    IWorkflowSignalRouter? workflows = null) : ControllerBase
 {
     private static readonly HashSet<string> TechLeadRoles = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -58,7 +60,11 @@ public class JobChatController(
                     ?? User?.FindFirst("AgentId")?.Value
                     ?? User?.FindFirst("agent_id")?.Value
                     ?? User?.FindFirst("PersonaId")?.Value
-                    ?? User?.FindFirst(ClaimTypes.Name)?.Value;
+                    ?? User?.FindFirst(ClaimTypes.Name)?.Value
+                    ?? User?.FindFirst(ClaimTypes.Email)?.Value
+                    ?? User?.FindFirst("email")?.Value
+                    ?? User?.FindFirst("sub")?.Value
+                    ?? User?.Identity?.Name;
 
         if (!string.IsNullOrWhiteSpace(claim))
         {
@@ -73,13 +79,22 @@ public class JobChatController(
         // 1. Check roles/claims on the authenticated principal
         if (User.IsInRole("Operator") || User.IsInRole("Admin") ||
             User.HasClaim("IsMasterKey", "true") ||
-            User.Claims.Any(c => c.Type == ClaimTypes.Role && OperatorRoles.Contains(c.Value)))
+            User.Claims.Any(c => (c.Type == ClaimTypes.Role || c.Type.Equals("role", StringComparison.OrdinalIgnoreCase) || c.Type.Equals("roles", StringComparison.OrdinalIgnoreCase) || c.Type.Equals("groups", StringComparison.OrdinalIgnoreCase) || c.Type.EndsWith("/role", StringComparison.OrdinalIgnoreCase)) && OperatorRoles.Contains(c.Value)))
+        {
+            return "operator";
+        }
+
+        // An explicit agent token / agent principal is not an operator unless granted an operator role above
+        var isExplicitAgent = User.HasClaim(c => c.Type == "agent_id" || c.Type == "AgentId" || c.Type == "persona_id" || c.Type == "PersonaId");
+
+        // Authenticated human users (e.g. from OIDC with email address)
+        if (!isExplicitAgent && (User.HasClaim(c => c.Type == ClaimTypes.Email || c.Type.Equals("email", StringComparison.OrdinalIgnoreCase)) || callerId.Contains('@')))
         {
             return "operator";
         }
 
         if (User.IsInRole("TechLead") || User.IsInRole("tech_lead") ||
-            User.Claims.Any(c => c.Type == ClaimTypes.Role && TechLeadRoles.Contains(c.Value)))
+            User.Claims.Any(c => (c.Type == ClaimTypes.Role || c.Type.Equals("role", StringComparison.OrdinalIgnoreCase) || c.Type.Equals("roles", StringComparison.OrdinalIgnoreCase) || c.Type.Equals("groups", StringComparison.OrdinalIgnoreCase) || c.Type.EndsWith("/role", StringComparison.OrdinalIgnoreCase)) && TechLeadRoles.Contains(c.Value)))
         {
             return "tech_lead";
         }
@@ -238,7 +253,7 @@ public class JobChatController(
             return NotFound(new { error = $"Job '{jobId}' not found." });
         }
 
-        var approverId = ResolveCallerId();
+        var approverId = ResolveCallerId() ?? request?.ApproverId?.Trim();
         if (string.IsNullOrWhiteSpace(approverId))
         {
             return Unauthorized(new { error = "unauthorized", message = "Caller identity claim is missing." });
@@ -283,22 +298,32 @@ public class JobChatController(
             Timestamp: DateTimeOffset.UtcNow
         );
 
-        if (temporalClient is not null)
+        if (workflows != null && parsedGuid.HasValue)
+        {
+            try
+            {
+                var delivery = await workflows.SendPlanApprovalAsync(parsedGuid.Value, signal);
+                if (delivery.Status == SignalDeliveryStatus.Rejected)
+                {
+                    logger?.LogWarning("Plan approval signal for {WorkflowId} was rejected: {Detail}", delivery.WorkflowId, delivery.Detail);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogInformation(ex, "Could not signal Temporal workflow for job {JobId}; proceeding with direct dispatch.", jobId);
+            }
+        }
+        else if (temporalClient is not null)
         {
             var workflowId = $"job-{jobId}";
             try
             {
-                var handle = temporalClient.GetWorkflowHandle<JobExecutionWorkflow>(workflowId);
+                var handle = temporalClient.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId);
                 await handle.SignalAsync(wf => wf.ReceivePlanApprovalAsync(signal));
             }
             catch (Exception ex)
             {
-                logger?.LogError(ex, "Failed to deliver PlanApprovedSignal to workflow {WorkflowId}", workflowId);
-                return StatusCode(StatusCodes.Status502BadGateway, new
-                {
-                    error = "workflow_signal_failed",
-                    message = $"Failed to deliver approval signal to workflow {workflowId}: {ex.Message}"
-                });
+                logger?.LogInformation(ex, "Failed to deliver PlanApprovedSignal to workflow {WorkflowId}; proceeding with direct dispatch.", workflowId);
             }
         }
 
@@ -347,6 +372,52 @@ public class JobChatController(
                 var dto = ProjectJobsController.ToDto(projectJob, project?.Name, msgCount);
                 await hubContext.Clients.All.SendAsync("JobUpdated", dto);
             }
+        }
+
+        if (projectJob != null && turnDispatcher != null)
+        {
+            var isDriving = workflows != null && await workflows.IsWorkflowDrivingAsync(projectJob.Id, projectJob.AssignedAgentId);
+            if (!isDriving)
+            {
+                var project = await dbContext.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == projectJob.ProjectId);
+                var assignedId = !string.IsNullOrWhiteSpace(projectJob.AssignedAgentId) ? projectJob.AssignedAgentId.Trim().ToLowerInvariant() : null;
+                var persona = assignedId != null ? await dbContext.Personas.FirstOrDefaultAsync(p => p.Id == assignedId) : null;
+                persona ??= await dbContext.Personas.FirstOrDefaultAsync();
+
+                if (persona != null && project != null)
+                {
+                    var tasks = ProjectJobsController.ParseTasks(projectJob.TasksJson);
+                    var firstTask = tasks.FirstOrDefault(t => !t.IsCompleted);
+                    var targetTaskId = firstTask?.Id != null && firstTask.Id != Guid.Empty
+                        ? firstTask.Id.ToString("D")
+                        : (firstTask?.Title ?? projectJob.CurrentTaskId);
+
+                    var prompt = !string.IsNullOrWhiteSpace(firstTask?.Title)
+                        ? $"Plan approved by {approverRole} (@{approverId}). Proceed with implementing task: {firstTask.Title}."
+                        : "Plan approved. Proceed with implementation.";
+
+                    try
+                    {
+                        await turnDispatcher.DispatchAsync(new JobTurnRequest(
+                            projectJob,
+                            project,
+                            persona,
+                            prompt,
+                            Sender: approverId,
+                            TaskId: targetTaskId
+                        ));
+                    }
+                    catch (Exception ex)
+                    {
+                        logger?.LogError(ex, "Failed to dispatch approved implementation turn for job {JobId}", jobId);
+                    }
+                }
+            }
+        }
+
+        if (projectJob != null && hubContext != null && !string.IsNullOrWhiteSpace(projectJob.AssignedAgentId))
+        {
+            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(dbContext, hubContext, projectJob.AssignedAgentId);
         }
 
         return Ok(new { success = true, approverId, approverRole });

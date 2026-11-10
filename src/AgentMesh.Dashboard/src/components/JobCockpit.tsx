@@ -1690,19 +1690,33 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               <div className="hidden xl:flex flex-col gap-0.5 max-w-xs truncate">
                 <span
                   className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg border max-w-xs truncate ${
-                    firstPendingTask.requiresDiscussion
+                    isAwaitingApproval
+                      ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                      : firstPendingTask.requiresDiscussion
                       ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
                       : 'bg-sky-500/10 text-sky-300 border-sky-500/25'
                   }`}
-                  title={`Current sequential target: ${firstPendingTask.title}${firstPendingTask.requiresDiscussion ? ' (Discussion Required)' : ''}`}
+                  title={
+                    isAwaitingApproval
+                      ? 'Plan Approval Gate Required (Stage 2)'
+                      : `Current sequential target: ${firstPendingTask.title}${firstPendingTask.requiresDiscussion ? ' (Discussion Required)' : ''}`
+                  }
                   data-testid="current-focus-badge"
                 >
-                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${firstPendingTask.requiresDiscussion ? 'bg-amber-400 animate-pulse' : 'bg-sky-400 animate-pulse'}`} />
-                  <span className="text-slate-400 font-normal">Focus:</span>
-                  {firstPendingTask.requiresDiscussion && (
-                    <span className="text-amber-400 font-semibold" data-testid="focus-discuss-tag">[Discuss]</span>
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isAwaitingApproval || firstPendingTask.requiresDiscussion ? 'bg-amber-400 animate-pulse' : 'bg-sky-400 animate-pulse'}`} />
+                  <span className="text-slate-400 font-normal">
+                    {isAwaitingApproval ? 'Stage 2 Gate:' : 'Focus:'}
+                  </span>
+                  {isAwaitingApproval ? (
+                    <span className="text-amber-400 font-semibold" data-testid="focus-awaiting-approval-tag">Awaiting Plan Approval</span>
+                  ) : (
+                    <>
+                      {firstPendingTask.requiresDiscussion && (
+                        <span className="text-amber-400 font-semibold" data-testid="focus-discuss-tag">[Discuss]</span>
+                      )}
+                      <span className="truncate">#{firstPendingTaskIndex + 1} {firstPendingTask.title}</span>
+                    </>
                   )}
-                  <span className="truncate">#{firstPendingTaskIndex + 1} {firstPendingTask.title}</span>
                 </span>
                 {job.progressHeartbeat && (
                   <div
@@ -1791,9 +1805,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             ) : (
               <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1" data-testid="job-tasks-list">
                 {filteredTasks.map((task, idx) => {
-                  const isCurrentFocus = !task.isCompleted && (task.id === (job.currentTaskId || firstPendingTaskId));
+                  const isCurrentFocus = !isAwaitingApproval && !task.isCompleted && (task.id === (job.currentTaskId || firstPendingTaskId));
                   const isTaskCompleted = task.isCompleted || task.status === 'completed';
-                  const isTaskInProgress = !isTaskCompleted && (task.status === 'in_progress' || isCurrentFocus);
+                  const isTaskInProgress = !task.isCompleted && !isAwaitingApproval && (task.status === 'in_progress' || isCurrentFocus);
 
                   return (
                     <div
@@ -2484,6 +2498,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     <p className="text-[11px] text-slate-400 leading-relaxed mt-0.5">
                       {activeTurnInfo.isOffline
                         ? `Starting environment & waiting for runner connection (@${activeTurnInfo.driverId || 'agy'})...`
+                        : isAwaitingApproval
+                        ? 'Awaiting plan approval before executing tasks...'
                         : (job.currentTaskId === 'stage-1-discovery' || (uniqueTasks.length === 0 && !isPending)
                             ? 'Exploring codebase and discussing plan...'
                             : 'Executing workspace commands, tests, and active persona logic.')}
