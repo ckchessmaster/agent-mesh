@@ -107,6 +107,17 @@ fi
 if ! grep -q 'REMOTE_CONTAINERS' /root/.bashrc 2>/dev/null; then
     echo 'export REMOTE_CONTAINERS="true"' >> /root/.bashrc
 fi
+if ! grep -q 'copilot() {' /root/.bashrc 2>/dev/null; then
+    cat << 'EOF' >> /root/.bashrc
+copilot() {
+    if [ "$1" = "login" ]; then
+        env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN command copilot login --device-code "${@:2}"
+    else
+        command copilot "$@"
+    fi
+}
+EOF
+fi
 
 # If ~/.config, ~/.aip, ~/.gemini, ~/.claude, or ~/.copilot was previously created as a symlink, remove it so credential managers have real directories
 if [ -L /root/.config ]; then rm -f /root/.config; fi

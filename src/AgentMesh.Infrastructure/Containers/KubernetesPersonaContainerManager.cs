@@ -1565,7 +1565,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
             else if (driverId.StartsWith("copilot") || adapterType == "copilot")
             {
-                authCmd = new[] { "copilot", "login", "--device-code" };
+                authCmd = new[] { "env", "-u", "GITHUB_TOKEN", "-u", "GH_TOKEN", "-u", "COPILOT_GITHUB_TOKEN", "copilot", "login", "--device-code" };
             }
             else
             {
@@ -1788,10 +1788,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
         {
-            var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || test -n \"$GH_TOKEN\" || test -n \"$GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
+            var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
             if (cpExit == 0)
             {
-                var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -o '\"token\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
+                var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
                 if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
                 {
                     try

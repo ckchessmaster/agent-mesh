@@ -1611,6 +1611,13 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
         else if (driverId.StartsWith("copilot") || adapterType == "copilot")
         {
+            psi.ArgumentList.Add("env");
+            psi.ArgumentList.Add("-u");
+            psi.ArgumentList.Add("GITHUB_TOKEN");
+            psi.ArgumentList.Add("-u");
+            psi.ArgumentList.Add("GH_TOKEN");
+            psi.ArgumentList.Add("-u");
+            psi.ArgumentList.Add("COPILOT_GITHUB_TOKEN");
             psi.ArgumentList.Add("copilot");
             psi.ArgumentList.Add("login");
             psi.ArgumentList.Add("--device-code");
@@ -1626,6 +1633,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         var tcsUrl = new TaskCompletionSource<string>();
         string? capturedUrl = null;
         string? capturedUserCode = null;
+        var errBuilder = new StringBuilder();
 
         void ParseLine(string line)
         {
@@ -1691,6 +1699,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 string? line;
                 while ((line = await proc.StandardError.ReadLineAsync()) != null)
                 {
+                    errBuilder.AppendLine(line);
                     ParseLine(line);
                 }
             }
@@ -1699,7 +1708,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         try
         {
-            var completed = await Task.WhenAny(tcsUrl.Task, Task.Delay(10000, ct));
+            var completed = await Task.WhenAny(tcsUrl.Task, Task.Delay(15000, ct));
             if (completed == tcsUrl.Task)
             {
                 var authUrl = await tcsUrl.Task;
@@ -1723,7 +1732,11 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             _logger.LogWarning("Failed to capture auth URL: {Error}", ex.Message);
         }
 
-        return new PersonaAuthStartResult(normPersonaId, driverId, "error", ErrorMessage: "Could not capture authorization link from container.");
+        var errText = errBuilder.ToString().Trim();
+        var errMsg = !string.IsNullOrWhiteSpace(errText)
+            ? errText
+            : "Could not capture authorization link from container.";
+        return new PersonaAuthStartResult(normPersonaId, driverId, "error", ErrorMessage: errMsg);
     }
 
     public async Task<PersonaAuthSubmitResult> SubmitAuthCodeAsync(string personaId, string code, CancellationToken ct = default)
@@ -1756,10 +1769,10 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
         {
-            var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || test -n \"$GH_TOKEN\" || test -n \"$GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
+            var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
             if (cpExit == 0)
             {
-                var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -o '\"token\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
+                var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
                 if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
                 {
                     try
