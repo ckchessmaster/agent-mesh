@@ -35,4 +35,56 @@ public static class DriverAdapters
             _ => normalized
         };
     }
+
+    /// <summary>
+    /// Infers an adapter when no adapter is recorded on the driver row.
+    /// Returns null if the driver ID doesn't match any known adapter family and no transport implies one.
+    /// </summary>
+    public static string? InferFromDriverId(
+        string? driverId,
+        string? endpoint = null,
+        AgentMesh.Core.Enums.RuntimeType? runtimeType = null)
+    {
+        if (runtimeType is AgentMesh.Core.Enums.RuntimeType.OpenAiCompatible or AgentMesh.Core.Enums.RuntimeType.LocalOllama ||
+            (!string.IsNullOrWhiteSpace(endpoint) &&
+             endpoint.StartsWith("http", StringComparison.OrdinalIgnoreCase)))
+        {
+            return OpenAi;
+        }
+
+        var id = driverId?.Trim().TrimStart('@').ToLowerInvariant() ?? string.Empty;
+        if (id.StartsWith("copilot", StringComparison.OrdinalIgnoreCase) || id.Contains("copilot", StringComparison.OrdinalIgnoreCase))
+            return Copilot;
+
+        if (id.StartsWith("claude", StringComparison.OrdinalIgnoreCase) || id.Contains("claude", StringComparison.OrdinalIgnoreCase))
+            return Claude;
+
+        if (id.StartsWith("openai", StringComparison.OrdinalIgnoreCase) || id.Contains("openai", StringComparison.OrdinalIgnoreCase))
+            return OpenAi;
+
+        if (id.StartsWith("agy", StringComparison.OrdinalIgnoreCase) ||
+            id.EndsWith("-agy", StringComparison.OrdinalIgnoreCase) ||
+            id.Contains("antigravity", StringComparison.OrdinalIgnoreCase))
+            return Agy;
+
+        return null;
+    }
+
+    /// <summary>
+    /// Resolves the adapter for a driver, checking explicit adapter first, then inferring from driverId / transport,
+    /// defaulting to fallback if provided.
+    /// </summary>
+    public static string ResolveAdapter(
+        string? adapter,
+        string? driverId = null,
+        string? endpoint = null,
+        AgentMesh.Core.Enums.RuntimeType? runtimeType = null,
+        string fallback = Agy)
+    {
+        var canonical = Canonicalize(adapter);
+        if (canonical != null) return canonical;
+
+        var inferred = InferFromDriverId(driverId, endpoint, runtimeType);
+        return inferred ?? fallback;
+    }
 }

@@ -232,8 +232,8 @@ public class ConfigStore
                 Name = "GitHub Copilot CLI",
                 Role = "Shell & Git Specialist",
                 AdapterType = "copilot",
-                Command = "gh",
-                Arguments = "copilot",
+                Command = "copilot",
+                Arguments = "",
                 Capabilities = new List<string> { "explain", "suggest", "git_ops" }
             };
         }
@@ -273,7 +273,7 @@ public class ConfigStore
     {
         "agy" => "agy",
         "claude" => "claude",
-        "copilot" => "gh",
+        "copilot" => "copilot",
         "openai" => null,
         _ => null
     };

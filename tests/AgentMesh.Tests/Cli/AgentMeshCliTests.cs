@@ -31,6 +31,8 @@ public class AgentMeshCliTests
             config.Agents["agy"].AdapterType.Should().Be("agy");
             config.Agents["claude"].AdapterType.Should().Be("claude");
             config.Agents["copilot"].AdapterType.Should().Be("copilot");
+            config.Agents["copilot"].Command.Should().Be("copilot");
+            config.Agents["copilot"].Arguments.Should().BeEmpty();
         }
         finally
         {

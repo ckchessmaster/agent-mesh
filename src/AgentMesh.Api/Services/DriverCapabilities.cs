@@ -60,10 +60,13 @@ public record DriverCapabilitiesView(
         string? rawCapabilitiesJson = null)
     {
         var (apiKey, unredactedSidecar, oauthToken) = DriverCapabilities.ExtractProbeSecrets(rawCapabilitiesJson, Sidecar);
+        var effectiveAdapter = DriverAdapters.Canonicalize(Adapter)
+            ?? DriverAdapters.InferFromDriverId(driverId, Endpoint, runtimeType);
+
         return new(
             DriverId: driverId,
             RuntimeType: runtimeType,
-            Adapter: Adapter,
+            Adapter: effectiveAdapter,
             Endpoint: Endpoint,
             OperatorModels: OperatorModels,
             DefaultModel: DefaultModel,

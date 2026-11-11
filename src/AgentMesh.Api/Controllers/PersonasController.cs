@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Enums;
@@ -740,6 +741,7 @@ public class PersonasController(
             _ => driverId
         };
 
+        var inferredAdapter = DriverAdapters.InferFromDriverId(driverId, runtimeType: RuntimeType.CliAgy) ?? DriverAdapters.Agy;
         var driver = new Agent
         {
             Id = driverId,
@@ -749,7 +751,7 @@ public class PersonasController(
             RuntimeType = RuntimeType.CliAgy,
             TrustTier = TrustTier.Intern,
             PersonaPrompt = $"Execution driver ({driverId})",
-            CapabilitiesJson = "[]",
+            CapabilitiesJson = JsonSerializer.Serialize(new { adapter = inferredAdapter }),
             LastHeartbeatAt = DateTimeOffset.UtcNow,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow

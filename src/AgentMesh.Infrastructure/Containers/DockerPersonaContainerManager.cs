@@ -1120,7 +1120,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
         else if (adapterType == "copilot" || driverId.StartsWith("copilot"))
         {
-            checkCmd = "gh --version";
+            checkCmd = "command -v copilot >/dev/null 2>&1 && copilot --version || gh --version";
         }
         else if (adapterType == "openai")
         {
@@ -1342,6 +1342,25 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             else if (driverId.StartsWith("claude") || adapterType == "claude")
             {
                 var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(normPersonaId, "timeout 15 claude -p \"hello\"", ct);
+                if (dryExit == 0)
+                {
+                    var summary = !string.IsNullOrWhiteSpace(dryOut) ? dryOut.Split('\n')[0].Trim() : "completed";
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "success",
+                        $"Driver executed test prompt successfully: {summary}"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "warning",
+                        $"Dry-run prompt exited with code {dryExit}: {(!string.IsNullOrWhiteSpace(dryErr) ? dryErr : dryOut)}"));
+                }
+            }
+            else if (driverId.StartsWith("copilot") || adapterType == "copilot")
+            {
+                var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(normPersonaId, "timeout 15 copilot -p \"hello\" --allow-all 2>&1 || timeout 15 gh copilot -- -p \"hello\" 2>&1", ct);
                 if (dryExit == 0)
                 {
                     var summary = !string.IsNullOrWhiteSpace(dryOut) ? dryOut.Split('\n')[0].Trim() : "completed";

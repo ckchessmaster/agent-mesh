@@ -393,12 +393,22 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     {
         var adapter = DriverAdapters.Canonicalize(request.Adapter);
 
+        if (adapter is null)
+        {
+            if (!string.IsNullOrWhiteSpace(request.Endpoint))
+            {
+                // No adapter recorded (rows written before the field existed): infer from transport.
+                return DriverAdapters.OpenAi;
+            }
+
+            return DriverAdapters.InferFromDriverId(request.DriverId, request.Endpoint, request.RuntimeType);
+        }
+
         // `generic` runs an arbitrary command with no discovery surface and no opinion to offer.
-        if (adapter is null or DriverAdapters.Generic)
+        if (adapter is DriverAdapters.Generic)
         {
             if (string.IsNullOrWhiteSpace(request.Endpoint)) return null;
 
-            // No adapter recorded (rows written before the field existed): infer from transport.
             return DriverAdapters.OpenAi;
         }
 
