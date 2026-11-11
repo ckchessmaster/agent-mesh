@@ -1,7 +1,7 @@
 name: Weekly Cleanup
 
 # Keeps only the most recent N releases (plus their CI artifacts and GHCR images/chart versions).
-# Git tags are intentionally left in place.
+# The git tags of the pruned releases are deleted too; tags without a release are left alone.
 
 on:
   schedule:
@@ -54,10 +54,10 @@ jobs:
           while read -r tag; do
             [ -z "$tag" ] && continue
             if [ "$DRY_RUN" = "true" ]; then
-              echo "[dry-run] would delete release $tag"
+              echo "[dry-run] would delete release and tag $tag"
             else
-              echo "Deleting release $tag"
-              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+              echo "Deleting release and tag $tag"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
             fi
           done < delete.txt
 
