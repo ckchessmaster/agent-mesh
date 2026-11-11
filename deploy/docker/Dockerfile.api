@@ -10,7 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_VERSION=22
 ENV PATH="/root/.local/bin:/usr/local/bin:${PATH}"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     curl \
     wget \
     ca-certificates \
@@ -18,13 +20,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tar \
     gzip \
     && mkdir -p -m 755 /etc/apt/keyrings \
-    && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && curl -fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
     && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
-    && apt-get update && apt-get install -y --no-install-recommends gh nodejs \
+    && curl -fsSL --retry 5 --retry-all-errors https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends gh nodejs \
     && npm install -g @anthropic-ai/claude-code \
-    && curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+    && curl -fsSL --retry 5 --retry-all-errors https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
     && chmod +x /usr/local/bin/agy \
     && mkdir -p /root/.gemini/antigravity-cli /root/.claude /root/.config /root/.agentmesh/tokens \
     && rm -rf /var/lib/apt/lists/*
