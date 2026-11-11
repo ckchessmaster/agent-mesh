@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Headers;
+using System.Net.Http.Headers;
 using System.Text.Json;
 using AgentMesh.Api.Services;
 using AgentMesh.Api.Tools;
@@ -291,6 +291,33 @@ public class SaveMemoryToolEndToEndTests : IClassFixture<WebApplicationFactory<A
         var stored = await ReadBackAsync(db =>
             db.AgentMemories.AsNoTracking().Where(m => m.AgentId == agentId).ToListAsync());
         stored.Should().ContainSingle().Which.ProjectId.Should().Be(AgentMemory.GlobalProjectId);
+    }
+
+    [Fact]
+    public async Task SaveMemory_NormalizesContentAndLegacyCategoryAliases()
+    {
+        var (agentId, token) = await RegisterAgentAsync();
+        await using var client = await ConnectAsync(CreateAuthenticatedClient(token, projectId: "agent-mesh"));
+
+        var result = await client.CallToolAsync("save_memory", new Dictionary<string, object?>
+        {
+            ["category"] = "architecture",
+            ["key"] = "db_choice",
+            ["content"] = "PostgreSQL is used as main store.",
+            ["isGlobal"] = false,
+        });
+
+        ShouldNotBeProtocolError(result, "content and architecture category should be normalized");
+
+        using var payload = JsonDocument.Parse(Text(result));
+        payload.RootElement.GetProperty("success").GetBoolean().Should().BeTrue();
+
+        var stored = await ReadBackAsync(db => db.AgentMemories.AsNoTracking()
+            .Where(m => m.AgentId == agentId && m.Key == "db_choice").ToListAsync());
+
+        var row = stored.Should().ContainSingle().Which;
+        row.Value.Should().Be("PostgreSQL is used as main store.");
+        row.Category.Should().Be(AgentMemoryCategories.CodebaseGotcha);
     }
 
     [Fact]

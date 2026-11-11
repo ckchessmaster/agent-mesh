@@ -195,16 +195,67 @@ builder.Services.AddMcpServer()
     .WithTools<SessionTools>()
     .WithTools<MemoryTools>()
     .WithTools<PlatformMcpTools>()
-    // save_memory takes `category` as a string so a bad value gets an actionable error instead of the
-    // library's generic invocation failure; this puts the enum constraint back on the published schema.
-    .WithRequestFilters(filters => filters.AddListToolsFilter(next => async (context, cancellationToken) =>
+    .WithRequestFilters(filters =>
     {
-        var result = await next(context, cancellationToken);
-        MemoryToolSchema.ApplyCategoryEnum(result);
-        // Same trade-off for manage_task's `action` and `status` arguments.
-        PlatformToolSchema.ApplyManagedTaskEnums(result);
-        return result;
-    }));
+        filters.AddListToolsFilter(next => async (context, cancellationToken) =>
+        {
+            var result = await next(context, cancellationToken);
+            MemoryToolSchema.ApplyCategoryEnum(result);
+            // Same trade-off for manage_task's `action` and `status` arguments.
+            PlatformToolSchema.ApplyManagedTaskEnums(result);
+            return result;
+        });
+        filters.AddCallToolFilter(next => async (context, cancellationToken) =>
+        {
+            var normalizedArgs = PlatformToolCallNormalizer.NormalizeArguments(context.Params.Name, context.Params.Arguments);
+            if (normalizedArgs is not null)
+            {
+                context.Params.Arguments = normalizedArgs;
+            }
+
+            try
+            {
+                var result = await next(context, cancellationToken);
+                if (result.IsError == true)
+                {
+                    var text = string.Concat(result.Content.OfType<ModelContextProtocol.Protocol.TextContentBlock>().Select(c => c.Text));
+                    if (text.Contains("An error occurred invoking", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new ModelContextProtocol.Protocol.CallToolResult
+                        {
+                            IsError = false,
+                            Content = [new ModelContextProtocol.Protocol.TextContentBlock
+                            {
+                                Text = System.Text.Json.JsonSerializer.Serialize(new
+                                {
+                                    success = false,
+                                    error = "tool_invocation_error",
+                                    message = text
+                                })
+                            }]
+                        };
+                    }
+                }
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return new ModelContextProtocol.Protocol.CallToolResult
+                {
+                    IsError = false,
+                    Content = [new ModelContextProtocol.Protocol.TextContentBlock
+                    {
+                        Text = System.Text.Json.JsonSerializer.Serialize(new
+                        {
+                            success = false,
+                            error = "invocation_failed",
+                            message = ex.Message
+                        })
+                    }]
+                };
+            }
+        });
+    });
 
 var app = builder.Build();
 
