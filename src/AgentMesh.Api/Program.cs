@@ -219,22 +219,19 @@ builder.Services.AddMcpServer()
                 if (result.IsError == true)
                 {
                     var text = string.Concat(result.Content.OfType<ModelContextProtocol.Protocol.TextContentBlock>().Select(c => c.Text));
-                    if (text.Contains("An error occurred invoking", StringComparison.OrdinalIgnoreCase))
+                    return new ModelContextProtocol.Protocol.CallToolResult
                     {
-                        return new ModelContextProtocol.Protocol.CallToolResult
+                        IsError = false,
+                        Content = [new ModelContextProtocol.Protocol.TextContentBlock
                         {
-                            IsError = false,
-                            Content = [new ModelContextProtocol.Protocol.TextContentBlock
+                            Text = System.Text.Json.JsonSerializer.Serialize(new
                             {
-                                Text = System.Text.Json.JsonSerializer.Serialize(new
-                                {
-                                    success = false,
-                                    error = "tool_invocation_error",
-                                    message = text
-                                })
-                            }]
-                        };
-                    }
+                                success = false,
+                                error = "tool_invocation_error",
+                                message = text
+                            })
+                        }]
+                    };
                 }
                 return result;
             }

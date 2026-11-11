@@ -179,12 +179,9 @@ public class PlatformMcpTools(
                 });
         }
 
-        var target = target_persona?.Trim().TrimStart('@').ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(target))
-        {
-            return Error("invalid_target_persona",
-                $"target_persona is required. Use '{OperatorPersonaId}' for the human, or a persona id assigned to this job.");
-        }
+        var target = string.IsNullOrWhiteSpace(target_persona)
+            ? OperatorPersonaId
+            : target_persona.Trim().TrimStart('@').ToLowerInvariant();
 
         var assignedPersonaIds = await GetAssignedPersonaIdsAsync(job.ProjectId, ct);
 
@@ -383,6 +380,9 @@ public class PlatformMcpTools(
 
         try
         {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(2));
+
             IReadOnlyList<string>? targetPersonaIds = !string.IsNullOrWhiteSpace(targetPersona)
                 ? [targetPersona.Trim().TrimStart('@').ToLowerInvariant()]
                 : null;
@@ -398,7 +398,7 @@ public class PlatformMcpTools(
                     // same reply twice.
                     MessageId: message.Id.ToString(),
                     TargetPersonaIds: targetPersonaIds),
-                ct);
+                timeoutCts.Token);
 
             if (!delivery.Delivered)
             {
@@ -408,10 +408,10 @@ public class PlatformMcpTools(
                     jobId, delivery.Status, delivery.Detail ?? "(none)");
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
             logger.LogWarning(ex,
-                "Routing a post_job_message reply into the workflow for job {JobId} failed", jobId);
+                "Routing a post_job_message reply into the workflow for job {JobId} failed or timed out", jobId);
         }
     }
 
@@ -600,6 +600,13 @@ public class PlatformMcpTools(
                 return Error("discovery_phase_read_only",
                     "Task status updates are disabled during Stage 1 Discovery. Complete discovery using set_checklist and receive plan approval before starting implementation.");
             }
+
+            if (IsJobAwaitingPlanApproval(job))
+            {
+                return Error("discovery_phase_read_only",
+                    "Task status updates are disabled while awaiting plan approval (Stage 2 Gate). The checklist has been registered; wait for operator plan approval before starting implementation.",
+                    details: new { error_subtype = "awaiting_plan_approval", jobId = job.Id, approvalPolicy = job.ApprovalPolicy.ToString(), progressHeartbeat = job.ProgressHeartbeat });
+            }
         }
 
         var (target, notFound) = ResolveTask(tasks, task_id, callerPersona, normalizedAction);
@@ -776,11 +783,36 @@ public class PlatformMcpTools(
     }
 
     /// <summary>
-    /// Determines whether the job is currently in Stage 1 Discovery or Stage 2 Awaiting Plan Approval,
+    /// Determines whether the job is currently in Stage 1 Discovery,
     /// enforcing read-only discovery restrictions on task updates and PR creation.
     /// </summary>
     private static bool IsJobInDiscoveryPhase(ProjectJob job, PlatformCallContext context)
     {
+        var heartbeat = job.ProgressHeartbeat ?? string.Empty;
+
+        // If the job's plan has already been approved or the job is actively executing tasks,
+        // it is NOT in discovery phase, regardless of stale session metadata.
+        if (heartbeat.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) ||
+            heartbeat.Contains("Executing task", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // If awaiting plan approval, it is in Stage 2 Gate, handled by IsJobAwaitingPlanApproval.
+        if (heartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // If the job has already registered checklist tasks and is no longer pointing to stage-1-discovery,
+        // it is past Stage 1 Discovery.
+        var hasTasks = !string.IsNullOrWhiteSpace(job.TasksJson) && job.TasksJson != "[]";
+        if (hasTasks && !string.Equals(job.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase) &&
+            !heartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         if (context.IsDiscoveryPhase)
         {
             return true;
@@ -791,14 +823,22 @@ public class PlatformMcpTools(
             return true;
         }
 
-        var heartbeat = job.ProgressHeartbeat ?? string.Empty;
-        if (heartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase) ||
-            heartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase))
+        if (heartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Determines whether the job has completed Stage 1 Discovery and is currently parked
+    /// awaiting human or lead plan approval (Stage 2 Gate).
+    /// </summary>
+    private static bool IsJobAwaitingPlanApproval(ProjectJob job)
+    {
+        var heartbeat = job.ProgressHeartbeat ?? string.Empty;
+        return heartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -937,6 +977,13 @@ public class PlatformMcpTools(
         {
             return Error("discovery_phase_read_only",
                 "Cannot open pull request during Stage 1 Discovery. You must first decompose the job into checklist tasks and receive plan approval.");
+        }
+
+        if (IsJobAwaitingPlanApproval(job))
+        {
+            return Error("discovery_phase_read_only",
+                "Cannot open pull request while awaiting plan approval (Stage 2 Gate). Wait for operator plan approval before starting implementation.",
+                details: new { error_subtype = "awaiting_plan_approval", jobId = job.Id, approvalPolicy = job.ApprovalPolicy.ToString() });
         }
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId, ct);

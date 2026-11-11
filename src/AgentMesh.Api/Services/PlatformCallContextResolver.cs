@@ -138,6 +138,26 @@ public class PlatformCallContextResolver(
         var gitBase = ReadMetadataString(session?.MetadataJson, "gitBaseBranch");
         var taskId = ReadMetadataString(session?.MetadataJson, "taskId");
 
+        // If the database job has already progressed past stage-1-discovery, do not let
+        // a stale session metadata taskId lock the caller into discovery phase.
+        if (jobId.HasValue && string.Equals(taskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
+        {
+            var dbJob = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == jobId.Value, ct);
+            if (dbJob != null)
+            {
+                var heartbeat = dbJob.ProgressHeartbeat ?? string.Empty;
+                var hasTasks = !string.IsNullOrWhiteSpace(dbJob.TasksJson) && dbJob.TasksJson != "[]";
+                var isPastDiscovery = heartbeat.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) ||
+                                      heartbeat.Contains("Executing task", StringComparison.OrdinalIgnoreCase) ||
+                                      (hasTasks && !string.Equals(dbJob.CurrentTaskId, "stage-1-discovery", StringComparison.OrdinalIgnoreCase) &&
+                                       !heartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase));
+                if (isPastDiscovery)
+                {
+                    taskId = dbJob.CurrentTaskId;
+                }
+            }
+        }
+
         return new PlatformCallContext(
             AgentId: agentId,
             AgentIdSource: agentSource,

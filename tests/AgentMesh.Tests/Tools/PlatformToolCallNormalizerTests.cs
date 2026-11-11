@@ -212,4 +212,51 @@ public class PlatformToolCallNormalizerTests
         normalized["payloadJson"].GetString().Should().Be("{}");
         normalized["sessionId"].GetString().Should().Be("sess-1");
     }
+
+    [Fact]
+    public void NormalizeArguments_PostJobMessage_SuppliesDefaultTargetPersonaAndRequiresReply()
+    {
+        var raw = new Dictionary<string, JsonElement>
+        {
+            ["content"] = JsonSerializer.SerializeToElement("Here is an update for the operator.")
+        };
+
+        var normalized = PlatformToolCallNormalizer.NormalizeArguments("post_job_message", raw);
+        normalized.Should().NotBeNull();
+        normalized!["content"].GetString().Should().Be("Here is an update for the operator.");
+        normalized["target_persona"].GetString().Should().Be("operator");
+        normalized["requires_reply"].GetBoolean().Should().BeFalse();
+    }
+
+    [Fact]
+    public void NormalizeArguments_ManageTask_DefaultsAction_WhenMissing()
+    {
+        // 1. With tasks array -> defaults to set_checklist
+        var rawTasks = new Dictionary<string, JsonElement>
+        {
+            ["tasks"] = JsonSerializer.SerializeToElement(new[]
+            {
+                new { title = "Task 1", target_file = "foo.cs" }
+            })
+        };
+        var normalizedTasks = PlatformToolCallNormalizer.NormalizeArguments("manage_task", rawTasks);
+        normalizedTasks.Should().NotBeNull();
+        normalizedTasks!["action"].GetString().Should().Be("set_checklist");
+
+        // 2. With status -> defaults to update_task_status
+        var rawStatus = new Dictionary<string, JsonElement>
+        {
+            ["status"] = JsonSerializer.SerializeToElement("in_progress"),
+            ["taskId"] = JsonSerializer.SerializeToElement("task-1")
+        };
+        var normalizedStatus = PlatformToolCallNormalizer.NormalizeArguments("manage_task", rawStatus);
+        normalizedStatus.Should().NotBeNull();
+        normalizedStatus!["action"].GetString().Should().Be("update_task_status");
+
+        // 3. With neither -> defaults to get_checklist
+        var rawEmpty = new Dictionary<string, JsonElement>();
+        var normalizedEmpty = PlatformToolCallNormalizer.NormalizeArguments("manage_task", rawEmpty);
+        normalizedEmpty.Should().NotBeNull();
+        normalizedEmpty!["action"].GetString().Should().Be("get_checklist");
+    }
 }

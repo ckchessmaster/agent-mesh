@@ -928,6 +928,14 @@ public class MeshClient
         }
         else if (normalizedTool is "manage_task")
         {
+            if (!dict.ContainsKey("action"))
+            {
+                if (dict.TryGetValue("operation", out var op)) dict["action"] = op;
+                else if (dict.TryGetValue("command", out var cmd)) dict["action"] = cmd;
+                else if (dict.ContainsKey("tasks")) dict["action"] = "set_checklist";
+                else if (dict.ContainsKey("status")) dict["action"] = "update_task_status";
+                else dict["action"] = "get_checklist";
+            }
             if (!dict.ContainsKey("task_id") && dict.TryGetValue("taskId", out var tid)) dict["task_id"] = tid;
             if (!dict.ContainsKey("progress_note") && dict.TryGetValue("progressNote", out var pn)) dict["progress_note"] = pn;
             if (!dict.ContainsKey("job_id") && dict.TryGetValue("jobId", out var jid)) dict["job_id"] = jid;
@@ -946,10 +954,18 @@ public class MeshClient
                 if (dict.TryGetValue("targetPersona", out var tp)) dict["target_persona"] = tp;
                 else if (dict.TryGetValue("target", out var tgt)) dict["target_persona"] = tgt;
                 else if (dict.TryGetValue("persona", out var p)) dict["target_persona"] = p;
+                else dict["target_persona"] = "operator";
             }
-            if (!dict.ContainsKey("requires_reply") && dict.TryGetValue("requiresReply", out var rr))
+            if (!dict.ContainsKey("requires_reply"))
             {
-                dict["requires_reply"] = rr;
+                if (dict.TryGetValue("requiresReply", out var rr))
+                {
+                    dict["requires_reply"] = rr;
+                }
+                else
+                {
+                    dict["requires_reply"] = false;
+                }
             }
             if (!dict.ContainsKey("job_id") && dict.TryGetValue("jobId", out var jid)) dict["job_id"] = jid;
         }
