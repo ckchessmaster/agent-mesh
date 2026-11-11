@@ -26,7 +26,7 @@ RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\nAcquire::http::Ti
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
     && curl -4fsSL --retry 5 --retry-all-errors https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get update && apt-get install -y --no-install-recommends gh nodejs \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code @github/copilot \
     && curl -4fsSL --retry 5 --retry-all-errors https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
     && chmod +x /usr/local/bin/agy \
     && mkdir -p /root/.gemini/antigravity-cli /root/.claude /root/.config /root/.agentmesh/tokens \

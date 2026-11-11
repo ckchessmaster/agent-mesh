@@ -79,22 +79,23 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
 fi
 
 # Ensure persistent workspace state directories exist with restricted permissions
-mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.local/bin
+mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.copilot /workspace/.agentmesh/state/.local/bin
 chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
-chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.local 2>/dev/null || true
+chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.copilot /workspace/.agentmesh/state/.local 2>/dev/null || true
 
 # Ensure ~/.bashrc exports PATH for all interactive shells
 if ! grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null; then
     echo 'export PATH="/root/.local/bin:/usr/local/bin:$PATH"' >> /root/.bashrc
 fi
 
-# If ~/.config, ~/.aip, ~/.gemini, or ~/.claude was previously created as a symlink, remove it so credential managers have real directories
+# If ~/.config, ~/.aip, ~/.gemini, ~/.claude, or ~/.copilot was previously created as a symlink, remove it so credential managers have real directories
 if [ -L /root/.config ]; then rm -f /root/.config; fi
 if [ -L /root/.aip ]; then rm -f /root/.aip; fi
 if [ -L /root/.gemini ]; then rm -f /root/.gemini; fi
 if [ -L /root/.claude ]; then rm -f /root/.claude; fi
-mkdir -p /root/.config /root/.aip /root/.gemini /root/.claude /root/.local/bin
-chmod 700 /root/.config /root/.aip /root/.gemini /root/.claude 2>/dev/null || true
+if [ -L /root/.copilot ]; then rm -f /root/.copilot; fi
+mkdir -p /root/.config /root/.aip /root/.gemini /root/.claude /root/.copilot /root/.local/bin
+chmod 700 /root/.config /root/.aip /root/.gemini /root/.claude /root/.copilot 2>/dev/null || true
 
 # Restore persistent state from workspace volume into local directories
 if [ -d /workspace/.agentmesh/state ]; then
@@ -142,6 +143,10 @@ sync_persona_state() {
     if [ -d /root/.claude ]; then
         mkdir -p /workspace/.agentmesh/state/.claude
         cp -a /root/.claude/. /workspace/.agentmesh/state/.claude/ 2>/dev/null || true
+    fi
+    if [ -d /root/.copilot ]; then
+        mkdir -p /workspace/.agentmesh/state/.copilot
+        cp -a /root/.copilot/. /workspace/.agentmesh/state/.copilot/ 2>/dev/null || true
     fi
     if [ -d /root/.local/bin ]; then
         mkdir -p /workspace/.agentmesh/state/.local/bin
@@ -296,6 +301,13 @@ echo "=========================================================="
 if [ -z "$AGENTMESH_PERSONA_ID" ]; then
     echo "ERROR: AGENTMESH_PERSONA_ID must be set for dedicated persona environment."
     exit 1
+fi
+
+# Ensure GitHub Copilot CLI is installed if missing and npm is available
+if command -v npm >/dev/null 2>&1 && ! command -v copilot >/dev/null 2>&1; then
+    echo "Ensuring GitHub Copilot CLI is available..."
+    npm install -g @github/copilot 2>/dev/null || true
+    hash -r 2>/dev/null || true
 fi
 
 ARGS=(run --persona "$AGENTMESH_PERSONA_ID" --url "$AGENTMESH_URL" --headless)

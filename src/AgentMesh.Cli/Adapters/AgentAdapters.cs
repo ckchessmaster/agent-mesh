@@ -849,8 +849,9 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             ? promptEvent.WorkingDirectory
             : AgentAdapterFactory.ResolveWorkspaceDirectory();
 
-        var agyPath = AgentAdapterFactory.ResolveExecutablePath(preset.Command ?? "agy")
-                      ?? AgentAdapterFactory.ResolveExecutablePath("agy");
+        var agyPath = (string.Equals(preset.AdapterType, "agy", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(preset.Command))
+            ? (AgentAdapterFactory.ResolveExecutablePath(preset.Command) ?? AgentAdapterFactory.ResolveExecutablePath("agy"))
+            : AgentAdapterFactory.ResolveExecutablePath("agy");
 
         if (agyPath != null)
         {
@@ -1899,25 +1900,41 @@ public class CopilotAdapter : IAgentAdapter
         var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
             ? promptEvent.WorkingDirectory
             : AgentAdapterFactory.ResolveWorkspaceDirectory();
-        var copilotPath = AgentAdapterFactory.ResolveExecutablePath("copilot");
-
-        if (copilotPath != null)
+        string? copilotPath = null;
+        if (!string.IsNullOrWhiteSpace(preset.Command) && !string.Equals(preset.Command, "gh", StringComparison.OrdinalIgnoreCase))
         {
+            copilotPath = AgentAdapterFactory.ResolveExecutablePath(preset.Command);
+        }
+        copilotPath ??= AgentAdapterFactory.ResolveExecutablePath("copilot");
+
+        var ghPath = copilotPath == null ? AgentAdapterFactory.ResolveExecutablePath("gh") : null;
+
+        if (copilotPath != null || ghPath != null)
+        {
+            var isViaGh = copilotPath == null && ghPath != null;
+            var executablePath = copilotPath ?? ghPath!;
+
             await onEvent(new TrajectoryEventPayload
             {
                 EventType = "thought",
-                Content = $"[GitHub Copilot CLI @{preset.Id}] Running prompt via {copilotPath}..."
+                Content = $"[GitHub Copilot CLI @{preset.Id}] Running prompt via {(isViaGh ? "gh copilot" : executablePath)}..."
             });
 
             var psi = new ProcessStartInfo
             {
-                FileName = copilotPath,
+                FileName = executablePath,
                 WorkingDirectory = cwd,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+
+            if (isViaGh)
+            {
+                psi.ArgumentList.Add("copilot");
+                psi.ArgumentList.Add("--");
+            }
 
             // Session ID resumption for multi-turn conversations
             if (AgyAdapter.GetSessionConversationId(promptEvent.SessionId) is string existingConvId &&
@@ -2055,8 +2072,17 @@ public class CopilotAdapter : IAgentAdapter
             }
         }
 
-        var fallback = new AgyAdapter();
-        await fallback.ExecutePromptAsync(preset, promptEvent, onEvent, ct);
+        await onEvent(new TrajectoryEventPayload
+        {
+            EventType = "error",
+            Content = $"[GitHub Copilot CLI @{preset.Id}] GitHub Copilot CLI ('copilot') is not installed on this system."
+        });
+
+        await onEvent(new TrajectoryEventPayload
+        {
+            EventType = "response",
+            Content = $"**Error: GitHub Copilot CLI (`copilot`) is not installed.**\n\nPlease install it using:\n```bash\nnpm install -g @github/copilot\n```"
+        });
     }
 }
 
