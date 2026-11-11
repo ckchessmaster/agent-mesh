@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Claims;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -587,8 +588,7 @@ public class AgentsController(
                 var driverToken = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{agent.Id}.oauth");
 
                 if (System.IO.File.Exists(copilotConfig) || System.IO.File.Exists(copilotApps) || System.IO.File.Exists(copilotHosts) || System.IO.File.Exists(driverToken) ||
-                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")) ||
-                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GH_TOKEN")))
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
                 {
                     steps.Add(new PersonaDriverVerificationStep(
                         "Authentication Check",
@@ -790,6 +790,9 @@ public class AgentsController(
                 psi.FileName = hostBinPath!;
                 psi.ArgumentList.Add("login");
                 psi.ArgumentList.Add("--device-code");
+                psi.Environment.Remove("GH_TOKEN");
+                psi.Environment.Remove("GITHUB_TOKEN");
+                psi.Environment.Remove("COPILOT_GITHUB_TOKEN");
             }
             else
             {
@@ -802,6 +805,7 @@ public class AgentsController(
             var tcsUrl = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             string? capturedUrl = null;
             string? capturedUserCode = null;
+            var errBuilder = new StringBuilder();
 
             void ParseLine(string line)
             {
@@ -853,13 +857,14 @@ public class AgentsController(
                     string? line;
                     while ((line = await proc.StandardError.ReadLineAsync()) != null)
                     {
+                        errBuilder.AppendLine(line);
                         ParseLine(line);
                     }
                 }
                 catch { }
             });
 
-            var completed = await Task.WhenAny(tcsUrl.Task, Task.Delay(10000, ct));
+            var completed = await Task.WhenAny(tcsUrl.Task, Task.Delay(15000, ct));
             if (completed == tcsUrl.Task && tcsUrl.Task.IsCompletedSuccessfully)
             {
                 var authUrl = await tcsUrl.Task;
@@ -881,7 +886,11 @@ public class AgentsController(
             }
 
             try { if (!proc.HasExited) proc.Kill(true); } catch { }
-            return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "error", ErrorMessage: "Could not capture authorization link from CLI login command."));
+            var errText = errBuilder.ToString().Trim();
+            var errMessage = !string.IsNullOrWhiteSpace(errText)
+                ? errText
+                : "Could not capture authorization link from CLI login command.";
+            return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "error", ErrorMessage: errMessage));
         }
 
         var targetPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
@@ -952,19 +961,19 @@ public class AgentsController(
                         if (System.IO.File.Exists(copilotConfig))
                         {
                             var json = await System.IO.File.ReadAllTextAsync(copilotConfig, ct);
-                            var match = Regex.Match(json, @"""(?:token|oauth_token)""\s*:\s*""([^""]+)""");
+                            var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
                             if (match.Success) copilotToken = match.Groups[1].Value;
                         }
                         if (copilotToken == null && System.IO.File.Exists(copilotHosts))
                         {
                             var json = await System.IO.File.ReadAllTextAsync(copilotHosts, ct);
-                            var match = Regex.Match(json, @"""oauth_token""\s*:\s*""([^""]+)""");
+                            var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
                             if (match.Success) copilotToken = match.Groups[1].Value;
                         }
                         if (copilotToken == null && System.IO.File.Exists(copilotApps))
                         {
                             var json = await System.IO.File.ReadAllTextAsync(copilotApps, ct);
-                            var match = Regex.Match(json, @"""oauth_token""\s*:\s*""([^""]+)""");
+                            var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
                             if (match.Success) copilotToken = match.Groups[1].Value;
                         }
 
