@@ -76,24 +76,31 @@ public record JobExecutionInput(
     }
 }
 
-public record ChildTaskExecutionInput(
-    string JobId,
-    string TaskId,
-    int TaskIndex,
-    string TaskTitle,
-    string AssignedAgentId,
-    string WorkspacePath,
-    string TargetBranch,
-    string? ProjectId = null
-) : TaskExecutionInput(
-    JobId: JobId,
-    TaskId: TaskId,
-    AgentId: AssignedAgentId,
-    ProjectId: ProjectId ?? JobId,
-    WorkspacePath: WorkspacePath,
-    TargetBranch: TargetBranch,
-    TaskIndex: TaskIndex,
-    TaskTitle: TaskTitle);
+public record ChildTaskExecutionInput : TaskExecutionInput
+{
+    public string AssignedAgentId => AgentId;
+
+    public ChildTaskExecutionInput(
+        string JobId,
+        string TaskId,
+        int TaskIndex,
+        string TaskTitle,
+        string AssignedAgentId,
+        string WorkspacePath,
+        string TargetBranch,
+        string? ProjectId = null)
+        : base(
+            JobId: JobId,
+            TaskId: TaskId,
+            AgentId: AssignedAgentId,
+            ProjectId: ProjectId ?? JobId,
+            WorkspacePath: WorkspacePath,
+            TargetBranch: TargetBranch,
+            TaskIndex: TaskIndex,
+            TaskTitle: TaskTitle)
+    {
+    }
+}
 
 public record JobExecutionResult(
     bool Success,
