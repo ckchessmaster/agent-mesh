@@ -2,6 +2,7 @@
 set -e
 
 export PATH="/usr/local/bin:/root/.local/bin:$PATH"
+export REMOTE_CONTAINERS="${REMOTE_CONTAINERS:-true}"
 
 # Allow direct shell execution when invoked with bash or sh
 if [ "$1" = "bash" ] || [ "$1" = "sh" ] || [ "$1" = "/bin/bash" ] || [ "$1" = "/bin/sh" ]; then
@@ -102,6 +103,9 @@ if [ -n "$GH_TOKEN" ] && ! grep -q 'GH_TOKEN' /root/.bashrc 2>/dev/null; then
 fi
 if [ -n "$GITHUB_TOKEN" ] && ! grep -q 'GITHUB_TOKEN' /root/.bashrc 2>/dev/null; then
     echo "export GITHUB_TOKEN=\"$GITHUB_TOKEN\"" >> /root/.bashrc
+fi
+if ! grep -q 'REMOTE_CONTAINERS' /root/.bashrc 2>/dev/null; then
+    echo 'export REMOTE_CONTAINERS="true"' >> /root/.bashrc
 fi
 
 # If ~/.config, ~/.aip, ~/.gemini, ~/.claude, or ~/.copilot was previously created as a symlink, remove it so credential managers have real directories

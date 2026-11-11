@@ -209,7 +209,14 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
     try {
       setAuthSubmitting(true);
       setError(null);
-      const res = await api.submitDriverAuthCode(agent.id, authCodeInput.trim() || authStartResult?.userCode || '');
+      let res = await api.submitDriverAuthCode(agent.id, authCodeInput.trim() || authStartResult?.userCode || '');
+      if (res.status === 'waiting') {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await new Promise(r => setTimeout(r, 1500));
+          res = await api.submitDriverAuthCode(agent.id, authCodeInput.trim() || authStartResult?.userCode || '');
+          if (res.status !== 'waiting') break;
+        }
+      }
       if (res.status === 'authenticated') {
         setAuthSuccessMessage(res.message || 'Successfully authenticated driver and refreshed models!');
         setAuthCodeInput('');
@@ -217,7 +224,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         setShowAuthWizard(false);
         await handleVerifyDriver();
       } else if (res.status === 'waiting') {
-        setError(res.message || 'Waiting for browser authorization. Once approved on GitHub, click again.');
+        setError(res.message || 'Authorization is still pending in browser. Once approved on GitHub, click again.');
       } else {
         setError(res.errorMessage || 'Failed to verify authorization code.');
       }
