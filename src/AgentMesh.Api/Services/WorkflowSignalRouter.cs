@@ -278,7 +278,7 @@ public class WorkflowSignalRouter(
 
         try
         {
-            var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(workflowId);
+            var handle = temporal.GetWorkflowHandle<ITaskExecutionWorkflow>(workflowId);
 
             // Typed expression, not the string name. The SDK registers the handler as
             // "ReceiveChatMessage" (it strips the Async suffix); an untyped call to
@@ -365,7 +365,7 @@ public class WorkflowSignalRouter(
 
         try
         {
-            var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(workflowId);
+            var handle = temporal.GetWorkflowHandle<ITaskExecutionWorkflow>(workflowId);
             await handle.SignalAsync(
                 w => w.ReceivePrReviewSignalAsync(signal),
                 new WorkflowSignalOptions { Rpc = Rpc(ct) });
@@ -504,7 +504,7 @@ public class WorkflowSignalRouter(
         }
 
         await temporal.StartWorkflowAsync(
-            (TaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(input),
+            (ITaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(input),
             new WorkflowOptions(workflowId, TaskQueue)
             {
                 Memo = new Dictionary<string, object>
@@ -548,7 +548,7 @@ public class WorkflowSignalRouter(
 
         try
         {
-            var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(workflowId);
+            var handle = temporal.GetWorkflowHandle<ITaskExecutionWorkflow>(workflowId);
             status = await handle.QueryAsync(
                 w => w.GetTaskStatus(),
                 new WorkflowQueryOptions { Rpc = Rpc(ct) });
@@ -703,7 +703,7 @@ public class WorkflowSignalRouter(
                 }
             }
 
-            var handle = temporal.GetWorkflowHandle<TaskExecutionWorkflow>(WorkflowIdFor(jobId));
+            var handle = temporal.GetWorkflowHandle<ITaskExecutionWorkflow>(WorkflowIdFor(jobId));
             var description = await handle.DescribeAsync(
                 new WorkflowDescribeOptions { Rpc = new RpcOptions { CancellationToken = deadline.Token } });
 

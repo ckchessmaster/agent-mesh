@@ -5,6 +5,7 @@ using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
+using AgentMesh.Worker.Workflows;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;

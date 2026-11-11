@@ -1,3 +1,4 @@
+using AgentMesh.Core.Activities;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
@@ -8,6 +9,7 @@ using AgentMesh.Infrastructure.Services;
 using AgentMesh.Infrastructure.Storage;
 using AgentMesh.Worker.Activities;
 using AgentMesh.Worker.Services;
+using AgentMesh.Worker.Workflows;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -68,6 +70,8 @@ var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
 var temporalNamespace = builder.Configuration["Temporal:Namespace"] ?? "default";
 
 builder.Services.AddHttpClient<NotificationActivities>();
+builder.Services.TryAddScoped<ITimelineActivities, TimelineActivities>();
+builder.Services.TryAddScoped<TimelineActivities>();
 
 builder.Services.AddHostedTemporalWorker(
     clientTargetHost: temporalHost,
@@ -82,7 +86,8 @@ builder.Services.AddHostedTemporalWorker(
     .AddScopedActivities<DatabaseActivities>()
     .AddScopedActivities<ExecutionActivities>()
     .AddScopedActivities<NotificationActivities>()
-    .AddScopedActivities<GitActivities>();
+    .AddScopedActivities<GitActivities>()
+    .AddScopedActivities<TimelineActivities>();
 
 var host = builder.Build();
 host.Run();

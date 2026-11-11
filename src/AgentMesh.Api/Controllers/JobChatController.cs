@@ -202,7 +202,7 @@ public class JobChatController(
                 try
                 {
                     await temporalClient.StartWorkflowAsync(
-                        (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                        (IJobExecutionWorkflow wf) => wf.RunAsync(new JobExecutionInput(
                             JobId: jobId,
                             AssignedAgentId: assignedAgentId,
                             ProjectId: projectId,
@@ -216,7 +216,7 @@ public class JobChatController(
                 }
                 catch (Temporalio.Exceptions.WorkflowAlreadyStartedException)
                 {
-                    var handle = temporalClient.GetWorkflowHandle<JobExecutionWorkflow>(workflowId);
+                    var handle = temporalClient.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId);
                     await handle.SignalAsync(wf => wf.ReceiveChatMessageAsync(chatSignal));
                 }
             }
@@ -512,7 +512,7 @@ public class JobChatController(
             var workflowId = $"job-{jobId}";
             try
             {
-                var handle = temporalClient.GetWorkflowHandle<JobExecutionWorkflow>(workflowId);
+                var handle = temporalClient.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId);
                 await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(signal));
             }
             catch (Exception ex)

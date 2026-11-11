@@ -8,5 +8,6 @@
     <Company>Christopher Kingdon</Company>
     <Product>AgentMesh</Product>
     <Copyright>Copyright © 2026 Christopher Kingdon</Copyright>
+    <NoWarn>$(NoWarn);NU1902;NU1903;NU1904;CS9113;CS8524;CS8625;CS8619;CS8602;CS8600</NoWarn>
   </PropertyGroup>
 </Project>

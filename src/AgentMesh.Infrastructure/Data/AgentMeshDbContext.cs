@@ -1,4 +1,4 @@
-﻿using AgentMesh.Core.Models;
+using AgentMesh.Core.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 
@@ -20,6 +20,8 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     public DbSet<JobHandoff> JobHandoffs => Set<JobHandoff>();
     public DbSet<AgentMemory> AgentMemories => Set<AgentMemory>();
     public DbSet<ProjectDocument> ProjectDocuments => Set<ProjectDocument>();
+    public DbSet<JobTimelineCard> JobTimelineCards => Set<JobTimelineCard>();
+    public DbSet<JobCardComment> JobCardComments => Set<JobCardComment>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
@@ -35,6 +37,38 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     {
         base.OnModelCreating(modelBuilder);
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(AgentMeshDbContext).Assembly);
+
+        modelBuilder.Entity<JobTimelineCard>(b =>
+        {
+            b.ToTable("job_timeline_cards");
+            b.HasKey(c => c.Id);
+            b.Property(c => c.JobId).HasMaxLength(64).IsRequired();
+            b.Property(c => c.TaskId).HasMaxLength(64);
+            b.Property(c => c.CardType).HasConversion<string>().HasMaxLength(32).IsRequired();
+            b.Property(c => c.Status).HasConversion<string>().HasMaxLength(32).IsRequired();
+            b.Property(c => c.Title).HasMaxLength(256).IsRequired();
+            b.Property(c => c.StructuredPayloadJson).HasColumnType("jsonb").IsRequired();
+            b.Property(c => c.CreatedAt).IsRequired();
+            b.Property(c => c.UpdatedAt).IsRequired();
+
+            b.HasIndex(c => new { c.JobId, c.CreatedAt });
+            b.HasMany(c => c.Comments)
+             .WithOne(m => m.Card)
+             .HasForeignKey(m => m.CardId)
+             .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<JobCardComment>(b =>
+        {
+            b.ToTable("job_card_comments");
+            b.HasKey(m => m.Id);
+            b.Property(m => m.SenderId).HasMaxLength(64).IsRequired();
+            b.Property(m => m.SenderType).HasMaxLength(16).IsRequired();
+            b.Property(m => m.Content).IsRequired();
+            b.Property(m => m.CreatedAt).IsRequired();
+
+            b.HasIndex(m => new { m.CardId, m.CreatedAt });
+        });
     }
 
     public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)

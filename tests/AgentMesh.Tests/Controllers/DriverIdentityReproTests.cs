@@ -1,4 +1,4 @@
-﻿using AgentMesh.Api.Controllers;
+using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
@@ -327,7 +327,7 @@ public class DriverIdentityReproTests
     private static string FindRepoFile(string relativePath)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.slnx")))
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.sln")) && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.slnx")))
         {
             dir = dir.Parent;
         }

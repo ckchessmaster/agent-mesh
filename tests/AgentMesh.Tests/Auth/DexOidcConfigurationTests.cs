@@ -10,7 +10,7 @@ public class DexOidcConfigurationTests
     {
         // Arrange: locate src/AgentMesh.AppHost/dex/config.yaml by finding solution root
         var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
-        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.slnx")))
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.sln")) && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.slnx")))
         {
             dir = dir.Parent;
         }
