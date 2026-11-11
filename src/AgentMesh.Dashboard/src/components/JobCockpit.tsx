@@ -40,6 +40,7 @@ import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette
 import { MarkdownMessage } from './MarkdownMessage';
 import { QuestionCard, parseTextQuestions } from './QuestionCard';
 import { JobSettingsModal } from './JobSettingsModal';
+import { CockpitLayout } from './cockpit/CockpitLayout';
 import { parseSessionMetadata, stripJobTurnNoise } from '../utils/sessionDisplay';
 
 export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem[] {
@@ -322,6 +323,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [isArchiving, setIsArchiving] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const [showTimelineCockpit, setShowTimelineCockpit] = useState(false);
 
   const handleConfirmReset = async () => {
     if (!onResetJob) return;
@@ -1428,6 +1430,22 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
 
           <button
             type="button"
+            onClick={() => setShowTimelineCockpit((prev) => !prev)}
+            title={showTimelineCockpit ? 'Switch to Conversational Chat View' : 'Switch to Structured Timeline Cockpit'}
+            aria-pressed={showTimelineCockpit}
+            data-testid="toggle-timeline-cockpit-btn"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition cursor-pointer ${
+              showTimelineCockpit
+                ? 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300'
+                : 'bg-slate-950/80 border-slate-800 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5" />
+            <span>Timeline</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setShowTeamSidebar((prev) => !prev)}
             title={showTeamSidebar ? 'Hide Team & Activity Sidebar' : 'Show Team & Activity Sidebar'}
             data-testid="toggle-team-sidebar-btn"
@@ -1957,6 +1975,11 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       </div>
 
       {/* Main Workspace: Conversational Chat Flow + Team & Activity Sidebar */}
+      {showTimelineCockpit ? (
+        <div className="flex-1 min-h-0 overflow-hidden" data-testid="timeline-cockpit-container">
+          <CockpitLayout jobId={job.id} />
+        </div>
+      ) : (
       <div className="flex-1 flex min-h-0 overflow-hidden relative">
         {/* Left Column: Conversational Chat Flow */}
         <div className="flex-1 flex flex-col min-h-0 relative">
@@ -2823,6 +2846,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
       </>
     )}
     </div>
+      )}
 
       {/* Internal Fullscreen Image Lightbox Modal fallback */}
       {internalLightbox && (

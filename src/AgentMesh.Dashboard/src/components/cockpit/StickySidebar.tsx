@@ -38,12 +38,17 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
   const [aborting, setAborting] = useState(false);
   const [abortSuccess, setAbortSuccess] = useState(false);
 
-  // Extract checklist from PlanApproval card if not explicitly provided
+  // Extract checklist from latest PlanApproval card (preferring Approved) if not explicitly provided
   let items: ProposedChecklistItem[] = customChecklist || [];
   if (items.length === 0) {
-    const planCard = cards.find(
+    const planCards = cards.filter(
       (c) => c.cardType === 'PlanApproval' && c.structuredPayloadJson
     );
+    const approvedPlanCards = planCards.filter((c) => c.status === 'Approved');
+    const planCard =
+      approvedPlanCards.length > 0
+        ? approvedPlanCards[approvedPlanCards.length - 1]
+        : planCards[planCards.length - 1];
     if (planCard) {
       try {
         const payload: PlanApprovalPayload = JSON.parse(planCard.structuredPayloadJson);
@@ -92,6 +97,37 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
       // ignore
     }
   }
+
+  const resolvedTaskIds = new Set<string>();
+  const resolvedTaskIndices = new Set<number>();
+  for (const c of cards) {
+    if (c.cardType === 'TaskStep' && (c.status === 'Resolved' || c.status === 'Approved')) {
+      if (c.taskId) resolvedTaskIds.add(c.taskId);
+      try {
+        const p: TaskStepPayload = JSON.parse(c.structuredPayloadJson);
+        if (typeof p.taskIndex === 'number') {
+          resolvedTaskIndices.add(p.taskIndex);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const getItemStatus = (item: ProposedChecklistItem, idx: number): 'completed' | 'in_progress' | 'pending' => {
+    if (item.status === 'completed') return 'completed';
+    if ((item.taskId && resolvedTaskIds.has(item.taskId)) || resolvedTaskIndices.has(idx)) {
+      return 'completed';
+    }
+    if (item.status === 'in_progress') return 'in_progress';
+    if (activeTaskIndex >= 0) {
+      if (idx < activeTaskIndex) return 'completed';
+      if (idx === activeTaskIndex) return 'in_progress';
+    }
+    return item.status || 'pending';
+  };
+
+  const completedCount = items.filter((item, idx) => getItemStatus(item, idx) === 'completed').length;
 
   const handleAbort = async () => {
     if (aborting || isAborting) return;
@@ -155,8 +191,7 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
             Plan Checklist
           </span>
           <span className="text-xs text-slate-500 font-mono">
-            {items.filter((_, idx) => (activeTaskIndex >= 0 ? idx < activeTaskIndex : false)).length}/
-            {items.length}
+            {completedCount}/{items.length}
           </span>
         </div>
 
@@ -167,14 +202,7 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
         ) : (
           <ul className="space-y-2">
             {items.map((item, idx) => {
-              let itemStatus: 'completed' | 'in_progress' | 'pending' = 'pending';
-              if (item.status) {
-                itemStatus = item.status;
-              } else if (activeTaskIndex >= 0) {
-                if (idx < activeTaskIndex) itemStatus = 'completed';
-                else if (idx === activeTaskIndex) itemStatus = 'in_progress';
-                else itemStatus = 'pending';
-              }
+              const itemStatus = getItemStatus(item, idx);
 
               return (
                 <li

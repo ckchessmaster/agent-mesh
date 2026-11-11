@@ -47,6 +47,8 @@ export interface DiscoveryQuestion {
 export interface DiscoveryPayload {
   questions: DiscoveryQuestion[];
   summary: string;
+  answers?: Record<string, string>;
+  feedback?: string;
 }
 
 export interface ProposedChecklistItem {

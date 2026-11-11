@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
@@ -45,17 +47,21 @@ public class JobTimelineController(
 {
     private WorkflowHandle<IJobExecutionWorkflow> GetWorkflowHandle(string jobId)
     {
-        try
-        {
-            var handle = temporalClient.GetWorkflowHandle<IJobExecutionWorkflow>(jobId);
-            if (handle != null) return handle;
-        }
-        catch
-        {
-        }
-
-        var workflowId = jobId.StartsWith("job-", StringComparison.OrdinalIgnoreCase) ? jobId : $"job-{jobId}";
+        var workflowId = jobId.StartsWith("job-", StringComparison.OrdinalIgnoreCase)
+            ? jobId
+            : $"job-{jobId}";
         return temporalClient.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId);
+    }
+
+    private async Task BroadcastCardUpdatedAsync(string jobId, JobTimelineCard card)
+    {
+        if (hubContext != null)
+        {
+            await hubContext.Clients.Group($"job-{jobId}")
+                .SendAsync("ReceiveTimelineCardUpdated", jobId, card);
+            await hubContext.Clients.Group(jobId)
+                .SendAsync("ReceiveTimelineCardUpdated", jobId, card);
+        }
     }
 
     [HttpGet("cards")]
@@ -106,9 +112,36 @@ public class JobTimelineController(
     [HttpPost("cards/{cardId}/submit-answers")]
     public async Task<IActionResult> SubmitAnswers(string jobId, Guid cardId, [FromBody] DiscoveryAnswersPayload payload)
     {
+        var answers = payload.Answers ?? new Dictionary<string, string>();
+        var card = await db.JobTimelineCards
+            .Include(c => c.Comments)
+            .FirstOrDefaultAsync(c => c.Id == cardId && c.JobId == jobId);
+        if (card != null)
+        {
+            try
+            {
+                var node = JsonNode.Parse(string.IsNullOrWhiteSpace(card.StructuredPayloadJson) ? "{}" : card.StructuredPayloadJson) as JsonObject ?? new JsonObject();
+                node["answers"] = JsonSerializer.SerializeToNode(answers);
+                if (!string.IsNullOrWhiteSpace(payload.Feedback))
+                {
+                    node["feedback"] = payload.Feedback;
+                }
+                card.StructuredPayloadJson = node.ToJsonString();
+            }
+            catch
+            {
+                // Preserve existing payload if not a JSON object
+            }
+
+            card.Status = TimelineCardStatus.Approved;
+            card.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+            await BroadcastCardUpdatedAsync(jobId, card);
+        }
+
         var handle = GetWorkflowHandle(jobId);
         await handle.SignalAsync(w => w.SubmitDiscoveryAnswersAsync(
-            new DiscoveryAnswersSignal(cardId, payload.Answers ?? new Dictionary<string, string>(), payload.Feedback)));
+            new DiscoveryAnswersSignal(cardId, answers, payload.Feedback)));
 
         return Accepted();
     }
@@ -116,6 +149,17 @@ public class JobTimelineController(
     [HttpPost("cards/{cardId}/plan-decision")]
     public async Task<IActionResult> SubmitPlanDecision(string jobId, Guid cardId, [FromBody] PlanDecisionPayload payload)
     {
+        var card = await db.JobTimelineCards
+            .Include(c => c.Comments)
+            .FirstOrDefaultAsync(c => c.Id == cardId && c.JobId == jobId);
+        if (card != null)
+        {
+            card.Status = payload.Approved ? TimelineCardStatus.Approved : TimelineCardStatus.Rejected;
+            card.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+            await BroadcastCardUpdatedAsync(jobId, card);
+        }
+
         var handle = GetWorkflowHandle(jobId);
         await handle.SignalAsync(w => w.SubmitPlanDecisionAsync(
             new PlanApprovalSignal(cardId, payload.Approved, payload.Feedback, payload.ApproverId ?? "human")));

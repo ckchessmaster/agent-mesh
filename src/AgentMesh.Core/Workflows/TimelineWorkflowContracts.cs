@@ -58,7 +58,8 @@ public record JobExecutionInput(
     string InitialPrompt,
     string TargetBranch,
     string AssignedAgentId,
-    string ApprovalPolicy = "LeadOrHuman"
+    string ApprovalPolicy = "LeadOrHuman",
+    bool UseLegacyTurnLoop = false
 )
 {
     // Backwards-compatible constructor for existing tests/callers that pass PlanApprovalPolicy and different parameter order:
@@ -70,7 +71,7 @@ public record JobExecutionInput(
         string InitialPrompt,
         string TargetBranch,
         PlanApprovalPolicy ApprovalPolicy)
-        : this(JobId, ProjectId, WorkspacePath, InitialPrompt, TargetBranch, AssignedAgentId, ApprovalPolicy.ToString())
+        : this(JobId, ProjectId, WorkspacePath, InitialPrompt, TargetBranch, AssignedAgentId, ApprovalPolicy.ToString(), UseLegacyTurnLoop: true)
     {
     }
 }
@@ -82,8 +83,17 @@ public record ChildTaskExecutionInput(
     string TaskTitle,
     string AssignedAgentId,
     string WorkspacePath,
-    string TargetBranch
-);
+    string TargetBranch,
+    string? ProjectId = null
+) : TaskExecutionInput(
+    JobId: JobId,
+    TaskId: TaskId,
+    AgentId: AssignedAgentId,
+    ProjectId: ProjectId ?? JobId,
+    WorkspacePath: WorkspacePath,
+    TargetBranch: TargetBranch,
+    TaskIndex: TaskIndex,
+    TaskTitle: TaskTitle);
 
 public record JobExecutionResult(
     bool Success,
@@ -135,11 +145,11 @@ public record JobWorkflowState(
     string CurrentHeartbeat
 );
 
-[Workflow]
+[Workflow("JobExecutionWorkflow")]
 public interface IJobExecutionWorkflow
 {
     [WorkflowRun]
-    Task<JobExecutionResult> RunAsync(JobExecutionInput input);
+    Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input);
 
     [WorkflowSignal]
     Task SubmitDiscoveryAnswersAsync(DiscoveryAnswersSignal signal);
@@ -171,14 +181,14 @@ public interface IJobExecutionWorkflow
     [WorkflowQuery]
     JobWorkflowState GetCurrentState();
 
-    Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input) => RunAsync(input);
+    Task<JobExecutionResult> RunAsync(JobExecutionInput input) => ExecuteJobAsync(input);
 }
 
-[Workflow]
+[Workflow("TaskExecutionWorkflow")]
 public interface ITaskExecutionWorkflow
 {
     [WorkflowRun]
-    Task<TaskExecutionResult> ExecuteTaskAsync(ChildTaskExecutionInput input);
+    Task<TaskExecutionResult> ExecuteTaskAsync(TaskExecutionInput input);
 
     [WorkflowSignal]
     Task AbortTurnAsync(AbortActiveTurnSignal signal);
@@ -195,8 +205,5 @@ public interface ITaskExecutionWorkflow
     [WorkflowQuery]
     TaskStatusView GetTaskStatus();
 
-    Task<TaskExecutionResult> RunAsync(ChildTaskExecutionInput input) => ExecuteTaskAsync(input);
-
-    Task<TaskExecutionResult> ExecuteTaskAsync(TaskExecutionInput input) => ExecuteTaskAsync(
-        new ChildTaskExecutionInput(input.JobId, input.TaskId, 0, input.TaskId, input.AgentId, input.WorkspacePath, input.TargetBranch));
+    Task<TaskExecutionResult> RunAsync(TaskExecutionInput input) => ExecuteTaskAsync(input);
 }

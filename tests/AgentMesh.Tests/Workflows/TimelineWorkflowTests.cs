@@ -53,7 +53,7 @@ public class TimelineWorkflowTests
         );
 
         var handle = await env.Client.StartWorkflowAsync(
-            (JobExecutionWorkflow wf) => wf.RunAsync(input),
+            (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
             new WorkflowOptions($"job-{jobId}", Queue));
 
         // 1. Verify workflow waits on discovery answers
@@ -117,7 +117,7 @@ public class TimelineWorkflowTests
         );
 
         var handle = await env.Client.StartWorkflowAsync(
-            (JobExecutionWorkflow wf) => wf.RunAsync(input),
+            (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
             new WorkflowOptions($"job-{jobId}", Queue));
 
         await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("discovery", StringComparison.OrdinalIgnoreCase));
@@ -274,7 +274,7 @@ public class TimelineWorkflowTests
         );
 
         var handle = await env.Client.StartWorkflowAsync(
-            (JobExecutionWorkflow wf) => wf.RunAsync(input),
+            (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
             new WorkflowOptions($"job-{jobId}", Queue));
 
         // Submit discovery & approve plan

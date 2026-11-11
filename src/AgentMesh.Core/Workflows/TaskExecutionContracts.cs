@@ -88,7 +88,9 @@ public record TaskExecutionInput(
     string WorkspacePath,
     string TargetBranch,
     string? PersonaId = null,
-    string? TurnSessionId = null);
+    string? TurnSessionId = null,
+    int? TaskIndex = null,
+    string? TaskTitle = null);
 
 /// <summary>
 /// The workflow's terminal result.

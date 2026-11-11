@@ -21,8 +21,8 @@ export const DiscoveryQaCard: React.FC<DiscoveryQaCardProps> = ({
     // fallback
   }
 
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [generalFeedback, setGeneralFeedback] = useState<string>('');
+  const [answers, setAnswers] = useState<Record<string, string>>(() => payload.answers || {});
+  const [generalFeedback, setGeneralFeedback] = useState<string>(() => payload.feedback || '');
   const [submitting, setSubmitting] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(card.status === 'Approved' || card.status === 'Resolved');
 

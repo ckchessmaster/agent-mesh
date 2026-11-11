@@ -10,9 +10,7 @@ namespace AgentMesh.Worker.Activities;
 
 public class TimelineActivities(
     AgentMeshDbContext dbContext,
-    ILogger<TimelineActivities> logger,
-    IConfiguration? config = null,
-    HttpClient? httpClient = null) : ITimelineActivities
+    ILogger<TimelineActivities> logger) : ITimelineActivities
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

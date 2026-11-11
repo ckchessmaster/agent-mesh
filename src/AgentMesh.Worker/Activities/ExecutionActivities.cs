@@ -256,13 +256,14 @@ public partial class ExecutionActivities(
         var processInfo = new ProcessStartInfo
         {
             FileName = "/bin/bash",
-            Arguments = $"-c \"{input.CommandLine}\"",
             WorkingDirectory = workingDir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        processInfo.ArgumentList.Add("-c");
+        processInfo.ArgumentList.Add(input.CommandLine);
 
         using var process = new Process { StartInfo = processInfo };
         process.Start();
@@ -272,6 +273,9 @@ public partial class ExecutionActivities(
         {
             setpgid(process.Id, process.Id);
         }
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
 
         try
         {
@@ -286,7 +290,9 @@ public partial class ExecutionActivities(
             throw;
         }
 
-        var output = await process.StandardOutput.ReadToEndAsync(token);
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
+        var output = string.IsNullOrEmpty(stderr) ? stdout : $"{stdout}\n{stderr}".TrimStart('\n');
         return new ExecutionOutput(process.ExitCode, output);
     }
 

@@ -84,4 +84,85 @@ describe('StickySidebar', () => {
       expect(onAbortTurn).toHaveBeenCalledWith('Turn stopped by operator via Cockpit Sidebar');
     });
   });
+
+  it('prefers the latest Approved PlanApproval card and marks Resolved TaskStep cards as completed', () => {
+    const cards = [
+      {
+        id: 'plan-1',
+        jobId: 'test-job-123',
+        stage: 1,
+        cardType: 'PlanApproval' as const,
+        status: 'Rejected' as const,
+        title: 'Initial Plan',
+        summaryMarkdown: '',
+        createdAt: '2026-11-11T00:00:00Z',
+        updatedAt: '2026-11-11T00:00:00Z',
+        structuredPayloadJson: JSON.stringify({
+          tasks: [
+            {
+              taskId: 'old-task-1',
+              title: 'Rejected Old Task',
+              targetFile: 'old.ts',
+              verificationMethod: 'old test',
+              status: 'pending'
+            }
+          ]
+        })
+      },
+      {
+        id: 'plan-2',
+        jobId: 'test-job-123',
+        stage: 1,
+        cardType: 'PlanApproval' as const,
+        status: 'Approved' as const,
+        title: 'Revised Plan',
+        summaryMarkdown: '',
+        createdAt: '2026-11-11T00:05:00Z',
+        updatedAt: '2026-11-11T00:05:00Z',
+        structuredPayloadJson: JSON.stringify({
+          tasks: [
+            {
+              taskId: 'new-task-1',
+              title: 'Approved Task One',
+              targetFile: 'src/one.ts',
+              verificationMethod: 'npm test',
+              status: 'pending'
+            },
+            {
+              taskId: 'new-task-2',
+              title: 'Approved Task Two',
+              targetFile: 'src/two.ts',
+              verificationMethod: 'npm test',
+              status: 'pending'
+            }
+          ]
+        })
+      },
+      {
+        id: 'step-1',
+        jobId: 'test-job-123',
+        stage: 2,
+        cardType: 'TaskStep' as const,
+        status: 'Resolved' as const,
+        title: 'Step 1: Approved Task One',
+        summaryMarkdown: '',
+        createdAt: '2026-11-11T00:10:00Z',
+        updatedAt: '2026-11-11T00:12:00Z',
+        structuredPayloadJson: JSON.stringify({
+          taskIndex: 0,
+          title: 'Approved Task One'
+        })
+      }
+    ];
+
+    render(<StickySidebar jobId="test-job-123" cards={cards} />);
+
+    expect(screen.queryByText('Rejected Old Task')).not.toBeInTheDocument();
+    expect(screen.getByText('Approved Task One')).toBeInTheDocument();
+    expect(screen.getByText('Approved Task Two')).toBeInTheDocument();
+    expect(screen.getByText('1/2')).toBeInTheDocument();
+    expect(screen.getByText('✓')).toBeInTheDocument();
+    expect(screen.getByText('○')).toBeInTheDocument();
+  });
 });
+
