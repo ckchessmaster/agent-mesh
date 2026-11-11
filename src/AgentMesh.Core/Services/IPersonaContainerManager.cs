@@ -33,11 +33,12 @@ public record PersonaAuthStartResult(
     string Status, // "ready", "waiting_code", "already_authenticated", "error"
     string? AuthUrl = null,
     string? Instructions = null,
-    string? ErrorMessage = null);
+    string? ErrorMessage = null,
+    string? UserCode = null);
 
 public record PersonaAuthSubmitResult(
     string PersonaId,
-    string Status, // "authenticated", "failed"
+    string Status, // "authenticated", "waiting", "failed"
     string? Message = null,
     string? ErrorMessage = null);
 

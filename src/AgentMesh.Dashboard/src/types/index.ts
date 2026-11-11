@@ -62,13 +62,14 @@ export interface PersonaAuthStartResult {
   driverId: string;
   status: 'ready' | 'waiting_code' | 'already_authenticated' | 'apikey_required' | 'error';
   authUrl?: string | null;
+  userCode?: string | null;
   instructions?: string | null;
   errorMessage?: string | null;
 }
 
 export interface PersonaAuthSubmitResult {
   personaId: string;
-  status: 'authenticated' | 'failed';
+  status: 'authenticated' | 'waiting' | 'failed';
   message?: string | null;
   errorMessage?: string | null;
 }

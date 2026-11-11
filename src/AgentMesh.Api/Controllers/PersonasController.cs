@@ -525,17 +525,12 @@ public class PersonasController(
         return Ok(result);
     }
 
-    public record SubmitAuthCodeRequest(string Code);
+    public record SubmitAuthCodeRequest(string? Code = null);
 
     [HttpPost("{id}/environment/auth/submit")]
     public async Task<IActionResult> SubmitPersonaAuthCode(string id, [FromBody] SubmitAuthCodeRequest req, CancellationToken ct)
     {
         var normalizedId = id.Trim().ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(req.Code))
-        {
-            return BadRequest(new { error = "Authorization code is required." });
-        }
-
         var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
         if (persona == null)
         {
@@ -547,7 +542,7 @@ public class PersonasController(
             return BadRequest(new { error = "Container manager is not available." });
         }
 
-        var result = await containerManager.SubmitAuthCodeAsync(normalizedId, req.Code, ct);
+        var result = await containerManager.SubmitAuthCodeAsync(normalizedId, req.Code ?? string.Empty, ct);
         return Ok(result);
     }
 

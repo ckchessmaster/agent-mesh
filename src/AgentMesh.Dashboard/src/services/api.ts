@@ -556,11 +556,11 @@ export const api = {
     return res.json();
   },
 
-  async submitPersonaAuthCode(personaId: string, code: string): Promise<PersonaAuthSubmitResult> {
+  async submitPersonaAuthCode(personaId: string, code?: string): Promise<PersonaAuthSubmitResult> {
     const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/environment/auth/submit`, {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ code })
+      body: JSON.stringify({ code: code ?? '' })
     });
     if (!res.ok) throw new Error(`Failed to submit driver auth code: ${res.statusText}`);
     return res.json();
@@ -594,11 +594,11 @@ export const api = {
     return res.json();
   },
 
-  async submitDriverAuthCode(driverId: string, code: string): Promise<PersonaAuthSubmitResult> {
+  async submitDriverAuthCode(driverId: string, code?: string): Promise<PersonaAuthSubmitResult> {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(driverId)}/auth/submit`, {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify({ code })
+      body: JSON.stringify({ code: code ?? '' })
     });
     if (!res.ok) throw new Error(`Failed to submit driver auth code: ${res.statusText}`);
     return res.json();

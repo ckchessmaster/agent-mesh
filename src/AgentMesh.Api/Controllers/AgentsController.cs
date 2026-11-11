@@ -714,7 +714,10 @@ public class AgentsController(
                         normalizedId,
                         "waiting_code",
                         existing.AuthUrl,
-                        "Click the authorization link to sign in, then paste the authorization code below."));
+                        existing.UserCode != null
+                            ? $"Enter the one-time code {existing.UserCode} on GitHub to authorize this device."
+                            : "Click the authorization link to sign in, then paste the authorization code below.",
+                        UserCode: existing.UserCode));
                 }
                 _activeHostAuthSessions.TryRemove(normalizedId, out _);
                 await existing.DisposeAsync();
@@ -773,6 +776,36 @@ public class AgentsController(
             proc.Start();
 
             var tcsUrl = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            string? capturedUrl = null;
+            string? capturedUserCode = null;
+
+            void ParseLine(string line)
+            {
+                var match = Regex.Match(line, @"https?://[^\s""'>]+");
+                if (match.Success && capturedUrl == null)
+                {
+                    capturedUrl = match.Value;
+                    tcsUrl.TrySetResult(match.Value);
+                }
+
+                if (capturedUserCode == null)
+                {
+                    var codeMatch = Regex.Match(line, @"(?:one-time code:\s*|code:\s*)([A-Za-z0-9-]+)", RegexOptions.IgnoreCase);
+                    if (codeMatch.Success)
+                    {
+                        capturedUserCode = codeMatch.Groups[1].Value.Trim();
+                    }
+                    else
+                    {
+                        var altMatch = Regex.Match(line, @"\b([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\b");
+                        if (altMatch.Success)
+                        {
+                            capturedUserCode = altMatch.Groups[1].Value.Trim();
+                        }
+                    }
+                }
+            }
+
             var readerTask = Task.Run(async () =>
             {
                 try
@@ -780,11 +813,7 @@ public class AgentsController(
                     string? line;
                     while ((line = await proc.StandardOutput.ReadLineAsync()) != null)
                     {
-                        var match = Regex.Match(line, @"https?://[^\s""'>]+");
-                        if (match.Success)
-                        {
-                            tcsUrl.TrySetResult(match.Value);
-                        }
+                        ParseLine(line);
                     }
                 }
                 catch (Exception ex)
@@ -800,11 +829,7 @@ public class AgentsController(
                     string? line;
                     while ((line = await proc.StandardError.ReadLineAsync()) != null)
                     {
-                        var match = Regex.Match(line, @"https?://[^\s""'>]+");
-                        if (match.Success)
-                        {
-                            tcsUrl.TrySetResult(match.Value);
-                        }
+                        ParseLine(line);
                     }
                 }
                 catch { }
@@ -814,13 +839,31 @@ public class AgentsController(
             if (completed == tcsUrl.Task && tcsUrl.Task.IsCompletedSuccessfully)
             {
                 var authUrl = await tcsUrl.Task;
-                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, tempHome);
+                if (string.IsNullOrWhiteSpace(capturedUserCode))
+                {
+                    try { await Task.Delay(200, ct); } catch { }
+                }
+
+                if (adapter == DriverAdapters.Copilot)
+                {
+                    try
+                    {
+                        await proc.StandardInput.WriteLineAsync();
+                        await proc.StandardInput.FlushAsync(ct);
+                    }
+                    catch { }
+                }
+
+                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode, tempHome);
                 return Ok(new PersonaAuthStartResult(
                     normalizedId,
                     normalizedId,
                     "waiting_code",
                     authUrl,
-                    "Click the authorization link to sign in, then paste the authorization code below."));
+                    capturedUserCode != null
+                        ? $"Enter the one-time code {capturedUserCode} on GitHub to authorize this device."
+                        : "Click the authorization link to sign in, then paste the authorization code below.",
+                    UserCode: capturedUserCode));
             }
 
             try { if (!proc.HasExited) proc.Kill(true); } catch { }
@@ -843,11 +886,6 @@ public class AgentsController(
         [FromBody] PersonasController.SubmitAuthCodeRequest req,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(req.Code))
-        {
-            return BadRequest(new { error = "Authorization code is required." });
-        }
-
         var normalizedId = id.Trim().TrimStart('@').ToLowerInvariant();
         var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
         if (agent == null)
@@ -858,14 +896,21 @@ public class AgentsController(
         var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
         var adapter = ResolveAdapterType(agent, view);
 
-        if (_activeHostAuthSessions.TryRemove(normalizedId, out var session))
+        if (_activeHostAuthSessions.TryGetValue(normalizedId, out var session))
         {
             try
             {
-                await session.Writer.WriteLineAsync(req.Code.Trim());
-                await session.Writer.FlushAsync(ct);
+                if (!string.IsNullOrWhiteSpace(req.Code))
+                {
+                    try
+                    {
+                        await session.Writer.WriteLineAsync(req.Code.Trim());
+                        await session.Writer.FlushAsync(ct);
+                    }
+                    catch { }
+                }
 
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
                 try
                 {
@@ -881,6 +926,28 @@ public class AgentsController(
                 }
                 candidateTokens.Add(Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
 
+                // For GitHub Copilot: check gh hosts.yml
+                var ghHostsFile = Path.Combine(userHome, ".config", "gh", "hosts.yml");
+                if (System.IO.File.Exists(ghHostsFile))
+                {
+                    try
+                    {
+                        var ghYaml = await System.IO.File.ReadAllTextAsync(ghHostsFile, ct);
+                        var tokMatch = Regex.Match(ghYaml, @"oauth_token:\s*([^\s]+)");
+                        if (tokMatch.Success && !string.IsNullOrWhiteSpace(tokMatch.Groups[1].Value))
+                        {
+                            var ghToken = tokMatch.Groups[1].Value.Trim();
+                            await SaveDriverOAuthTokenAsync(agent, ghToken, ct);
+                            await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
+                            await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                            _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                            await session.DisposeAsync();
+                            return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated GitHub Copilot driver and refreshed models!"));
+                        }
+                    }
+                    catch { }
+                }
+
                 foreach (var tokenPath in candidateTokens)
                 {
                     if (System.IO.File.Exists(tokenPath))
@@ -891,6 +958,8 @@ public class AgentsController(
                             await SaveDriverOAuthTokenAsync(agent, rawTok, ct);
                             await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
                             await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                            _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                            await session.DisposeAsync();
                             return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed model catalog!"));
                         }
                     }
@@ -899,18 +968,23 @@ public class AgentsController(
                 if (session.Process.HasExited && session.Process.ExitCode == 0)
                 {
                     await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                    _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                    await session.DisposeAsync();
                     return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Driver authentication completed successfully!"));
                 }
 
-                return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: "Authorization code was submitted, but authentication could not be verified."));
+                if (!session.Process.HasExited)
+                {
+                    return Ok(new PersonaAuthSubmitResult(normalizedId, "waiting", "Authorization is still pending in browser. Once you approve on GitHub, click again."));
+                }
+
+                _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                await session.DisposeAsync();
+                return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: "Authentication process exited before completing."));
             }
             catch (Exception ex)
             {
                 return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: ex.Message));
-            }
-            finally
-            {
-                await session.DisposeAsync();
             }
         }
 
@@ -1360,12 +1434,13 @@ public class AgentsController(
         return RunHostCommandAsync("/bin/bash", $"-c \"{escaped}\"", ct);
     }
 
-    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? tempHome = null) : IAsyncDisposable
+    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null, string? tempHome = null) : IAsyncDisposable
     {
         public Process Process { get; } = process;
         public StreamWriter Writer { get; } = writer;
         public Task ReaderTask { get; } = readerTask;
         public string AuthUrl { get; } = authUrl;
+        public string? UserCode { get; } = userCode;
         public string? TempHome { get; } = tempHome;
 
         public async ValueTask DisposeAsync()

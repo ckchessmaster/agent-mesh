@@ -1502,10 +1502,12 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
             {
-                var promptMsg = !string.IsNullOrWhiteSpace(loginCmd)
-                    ? "Please open the authorization link in your browser to approve access. Once approved, paste the code below if required."
-                    : "Click the link to sign in, then paste the authorization code below.";
-                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", existing.AuthUrl, promptMsg);
+                var promptMsg = !string.IsNullOrWhiteSpace(existing.UserCode)
+                    ? $"Enter the one-time code {existing.UserCode} on GitHub to authorize this device."
+                    : (!string.IsNullOrWhiteSpace(loginCmd)
+                        ? "Please open the authorization link in your browser to approve access. Once approved, paste the code below if required."
+                        : "Click the link to sign in, then paste the authorization code below.");
+                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", existing.AuthUrl, promptMsg, UserCode: existing.UserCode);
             }
             _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
         }
@@ -1582,8 +1584,6 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     var buf = new byte[2048];
                     while (webSocket.State == WebSocketState.Open)
                     {
-                        var read = await stdOutStream.ReadAsync(buf, 0, buf.Length, CancellationToken.None);
-                        if (read <= 0) break;
                         var chunk = Encoding.UTF8.GetString(buf, 0, read);
                         capturedOutput.Append(chunk);
                         var match = Regex.Match(capturedOutput.ToString(), @"https?://[^\s""'>]+");
@@ -1591,6 +1591,24 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         {
                             session.AuthUrl = match.Value;
                             tcsUrl.TrySetResult(match.Value);
+                        }
+
+                        if (session.UserCode == null)
+                        {
+                            var text = capturedOutput.ToString();
+                            var codeMatch = Regex.Match(text, @"(?:one-time code:\s*|code:\s*)([A-Za-z0-9-]+)", RegexOptions.IgnoreCase);
+                            if (codeMatch.Success)
+                            {
+                                session.UserCode = codeMatch.Groups[1].Value.Trim();
+                            }
+                            else
+                            {
+                                var altMatch = Regex.Match(text, @"\b([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\b");
+                                if (altMatch.Success)
+                                {
+                                    session.UserCode = altMatch.Groups[1].Value.Trim();
+                                }
+                            }
                         }
                     }
 
@@ -1647,6 +1665,24 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                             session.AuthUrl = match.Value;
                             tcsUrl.TrySetResult(match.Value);
                         }
+
+                        if (session.UserCode == null)
+                        {
+                            var text = capturedOutput.ToString();
+                            var codeMatch = Regex.Match(text, @"(?:one-time code:\s*|code:\s*)([A-Za-z0-9-]+)", RegexOptions.IgnoreCase);
+                            if (codeMatch.Success)
+                            {
+                                session.UserCode = codeMatch.Groups[1].Value.Trim();
+                            }
+                            else
+                            {
+                                var altMatch = Regex.Match(text, @"\b([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\b");
+                                if (altMatch.Success)
+                                {
+                                    session.UserCode = altMatch.Groups[1].Value.Trim();
+                                }
+                            }
+                        }
                     }
                 }
                 catch { }
@@ -1677,10 +1713,28 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 }
 
                 var authUrl = await tcsUrl.Task;
-                var promptMsg = !string.IsNullOrWhiteSpace(loginCmd)
-                    ? "Please open the authorization link in your browser to approve access. Once approved, paste the code below if required."
-                    : "Click the link to sign in, then paste the authorization code below.";
-                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", authUrl, promptMsg);
+                if (string.IsNullOrWhiteSpace(session.UserCode))
+                {
+                    try { await Task.Delay(200, ct); } catch { }
+                }
+
+                if (driverId.StartsWith("copilot") || adapterType == "copilot")
+                {
+                    try
+                    {
+                        var nl = Encoding.UTF8.GetBytes("\n");
+                        await stdInStream.WriteAsync(nl, 0, nl.Length, CancellationToken.None);
+                        await stdInStream.FlushAsync(CancellationToken.None);
+                    }
+                    catch { }
+                }
+
+                var promptMsg = !string.IsNullOrWhiteSpace(session.UserCode)
+                    ? $"Enter the one-time code {session.UserCode} on GitHub to authorize this device."
+                    : (!string.IsNullOrWhiteSpace(loginCmd)
+                        ? "Please open the authorization link in your browser to approve access. Once approved, paste the code below if required."
+                        : "Click the link to sign in, then paste the authorization code below.");
+                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", authUrl, promptMsg, UserCode: session.UserCode);
             }
 
             _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
@@ -1722,18 +1776,75 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
         }
 
-        if (_activeK8sAuthSessions.TryRemove(normPersonaId, out var session))
+        if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+        {
+            var (ghExit, _, _) = await ExecInContainerAsync(normPersonaId, "gh auth status >/dev/null 2>&1 || test -n \"$GITHUB_TOKEN\"", ct);
+            if (ghExit == 0)
+            {
+                var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
+                if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
+                {
+                    try
+                    {
+                        var ghTok = tokOut.Trim();
+                        var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                        var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                        Directory.CreateDirectory(tokensDir);
+                        File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), ghTok);
+                        if (!string.IsNullOrWhiteSpace(info.DriverId))
+                        {
+                            File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), ghTok);
+                        }
+                    }
+                    catch { }
+                }
+                return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication confirmed and credentials persisted to workspace!");
+            }
+        }
+
+        if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var session))
         {
             try
             {
-                var codeBytes = Encoding.UTF8.GetBytes(code.Trim() + "\n");
-                await session.StdIn.WriteAsync(codeBytes, 0, codeBytes.Length, ct);
-                await session.StdIn.FlushAsync(ct);
+                if (!string.IsNullOrWhiteSpace(code))
+                {
+                    var codeBytes = Encoding.UTF8.GetBytes(code.Trim() + "\n");
+                    await session.StdIn.WriteAsync(codeBytes, 0, codeBytes.Length, ct);
+                    await session.StdIn.FlushAsync(ct);
+                }
 
-                // Poll for token creation or auth check up to 10 seconds
-                for (var i = 0; i < 10; i++)
+                // Poll for token creation or auth check up to 5 seconds
+                for (var i = 0; i < 5; i++)
                 {
                     await Task.Delay(1000, ct);
+
+                    if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+                    {
+                        var (ghExit, _, _) = await ExecInContainerAsync(normPersonaId, "gh auth status >/dev/null 2>&1 || test -n \"$GITHUB_TOKEN\"", ct);
+                        if (ghExit == 0)
+                        {
+                            var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
+                            if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
+                            {
+                                try
+                                {
+                                    var ghTok = tokOut.Trim();
+                                    var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                                    var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                                    Directory.CreateDirectory(tokensDir);
+                                    File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), ghTok);
+                                    if (!string.IsNullOrWhiteSpace(info.DriverId))
+                                    {
+                                        File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), ghTok);
+                                    }
+                                }
+                                catch { }
+                            }
+                            _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
+                            await session.DisposeAsync();
+                            return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication completed successfully!");
+                        }
+                    }
 
                     if (!string.IsNullOrWhiteSpace(authCheckCmd))
                     {
@@ -1741,6 +1852,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         if (recheckExit == 0)
                         {
                             await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
+                            _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
+                            await session.DisposeAsync();
                             return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication completed successfully!");
                         }
                     }
@@ -1775,11 +1888,21 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         }
                         catch { }
 
+                        _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
+                        await session.DisposeAsync();
                         return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials and persisted in Kubernetes secret!");
                     }
                 }
 
                 await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
+
+                if (!session.IsCompleted)
+                {
+                    return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
+                }
+
+                _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
+                await session.DisposeAsync();
 
                 if (!string.IsNullOrWhiteSpace(authCheckCmd))
                 {
@@ -2847,6 +2970,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
     {
         public Stream StdIn => stdIn;
         public string? AuthUrl { get; set; }
+        public string? UserCode { get; set; }
         public bool IsCompleted => tcs.Task.IsCompleted;
 
         public async ValueTask DisposeAsync()
