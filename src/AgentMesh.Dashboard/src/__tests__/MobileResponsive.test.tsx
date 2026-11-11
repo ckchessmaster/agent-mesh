@@ -247,7 +247,7 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     });
   });
 
-  it('manages Team & Activity drawer slide-over and close in JobCockpit on mobile', () => {
+  it('renders Timeline Cockpit and layout in JobCockpit on mobile', () => {
     window.innerWidth = 375;
 
     render(
@@ -266,24 +266,13 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
       />
     );
 
-    // On mobile (<768px), sidebar defaults to hidden
-    expect(screen.queryByTestId('job-team-sidebar')).not.toBeInTheDocument();
-
-    // Open sidebar drawer via header button
-    const toggleBtn = screen.getByTestId('toggle-team-sidebar-btn');
-    fireEvent.click(toggleBtn);
-
-    // Sidebar and mobile backdrop overlay should be present
-    expect(screen.getByTestId('job-team-sidebar')).toBeInTheDocument();
-    const backdrop = screen.getByTestId('job-team-sidebar-backdrop');
-    expect(backdrop).toBeInTheDocument();
-
-    // Clicking backdrop closes drawer
-    fireEvent.click(backdrop);
-    expect(screen.queryByTestId('job-team-sidebar')).not.toBeInTheDocument();
+    // Timeline cockpit container is rendered on mobile
+    expect(screen.getByTestId('timeline-cockpit-container')).toBeInTheDocument();
+    expect(screen.getByTestId('cockpit-layout')).toBeInTheDocument();
+    expect(screen.getByTestId('sticky-sidebar')).toBeInTheDocument();
   });
 
-  it('renders responsive mobile header and tasks checklist at 375px without breaking or clipping controls', () => {
+  it('renders responsive mobile header and CockpitLayout at 375px without breaking or clipping controls', () => {
     window.innerWidth = 375;
 
     render(
@@ -322,13 +311,11 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     // All mobile header action controls are accessible
     expect(screen.getByTestId('cockpit-assigned-agent-select')).toBeInTheDocument();
     expect(screen.getByTestId('cockpit-edit-job-btn')).toBeInTheDocument();
-    expect(screen.getByTestId('toggle-team-sidebar-btn')).toBeInTheDocument();
     expect(screen.getByTestId('toggle-job-artifacts-btn')).toBeInTheDocument();
     expect(screen.getByTestId('cockpit-complete-job-btn')).toBeInTheDocument();
 
-    // Deterministic progress meter and task objectives
-    expect(screen.getByTestId('deterministic-progress-meter')).toHaveTextContent(/Task 1 of 1/);
-    expect(screen.getByTestId('toggle-tasks-btn')).toBeInTheDocument();
+    // Timeline Cockpit container is rendered
+    expect(screen.getByTestId('timeline-cockpit-container')).toBeInTheDocument();
   });
 
   it('renders touch-accessible action buttons in ProjectList on mobile without requiring mouse hover', () => {

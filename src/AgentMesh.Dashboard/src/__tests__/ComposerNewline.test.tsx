@@ -5,14 +5,10 @@ import { api } from '../services/api';
 import type {
   Agent,
   AgentSession,
-  JobMessage,
-  Project,
-  ProjectJob,
   SessionMessage,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from '../types';
-import { ProjectJobStatus, WorkspaceType } from '../types';
 
 vi.mock('../services/api', () => ({
   api: {
@@ -101,35 +97,6 @@ const mockSession: AgentSession = {
   updatedAt: new Date().toISOString()
 };
 
-const mockProject: Project = {
-  id: 'proj-nl-1',
-  name: 'Newline Project',
-  description: 'Project for composer newline coverage',
-  workspaceType: WorkspaceType.Git,
-  gitRepositoryUrl: 'https://github.com/acme/nl.git',
-  gitBaseBranch: 'main',
-  projectInstructions: '',
-  assignedPersonas: [],
-  jobCount: 1,
-  activeJobCount: 1,
-  createdAt: new Date().toISOString(),
-  updatedAt: new Date().toISOString()
-};
-
-const mockJob: ProjectJob = {
-  id: 'job-nl-1',
-  projectId: 'proj-nl-1',
-  projectName: 'Newline Project',
-  title: 'Newline Job',
-  description: '',
-  status: ProjectJobStatus.Active,
-  gitBranchName: 'mesh/job-nl-1',
-  tasks: [],
-  messageCount: 0,
-  createdAt: new Date().toISOString(),
-  updatedAt: new Date().toISOString()
-};
-
 const createdMessage: SessionMessage = {
   id: 'msg-nl-1',
   sessionId: 'session-nl-1',
@@ -139,19 +106,7 @@ const createdMessage: SessionMessage = {
   createdAt: new Date().toISOString()
 };
 
-const createdJobMessage: JobMessage = {
-  id: 'jm-1',
-  jobId: 'job-nl-1',
-  content: '',
-  senderType: 'User',
-  senderId: 'admin',
-  senderName: 'admin',
-  mentions: [],
-  createdAt: new Date().toISOString()
-};
-
 const SESSION_COMPOSER = /Send instruction to/i;
-const JOB_COMPOSER = /Type your message, tasks, or delegate with @persona/i;
 
 /**
  * `fireEvent.keyDown` returns `false` when a handler called preventDefault.
@@ -294,43 +249,5 @@ describe('Session chat composer: shift+Enter inserts a newline', () => {
     expect(api.postSessionMessage).not.toHaveBeenCalled();
     // Default left intact so the IME can still commit its candidate.
     expect(notCancelled).toBe(true);
-  });
-});
-
-describe('Project chat composer: shift+Enter keeps working (regression guard)', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    localStorage.clear();
-    vi.mocked(api.getStatus).mockResolvedValue(healthyStatus);
-    vi.mocked(api.getCapabilities).mockResolvedValue(caps);
-    vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
-    vi.mocked(api.getPersonas).mockResolvedValue([]);
-    vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
-    vi.mocked(api.getProjects).mockResolvedValue([mockProject]);
-    vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob]);
-    vi.mocked(api.getJobMessages).mockResolvedValue([]);
-    vi.mocked(api.getJobTasks).mockResolvedValue([]);
-    vi.mocked(api.postJobMessage).mockResolvedValue(createdJobMessage);
-  });
-
-  it('shift+Enter does not send and leaves the default newline insertion intact', async () => {
-    const composer = await openComposer(JOB_COMPOSER, 'Newline Job');
-
-    fireEvent.change(composer, { target: { value: 'plan it' } });
-    const notCancelled = fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true });
-
-    expect(notCancelled).toBe(true);
-    expect(api.postJobMessage).not.toHaveBeenCalled();
-  });
-
-  it('plain Enter still sends', async () => {
-    const composer = await openComposer(JOB_COMPOSER, 'Newline Job');
-
-    fireEvent.change(composer, { target: { value: 'ship it' } });
-    fireEvent.keyDown(composer, { key: 'Enter', shiftKey: false });
-
-    await waitFor(() => {
-      expect(api.postJobMessage).toHaveBeenCalledTimes(1);
-    });
   });
 });

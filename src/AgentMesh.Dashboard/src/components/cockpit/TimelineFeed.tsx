@@ -1,4 +1,5 @@
 import React from 'react';
+import { ProjectJobStatus, type ProjectJob } from '../../types';
 import type { JobTimelineCard } from '../../types/timeline';
 import { JobInitializedCard } from './cards/JobInitializedCard';
 import { DiscoveryQaCard } from './cards/DiscoveryQaCard';
@@ -6,11 +7,14 @@ import { PlanApprovalCard } from './cards/PlanApprovalCard';
 import { TaskStepCard } from './cards/TaskStepCard';
 import { TurnInterruptedCard } from './cards/TurnInterruptedCard';
 import { CardComments } from './cards/CardComments';
-import { Layers, Loader2 } from 'lucide-react';
+import { Layers, Loader2, Play } from 'lucide-react';
 
 export interface TimelineFeedProps {
   cards: JobTimelineCard[];
   loading?: boolean;
+  job?: ProjectJob;
+  onStartJob?: () => void;
+  isStarting?: boolean;
   onSubmitAnswers?: (
     cardId: string,
     answers: Record<string, string>,
@@ -32,6 +36,9 @@ export interface TimelineFeedProps {
 export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   cards,
   loading = false,
+  job,
+  onStartJob,
+  isStarting = false,
   onSubmitAnswers,
   onSubmitPlanDecision,
   onSubmitIntervention,
@@ -47,6 +54,32 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   }
 
   if (cards.length === 0) {
+    if (job?.status === ProjectJobStatus.Pending) {
+      return (
+        <div
+          data-testid="timeline-pending-start-state"
+          className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400"
+        >
+          <Layers className="w-10 h-10 mb-3 text-amber-400/80" />
+          <h3 className="text-sm font-semibold text-slate-200">Job Pending Start</h3>
+          <p className="text-xs text-slate-400 mt-1 text-center max-w-md">
+            This job has not been started yet. Click Start Job to launch the Temporal orchestration workflow and begin Discovery Q&amp;A.
+          </p>
+          {onStartJob && (
+            <button
+              type="button"
+              onClick={onStartJob}
+              disabled={isStarting}
+              className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white shadow-sm transition-colors disabled:opacity-50"
+            >
+              <Play size={14} />
+              <span>{isStarting ? 'Starting Workflow...' : 'Start Job'}</span>
+            </button>
+          )}
+        </div>
+      );
+    }
+
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-500">
         <Layers className="w-10 h-10 mb-3 text-slate-600" />

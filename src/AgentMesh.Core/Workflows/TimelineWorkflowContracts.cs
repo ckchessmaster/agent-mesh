@@ -58,11 +58,9 @@ public record JobExecutionInput(
     string InitialPrompt,
     string TargetBranch,
     string AssignedAgentId,
-    string ApprovalPolicy = "LeadOrHuman",
-    bool UseLegacyTurnLoop = false
+    string ApprovalPolicy = "LeadOrHuman"
 )
 {
-    // Backwards-compatible constructor for existing tests/callers that pass PlanApprovalPolicy and different parameter order:
     public JobExecutionInput(
         string JobId,
         string AssignedAgentId,
@@ -71,7 +69,7 @@ public record JobExecutionInput(
         string InitialPrompt,
         string TargetBranch,
         PlanApprovalPolicy ApprovalPolicy)
-        : this(JobId, ProjectId, WorkspacePath, InitialPrompt, TargetBranch, AssignedAgentId, ApprovalPolicy.ToString(), UseLegacyTurnLoop: true)
+        : this(JobId, ProjectId, WorkspacePath, InitialPrompt, TargetBranch, AssignedAgentId, ApprovalPolicy.ToString())
     {
     }
 }

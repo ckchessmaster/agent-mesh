@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { JobCockpit } from '../JobCockpit';
-import { api } from '../../services/api';
 import type { JobTask, Project, ProjectJob } from '../../types';
 import { ProjectJobStatus, PlanApprovalPolicy, JobLifecycleStatus } from '../../types';
 
@@ -10,7 +9,20 @@ vi.mock('../../services/api', () => ({
     approvePlan: vi.fn(),
     uploadJobAttachments: vi.fn(),
     deleteTaskAttachment: vi.fn(),
+    getTimelineCards: vi.fn().mockResolvedValue([])
   }
+}));
+
+vi.mock('../../hooks/useSignalR', () => ({
+  useSignalR: () => ({
+    connection: {
+      on: vi.fn(),
+      off: vi.fn(),
+      invoke: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined)
+    },
+    connected: false
+  })
 }));
 
 describe('JobCockpit - Living Checklist & Autonomous Lifecycle Gates', () => {
@@ -65,71 +77,42 @@ describe('JobCockpit - Living Checklist & Autonomous Lifecycle Gates', () => {
     vi.clearAllMocks();
   });
 
-  it('renders deterministic progress meter and hides manual add task form for autonomous job', () => {
+  it('renders living checklist with tasks and status indicators in StickySidebar', () => {
     render(<JobCockpit {...baseProps} />);
 
-    // Deterministic progress meter: Task 2 of 3 (33% complete)
-    const meter = screen.getByTestId('deterministic-progress-meter');
-    expect(meter).toBeInTheDocument();
-    expect(meter).toHaveTextContent(/Task 2 of 3/);
+    // Living checklist container in StickySidebar
+    const checklist = screen.getByTestId('sidebar-checklist');
+    expect(checklist).toBeInTheDocument();
 
-    // Manual add task form should NOT be rendered for autonomous job
-    expect(screen.queryByTestId('new-task-input')).toBeNull();
+    // All tasks from mockTasks are rendered in the living checklist
+    expect(screen.getByText(/Task 1: Inspect repository/i)).toBeInTheDocument();
+    expect(screen.getByText(/Task 2: Configure temporal workflow/i)).toBeInTheDocument();
+    expect(screen.getByText(/Task 3: Verify with unit tests/i)).toBeInTheDocument();
+
+    // Task items have checklist-item testids
+    expect(screen.getByTestId('checklist-item-task-1')).toBeInTheDocument();
+    expect(screen.getByTestId('checklist-item-task-2')).toBeInTheDocument();
+    expect(screen.getByTestId('checklist-item-task-3')).toBeInTheDocument();
   });
 
-  it('renders living checklist with in-progress indicators and heartbeat note beneath active task', () => {
+  it('renders living checklist with heartbeat note beneath active agent profile', () => {
     render(<JobCockpit {...baseProps} />);
 
-    // Progress heartbeat note rendered beneath active task indicator
-    const heartbeatNotes = screen.getAllByTestId('task-heartbeat-note');
-    expect(heartbeatNotes.length).toBeGreaterThan(0);
-    expect(heartbeatNotes[0]).toHaveTextContent('Configuring temporal approval gate and signals.');
-
-    // Task 2 has in-progress indicator / spinner
-    expect(screen.getByTestId('task-progress-indicator-task-2')).toBeInTheDocument();
+    // Progress heartbeat note rendered in StickySidebar
+    const heartbeatNote = screen.getByTestId('sidebar-heartbeat');
+    expect(heartbeatNote).toBeInTheDocument();
+    expect(heartbeatNote).toHaveTextContent('Configuring temporal approval gate and signals.');
   });
 
-  it('renders Plan Approval Action Bar during AwaitingApproval stage and triggers approvePlan API', async () => {
-    const awaitingApprovalJob: ProjectJob = {
-      ...mockJob,
-      status: ProjectJobStatus.Active,
-      lifecycleStatus: JobLifecycleStatus.AwaitingApproval,
-      approvalPolicy: PlanApprovalPolicy.LeadOrHuman
-    };
+  it('renders Temporal Health metrics and Emergency Stop Turn button in StickySidebar', () => {
+    render(<JobCockpit {...baseProps} />);
 
-    vi.mocked(api.approvePlan).mockResolvedValue({ success: true, approverRole: 'operator' });
+    // Temporal Health section is rendered
+    expect(screen.getByText(/Temporal Health/i)).toBeInTheDocument();
+    expect(screen.getByText('Workflow:')).toBeInTheDocument();
 
-    render(<JobCockpit {...baseProps} job={awaitingApprovalJob} />);
-
-    // Plan Approval Action Bar rendered
-    expect(screen.getByTestId('plan-approval-action-bar')).toBeInTheDocument();
-    expect(screen.getByText(/Plan Approval Gate Required/i)).toBeInTheDocument();
-    expect(screen.getByText(/Lead or Human/i)).toBeInTheDocument();
-
-    // Click Approve Plan button
-    const approveBtn = screen.getByTestId('approve-plan-btn');
-    fireEvent.click(approveBtn);
-
-    await waitFor(() => {
-      expect(api.approvePlan).toHaveBeenCalledWith('job-autonomous-1', 'operator');
-    });
-  });
-
-  it('enforces HumanOnly approval policy on Plan Approval button when user is not operator', () => {
-    const humanOnlyJob: ProjectJob = {
-      ...mockJob,
-      status: ProjectJobStatus.Active,
-      lifecycleStatus: JobLifecycleStatus.AwaitingApproval,
-      approvalPolicy: PlanApprovalPolicy.HumanOnly
-    };
-
-    // User acting as tech_lead (non-operator)
-    render(<JobCockpit {...baseProps} job={humanOnlyJob} userRole="tech_lead" />);
-
-    expect(screen.getByTestId('plan-approval-action-bar')).toBeInTheDocument();
-    expect(screen.getByText(/Human Only/i)).toBeInTheDocument();
-
-    const approveBtn = screen.getByTestId('approve-plan-btn');
-    expect(approveBtn).toBeDisabled();
+    // Stop active turn button is rendered
+    expect(screen.getByTestId('stop-active-turn-btn')).toBeInTheDocument();
+    expect(screen.getByTestId('stop-active-turn-btn')).toHaveTextContent(/Stop Active Turn/i);
   });
 });

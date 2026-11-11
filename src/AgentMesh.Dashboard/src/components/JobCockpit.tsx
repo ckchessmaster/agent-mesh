@@ -1,47 +1,33 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   GitBranch,
   CheckCircle2,
-  Circle,
-  Send,
-  Sparkles,
-  Bot,
-  User,
-  ChevronRight,
-  ChevronDown,
   Settings,
-  ArrowDown,
-  ListTodo,
-  Check,
   Briefcase,
-  Paperclip,
   FileText,
-  Image as ImageIcon,
-  X,
-  ZoomIn,
-  Download,
-  AlertCircle,
-  Square,
-  Users,
   RefreshCw,
   Archive,
   RotateCcw,
   Clock,
   Play,
-  HelpCircle,
   Sliders,
-  Activity,
-  ShieldCheck,
   FileDiff
 } from 'lucide-react';
-import type { AgentSession, AskQuestionItem, JobMessage, JobTask, Persona, Project, ProjectJob, QuestionAnswerPayload, SessionAttachment } from '../types';
-import { ProjectJobStatus, PlanApprovalPolicy, JobLifecycleStatus } from '../types';
-import { TeamMentionPalette, type MentionableMember } from './TeamMentionPalette';
-import { MarkdownMessage } from './MarkdownMessage';
-import { QuestionCard, parseTextQuestions } from './QuestionCard';
+import type {
+  AgentSession,
+  AskQuestionItem,
+  JobMessage,
+  JobTask,
+  Persona,
+  Project,
+  ProjectJob,
+  QuestionAnswerPayload,
+  SessionAttachment
+} from '../types';
+import { ProjectJobStatus } from '../types';
+import { parseTextQuestions } from './QuestionCard';
 import { JobSettingsModal } from './JobSettingsModal';
 import { CockpitLayout } from './cockpit/CockpitLayout';
-import { parseSessionMetadata, stripJobTurnNoise } from '../utils/sessionDisplay';
 
 export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem[] {
   if (msg.senderType === 'user') return [];
@@ -50,7 +36,9 @@ export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem
     try {
       let p = JSON.parse(msg.structuredPayloadJson);
       if (typeof p === 'string') {
-        try { p = JSON.parse(p); } catch {}
+        try {
+          p = JSON.parse(p);
+        } catch {}
       }
       if (p) {
         if (Array.isArray(p.questions)) return p.questions as AskQuestionItem[];
@@ -62,11 +50,13 @@ export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem
           } catch {}
         }
         if (p.question) {
-          return [{
-            question: p.question,
-            options: Array.isArray(p.options) ? p.options : [],
-            is_multi_select: !!p.is_multi_select
-          }];
+          return [
+            {
+              question: p.question,
+              options: Array.isArray(p.options) ? p.options : [],
+              is_multi_select: !!p.is_multi_select
+            }
+          ];
         }
         if (Array.isArray(p) && p.length > 0 && (p[0].question || p[0].Question)) {
           return p as AskQuestionItem[];
@@ -79,24 +69,6 @@ export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem
   }
 
   return parseTextQuestions(msg.content);
-}
-import { api } from '../services/api';
-
-const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
-const MAX_ATTACHMENTS_PER_MESSAGE = 10;
-const DEFAULT_ATTACHMENT_PROMPT = 'Please review the attached file(s).';
-
-function formatAttachmentSize(bytes?: number): string {
-  if (!bytes || bytes <= 0) return '0 B';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function isImageAttachment(contentType?: string, fileName?: string): boolean {
-  const ct = (contentType || '').toLowerCase();
-  const name = (fileName || '').toLowerCase();
-  return ct.startsWith('image/') || /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)$/.test(name);
 }
 
 export function extractJobMessageAttachments(msg: JobMessage): SessionAttachment[] {
@@ -117,14 +89,22 @@ export function extractJobMessageAttachments(msg: JobMessage): SessionAttachment
         const id = item.id || item.Id || '';
         const fileName = item.fileName || item.FileName || item.name || item.Name || '';
         const contentType = item.contentType || item.ContentType || '';
-        const sizeBytes = typeof item.sizeBytes === 'number'
-          ? item.sizeBytes
-          : typeof item.SizeBytes === 'number'
-          ? item.SizeBytes
-          : (typeof item.size === 'number' ? item.size : 0);
+        const sizeBytes =
+          typeof item.sizeBytes === 'number'
+            ? item.sizeBytes
+            : typeof item.SizeBytes === 'number'
+            ? item.SizeBytes
+            : typeof item.size === 'number'
+            ? item.size
+            : 0;
         const s3Key = item.s3Key || item.S3Key || '';
         const targetId = id || fileName;
-        const downloadUrl = item.downloadUrl || item.DownloadUrl || (targetId ? `/api/project-jobs/${encodeURIComponent(msg.jobId)}/attachments/${encodeURIComponent(targetId)}/content` : '');
+        const downloadUrl =
+          item.downloadUrl ||
+          item.DownloadUrl ||
+          (targetId
+            ? `/api/project-jobs/${encodeURIComponent(msg.jobId)}/attachments/${encodeURIComponent(targetId)}/content`
+            : '');
         const createdAt = item.createdAt || item.CreatedAt || msg.createdAt;
 
         return {
@@ -143,23 +123,6 @@ export function extractJobMessageAttachments(msg: JobMessage): SessionAttachment
   return [];
 }
 
-function extractClipboardFiles(e: React.ClipboardEvent): File[] {
-  const files: File[] = [];
-  if (e.clipboardData?.files && e.clipboardData.files.length > 0) {
-    return Array.from(e.clipboardData.files);
-  }
-  if (e.clipboardData?.items) {
-    for (let i = 0; i < e.clipboardData.items.length; i++) {
-      const item = e.clipboardData.items[i];
-      if (item.kind === 'file') {
-        const f = item.getAsFile();
-        if (f) files.push(f);
-      }
-    }
-  }
-  return files;
-}
-
 export interface StagedJobAttachmentItem {
   localId: string;
   file: File;
@@ -172,12 +135,6 @@ export interface StagedJobAttachmentItem {
   uploaded?: SessionAttachment;
 }
 
-/**
- * Which pending task a persona would treat as its focus: the first one assigned to them,
- * else the first nobody owns (the "tell an agent to grab it" flow), else the first pending.
- * Mirrors ProjectJobsController.ResolveTargetTask so the cockpit can point a queued turn's
- * reassignment at the right task without another round trip.
- */
 export function resolveTargetTaskId(tasks: JobTask[], personaId?: string | null): string | null {
   const pending = tasks.filter((t) => !t.isCompleted);
   if (pending.length === 0) return null;
@@ -197,14 +154,11 @@ export function getActiveMentionQuery(
   const lastAtIndex = beforeCursor.lastIndexOf('@');
   if (lastAtIndex === -1) return null;
 
-  // The @ symbol must be at start of string or preceded by whitespace
   if (lastAtIndex > 0 && !/\s/.test(beforeCursor[lastAtIndex - 1])) {
     return null;
   }
 
   const query = beforeCursor.slice(lastAtIndex + 1);
-
-  // If there's whitespace inside the query, the mention has ended
   if (/\s/.test(query)) {
     return null;
   }
@@ -212,7 +166,7 @@ export function getActiveMentionQuery(
   return { query, startIndex: lastAtIndex };
 }
 
-interface JobCockpitProps {
+export interface JobCockpitProps {
   project: Project;
   job: ProjectJob;
   tasks: JobTask[];
@@ -224,8 +178,15 @@ interface JobCockpitProps {
   onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
   onAddTask?: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
   onToggleTask?: (taskId: string, isCompleted: boolean) => Promise<void>;
-  onUpdateTask?: (taskId: string, updates: { title?: string; isCompleted?: boolean; requiresDiscussion?: boolean; attachments?: SessionAttachment[] }) => Promise<void>;
-  /** Assign/reassign a task. Passing null clears the assignee. */
+  onUpdateTask?: (
+    taskId: string,
+    updates: {
+      title?: string;
+      isCompleted?: boolean;
+      requiresDiscussion?: boolean;
+      attachments?: SessionAttachment[];
+    }
+  ) => Promise<void>;
   onAssignTask?: (taskId: string, personaId: string | null) => Promise<void>;
   onDeleteTask?: (taskId: string) => Promise<void>;
   onCompleteJob: (resultSummary?: string) => Promise<void>;
@@ -250,29 +211,10 @@ interface JobCockpitProps {
   onCancelQueuedTurn?: (turnId: string) => Promise<void> | void;
   onCancelQueuedTurns?: (personaId: string) => Promise<void> | void;
   sessions?: AgentSession[];
-  /**
-   * How many artifacts this job has, for the header toggle's badge.
-   *
-   * Passed in rather than fetched here because the artifacts belong to the same store the SignalR
-   * handlers write into (App.tsx), and a second copy fetched inside this component would drift from the
-   * one the panel renders the moment a live artifact event landed.
-   */
   jobArtifactCount?: number;
-  /** Whether the job Artifacts panel is open. Drives the toggle's pressed style. */
   showJobArtifactsPanel?: boolean;
-  /** Opens/closes the job Artifacts panel, which the parent renders beside this cockpit. */
   onToggleJobArtifactsPanel?: () => void;
-  /**
-   * Whether the job Changes panel is open — the twin of `showJobArtifactsPanel`.
-   *
-   * Both flags are owned by the parent and it enforces that at most one is true: the two panels share
-   * one column of one width, so rendering both would make the header claim two things are open while
-   * showing one. Keeping this header's existing `showJobArtifactsPanel` contract untouched (rather than
-   * replacing the pair with a single tab value) is deliberate — that prop is a documented part of the
-   * cockpit's surface with tests built on it, and the mutual exclusion belongs with the state.
-   */
   showJobChangesPanel?: boolean;
-  /** Opens/closes the job Changes panel, which the parent renders beside this cockpit. */
   onToggleJobChangesPanel?: () => void;
   onAnswerQuestion?: (
     sessionIdOrTargetId: string,
@@ -284,36 +226,24 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   project,
   job,
   tasks,
-  messages,
   personas = [],
-  sessions = [],
-  userRole = 'operator',
   onStartJob,
-  onSendMessage,
-  onUpdateTask,
-  onAssignTask,
   onCompleteJob,
   onArchiveJob,
   onReopenJob,
   onResetJob,
-  onSelectTurnSession,
-  onOpenLightbox,
-  onUploadAttachments,
   onEditProject,
   onUpdateJob,
   onDeleteJob,
-  onStopTurn,
+  onAssignTask,
   onCancelQueuedTurn,
   onCancelQueuedTurns,
-  onAnswerQuestion,
   jobArtifactCount = 0,
   showJobArtifactsPanel = false,
   onToggleJobArtifactsPanel,
   showJobChangesPanel = false,
   onToggleJobChangesPanel
 }) => {
-  const [prompt, setPrompt] = useState('');
-  const [isSending, setIsSending] = useState(false);
   const [showJobSettingsModal, setShowJobSettingsModal] = useState(false);
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
@@ -323,20 +253,25 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [isArchiving, setIsArchiving] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
-  const [showTimelineCockpit, setShowTimelineCockpit] = useState(false);
 
-  const handleConfirmReset = async () => {
-    if (!onResetJob) return;
-    setIsResetting(true);
-    try {
-      await onResetJob();
-      setShowResetConfirm(false);
-    } catch (err: any) {
-      console.error('Failed to reset job:', err);
-    } finally {
-      setIsResetting(false);
+  const isCompleted = job.status === ProjectJobStatus.Completed;
+  const isArchived = job.status === ProjectJobStatus.Archived;
+  const isPending = job.status === ProjectJobStatus.Pending;
+
+  const teamMembers = useMemo(() => {
+    const map = new Map<string, { id: string; name: string; role: string }>();
+    if (project.assignedPersonas) {
+      for (const p of project.assignedPersonas) {
+        map.set(p.id.toLowerCase(), { id: p.id, name: p.name, role: p.role });
+      }
     }
-  };
+    for (const p of personas) {
+      if (!map.has(p.id.toLowerCase())) {
+        map.set(p.id.toLowerCase(), { id: p.id, name: p.name, role: p.role });
+      }
+    }
+    return Array.from(map.values());
+  }, [project.assignedPersonas, personas]);
 
   const handleStartJob = async () => {
     if (!onStartJob) return;
@@ -348,895 +283,12 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
-  // Task checklist presentation state
-  const [isTasksExpanded, setIsTasksExpanded] = useState(() =>
-    typeof window !== 'undefined' ? window.innerWidth >= 768 : true
-  );
-  const [taskFilter, setTaskFilter] = useState<'all' | 'pending' | 'completed'>('pending');
-
-  // Attachment & Drag-Drop State
-  const [stagedAttachments, setStagedAttachments] = useState<StagedJobAttachmentItem[]>([]);
-  const [isDragging, setIsDragging] = useState(false);
-  const [attachmentError, setAttachmentError] = useState<string | null>(null);
-  const [internalLightbox, setInternalLightbox] = useState<{
-    url: string;
-    fileName: string;
-    sizeBytes?: number;
-  } | null>(null);
-
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const existingTaskFileInputRef = useRef<HTMLInputElement>(null);
-  const [targetTaskForUpload, setTargetTaskForUpload] = useState<string | null>(null);
-
-  // Assignment: which row is mid-request, and the last failure to surface inline.
-  const [assigningTaskId, setAssigningTaskId] = useState<string | null>(null);
-  const [assignError, setAssignError] = useState<string | null>(null);
-
-  // Team Member Autocomplete Palette State
-  const [mentionState, setMentionState] = useState<{
-    isOpen: boolean;
-    query: string;
-    startIndex: number;
-  }>({
-    isOpen: false,
-    query: '',
-    startIndex: -1
-  });
-  const [mentionHighlightedIndex, setMentionHighlightedIndex] = useState(0);
-  const [showTeamSidebar, setShowTeamSidebar] = useState(() =>
-    typeof window !== 'undefined' ? window.innerWidth >= 768 : true
-  );
-
-  // Question answering state
-  const [submittingQuestionId, setSubmittingQuestionId] = useState<string | null>(null);
-  const [answeredQuestionIds, setAnsweredQuestionIds] = useState<string[]>([]);
-
-  // Plan approval state (Stage 2 Gate)
-  const [isApprovingPlan, setIsApprovingPlan] = useState(false);
-  const [planApproved, setPlanApproved] = useState(false);
-  const [approvalError, setApprovalError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setPlanApproved(false);
-    setApprovalError(null);
-  }, [job.id]);
-
-  const isAwaitingApproval =
-    !planApproved &&
-    (job.lifecycleStatus === JobLifecycleStatus.AwaitingApproval ||
-     (job.status as any) === 'awaiting_approval' ||
-     (job.status as any) === 'AwaitingApproval');
-
-  const handleApprovePlan = async () => {
-    setIsApprovingPlan(true);
-    setApprovalError(null);
-    try {
-      await api.approvePlan(job.id, userRole);
-      setPlanApproved(true);
-      if (onUpdateJob) {
-        await onUpdateJob({ status: ProjectJobStatus.Active });
-      }
-    } catch (err: any) {
-      setApprovalError(err?.message || 'Failed to approve plan.');
-    } finally {
-      setIsApprovingPlan(false);
-    }
-  };
-
-  const handleAnswerQuestion = async (
-    msg: JobMessage,
-    _questions: AskQuestionItem[],
-    answers: QuestionAnswerPayload[]
-  ) => {
-    setSubmittingQuestionId(msg.id);
-    try {
-      const parts = answers.map((ans) => {
-        const chosen = [
-          ...(ans.selectedOptions || []),
-          ...(ans.customText?.trim() ? [ans.customText.trim()] : [])
-        ];
-        return `Q: ${ans.question} -> A: ${chosen.length > 0 ? chosen.join(', ') : 'User skipped'}`;
-      });
-      const answerSummary = parts.join('\n');
-
-      if (onAnswerQuestion) {
-        await onAnswerQuestion(msg.turnSessionId || msg.id, {
-          toolCallId: msg.id,
-          answers,
-          answerSummary
-        });
-      } else if (msg.turnSessionId) {
-        await api.submitQuestionAnswer(msg.turnSessionId, {
-          toolCallId: msg.id,
-          answers
-        });
-      } else {
-        await onSendMessage(
-          `User answered question:\n${answerSummary}\nPlease proceed with this answer.`,
-          []
-        );
-      }
-      setAnsweredQuestionIds((prev) => [...prev, msg.id]);
-    } catch (err) {
-      console.error('Failed to submit question answer:', err);
-    } finally {
-      setSubmittingQuestionId(null);
-    }
-  };
-
-  const pendingQuestion = useMemo(() => {
-    // Only search backwards from the latest messages.
-    // If a user message has already been sent after a question,
-    // that question is superseded and cannot be an active "pending question".
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m.senderType === 'user') {
-        // Any question asked before this user message has already been replied to / superseded
-        break;
-      }
-      const qs = extractQuestionsFromJobMessage(m);
-      if (qs.length > 0) {
-        const isAns = answeredQuestionIds.includes(m.id);
-        if (!isAns) {
-          return { msg: m, questions: qs };
-        }
-      }
-    }
-    return null;
-  }, [messages, answeredQuestionIds]);
-
-  const isSessionWaitingForInput = useMemo(() => {
-    const lastMsgWithSession = [...messages].reverse().find((m) => m.turnSessionId);
-    if (!lastMsgWithSession?.turnSessionId) return false;
-    const lastUserMsgIdx = [...messages].reverse().findIndex((m) => m.senderType === 'user');
-    const lastTurnMsgIdx = [...messages].reverse().findIndex((m) => m.id === lastMsgWithSession.id);
-    if (lastUserMsgIdx !== -1 && lastUserMsgIdx < lastTurnMsgIdx) {
-      return false;
-    }
-    return sessions.some(
-      (s) => s.id === lastMsgWithSession.turnSessionId && s.status === 'waiting_for_input'
-    );
-  }, [sessions, messages]);
-
-  const isWaitingForInput = Boolean(pendingQuestion || isSessionWaitingForInput);
-
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const userScrolledUpRef = useRef(false);
-  const [isScrolledUp, setIsScrolledUp] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  // --- Chat transcript "stick to bottom" ---------------------------------------------
-  // The old rule was one effect keyed on `messages` that wrote scrollTop = scrollHeight
-  // unless the operator had scrolled up. It missed the mobile case the bug report is about:
-  // App.tsx keeps this panel inside `<main class="hidden">` while the phone is showing the
-  // master list (App.tsx:3475), so the transcript mounts with `display: none`. A hidden
-  // element reports 0 for every layout metric, so the pin is spent as a silent no-op that
-  // *looks* like it succeeded, and tapping into the job afterwards leaves the operator
-  // staring at the top of history. Nothing re-pins, because `messages` never changed again.
-  //
-  // One function decides, from four distinct reasons to pin:
-  //   * forced — the transcript just mounted, the operator asked, or we could never get a
-  //              measurement for the content currently on screen. Pin unconditionally.
-  //   * owner  — a different job is on screen: the operator navigated here to read the
-  //              newest message, and any "scrolled up" carried over from the previous job
-  //              is stale.
-  //   * new    — this transcript gained messages while the operator was following it.
-  //   * grew   — the DOM got taller without a React render (late image decode, mermaid
-  //              resolving to SVG, markdown hydrating). Only the observers can see that,
-  //              so only they may ask for it.
-  //
-  // A scrollHeight read forces layout, so it happens only when we are about to write
-  // scrollTop or are explicitly checking for growth — never on an ordinary render.
-  const forceChatPinRef = useRef(true);
-  const pinnedChatOwnerRef = useRef<string | null>(null);
-  const pinnedChatContentRef = useRef<string | null>(null);
-  const pinnedChatHeightRef = useRef(-1);
-  const chatObserversCleanupRef = useRef<(() => void) | null>(null);
-  const syncChatScrollRef = useRef<(options: { allowGrowthPin: boolean }) => void>(() => {});
-
-  const chatContentKey = `${messages.length}|${messages[messages.length - 1]?.id ?? ''}`;
-
-  const syncChatScroll = useCallback(
-    ({ allowGrowthPin }: { allowGrowthPin: boolean }) => {
-      const container = messagesContainerRef.current;
-      if (!container) {
-        // Transcript unmounted (operator went back to the master list). Invalidate the
-        // cache so remounting counts as a fresh pin even if the content is identical.
-        pinnedChatHeightRef.current = -1;
-        return;
-      }
-
-      // `display: none` collapses clientHeight to 0. Writing scrollTop there is a no-op,
-      // so bail *without* recording the content as pinned: that leaves the next measurable
-      // pass — the moment the panel is un-hidden — still holding a reason to pin.
-      if (container.clientHeight === 0) {
-        pinnedChatHeightRef.current = -1;
-        return;
-      }
-
-      const following = !userScrolledUpRef.current;
-      // A different job on screen means the newest message is what they came for.
-      const ownerChanged = pinnedChatOwnerRef.current !== job.id;
-      const contentChanged = pinnedChatContentRef.current !== chatContentKey;
-
-      let shouldPin =
-        forceChatPinRef.current || ownerChanged || (following && contentChanged);
-      if (!shouldPin && allowGrowthPin && following) {
-        shouldPin = container.scrollHeight !== pinnedChatHeightRef.current;
-      }
-      if (!shouldPin) return;
-
-      forceChatPinRef.current = false;
-      // Assigning scrollTop (rather than scrollIntoView) keeps the scroll on this
-      // container instead of dragging ancestor scrollables around.
-      container.scrollTop = container.scrollHeight;
-      pinnedChatHeightRef.current = container.scrollHeight;
-      pinnedChatOwnerRef.current = job.id;
-      pinnedChatContentRef.current = chatContentKey;
-
-      if (ownerChanged) {
-        // Opening a different job clears any "scrolled up" inherited from the previous
-        // one, so live turns on this job are followed again.
-        userScrolledUpRef.current = false;
-        setIsScrolledUp(false);
-      }
-    },
-    [job.id, chatContentKey]
-  );
-
-  // Assigned during render: the ref callback below runs synchronously during commit,
-  // before passive effects, and needs the current values immediately.
-  syncChatScrollRef.current = syncChatScroll;
-
-  // Runs before paint on renders that can change what is on screen, so the top of a
-  // newly opened job is never flashed. Keyed on the transcript rather than running every
-  // render: growth without a React render is the observers' job.
-  useLayoutEffect(() => {
-    syncChatScroll({ allowGrowthPin: false });
-  }, [syncChatScroll]);
-
-  // Container ref callback: mounting is itself a reason to pin, and it is the only place
-  // that learns when the observed node comes and goes.
-  const handleChatContainerRef = useCallback((node: HTMLDivElement | null) => {
-    messagesContainerRef.current = node;
-    chatObserversCleanupRef.current?.();
-    chatObserversCleanupRef.current = null;
-    if (!node) {
-      pinnedChatHeightRef.current = -1;
-      return;
-    }
-
-    forceChatPinRef.current = true;
-    syncChatScrollRef.current({ allowGrowthPin: false });
-
-    const cleanup: Array<() => void> = [];
-
-    // Un-hiding the mobile master-list -> detail transition gives this node a box for the
-    // first time; the on-screen keyboard also changes clientHeight without any React
-    // render. Both are invisible to effects and to `scroll`, so observe the box itself.
-    if (typeof ResizeObserver !== 'undefined') {
-      const observer = new ResizeObserver(() =>
-        syncChatScrollRef.current({ allowGrowthPin: true })
-      );
-      observer.observe(node);
-      cleanup.push(() => observer.disconnect());
-    }
-
-    // Content can grow without a React render: streamed DOM, lazily decoded images,
-    // async mermaid SVG injection. Re-pin while the operator is still following.
-    if (typeof MutationObserver !== 'undefined') {
-      const observer = new MutationObserver(() =>
-        syncChatScrollRef.current({ allowGrowthPin: true })
-      );
-      observer.observe(node, { childList: true, subtree: true });
-      cleanup.push(() => observer.disconnect());
-    }
-
-    // An <img> changing intrinsic size on decode does not touch the DOM tree.
-    const handleMediaLoad = (event: Event) => {
-      const target = event.target as HTMLElement | null;
-      if (target && target.tagName === 'IMG') {
-        syncChatScrollRef.current({ allowGrowthPin: true });
-      }
-    };
-    node.addEventListener('load', handleMediaLoad, true);
-    cleanup.push(() => node.removeEventListener('load', handleMediaLoad, true));
-
-    chatObserversCleanupRef.current = () => {
-      cleanup.forEach((fn) => fn());
-      chatObserversCleanupRef.current = null;
-    };
-  }, []);
-
-  // A viewport resize moves the bottom without firing a scroll event on the container.
-  useEffect(() => {
-    const handleWindowResize = () => syncChatScrollRef.current({ allowGrowthPin: true });
-    window.addEventListener('resize', handleWindowResize);
-    return () => window.removeEventListener('resize', handleWindowResize);
-  }, []);
-
-  // Auto-scroll management: track user manual scrolling vs automatic tracking
-  const handleMessagesScroll = () => {
-    if (!messagesContainerRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
-    const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
-    if (distanceFromBottom < 80) {
-      userScrolledUpRef.current = false;
-      setIsScrolledUp(false);
-    } else if (distanceFromBottom > 200) {
-      userScrolledUpRef.current = true;
-      setIsScrolledUp(true);
-    }
-  };
-
-  const scrollToBottom = (instant = false) => {
-    userScrolledUpRef.current = false;
-    setIsScrolledUp(false);
-
-    const container = messagesContainerRef.current;
-    if (!container) {
-      forceChatPinRef.current = true;
-      syncChatScrollRef.current({ allowGrowthPin: false });
-      if (typeof messagesEndRef.current?.scrollIntoView === 'function') {
-        messagesEndRef.current.scrollIntoView({ behavior: instant ? 'auto' : 'smooth' });
-      }
-      return;
-    }
-
-    // A hidden panel has no box to scroll, so let the shared pin logic own the write and
-    // skip the animation: there is nothing to animate until the panel is un-hidden.
-    if (container.clientHeight === 0 || instant) {
-      forceChatPinRef.current = true;
-      syncChatScrollRef.current({ allowGrowthPin: false });
-      return;
-    }
-
-    // Smooth is an animation toward the current bottom, so the target is captured before
-    // the pin runs. The pin lands the container exactly there, then the animation plays.
-    const target = container.scrollHeight;
-    forceChatPinRef.current = true;
-    syncChatScrollRef.current({ allowGrowthPin: false });
-    if (typeof container.scrollTo === 'function') {
-      container.scrollTo({ top: target, behavior: 'smooth' });
-    }
-  };
-
-  // Immediate feedback / active turn detection
-  const activeTurnInfo = useMemo(() => {
-    if (isSending) {
-      return {
-        isActive: true,
-        personaName: 'Team',
-        turnSessionId: undefined,
-        statusText: 'Sending message and initiating turn...'
-      };
-    }
-
-    // 1. Search for any live session directly associated with this job
-    // Sessions created for this job have metadataJson with jobId matching job.id,
-    // or title starting with "Job Turn: ..." matching job.title.
-    const liveJobSession = sessions.find((s) => {
-      const isLive = s.status === 'thinking' || s.status === 'busy' || s.status === 'waiting_for_input';
-      if (!isLive) return false;
-      const meta = parseSessionMetadata(s.metadataJson);
-      if (meta.jobId && job.id && meta.jobId.toLowerCase() === job.id.toLowerCase()) {
-        return true;
-      }
-      if (s.title && job.title) {
-        const stripped = stripJobTurnNoise(s.title).toLowerCase();
-        if (stripped === job.title.toLowerCase() || s.title.toLowerCase().includes(job.title.toLowerCase())) {
-          return true;
-        }
-      }
-      return false;
-    });
-
-    if (liveJobSession) {
-      const meta = parseSessionMetadata(liveJobSession.metadataJson);
-      const personaId = liveJobSession.personaId || meta.personaId;
-      const personaObj =
-        personas.find(
-          (p) =>
-            (personaId && p.id.toLowerCase() === personaId.toLowerCase()) ||
-            (liveJobSession.personaName && p.name.toLowerCase() === liveJobSession.personaName.toLowerCase())
-        ) ||
-        project.assignedPersonas?.find(
-          (p) =>
-            (personaId && p.id.toLowerCase() === personaId.toLowerCase()) ||
-            (liveJobSession.personaName && p.name.toLowerCase() === liveJobSession.personaName.toLowerCase())
-        );
-      const personaName = personaObj?.name || liveJobSession.personaName || meta.personaName || 'Persona';
-      const isOffline = personaObj?.driverStatus === 'offline';
-
-      const statusText = isOffline
-        ? 'is queued (waiting for runner connection)...'
-        : liveJobSession.status === 'waiting_for_input'
-        ? 'is waiting for input...'
-        : 'is actively working on this turn...';
-
-      return {
-        isActive: true,
-        isOffline,
-        driverId: personaObj?.driverId || liveJobSession.driverId || undefined,
-        personaName,
-        personaId: personaObj?.id || personaId || undefined,
-        turnSessionId: liveJobSession.id,
-        statusText
-      };
-    }
-
-    if (messages.length === 0) {
-      if (
-        job.status === ProjectJobStatus.Active ||
-        job.status === ProjectJobStatus.Pending ||
-        (job.status as unknown as string) === 'active' ||
-        (job.status as unknown as string) === 'in_progress'
-      ) {
-        const personaId = job.assignedAgentId;
-        const personaObj =
-          personas.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase()) ||
-          project.assignedPersonas?.find((p) => personaId && p.id.toLowerCase() === personaId.toLowerCase());
-        const personaName = personaObj?.name || personaId || 'Assigned Lead';
-        const isOffline = personaObj?.driverStatus === 'offline';
-        return {
-          isActive: true,
-          isOffline,
-          driverId: personaObj?.driverId || undefined,
-          personaName,
-          personaId: personaObj?.id || personaId || undefined,
-          turnSessionId: undefined,
-          statusText: isOffline
-            ? 'is queued (waiting for runner connection)...'
-            : (job.progressHeartbeat || 'is starting discovery & analyzing requirements...')
-        };
-      }
-      return null;
-    }
-    const lastMsg = messages[messages.length - 1];
-
-    if (lastMsg.turnSessionId && sessions.length > 0) {
-      const turnSession = sessions.find((s) => s.id === lastMsg.turnSessionId);
-      if (turnSession && turnSession.status !== 'thinking' && turnSession.status !== 'waiting_for_input' && turnSession.status !== 'busy') {
-        return null;
-      }
-    }
-
-    if (lastMsg.senderType === 'user' && lastMsg.turnSessionId) {
-      const mention = lastMsg.mentions?.[0];
-      const personaObj =
-        personas.find((p) => p.id === mention) ||
-        project.assignedPersonas?.find((p) => p.id === mention);
-      const isOffline = personaObj?.driverStatus === 'offline';
-      return {
-        isActive: true,
-        isOffline,
-        driverId: personaObj?.driverId,
-        personaName: personaObj?.name || mention || 'Persona',
-        personaId: personaObj?.id || mention,
-        turnSessionId: lastMsg.turnSessionId,
-        statusText: isOffline ? 'is queued (waiting for runner connection)...' : 'is actively working on this task...'
-      };
-    }
-
-    if (
-      lastMsg.senderType === 'persona' &&
-      lastMsg.turnSessionId &&
-      (lastMsg.content.includes("I'm on it") || lastMsg.content.includes('starting work') || lastMsg.content.includes('queued'))
-    ) {
-      const personaObj =
-        personas.find((p) => p.id === lastMsg.senderId) ||
-        project.assignedPersonas?.find((p) => p.id === lastMsg.senderId) ||
-        personas.find((p) => p.name === lastMsg.senderName);
-      const isOffline = personaObj?.driverStatus === 'offline';
-      return {
-        isActive: true,
-        isOffline,
-        driverId: personaObj?.driverId,
-        personaName: lastMsg.senderName || 'Persona',
-        personaId: personaObj?.id || lastMsg.senderId,
-        turnSessionId: lastMsg.turnSessionId,
-        statusText: isOffline ? 'is queued (waiting for runner connection)...' : 'is actively working on this task...'
-      };
-    }
-
-    return null;
-  }, [messages, isSending, personas, project.assignedPersonas, sessions, job.id, job.title, job.status, job.progressHeartbeat, job.assignedAgentId]);
-
-  // Filtered task items for the structured checklist
-  const uniqueTasks = useMemo(() => {
-    return tasks.filter(
-      (t, index, self) => index === self.findIndex((item) => item.id === t.id)
-    );
-  }, [tasks]);
-
-  const filteredTasks = useMemo(() => {
-    if (taskFilter === 'pending') return uniqueTasks.filter((t) => !t.isCompleted);
-    if (taskFilter === 'completed') return uniqueTasks.filter((t) => t.isCompleted);
-    return uniqueTasks;
-  }, [uniqueTasks, taskFilter]);
-
-  // A turn starting or stopping adds a live status block to the transcript without
-  // changing the message list, so it is treated as growth rather than new content.
-  // Keyed on activeTurnInfo (a memo) instead of running every render.
-  useLayoutEffect(() => {
-    syncChatScroll({ allowGrowthPin: true });
-  }, [syncChatScroll, activeTurnInfo]);
-
-  // Team members list: priority given to project's assigned personas, fallback to all personas
-  const teamMembers: MentionableMember[] = useMemo(() => {
-    const assigned = project.assignedPersonas || [];
-    const leadId = project.defaultLeadPersonaId;
-
-    if (assigned.length > 0) {
-      return assigned.map((p) => ({
-        id: p.id,
-        name: p.name,
-        role: p.role,
-        driverId: p.driverId,
-        isLead: p.id === leadId,
-        isAssigned: true
-      }));
-    }
-
-    if (personas && personas.length > 0) {
-      return personas.map((p) => ({
-        id: p.id,
-        name: p.name,
-        role: p.role,
-        driverId: p.driverId,
-        isLead: p.id === leadId,
-        isAssigned: false
-      }));
-    }
-
-    return [];
-  }, [project.assignedPersonas, project.defaultLeadPersonaId, personas]);
-
-  // Assignee ids come from the server, but the cockpit shows display names.
-  const memberNameFor = useCallback(
-    (personaId?: string | null) => {
-      if (!personaId) return '';
-      const norm = personaId.trim().toLowerCase();
-      const member = teamMembers.find((m) => m.id.toLowerCase() === norm);
-      if (member) return member.name;
-      const persona = personas.find((p) => p.id.toLowerCase() === norm);
-      return persona?.name || personaId;
-    },
-    [teamMembers, personas]
-  );
-
-  const filteredMentionMembers = useMemo(() => {
-    const q = mentionState.query.toLowerCase().trim();
-    return teamMembers.filter((m) => {
-      if (!q) return true;
-      return (
-        m.id.toLowerCase().includes(q) ||
-        m.name.toLowerCase().includes(q) ||
-        m.role.toLowerCase().includes(q) ||
-        m.driverId.toLowerCase().includes(q)
-      );
-    });
-  }, [teamMembers, mentionState.query]);
-
-  const handleOpenLightbox = useCallback(
-    (item: { url: string; fileName: string; sizeBytes?: number }) => {
-      if (onOpenLightbox) {
-        onOpenLightbox(item);
-      } else {
-        setInternalLightbox(item);
-      }
-    },
-    [onOpenLightbox]
-  );
-
-  const stageFiles = useCallback(
-    async (rawFiles: FileList | File[]) => {
-      const incoming = Array.from(rawFiles || []);
-      if (incoming.length === 0) return;
-
-      setAttachmentError(null);
-
-      if (stagedAttachments.length + incoming.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-        setAttachmentError(`Maximum of ${MAX_ATTACHMENTS_PER_MESSAGE} files can be attached per message.`);
-        return;
-      }
-
-      for (const f of incoming) {
-        if (f.size > MAX_ATTACHMENT_SIZE_BYTES) {
-          setAttachmentError(`File "${f.name}" exceeds the 25 MB maximum file size limit.`);
-          return;
-        }
-      }
-
-      const newItems: StagedJobAttachmentItem[] = incoming.map((file, idx) => {
-        const safeName = file.name || `attachment-${Date.now()}-${idx}.bin`;
-        let previewUrl: string | undefined;
-        if (isImageAttachment(file.type, safeName) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
-          try {
-            previewUrl = URL.createObjectURL(file);
-          } catch {}
-        }
-
-        return {
-          localId: `local-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
-          file,
-          name: safeName,
-          sizeBytes: file.size,
-          contentType: file.type || 'application/octet-stream',
-          previewUrl,
-          uploading: true
-        };
-      });
-
-      setStagedAttachments((prev) => [...prev, ...newItems]);
-
-      try {
-        let uploadedDtos: SessionAttachment[];
-        if (typeof onUploadAttachments === 'function') {
-          uploadedDtos = await onUploadAttachments(incoming);
-        } else {
-          uploadedDtos = await api.uploadJobAttachments(job.id, incoming);
-        }
-
-        setStagedAttachments((prev) =>
-          prev.map((item) => {
-            const matched = newItems.find((n) => n.localId === item.localId);
-            if (!matched) return item;
-
-            const idx = newItems.indexOf(matched);
-            const dto = uploadedDtos[idx] || uploadedDtos.find((d) => d.fileName === item.name);
-            return {
-              ...item,
-              uploading: false,
-              uploaded: dto
-            };
-          })
-        );
-      } catch (err: any) {
-        const errMsg = err?.message || 'Failed to upload attachments';
-        setAttachmentError(errMsg);
-        setStagedAttachments((prev) =>
-          prev.map((item) => {
-            const isOneOfThese = newItems.some((n) => n.localId === item.localId);
-            return isOneOfThese ? { ...item, uploading: false, error: errMsg } : item;
-          })
-        );
-      }
-    },
-    [stagedAttachments.length, onUploadAttachments, job.id]
-  );
-
-  const removeStagedAttachment = (localId: string) => {
-    setStagedAttachments((prev) => {
-      const match = prev.find((a) => a.localId === localId);
-      if (match?.previewUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
-        try {
-          URL.revokeObjectURL(match.previewUrl);
-        } catch {}
-      }
-      return prev.filter((a) => a.localId !== localId);
-    });
-  };
-
-  const handlePaste = useCallback(
-    (e: React.ClipboardEvent) => {
-      const files = extractClipboardFiles(e);
-      if (files.length > 0) {
-        e.preventDefault();
-        void stageFiles(files);
-      }
-    },
-    [stageFiles]
-  );
-
-  const checkMentionTrigger = (text: string, cursorPos: number) => {
-    const mentionInfo = getActiveMentionQuery(text, cursorPos);
-    if (mentionInfo) {
-      setMentionState({
-        isOpen: true,
-        query: mentionInfo.query,
-        startIndex: mentionInfo.startIndex
-      });
-      setMentionHighlightedIndex(0);
-    } else {
-      setMentionState((prev) => (prev.isOpen ? { ...prev, isOpen: false } : prev));
-    }
-  };
-
-  const handlePromptChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value;
-    setPrompt(val);
-    const cursorPos = e.target.selectionStart ?? val.length;
-    checkMentionTrigger(val, cursorPos);
-  };
-
-  const handleCursorActivity = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
-    const target = e.currentTarget;
-    checkMentionTrigger(target.value, target.selectionStart ?? target.value.length);
-  };
-
-  const handleSelectMention = (member: MentionableMember) => {
-    const cursorPos = textareaRef.current?.selectionStart ?? prompt.length;
-    const mentionInfo = getActiveMentionQuery(prompt, cursorPos);
-
-    let nextPrompt: string;
-    let nextCursorPos: number;
-
-    if (mentionInfo) {
-      const before = prompt.slice(0, mentionInfo.startIndex);
-      const after = prompt.slice(cursorPos);
-      const afterClean = after.startsWith(' ') ? after.slice(1) : after;
-      const mentionTag = `@${member.id} `;
-      nextPrompt = `${before}${mentionTag}${afterClean}`;
-      nextCursorPos = before.length + mentionTag.length;
-    } else {
-      const mentionTag = `@${member.id} `;
-      nextPrompt = prompt ? `${prompt} ${mentionTag}` : mentionTag;
-      nextCursorPos = nextPrompt.length;
-    }
-
-    setPrompt(nextPrompt);
-    setMentionState({ isOpen: false, query: '', startIndex: -1 });
-    setMentionHighlightedIndex(0);
-
-    requestAnimationFrame(() => {
-      if (textareaRef.current) {
-        textareaRef.current.focus();
-        textareaRef.current.setSelectionRange(nextCursorPos, nextCursorPos);
-      }
-    });
-  };
-
-  const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (mentionState.isOpen && filteredMentionMembers.length > 0) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setMentionHighlightedIndex((prev) => (prev + 1) % filteredMentionMembers.length);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setMentionHighlightedIndex(
-          (prev) => (prev - 1 + filteredMentionMembers.length) % filteredMentionMembers.length
-        );
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setMentionState((prev) => ({ ...prev, isOpen: false }));
-        return;
-      }
-      if (e.key === 'Enter' || e.key === 'Tab') {
-        e.preventDefault();
-        const selected =
-          filteredMentionMembers[mentionHighlightedIndex] || filteredMentionMembers[0];
-        if (selected) {
-          handleSelectMention(selected);
-        }
-        return;
-      }
-    } else if (mentionState.isOpen && e.key === 'Escape') {
-      e.preventDefault();
-      setMentionState((prev) => ({ ...prev, isOpen: false }));
-      return;
-    }
-
-    // Normal Enter without Shift to send message
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      void handleSend();
-    }
-  };
-
-  const readyStagedAttachments = useMemo(
-    () => stagedAttachments.filter((a) => !a.uploading && !a.error),
-    [stagedAttachments]
-  );
-
-  const hasPendingUploads = stagedAttachments.some((a) => a.uploading);
-  const isPending = job.status === ProjectJobStatus.Pending;
-  const isCompleted = job.status === ProjectJobStatus.Completed;
-  const isArchived = job.status === ProjectJobStatus.Archived;
-  const isClosed = isArchived;
-  const canSend = Boolean(prompt.trim() || readyStagedAttachments.length > 0) && !hasPendingUploads && !isSending && !isClosed;
-
-  const handleSend = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!canSend) return;
-
-    const text = prompt.trim();
-    const attachmentsToSend: SessionAttachment[] = readyStagedAttachments.map(
-      (item) =>
-        item.uploaded || {
-          id: item.localId,
-          sessionId: job.id,
-          fileName: item.name,
-          contentType: item.contentType,
-          sizeBytes: item.sizeBytes,
-          s3Key: `jobs/${job.id}/attachments/${item.localId}/${item.name}`,
-          downloadUrl: item.previewUrl || `/api/project-jobs/${encodeURIComponent(job.id)}/attachments/${encodeURIComponent(item.localId)}/content`,
-          createdAt: new Date().toISOString()
-        }
-    );
-
-    if (pendingQuestion && text && attachmentsToSend.length === 0) {
-      setPrompt('');
-      const answers: QuestionAnswerPayload[] = pendingQuestion.questions.map((q, idx) => ({
-        questionIndex: idx,
-        question: q.question,
-        selectedOptions: [],
-        customText: text
-      }));
-      await handleAnswerQuestion(pendingQuestion.msg, pendingQuestion.questions, answers);
-      return;
-    }
-
-    const effectiveText = text || (attachmentsToSend.length > 0 ? DEFAULT_ATTACHMENT_PROMPT : '');
-
-    setPrompt('');
-    setStagedAttachments([]);
-    setAttachmentError(null);
-    setIsSending(true);
-
-    try {
-      await onSendMessage(effectiveText, attachmentsToSend.length > 0 ? attachmentsToSend : undefined);
-    } catch (err: any) {
-      setAttachmentError(err?.message || 'Failed to send message');
-    } finally {
-      setIsSending(false);
-    }
-  };
-
-  const handleUploadExistingTaskFiles = async (taskId: string, rawFiles: FileList | File[] | null) => {
-    const incoming = Array.from(rawFiles || []);
-    if (incoming.length === 0) return;
-
-    try {
-      const uploaded = await api.uploadTaskAttachments(job.id, taskId, incoming);
-      if (onUpdateTask) {
-        const target = tasks.find((t) => t.id === taskId);
-        const existingAtts = target?.attachments || [];
-        const merged = [...existingAtts];
-        for (const u of uploaded) {
-          if (!merged.some((m) => m.id === u.id)) {
-            merged.push(u);
-          }
-        }
-        await onUpdateTask(taskId, { attachments: merged });
-      }
-    } catch (err: any) {
-      setAttachmentError(err?.message || 'Failed to upload task attachment');
-    } finally {
-      setTargetTaskForUpload(null);
-    }
-  };
-
-  const handleProceedToCoding = async (targetTask?: JobTask, personaId?: string | null) => {
-    if (targetTask && onUpdateTask && targetTask.requiresDiscussion) {
-      await onUpdateTask(targetTask.id, { requiresDiscussion: false });
-    }
-    const mentionPrefix = personaId ? `@${personaId} ` : '';
-    const proceedText = `${mentionPrefix}Discussion approved — proceed with implementation of "${targetTask?.title || 'the task'}".`;
-    await onSendMessage(proceedText);
-  };
-
-  const handleMentionInsert = (personaId: string) => {
-    const mentionTag = `@${personaId} `;
-    setPrompt((prev) => {
-      if (prev.endsWith(' ') || prev.length === 0) {
-        return prev + mentionTag;
-      }
-      return `${prev} ${mentionTag}`;
-    });
-    textareaRef.current?.focus();
-  };
-
   const handleConfirmComplete = async () => {
     setIsCompleting(true);
     try {
       await onCompleteJob(resultSummary.trim() || undefined);
       setShowCompleteConfirm(false);
+      setResultSummary('');
     } finally {
       setIsCompleting(false);
     }
@@ -1263,43 +315,21 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
-  const completedCount = uniqueTasks.filter((t) => t.isCompleted).length;
-  const progressPercent = uniqueTasks.length > 0 ? Math.round((completedCount / uniqueTasks.length) * 100) : 0;
-  const firstPendingTask = uniqueTasks.find((t) => !t.isCompleted);
-  const firstPendingTaskId = firstPendingTask?.id;
-  const firstPendingTaskIndex = firstPendingTask ? uniqueTasks.findIndex((t) => t.id === firstPendingTaskId) : -1;
+  const handleConfirmReset = async () => {
+    if (!onResetJob) return;
+    setIsResetting(true);
+    try {
+      await onResetJob();
+      setShowResetConfirm(false);
+    } catch (err: any) {
+      console.error('Failed to reset job:', err);
+    } finally {
+      setIsResetting(false);
+    }
+  };
 
   return (
-    <div
-      className="flex-1 flex flex-col h-full bg-slate-950 overflow-hidden relative"
-      onDragOver={(e) => {
-        e.preventDefault();
-        setIsDragging(true);
-      }}
-      onDragLeave={(e) => {
-        e.preventDefault();
-        setIsDragging(false);
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        setIsDragging(false);
-        if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-          void stageFiles(e.dataTransfer.files);
-        }
-      }}
-    >
-      {/* Drag & Drop Overlay */}
-      {isDragging && (
-        <div
-          className="absolute inset-3 z-40 rounded-2xl bg-sky-950/90 border-2 border-dashed border-sky-400 flex flex-col items-center justify-center text-sky-200 pointer-events-none"
-          data-testid="job-dropzone-overlay"
-        >
-          <Paperclip className="w-10 h-10 mb-2 text-sky-400 animate-bounce" />
-          <span className="text-sm font-semibold">Drop images or files to attach to this job</span>
-          <span className="text-xs text-sky-300/80 mt-1">Up to 10 files (max 25 MB each)</span>
-        </div>
-      )}
-
+    <div className="flex-1 flex flex-col h-full bg-slate-950 overflow-hidden relative">
       {/* Header Bar */}
       <div className="px-3 sm:px-6 py-2.5 sm:py-3.5 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-sm flex flex-col md:flex-row md:items-center justify-between gap-2.5 sm:gap-4 shrink-0">
         <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 w-full md:w-auto">
@@ -1326,20 +356,18 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   Completed
                 </span>
               ) : isPending ? (
-                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 border border-slate-700/60 flex items-center gap-1" data-testid="job-status-pending">
+                <span
+                  className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 border border-slate-700/60 flex items-center gap-1"
+                  data-testid="job-status-pending"
+                >
                   <Clock className="w-3 h-3 text-slate-400" /> Pending Start
                 </span>
               ) : (
-                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40" data-testid="job-status-active">
-                  Active Job
-                </span>
-              )}
-              {isWaitingForInput && (
                 <span
-                  className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 animate-pulse"
-                  data-testid="waiting-for-input-badge"
+                  className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40"
+                  data-testid="job-status-active"
                 >
-                  <HelpCircle className="w-3 h-3 text-amber-400" /> Waiting for Input
+                  Active Job
                 </span>
               )}
               {job.priority !== undefined && (
@@ -1359,9 +387,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 </span>
               )}
             </div>
-            <h1 className="text-base font-bold text-slate-100 truncate mt-0.5">
-              {job.title}
-            </h1>
+            <h1 className="text-base font-bold text-slate-100 truncate mt-0.5">{job.title}</h1>
           </div>
         </div>
 
@@ -1428,44 +454,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             </button>
           )}
 
-          <button
-            type="button"
-            onClick={() => setShowTimelineCockpit((prev) => !prev)}
-            title={showTimelineCockpit ? 'Switch to Conversational Chat View' : 'Switch to Structured Timeline Cockpit'}
-            aria-pressed={showTimelineCockpit}
-            data-testid="toggle-timeline-cockpit-btn"
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition cursor-pointer ${
-              showTimelineCockpit
-                ? 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300'
-                : 'bg-slate-950/80 border-slate-800 text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Activity className="w-3.5 h-3.5" />
-            <span>Timeline</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setShowTeamSidebar((prev) => !prev)}
-            title={showTeamSidebar ? 'Hide Team & Activity Sidebar' : 'Show Team & Activity Sidebar'}
-            data-testid="toggle-team-sidebar-btn"
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition cursor-pointer ${
-              showTeamSidebar
-                ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
-                : 'bg-slate-950/80 border-slate-800 text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            <span>Team ({teamMembers.length})</span>
-            {activeTurnInfo?.isActive && (
-              <span className="w-2 h-2 rounded-full bg-sky-400 animate-ping shrink-0" />
-            )}
-          </button>
-
-          {/* Artifacts panel toggle — the job twin of the session header's Artifacts button, styled to
-              match this header's Team toggle so the two side-by-side controls read as one group.
-              Rendered only when the parent actually owns a panel: a toggle that toggles nothing is worse
-              than no toggle. */}
           {onToggleJobArtifactsPanel && (
             <button
               type="button"
@@ -1484,11 +472,6 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
             </button>
           )}
 
-          {/* Changes panel toggle — the second tab of the same column.
-              No count badge, unlike Artifacts: the artifact list is an index read the app already makes
-              on job switch, while a change count is a `git`-backed read. Paying for one per job the
-              operator merely clicks through, most of which they will never inspect, has no buyer — so
-              the number appears once the panel is open instead. */}
           {onToggleJobChangesPanel && (
             <button
               type="button"
@@ -1663,1247 +646,21 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         </div>
       </div>
 
-      {/* Plan Approval Action Banner (Stage 2 Gate) */}
-      {isAwaitingApproval && (
-        <div
-          className="border-b border-amber-500/30 bg-amber-950/30 px-3 sm:px-6 py-3 shrink-0"
-          data-testid="plan-approval-action-bar"
-        >
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-            <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4 text-amber-400" />
-                <span className="text-xs font-semibold text-amber-200">
-                  Plan Approval Gate Required (Stage 2)
-                </span>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                  {job.approvalPolicy === PlanApprovalPolicy.HumanOnly || job.approvalPolicy === 1
-                    ? 'Human Only'
-                    : job.approvalPolicy === PlanApprovalPolicy.Autonomous || job.approvalPolicy === 2
-                      ? 'Autonomous'
-                      : 'Lead or Human'}
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-300">
-                The implementer completed discovery and proposed {uniqueTasks.length} tasks in the checklist. Approve to unblock autonomous implementation.
-              </p>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {approvalError && (
-                <span className="text-[11px] text-rose-400 max-w-[200px] truncate" title={approvalError}>
-                  {approvalError}
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={handleApprovePlan}
-                disabled={isApprovingPlan || ((job.approvalPolicy === PlanApprovalPolicy.HumanOnly || job.approvalPolicy === 1) && userRole !== 'operator')}
-                className="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition shadow-sm cursor-pointer"
-                data-testid="approve-plan-btn"
-              >
-                {isApprovingPlan ? (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Check className="w-3.5 h-3.5" />
-                )}
-                <span>Approve Plan</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Redesigned Task Checklist */}
-      <div className="px-3 sm:px-6 py-2 sm:py-3 border-b border-slate-800/60 bg-slate-900/50">
-        {/* Task Header & Progress Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 sm:gap-4 mb-2">
-          <div className="flex items-center flex-wrap gap-2 sm:gap-2.5 min-w-0">
-            <button
-              type="button"
-              onClick={() => setIsTasksExpanded((prev) => !prev)}
-              className="text-slate-400 hover:text-slate-200 p-0.5 rounded transition flex items-center gap-1.5 cursor-pointer"
-              title={isTasksExpanded ? 'Collapse task list' : 'Expand task list'}
-              data-testid="toggle-tasks-btn"
-            >
-              {isTasksExpanded ? (
-                <ChevronDown className="w-4 h-4 text-slate-400" />
-              ) : (
-                <ChevronRight className="w-4 h-4 text-slate-400" />
-              )}
-              <ListTodo className="w-4 h-4 text-sky-400 shrink-0" />
-              <span className="text-xs font-semibold text-slate-200">Tasks & Objectives</span>
-            </button>
-            <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
-              ({completedCount}/{uniqueTasks.length} completed • {progressPercent}%)
-            </span>
-            <span
-              className="text-[11px] font-mono text-slate-300 bg-slate-800/80 px-2 py-0.5 rounded-full border border-slate-700/50 shrink-0"
-              data-testid="deterministic-progress-meter"
-            >
-              Task {uniqueTasks.length === 0 ? 0 : (firstPendingTaskIndex >= 0 ? firstPendingTaskIndex + 1 : uniqueTasks.length)} of {uniqueTasks.length} ({progressPercent}% complete)
-            </span>
-            {firstPendingTask ? (
-              <div className="hidden xl:flex flex-col gap-0.5 max-w-xs truncate">
-                <span
-                  className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-lg border max-w-xs truncate ${
-                    isAwaitingApproval
-                      ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
-                      : firstPendingTask.requiresDiscussion
-                      ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
-                      : 'bg-sky-500/10 text-sky-300 border-sky-500/25'
-                  }`}
-                  title={
-                    isAwaitingApproval
-                      ? 'Plan Approval Gate Required (Stage 2)'
-                      : `Current sequential target: ${firstPendingTask.title}${firstPendingTask.requiresDiscussion ? ' (Discussion Required)' : ''}`
-                  }
-                  data-testid="current-focus-badge"
-                >
-                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isAwaitingApproval || firstPendingTask.requiresDiscussion ? 'bg-amber-400 animate-pulse' : 'bg-sky-400 animate-pulse'}`} />
-                  <span className="text-slate-400 font-normal">
-                    {isAwaitingApproval ? 'Stage 2 Gate:' : 'Focus:'}
-                  </span>
-                  {isAwaitingApproval ? (
-                    <span className="text-amber-400 font-semibold" data-testid="focus-awaiting-approval-tag">Awaiting Plan Approval</span>
-                  ) : (
-                    <>
-                      {firstPendingTask.requiresDiscussion && (
-                        <span className="text-amber-400 font-semibold" data-testid="focus-discuss-tag">[Discuss]</span>
-                      )}
-                      <span className="truncate">#{firstPendingTaskIndex + 1} {firstPendingTask.title}</span>
-                    </>
-                  )}
-                </span>
-                {job.progressHeartbeat && (
-                  <div
-                    className="flex items-center gap-1.5 text-[10px] text-sky-300/90 italic pl-1 truncate"
-                    title={`Heartbeat: ${job.progressHeartbeat}`}
-                    data-testid="job-progress-heartbeat"
-                  >
-                    <Activity className="w-3 h-3 text-sky-400 shrink-0 animate-pulse" />
-                    <span className="truncate">{job.progressHeartbeat}</span>
-                  </div>
-                )}
-              </div>
-            ) : job.progressHeartbeat ? (
-              <div
-                className="hidden xl:flex items-center gap-1.5 text-[11px] text-sky-300/90 italic pl-1 max-w-sm truncate"
-                title={`Heartbeat: ${job.progressHeartbeat}`}
-                data-testid="job-progress-heartbeat"
-              >
-                <Activity className="w-3 h-3 text-sky-400 shrink-0 animate-pulse" />
-                <span className="truncate">{job.progressHeartbeat}</span>
-              </div>
-            ) : null}
-          </div>
-
-          <div className="flex items-center justify-between sm:justify-end gap-2 sm:gap-3 w-full sm:w-auto shrink-0">
-            {isTasksExpanded && (
-              <div className="flex items-center bg-slate-950/80 border border-slate-800 rounded-lg p-0.5 text-[11px]">
-                <button
-                  type="button"
-                  onClick={() => setTaskFilter('all')}
-                  className={`px-2 py-0.5 rounded-md transition ${
-                    taskFilter === 'all'
-                      ? 'bg-slate-800 text-sky-300 font-semibold shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  All ({uniqueTasks.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setTaskFilter('pending')}
-                  className={`px-2 py-0.5 rounded-md transition ${
-                    taskFilter === 'pending'
-                      ? 'bg-slate-800 text-sky-300 font-semibold shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Pending ({uniqueTasks.length - completedCount})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setTaskFilter('completed')}
-                  className={`px-2 py-0.5 rounded-md transition ${
-                    taskFilter === 'completed'
-                      ? 'bg-slate-800 text-sky-300 font-semibold shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Done ({completedCount})
-                </button>
-              </div>
-            )}
-            <div className="w-20 sm:w-32 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
-              <div
-                className="h-full bg-emerald-500 transition-all duration-300 rounded-full"
-                style={{ width: `${progressPercent}%` }}
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* Expandable Task Content */}
-        {isTasksExpanded && (
-          <div className="space-y-2 mt-2">
-            {/* Task Item Rows */}
-            {filteredTasks.length === 0 ? (
-              <div className="py-4 px-4 rounded-xl bg-slate-950/40 border border-slate-800/60 text-center text-xs text-slate-400">
-                {uniqueTasks.length === 0
-                  ? isPending
-                    ? "Job pending. Click 'Start Job' to begin Stage 1 discovery and task breakdown."
-                    : (job.progressHeartbeat || "Autonomous implementer exploring repository to decompose tasks into living checklist...")
-                  : taskFilter === 'pending' && completedCount === uniqueTasks.length
-                  ? `All ${uniqueTasks.length} tasks completed!`
-                  : `No ${taskFilter} tasks found.`}
-              </div>
-            ) : (
-              <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1" data-testid="job-tasks-list">
-                {filteredTasks.map((task, idx) => {
-                  const isCurrentFocus = !isAwaitingApproval && !task.isCompleted && (task.id === (job.currentTaskId || firstPendingTaskId));
-                  const isTaskCompleted = task.isCompleted || task.status === 'completed';
-                  const isTaskInProgress = !task.isCompleted && !isAwaitingApproval && (task.status === 'in_progress' || isCurrentFocus);
-
-                  return (
-                    <div
-                      key={task.id}
-                      className={`flex flex-col gap-1.5 px-3 py-2 rounded-xl border text-xs transition ${
-                        isTaskCompleted
-                          ? 'bg-emerald-950/15 border-emerald-500/25 text-emerald-300/80'
-                          : isTaskInProgress
-                          ? 'bg-sky-950/25 border-sky-500/40 text-slate-100 shadow-sm ring-1 ring-sky-500/20'
-                          : 'bg-slate-950/60 border-slate-800/80 text-slate-300'
-                      }`}
-                      data-testid={`task-row-${task.id}`}
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                          {isTaskCompleted ? (
-                            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" data-testid={`task-completed-icon-${task.id}`} />
-                          ) : isTaskInProgress ? (
-                            <div className="relative flex items-center justify-center w-4 h-4 shrink-0" data-testid={`task-progress-indicator-${task.id}`}>
-                              <span className="animate-ping absolute inline-flex h-3 w-3 rounded-full bg-sky-400 opacity-75"></span>
-                              <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-500"></span>
-                            </div>
-                          ) : (
-                            <Circle className="w-4 h-4 text-slate-500 shrink-0" data-testid={`task-todo-icon-${task.id}`} />
-                          )}
-                          <span className={`font-mono text-[10px] shrink-0 ${isTaskInProgress ? 'text-sky-400 font-semibold' : 'text-slate-500'}`}>
-                            #{idx + 1}
-                          </span>
-                          <div className="min-w-0 flex-1 flex flex-wrap items-center gap-2">
-                            <span
-                              className={`break-words leading-relaxed ${
-                                isTaskCompleted
-                                  ? 'line-through text-slate-400'
-                                  : isTaskInProgress
-                                  ? 'text-slate-100 font-semibold'
-                                  : 'text-slate-200 font-medium'
-                              }`}
-                            >
-                              {task.title}
-                            </span>
-                            {task.targetFile && (
-                              <span
-                                className="font-mono text-[10px] text-sky-300 bg-sky-950/50 px-1.5 py-0.5 rounded border border-sky-800/50 truncate max-w-[200px]"
-                                title={`Target file: ${task.targetFile}`}
-                                data-testid={`task-target-file-${task.id}`}
-                              >
-                                {task.targetFile}
-                              </span>
-                            )}
-                            {task.verificationMethod && (
-                              <span
-                                className="font-mono text-[10px] text-emerald-300 bg-emerald-950/50 px-1.5 py-0.5 rounded border border-emerald-800/50 truncate max-w-[180px]"
-                                title={`Verification method: ${task.verificationMethod}`}
-                                data-testid={`task-verification-${task.id}`}
-                              >
-                                {task.verificationMethod}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 shrink-0">
-                          {task.assignedPersonaId && (
-                            <span
-                              className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/60 text-slate-400 border border-slate-700/50 truncate max-w-[110px]"
-                              title={`Assigned to @${memberNameFor(task.assignedPersonaId)}`}
-                              data-testid={`task-assignee-static-${task.id}`}
-                            >
-                              @{memberNameFor(task.assignedPersonaId)}
-                            </span>
-                          )}
-                          {isTaskCompleted ? (
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
-                              Completed
-                            </span>
-                          ) : isTaskInProgress ? (
-                            <span
-                              className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-sky-500/15 text-sky-300 border border-sky-500/30 flex items-center gap-1 font-semibold"
-                              data-testid={`task-focus-${task.id}`}
-                            >
-                              <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
-                              In Progress
-                            </span>
-                          ) : (
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800/80 text-slate-400 border border-slate-700/40">
-                              Queued
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Heartbeat Note beneath active task indicator */}
-                      {isTaskInProgress && job.progressHeartbeat && (
-                        <div
-                          className="flex items-center gap-1.5 text-[11px] text-sky-300/90 italic pt-0.5 pl-6"
-                          data-testid="task-heartbeat-note"
-                        >
-                          <Activity className="w-3 h-3 text-sky-400 animate-pulse shrink-0" />
-                          <span className="truncate">{job.progressHeartbeat}</span>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
+      {/* Main Workspace: Structured Timeline Cockpit (StickySidebar + TimelineFeed) */}
+      <div className="flex-1 min-h-0 overflow-hidden" data-testid="timeline-cockpit-container">
+        <CockpitLayout
+          jobId={job.id}
+          job={job}
+          tasks={tasks}
+          project={project}
+          personas={personas}
+          onStartJob={isPending && onStartJob ? handleStartJob : undefined}
+          isStarting={isStarting}
+          onAssignTask={onAssignTask}
+          onCancelQueuedTurn={onCancelQueuedTurn}
+          onCancelQueuedTurns={onCancelQueuedTurns}
+        />
       </div>
-
-      {/* Main Workspace: Conversational Chat Flow + Team & Activity Sidebar */}
-      {showTimelineCockpit ? (
-        <div className="flex-1 min-h-0 overflow-hidden" data-testid="timeline-cockpit-container">
-          <CockpitLayout jobId={job.id} />
-        </div>
-      ) : (
-      <div className="flex-1 flex min-h-0 overflow-hidden relative">
-        {/* Left Column: Conversational Chat Flow */}
-        <div className="flex-1 flex flex-col min-h-0 relative">
-          {/* Live Chat Message Feed */}
-          <div
-            ref={handleChatContainerRef}
-            onScroll={handleMessagesScroll}
-            data-testid="job-messages-container"
-            className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-3 sm:space-y-4 relative"
-          >
-            {messages.length === 0 ? (
-              activeTurnInfo?.isActive ? (
-                <div
-                  className="h-full flex flex-col items-center justify-center text-center p-8 max-w-md mx-auto"
-                  data-testid="cockpit-active-turn-empty-state"
-                >
-                  <div className="relative w-14 h-14 rounded-2xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400 mb-4 shadow-lg shadow-sky-500/5">
-                    <Bot className="w-7 h-7" />
-                    <span className="absolute -top-1 -right-1 w-3 h-3 rounded-full bg-sky-400 animate-ping" />
-                    <span className="absolute -top-1 -right-1 w-3 h-3 rounded-full bg-sky-500" />
-                  </div>
-                  <h3 className="text-base font-semibold text-slate-200">
-                    {activeTurnInfo.personaName} is actively working
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
-                    {activeTurnInfo.statusText || 'Exploring the workspace, analyzing requirements, and executing initial turn tasks.'}
-                  </p>
-                  {activeTurnInfo.turnSessionId && onSelectTurnSession && (
-                    <button
-                      type="button"
-                      onClick={() => onSelectTurnSession(activeTurnInfo.turnSessionId!)}
-                      className="mt-4 px-4 py-2 bg-sky-600/20 hover:bg-sky-600/30 border border-sky-500/40 text-sky-300 hover:text-sky-200 rounded-xl text-xs font-semibold flex items-center gap-2 transition cursor-pointer shadow-sm"
-                      data-testid="cockpit-view-active-turn-trajectory"
-                    >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>View Live Trajectory</span>
-                    </button>
-                  )}
-                  <p className="text-[11px] text-slate-500 mt-4">
-                    You can also queue instructions or questions below.
-                  </p>
-                </div>
-              ) : (
-                <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-500">
-                  <Bot className="w-12 h-12 stroke-[1.2] text-slate-600 mb-3" />
-                  <h3 className="text-sm font-semibold text-slate-300">Job Collaboration Channel Ready</h3>
-                  <p className="text-xs text-slate-500 max-w-sm mt-1">
-                    Give instructions, attach files, or assign tasks to your team. Use <code className="text-sky-400 font-mono">@persona</code> to tag specific personas.
-                  </p>
-                </div>
-              )
-            ) : (
-              messages.map((msg) => {
-                const isUser = msg.senderType === 'user';
-                const isSystem = msg.senderType === 'system';
-                const msgAttachments = extractJobMessageAttachments(msg);
-
-                if (isSystem) {
-                  return (
-                    <div
-                      key={msg.id}
-                      className="flex justify-center my-2"
-                      data-testid={`system-message-${msg.id}`}
-                    >
-                      <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-800/80 border border-slate-700/60 text-xs text-slate-300 shadow-sm max-w-xl text-center">
-                        <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                        <span>{msg.content}</span>
-                        <span className="text-[10px] text-slate-500 font-mono shrink-0">
-                          {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                }
-
-                return (
-                  <div
-                    key={msg.id}
-                    className={`flex gap-3 max-w-3xl ${isUser ? 'ml-auto flex-row-reverse' : ''}`}
-                  >
-                    <div
-                      className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 border ${
-                        isUser
-                          ? 'bg-sky-500/20 text-sky-300 border-sky-500/30'
-                          : 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
-                      }`}
-                    >
-                      {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
-                    </div>
-
-                    <div className={`space-y-1.5 ${isUser ? 'text-right' : ''}`}>
-                      <div className="flex items-center gap-2 text-xs">
-                        <span className="font-semibold text-slate-200">
-                          {isUser ? 'You' : msg.senderName || msg.senderId || 'Persona'}
-                        </span>
-                        {!isUser && msg.senderId && (
-                          <span className="text-[10px] font-mono text-sky-400 bg-sky-500/10 px-1.5 py-0.2 rounded border border-sky-500/20">
-                            @{msg.senderId}
-                          </span>
-                        )}
-                        <span className="text-[10px] text-slate-500">
-                          {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </span>
-                      </div>
-
-                      {(() => {
-                        const hasReadyToProceed = !isUser && msg.content.includes('[READY_TO_PROCEED]');
-                        const displayContent = hasReadyToProceed
-                          ? msg.content.replace(/\[READY_TO_PROCEED\]/gi, '').trim()
-                          : msg.content;
-
-                        return (
-                          <>
-                            <div
-                              className={`p-3.5 rounded-2xl text-xs leading-relaxed border ${
-                                isUser
-                                  ? 'bg-sky-600/20 border-sky-500/30 text-sky-100 text-left rounded-tr-none'
-                                  : 'bg-slate-900 border-slate-800 text-slate-200 rounded-tl-none shadow-sm text-left'
-                              }`}
-                            >
-                              <MarkdownMessage content={displayContent} isUser={isUser} />
-                            </div>
-
-                            {hasReadyToProceed && (
-                              <div
-                                className="mt-2.5 p-3.5 rounded-2xl bg-sky-950/30 border border-sky-500/30 text-xs space-y-2.5 shadow-sm text-left"
-                                data-testid={`ready-to-proceed-card-${msg.id}`}
-                              >
-                                <div className="flex items-center justify-between gap-2">
-                                  <div className="flex items-center gap-2 text-sky-200 font-semibold">
-                                    <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
-                                    <span>Ready to Proceed</span>
-                                  </div>
-                                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-300 border border-sky-500/25">
-                                    Alignment Proposed
-                                  </span>
-                                </div>
-                                <p className="text-[11px] text-slate-300 leading-relaxed">
-                                  The team has aligned on requirements and is ready to begin coding on the target task. Confirm to proceed with implementation, or reply in chat to continue discussing.
-                                </p>
-                                <div className="flex items-center gap-2 pt-1 flex-wrap">
-                                  {firstPendingTask && firstPendingTask.requiresDiscussion ? (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleProceedToCoding(firstPendingTask, msg.senderId)}
-                                      className="px-3.5 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold transition text-xs flex items-center gap-1.5 cursor-pointer shadow-sm"
-                                      data-testid="proceed-to-coding-btn"
-                                    >
-                                      <Play className="w-3.5 h-3.5 fill-current" />
-                                      <span>Proceed to Coding</span>
-                                    </button>
-                                  ) : (
-                                    <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 font-medium">
-                                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                                      <span>Discussion approved — implementation unlocked</span>
-                                    </div>
-                                  )}
-                                  <span className="text-[11px] text-slate-500 italic ml-1">
-                                    or continue talking below
-                                  </span>
-                                </div>
-                              </div>
-                            )}
-
-                            {(() => {
-                              const msgQuestions = isUser ? [] : extractQuestionsFromJobMessage(msg);
-
-                              if (msgQuestions.length === 0) return null;
-
-                              const msgIndex = messages.findIndex((m) => m.id === msg.id);
-                              const subsequentUserMsg = messages
-                                .slice(msgIndex >= 0 ? msgIndex + 1 : 0)
-                                .find((other) => other.senderType === 'user');
-
-                              const isMsgQuestionAnswered =
-                                answeredQuestionIds.includes(msg.id) ||
-                                Boolean(subsequentUserMsg);
-
-                              const answeredText = (() => {
-                                if (!isMsgQuestionAnswered) return undefined;
-                                if (subsequentUserMsg?.content) {
-                                  if (subsequentUserMsg.content.includes('User answered question')) {
-                                    return subsequentUserMsg.content.replace(/^User answered question:\n?/i, '');
-                                  }
-                                  return `Addressed in subsequent reply: "${subsequentUserMsg.content.slice(0, 120)}${subsequentUserMsg.content.length > 120 ? '...' : ''}"`;
-                                }
-                                return 'Answer submitted';
-                              })();
-
-                              return (
-                                <div className="mt-2.5 text-left" data-testid={`job-question-container-${msg.id}`}>
-                                  <QuestionCard
-                                    cardKey={`job-q-${msg.id}`}
-                                    targetId={msg.id}
-                                    eventCreatedAt={msg.createdAt}
-                                    parsedQuestions={msgQuestions}
-                                    isAnswered={isMsgQuestionAnswered}
-                                    answeredContent={answeredText}
-                                    isSubmitting={submittingQuestionId === msg.id}
-                                    onSubmit={async (answers) => {
-                                      await handleAnswerQuestion(msg, msgQuestions, answers);
-                                    }}
-                                  />
-                                </div>
-                              );
-                            })()}
-                          </>
-                        );
-                      })()}
-
-                  {/* Message Attachments Rendering */}
-                  {msgAttachments.length > 0 && (
-                    <div
-                      className={`flex flex-wrap gap-2 pt-1 ${isUser ? 'justify-end' : 'justify-start'}`}
-                      data-testid={`job-message-attachments-${msg.id}`}
-                    >
-                      {msgAttachments.map((att) => {
-                        const isImg = isImageAttachment(att.contentType, att.fileName);
-                        const targetId = att.id || att.fileName;
-                        const streamUrl = att.downloadUrl || (targetId ? `/api/project-jobs/${encodeURIComponent(msg.jobId)}/attachments/${encodeURIComponent(targetId)}/content` : '');
-
-                        if (isImg && streamUrl) {
-                          return (
-                            <button
-                              key={att.id || att.fileName}
-                              type="button"
-                              onClick={() =>
-                                handleOpenLightbox({
-                                  url: streamUrl,
-                                  fileName: att.fileName || 'attachment.png',
-                                  sizeBytes: att.sizeBytes
-                                })
-                              }
-                              aria-label={`Zoom image ${att.fileName || 'image'}`}
-                              className="group relative rounded-xl overflow-hidden border border-sky-500/40 bg-slate-950/80 hover:border-sky-300 transition cursor-pointer"
-                            >
-                              <img
-                                src={streamUrl}
-                                alt={att.fileName || 'attachment image'}
-                                className="max-h-36 max-w-[200px] object-cover block"
-                              />
-                              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-1 text-xs font-semibold text-white">
-                                <ZoomIn className="w-4 h-4 text-sky-300" />
-                                <span>Zoom</span>
-                              </div>
-                            </button>
-                          );
-                        }
-
-                        return (
-                          <a
-                            key={att.id || att.fileName}
-                            href={streamUrl ? `${streamUrl}${streamUrl.includes('?') ? '&' : '?'}download=true` : '#'}
-                            download={att.fileName || 'attachment'}
-                            className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-slate-950/80 hover:bg-slate-900 border border-sky-500/30 hover:border-sky-400 text-xs text-slate-200 transition"
-                          >
-                            <FileText className="w-4 h-4 text-sky-400 shrink-0" />
-                            <div className="min-w-0 text-left">
-                              <div className="font-mono text-xs text-white truncate max-w-[160px]">
-                                {att.fileName || 'Attachment'}
-                              </div>
-                              <div className="text-[10px] text-slate-400">
-                                {formatAttachmentSize(att.sizeBytes)}
-                              </div>
-                            </div>
-                            <Download className="w-3.5 h-3.5 text-sky-400 shrink-0 ml-1" />
-                          </a>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {/* Two-Tier Turn Execution Button */}
-                  {msg.turnSessionId && (
-                    <div className={isUser ? 'text-right' : 'text-left'}>
-                      <button
-                        type="button"
-                        onClick={() => onSelectTurnSession?.(msg.turnSessionId!)}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[11px] text-sky-400 hover:text-sky-300 transition cursor-pointer shadow-sm"
-                      >
-                        <Sparkles className="w-3 h-3 text-sky-400" />
-                        <span>View Turn Execution & Trajectory</span>
-                        <ChevronRight className="w-3 h-3" />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })
-        )}
-
-        {/* Subtle conversational working indicator at bottom of message stream */}
-        {activeTurnInfo?.isActive && (
-          <div className={`flex items-center gap-2 py-1.5 px-3 text-xs font-medium ${activeTurnInfo.isOffline ? 'text-amber-400' : 'text-sky-400'}`}>
-            {activeTurnInfo.isOffline ? (
-              <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-            ) : (
-              <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400 shrink-0" />
-            )}
-            <span>
-              {activeTurnInfo.isOffline
-                ? `${activeTurnInfo.personaName} is queued (waiting for runner @${activeTurnInfo.driverId || 'agent'} to connect)...`
-                : `${activeTurnInfo.personaName} is working on this turn...`}
-            </span>
-          </div>
-        )}
-
-        <div ref={messagesEndRef} />
-      </div>
-
-      {/* Floating Scroll-to-Bottom Pill when user scrolls up */}
-      {isScrolledUp && (
-        <button
-          type="button"
-          onClick={() => scrollToBottom(true)}
-          className="absolute bottom-24 right-8 z-30 px-3.5 py-2 rounded-full bg-slate-900/95 hover:bg-slate-800 text-sky-400 hover:text-sky-300 border border-slate-700 shadow-2xl flex items-center gap-2 text-xs font-semibold backdrop-blur transition cursor-pointer"
-          data-testid="job-scroll-to-bottom-btn"
-        >
-          <ArrowDown className="w-3.5 h-3.5 animate-bounce" />
-          <span>New messages below</span>
-        </button>
-      )}
-
-      {/* Prompt Composer & Mention Bar */}
-      <div className="p-3 sm:p-4 border-t border-slate-800/80 bg-slate-900/80 backdrop-blur-sm shrink-0 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-        {/* Attachment Error Banner */}
-        {attachmentError && (
-          <div className="mb-2.5 px-3 py-2 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-              <span>{attachmentError}</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAttachmentError(null)}
-              className="text-rose-400 hover:text-rose-200 text-xs font-semibold cursor-pointer"
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {/* Staged Attachments Preview Bar */}
-        {stagedAttachments.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-2.5" data-testid="job-staged-attachments">
-            {stagedAttachments.map((att) => {
-              const isImg = isImageAttachment(att.contentType, att.name);
-              return (
-                <div
-                  key={att.localId}
-                  className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-950 border text-xs text-slate-200 max-w-xs ${
-                    att.error ? 'border-rose-500/50 bg-rose-950/20' : 'border-slate-800'
-                  }`}
-                >
-                  {isImg && att.previewUrl ? (
-                    <img
-                      src={att.previewUrl}
-                      alt={att.name}
-                      className="w-7 h-7 object-cover rounded shrink-0 border border-slate-700"
-                    />
-                  ) : isImg ? (
-                    <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
-                  ) : (
-                    <FileText className="w-4 h-4 text-slate-400 shrink-0" />
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-mono text-[11px] text-white max-w-[130px]">{att.name}</div>
-                    <div className="text-[10px] text-slate-400">
-                      {att.uploading ? (
-                        <span className="text-sky-400 animate-pulse">Uploading...</span>
-                      ) : att.error ? (
-                        <span className="text-rose-400">{att.error}</span>
-                      ) : (
-                        formatAttachmentSize(att.sizeBytes)
-                      )}
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => removeStagedAttachment(att.localId)}
-                    aria-label={`Remove attachment ${att.name}`}
-                    className="p-0.5 rounded hover:bg-slate-800 text-slate-400 hover:text-rose-400 transition cursor-pointer"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Quick Mention Chips */}
-        {project.assignedPersonas && project.assignedPersonas.length > 0 && (
-          <div className="flex items-center gap-1.5 mb-2.5 overflow-x-auto pb-1 text-xs">
-            <span className="text-[11px] font-semibold text-slate-500 mr-1 shrink-0">Quick Mention:</span>
-            {project.assignedPersonas.map((p) => (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => handleMentionInsert(p.id)}
-                className="px-2 py-0.5 rounded-md bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-sky-500/40 text-[11px] text-slate-300 hover:text-sky-300 transition shrink-0 cursor-pointer"
-              >
-                @{p.id}
-              </button>
-            ))}
-          </div>
-        )}
-
-        <form onSubmit={handleSend} className="relative flex items-center gap-2">
-          {/* Hidden File Input */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            data-testid="job-file-input"
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) {
-                void stageFiles(e.target.files);
-                e.target.value = '';
-              }
-            }}
-          />
-
-          {/* Hidden File Input for Existing Task Attachments */}
-          <input
-            ref={existingTaskFileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            data-testid="existing-task-file-input"
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0 && targetTaskForUpload) {
-                void handleUploadExistingTaskFiles(targetTaskForUpload, e.target.files);
-                e.target.value = '';
-              }
-            }}
-          />
-
-          {/* Paperclip Attach Button */}
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            title="Attach files (Images, PDFs, Code, Logs, ZIP — max 25 MB)"
-            aria-label="Attach files"
-            data-testid="job-attach-btn"
-            disabled={isClosed || isSending}
-            className="p-3 bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-sky-300 disabled:opacity-40 rounded-xl transition cursor-pointer shrink-0 shadow-md flex items-center justify-center self-stretch"
-          >
-            <Paperclip className="w-4 h-4" />
-          </button>
-
-          <div className="relative flex-1">
-            <TeamMentionPalette
-              members={teamMembers}
-              query={mentionState.query}
-              isOpen={mentionState.isOpen}
-              highlightedIndex={mentionHighlightedIndex}
-              onSelect={handleSelectMention}
-              onClose={() => setMentionState((prev) => ({ ...prev, isOpen: false }))}
-              triggerRef={textareaRef}
-            />
-            <textarea
-              ref={textareaRef}
-              rows={2}
-              value={prompt}
-              onChange={handlePromptChange}
-              onKeyUp={handleCursorActivity}
-              onClick={handleCursorActivity}
-              onKeyDown={handlePromptKeyDown}
-              onPaste={handlePaste}
-              placeholder={
-                isArchived
-                  ? "This job is archived and read-only. Reopen the job to post messages..."
-                  : isWaitingForInput
-                  ? "Agent is waiting for your answer above (type here or use the card above to respond)..."
-                  : isCompleted
-                  ? "Job completed. Continue discussion, delegate with @persona, or reopen if needed..."
-                  : "Type your message, tasks, or delegate with @persona (Press Enter to send)..."
-              }
-              disabled={isClosed || isSending}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition resize-none disabled:opacity-50"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={!canSend}
-            className="p-3 bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 rounded-xl transition cursor-pointer shrink-0 shadow-md flex items-center justify-center self-stretch"
-            title="Send Message"
-          >
-            <Send className="w-4 h-4" />
-          </button>
-        </form>
-      </div>
-    </div>
-
-      {/* Team & Activity Sidebar */}
-      {showTeamSidebar && (
-        <>
-          {/* Mobile Backdrop Overlay */}
-          <div
-            className="md:hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-xs"
-            onClick={() => setShowTeamSidebar(false)}
-            data-testid="job-team-sidebar-backdrop"
-          />
-          <aside
-            className="fixed inset-y-0 right-0 z-50 w-full sm:w-80 max-w-[85vw] border-l border-slate-800 bg-slate-950 shadow-2xl flex flex-col overflow-y-auto md:static md:z-auto md:w-80 md:shadow-none"
-            data-testid="job-team-sidebar"
-          >
-            {/* Sidebar Header */}
-            <div className="p-4 border-b border-slate-800/80 flex items-center justify-between shrink-0 bg-slate-900/40 pt-[max(1rem,env(safe-area-inset-top))]">
-              <div className="flex items-center gap-2">
-                <Users className="w-4 h-4 text-sky-400" />
-                <h3 className="text-xs font-bold text-slate-100 uppercase tracking-wider">
-                  Team & Activity
-                </h3>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800/80 text-slate-300 border border-slate-700/50">
-                  {teamMembers.length} {teamMembers.length === 1 ? 'member' : 'members'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setShowTeamSidebar(false)}
-                  className="md:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer min-w-[36px] min-h-[36px] flex items-center justify-center"
-                  title="Close Team & Activity Sidebar"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-          <div className="p-4 space-y-4 flex-1 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
-            {/* Active Turn Real-Time Feedback Card (inside sidebar) */}
-            {activeTurnInfo?.isActive && (
-              <div
-                className={`p-3.5 rounded-xl text-xs shadow-md space-y-3 ${
-                  activeTurnInfo.isOffline
-                    ? 'bg-amber-950/40 border border-amber-500/40 text-amber-200'
-                    : 'bg-sky-950/40 border border-sky-500/40'
-                }`}
-                data-testid="job-active-turn-indicator"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div
-                    className={`relative flex items-center justify-center w-7 h-7 rounded-lg shrink-0 ${
-                      activeTurnInfo.isOffline
-                        ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                        : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
-                    }`}
-                  >
-                    {activeTurnInfo.isOffline ? (
-                      <AlertCircle className="w-3.5 h-3.5 text-amber-400" />
-                    ) : (
-                      <>
-                        <Bot className="w-3.5 h-3.5 animate-pulse" />
-                        <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-sky-400 animate-ping" />
-                      </>
-                    )}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5 justify-between">
-                      <span className="font-semibold text-slate-100 truncate">
-                        {activeTurnInfo.personaName} {activeTurnInfo.statusText}
-                      </span>
-                      <span
-                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded border shrink-0 ${
-                          activeTurnInfo.isOffline
-                            ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
-                            : 'bg-sky-500/20 text-sky-300 border-sky-500/30 animate-pulse'
-                        }`}
-                      >
-                        {activeTurnInfo.isOffline ? 'Queued' : 'Working'}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-400 leading-relaxed mt-0.5">
-                      {activeTurnInfo.isOffline
-                        ? `Starting environment & waiting for runner connection (@${activeTurnInfo.driverId || 'agy'})...`
-                        : isAwaitingApproval
-                        ? 'Awaiting plan approval before executing tasks...'
-                        : (job.currentTaskId === 'stage-1-discovery' || (uniqueTasks.length === 0 && !isPending)
-                            ? 'Exploring codebase and discussing plan...'
-                            : 'Executing workspace commands, tests, and active persona logic.')}
-                    </p>
-                  </div>
-                </div>
-
-                {activeTurnInfo.turnSessionId && (
-                  <div className="flex items-center gap-2 pt-1 border-t border-sky-500/20">
-                    {onStopTurn && (
-                      <button
-                        type="button"
-                        onClick={() => onStopTurn(activeTurnInfo.turnSessionId!)}
-                        title="Stop active turn execution"
-                        data-testid="job-stop-turn-btn"
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-600/90 hover:bg-rose-500 text-white border border-rose-500/40 text-xs font-semibold transition cursor-pointer shadow-sm animate-pulse"
-                      >
-                        <Square className="w-3 h-3 fill-current" />
-                        <span>Stop</span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => onSelectTurnSession?.(activeTurnInfo.turnSessionId!)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 hover:text-white border border-sky-500/40 text-xs font-semibold transition cursor-pointer shadow-sm"
-                    >
-                      <Sparkles className="w-3 h-3 text-sky-400" />
-                      <span>View Trajectory</span>
-                      <ChevronRight className="w-3 h-3" />
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Queued Turns Card */}
-            {job.queuedTurns && job.queuedTurns.length > 0 && (
-              <div
-                className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-xs shadow-md space-y-2.5"
-                data-testid="job-queued-turns-indicator"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div className="relative flex items-center justify-center w-7 h-7 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30 shrink-0">
-                    <Clock className="w-3.5 h-3.5 animate-spin" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5 justify-between">
-                      <span className="font-semibold text-amber-200 truncate">
-                        {job.queuedTurns.length} Queued Turn{job.queuedTurns.length === 1 ? '' : 's'}
-                      </span>
-                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 shrink-0">
-                        Waiting for Slot
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-amber-300/80 leading-relaxed mt-0.5">
-                      Target persona reached concurrency limit on other jobs. Will execute automatically when free.
-                    </p>
-                  </div>
-                </div>
-
-                {assignError && (
-                  <div
-                    data-testid="task-assign-error"
-                    className="flex items-center justify-between text-xs text-rose-300 bg-rose-950/60 border border-rose-500/40 rounded-lg px-2.5 py-1.5"
-                  >
-                    <span className="truncate">{assignError}</span>
-                    <button
-                      type="button"
-                      data-testid="task-assign-error-dismiss"
-                      onClick={() => setAssignError(null)}
-                      className="text-rose-400 hover:text-rose-200 shrink-0 ml-2"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                )}
-
-                {/* Individual Queued Turns */}
-                <div className="space-y-1.5 pt-1.5 border-t border-amber-500/20">
-                  {job.queuedTurns.map((turn) => {
-                    const targetPersona = personas.find((p) => p.id === turn.targetPersonaId);
-                    const displayName = targetPersona?.name || turn.targetPersonaId;
-                    return (
-                      <div
-                        key={turn.id}
-                        data-testid={`queued-turn-item-${turn.id}`}
-                        className="flex items-center justify-between gap-2 p-2 rounded-lg bg-amber-900/30 border border-amber-500/25 text-[11px]"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5">
-                            <span className="font-semibold text-amber-200 truncate">@{displayName}</span>
-                            <span className="text-[10px] text-amber-400/60 font-mono">
-                              {new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                            </span>
-                          </div>
-                          <p className="text-[11px] text-amber-300/70 truncate mt-0.5 font-mono">
-                            {turn.content.slice(0, 60)}{turn.content.length > 60 ? '...' : ''}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-1.5 shrink-0">
-                        {onAssignTask && (
-                          <select
-                            value={turn.targetPersonaId}
-                            disabled={assigningTaskId === `turn:${turn.id}`}
-                            onChange={async (e) => {
-                              const nextPersona = e.target.value;
-                              if (!nextPersona || nextPersona === turn.targetPersonaId) return;
-                              // The queued message belongs to whoever was going to run the
-                              // task it landed on, so redirecting it means reassigning that
-                              // task — which is what moves the turn server-side.
-                              const targetTaskId = resolveTargetTaskId(uniqueTasks, turn.targetPersonaId);
-                              if (!targetTaskId) {
-                                setAssignError('This queued turn has no task to reassign. Add a task first, or cancel the turn.');
-                                return;
-                              }
-                              setAssigningTaskId(`turn:${turn.id}`);
-                              setAssignError(null);
-                              try {
-                                await onAssignTask(targetTaskId, nextPersona);
-                              } catch (err) {
-                                setAssignError(err instanceof Error ? err.message : 'Failed to reassign queued turn');
-                              } finally {
-                                setAssigningTaskId(null);
-                              }
-                            }}
-                            aria-label={`Reassign queued turn for ${displayName}`}
-                            data-testid={`reassign-queued-turn-${turn.id}`}
-                            title="Send this queued turn to a different team member"
-                            className="max-w-[110px] rounded-md border bg-amber-950/60 border-amber-500/30 text-amber-100 px-1.5 py-1 text-[10px] transition focus:outline-none focus:border-sky-500 disabled:opacity-50 cursor-pointer"
-                          >
-                            <option value={turn.targetPersonaId}>@{displayName}</option>
-                            {teamMembers
-                              .filter((m) => m.id !== turn.targetPersonaId)
-                              .map((m) => (
-                                <option key={m.id} value={m.id}>
-                                  → {m.name}
-                                </option>
-                              ))}
-                          </select>
-                        )}
-                        {onCancelQueuedTurn && (
-                          <button
-                            type="button"
-                            onClick={() => onCancelQueuedTurn(turn.id)}
-                            title="Cancel queued turn"
-                            data-testid={`cancel-queued-turn-btn-${turn.id}`}
-                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-rose-600/80 hover:bg-rose-500 text-white font-medium text-[10px] transition cursor-pointer shrink-0 shadow-sm"
-                          >
-                            <X className="w-3 h-3" />
-                            <span>Cancel</span>
-                          </button>
-                        )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Team Members List */}
-            <div className="space-y-2">
-              <div className="text-[10px] font-mono uppercase tracking-wider text-slate-400 font-semibold px-0.5">
-                Assigned Team Members
-              </div>
-              <div className="space-y-2">
-                {teamMembers.map((member) => {
-                  const isWorking =
-                    activeTurnInfo?.isActive &&
-                    (activeTurnInfo.personaName?.toLowerCase() === member.name?.toLowerCase() ||
-                      activeTurnInfo.personaName?.toLowerCase() === member.id?.toLowerCase() ||
-                      activeTurnInfo.personaId?.toLowerCase() === member.id?.toLowerCase());
-                  const queuedCount = (job.queuedTurns || []).filter(
-                    (t) => t.targetPersonaId === member.id
-                  ).length;
-                  const personaObj = personas.find((p) => p.id === member.id);
-
-                  return (
-                    <div
-                      key={member.id}
-                      className={`p-3 rounded-xl border transition ${
-                        isWorking
-                          ? 'bg-sky-950/25 border-sky-500/40 shadow-sm'
-                          : queuedCount > 0
-                          ? 'bg-amber-950/20 border-amber-500/30'
-                          : 'bg-slate-900/50 border-slate-800/80'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <div className="relative w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 shrink-0">
-                            <Bot className="w-3.5 h-3.5" />
-                            <span
-                              className={`absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 rounded-full border border-slate-900 ${
-                                isWorking
-                                  ? 'bg-sky-400 animate-ping'
-                                  : queuedCount > 0
-                                  ? 'bg-amber-400'
-                                  : 'bg-emerald-400'
-                              }`}
-                            />
-                          </div>
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-1.5">
-                              <span className="font-semibold text-xs text-white truncate">
-                                {member.name}
-                              </span>
-                              {member.isLead && (
-                                <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                  Lead
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-[10px] text-slate-400 truncate">
-                              {member.role || 'Member'}
-                            </div>
-                          </div>
-                        </div>
-
-                        <span
-                          className={`text-[9px] font-mono px-1.5 py-0.2 rounded shrink-0 ${
-                            isWorking
-                              ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40 animate-pulse'
-                              : queuedCount > 0
-                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                              : 'bg-slate-800/60 text-slate-400 border border-slate-700/50'
-                          }`}
-                        >
-                          {isWorking ? 'Working' : queuedCount > 0 ? `Queued (${queuedCount})` : 'Idle'}
-                        </span>
-                      </div>
-
-                      <div className="mt-2 text-[10px] flex items-center gap-1.5 text-slate-400 font-mono">
-                        <span className="text-sky-400/90">@{member.id}</span>
-                        <span className="text-slate-600">•</span>
-                        <span className="text-slate-400 truncate">
-                          {isWorking
-                            ? 'Executing active turn...'
-                            : queuedCount > 0
-                            ? `${queuedCount} turn(s) queued`
-                            : personaObj?.maxConcurrentJobs
-                            ? `Max ${personaObj.maxConcurrentJobs} job(s)`
-                            : 'Ready for instructions'}
-                        </span>
-                      </div>
-
-                      {queuedCount > 0 && (onCancelQueuedTurns || onCancelQueuedTurn) && (
-                        <div className="mt-2 pt-1.5 border-t border-amber-500/20 flex items-center justify-between">
-                          <span className="text-[10px] text-amber-300/80 font-medium">
-                            {queuedCount} turn{queuedCount === 1 ? '' : 's'} waiting
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const turnsForMember = (job.queuedTurns || []).filter(
-                                (t) => t.targetPersonaId === member.id
-                              );
-                              if (turnsForMember.length === 0) return;
-                              // Prefer the bulk endpoint: N concurrent per-turn DELETEs each
-                              // read-modify-write QueuedTurnsJson and lose updates.
-                              if (onCancelQueuedTurns) {
-                                onCancelQueuedTurns(member.id);
-                                return;
-                              }
-                              turnsForMember.forEach((t) => onCancelQueuedTurn?.(t.id));
-                            }}
-                            title={`Cancel queued turns for ${member.name}`}
-                            data-testid={`cancel-member-queued-turns-${member.id}`}
-                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-600/80 hover:bg-rose-500 text-white font-medium text-[10px] transition cursor-pointer shadow-sm"
-                          >
-                            <X className="w-2.5 h-2.5" />
-                            <span>Cancel</span>
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </aside>
-      </>
-    )}
-    </div>
-      )}
-
-      {/* Internal Fullscreen Image Lightbox Modal fallback */}
-      {internalLightbox && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label={`Image preview: ${internalLightbox.fileName}`}
-          data-testid="job-attachment-lightbox"
-          onClick={() => setInternalLightbox(null)}
-          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-2 sm:p-6"
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="max-w-5xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
-          >
-            <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
-              <div className="flex items-center gap-2 min-w-0">
-                <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
-                <span className="font-mono text-xs font-semibold text-white truncate">
-                  {internalLightbox.fileName}
-                </span>
-                {internalLightbox.sizeBytes ? (
-                  <span className="text-[11px] font-mono text-slate-400">
-                    ({formatAttachmentSize(internalLightbox.sizeBytes)})
-                  </span>
-                ) : null}
-              </div>
-              <div className="flex items-center gap-2">
-                <a
-                  href={`${internalLightbox.url}${internalLightbox.url.includes('?') ? '&' : '?'}download=true`}
-                  download={internalLightbox.fileName}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition"
-                >
-                  <Download className="w-3.5 h-3.5 text-sky-400" />
-                  <span>Download</span>
-                </a>
-                <button
-                  type="button"
-                  onClick={() => setInternalLightbox(null)}
-                  aria-label="Close image preview"
-                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-            <div className="flex-1 p-6 bg-slate-950 flex items-center justify-center overflow-auto">
-              <img
-                src={internalLightbox.url}
-                alt={internalLightbox.fileName}
-                className="max-h-[75vh] max-w-full object-contain rounded-lg shadow-xl"
-                data-testid="job-lightbox-image"
-              />
-            </div>
-          </div>
-        </div>
-      )}
 
       {showJobSettingsModal && (
         <JobSettingsModal
