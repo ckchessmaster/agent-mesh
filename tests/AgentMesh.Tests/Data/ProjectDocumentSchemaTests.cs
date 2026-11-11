@@ -329,7 +329,7 @@ public class ProjectDocumentSchemaTests
     /// means the next migration stacked on top shows up as a failure to re-check rather than a silent
     /// assumption that the snapshot is current.
     /// </remarks>
-    private const string TipMigrationId = "20261105013316_AddProjectJobArtifacts";
+    private const string TipMigrationId = "20261111052729_AddJobTimelineCardsAndComments";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()
@@ -351,7 +351,7 @@ public class ProjectDocumentSchemaTests
         // contract (upload into a project that is there) does, and it only holds if the table is created
         // after the projects table it points at.
         //
-        // Re-checked when AddProjectJobArtifacts was stacked on top: it adds a column to project_jobs and
+        // Re-checked when AddProjectJobArtifacts and AddJobTimelineCardsAndComments were stacked on top:
         // neither creates nor re-orders anything project_documents reads.
         migrations.IndexOf("20261020184553_AddProjectsAndJobs")
             .Should().BeLessThan(documentsIndex,
@@ -433,6 +433,7 @@ public class ProjectDocumentSchemaTests
             "agents", "personas", "agent_sessions", "session_messages", "agent_jobs",
             "projects", "project_personas", "project_jobs", "job_messages",
             "job_handoffs", "job_workspace_states", "agent_memories",
+            "job_timeline_cards", "job_card_comments",
         };
 
         // Word-boundary matching so 'project_documents' is not read as a hit for 'project_personas' and

@@ -3,6 +3,7 @@ using AgentMesh.Api.Services;
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
+using AgentMesh.Worker.Workflows;
 using AgentMesh.Tests.Sandbox;
 using FluentAssertions;
 using Temporalio.Activities;

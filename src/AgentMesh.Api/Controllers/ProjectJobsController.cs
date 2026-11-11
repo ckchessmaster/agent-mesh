@@ -1850,7 +1850,7 @@ public class ProjectJobsController(
             try
             {
                 await temporalClient.StartWorkflowAsync(
-                    (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                    (IJobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
                         JobId: id.ToString(),
                         AssignedAgentId: assignedAgentId,
                         ProjectId: job.ProjectId,
@@ -1871,7 +1871,7 @@ public class ProjectJobsController(
                     var handle = temporalClient.GetWorkflowHandle(workflowId);
                     await handle.TerminateAsync("Restarted by operator via StartJob");
                     await temporalClient.StartWorkflowAsync(
-                        (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                        (IJobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
                             JobId: id.ToString(),
                             AssignedAgentId: assignedAgentId,
                             ProjectId: job.ProjectId,

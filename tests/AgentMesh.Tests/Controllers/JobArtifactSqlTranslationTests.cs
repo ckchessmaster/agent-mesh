@@ -176,7 +176,7 @@ public class JobArtifactSqlTranslationTests
         // Tests run from bin/, so walk up to the repo root rather than hardcoding a depth that breaks
         // when the target framework folder changes.
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.slnx")))
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.sln")) && !File.Exists(Path.Combine(dir.FullName, "AgentMesh.slnx")))
         {
             dir = dir.Parent;
         }

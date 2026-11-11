@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AgentMesh.Core.Workflows;
 
 /// <summary>
@@ -86,16 +88,26 @@ public record TaskExecutionInput(
     string WorkspacePath,
     string TargetBranch,
     string? PersonaId = null,
-    string? TurnSessionId = null);
+    string? TurnSessionId = null,
+    int? TaskIndex = null,
+    string? TaskTitle = null);
 
 /// <summary>
 /// The workflow's terminal result.
 /// </summary>
+[method: JsonConstructor]
 public record TaskExecutionResult(
     bool Success,
-    string TaskId,
-    string? FinalPrUrl,
-    string Summary);
+    string? ErrorMessage = null,
+    string? TaskId = null,
+    string? FinalPrUrl = null,
+    string? Summary = null)
+{
+    public TaskExecutionResult(bool Success, string TaskId, string? FinalPrUrl, string Summary)
+        : this(Success, Summary, TaskId, FinalPrUrl, Summary)
+    {
+    }
+}
 
 /// <summary>
 /// The workflow's observable state, returned by the <c>GetTaskStatus</c> query.

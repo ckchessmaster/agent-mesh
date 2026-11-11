@@ -512,7 +512,7 @@ public class JobChatController(
             var workflowId = $"job-{jobId}";
             try
             {
-                var handle = temporalClient.GetWorkflowHandle<JobExecutionWorkflow>(workflowId);
+                var handle = temporalClient.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId);
                 await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(signal));
             }
             catch (Exception ex)

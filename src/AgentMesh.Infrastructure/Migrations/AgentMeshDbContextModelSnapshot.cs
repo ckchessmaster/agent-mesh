@@ -129,7 +129,7 @@ namespace AgentMesh.Infrastructure.Migrations
                         .ValueGeneratedOnAdd()
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)")
-                        .HasDefaultValue("LeadOrHuman")
+                        .HasDefaultValue("Autonomous")
                         .HasColumnName("approval_policy");
 
                     b.Property<string>("ApprovalStatus")
@@ -403,6 +403,47 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.ToTable("agent_sessions", (string)null);
                 });
 
+            modelBuilder.Entity("AgentMesh.Core.Models.JobCardComment", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<Guid>("CardId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("card_id");
+
+                    b.Property<string>("Content")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("content");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("SenderId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("sender_id");
+
+                    b.Property<string>("SenderType")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("sender_type");
+
+                    b.HasKey("Id")
+                        .HasName("pk_job_card_comments");
+
+                    b.HasIndex("CardId", "CreatedAt")
+                        .HasDatabaseName("ix_job_card_comments_card_id_created_at");
+
+                    b.ToTable("job_card_comments", (string)null);
+                });
+
             modelBuilder.Entity("AgentMesh.Core.Models.JobHandoff", b =>
                 {
                     b.Property<Guid>("Id")
@@ -568,6 +609,64 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDatabaseName("ix_job_messages_turn_session_id");
 
                     b.ToTable("job_messages", (string)null);
+                });
+
+            modelBuilder.Entity("AgentMesh.Core.Models.JobTimelineCard", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid")
+                        .HasColumnName("id");
+
+                    b.Property<string>("CardType")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("card_type");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("JobId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("job_id");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("status");
+
+                    b.Property<string>("StructuredPayloadJson")
+                        .IsRequired()
+                        .HasColumnType("jsonb")
+                        .HasColumnName("structured_payload_json");
+
+                    b.Property<string>("TaskId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("task_id");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("title");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id")
+                        .HasName("pk_job_timeline_cards");
+
+                    b.HasIndex("JobId", "CreatedAt")
+                        .HasDatabaseName("ix_job_timeline_cards_job_id_created_at");
+
+                    b.ToTable("job_timeline_cards", (string)null);
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.JobWorkspaceState", b =>
@@ -1003,7 +1102,7 @@ namespace AgentMesh.Infrastructure.Migrations
                         .ValueGeneratedOnAdd()
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)")
-                        .HasDefaultValue("LeadOrHuman")
+                        .HasDefaultValue("Autonomous")
                         .HasColumnName("approval_policy");
 
                     b.Property<string>("ArtifactsJson")
@@ -1238,6 +1337,18 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Navigation("Session");
                 });
 
+            modelBuilder.Entity("AgentMesh.Core.Models.JobCardComment", b =>
+                {
+                    b.HasOne("AgentMesh.Core.Models.JobTimelineCard", "Card")
+                        .WithMany("Comments")
+                        .HasForeignKey("CardId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_job_card_comments_job_timeline_cards_card_id");
+
+                    b.Navigation("Card");
+                });
+
             modelBuilder.Entity("AgentMesh.Core.Models.ProjectPersona", b =>
                 {
                     b.HasOne("AgentMesh.Core.Models.Persona", null)
@@ -1270,6 +1381,11 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Navigation("Jobs");
 
                     b.Navigation("Messages");
+                });
+
+            modelBuilder.Entity("AgentMesh.Core.Models.JobTimelineCard", b =>
+                {
+                    b.Navigation("Comments");
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.Persona", b =>

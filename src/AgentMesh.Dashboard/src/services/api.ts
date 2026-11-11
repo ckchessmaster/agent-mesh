@@ -32,7 +32,14 @@ import type {
   StagedJob,
   SubmitAnswerRequest,
   SystemCapabilitiesResponse,
-  SystemStatusResponse
+  SystemStatusResponse,
+  JobTimelineCard,
+  JobCardComment,
+  AddCommentRequest,
+  DiscoveryAnswersPayload,
+  PlanDecisionPayload,
+  AbortTurnRequest,
+  InterventionRequest
 } from '../types';
 import { JobFileChangeStatus } from '../types';
 
@@ -1621,5 +1628,72 @@ export const api = {
     }
     const body = await res.json().catch(() => ({}));
     return body?.job as ProjectJob | undefined;
+  },
+
+  async getTimelineCards(jobId: string): Promise<JobTimelineCard[]> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/cards`, {
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to fetch timeline cards'));
+    }
+    return (await res.json()) as JobTimelineCard[];
+  },
+
+  async addTimelineComment(jobId: string, cardId: string, req: AddCommentRequest): Promise<JobCardComment> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/cards/${encodeURIComponent(cardId)}/comments`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to post timeline comment'));
+    }
+    return (await res.json()) as JobCardComment;
+  },
+
+  async submitTimelineAnswers(jobId: string, cardId: string, payload: DiscoveryAnswersPayload): Promise<void> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/cards/${encodeURIComponent(cardId)}/submit-answers`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to submit discovery answers'));
+    }
+  },
+
+  async submitTimelinePlanDecision(jobId: string, cardId: string, payload: PlanDecisionPayload): Promise<void> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/cards/${encodeURIComponent(cardId)}/plan-decision`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to submit plan decision'));
+    }
+  },
+
+  async abortTimelineTurn(jobId: string, req: AbortTurnRequest): Promise<void> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/abort-turn`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to abort turn'));
+    }
+  },
+
+  async submitTimelineIntervention(jobId: string, req: InterventionRequest): Promise<void> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/intervention`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to submit intervention'));
+    }
   }
 };
+

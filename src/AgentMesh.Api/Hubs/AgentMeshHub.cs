@@ -57,6 +57,34 @@ public class AgentMeshHub(AgentMeshDbContext? db = null) : Hub
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"session-{sessionId}");
     }
 
+    public async Task JoinJob(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId)) return;
+        var normalized = jobId.Trim();
+        await Groups.AddToGroupAsync(Context.ConnectionId, $"job-{normalized}");
+        await Groups.AddToGroupAsync(Context.ConnectionId, normalized);
+    }
+
+    public async Task LeaveJob(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId)) return;
+        var normalized = jobId.Trim();
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"job-{normalized}");
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, normalized);
+    }
+
+    public async Task BroadcastTimelineCardUpdated(string jobId, object card)
+    {
+        await Clients.Group($"job-{jobId}").SendAsync("ReceiveTimelineCardUpdated", card);
+        await Clients.Group(jobId).SendAsync("ReceiveTimelineCardUpdated", card);
+    }
+
+    public async Task BroadcastTimelineComment(string jobId, Guid cardId, object comment)
+    {
+        await Clients.Group($"job-{jobId}").SendAsync("ReceiveTimelineComment", jobId, cardId, comment);
+        await Clients.Group(jobId).SendAsync("ReceiveTimelineComment", jobId, cardId, comment);
+    }
+
     public async Task ReportCommandOutput(string sessionId, string commandId, string output)
     {
         if (string.IsNullOrWhiteSpace(sessionId)) return;

@@ -6,9 +6,21 @@ using Temporalio.Workflows;
 
 namespace AgentMesh.Core.Workflows;
 
-[Workflow]
+[Workflow("JobExecutionWorkflow")]
 public class JobExecutionWorkflow : IJobExecutionWorkflow
 {
+    private static readonly ActivityOptions TimelineActivityOptions = new()
+    {
+        StartToCloseTimeout = TimeSpan.FromMinutes(5),
+        RetryPolicy = new RetryPolicy
+        {
+            InitialInterval = TimeSpan.FromSeconds(1),
+            BackoffCoefficient = 2.0f,
+            MaximumInterval = TimeSpan.FromSeconds(30),
+            MaximumAttempts = 3
+        }
+    };
+
     private static readonly ActivityOptions TurnActivityOptions = new()
     {
         StartToCloseTimeout = TimeSpan.FromHours(2),
@@ -37,10 +49,17 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
     private readonly Queue<ChatMessageSignal> _chatInbox = new();
     private readonly HashSet<string> _seenMessageIds = new(StringComparer.Ordinal);
-    private PlanApprovedSignal? _planApproval;
+    private DiscoveryAnswersSignal? _discoveryAnswers;
+    private PlanApprovalSignal? _timelinePlanApproval;
+    private PlanApprovedSignal? _legacyPlanApproval;
     private PrReviewSignal? _prReview;
+    private AbortActiveTurnSignal? _pendingAbort;
+    private TurnInterventionSignal? _pendingIntervention;
+    private ChildWorkflowHandle<ITaskExecutionWorkflow, TaskExecutionResult>? _activeChildHandle;
+    private string? _activeChildWorkflowId;
     private List<ChecklistTaskItem> _tasks = new();
-    private int _currentTaskIndex = 0;
+    private int _currentTaskIndex;
+    private int _totalTasks;
     private string _currentHeartbeat = "Initializing job";
     private PlanApprovalPolicy _approvalPolicy = PlanApprovalPolicy.Autonomous;
     private string? _assignedAgentId;
@@ -48,9 +67,205 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     [WorkflowRun]
     public async Task<JobExecutionResult> ExecuteJobAsync(JobExecutionInput input)
     {
-        _approvalPolicy = input.ApprovalPolicy;
         _assignedAgentId = input.AssignedAgentId;
+        if (Enum.TryParse<PlanApprovalPolicy>(input.ApprovalPolicy, ignoreCase: true, out var parsedPolicy))
+        {
+            _approvalPolicy = parsedPolicy;
+        }
+        else
+        {
+            _approvalPolicy = PlanApprovalPolicy.LeadOrHuman;
+        }
 
+        if (input.UseLegacyTurnLoop)
+        {
+            return await ExecuteLegacyTurnLoopAsync(input);
+        }
+
+        return await ExecuteTimelineLoopAsync(input);
+    }
+
+    public Task<JobExecutionResult> RunAsync(JobExecutionInput input) => ExecuteJobAsync(input);
+
+    private async Task<JobExecutionResult> ExecuteTimelineLoopAsync(JobExecutionInput input)
+    {
+        _currentHeartbeat = "Initializing job";
+
+        var initPayload = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            jobId = input.JobId,
+            projectId = input.ProjectId,
+            workspacePath = input.WorkspacePath,
+            targetBranch = input.TargetBranch,
+            assignedAgentId = input.AssignedAgentId,
+            initialPrompt = input.InitialPrompt,
+            approvalPolicy = input.ApprovalPolicy
+        });
+
+        await Workflow.ExecuteActivityAsync(
+            (ITimelineActivities act) => act.CreateCardAsync(new CreateTimelineCardInput(
+                input.JobId,
+                null,
+                TimelineCardType.JobInitialized,
+                TimelineCardStatus.Active,
+                $"Job Initialized: {input.JobId}",
+                initPayload
+            )),
+            TimelineActivityOptions
+        );
+
+        // Stage 1A: Discovery Q&A activity -> wait on DiscoveryAnswersSignal
+        _currentHeartbeat = "Awaiting discovery Q&A answers";
+        var discoveryResult = await Workflow.ExecuteActivityAsync(
+            (ITimelineActivities act) => act.ExecuteDiscoveryQaActivityAsync(new DiscoveryQaActivityInput(
+                input.JobId,
+                input.InitialPrompt,
+                input.WorkspacePath
+            )),
+            TimelineActivityOptions
+        );
+
+        await Workflow.WaitConditionAsync(() => _discoveryAnswers != null);
+
+        await Workflow.ExecuteActivityAsync(
+            (ITimelineActivities act) => act.UpdateCardStatusAsync(new UpdateTimelineCardStatusInput(
+                discoveryResult.CardId,
+                TimelineCardStatus.Approved
+            )),
+            TimelineActivityOptions
+        );
+
+        // Stage 1B, Stage 2 & Stage 3: Decomposition + Approval + Child Task Execution (with Realign loop)
+        string? planFeedback = null;
+
+        while (true)
+        {
+            DecompositionActivityResult decompositionResult;
+
+            while (true)
+            {
+                _timelinePlanApproval = null;
+                _currentHeartbeat = planFeedback == null ? "Decomposing job tasks" : "Re-decomposing plan with feedback";
+                decompositionResult = await Workflow.ExecuteActivityAsync(
+                    (ITimelineActivities act) => act.ExecuteDecompositionActivityAsync(new DecompositionActivityInput(
+                        input.JobId,
+                        input.InitialPrompt,
+                        input.WorkspacePath,
+                        planFeedback,
+                        _discoveryAnswers!.Answers
+                    )),
+                    TimelineActivityOptions
+                );
+
+                _currentHeartbeat = "Awaiting plan approval";
+                await Workflow.WaitConditionAsync(() => _timelinePlanApproval != null);
+
+                if (_timelinePlanApproval!.Approved)
+                {
+                    await Workflow.ExecuteActivityAsync(
+                        (ITimelineActivities act) => act.UpdateCardStatusAsync(new UpdateTimelineCardStatusInput(
+                            decompositionResult.CardId,
+                            TimelineCardStatus.Approved
+                        )),
+                        TimelineActivityOptions
+                    );
+                    break;
+                }
+
+                planFeedback = _timelinePlanApproval.Feedback ?? "Plan rejected by approver";
+                await Workflow.ExecuteActivityAsync(
+                    (ITimelineActivities act) => act.UpdateCardStatusAsync(new UpdateTimelineCardStatusInput(
+                        decompositionResult.CardId,
+                        TimelineCardStatus.Rejected
+                    )),
+                    TimelineActivityOptions
+                );
+            }
+
+            var tasks = decompositionResult.Payload.Tasks;
+            _totalTasks = tasks.Count;
+            bool realigned = false;
+
+            for (int idx = 0; idx < tasks.Count; idx++)
+            {
+                _currentTaskIndex = idx;
+                var task = tasks[idx];
+                _currentHeartbeat = $"Executing task {idx + 1}/{_totalTasks}: {task.Title}";
+
+                _pendingAbort = null;
+                _pendingIntervention = null;
+
+                var childInput = new ChildTaskExecutionInput(
+                    input.JobId,
+                    task.TaskId,
+                    idx,
+                    task.Title,
+                    input.AssignedAgentId,
+                    input.WorkspacePath,
+                    input.TargetBranch,
+                    input.ProjectId
+                );
+
+                var childWorkflowId = $"job-{input.JobId}-task-{idx}";
+                _activeChildWorkflowId = childWorkflowId;
+
+                var childHandle = await Workflow.StartChildWorkflowAsync(
+                    (ITaskExecutionWorkflow wf) => wf.ExecuteTaskAsync(childInput),
+                    new ChildWorkflowOptions
+                    {
+                        Id = childWorkflowId,
+                        TaskQueue = Workflow.Info.TaskQueue
+                    }
+                );
+
+                _activeChildHandle = childHandle;
+
+                if (_pendingAbort != null)
+                {
+                    await childHandle.SignalAsync(wf => wf.AbortTurnAsync(_pendingAbort));
+                    _pendingAbort = null;
+                }
+                if (_pendingIntervention != null)
+                {
+                    await childHandle.SignalAsync(wf => wf.InterveneTurnAsync(_pendingIntervention));
+                    _pendingIntervention = null;
+                }
+
+                var result = await childHandle.GetResultAsync();
+                _activeChildHandle = null;
+                _activeChildWorkflowId = null;
+                _pendingAbort = null;
+                _pendingIntervention = null;
+
+                if (!result.Success)
+                {
+                    var err = result.ErrorMessage ?? result.Summary ?? "Unknown error";
+                    if (err.StartsWith("Realigned:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        planFeedback = err;
+                        realigned = true;
+                        break;
+                    }
+
+                    _currentHeartbeat = $"Failed on task {idx + 1}";
+                    return new JobExecutionResult(false, $"Task {idx} ({task.Title}) failed: {err}");
+                }
+            }
+
+            if (realigned)
+            {
+                continue;
+            }
+
+            break;
+        }
+
+        _currentHeartbeat = "Completed all tasks successfully";
+        return new JobExecutionResult(true, "All tasks completed successfully.");
+    }
+
+    private async Task<JobExecutionResult> ExecuteLegacyTurnLoopAsync(JobExecutionInput input)
+    {
         // 1. Stage 1: Discovery & Planning Loop
         _currentHeartbeat = "Exploring codebase and generating checklist";
         int discoveryTurns = 0;
@@ -76,7 +291,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             if (discoveryOutcome.Status == TurnOutcomeStatus.Failed)
             {
                 _currentHeartbeat = $"Discovery failed: {discoveryOutcome.Message}";
-                return new JobExecutionResult(Success: false, Summary: $"Discovery failed: {discoveryOutcome.Message}");
+                return new JobExecutionResult(Success: false, Message: $"Discovery failed: {discoveryOutcome.Message}");
             }
 
             if (!string.IsNullOrWhiteSpace(discoveryOutcome.PrUrl) || discoveryOutcome.Status == TurnOutcomeStatus.PrOpenedAwaitingReview)
@@ -115,14 +330,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 continue;
             }
 
-            // Completed or other status without setting checklist yet
             break;
         }
 
         if (_tasks.Count == 0 && string.IsNullOrWhiteSpace(activePrUrl))
         {
-            // If discovery completed without setting a checklist, provide a fallback task
-            // so the workflow proceeds to implementation rather than stalling at the review gate.
             _tasks.Add(new ChecklistTaskItem(
                 Title: !string.IsNullOrWhiteSpace(input.InitialPrompt) ? input.InitialPrompt : "Execute job implementation",
                 TargetFile: null,
@@ -131,13 +343,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
         if (!string.IsNullOrWhiteSpace(activePrUrl))
         {
-            // Fast-track: if a pull request was already opened during discovery, skip planning approval
-            // and task execution loops to enter the review gate directly.
             _currentHeartbeat = "Pull request active; awaiting code review";
         }
         else
         {
-            if (input.ApprovalPolicy == PlanApprovalPolicy.Autonomous)
+            if (_approvalPolicy == PlanApprovalPolicy.Autonomous)
             {
                 _currentHeartbeat = "Plan auto-approved. Starting implementation";
             }
@@ -153,22 +363,21 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 // 2. Stage 2: Plan Approval Gate
                 await Workflow.WaitConditionAsync(() =>
                 {
-                    if (_tasks.Count == 0 || _planApproval == null) return false;
-                    var isApproved = input.ApprovalPolicy switch
+                    if (_tasks.Count == 0 || _legacyPlanApproval == null) return false;
+                    var isApproved = _approvalPolicy switch
                     {
                         PlanApprovalPolicy.LeadOrHuman =>
-                            _planApproval.ApproverRole is "operator" or "tech_lead",
+                            _legacyPlanApproval.ApproverRole is "operator" or "tech_lead",
                         PlanApprovalPolicy.HumanOnly =>
-                            _planApproval.ApproverRole == "operator",
+                            _legacyPlanApproval.ApproverRole == "operator",
                         _ => false
                     };
 
                     if (!isApproved)
                     {
-                        // Explicitly discard rejected approval signal so it does not linger
-                        var rejectedRole = _planApproval.ApproverRole;
-                        _planApproval = null;
-                        _currentHeartbeat = $"Plan approval rejected: role '{rejectedRole}' is not permitted by policy {input.ApprovalPolicy}";
+                        var rejectedRole = _legacyPlanApproval.ApproverRole;
+                        _legacyPlanApproval = null;
+                        _currentHeartbeat = $"Plan approval rejected: role '{rejectedRole}' is not permitted by policy {_approvalPolicy}";
                         return false;
                     }
 
@@ -184,7 +393,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 var currentTask = _tasks[_currentTaskIndex];
                 _currentHeartbeat = $"Executing task {_currentTaskIndex + 1}/{_tasks.Count}: {currentTask.Title}";
 
-                // Check for inbound chat interjections
                 ChatMessageSignal? pendingMessage = _chatInbox.Count > 0 ? _chatInbox.Dequeue() : null;
 
                 var turnOutcome = await Workflow.ExecuteActivityAsync(
@@ -220,7 +428,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 if (turnOutcome.Status == TurnOutcomeStatus.Failed)
                 {
                     _currentHeartbeat = $"Task failed: {turnOutcome.Message ?? currentTask.Title}";
-                    return new JobExecutionResult(Success: false, Summary: $"Task failed: {turnOutcome.Message}");
+                    return new JobExecutionResult(Success: false, Message: $"Task failed: {turnOutcome.Message}");
                 }
 
                 if (turnOutcome.Status is TurnOutcomeStatus.TaskCompleted or TurnOutcomeStatus.PrOpenedAwaitingReview)
@@ -244,7 +452,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
             if (!_prReview!.IsApproved)
             {
-                // Changes requested; re-enter coding turn
                 _currentHeartbeat = "Changes requested on PR; resuming coding turn";
                 ChatMessageSignal? reviewFeedback = new ChatMessageSignal(
                     _prReview.ReviewerId,
@@ -302,7 +509,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             prApproved = true;
         }
 
-        // 5. Final Server-Side Merge Activity (reached ONLY when prApproved == true)
+        // 5. Final Server-Side Merge Activity
         _currentHeartbeat = "Merging pull request";
         var mergePrRef = activePrUrl;
         if (string.IsNullOrWhiteSpace(mergePrRef) && _prReview?.PrNumber != null)
@@ -321,7 +528,62 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             GitActivityOptions);
 
         _currentHeartbeat = "Job completed and merged";
-        return new JobExecutionResult(Success: true, Summary: mergeSummary ?? "Job completed and merged.");
+        return new JobExecutionResult(Success: true, Message: mergeSummary ?? "Job completed and merged.");
+    }
+
+    [WorkflowSignal]
+    public Task SubmitDiscoveryAnswersAsync(DiscoveryAnswersSignal signal)
+    {
+        _discoveryAnswers = signal;
+        return Task.CompletedTask;
+    }
+
+    [WorkflowSignal]
+    public Task SubmitPlanDecisionAsync(PlanApprovalSignal signal)
+    {
+        _timelinePlanApproval = signal;
+        if (signal.Approved)
+        {
+            _legacyPlanApproval = new PlanApprovedSignal(signal.ApproverId, "operator", signal.Feedback, Workflow.UtcNow);
+        }
+        return Task.CompletedTask;
+    }
+
+    [WorkflowSignal]
+    public async Task AbortTurnAsync(AbortActiveTurnSignal signal)
+    {
+        if (_activeChildHandle != null)
+        {
+            await _activeChildHandle.SignalAsync(wf => wf.AbortTurnAsync(signal));
+            _pendingAbort = null;
+        }
+        else if (_activeChildWorkflowId != null)
+        {
+            _pendingAbort = signal;
+        }
+        else
+        {
+            _pendingAbort = null;
+        }
+    }
+
+    [WorkflowSignal]
+    public async Task InterveneTurnAsync(TurnInterventionSignal signal)
+    {
+        _pendingAbort = null;
+        if (_activeChildHandle != null)
+        {
+            await _activeChildHandle.SignalAsync(wf => wf.InterveneTurnAsync(signal));
+            _pendingIntervention = null;
+        }
+        else if (_activeChildWorkflowId != null)
+        {
+            _pendingIntervention = signal;
+        }
+        else
+        {
+            _pendingIntervention = null;
+        }
     }
 
     [WorkflowSignal]
@@ -332,9 +594,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             return Task.CompletedTask;
         }
 
-        // Self-sent messages (e.g. when the assigned agent calls post_job_message(requires_reply: true))
-        // arrive while the turn is still running and must not be queued into _chatInbox, or they will
-        // immediately unblock the subsequent WaitConditionAsync without waiting for the human/lead reply.
         if (IsSameAgentIdentity(signal.SenderId, _assignedAgentId))
         {
             return Task.CompletedTask;
@@ -374,7 +633,8 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     [WorkflowSignal]
     public Task ReceivePlanApprovalAsync(PlanApprovedSignal signal)
     {
-        _planApproval = signal;
+        _legacyPlanApproval = signal;
+        _timelinePlanApproval = new PlanApprovalSignal(Guid.Empty, true, signal.Comments, signal.ApproverId);
         return Task.CompletedTask;
     }
 
@@ -389,6 +649,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     public Task ReceiveSetChecklistAsync(List<ChecklistTaskItem> tasks)
     {
         _tasks = tasks ?? new();
+        _totalTasks = _tasks.Count;
         _currentHeartbeat = _approvalPolicy == PlanApprovalPolicy.Autonomous
             ? "Checklist registered. Auto-approving plan."
             : "Checklist registered. Awaiting plan approval.";
@@ -404,5 +665,5 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
     [WorkflowQuery]
     public JobWorkflowState GetCurrentState() =>
-        new(_currentTaskIndex, _tasks.Count, _currentHeartbeat);
+        new(_currentTaskIndex, _tasks.Count > 0 ? _tasks.Count : _totalTasks, _currentHeartbeat);
 }

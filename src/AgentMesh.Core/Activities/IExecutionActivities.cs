@@ -47,4 +47,12 @@ public interface IExecutionActivities
 
     [Activity]
     Task<TurnOutcome> RunJobCodingTurnAsync(AgentMesh.Core.Workflows.CodingTurnInput input);
+
+    [Activity]
+    Task<ExecutionOutput> ExecuteShellCommandAsync(CommandInput input, CancellationToken cancellationToken = default) =>
+        Task.FromResult(new ExecutionOutput(0, string.Empty));
+
+    [Activity]
+    Task<TurnOutcome> RunAgentCodingTurnAsync(TaskExecutionInput input, ChatMessageSignal? pendingReply) =>
+        Task.FromResult(TurnOutcome.Completed());
 }

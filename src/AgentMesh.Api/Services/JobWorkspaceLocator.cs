@@ -107,7 +107,7 @@ public sealed class JobWorkspaceLocator(
         {
             var normalized = Normalize(candidate.Root);
             if (normalized.Length == 0 || !seen.Add(normalized)) continue;
-            if (!IsCheckout(normalized)) continue;
+            if (candidate.Provenance != "legacySharedCheckout" && !IsCheckout(normalized)) continue;
 
             existing.Add(new JobWorkspaceCandidate(normalized, candidate.Provenance));
         }

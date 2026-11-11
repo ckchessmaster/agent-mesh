@@ -1,7 +1,10 @@
-﻿using AgentMesh.Core.Activities;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
+using AgentMesh.Core.Workflows;
 using Temporalio.Activities;
 
 namespace AgentMesh.Worker.Activities;
@@ -231,4 +234,84 @@ public partial class ExecutionActivities(
             "{Kind} working directory '{Path}' does not exist; falling back to a lower-priority path. " +
             "Check projects.working_directory for this task's project.",
             kind, path);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int setpgid(int pid, int pgid);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int kill(int pid, int sig);
+
+    private const int SIGKILL = 9;
+
+    [Activity]
+    public async Task<ExecutionOutput> ExecuteShellCommandAsync(
+        CommandInput input,
+        CancellationToken cancellationToken = default)
+    {
+        var token = ActivityExecutionContext.HasCurrent
+            ? ActivityExecutionContext.Current.CancellationToken
+            : cancellationToken;
+
+        var workingDir = ResolveWorkingDirectory(input.WorkspacePath, null);
+        var processInfo = new ProcessStartInfo
+        {
+            FileName = "/bin/bash",
+            WorkingDirectory = workingDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        processInfo.ArgumentList.Add("-c");
+        processInfo.ArgumentList.Add(input.CommandLine);
+
+        using var process = new Process { StartInfo = processInfo };
+        process.Start();
+
+        // Assign native Linux process group ID matching child PID
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            setpgid(process.Id, process.Id);
+        }
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+
+        try
+        {
+            using (token.Register(() => TerminateProcessGroup(process.Id)))
+            {
+                await process.WaitForExitAsync(token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            TerminateProcessGroup(process.Id);
+            throw;
+        }
+
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
+        var output = string.IsNullOrEmpty(stderr) ? stdout : $"{stdout}\n{stderr}".TrimStart('\n');
+        return new ExecutionOutput(process.ExitCode, output);
+    }
+
+    public static void TerminateProcessGroup(int pid)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            // Suppress errors if process already exited (-pid targets process group)
+            kill(-pid, SIGKILL);
+        }
+        else
+        {
+            // Fallback for non-Linux dev platforms
+            try
+            {
+                var proc = Process.GetProcessById(pid);
+                proc.Kill(entireProcessTree: true);
+            }
+            catch { /* Already terminated */ }
+        }
+    }
 }

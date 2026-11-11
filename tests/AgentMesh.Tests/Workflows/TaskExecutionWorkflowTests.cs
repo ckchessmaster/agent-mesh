@@ -1,6 +1,7 @@
 using AgentMesh.Core.Activities;
 using AgentMesh.Tests.Sandbox;
 using AgentMesh.Core.Workflows;
+using AgentMesh.Worker.Workflows;
 using FluentAssertions;
 using Temporalio.Activities;
 using Temporalio.Client;

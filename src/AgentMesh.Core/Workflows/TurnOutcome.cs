@@ -1,4 +1,4 @@
-﻿namespace AgentMesh.Core.Workflows;
+namespace AgentMesh.Core.Workflows;
 
 /// <summary>
 /// Where a single macro coding turn ended, which is the only thing the Temporal workflow is
@@ -68,6 +68,8 @@ public record TurnOutcome(
     string? PrUrl = null,
     int? PrNumber = null)
 {
+    public string? Summary => Message;
+
     /// <summary>Convenience for the "keep going" case.</summary>
     public static TurnOutcome ContinueTurn(string? message = null) =>
         new(TurnOutcomeStatus.Continue, message);
