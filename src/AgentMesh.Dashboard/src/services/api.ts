@@ -1536,7 +1536,15 @@ export const api = {
       headers: getHeaders(),
       body: JSON.stringify({ approverRole, comments })
     });
-    if (!res.ok) throw new Error(`Failed to approve plan: ${res.statusText}`);
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const b = await res.json();
+        if (b?.message) errMsg = b.message;
+        else if (b?.error) errMsg = b.error;
+      } catch {}
+      throw new Error(errMsg || `Failed to approve plan (${res.status})`);
+    }
     return res.json();
   },
 

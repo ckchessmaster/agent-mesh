@@ -3,6 +3,7 @@ using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Models;
 using FluentAssertions;
 
 namespace AgentMesh.Tests.Cli;
@@ -1054,6 +1055,131 @@ public class OpenAiAdapterTests
         {
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
+    }
+
+    [Theory]
+    [InlineData("Error: file not found", true)]
+    [InlineData("Error writing file", true)]
+    [InlineData("Tool execution error: command exited with code 1", true)]
+    [InlineData("An error occurred invoking 'open_pull_request'.", true)]
+    [InlineData("""{"success":false,"error":"missing_argument"}""", true)]
+    [InlineData("""{"isError":true,"content":[{"text":"failed"}]}""", true)]
+    [InlineData("""{"error":"unauthorized"}""", true)]
+    [InlineData("PR #4242 opened: https://github.com/ckchessmaster/agent-mesh/pull/4242", false)]
+    [InlineData("""{"success":true,"pr_number":4242}""", false)]
+    [InlineData("Successfully wrote 120 bytes to test.txt", false)]
+    [InlineData("", true)]
+    [InlineData(null, true)]
+    public void IsToolResultError_DetectsFailuresCorrectly(string? output, bool expectedIsError)
+    {
+        var isError = OpenAiAdapter.IsToolResultError(output);
+        isError.Should().Be(expectedIsError);
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_WriteToFileAlias_And_CaseInsensitiveArgs_Succeeds()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_alias_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var args = JsonSerializer.Serialize(new
+            {
+                TargetFile = "aliased_output.txt",
+                CodeContent = "Hello from write_to_file tool alias"
+            });
+            var res = await OpenAiAdapter.ExecuteToolLocallyAsync("write_to_file", args, tempDir, CancellationToken.None);
+            res.Should().Contain("Successfully wrote");
+
+            var written = await File.ReadAllTextAsync(Path.Combine(tempDir, "aliased_output.txt"));
+            written.Should().Be("Hello from write_to_file tool alias");
+
+            // Now test replace_file_content alias
+            var editArgs = JsonSerializer.Serialize(new
+            {
+                TargetFile = "aliased_output.txt",
+                TargetContent = "Hello from write_to_file",
+                ReplacementContent = "Replaced in replace_file_content"
+            });
+            var editRes = await OpenAiAdapter.ExecuteToolLocallyAsync("replace_file_content", editArgs, tempDir, CancellationToken.None);
+            editRes.Should().Contain("Successfully replaced");
+
+            var updated = await File.ReadAllTextAsync(Path.Combine(tempDir, "aliased_output.txt"));
+            updated.Should().Be("Replaced in replace_file_content tool alias");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_AskQuestion_ReturnsNotedResponse()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_ask_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var args = JsonSerializer.Serialize(new
+            {
+                question = "Should we enable strict linting?",
+                options = new[] { "Yes", "No" }
+            });
+            var res = await OpenAiAdapter.ExecuteToolLocallyAsync("ask_question", args, tempDir, CancellationToken.None);
+            res.Should().Contain("Question submitted to operator");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public void OpenAiAdapter_GetToolDefinitions_OpenPullRequestSchema_ContainsSummary3RAndBranchName()
+    {
+        var tools = OpenAiAdapter.GetToolDefinitions();
+        var prTool = tools.FirstOrDefault(t =>
+        {
+            var json = JsonSerializer.Serialize(t);
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.GetProperty("function").GetProperty("name").GetString() == "open_pull_request";
+        });
+
+        prTool.Should().NotBeNull();
+        var prJson = JsonSerializer.Serialize(prTool);
+        using var prDoc = JsonDocument.Parse(prJson);
+        var props = prDoc.RootElement.GetProperty("function").GetProperty("parameters").GetProperty("properties");
+
+        props.TryGetProperty("summary_3r", out var s3r).Should().BeTrue();
+        props.TryGetProperty("branch_name", out var bn).Should().BeTrue();
+        props.TryGetProperty("title", out var t).Should().BeTrue();
+    }
+
+    [Fact]
+    public void OpenAiAdapter_GetToolDefinitions_SaveMemorySchema_ContainsValueAndCanonicalCategories()
+    {
+        var tools = OpenAiAdapter.GetToolDefinitions();
+        var memTool = tools.FirstOrDefault(t =>
+        {
+            var json = JsonSerializer.Serialize(t);
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.GetProperty("function").GetProperty("name").GetString() == "save_memory";
+        });
+
+        memTool.Should().NotBeNull();
+        var memJson = JsonSerializer.Serialize(memTool);
+        using var memDoc = JsonDocument.Parse(memJson);
+        var props = memDoc.RootElement.GetProperty("function").GetProperty("parameters").GetProperty("properties");
+
+        props.TryGetProperty("value", out var val).Should().BeTrue();
+        props.TryGetProperty("key", out var k).Should().BeTrue();
+        props.TryGetProperty("category", out var cat).Should().BeTrue();
+        props.TryGetProperty("is_global", out var ig).Should().BeTrue();
+
+        var catEnums = cat.GetProperty("enum").EnumerateArray().Select(e => e.GetString()).ToList();
+        catEnums.Should().Contain(AgentMemoryCategories.Environment);
+        catEnums.Should().Contain(AgentMemoryCategories.BuildAndTest);
+        catEnums.Should().Contain(AgentMemoryCategories.CodebaseGotcha);
     }
 
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler

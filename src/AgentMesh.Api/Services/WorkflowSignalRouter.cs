@@ -1,3 +1,4 @@
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using Temporalio.Api.Enums.V1;
 using Temporalio.Client;
@@ -46,6 +47,15 @@ public interface IWorkflowSignalRouter
         Guid jobId,
         PrReviewSignal signal,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Delivers plan approval into the workflow parked on plan approval for this job.
+    /// </summary>
+    Task<SignalDelivery> SendPlanApprovalAsync(
+        Guid jobId,
+        PlanApprovedSignal signal,
+        CancellationToken ct = default) =>
+        Task.FromResult(new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow));
 
     /// <summary>
     /// Delivers the living checklist into the job execution workflow.
@@ -359,6 +369,50 @@ public class WorkflowSignalRouter(
         {
             return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, Describe(ex));
         }
+    }
+
+    public async Task<SignalDelivery> SendPlanApprovalAsync(
+        Guid jobId,
+        PlanApprovedSignal signal,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(signal);
+
+        // Check if a job-level execution workflow is running first
+        var jobWorkflowIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}" };
+        foreach (var jobWfId in jobWorkflowIds.Distinct())
+        {
+            var jobDesc = await DescribeAsync(jobWfId, ct);
+            if (jobDesc is not null && jobDesc.Status == WorkflowExecutionStatus.Running)
+            {
+                try
+                {
+                    var jobHandle = temporal.GetWorkflowHandle<IJobExecutionWorkflow>(jobWfId);
+                    await jobHandle.SignalAsync(
+                        w => w.ReceivePlanApprovalAsync(signal),
+                        new WorkflowSignalOptions { Rpc = Rpc(ct) });
+
+                    logger?.LogInformation(
+                        "Signalled job execution workflow {WorkflowId} with plan approval from {ApproverId}",
+                        jobWfId, signal.ApproverId);
+
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Delivered);
+                }
+                catch (RpcException ex)
+                {
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, Describe(ex));
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+                {
+                    logger?.LogWarning(ex, "Plan approval signal for {WorkflowId} was rejected", jobWfId);
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, ex.Message);
+                }
+            }
+        }
+
+        var workflowId = WorkflowIdFor(jobId);
+        return new SignalDelivery(workflowId, SignalDeliveryStatus.NoRunningWorkflow,
+            "No running workflow found for this job; continuing with direct dispatch.");
     }
 
     public async Task<SignalDelivery> SendSetChecklistAsync(
