@@ -5,8 +5,11 @@ ENV NODE_VERSION=22
 ENV PATH="/root/.local/bin:/usr/local/bin:${PATH}"
 ENV TERM="xterm-256color"
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # 1. Install base utilities, Python 3, GitHub CLI, Node.js, and CLIs
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/99network-resilience \
+    && apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     git \
@@ -25,13 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-venv \
     && mkdir -p -m 755 /etc/apt/keyrings \
-    && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && curl -4fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
     && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && curl -4fsSL --retry 5 --retry-all-errors https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get update && apt-get install -y --no-install-recommends gh nodejs \
     && npm install -g pnpm @anthropic-ai/claude-code \
-    && curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+    && curl -4fsSL --retry 5 --retry-all-errors https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
     && chmod +x /usr/local/bin/agy \
     && rm -rf /var/lib/apt/lists/*
 
