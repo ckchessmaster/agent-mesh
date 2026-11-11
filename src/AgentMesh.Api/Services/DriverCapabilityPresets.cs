@@ -46,6 +46,20 @@ public static class DriverCapabilityPresets
     };
 
     /// <summary>
+    /// Models supported by the GitHub Copilot CLI via <c>--model</c>.
+    /// </summary>
+    private static readonly (string Id, string Name)[] CopilotModels =
+    {
+        ("auto", "Auto (Copilot picks the model)"),
+        ("claude-3.7-sonnet", "Claude 3.7 Sonnet"),
+        ("claude-3.5-sonnet", "Claude 3.5 Sonnet"),
+        ("gpt-4o", "GPT-4o"),
+        ("o1", "OpenAI o1"),
+        ("o3-mini", "OpenAI o3-mini"),
+        ("claude-3.5-haiku", "Claude 3.5 Haiku")
+    };
+
+    /// <summary>
     /// Context tiers <c>CopilotAdapter</c> forwards via <c>--context</c>.
     /// </summary>
     /// <remarks>
@@ -85,19 +99,15 @@ public static class DriverCapabilityPresets
                     EffortSource: "preset:claude-cli-contract");
 
             case DriverAdapters.Copilot:
-                // The Copilot catalogue is account-scoped and there is no discovery command, so
-                // the only honest bundled entry is "let the CLI choose". Anything else must come
-                // from the operator's `models` array.
-                //
-                // The copilot binary is not installed on the build host, so unlike the claude
-                // preset this one is asserted against CopilotAdapter's own argument construction
-                // rather than `copilot --help`. That is why it is one entry wide.
                 return new DriverCapabilityReading(
                     Adapter: DriverAdapters.Copilot,
-                    Models: new List<DriverModelCapability>
-                    {
-                        new("auto", "Auto (Copilot picks the model)", Array.Empty<string>(), CopilotContextSizes)
-                    },
+                    Models: CopilotModels
+                        .Select(m => new DriverModelCapability(
+                            m.Id,
+                            m.Name,
+                            Array.Empty<string>(),
+                            CopilotContextSizes))
+                        .ToList(),
                     ModelSource: CapabilitySourceKind.StaticPreset,
                     ObservedAt: observedAt,
                     SupportsContextSelection: true,

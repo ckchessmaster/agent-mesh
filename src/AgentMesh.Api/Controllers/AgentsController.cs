@@ -1078,6 +1078,7 @@ public class AgentsController(
 
                 var patch = new JsonObject
                 {
+                    ["adapter"] = reading.Adapter,
                     ["declared"] = JsonSerializer.SerializeToNode(declaration)
                 };
 
@@ -1366,18 +1367,7 @@ public class AgentsController(
 
     private static string ResolveAdapterType(Agent agent, DriverCapabilitiesView view)
     {
-        var canonical = DriverAdapters.Canonicalize(view.Adapter);
-        if (!string.IsNullOrEmpty(canonical)) return canonical;
-        if (!string.IsNullOrWhiteSpace(view.Endpoint)) return DriverAdapters.OpenAi;
-        if (agent.Id.StartsWith("claude", StringComparison.OrdinalIgnoreCase)) return DriverAdapters.Claude;
-        if (agent.Id.StartsWith("copilot", StringComparison.OrdinalIgnoreCase)) return DriverAdapters.Copilot;
-        if (agent.Id.StartsWith("openai", StringComparison.OrdinalIgnoreCase)) return DriverAdapters.OpenAi;
-        return agent.RuntimeType switch
-        {
-            RuntimeType.OpenAiCompatible or RuntimeType.LocalOllama => DriverAdapters.OpenAi,
-            RuntimeType.CliAgy => DriverAdapters.Agy,
-            _ => DriverAdapters.Agy
-        };
+        return DriverAdapters.ResolveAdapter(view.Adapter, agent.Id, view.Endpoint, agent.RuntimeType, fallback: DriverAdapters.Agy);
     }
 
     private static string? FindHostBinary(string name)

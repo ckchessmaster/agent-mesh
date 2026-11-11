@@ -451,6 +451,30 @@ public class DriverCapabilityProbeTests
     }
 
     [Fact]
+    public async Task Copilot_HasAStaticPresetMatchingCliContract()
+    {
+        var reading = await Probe().ProbeAsync(new DriverCapabilityProbeRequest(
+            DriverId: "copilot", RuntimeType: RuntimeType.CliAgy, Adapter: "copilot", Endpoint: null));
+
+        reading.Should().NotBeNull();
+        reading!.Adapter.Should().Be("copilot");
+        reading.ModelSource.Should().Be(CapabilitySourceKind.StaticPreset);
+        reading.Models.Select(m => m.Id).Should().Contain(new[] { "auto", "claude-3.7-sonnet", "gpt-4o", "o1", "o3-mini" });
+    }
+
+    [Fact]
+    public async Task Copilot_InferredFromDriverIdWhenAdapterIsNull()
+    {
+        var reading = await Probe().ProbeAsync(new DriverCapabilityProbeRequest(
+            DriverId: "copilot-beeline", RuntimeType: RuntimeType.CliAgy, Adapter: null, Endpoint: null));
+
+        reading.Should().NotBeNull();
+        reading!.Adapter.Should().Be("copilot");
+        reading.Models.Should().NotBeEmpty();
+        reading.Models.Select(m => m.Id).Should().Contain("auto");
+    }
+
+    [Fact]
     public async Task Generic_HasNoOpinionToOffer()
     {
         var reading = await Probe().ProbeAsync(new DriverCapabilityProbeRequest(
@@ -561,6 +585,26 @@ public class DriverCapabilityProbeTests
         DriverCapabilityProbe.NormalizeAdapter(new DriverCapabilityProbeRequest(
             DriverId: "x", RuntimeType: RuntimeType.CliAgy, Adapter: null, Endpoint: "http://h:1234/v1"))
             .Should().Be("openai");
+    }
+
+    [Fact]
+    public void NormalizeAdapter_InfersAdapterFromDriverIdWhenAdapterIsNull()
+    {
+        DriverCapabilityProbe.NormalizeAdapter(new DriverCapabilityProbeRequest(
+            DriverId: "copilot-beeline", RuntimeType: RuntimeType.CliAgy, Adapter: null, Endpoint: null))
+            .Should().Be("copilot");
+
+        DriverCapabilityProbe.NormalizeAdapter(new DriverCapabilityProbeRequest(
+            DriverId: "claude-coder", RuntimeType: RuntimeType.CliAgy, Adapter: null, Endpoint: null))
+            .Should().Be("claude");
+
+        DriverCapabilityProbe.NormalizeAdapter(new DriverCapabilityProbeRequest(
+            DriverId: "agy-fast", RuntimeType: RuntimeType.CliAgy, Adapter: null, Endpoint: null))
+            .Should().Be("agy");
+
+        DriverCapabilityProbe.NormalizeAdapter(new DriverCapabilityProbeRequest(
+            DriverId: "unknown-driver", RuntimeType: RuntimeType.CliAgy, Adapter: null, Endpoint: null))
+            .Should().BeNull();
     }
 
     [Fact]

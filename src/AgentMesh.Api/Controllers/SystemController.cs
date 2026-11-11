@@ -397,20 +397,7 @@ public class SystemController(
         DriverCapabilitiesView view,
         DriverCapabilityReading? reading)
     {
-        var adapter = DriverAdapters.Canonicalize(view.Adapter) ?? view.Adapter;
-
-        if (string.IsNullOrEmpty(adapter))
-        {
-            adapter = view.Endpoint != null
-                ? DriverAdapters.OpenAi
-                : agent.RuntimeType switch
-                {
-                    RuntimeType.OpenAiCompatible or RuntimeType.LocalOllama => DriverAdapters.OpenAi,
-                    RuntimeType.CliAgy => DriverAdapters.Agy,
-                    RuntimeType.McpCloud => DriverAdapters.Generic,
-                    _ => DriverAdapters.Generic
-                };
-        }
+        var adapter = DriverAdapters.ResolveAdapter(view.Adapter, agent.Id, view.Endpoint, agent.RuntimeType, fallback: DriverAdapters.Agy);
 
         // No reading means the probe had nothing to say (generic drivers, or a host where probing
         // is disabled). That is "unavailable", not "empty list of everything".
