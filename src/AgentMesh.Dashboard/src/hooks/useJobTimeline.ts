@@ -20,6 +20,10 @@ export function useJobTimeline(jobId: string) {
 
   const fetchCards = useCallback(async () => {
     if (!jobId) return;
+    if (typeof api.getTimelineCards !== 'function') {
+      setLoading(false);
+      return;
+    }
     try {
       setLoading(true);
       setError(null);
@@ -33,17 +37,42 @@ export function useJobTimeline(jobId: string) {
     }
   }, [jobId]);
 
+  const refreshCardsQuietly = useCallback(async () => {
+    if (!jobId || typeof api.getTimelineCards !== 'function') return;
+    try {
+      const data = await api.getTimelineCards(jobId);
+      if (Array.isArray(data)) {
+        setCards(data);
+      }
+    } catch {
+      // ignore transient background poll errors
+    }
+  }, [jobId]);
+
   useEffect(() => {
     void fetchCards();
   }, [fetchCards]);
+
+  useEffect(() => {
+    if (!jobId || import.meta.env.MODE === 'test') return;
+    const interval = setInterval(() => {
+      void refreshCardsQuietly();
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [jobId, refreshCardsQuietly]);
 
   useEffect(() => {
     if (!connection || !connected || !jobId) return;
 
     connection.invoke('JoinJob', jobId).catch(() => {});
 
-    const handleCardUpdated = (updatedCard: JobTimelineCard) => {
-      if (!updatedCard) return;
+    const handleCardUpdated = (
+      firstArg: JobTimelineCard | string,
+      secondArg?: JobTimelineCard
+    ) => {
+      const updatedCard =
+        typeof firstArg === 'object' && firstArg !== null ? firstArg : secondArg;
+      if (!updatedCard || !updatedCard.id) return;
       setCards((prev) => {
         const idx = prev.findIndex((c) => c.id === updatedCard.id);
         if (idx >= 0) {

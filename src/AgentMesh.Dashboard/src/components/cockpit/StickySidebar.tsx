@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
+import { ProjectJobStatus, type JobTask, type ProjectJob, type Persona, type Project } from '../../types';
 import type {
   ProposedChecklistItem,
   TemporalHealthState,
@@ -6,6 +7,7 @@ import type {
   PlanApprovalPayload,
   TaskStepPayload
 } from '../../types/timeline';
+import { resolveTargetTaskId } from '../JobCockpit';
 import {
   SquareTerminal,
   Activity,
@@ -13,30 +15,63 @@ import {
   AlertOctagon,
   CheckCircle2,
   PlayCircle,
-  Circle
+  Circle,
+  Clock,
+  X
 } from 'lucide-react';
 
 export interface StickySidebarProps {
   jobId: string;
+  job?: ProjectJob;
+  tasks?: JobTask[];
+  project?: Project;
+  personas?: Persona[];
   checklist?: ProposedChecklistItem[];
   cards?: JobTimelineCard[];
   heartbeat?: string;
   temporalHealth?: Partial<TemporalHealthState>;
   onAbortTurn?: (reason?: string) => Promise<void> | void;
   isAborting?: boolean;
+  onAssignTask?: (taskId: string, personaId: string | null) => Promise<void>;
+  onCancelQueuedTurn?: (turnId: string) => Promise<void> | void;
+  onCancelQueuedTurns?: (personaId: string) => Promise<void> | void;
 }
 
 export const StickySidebar: React.FC<StickySidebarProps> = ({
   jobId,
+  job,
+  tasks: jobTasks = [],
+  project,
+  personas = [],
   checklist: customChecklist,
   cards = [],
   heartbeat: propHeartbeat,
   temporalHealth,
   onAbortTurn,
-  isAborting = false
+  isAborting = false,
+  onAssignTask,
+  onCancelQueuedTurn,
+  onCancelQueuedTurns: _onCancelQueuedTurns
 }) => {
   const [aborting, setAborting] = useState(false);
   const [abortSuccess, setAbortSuccess] = useState(false);
+  const [assignError, setAssignError] = useState<string | null>(null);
+  const [assigningTaskId, setAssigningTaskId] = useState<string | null>(null);
+
+  const teamMembers = useMemo(() => {
+    const map = new Map<string, { id: string; name: string; role: string }>();
+    if (project?.assignedPersonas) {
+      for (const p of project.assignedPersonas) {
+        map.set(p.id.toLowerCase(), { id: p.id, name: p.name, role: p.role });
+      }
+    }
+    for (const p of personas) {
+      if (!map.has(p.id.toLowerCase())) {
+        map.set(p.id.toLowerCase(), { id: p.id, name: p.name, role: p.role });
+      }
+    }
+    return Array.from(map.values());
+  }, [project?.assignedPersonas, personas]);
 
   // Extract checklist from latest PlanApproval card (preferring Approved) if not explicitly provided
   let items: ProposedChecklistItem[] = customChecklist || [];
@@ -61,6 +96,21 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
     }
   }
 
+  if (items.length === 0 && jobTasks.length > 0) {
+    items = jobTasks.map((t, idx) => ({
+      taskId: t.id || `task-${idx + 1}`,
+      title: t.title,
+      targetFile: t.targetFile || '',
+      verificationMethod: t.verificationMethod || '',
+      status:
+        t.isCompleted || t.status === 'completed'
+          ? 'completed'
+          : t.status === 'in_progress'
+          ? 'in_progress'
+          : 'pending'
+    }));
+  }
+
   // Extract latest heartbeat from TaskStep cards if not provided
   let currentHeartbeat = propHeartbeat || '';
   if (!currentHeartbeat) {
@@ -82,6 +132,10 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
         // ignore
       }
     }
+  }
+
+  if (!currentHeartbeat && job?.progressHeartbeat) {
+    currentHeartbeat = job.progressHeartbeat;
   }
 
   // Determine item status based on cards
@@ -158,7 +212,18 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
   const workflowId = temporalHealth?.workflowId || (jobId.startsWith('job-') ? jobId : `job-${jobId}`);
   const runId = temporalHealth?.runId || 'run-live-01';
   const attempt = temporalHealth?.attempt ?? 1;
-  const status = temporalHealth?.status || (activeTaskStep ? 'Running' : 'Ready');
+  const derivedStatus = () => {
+    if (temporalHealth?.status) return temporalHealth.status;
+    if (activeTaskStep) return 'Running';
+    if (job) {
+      if (job.status === ProjectJobStatus.Pending && cards.length === 0) return 'Pending';
+      if (job.status === ProjectJobStatus.Active) return 'Running';
+      if (job.status === ProjectJobStatus.Completed) return 'Completed';
+      if (job.status === ProjectJobStatus.Archived) return 'Archived';
+    }
+    return 'Ready';
+  };
+  const status = derivedStatus();
 
   return (
     <aside
@@ -200,13 +265,14 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
             Checklist pending decomposition...
           </div>
         ) : (
-          <ul className="space-y-2">
+          <ul data-testid="sidebar-checklist" className="space-y-2">
             {items.map((item, idx) => {
               const itemStatus = getItemStatus(item, idx);
 
               return (
                 <li
                   key={item.taskId || idx}
+                  data-testid={`checklist-item-${item.taskId || idx}`}
                   className={`p-2.5 rounded border text-xs transition-all ${
                     itemStatus === 'in_progress'
                       ? 'bg-indigo-950/40 border-indigo-500/50 text-indigo-200 shadow-sm'
@@ -253,7 +319,10 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
 
         {/* Heartbeat Indicator */}
         {currentHeartbeat && (
-          <div className="mt-4 p-2.5 bg-slate-800/60 border border-slate-700/60 rounded-md flex items-center space-x-2">
+          <div
+            data-testid="sidebar-heartbeat"
+            className="mt-4 p-2.5 bg-slate-800/60 border border-slate-700/60 rounded-md flex items-center space-x-2"
+          >
             <Heart className="w-4 h-4 text-rose-400 animate-pulse flex-shrink-0" />
             <div className="min-w-0 flex-1">
               <span className="text-[11px] text-slate-300 font-mono block truncate">
@@ -263,6 +332,116 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
           </div>
         )}
       </div>
+
+      {/* Queued Turns Section */}
+      {job?.queuedTurns && job.queuedTurns.length > 0 && (
+        <div
+          className="p-3 rounded-lg bg-amber-950/40 border border-amber-500/40 text-xs shadow-md space-y-2 mb-4"
+          data-testid="job-queued-turns-indicator"
+        >
+          <div className="flex items-center gap-2">
+            <Clock className="w-4 h-4 text-amber-300 animate-spin shrink-0" />
+            <div className="min-w-0 flex-1 flex items-center justify-between">
+              <span className="font-semibold text-amber-200 truncate">
+                {job.queuedTurns.length} Queued Turn{job.queuedTurns.length === 1 ? '' : 's'}
+              </span>
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                Waiting for Slot
+              </span>
+            </div>
+          </div>
+
+          {assignError && (
+            <div
+              data-testid="task-assign-error"
+              className="flex items-center justify-between text-xs text-rose-300 bg-rose-950/60 border border-rose-500/40 rounded-lg px-2 py-1"
+            >
+              <span className="truncate">{assignError}</span>
+              <button
+                type="button"
+                data-testid="task-assign-error-dismiss"
+                onClick={() => setAssignError(null)}
+                className="text-rose-400 hover:text-rose-200 shrink-0 ml-2"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
+          <div className="space-y-1.5 pt-1 border-t border-amber-500/20">
+            {job.queuedTurns.map((turn) => {
+              const targetPersona = personas.find((p) => p.id === turn.targetPersonaId);
+              const displayName = targetPersona?.name || turn.targetPersonaId;
+              return (
+                <div
+                  key={turn.id}
+                  data-testid={`queued-turn-item-${turn.id}`}
+                  className="flex items-center justify-between gap-2 p-1.5 rounded bg-amber-900/30 border border-amber-500/25 text-[11px]"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-semibold text-amber-200 truncate">@{displayName}</span>
+                    </div>
+                    <p className="text-[10px] text-amber-300/70 truncate font-mono">
+                      {turn.content.slice(0, 45)}{turn.content.length > 45 ? '...' : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {onAssignTask && (
+                      <select
+                        value={turn.targetPersonaId}
+                        disabled={assigningTaskId === `turn:${turn.id}`}
+                        onChange={async (e) => {
+                          const nextPersona = e.target.value;
+                          if (!nextPersona || nextPersona === turn.targetPersonaId) return;
+                          const targetTaskId = resolveTargetTaskId(jobTasks, turn.targetPersonaId);
+                          if (!targetTaskId) {
+                            setAssignError('This queued turn has no task to reassign. Add a task first, or cancel the turn.');
+                            return;
+                          }
+                          setAssigningTaskId(`turn:${turn.id}`);
+                          setAssignError(null);
+                          try {
+                            await onAssignTask(targetTaskId, nextPersona);
+                          } catch (err) {
+                            setAssignError(err instanceof Error ? err.message : 'Failed to reassign queued turn');
+                          } finally {
+                            setAssigningTaskId(null);
+                          }
+                        }}
+                        aria-label={`Reassign queued turn for ${displayName}`}
+                        data-testid={`reassign-queued-turn-${turn.id}`}
+                        title="Send this queued turn to a different team member"
+                        className="max-w-[100px] rounded border bg-amber-950/60 border-amber-500/30 text-amber-100 px-1 py-0.5 text-[10px] cursor-pointer"
+                      >
+                        <option value={turn.targetPersonaId}>@{displayName}</option>
+                        {teamMembers
+                          .filter((m) => m.id !== turn.targetPersonaId)
+                          .map((m) => (
+                            <option key={m.id} value={m.id}>
+                              → {m.name}
+                            </option>
+                          ))}
+                      </select>
+                    )}
+                    {onCancelQueuedTurn && (
+                      <button
+                        type="button"
+                        onClick={() => onCancelQueuedTurn(turn.id)}
+                        title="Cancel queued turn"
+                        data-testid={`cancel-queued-turn-btn-${turn.id}`}
+                        className="px-1.5 py-0.5 rounded bg-rose-600/80 hover:bg-rose-500 text-white font-medium text-[10px]"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Temporal Health Metrics */}
       <div className="p-3 bg-slate-950/60 border border-slate-800/80 rounded-md mb-4 text-xs font-mono space-y-1.5">

@@ -58,9 +58,7 @@ public class JobTimelineController(
         if (hubContext != null)
         {
             await hubContext.Clients.Group($"job-{jobId}")
-                .SendAsync("ReceiveTimelineCardUpdated", jobId, card);
-            await hubContext.Clients.Group(jobId)
-                .SendAsync("ReceiveTimelineCardUpdated", jobId, card);
+                .SendAsync("ReceiveTimelineCardUpdated", card);
         }
     }
 
@@ -75,6 +73,22 @@ public class JobTimelineController(
             .ToListAsync();
 
         return Ok(cards);
+    }
+
+    [HttpPost("cards/{cardId}/notify-updated")]
+    public async Task<IActionResult> NotifyCardUpdated(string jobId, Guid cardId)
+    {
+        var card = await db.JobTimelineCards
+            .AsNoTracking()
+            .Include(c => c.Comments)
+            .FirstOrDefaultAsync(c => c.Id == cardId && c.JobId == jobId);
+        if (card == null)
+        {
+            return NotFound();
+        }
+
+        await BroadcastCardUpdatedAsync(jobId, card);
+        return Ok(card);
     }
 
     [HttpPost("cards/{cardId}/comments")]
@@ -101,8 +115,6 @@ public class JobTimelineController(
         if (hubContext != null)
         {
             await hubContext.Clients.Group($"job-{jobId}")
-                .SendAsync("ReceiveTimelineComment", jobId, cardId, comment);
-            await hubContext.Clients.Group(jobId)
                 .SendAsync("ReceiveTimelineComment", jobId, cardId, comment);
         }
 

@@ -1,16 +1,35 @@
 import React from 'react';
 import { useJobTimeline } from '../../hooks/useJobTimeline';
+import type { JobTask, ProjectJob, Project, Persona } from '../../types';
 import { StickySidebar } from './StickySidebar';
 import { TimelineFeed } from './TimelineFeed';
 
 export interface CockpitLayoutProps {
   jobId: string;
+  job?: ProjectJob;
+  tasks?: JobTask[];
+  project?: Project;
+  personas?: Persona[];
+  onStartJob?: () => void;
+  isStarting?: boolean;
+  onAssignTask?: (taskId: string, personaId: string | null) => Promise<void>;
+  onCancelQueuedTurn?: (turnId: string) => Promise<void> | void;
+  onCancelQueuedTurns?: (personaId: string) => Promise<void> | void;
   onBack?: () => void;
   className?: string;
 }
 
 export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
   jobId,
+  job,
+  tasks,
+  project,
+  personas,
+  onStartJob,
+  isStarting = false,
+  onAssignTask,
+  onCancelQueuedTurn,
+  onCancelQueuedTurns,
   className = ''
 }) => {
   const {
@@ -32,8 +51,15 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
       {/* Sticky Left Sidebar (320px) */}
       <StickySidebar
         jobId={jobId}
+        job={job}
+        tasks={tasks}
+        project={project}
+        personas={personas}
         cards={cards}
         onAbortTurn={abortActiveTurn}
+        onAssignTask={onAssignTask}
+        onCancelQueuedTurn={onCancelQueuedTurn}
+        onCancelQueuedTurns={onCancelQueuedTurns}
       />
 
       {/* Main Timeline Feed */}
@@ -46,6 +72,9 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
         <TimelineFeed
           cards={cards}
           loading={loading}
+          job={job}
+          onStartJob={onStartJob}
+          isStarting={isStarting}
           onSubmitAnswers={submitAnswers}
           onSubmitPlanDecision={submitPlanDecision}
           onSubmitIntervention={submitIntervention}
@@ -55,3 +84,4 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
     </div>
   );
 };
+

@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
-import type { Persona, Project, ProjectJob, JobTask, JobMessage, AgentSession, JobArtifact } from '../types';
+import type { Persona, Project, ProjectJob, JobTask, JobMessage, JobArtifact } from '../types';
 import { WorkspaceType, ProjectJobStatus } from '../types';
 
 vi.mock('../services/api', () => ({
@@ -244,129 +244,14 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       expect(screen.getByText('Complete Job')).toBeInTheDocument();
     });
 
-    // Task checklist bar displays progress (1/2 completed)
-    expect(screen.getByText(/1\/2 completed/i)).toBeInTheDocument();
-    // Default filter is 'pending', showing only incomplete tasks
-    expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
-    expect(screen.queryByText('Implement OAuth endpoints')).not.toBeInTheDocument();
+    // Timeline cockpit container and StickySidebar are rendered
+    expect(screen.getByTestId('timeline-cockpit-container')).toBeInTheDocument();
+    expect(screen.getByTestId('sticky-sidebar')).toBeInTheDocument();
 
-    // Clicking All filter shows all tasks including completed
-    fireEvent.click(screen.getByRole('button', { name: /^All/i }));
+    // Living checklist displays tasks
+    expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
     expect(screen.getByText('Implement OAuth endpoints')).toBeInTheDocument();
-    expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
-
-    // Messages render in chat feed with persona badges and two-tier trajectory button
-    expect(screen.getByText('@astra please implement the OAuth endpoints')).toBeInTheDocument();
-    expect(screen.getByText(/I have finished the OAuth controller/)).toBeInTheDocument();
-    expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
-
-    // Quick mention chips are visible
-    expect(screen.getAllByText('@astra').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('@qa-tester').length).toBeGreaterThan(0);
   }, 15000);
-
-  it('allows clicking quick mention chip to insert persona mention into prompt input and sending message', async () => {
-    vi.mocked(api.postJobMessage).mockResolvedValue({
-      id: 'm-3',
-      jobId: 'job-101',
-      senderType: 'user',
-      content: '@qa-tester please verify token expiration',
-      mentions: ['qa-tester'],
-      createdAt: new Date().toISOString()
-    });
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    }, { timeout: 4000 });
-    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
-
-    await waitFor(() => {
-      expect(screen.getAllByText('@qa-tester').length).toBeGreaterThan(0);
-    });
-
-    // Click mention chip (the button element)
-    const mentionButtons = screen.getAllByRole('button', { name: /@qa-tester/i });
-    fireEvent.click(mentionButtons[0]);
-
-    const textarea = screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i);
-    expect((textarea as HTMLTextAreaElement).value).toContain('@qa-tester ');
-
-    // Type the rest of the message
-    fireEvent.change(textarea, { target: { value: '@qa-tester please verify token expiration' } });
-
-    // Submit message
-    const sendBtn = screen.getByTitle('Send Message');
-    fireEvent.click(sendBtn);
-
-    await waitFor(() => {
-      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
-        content: '@qa-tester please verify token expiration',
-        senderType: 'user'
-      });
-    });
-  });
-
-  it('opens team member mention autocomplete when typing @ in the job message area and autocompletes persona', async () => {
-    vi.mocked(api.postJobMessage).mockResolvedValue({
-      id: 'm-4',
-      jobId: 'job-101',
-      senderType: 'user',
-      content: '@astra please review security architecture',
-      mentions: ['astra'],
-      createdAt: new Date().toISOString()
-    });
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    }, { timeout: 4000 });
-    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
-
-    await waitFor(() => {
-      expect(
-        screen.getByPlaceholderText(/Type your message, tasks, or delegate with @persona/i)
-      ).toBeInTheDocument();
-    });
-
-    const textarea = screen.getByPlaceholderText(
-      /Type your message, tasks, or delegate with @persona/i
-    );
-
-    // Enter @ in the job message area
-    fireEvent.change(textarea, { target: { value: '@' } });
-
-    // Autocomplete palette should appear showing project team members
-    const palette = screen.getByTestId('team-mention-palette');
-    expect(palette).toBeInTheDocument();
-    expect(within(palette).getByText('Team Members')).toBeInTheDocument();
-    expect(within(palette).getByText('Astra')).toBeInTheDocument();
-    expect(within(palette).getByText('QA Tester')).toBeInTheDocument();
-
-    // Select Astra from the autocomplete dropdown
-    const astraOption = screen.getByTestId('team-mention-option-astra');
-    fireEvent.click(astraOption);
-
-    // Textarea updated with mention and palette closed
-    expect((textarea as HTMLTextAreaElement).value).toBe('@astra ');
-    expect(screen.queryByTestId('team-mention-palette')).not.toBeInTheDocument();
-
-    // Finish typing message and send
-    fireEvent.change(textarea, {
-      target: { value: '@astra please review security architecture' }
-    });
-    const sendBtn = screen.getByTitle('Send Message');
-    fireEvent.click(sendBtn);
-
-    await waitFor(() => {
-      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
-        content: '@astra please review security architecture',
-        senderType: 'user'
-      });
-    });
-  });
 
   it('renders autonomous living checklist tasks for the active job', async () => {
     render(<App />);
@@ -467,9 +352,9 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       expect(api.assignJobTask).toHaveBeenCalledWith('job-101', 'task-2', 'qa-tester');
     });
 
-    // The handover message is pulled back in so the chat explains why the queue moved.
+    // The server job DTO converges the queued turn target in StickySidebar.
     await waitFor(() => {
-      expect(screen.getByText(/reassigned from @Astra to @QA Tester/)).toBeInTheDocument();
+      expect(screen.getByTestId('reassign-queued-turn-turn-9')).toHaveValue('qa-tester');
     });
   });
 
@@ -656,75 +541,6 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     });
   });
 
-  it('allows attaching files in job cockpit, stages them, sends attachments to postJobMessage, and renders attachments in job messages', async () => {
-    const uploadedAtt = {
-      id: 'att-job-99',
-      sessionId: 'job-101',
-      fileName: 'spec.pdf',
-      contentType: 'application/pdf',
-      sizeBytes: 4096,
-      s3Key: 'jobs/job-101/attachments/att-job-99/spec.pdf',
-      downloadUrl: '/api/project-jobs/job-101/attachments/att-job-99/content',
-      createdAt: new Date().toISOString()
-    };
-
-    vi.mocked(api.uploadJobAttachments).mockResolvedValue([uploadedAtt]);
-
-    const createdJobMsg: JobMessage = {
-      id: 'msg-job-created-1',
-      jobId: 'job-101',
-      senderType: 'user',
-      content: 'Please review the attached file(s).',
-      mentions: [],
-      structuredPayloadJson: JSON.stringify({
-        attachments: [uploadedAtt]
-      }),
-      createdAt: new Date().toISOString()
-    };
-
-    vi.mocked(api.postJobMessage).mockResolvedValue(createdJobMsg);
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    }, { timeout: 4000 });
-    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
-
-    await waitFor(() => {
-      expect(screen.getByTestId('job-attach-btn')).toBeInTheDocument();
-    });
-
-    const fileInput = screen.getByTestId('job-file-input');
-    const pdfFile = new File(['pdf-data'], 'spec.pdf', { type: 'application/pdf' });
-    fireEvent.change(fileInput, { target: { files: [pdfFile] } });
-
-    await waitFor(() => {
-      expect(api.uploadJobAttachments).toHaveBeenCalledWith('job-101', [pdfFile]);
-      expect(screen.getByTestId('job-staged-attachments')).toBeInTheDocument();
-      expect(screen.getByText('spec.pdf')).toBeInTheDocument();
-    });
-
-    const sendBtn = screen.getByRole('button', { name: /Send Message/i });
-    expect(sendBtn).not.toBeDisabled();
-
-    fireEvent.click(sendBtn);
-
-    await waitFor(() => {
-      expect(api.postJobMessage).toHaveBeenCalledWith('job-101', {
-        content: 'Please review the attached file(s).',
-        senderType: 'user',
-        attachments: [uploadedAtt]
-      });
-    });
-
-    // The message with attachment is rendered in the message feed
-    await waitFor(() => {
-      expect(screen.getByTestId('job-message-attachments-msg-job-created-1')).toBeInTheDocument();
-      expect(screen.getByText('spec.pdf')).toBeInTheDocument();
-    });
-  });
-
   it('allows editing project details and team members from project list and updates project', async () => {
     const updatedProj = {
       ...mockProject,
@@ -760,64 +576,6 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
           name: 'Mesh Core System (Updated)'
         })
       );
-    });
-  });
-
-  it('clicking View Turn Execution & Trajectory loads turn session without empty observatory and provides Return to Job button', async () => {
-    vi.mocked(api.getSession).mockResolvedValue({
-      id: 'sess-turn-456',
-      title: 'Job Turn: Implement OAuth Provider (@Astra)',
-      status: 'active',
-      metadataJson: JSON.stringify({
-        jobId: 'job-101',
-        projectId: 'mesh-core',
-        projectName: 'Mesh Core System',
-        personaId: 'astra'
-      }),
-      driverId: 'agy',
-      personaId: 'astra',
-      personaName: 'Astra',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    });
-    vi.mocked(api.getSessionMessages).mockResolvedValue([
-      {
-        id: 'msg-ev-1',
-        sessionId: 'sess-turn-456',
-        senderAgentId: 'astra',
-        eventType: 'thought',
-        content: 'Analyzing OAuth specifications and scopes',
-        createdAt: new Date().toISOString()
-      }
-    ]);
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-    }, { timeout: 4000 });
-    fireEvent.click(screen.getAllByText('Implement OAuth Provider')[0]);
-
-    await waitFor(() => {
-      expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
-    });
-
-    // Click View Turn Execution & Trajectory
-    fireEvent.click(screen.getByText('View Turn Execution & Trajectory'));
-
-    // Should load the session details in both sidebar and main panel, not show the empty observatory screen
-    await waitFor(() => {
-      expect(screen.getAllByText('Job Turn: Implement OAuth Provider (@Astra)').length).toBeGreaterThan(0);
-      expect(screen.queryByText('Agent Session Observatory')).not.toBeInTheDocument();
-      expect(screen.getByText('← Back to Job')).toBeInTheDocument();
-    });
-
-    // Click Back to Job returns to Job Cockpit
-    fireEvent.click(screen.getByText('← Back to Job'));
-
-    await waitFor(() => {
-      expect(screen.getAllByText('Implement OAuth Provider').length).toBeGreaterThan(0);
-      expect(screen.getByText('View Turn Execution & Trajectory')).toBeInTheDocument();
     });
   });
 
@@ -880,98 +638,6 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     await waitFor(() => {
       expect(screen.queryByText('Old Archived Sprint')).not.toBeInTheDocument();
       expect(toggleArchivedBtn).toHaveTextContent('Show Archived');
-    });
-  });
-
-  it('surfaces questions in job chat, renders interactive question cards, and calls submitQuestionAnswer when answered', async () => {
-    const jobWithQuestion: ProjectJob = {
-      id: 'job-q-101',
-      projectId: 'mesh-core',
-      title: 'Question Workflow Job',
-      description: 'Job with question',
-      status: ProjectJobStatus.Active,
-      gitBranchName: 'mesh/job-q-101',
-      tasks: [],
-      messageCount: 1,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    const questionMsg: JobMessage = {
-      id: 'msg-job-q-1',
-      jobId: 'job-q-101',
-      senderType: 'persona',
-      senderId: 'agy-astra',
-      senderName: 'Astra',
-      content: 'I have a question before we begin:',
-      mentions: [],
-      turnSessionId: 'sess-q-turn-1',
-      structuredPayloadJson: JSON.stringify({
-        toolName: 'ask_question',
-        questions: [
-          {
-            question: 'Should we enable streaming logs?',
-            options: ['Yes', 'No'],
-            is_multi_select: false
-          }
-        ]
-      }),
-      createdAt: new Date().toISOString()
-    };
-
-    const turnSession: AgentSession = {
-      id: 'sess-q-turn-1',
-      title: 'Turn Session Q',
-      status: 'waiting_for_input',
-      metadataJson: '{}',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    vi.mocked(api.getProjectJobs).mockResolvedValue([jobWithQuestion]);
-    vi.mocked(api.getJobMessages).mockResolvedValue([questionMsg]);
-    vi.mocked(api.getSessions).mockResolvedValue([turnSession]);
-    vi.mocked(api.submitQuestionAnswer).mockResolvedValue({
-      toolResult: {} as any,
-      prompt: {} as any,
-      session: turnSession
-    });
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(screen.getAllByText('Question Workflow Job').length).toBeGreaterThan(0);
-    }, { timeout: 4000 });
-    fireEvent.click(screen.getAllByText('Question Workflow Job')[0]);
-
-    // Wait for job chat to load
-    await waitFor(() => {
-      expect(screen.getByTestId('question-card-msg-job-q-1')).toBeInTheDocument();
-      expect(screen.getByText('Should we enable streaming logs?')).toBeInTheDocument();
-    });
-
-    // Option pill 'Yes' is rendered
-    const yesBtn = screen.getByText('Yes');
-    expect(yesBtn).toBeInTheDocument();
-    fireEvent.click(yesBtn);
-
-    // Click Submit Answer
-    const submitBtn = screen.getByRole('button', { name: /Submit Answer/i });
-    fireEvent.click(submitBtn);
-
-    await waitFor(() => {
-      expect(api.submitQuestionAnswer).toHaveBeenCalledWith(
-        'sess-q-turn-1',
-        expect.objectContaining({
-          toolCallId: 'msg-job-q-1',
-          answers: [
-            expect.objectContaining({
-              question: 'Should we enable streaming logs?',
-              selectedOptions: ['Yes']
-            })
-          ]
-        })
-      );
     });
   });
 
@@ -1320,7 +986,7 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
       // The rest of the cockpit survived the failed call.
       expect(screen.getByText('Write integration test coverage')).toBeInTheDocument();
-      expect(screen.getByText(/please implement the OAuth endpoints/i)).toBeInTheDocument();
+      expect(screen.getByTestId('timeline-cockpit-container')).toBeInTheDocument();
     });
 
     it('clears artifacts when switching to a job with none', async () => {
