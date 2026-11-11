@@ -1584,6 +1584,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     var buf = new byte[2048];
                     while (webSocket.State == WebSocketState.Open)
                     {
+                        var read = await stdOutStream.ReadAsync(buf, 0, buf.Length, CancellationToken.None);
+                        if (read <= 0) break;
                         var chunk = Encoding.UTF8.GetString(buf, 0, read);
                         capturedOutput.Append(chunk);
                         var match = Regex.Match(capturedOutput.ToString(), @"https?://[^\s""'>]+");
