@@ -1565,7 +1565,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
             else if (driverId.StartsWith("copilot") || adapterType == "copilot")
             {
-                authCmd = new[] { "copilot", "login" };
+                authCmd = new[] { "copilot", "login", "--device-code" };
             }
             else
             {
@@ -1739,17 +1739,6 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     try { await Task.Delay(200, ct); } catch { }
                 }
 
-                if (driverId.StartsWith("copilot") || adapterType == "copilot")
-                {
-                    try
-                    {
-                        var nl = Encoding.UTF8.GetBytes("\n");
-                        await stdInStream.WriteAsync(nl, 0, nl.Length, CancellationToken.None);
-                        await stdInStream.FlushAsync(CancellationToken.None);
-                    }
-                    catch { }
-                }
-
                 var promptMsg = !string.IsNullOrWhiteSpace(session.UserCode)
                     ? $"Enter the one-time code {session.UserCode} on GitHub to authorize this device."
                     : (!string.IsNullOrWhiteSpace(loginCmd)
@@ -1827,7 +1816,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             try
             {
-                if (!string.IsNullOrWhiteSpace(code))
+                if (!string.IsNullOrWhiteSpace(code) && !info.DriverId.StartsWith("copilot") && info.AdapterType != "copilot")
                 {
                     var codeBytes = Encoding.UTF8.GetBytes(code.Trim() + "\n");
                     await session.StdIn.WriteAsync(codeBytes, 0, codeBytes.Length, ct);
@@ -1938,11 +1927,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
             catch (Exception ex)
             {
-                return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: ex.Message);
-            }
-            finally
-            {
+                _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
                 await session.DisposeAsync();
+                return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: ex.Message);
             }
         }
 

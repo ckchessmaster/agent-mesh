@@ -789,6 +789,7 @@ public class AgentsController(
             {
                 psi.FileName = hostBinPath!;
                 psi.ArgumentList.Add("login");
+                psi.ArgumentList.Add("--device-code");
             }
             else
             {
@@ -867,16 +868,6 @@ public class AgentsController(
                     try { await Task.Delay(200, ct); } catch { }
                 }
 
-                if (adapter == DriverAdapters.Copilot)
-                {
-                    try
-                    {
-                        await proc.StandardInput.WriteLineAsync();
-                        await proc.StandardInput.FlushAsync(ct);
-                    }
-                    catch { }
-                }
-
                 _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode, tempHome);
                 return Ok(new PersonaAuthStartResult(
                     normalizedId,
@@ -923,7 +914,7 @@ public class AgentsController(
         {
             try
             {
-                if (!string.IsNullOrWhiteSpace(req.Code))
+                if (!string.IsNullOrWhiteSpace(req.Code) && adapter != DriverAdapters.Copilot)
                 {
                     try
                     {

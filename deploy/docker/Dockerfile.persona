@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_VERSION=22
 ENV PATH="/root/.local/bin:/usr/local/bin:${PATH}"
 ENV TERM="xterm-256color"
+ENV REMOTE_CONTAINERS=true
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 

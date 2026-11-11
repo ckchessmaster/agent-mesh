@@ -1613,6 +1613,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         {
             psi.ArgumentList.Add("copilot");
             psi.ArgumentList.Add("login");
+            psi.ArgumentList.Add("--device-code");
         }
         else
         {
@@ -1707,16 +1708,6 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     try { await Task.Delay(200, ct); } catch { }
                 }
 
-                if (driverId.StartsWith("copilot") || adapterType == "copilot")
-                {
-                    try
-                    {
-                        await proc.StandardInput.WriteLineAsync();
-                        await proc.StandardInput.FlushAsync();
-                    }
-                    catch { }
-                }
-
                 var session = new ActiveAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode);
                 _activeAuthSessions[normPersonaId] = session;
                 var promptMsg = !string.IsNullOrWhiteSpace(capturedUserCode)
@@ -1793,7 +1784,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         {
             try
             {
-                if (!string.IsNullOrWhiteSpace(code))
+                if (!string.IsNullOrWhiteSpace(code) && !info.DriverId.StartsWith("copilot") && info.AdapterType != "copilot")
                 {
                     await session.Writer.WriteLineAsync(code.Trim());
                     await session.Writer.FlushAsync();
