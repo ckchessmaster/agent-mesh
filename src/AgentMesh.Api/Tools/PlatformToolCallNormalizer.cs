@@ -224,6 +224,15 @@ public static class PlatformToolCallNormalizer
 
     private static void NormalizeManageTask(IDictionary<string, JsonElement> args)
     {
+        if (!args.ContainsKey("action"))
+        {
+            if (TryGetString(args, "operation", out var op)) args["action"] = JsonSerializer.SerializeToElement(op);
+            else if (TryGetString(args, "command", out var cmd)) args["action"] = JsonSerializer.SerializeToElement(cmd);
+            else if (args.ContainsKey("tasks")) args["action"] = JsonSerializer.SerializeToElement("set_checklist");
+            else if (args.ContainsKey("status")) args["action"] = JsonSerializer.SerializeToElement("update_task_status");
+            else args["action"] = JsonSerializer.SerializeToElement("get_checklist");
+        }
+
         if (!args.ContainsKey("task_id") && TryGetString(args, "taskId", out var tid)) args["task_id"] = JsonSerializer.SerializeToElement(tid);
         if (!args.ContainsKey("progress_note") && TryGetString(args, "progressNote", out var pn)) args["progress_note"] = JsonSerializer.SerializeToElement(pn);
         if (!args.ContainsKey("job_id") && TryGetString(args, "jobId", out var jid)) args["job_id"] = JsonSerializer.SerializeToElement(jid);
@@ -291,6 +300,7 @@ public static class PlatformToolCallNormalizer
             if (TryGetString(args, "targetPersona", out var tp)) args["target_persona"] = JsonSerializer.SerializeToElement(tp);
             else if (TryGetString(args, "target", out var tgt)) args["target_persona"] = JsonSerializer.SerializeToElement(tgt);
             else if (TryGetString(args, "persona", out var p)) args["target_persona"] = JsonSerializer.SerializeToElement(p);
+            else args["target_persona"] = JsonSerializer.SerializeToElement("operator");
         }
 
         if (!args.ContainsKey("requires_reply"))

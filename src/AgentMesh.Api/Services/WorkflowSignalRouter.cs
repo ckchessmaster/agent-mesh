@@ -211,7 +211,18 @@ public class WorkflowSignalRouter(
         var jobWorkflowIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}" };
         foreach (var jobWfId in jobWorkflowIds.Distinct())
         {
-            var jobDesc = await DescribeAsync(jobWfId, ct);
+            using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeCts.CancelAfter(ProbeTimeout);
+            WorkflowExecutionDescription? jobDesc = null;
+            try
+            {
+                jobDesc = await DescribeAsync(jobWfId, probeCts.Token);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                logger?.LogDebug("Probe for job workflow {WorkflowId} timed out or failed: {Detail}", jobWfId, Describe(ex));
+            }
+
             if (jobDesc is not null && jobDesc.Status == WorkflowExecutionStatus.Running)
             {
                 try

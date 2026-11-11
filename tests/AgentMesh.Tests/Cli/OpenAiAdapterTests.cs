@@ -1182,6 +1182,36 @@ public class OpenAiAdapterTests
         catEnums.Should().Contain(AgentMemoryCategories.CodebaseGotcha);
     }
 
+    [Theory]
+    [InlineData("""{"requires_reply": true}""", true)]
+    [InlineData("""{"requires_reply": "true"}""", true)]
+    [InlineData("""{"requires_reply": "True"}""", true)]
+    [InlineData("""{"requiresReply": true}""", true)]
+    [InlineData("""{"requiresReply": "true"}""", true)]
+    [InlineData("""{"requires_reply": false}""", false)]
+    [InlineData("""{"requires_reply": "false"}""", false)]
+    [InlineData("""{"content": "hello"}""", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsRequiresReply_ParsesBooleanAndStringValues(string? toolArgs, bool expected)
+    {
+        OpenAiAdapter.IsRequiresReply(toolArgs).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("""{"action": "set_checklist"}""", true)]
+    [InlineData("""{"Action": "set_checklist"}""", true)]
+    [InlineData("""{"operation": "SET_CHECKLIST"}""", true)]
+    [InlineData("""{"command": "set_checklist"}""", true)]
+    [InlineData("""{"action": "update_task_status"}""", false)]
+    [InlineData("""{"action": "get_checklist"}""", false)]
+    [InlineData("{}", false)]
+    [InlineData(null, false)]
+    public void IsSetChecklistAction_DetectsSetChecklistInVariousKeysAndCasings(string? toolArgs, bool expected)
+    {
+        OpenAiAdapter.IsSetChecklistAction(toolArgs).Should().Be(expected);
+    }
+
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

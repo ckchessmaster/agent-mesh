@@ -893,11 +893,17 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
         SaveHistoryToDisk(promptEvent.SessionId, history);
 
-        var isDiscoveryPhase = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+        var isPastDiscovery = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true);
+
+        var isDiscoveryPhase = !isPastDiscovery && (
+            (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
             || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
             || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true)
             || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true)
-            || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true);
+            || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
         var toolsDefinition = isDirectMode ? null : GetToolDefinitions(isDiscoveryPhase);
@@ -1442,6 +1448,24 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             return;
                         }
                     }
+
+                    // manage_task with action='set_checklist' yields the turn for Stage 2 Plan Approval
+                    if (string.Equals(toolName, "manage_task", StringComparison.OrdinalIgnoreCase) && IsSetChecklistAction(toolArgs))
+                    {
+                        var isError = IsToolResultError(toolResult);
+                        if (!isError)
+                        {
+                            responseEmitted = true;
+                            await onEvent(new TrajectoryEventPayload
+                            {
+                                EventType = "response",
+                                Content = !string.IsNullOrWhiteSpace(finalContent)
+                                    ? $"{finalContent.Trim()}\n\nTurn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."
+                                    : "Turn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."
+                            });
+                            return;
+                        }
+                    }
                 }
 
                 if (askedQuestion)
@@ -1556,6 +1580,50 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     Content = $"Completed {fbName}",
                     ToolResultJson = toolResult
                 });
+
+                // post_job_message with requires_reply=true parks the turn
+                if (string.Equals(fbName, "post_job_message", StringComparison.OrdinalIgnoreCase) && IsRequiresReply(fbArgs))
+                {
+                    var isError = IsToolResultError(toolResult);
+                    if (!isError)
+                    {
+                        askedQuestion = true;
+                        responseEmitted = true;
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = "Turn paused: plan / question posted to Job Chat awaiting reply."
+                        });
+                        return;
+                    }
+                }
+
+                // manage_task with action='set_checklist' yields the turn for Stage 2 Plan Approval
+                if (string.Equals(fbName, "manage_task", StringComparison.OrdinalIgnoreCase) && IsSetChecklistAction(fbArgs))
+                {
+                    var isError = IsToolResultError(toolResult);
+                    if (!isError)
+                    {
+                        responseEmitted = true;
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = "Turn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."
+                        });
+                        return;
+                    }
+                }
+
+                // open_pull_request yields the turn to code review
+                if (string.Equals(fbName, "open_pull_request", StringComparison.OrdinalIgnoreCase))
+                {
+                    var isError = IsToolResultError(toolResult);
+                    if (!isError)
+                    {
+                        responseEmitted = true;
+                        return;
+                    }
+                }
 
                 history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
                 history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
@@ -1965,7 +2033,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             requires_reply = new { type = "boolean", description = "If true, halts turn and parks session awaiting response." },
                             job_id = new { type = "string", description = "Optional job GUID." }
                         },
-                        required = new[] { "content", "target_persona", "requires_reply" }
+                        required = new[] { "content" }
                     }
                 }
             },
@@ -2508,7 +2576,34 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (doc.RootElement.TryGetProperty("requires_reply", out var req) ||
                 doc.RootElement.TryGetProperty("requiresReply", out req))
             {
-                return req.ValueKind == JsonValueKind.True;
+                if (req.ValueKind == JsonValueKind.True) return true;
+                if (req.ValueKind == JsonValueKind.String &&
+                    bool.TryParse(req.GetString(), out var b) && b)
+                {
+                    return true;
+                }
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    internal static bool IsSetChecklistAction(string? toolArgs)
+    {
+        if (string.IsNullOrWhiteSpace(toolArgs)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(toolArgs);
+            var root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                if (root.TryGetProperty("action", out var act) ||
+                    root.TryGetProperty("Action", out act) ||
+                    root.TryGetProperty("operation", out act) ||
+                    root.TryGetProperty("command", out act))
+                {
+                    return string.Equals(act.GetString()?.Trim(), "set_checklist", StringComparison.OrdinalIgnoreCase);
+                }
             }
         }
         catch { }
