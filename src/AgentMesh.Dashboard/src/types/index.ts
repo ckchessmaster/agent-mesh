@@ -657,5 +657,177 @@ export interface JobArtifact extends ArtifactLike {
   sourceSessionId?: string | null;
 }
 
+// ── Job file changes (the Cockpit's Changes tab) ─────────────────────────────
+//
+// Mirrors `AgentMesh.Core.Models.JobChangeSetDtos`. The three wire vocabularies below
+// (`JobChangeSourceKind`, `JobFileChangeStatus`, `JobChangeReasonCode`) are declared as string-literal
+// unions plus const objects rather than TS enums, for the same reason the C# side uses constants
+// instead of an enum: the values cross a wire a browser reads, and a renumbered enum is a breaking
+// change nobody notices until every row is mislabelled. Every field past the first few is optional on
+// the client even where the server always sends it — a dashboard newer than its API build is a normal
+// deployment state here, and the panel degrades to "no changes yet" rather than to a crash.
+
+/** Which source answered the question — see the C# `JobChangesSources`. */
+export const JobChangeSourceKind = {
+  /** `git diff` in a checkout the API can see: includes uncommitted and unpushed work. */
+  LocalGit: 'localGit',
+  /** GitHub's comparison for the pushed branch: committed work only. */
+  GitHubCompare: 'gitHubCompare',
+  /** The working checkpoint: paths, no line stats, no diff behind them. */
+  Checkpoint: 'checkpoint',
+} as const;
+export type JobChangeSourceKind = (typeof JobChangeSourceKind)[keyof typeof JobChangeSourceKind];
+
+/** A row's status. Unknown values are preserved verbatim, so this is `string` widened by the known set. */
+export const JobFileChangeStatus = {
+  Added: 'added',
+  Modified: 'modified',
+  Deleted: 'deleted',
+  Renamed: 'renamed',
+  Copied: 'copied',
+  TypeChanged: 'typeChanged',
+  Untracked: 'untracked',
+  Ignored: 'ignored',
+} as const;
+export type JobFileChangeStatus =
+  | (typeof JobFileChangeStatus)[keyof typeof JobFileChangeStatus]
+  | string;
+
+/** Machine-readable reason a change set came back empty — see the C# `JobChangeUnavailableReasons`. */
+export const JobChangeReasonCode = {
+  NoWorkspace: 'no_workspace',
+  BranchMismatch: 'branch_mismatch',
+  NoBranch: 'no_branch',
+  UnknownRef: 'unknown_ref',
+  GitUnavailable: 'git_unavailable',
+  RemoteUnavailable: 'remote_unavailable',
+  RemoteFailed: 'remote_failed',
+  NoChanges: 'no_changes',
+  PathNotInChangeSet: 'path_not_in_change_set',
+} as const;
+export type JobChangeReasonCode =
+  | (typeof JobChangeReasonCode)[keyof typeof JobChangeReasonCode]
+  | string;
+
+/** Where the answer came from, and how much of the answer it is. */
+export interface JobChangeSourceInfo {
+  /** Null when nothing could be read; `reasonCode` then says why. */
+  kind: JobChangeSourceKind | string | null;
+  reasonCode?: JobChangeReasonCode | string | null;
+  /** Human-readable and safe to show verbatim: it carries no paths or secrets. */
+  message?: string | null;
+  /** True when a better source was tried first and failed, so this answer is a fallback. */
+  degraded?: boolean;
+  /** True when uncommitted work could not be included (a remote-only read). */
+  committedOnly?: boolean;
+  truncated?: boolean;
+  repository?: string | null;
+}
+
+export interface JobChangeStats {
+  /** The real total, even when `files` is capped — do not substitute `files.length`. */
+  filesChanged: number;
+  additions: number;
+  deletions: number;
+  omittedFiles?: number;
+}
+
+export interface JobChangedFile {
+  path: string;
+  status: JobFileChangeStatus;
+  /** Populated only for a rename/copy, so the row can render `old → new`. */
+  previousPath?: string | null;
+  /** Null for a binary file: "not countable" is a different fact from zero. */
+  additions?: number | null;
+  deletions?: number | null;
+  binary?: boolean;
+  /** False when the source names paths but cannot diff them (the checkpoint fallback). */
+  patchAvailable?: boolean;
+}
+
+export interface JobChangeCommit {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  authorName?: string | null;
+  authorEmail?: string | null;
+  committedAt?: string | null;
+}
+
+export interface JobChangeSet {
+  jobId: string;
+  branch?: string | null;
+  baseBranch?: string | null;
+  headSha?: string | null;
+  /** The fork point, not the base branch's tip. Forward with `headSha` to pin a patch request. */
+  baseSha?: string | null;
+  stats: JobChangeStats;
+  files: JobChangedFile[];
+  source: JobChangeSourceInfo;
+  commits: JobChangeCommit[];
+  hasUncommittedChanges?: boolean;
+  uncommittedPaths?: string[] | null;
+  uncommittedCount?: number | null;
+  generatedAt?: string | null;
+  /** Why better sources were skipped, in precedence order. */
+  notes?: string[] | null;
+}
+
+export interface JobChangePatch {
+  jobId: string;
+  branch?: string | null;
+  baseBranch?: string | null;
+  headSha?: string | null;
+  baseSha?: string | null;
+  /** Unified diff text; empty for a binary file. */
+  patch: string;
+  path?: string | null;
+  previousPath?: string | null;
+  status?: JobFileChangeStatus | null;
+  binary?: boolean;
+  empty?: boolean;
+  truncated?: boolean;
+  additions?: number | null;
+  deletions?: number | null;
+  contextLines?: number;
+  source?: JobChangeSourceInfo | null;
+}
+
+// ── Job side panel ───────────────────────────────────────────────────────────
+
+/**
+ * Which tab the job Cockpit's side panel is showing. `null` (no panel open) is represented by the
+ * caller as `JobPanelTab | null`, not by an empty string, so a switch statement over the tab cannot be
+ * handed a value that silently renders nothing.
+ *
+ * One union for both tabs is the whole point: the panel is one column with one width, so "which panel"
+ * must have exactly one owner rather than two booleans that can both be true.
+ */
+export type JobPanelTab = 'artifacts' | 'changes';
+
+/** The tab strip's labels, in display order. */
+export const JOB_PANEL_TABS: { id: JobPanelTab; label: string }[] = [
+  { id: 'artifacts', label: 'Artifacts' },
+  { id: 'changes', label: 'Changes' }
+];
+
+/**
+ * The outcome of a patch request, as a discriminated union rather than a thrown error.
+ *
+ * The endpoint answers a refused patch with `404` plus a machine-readable `reasonCode`, and "this path
+ * is not in the change set" / "no source here can produce a diff" are ordinary states the panel renders
+ * as a sentence — not exceptions. Modelling them in the return type is what stops the component from
+ * reaching for a try/catch and then printing the generic "failed to load" text for a file that simply
+ * has no diff behind it. A thrown error is then only what it should be: a transport or server fault.
+ */
+export type JobChangePatchResult =
+  | { found: true; patch: JobChangePatch }
+  | {
+      found: false;
+      reasonCode?: string | null;
+      message: string;
+      notes?: string[] | null;
+    };
+
 
 
