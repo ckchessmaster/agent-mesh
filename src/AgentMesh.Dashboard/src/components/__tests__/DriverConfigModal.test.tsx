@@ -329,4 +329,66 @@ describe('DriverConfigModal', () => {
     expect(savedPatch.sidecar.tags).toBe('');
     expect(savedPatch.sidecar.hostname).toBe('kingdom-agent-mesh-01');
   });
+
+  it('renders one-time device code and allows completion without typing auth code for device flow', async () => {
+    const copilotAgent: Agent = {
+      id: 'copilot',
+      name: 'GitHub Copilot CLI',
+      runtimeType: 0,
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({ adapter: 'copilot' }),
+      config: { adapter: 'copilot', capabilities: ['bash'], hasApiKey: false }
+    };
+
+    vi.spyOn(api, 'startDriverAuth').mockResolvedValueOnce({
+      personaId: 'copilot',
+      driverId: 'copilot',
+      status: 'waiting_code',
+      authUrl: 'https://github.com/login/device',
+      userCode: 'WD7C-6F5A',
+      instructions: 'Enter the one-time code WD7C-6F5A on GitHub to authorize this device.'
+    });
+
+    vi.spyOn(api, 'submitDriverAuthCode').mockResolvedValueOnce({
+      personaId: 'copilot',
+      status: 'authenticated',
+      message: 'Successfully authenticated driver and refreshed models!'
+    });
+
+    vi.spyOn(api, 'verifyDriver').mockResolvedValueOnce({
+      personaId: 'copilot',
+      driverId: 'copilot',
+      overallStatus: 'passed',
+      steps: []
+    });
+
+    render(
+      <DriverConfigModal
+        agent={copilotAgent}
+        initialConfig={copilotAgent.config}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Authenticate Driver/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/One-Time Device Code/i)).toBeInTheDocument();
+      expect(screen.getByTestId('device-user-code')).toHaveTextContent('WD7C-6F5A');
+      expect(screen.getByRole('link', { name: /Authorize in Browser/i })).toHaveAttribute(
+        'href',
+        'https://github.com/login/device'
+      );
+      expect(screen.getByRole('button', { name: /I Have Authorized in Browser/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /I Have Authorized in Browser/i }));
+
+    await waitFor(() => {
+      expect(api.submitDriverAuthCode).toHaveBeenCalledWith('copilot', 'WD7C-6F5A');
+      expect(screen.getByText(/Successfully authenticated driver and refreshed models!/i)).toBeInTheDocument();
+    });
+  });
 });

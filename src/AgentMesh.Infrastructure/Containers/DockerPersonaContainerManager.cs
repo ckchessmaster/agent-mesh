@@ -1468,10 +1468,12 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         {
             if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
             {
-                var promptMsg = !string.IsNullOrWhiteSpace(loginCmd)
-                    ? "Please open the authorization link in your browser to approve device access. Once approved, paste the code below if prompted."
-                    : "Please open the authorization link, approve access, and paste the authorization code below.";
-                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", existing.AuthUrl, promptMsg);
+                var promptMsg = !string.IsNullOrWhiteSpace(existing.UserCode)
+                    ? $"Enter the one-time code {existing.UserCode} on GitHub to authorize this device."
+                    : (!string.IsNullOrWhiteSpace(loginCmd)
+                        ? "Please open the authorization link in your browser to approve device access. Once approved, paste the code below if prompted."
+                        : "Please open the authorization link, approve access, and paste the authorization code below.");
+                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", existing.AuthUrl, promptMsg, UserCode: existing.UserCode);
             }
             _activeAuthSessions.TryRemove(normPersonaId, out _);
         }
@@ -1529,6 +1531,36 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         proc.Start();
 
         var tcsUrl = new TaskCompletionSource<string>();
+        string? capturedUrl = null;
+        string? capturedUserCode = null;
+
+        void ParseLine(string line)
+        {
+            var match = Regex.Match(line, @"https?://[^\s""'>]+");
+            if (match.Success && capturedUrl == null)
+            {
+                capturedUrl = match.Value;
+                tcsUrl.TrySetResult(match.Value);
+            }
+
+            if (capturedUserCode == null)
+            {
+                var codeMatch = Regex.Match(line, @"(?:one-time code:\s*|code:\s*)([A-Za-z0-9-]+)", RegexOptions.IgnoreCase);
+                if (codeMatch.Success)
+                {
+                    capturedUserCode = codeMatch.Groups[1].Value.Trim();
+                }
+                else
+                {
+                    var altMatch = Regex.Match(line, @"\b([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\b");
+                    if (altMatch.Success)
+                    {
+                        capturedUserCode = altMatch.Groups[1].Value.Trim();
+                    }
+                }
+            }
+        }
+
         var readerTask = Task.Run(async () =>
         {
             try
@@ -1536,11 +1568,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 string? line;
                 while ((line = await proc.StandardOutput.ReadLineAsync()) != null)
                 {
-                    var match = Regex.Match(line, @"https?://[^\s""'>]+");
-                    if (match.Success)
-                    {
-                        tcsUrl.TrySetResult(match.Value);
-                    }
+                    ParseLine(line);
                 }
 
                 await Task.Delay(1000);
@@ -1570,11 +1598,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 string? line;
                 while ((line = await proc.StandardError.ReadLineAsync()) != null)
                 {
-                    var match = Regex.Match(line, @"https?://[^\s""'>]+");
-                    if (match.Success)
-                    {
-                        tcsUrl.TrySetResult(match.Value);
-                    }
+                    ParseLine(line);
                 }
             }
             catch { }
@@ -1586,12 +1610,29 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             if (completed == tcsUrl.Task)
             {
                 var authUrl = await tcsUrl.Task;
-                var session = new ActiveAuthSession(proc, proc.StandardInput, readerTask, authUrl);
+                if (string.IsNullOrWhiteSpace(capturedUserCode))
+                {
+                    try { await Task.Delay(200, ct); } catch { }
+                }
+
+                if (driverId.StartsWith("copilot") || adapterType == "copilot")
+                {
+                    try
+                    {
+                        await proc.StandardInput.WriteLineAsync();
+                        await proc.StandardInput.FlushAsync();
+                    }
+                    catch { }
+                }
+
+                var session = new ActiveAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode);
                 _activeAuthSessions[normPersonaId] = session;
-                var promptMsg = !string.IsNullOrWhiteSpace(loginCmd)
-                    ? "Please open the authorization link in your browser to approve access. Once approved, paste the code below if required."
-                    : "Click the link to sign in, then paste the authorization code below.";
-                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", authUrl, promptMsg);
+                var promptMsg = !string.IsNullOrWhiteSpace(capturedUserCode)
+                    ? $"Enter the one-time code {capturedUserCode} on GitHub to authorize this device."
+                    : (!string.IsNullOrWhiteSpace(loginCmd)
+                        ? "Please open the authorization link in your browser to approve access. Once approved, paste the code below if required."
+                        : "Click the link to sign in, then paste the authorization code below.");
+                return new PersonaAuthStartResult(normPersonaId, driverId, "waiting_code", authUrl, promptMsg, UserCode: capturedUserCode);
             }
         }
         catch (Exception ex)
@@ -1630,29 +1671,98 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             }
         }
 
-        if (_activeAuthSessions.TryRemove(normPersonaId, out var session))
+        if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+        {
+            var (ghExit, _, _) = await ExecInContainerAsync(normPersonaId, "gh auth status >/dev/null 2>&1 || test -n \"$GITHUB_TOKEN\"", ct);
+            if (ghExit == 0)
+            {
+                var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
+                if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
+                {
+                    try
+                    {
+                        var ghTok = tokOut.Trim();
+                        var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                        var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                        Directory.CreateDirectory(tokensDir);
+                        File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), ghTok);
+                        if (!string.IsNullOrWhiteSpace(info.DriverId))
+                        {
+                            File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), ghTok);
+                        }
+                    }
+                    catch { }
+                }
+                return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication confirmed and credentials persisted to workspace!");
+            }
+        }
+
+        if (_activeAuthSessions.TryGetValue(normPersonaId, out var session))
         {
             try
             {
-                await session.Writer.WriteLineAsync(code.Trim());
-                await session.Writer.FlushAsync();
+                if (!string.IsNullOrWhiteSpace(code))
+                {
+                    await session.Writer.WriteLineAsync(code.Trim());
+                    await session.Writer.FlushAsync();
+                }
 
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-
-                await session.Process.WaitForExitAsync(linkedCts.Token);
-                await session.DisposeAsync();
+                try
+                {
+                    await session.Process.WaitForExitAsync(linkedCts.Token);
+                }
+                catch (OperationCanceledException) { }
 
                 await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
+
+                if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+                {
+                    var (ghExit, _, _) = await ExecInContainerAsync(normPersonaId, "gh auth status >/dev/null 2>&1 || test -n \"$GITHUB_TOKEN\"", ct);
+                    if (ghExit == 0)
+                    {
+                        var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
+                        if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
+                        {
+                            try
+                            {
+                                var ghTok = tokOut.Trim();
+                                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                                var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                                Directory.CreateDirectory(tokensDir);
+                                File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), ghTok);
+                                if (!string.IsNullOrWhiteSpace(info.DriverId))
+                                {
+                                    File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), ghTok);
+                                }
+                            }
+                            catch { }
+                        }
+                        _activeAuthSessions.TryRemove(normPersonaId, out _);
+                        await session.DisposeAsync();
+                        return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication completed successfully!");
+                    }
+                }
 
                 if (!string.IsNullOrWhiteSpace(authCheckCmd))
                 {
                     var (recheckExit, _, _) = await ExecInContainerAsync(normPersonaId, authCheckCmd, ct);
                     if (recheckExit == 0)
                     {
+                        _activeAuthSessions.TryRemove(normPersonaId, out _);
+                        await session.DisposeAsync();
                         return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication completed successfully!");
                     }
                 }
+
+                if (!session.Process.HasExited)
+                {
+                    return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
+                }
+
+                _activeAuthSessions.TryRemove(normPersonaId, out _);
+                await session.DisposeAsync();
 
                 var (chkExit, outStr, _) = await ExecInContainerAsync(
                     normPersonaId,
@@ -2424,12 +2534,13 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
     }
 
-    private sealed class ActiveAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl) : IAsyncDisposable
+    private sealed class ActiveAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null) : IAsyncDisposable
     {
         public Process Process { get; } = process;
         public StreamWriter Writer { get; } = writer;
         public Task ReaderTask { get; } = readerTask;
         public string AuthUrl { get; } = authUrl;
+        public string? UserCode { get; } = userCode;
 
         public async ValueTask DisposeAsync()
         {

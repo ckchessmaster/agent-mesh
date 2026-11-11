@@ -14,7 +14,9 @@ import {
   XCircle,
   ExternalLink,
   RefreshCw,
-  RotateCw
+  RotateCw,
+  Copy,
+  Check
 } from 'lucide-react';
 import type {
   Agent,
@@ -116,6 +118,35 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [wizardApiKeyInput, setWizardApiKeyInput] = useState('');
   const [wizardApiKeySaving, setWizardApiKeySaving] = useState(false);
   const [authSuccessMessage, setAuthSuccessMessage] = useState<string | null>(null);
+  const [copiedCode, setCopiedCode] = useState(false);
+
+  useEffect(() => {
+    if (!showAuthWizard || authMode !== 'oauth' || !authStartResult?.userCode) {
+      return;
+    }
+
+    let isMounted = true;
+    const interval = setInterval(async () => {
+      try {
+        const res = await api.submitDriverAuthCode(agent.id, authStartResult.userCode || '');
+        if (!isMounted) return;
+        if (res.status === 'authenticated') {
+          setAuthSuccessMessage(res.message || 'Successfully authenticated driver and refreshed models!');
+          setAuthCodeInput('');
+          setAuthStartResult(null);
+          setShowAuthWizard(false);
+          await handleVerifyDriver();
+        }
+      } catch {
+        // Silently keep waiting during background device polling
+      }
+    }, 3000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [showAuthWizard, authMode, authStartResult?.userCode, agent.id]);
 
   const handleVerifyDriver = async () => {
     try {
@@ -174,17 +205,19 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   };
 
   const handleSubmitDriverAuthCode = async () => {
-    if (!authCodeInput.trim()) return;
+    if (!authStartResult?.userCode && !authCodeInput.trim()) return;
     try {
       setAuthSubmitting(true);
       setError(null);
-      const res = await api.submitDriverAuthCode(agent.id, authCodeInput.trim());
+      const res = await api.submitDriverAuthCode(agent.id, authCodeInput.trim() || authStartResult?.userCode || '');
       if (res.status === 'authenticated') {
         setAuthSuccessMessage(res.message || 'Successfully authenticated driver and refreshed models!');
         setAuthCodeInput('');
         setAuthStartResult(null);
         setShowAuthWizard(false);
         await handleVerifyDriver();
+      } else if (res.status === 'waiting') {
+        setError(res.message || 'Waiting for browser authorization. Once approved on GitHub, click again.');
       } else {
         setError(res.errorMessage || 'Failed to verify authorization code.');
       }
@@ -626,42 +659,106 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                   </div>
                 ) : (
                   <div className="space-y-2 pt-1">
-                    {authStartResult?.authUrl && (
-                      <div className="space-y-1.5">
+                    {authStartResult?.userCode ? (
+                      <div className="p-3 rounded-lg bg-purple-950/40 border border-purple-500/40 space-y-2.5">
+                        <div className="text-[11px] font-medium text-purple-300 flex items-center justify-between">
+                          <span>One-Time Device Code</span>
+                          {copiedCode && (
+                            <span className="text-[10px] text-emerald-400 font-medium">Copied!</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span
+                            data-testid="device-user-code"
+                            className="font-mono text-base font-bold text-white tracking-widest px-3 py-1.5 bg-slate-950 rounded border border-purple-500/50 select-all"
+                          >
+                            {authStartResult.userCode}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(authStartResult.userCode!);
+                              setCopiedCode(true);
+                              setTimeout(() => setCopiedCode(false), 2000);
+                            }}
+                            className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 flex items-center gap-1 cursor-pointer transition"
+                          >
+                            {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                            <span>{copiedCode ? 'Copied' : 'Copy'}</span>
+                          </button>
+                        </div>
                         <p className="text-[11px] text-slate-300">
-                          Step 1: Open the authorization link in your browser to sign in:
+                          Step 1: Open GitHub in your browser to sign in:
                         </p>
-                        <a
-                          href={authStartResult.authUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px] transition"
-                        >
-                          <span>Authorize in Browser</span>
-                          <ExternalLink className="w-3 h-3" />
-                        </a>
+                        {authStartResult.authUrl && (
+                          <a
+                            href={authStartResult.authUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px] transition"
+                          >
+                            <span>Authorize in Browser</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        )}
+                        <p className="text-[11px] text-slate-300">
+                          Step 2: Enter the code above on GitHub, click <strong>Continue</strong>, and authorize device.
+                        </p>
+                        <p className="text-[11px] text-slate-400 text-[10px]">
+                          Step 3: Verification automatically completes once approved, or click below:
+                        </p>
+                        <div className="pt-0.5">
+                          <button
+                            type="button"
+                            onClick={handleSubmitDriverAuthCode}
+                            disabled={authSubmitting}
+                            className="px-3.5 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs disabled:opacity-50 cursor-pointer flex items-center gap-1.5 transition"
+                          >
+                            {authSubmitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                            <span>{authSubmitting ? 'Verifying...' : 'I Have Authorized in Browser'}</span>
+                          </button>
+                        </div>
                       </div>
+                    ) : (
+                      <>
+                        {authStartResult?.authUrl && (
+                          <div className="space-y-1.5">
+                            <p className="text-[11px] text-slate-300">
+                              Step 1: Open the authorization link in your browser to sign in:
+                            </p>
+                            <a
+                              href={authStartResult.authUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px] transition"
+                            >
+                              <span>Authorize in Browser</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          </div>
+                        )}
+                        <p className="text-[11px] text-slate-300">
+                          {authStartResult?.authUrl ? 'Step 2: ' : ''}Paste the authorization code below and click Submit:
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={authCodeInput}
+                            onChange={(e) => setAuthCodeInput(e.target.value)}
+                            placeholder="Paste authorization code..."
+                            className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-sky-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleSubmitDriverAuthCode}
+                            disabled={authSubmitting || !authCodeInput.trim()}
+                            className="px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs disabled:opacity-50 cursor-pointer shrink-0"
+                          >
+                            {authSubmitting ? 'Verifying...' : 'Submit Code'}
+                          </button>
+                        </div>
+                      </>
                     )}
-                    <p className="text-[11px] text-slate-300">
-                      {authStartResult?.authUrl ? 'Step 2: ' : ''}Paste the authorization code below and click Submit:
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="text"
-                        value={authCodeInput}
-                        onChange={(e) => setAuthCodeInput(e.target.value)}
-                        placeholder="Paste authorization code..."
-                        className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-sky-500"
-                      />
-                      <button
-                        type="button"
-                        onClick={handleSubmitDriverAuthCode}
-                        disabled={authSubmitting || !authCodeInput.trim()}
-                        className="px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs disabled:opacity-50 cursor-pointer shrink-0"
-                      >
-                        {authSubmitting ? 'Verifying...' : 'Submit Code'}
-                      </button>
-                    </div>
                   </div>
                 )}
               </div>
