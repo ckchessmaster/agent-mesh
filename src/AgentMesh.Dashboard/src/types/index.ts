@@ -1,4 +1,4 @@
-﻿export interface DriverPersonaSummary {
+export interface DriverPersonaSummary {
   id: string;
   name: string;
   role: string;

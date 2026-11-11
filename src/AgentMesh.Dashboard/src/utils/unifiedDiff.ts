@@ -1,4 +1,4 @@
-﻿/**
+/**
  * A minimal, dependency-free parser for unified diffs, sized for one job: turn git's (or GitHub's)
  * patch text into coloured lines with line-number gutters.
  *

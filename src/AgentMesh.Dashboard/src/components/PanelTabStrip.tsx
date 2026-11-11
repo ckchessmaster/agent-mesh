@@ -1,4 +1,4 @@
-﻿import React from 'react';
+import React from 'react';
 import { JOB_PANEL_TABS, type JobPanelTab } from '../types';
 
 /**
