@@ -36,9 +36,15 @@ mkdir -p /workspace
 cd /workspace
 git config --global --add safe.directory '*' 2>/dev/null || true
 
-# Configure GitHub CLI and git identity if provided
-if [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_TOKEN" ]; then
+# Configure GitHub CLI, Copilot CLI, and git identity if provided
+if [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_TOKEN" ] || [ -n "$COPILOT_GITHUB_TOKEN" ]; then
     gh auth setup-git 2>/dev/null || true
+    COPILOT_AUTH_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-$GITHUB_TOKEN}}"
+    if [ -n "$COPILOT_AUTH_TOKEN" ] && [ ! -s /root/.copilot/config.json ]; then
+        mkdir -p /root/.copilot
+        printf '{"token":"%s"}\n' "$COPILOT_AUTH_TOKEN" > /root/.copilot/config.json
+        chmod 600 /root/.copilot/config.json
+    fi
 fi
 
 if [ -n "$GIT_AUTHOR_NAME" ]; then
@@ -86,6 +92,16 @@ chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /
 # Ensure ~/.bashrc exports PATH for all interactive shells
 if ! grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null; then
     echo 'export PATH="/root/.local/bin:/usr/local/bin:$PATH"' >> /root/.bashrc
+fi
+
+if [ -n "$COPILOT_GITHUB_TOKEN" ] && ! grep -q 'COPILOT_GITHUB_TOKEN' /root/.bashrc 2>/dev/null; then
+    echo "export COPILOT_GITHUB_TOKEN=\"$COPILOT_GITHUB_TOKEN\"" >> /root/.bashrc
+fi
+if [ -n "$GH_TOKEN" ] && ! grep -q 'GH_TOKEN' /root/.bashrc 2>/dev/null; then
+    echo "export GH_TOKEN=\"$GH_TOKEN\"" >> /root/.bashrc
+fi
+if [ -n "$GITHUB_TOKEN" ] && ! grep -q 'GITHUB_TOKEN' /root/.bashrc 2>/dev/null; then
+    echo "export GITHUB_TOKEN=\"$GITHUB_TOKEN\"" >> /root/.bashrc
 fi
 
 # If ~/.config, ~/.aip, ~/.gemini, ~/.claude, or ~/.copilot was previously created as a symlink, remove it so credential managers have real directories

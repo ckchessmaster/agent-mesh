@@ -522,7 +522,7 @@ public class AgentsController(
         var cliBin = adapter switch
         {
             DriverAdapters.Claude => "claude",
-            DriverAdapters.Copilot => "gh",
+            DriverAdapters.Copilot => "copilot",
             _ => "agy"
         };
 
@@ -576,6 +576,31 @@ public class AgentsController(
                         "Authentication Check",
                         "warning",
                         "Not authenticated with Google AI Pro. Click 'Authenticate Driver' to sign in."));
+                }
+            }
+            else if (adapter == DriverAdapters.Copilot)
+            {
+                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
+                var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
+                var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
+                var driverToken = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{agent.Id}.oauth");
+
+                if (System.IO.File.Exists(copilotConfig) || System.IO.File.Exists(copilotApps) || System.IO.File.Exists(copilotHosts) || System.IO.File.Exists(driverToken) ||
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")) ||
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GH_TOKEN")))
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Authentication Check",
+                        "success",
+                        "GitHub Copilot credentials active on API host"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Authentication Check",
+                        "warning",
+                        "GitHub Copilot is not authenticated. Click 'Authenticate Driver' to sign in."));
                 }
             }
             else if (!string.IsNullOrWhiteSpace(view.AuthCheckCommand))
@@ -698,7 +723,7 @@ public class AgentsController(
         var cliBin = adapter switch
         {
             DriverAdapters.Claude => "claude",
-            DriverAdapters.Copilot => "gh",
+            DriverAdapters.Copilot => "copilot",
             _ => "agy"
         };
 
@@ -763,9 +788,7 @@ public class AgentsController(
             else if (adapter == DriverAdapters.Copilot)
             {
                 psi.FileName = hostBinPath!;
-                psi.ArgumentList.Add("auth");
                 psi.ArgumentList.Add("login");
-                psi.ArgumentList.Add("-w");
             }
             else
             {
@@ -926,7 +949,49 @@ public class AgentsController(
                 }
                 candidateTokens.Add(Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
 
-                // For GitHub Copilot: check gh hosts.yml
+                // For GitHub Copilot: check ~/.copilot/config.json and ~/.config/github-copilot
+                var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
+                var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
+                var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
+                if (System.IO.File.Exists(copilotConfig) || System.IO.File.Exists(copilotHosts) || System.IO.File.Exists(copilotApps))
+                {
+                    try
+                    {
+                        string? copilotToken = null;
+                        if (System.IO.File.Exists(copilotConfig))
+                        {
+                            var json = await System.IO.File.ReadAllTextAsync(copilotConfig, ct);
+                            var match = Regex.Match(json, @"""(?:token|oauth_token)""\s*:\s*""([^""]+)""");
+                            if (match.Success) copilotToken = match.Groups[1].Value;
+                        }
+                        if (copilotToken == null && System.IO.File.Exists(copilotHosts))
+                        {
+                            var json = await System.IO.File.ReadAllTextAsync(copilotHosts, ct);
+                            var match = Regex.Match(json, @"""oauth_token""\s*:\s*""([^""]+)""");
+                            if (match.Success) copilotToken = match.Groups[1].Value;
+                        }
+                        if (copilotToken == null && System.IO.File.Exists(copilotApps))
+                        {
+                            var json = await System.IO.File.ReadAllTextAsync(copilotApps, ct);
+                            var match = Regex.Match(json, @"""oauth_token""\s*:\s*""([^""]+)""");
+                            if (match.Success) copilotToken = match.Groups[1].Value;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(copilotToken))
+                        {
+                            var cleanTok = copilotToken.Trim();
+                            await SaveDriverOAuthTokenAsync(agent, cleanTok, ct);
+                            await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
+                            await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                            _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                            await session.DisposeAsync();
+                            return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated GitHub Copilot driver and refreshed models!"));
+                        }
+                    }
+                    catch { }
+                }
+
+                // Fallback check for gh hosts.yml
                 var ghHostsFile = Path.Combine(userHome, ".config", "gh", "hosts.yml");
                 if (System.IO.File.Exists(ghHostsFile))
                 {

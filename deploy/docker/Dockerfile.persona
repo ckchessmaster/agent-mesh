@@ -53,7 +53,7 @@ RUN dotnet publish src/AgentMesh.Cli/AgentMesh.Cli.csproj \
     && rm -rf /src
 
 # 3. Prepare workspace, home config dirs & entrypoint
-RUN mkdir -p /workspace /root/.gemini/antigravity-cli /root/.claude /root/.config \
+RUN mkdir -p /workspace /root/.gemini/antigravity-cli /root/.claude /root/.copilot /root/.config \
     && git config --global --add safe.directory '*'
 
 
