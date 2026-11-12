@@ -172,6 +172,30 @@ public class JobTimelineController(
             await BroadcastCardUpdatedAsync(jobId, card);
         }
 
+        if (Guid.TryParse(jobId, out var parsedJobGuid))
+        {
+            var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == parsedJobGuid);
+            if (job != null)
+            {
+                job.ProgressHeartbeat = payload.Approved
+                    ? "Plan approved. Starting implementation."
+                    : $"Plan rejected: {payload.Feedback ?? "realign requested"}";
+                job.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync();
+
+                if (hubContext != null)
+                {
+                    await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
+                    {
+                        jobId = job.Id,
+                        progressHeartbeat = job.ProgressHeartbeat,
+                        currentTaskId = job.CurrentTaskId,
+                        lifecycleStatus = ProjectJobsController.DeriveLifecycleStatus(job)
+                    });
+                }
+            }
+        }
+
         var handle = GetWorkflowHandle(jobId);
         await handle.SignalAsync(w => w.SubmitPlanDecisionAsync(
             new PlanApprovalSignal(cardId, payload.Approved, payload.Feedback, payload.ApproverId ?? "human")));

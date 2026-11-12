@@ -1330,6 +1330,184 @@ public class OpenAiAdapterTests
         }
     }
 
+    [Fact]
+    public async Task ExecutePromptAsync_WhenToolBatchHasSetChecklistAndPostJobMessage_ExecutesBothAndParksTurn()
+    {
+        var executedTools = new List<string>();
+        OpenAiAdapter.PlatformToolExecutor = (toolName, args, sId, pId, aId, ct) =>
+        {
+            executedTools.Add(toolName);
+            return Task.FromResult("{\"success\":true}");
+        };
+
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "test-agent",
+            Name = "Test Agent",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "test-model"
+        };
+
+        var sessionId = Guid.NewGuid();
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = sessionId,
+            Prompt = "Run discovery",
+            Model = "test-model"
+        };
+
+        var directJson = """
+        {
+            "id": "chatcmpl-test",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_task",
+                                    "arguments": "{\"action\":\"set_checklist\",\"tasks\":[{\"id\":\"t1\",\"title\":\"Task 1\"}]}"
+                                }
+                            },
+                            {
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {
+                                    "name": "post_job_message",
+                                    "arguments": "{\"message\":\"Clarification question: table vs metadata?\",\"requires_reply\":true}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        """;
+
+        var mockClient = new HttpClient(new MockHttpMessageHandler(_ =>
+        {
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(directJson, System.Text.Encoding.UTF8, "application/json")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            executedTools.Should().Contain("manage_task");
+            executedTools.Should().Contain("post_job_message");
+            events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Turn paused: plan / question posted to Job Chat awaiting reply."));
+
+            var history = OpenAiAdapter.GetSessionHistory(sessionId)!;
+            history.Should().Contain(m => m.Role == "assistant" && m.ToolCalls != null && m.ToolCalls.Count == 2);
+            history.Should().Contain(m => m.Role == "tool" && m.ToolCallId == "call_1");
+            history.Should().Contain(m => m.Role == "tool" && m.ToolCallId == "call_2");
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.PlatformToolExecutor = null;
+        }
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WhenToolBatchHasOnlySetChecklist_ConcludesTurnAwaitingPlanApproval()
+    {
+        var executedTools = new List<string>();
+        OpenAiAdapter.PlatformToolExecutor = (toolName, args, sId, pId, aId, ct) =>
+        {
+            executedTools.Add(toolName);
+            return Task.FromResult("{\"success\":true}");
+        };
+
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "test-agent",
+            Name = "Test Agent",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "test-model"
+        };
+
+        var sessionId = Guid.NewGuid();
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = sessionId,
+            Prompt = "Run discovery",
+            Model = "test-model"
+        };
+
+        var directJson = """
+        {
+            "id": "chatcmpl-test",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "manage_task",
+                                    "arguments": "{\"action\":\"set_checklist\",\"tasks\":[{\"id\":\"t1\",\"title\":\"Task 1\"}]}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        """;
+
+        var mockClient = new HttpClient(new MockHttpMessageHandler(_ =>
+        {
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(directJson, System.Text.Encoding.UTF8, "application/json")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            executedTools.Should().ContainSingle().Which.Should().Be("manage_task");
+            events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Turn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."));
+
+            var history = OpenAiAdapter.GetSessionHistory(sessionId)!;
+            history.Should().Contain(m => m.Role == "assistant" && m.ToolCalls != null && m.ToolCalls.Count == 1);
+            history.Should().Contain(m => m.Role == "tool" && m.ToolCallId == "call_1");
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.PlatformToolExecutor = null;
+        }
+    }
+
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

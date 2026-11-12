@@ -1,5 +1,6 @@
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
+using Temporalio.Api.Enums.V1;
 using Temporalio.Common;
 using Temporalio.Exceptions;
 using Temporalio.Workflows;
@@ -82,8 +83,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             TimelineActivityOptions
         );
 
-        // Stage 1A: Discovery Q&A activity -> wait on DiscoveryAnswersSignal
-        _currentHeartbeat = "Awaiting discovery Q&A answers";
+        // Stage 1A: Discovery Q&A activity -> wait on DiscoveryAnswersSignal if clarifying questions were asked
         var discoveryResult = await Workflow.ExecuteActivityAsync(
             (ITimelineActivities act) => act.ExecuteDiscoveryQaActivityAsync(new DiscoveryQaActivityInput(
                 input.JobId,
@@ -93,15 +93,19 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             TimelineActivityOptions
         );
 
-        await Workflow.WaitConditionAsync(() => _discoveryAnswers != null);
+        if (discoveryResult.Payload.Questions.Count > 0 && discoveryResult.CardId != Guid.Empty)
+        {
+            _currentHeartbeat = "Awaiting discovery Q&A answers";
+            await Workflow.WaitConditionAsync(() => _discoveryAnswers != null);
 
-        await Workflow.ExecuteActivityAsync(
-            (ITimelineActivities act) => act.UpdateCardStatusAsync(new UpdateTimelineCardStatusInput(
-                discoveryResult.CardId,
-                TimelineCardStatus.Approved
-            )),
-            TimelineActivityOptions
-        );
+            await Workflow.ExecuteActivityAsync(
+                (ITimelineActivities act) => act.UpdateCardStatusAsync(new UpdateTimelineCardStatusInput(
+                    discoveryResult.CardId,
+                    TimelineCardStatus.Approved
+                )),
+                TimelineActivityOptions
+            );
+        }
 
         // Stage 1B, Stage 2 & Stage 3: Decomposition + Approval + Child Task Execution (with Realign loop)
         string? planFeedback = null;
@@ -114,13 +118,14 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             {
                 _timelinePlanApproval = null;
                 _currentHeartbeat = planFeedback == null ? "Decomposing job tasks" : "Re-decomposing plan with feedback";
+                var answers = _discoveryAnswers?.Answers ?? new Dictionary<string, string>();
                 decompositionResult = await Workflow.ExecuteActivityAsync(
                     (ITimelineActivities act) => act.ExecuteDecompositionActivityAsync(new DecompositionActivityInput(
                         input.JobId,
                         input.InitialPrompt,
                         input.WorkspacePath,
                         planFeedback,
-                        _discoveryAnswers!.Answers
+                        answers
                     )),
                     TimelineActivityOptions
                 );
@@ -182,7 +187,8 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                     new ChildWorkflowOptions
                     {
                         Id = childWorkflowId,
-                        TaskQueue = Workflow.Info.TaskQueue
+                        TaskQueue = Workflow.Info.TaskQueue,
+                        IdReusePolicy = WorkflowIdReusePolicy.AllowDuplicate
                     }
                 );
 
