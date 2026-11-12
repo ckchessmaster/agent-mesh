@@ -994,7 +994,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 {
                     ["model"] = effectiveModel,
                     ["messages"] = dispatchMessages.Select(m => m.ToSerializableObject()).ToList(),
-                    ["stream"] = true
+                    ["stream"] = true,
+                    ["stream_options"] = new Dictionary<string, object> { ["include_usage"] = true }
                 };
 
                 if (toolsDefinition != null && toolsDefinition.Count > 0)
@@ -1190,6 +1191,20 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     if (string.IsNullOrWhiteSpace(line)) continue;
 
                     var trimmed = line.Trim();
+                    if (trimmed.StartsWith('{'))
+                    {
+                        // The server returned a direct JSON body rather than SSE lines
+                        var rest = await reader.ReadToEndAsync(ct);
+                        var fullJson = trimmed + "\n" + rest;
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(fullJson);
+                            ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens);
+                        }
+                        catch { }
+                        break;
+                    }
+
                     if (!trimmed.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) continue;
 
                     var data = trimmed.Length > 5 ? trimmed[5..].Trim() : "";
@@ -1198,80 +1213,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     try
                     {
                         using var doc = JsonDocument.Parse(data);
-                        var root = doc.RootElement;
-
-                        // Check usage in chunk
-                        if (root.TryGetProperty("usage", out var usageElem) && usageElem.ValueKind == JsonValueKind.Object)
-                        {
-                            if (usageElem.TryGetProperty("prompt_tokens", out var pt) || usageElem.TryGetProperty("input_tokens", out pt))
-                                totalInputTokens = pt.GetInt64();
-                            if (usageElem.TryGetProperty("completion_tokens", out var ctProp) || usageElem.TryGetProperty("output_tokens", out ctProp))
-                                totalOutputTokens = ctProp.GetInt64();
-                            if (usageElem.TryGetProperty("total_tokens", out var tt))
-                                totalTokens = tt.GetInt64();
-                        }
-
-                        if (!root.TryGetProperty("choices", out var choicesElem) || choicesElem.GetArrayLength() == 0)
-                            continue;
-
-                        var choice = choicesElem[0];
-                        if (!choice.TryGetProperty("delta", out var deltaElem)) continue;
-
-                        // Delta content
-                        if (deltaElem.TryGetProperty("content", out var cProp) && cProp.ValueKind == JsonValueKind.String)
-                        {
-                            var textChunk = cProp.GetString();
-                            if (!string.IsNullOrEmpty(textChunk))
-                            {
-                                contentBuilder.Append(textChunk);
-                            }
-                        }
-
-                        // Delta reasoning / thought (DeepSeek-R1, Qwen reasoning, etc.)
-                        if ((deltaElem.TryGetProperty("reasoning_content", out var rcProp) ||
-                             deltaElem.TryGetProperty("reasoning", out rcProp) ||
-                             deltaElem.TryGetProperty("thought", out rcProp)) &&
-                            rcProp.ValueKind == JsonValueKind.String)
-                        {
-                            var reasoningChunk = rcProp.GetString();
-                            if (!string.IsNullOrEmpty(reasoningChunk))
-                            {
-                                reasoningBuilder.Append(reasoningChunk);
-                            }
-                        }
-
-                        // Delta tool_calls
-                        if (deltaElem.TryGetProperty("tool_calls", out var tcProp) && tcProp.ValueKind == JsonValueKind.Array)
-                        {
-                            foreach (var tcElem in tcProp.EnumerateArray())
-                            {
-                                var idx = tcElem.TryGetProperty("index", out var iProp) ? iProp.GetInt32() : 0;
-                                if (!toolCallsByIndex.TryGetValue(idx, out var tuple))
-                                {
-                                    tuple = (null, new StringBuilder(), new StringBuilder());
-                                    toolCallsByIndex[idx] = tuple;
-                                }
-
-                                if (tcElem.TryGetProperty("id", out var idProp) && idProp.ValueKind == JsonValueKind.String)
-                                {
-                                    tuple.Id = idProp.GetString();
-                                }
-
-                                if (tcElem.TryGetProperty("function", out var fnElem))
-                                {
-                                    if (fnElem.TryGetProperty("name", out var fnNameProp) && fnNameProp.ValueKind == JsonValueKind.String)
-                                    {
-                                        tuple.Name.Append(fnNameProp.GetString());
-                                    }
-                                    if (fnElem.TryGetProperty("arguments", out var fnArgsProp) && fnArgsProp.ValueKind == JsonValueKind.String)
-                                    {
-                                        tuple.Args.Append(fnArgsProp.GetString());
-                                    }
-                                }
-
-                                toolCallsByIndex[idx] = tuple;
-                            }
-                        }
+                        ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens);
                     }
                     catch
                     {
@@ -2728,6 +2670,99 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             }
         }
         return null;
+    }
+
+    private static void ParseOpenAiChunkOrMessage(
+        JsonElement root,
+        StringBuilder contentBuilder,
+        StringBuilder reasoningBuilder,
+        SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)> toolCallsByIndex,
+        ref long totalInputTokens,
+        ref long totalOutputTokens,
+        ref long totalTokens)
+    {
+        // Check usage in chunk/message
+        if (root.TryGetProperty("usage", out var usageElem) && usageElem.ValueKind == JsonValueKind.Object)
+        {
+            if (usageElem.TryGetProperty("prompt_tokens", out var pt) || usageElem.TryGetProperty("input_tokens", out pt))
+                totalInputTokens = pt.GetInt64();
+            if (usageElem.TryGetProperty("completion_tokens", out var ctProp) || usageElem.TryGetProperty("output_tokens", out ctProp))
+                totalOutputTokens = ctProp.GetInt64();
+            if (usageElem.TryGetProperty("total_tokens", out var tt))
+                totalTokens = tt.GetInt64();
+        }
+
+        if (!root.TryGetProperty("choices", out var choicesElem) || choicesElem.GetArrayLength() == 0)
+            return;
+
+        var choice = choicesElem[0];
+        var elem = choice.TryGetProperty("delta", out var deltaElem) ? deltaElem : (choice.TryGetProperty("message", out var msgElem) ? msgElem : choice);
+
+        // Content
+        if (elem.TryGetProperty("content", out var cProp) && cProp.ValueKind == JsonValueKind.String)
+        {
+            var textChunk = cProp.GetString();
+            if (!string.IsNullOrEmpty(textChunk))
+            {
+                contentBuilder.Append(textChunk);
+            }
+        }
+        else if (choice.TryGetProperty("text", out var tProp) && tProp.ValueKind == JsonValueKind.String)
+        {
+            var textChunk = tProp.GetString();
+            if (!string.IsNullOrEmpty(textChunk))
+            {
+                contentBuilder.Append(textChunk);
+            }
+        }
+
+        // Delta reasoning / thought (DeepSeek-R1, Qwen reasoning, etc.)
+        if ((elem.TryGetProperty("reasoning_content", out var rcProp) ||
+             elem.TryGetProperty("reasoning", out rcProp) ||
+             elem.TryGetProperty("thought", out rcProp) ||
+             elem.TryGetProperty("reasoning_text", out rcProp)) &&
+            rcProp.ValueKind == JsonValueKind.String)
+        {
+            var reasoningChunk = rcProp.GetString();
+            if (!string.IsNullOrEmpty(reasoningChunk))
+            {
+                reasoningBuilder.Append(reasoningChunk);
+            }
+        }
+
+        // Tool calls
+        if (elem.TryGetProperty("tool_calls", out var tcProp) && tcProp.ValueKind == JsonValueKind.Array)
+        {
+            int fallbackIdx = 0;
+            foreach (var tcElem in tcProp.EnumerateArray())
+            {
+                var idx = tcElem.TryGetProperty("index", out var iProp) ? iProp.GetInt32() : fallbackIdx++;
+                if (!toolCallsByIndex.TryGetValue(idx, out var tuple))
+                {
+                    tuple = (null, new StringBuilder(), new StringBuilder());
+                    toolCallsByIndex[idx] = tuple;
+                }
+
+                if (tcElem.TryGetProperty("id", out var idProp) && idProp.ValueKind == JsonValueKind.String)
+                {
+                    tuple.Id = idProp.GetString();
+                }
+
+                if (tcElem.TryGetProperty("function", out var fnElem))
+                {
+                    if (fnElem.TryGetProperty("name", out var fnNameProp) && fnNameProp.ValueKind == JsonValueKind.String)
+                    {
+                        tuple.Name.Append(fnNameProp.GetString());
+                    }
+                    if (fnElem.TryGetProperty("arguments", out var fnArgsProp) && fnArgsProp.ValueKind == JsonValueKind.String)
+                    {
+                        tuple.Args.Append(fnArgsProp.GetString());
+                    }
+                }
+
+                toolCallsByIndex[idx] = tuple;
+            }
+        }
     }
 }
 

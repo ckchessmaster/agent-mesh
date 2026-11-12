@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
@@ -152,6 +153,7 @@ public class TimelineActivities(
 
         var job = await TryLoadJobAsync(input.JobId, ct);
         string? agentSummary = null;
+        string? recentMessage = null;
         var questions = new List<DiscoveryQuestion>();
 
         if (turnRunner != null && promptStackBuilder != null && job != null)
@@ -188,17 +190,53 @@ public class TimelineActivities(
                 var outcome = await turnRunner.RunTurnAsync(request, ct);
                 agentSummary = outcome.Message;
 
-                var recentMessage = await dbContext.JobMessages
+                recentMessage = await dbContext.JobMessages
                     .AsNoTracking()
-                    .Where(m => m.JobId == job.Id && m.SenderType == "agent")
+                    .Where(m => m.JobId == job.Id && (m.SenderType == "persona" || m.SenderType == "agent"))
                     .OrderByDescending(m => m.CreatedAt)
                     .Select(m => m.Content)
                     .FirstOrDefaultAsync(ct);
 
-                var sourceText = !string.IsNullOrWhiteSpace(recentMessage) ? recentMessage : outcome.Message;
-                if (!string.IsNullOrWhiteSpace(sourceText))
+                // Also check if any ask_question tool call was logged in session messages
+                var recentToolCallArgs = await (from sm in dbContext.SessionMessages.AsNoTracking()
+                                                join s in dbContext.AgentSessions.AsNoTracking() on sm.SessionId equals s.Id
+                                                where s.MetadataJson.Contains(job.Id.ToString()) && sm.ToolName == "ask_question"
+                                                orderby sm.CreatedAt descending
+                                                select sm.ToolArgsJson)
+                                                .FirstOrDefaultAsync(ct);
+
+                if (!string.IsNullOrWhiteSpace(recentToolCallArgs))
                 {
-                    questions = ExtractQuestionsFromText(sourceText!);
+                    questions = ExtractQuestionsFromText(recentToolCallArgs);
+                }
+
+                if (questions.Count == 0 && !string.IsNullOrWhiteSpace(recentMessage))
+                {
+                    questions = ExtractQuestionsFromText(recentMessage);
+                }
+
+                if (questions.Count == 0)
+                {
+                    var recentSessionResponse = await (from sm in dbContext.SessionMessages.AsNoTracking()
+                                                       join s in dbContext.AgentSessions.AsNoTracking() on sm.SessionId equals s.Id
+                                                       where s.MetadataJson.Contains(job.Id.ToString()) && sm.EventType == "response"
+                                                       orderby sm.CreatedAt descending
+                                                       select sm.Content)
+                                                       .FirstOrDefaultAsync(ct);
+
+                    if (!string.IsNullOrWhiteSpace(recentSessionResponse))
+                    {
+                        questions = ExtractQuestionsFromText(recentSessionResponse);
+                        if (!string.IsNullOrWhiteSpace(recentSessionResponse) && (string.IsNullOrWhiteSpace(agentSummary) || agentSummary.StartsWith("Turn concluded")))
+                        {
+                            agentSummary = recentSessionResponse;
+                        }
+                    }
+                }
+
+                if (questions.Count == 0 && !string.IsNullOrWhiteSpace(outcome.Message))
+                {
+                    questions = ExtractQuestionsFromText(outcome.Message);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -233,9 +271,11 @@ public class TimelineActivities(
             ];
         }
 
-        var summary = !string.IsNullOrWhiteSpace(agentSummary)
+        var summary = !string.IsNullOrWhiteSpace(agentSummary) && !agentSummary.StartsWith("Turn concluded")
             ? agentSummary!
-            : $"Discovery questionnaire for initial prompt: {input.InitialPrompt}";
+            : (!string.IsNullOrWhiteSpace(recentMessage)
+                ? recentMessage!
+                : $"Discovery questionnaire for initial prompt: {input.InitialPrompt}");
 
         var payload = new DiscoveryPayload(questions, summary);
         var payloadJson = JsonSerializer.Serialize(payload, JsonOptions);
@@ -524,9 +564,86 @@ public class TimelineActivities(
         return targetCard.Id;
     }
 
-    private static List<DiscoveryQuestion> ExtractQuestionsFromText(string text)
+    internal static List<DiscoveryQuestion> ExtractQuestionsFromText(string text)
     {
         var result = new List<DiscoveryQuestion>();
+        if (string.IsNullOrWhiteSpace(text)) return result;
+
+        // 1. Check for ```ask_question or ```json:ask_question blocks or raw json with "questions"
+        var jsonBlockMatch = Regex.Match(text, @"```(?:json:)?ask_question\s*([\s\S]*?)```", RegexOptions.IgnoreCase);
+        var jsonCandidate = jsonBlockMatch.Success ? jsonBlockMatch.Groups[1].Value.Trim() : (text.Trim().StartsWith('{') ? text.Trim() : null);
+
+        if (!string.IsNullOrWhiteSpace(jsonCandidate))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(jsonCandidate);
+                if (doc.RootElement.TryGetProperty("questions", out var qArray) && qArray.ValueKind == JsonValueKind.Array)
+                {
+                    int qIdx = 1;
+                    foreach (var qElem in qArray.EnumerateArray())
+                    {
+                        var qText = qElem.TryGetProperty("question", out var qt) ? qt.GetString() : null;
+                        if (string.IsNullOrWhiteSpace(qText) && qElem.TryGetProperty("id", out var idProp))
+                        {
+                            qText = idProp.GetString();
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(qText))
+                        {
+                            var opts = new List<string>();
+                            if (qElem.TryGetProperty("options", out var opArr) && opArr.ValueKind == JsonValueKind.Array)
+                            {
+                                foreach (var o in opArr.EnumerateArray())
+                                {
+                                    var optStr = o.GetString();
+                                    if (!string.IsNullOrWhiteSpace(optStr)) opts.Add(optStr);
+                                }
+                            }
+                            result.Add(new DiscoveryQuestion($"q_{qIdx++}", qText.Trim(), opts.Count > 0 ? opts : null));
+                            if (result.Count >= 5) return result;
+                        }
+                    }
+                    if (result.Count > 0) return result;
+                }
+            }
+            catch { }
+        }
+
+        // 2. Check for numbered or bulleted questions: e.g. "1. Question?" or "- Question?" or "• Question?"
+        var numberedMatches = Regex.Matches(text, @"^\s*(?:\d+[\.\)]|[-*•])\s+(.+)$", RegexOptions.Multiline);
+        if (numberedMatches.Count > 0)
+        {
+            int qIdx = 1;
+            foreach (Match m in numberedMatches)
+            {
+                var line = m.Groups[1].Value.Trim();
+                if (line.Contains('?') && line.Length > 5)
+                {
+                    var extractedOpts = new List<string>();
+                    var parenMatch = Regex.Match(line, @"\(([^)]+)\)");
+                    if (parenMatch.Success)
+                    {
+                        var rawChoices = Regex.Split(parenMatch.Groups[1].Value, @"[,/]| or ", RegexOptions.IgnoreCase);
+                        foreach (var c in rawChoices)
+                        {
+                            var trimmed = Regex.Replace(c.Trim(), @"^(?:etc|e\.g\.)\.?$", "", RegexOptions.IgnoreCase).Trim();
+                            if (trimmed.Length > 1 && trimmed.Length < 35 && !extractedOpts.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+                            {
+                                extractedOpts.Add(trimmed);
+                            }
+                        }
+                    }
+
+                    var cleaned = Regex.Replace(line, @"\s*\([^)]*\)", "").Trim().TrimStart('-', '*', '•', '#', ' ').Trim();
+                    result.Add(new DiscoveryQuestion($"q_{qIdx++}", cleaned, extractedOpts.Count > 0 ? extractedOpts : null));
+                    if (result.Count >= 5) break;
+                }
+            }
+            if (result.Count > 0) return result;
+        }
+
+        // 3. Line-by-line fallback for lines ending with '?'
         var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         int idx = 1;
         foreach (var line in lines)
@@ -534,8 +651,7 @@ public class TimelineActivities(
             if (line.EndsWith('?') && line.Length > 10)
             {
                 var cleaned = line.TrimStart('-', '*', '•', '#', ' ').Trim();
-                result.Add(new DiscoveryQuestion($"q_{idx}", cleaned));
-                idx++;
+                result.Add(new DiscoveryQuestion($"q_{idx++}", cleaned));
                 if (result.Count >= 5) break;
             }
         }

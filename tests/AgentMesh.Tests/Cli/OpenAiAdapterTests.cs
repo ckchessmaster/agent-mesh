@@ -1212,6 +1212,124 @@ public class OpenAiAdapterTests
         OpenAiAdapter.IsSetChecklistAction(toolArgs).Should().Be(expected);
     }
 
+    [Fact]
+    public async Task ExecutePromptAsync_WhenProxyReturnsDirectJsonResponse_ParsesContentAndUsage()
+    {
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "qwen3.8-flash-next"
+        };
+
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = Guid.NewGuid(),
+            Prompt = "In agent-mesh is there an easy way to increase the size of the PVC?",
+            Model = "qwen3.8-flash-next"
+        };
+
+        var directJson = """
+        {
+            "id": "chatcmpl-test",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Yes, you can configure personas.pvc.size in helm values."
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 40,
+                "completion_tokens": 15,
+                "total_tokens": 55
+            }
+        }
+        """;
+
+        var mockClient = new HttpClient(new MockHttpMessageHandler(req =>
+        {
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(directJson, System.Text.Encoding.UTF8, "application/json")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEv, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Yes, you can configure personas.pvc.size in helm values."));
+            events.Should().NotContain(e => e.EventType == "response" && e.Content == "Turn completed.");
+
+            var resp = events.First(e => e.EventType == "response");
+            resp.StructuredPayloadJson.Should().NotBeNull();
+            resp.StructuredPayloadJson.Should().Contain("\"totalTokens\":55");
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+        }
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_SendsStreamOptionsWithIncludeUsage()
+    {
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "qwen3.8-flash-next"
+        };
+
+        var promptEv = new PromptReceivedEvent
+        {
+            SessionId = Guid.NewGuid(),
+            Prompt = "Hello",
+            Model = "qwen3.8-flash-next"
+        };
+
+        string? capturedBody = null;
+        var sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
+
+        var mockClient = new HttpClient(new MockHttpMessageHandler(req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().Result;
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            await adapter.ExecutePromptAsync(preset, promptEv, _ => Task.CompletedTask, CancellationToken.None);
+
+            capturedBody.Should().NotBeNull();
+            using var doc = JsonDocument.Parse(capturedBody!);
+            doc.RootElement.TryGetProperty("stream_options", out var streamOpts).Should().BeTrue();
+            streamOpts.GetProperty("include_usage").GetBoolean().Should().BeTrue();
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+        }
+    }
+
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

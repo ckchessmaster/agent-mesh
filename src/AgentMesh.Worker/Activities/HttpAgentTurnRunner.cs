@@ -389,7 +389,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         {
             prompt = request.Prompt,
             promptStack = PromptStackWirePayload.From(request.Stack),
-            personaId = request.PersonaId,
+            personaId = request.PersonaId ?? request.Input.PersonaId ?? request.Input.AgentId ?? request.AgentId,
             taskId = request.Input.TaskId,
             turnSessionId = (Guid?)null,
             sender = "temporal-worker",
