@@ -1280,6 +1280,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             {
                 var executedToolCalls = new List<OpenAiToolCall>();
                 var toolResults = new List<(string CallId, string Output)>();
+                var checklistRegistered = false;
+                var prOpened = false;
 
                 foreach (var kvp in toolCallsByIndex)
                 {
@@ -1387,33 +1389,21 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         if (!isError)
                         {
                             responseEmitted = true;
-                            return;
+                            prOpened = true;
+                            break;
                         }
                     }
 
-                    // manage_task with action='set_checklist' yields the turn for Stage 2 Plan Approval
+                    // manage_task with action='set_checklist' registers the living task checklist.
+                    // Do not abort immediately: allow subsequent tools in the batch (e.g. post_job_message) to execute.
                     if (string.Equals(toolName, "manage_task", StringComparison.OrdinalIgnoreCase) && IsSetChecklistAction(toolArgs))
                     {
                         var isError = IsToolResultError(toolResult);
                         if (!isError)
                         {
-                            responseEmitted = true;
-                            await onEvent(new TrajectoryEventPayload
-                            {
-                                EventType = "response",
-                                Content = !string.IsNullOrWhiteSpace(finalContent)
-                                    ? $"{finalContent.Trim()}\n\nTurn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."
-                                    : "Turn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."
-                            });
-                            return;
+                            checklistRegistered = true;
                         }
                     }
-                }
-
-                if (askedQuestion)
-                {
-                    // Stop loop and wait for human response
-                    return;
                 }
 
                 // Add assistant response with tool_calls and corresponding tool output messages
@@ -1434,6 +1424,30 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     });
                 }
                 SaveHistoryToDisk(promptEvent.SessionId, history);
+
+                if (prOpened)
+                {
+                    return;
+                }
+
+                if (askedQuestion)
+                {
+                    // Stop loop and wait for human response
+                    return;
+                }
+
+                if (checklistRegistered && !askedQuestion)
+                {
+                    responseEmitted = true;
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = !string.IsNullOrWhiteSpace(finalContent)
+                            ? $"{finalContent.Trim()}\n\nTurn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."
+                            : "Turn concluded: Living task checklist registered. Awaiting Stage 2 Plan Approval."
+                    });
+                    return;
+                }
 
                 // Differentiated step budget: pure read-only turns increment step budget every 2 turns,
                 // while mutating commands increment every turn.
@@ -1546,6 +1560,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var isError = IsToolResultError(toolResult);
                     if (!isError)
                     {
+                        history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
+                        history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
+                        SaveHistoryToDisk(promptEvent.SessionId, history);
+
                         responseEmitted = true;
                         await onEvent(new TrajectoryEventPayload
                         {
@@ -1562,6 +1580,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var isError = IsToolResultError(toolResult);
                     if (!isError)
                     {
+                        history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
+                        history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
+                        SaveHistoryToDisk(promptEvent.SessionId, history);
+
                         responseEmitted = true;
                         return;
                     }

@@ -130,6 +130,10 @@ public class TimelineActivities(
                 {
                     job.ProgressHeartbeat = "Completed all tasks successfully";
                 }
+                else if (card.CardType == TimelineCardType.PlanApproval && input.Status == TimelineCardStatus.Approved)
+                {
+                    job.ProgressHeartbeat = "Plan approved. Starting implementation.";
+                }
                 job.UpdatedAt = DateTimeOffset.UtcNow;
             }
 
@@ -238,6 +242,32 @@ public class TimelineActivities(
                 {
                     questions = ExtractQuestionsFromText(outcome.Message);
                 }
+
+                if (questions.Count == 0)
+                {
+                    var recentThoughts = await (from sm in dbContext.SessionMessages.AsNoTracking()
+                                                join s in dbContext.AgentSessions.AsNoTracking() on sm.SessionId equals s.Id
+                                                where s.MetadataJson.Contains(job.Id.ToString()) && sm.EventType == "thought"
+                                                orderby sm.CreatedAt descending
+                                                select sm.Content)
+                                                .Take(10)
+                                                .ToListAsync(ct);
+
+                    foreach (var thought in recentThoughts)
+                    {
+                        if (string.IsNullOrWhiteSpace(thought)) continue;
+                        var extracted = ExtractQuestionsFromText(thought);
+                        if (extracted.Count > 0)
+                        {
+                            questions = extracted;
+                            if (string.IsNullOrWhiteSpace(agentSummary) || agentSummary.StartsWith("Turn concluded"))
+                            {
+                                agentSummary = "Clarifying questions formulated during discovery exploration.";
+                            }
+                            break;
+                        }
+                    }
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -245,30 +275,15 @@ public class TimelineActivities(
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Agent discovery turn encountered an error for job {JobId}; using structured default questions", input.JobId);
+                logger.LogWarning(ex, "Agent discovery turn encountered an error for job {JobId}", input.JobId);
             }
         }
 
         if (questions.Count == 0)
         {
-            questions =
-            [
-                new(
-                    "env_target",
-                    "What is the target runtime environment for this feature?",
-                    new[] { "Local Development (Docker/Bare Metal)", "Staging Cluster", "Production Workload" }
-                ),
-                new(
-                    "data_preservation",
-                    "Should existing database entities and migration states be preserved?",
-                    new[] { "Strict zero-loss data preservation", "Destructive resets permitted" }
-                ),
-                new(
-                    "validation_mode",
-                    "Which test execution mode should be enforced for verification?",
-                    new[] { "Full integration test suite (dotnet + vitest)", "Unit tests only", "Dry-run verification" }
-                )
-            ];
+            logger.LogInformation("Discovery turn for job {JobId} concluded without clarifying questions; skipping DiscoveryQa card", input.JobId);
+            var emptyPayload = new DiscoveryPayload(questions, agentSummary ?? "Discovery completed without clarifying questions.");
+            return new DiscoveryQaActivityResult(Guid.Empty, emptyPayload);
         }
 
         var summary = !string.IsNullOrWhiteSpace(agentSummary) && !agentSummary.StartsWith("Turn concluded")
@@ -303,7 +318,8 @@ public class TimelineActivities(
         await dbContext.SaveChangesAsync(ct);
         await NotifyCardUpdatedAsync(card);
 
-        logger.LogInformation("Created DiscoveryQa card {CardId} for job {JobId}", card.Id, input.JobId);
+        logger.LogInformation("Created DiscoveryQa card {CardId} for job {JobId} with {QuestionCount} questions", 
+            card.Id, input.JobId, questions.Count);
 
         return new DiscoveryQaActivityResult(card.Id, payload);
     }
@@ -610,7 +626,8 @@ public class TimelineActivities(
             catch { }
         }
 
-        // 2. Check for numbered or bulleted questions: e.g. "1. Question?" or "- Question?" or "• Question?"
+        // 2. Check for numbered or bulleted questions or domain tradeoffs:
+        // e.g. "1. Question?" or "- Question?" or "- Storage: table vs metadata" or "- Q2: Who answers?"
         var numberedMatches = Regex.Matches(text, @"^\s*(?:\d+[\.\)]|[-*•])\s+(.+)$", RegexOptions.Multiline);
         if (numberedMatches.Count > 0)
         {
@@ -618,19 +635,43 @@ public class TimelineActivities(
             foreach (Match m in numberedMatches)
             {
                 var line = m.Groups[1].Value.Trim();
-                if (line.Contains('?') && line.Length > 5)
+                var isQuestionCandidate = line.Contains('?') ||
+                    Regex.IsMatch(line, @"\bvs(?:\.|\b)", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(line, @"^Q\d+[:\s]", RegexOptions.IgnoreCase);
+
+                if (isQuestionCandidate && line.Length > 8)
                 {
+                    if (line.StartsWith("Questions to ask", StringComparison.OrdinalIgnoreCase)) continue;
+
                     var extractedOpts = new List<string>();
-                    var parenMatch = Regex.Match(line, @"\(([^)]+)\)");
-                    if (parenMatch.Success)
+                    if (Regex.IsMatch(line, @"\bvs(?:\.|\b)", RegexOptions.IgnoreCase))
                     {
-                        var rawChoices = Regex.Split(parenMatch.Groups[1].Value, @"[,/]| or ", RegexOptions.IgnoreCase);
-                        foreach (var c in rawChoices)
+                        var vsParts = Regex.Split(line, @"\s*\bvs(?:\.|\b)\s*", RegexOptions.IgnoreCase);
+                        if (vsParts.Length >= 2)
                         {
-                            var trimmed = Regex.Replace(c.Trim(), @"^(?:etc|e\.g\.)\.?$", "", RegexOptions.IgnoreCase).Trim();
-                            if (trimmed.Length > 1 && trimmed.Length < 35 && !extractedOpts.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+                            var optA = CleanVsOption(vsParts[0]);
+                            var optB = CleanVsOption(vsParts[1]);
+                            if (!string.IsNullOrWhiteSpace(optA) && !string.IsNullOrWhiteSpace(optB))
                             {
-                                extractedOpts.Add(trimmed);
+                                extractedOpts.Add(optA);
+                                extractedOpts.Add(optB);
+                            }
+                        }
+                    }
+
+                    if (extractedOpts.Count == 0)
+                    {
+                        var parenMatch = Regex.Match(line, @"\(([^)]+)\)");
+                        if (parenMatch.Success)
+                        {
+                            var rawChoices = Regex.Split(parenMatch.Groups[1].Value, @"[,/]| or ", RegexOptions.IgnoreCase);
+                            foreach (var c in rawChoices)
+                            {
+                                var trimmed = Regex.Replace(c.Trim(), @"^(?:etc|e\.g\.)\.?$", "", RegexOptions.IgnoreCase).Trim();
+                                if (trimmed.Length > 1 && trimmed.Length < 35 && !extractedOpts.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+                                {
+                                    extractedOpts.Add(trimmed);
+                                }
                             }
                         }
                     }
@@ -656,6 +697,55 @@ public class TimelineActivities(
             }
         }
         return result;
+    }
+
+    private static string? CleanVsOption(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var text = raw.Trim().TrimStart('-', '*', '•', '.', ' ');
+
+        // 1. Strip label / prefix before colon if short, e.g. "Storage: ..." or "Q1: ..."
+        var colonIdx = text.IndexOf(':');
+        if (colonIdx >= 0 && colonIdx < text.Length - 1 && colonIdx < 25)
+        {
+            text = text[(colonIdx + 1)..].Trim();
+        }
+
+        // 2. Strip prefix before " - ", e.g. "Read-only enforcement depth - hard refusal..."
+        var dashIdx = text.IndexOf(" - ", StringComparison.Ordinal);
+        if (dashIdx >= 0 && dashIdx < text.Length - 3)
+        {
+            text = text[(dashIdx + 3)..].Trim();
+        }
+
+        // 3. Remove parentheticals before period or plus checks, e.g. "(migration + Architect)" or "(advisory)"
+        text = Regex.Replace(text, @"\s*\([^)]*\)", "").Trim();
+
+        // 4. Strip sentence continuation after period, e.g. "... + metadata. My default: reuse..."
+        var periodIdx = text.IndexOf('.');
+        if (periodIdx >= 0)
+        {
+            text = text[..periodIdx].Trim();
+        }
+
+        // 5. Strip trailing additions with '+', e.g. "... + metadata"
+        var plusIdx = text.IndexOf('+');
+        if (plusIdx > 0)
+        {
+            text = text[..plusIdx].Trim();
+        }
+
+        text = text.Trim();
+        if (text.Length >= 2 &&
+            ((text.StartsWith('\'') && text.EndsWith('\'')) ||
+             (text.StartsWith('"') && text.EndsWith('"')) ||
+             (text.StartsWith('`') && text.EndsWith('`'))))
+        {
+            text = text[1..^1].Trim();
+        }
+
+        if (text.Length > 60) text = text[..60].Trim();
+        return text.Length >= 2 ? text : null;
     }
 
     private static List<ProposedChecklistItem> ParseTasksFromJobJson(string? tasksJson)

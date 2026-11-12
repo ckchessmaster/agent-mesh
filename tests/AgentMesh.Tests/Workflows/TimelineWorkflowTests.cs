@@ -155,6 +155,89 @@ public class TimelineWorkflowTests
     }
 
     [Fact]
+    public void ExtractQuestionsFromText_WithDomainTradeoffsAndVs_ExtractsOptionsWithoutLiteralQuestionMark()
+    {
+        var text = """
+        Questions to ask (Operator + Architect):
+        - Storage: new 'project_threads' table (migration + Architect) vs. zero-migration reuse of 'AgentSession' + metadata. My default: reuse AgentSession.
+        - Q2: Who answers? Any persona from project team / default lead persona, or the operator picks a persona per thread?
+        - Q3: Read-only enforcement depth - hard refusal in the runner vs. prompt-only instruction (advisory).
+        """;
+
+        var questions = TimelineActivities.ExtractQuestionsFromText(text);
+
+        questions.Should().HaveCount(3);
+        questions[0].Question.Should().Contain("Storage: new 'project_threads' table");
+        questions[0].Options.Should().NotBeNull();
+        questions[0].Options!.Should().Contain("new 'project_threads' table");
+        questions[0].Options!.Should().Contain("zero-migration reuse of 'AgentSession'");
+
+        questions[1].Question.Should().Contain("Who answers?");
+
+        questions[2].Question.Should().Contain("Read-only enforcement depth");
+        questions[2].Options.Should().NotBeNull();
+        questions[2].Options!.Should().Contain("hard refusal in the runner");
+        questions[2].Options!.Should().Contain("prompt-only instruction");
+    }
+
+    [Fact]
+    public async Task JobWorkflow_WhenDiscoveryHasZeroQuestions_SkipsDiscoveryQaAndAdvancesToPlanApproval()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var timeline = new FakeTimelineActivities();
+        timeline.CustomDiscoveryQuestions = []; // 0 discovery questions
+        var execution = new FakeExecutionActivities();
+
+        var workerOptions = new TemporalWorkerOptions(Queue)
+            .AddActivity((Func<CreateTimelineCardInput, Task<JobTimelineCard>>)timeline.CreateCardAsync)
+            .AddActivity((Func<UpdateTimelineCardStatusInput, Task>)timeline.UpdateCardStatusAsync)
+            .AddActivity((Func<DiscoveryQaActivityInput, Task<DiscoveryQaActivityResult>>)timeline.ExecuteDiscoveryQaActivityAsync)
+            .AddActivity((Func<DecompositionActivityInput, Task<DecompositionActivityResult>>)timeline.ExecuteDecompositionActivityAsync)
+            .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
+            .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
+            .AddActivity((Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>)execution.RunAgentCodingTurnAsync)
+            .AddWorkflow<JobExecutionWorkflow>()
+            .AddWorkflow<TaskExecutionWorkflow>();
+
+        using var worker = new TemporalWorker(env.Client, workerOptions);
+        await worker.ExecuteAsync(async () =>
+        {
+            var jobId = Guid.NewGuid().ToString();
+            var handle = await env.Client.StartWorkflowAsync(
+                (IJobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                    JobId: jobId,
+                    AssignedAgentId: "lead-agent",
+                    ProjectId: "proj-zero-q",
+                    WorkspacePath: "/workspace",
+                    InitialPrompt: "Create automated feature without clarifications",
+                    TargetBranch: "main",
+                    ApprovalPolicy: PlanApprovalPolicy.Autonomous
+                )),
+                new WorkflowOptions($"test-job-{jobId}", Queue)
+            );
+
+            // Wait for decomposition to complete and plan approval card to be active
+            while (timeline.DecompositionInputs.Count == 0)
+            {
+                await Task.Delay(100);
+            }
+
+            // Verify Discovery Q&A was NOT waited on (no discovery answers signal required)
+            timeline.DiscoveryQaInputs.Should().HaveCount(1);
+            timeline.UpdatedCards.Should().NotContain(c => c.CardId == timeline.DiscoveryQaCardId);
+
+            // Submit plan approval
+            await handle.SignalAsync((IJobExecutionWorkflow wf) => wf.SubmitPlanDecisionAsync(
+                new PlanApprovalSignal(timeline.PlanCardId, true, "Plan approved immediately", "operator")));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+            timeline.TaskStepInputs.Should().NotBeEmpty();
+            execution.CodingInputs.Should().NotBeEmpty();
+        });
+    }
+
+    [Fact]
     public async Task JobWorkflow_RejectionLoop_ReDecomposesWithFeedback()
     {
         await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
@@ -477,13 +560,16 @@ public class TimelineWorkflowTests
             return Task.CompletedTask;
         }
 
+        public List<DiscoveryQuestion>? CustomDiscoveryQuestions { get; set; }
+
         [Activity]
         public Task<DiscoveryQaActivityResult> ExecuteDiscoveryQaActivityAsync(DiscoveryQaActivityInput input)
         {
             DiscoveryQaInputs.Add(input);
-            var questions = new List<DiscoveryQuestion> { new("q1", "Question 1", new[] { "A", "B" }) };
+            var questions = CustomDiscoveryQuestions ?? new List<DiscoveryQuestion> { new("q1", "Question 1", new[] { "A", "B" }) };
             var payload = new DiscoveryPayload(questions, "Discovery summary");
-            return Task.FromResult(new DiscoveryQaActivityResult(DiscoveryQaCardId, payload));
+            var cardId = questions.Count > 0 ? DiscoveryQaCardId : Guid.Empty;
+            return Task.FromResult(new DiscoveryQaActivityResult(cardId, payload));
         }
 
         public List<ProposedChecklistItem> CustomTasks { get; set; } =
