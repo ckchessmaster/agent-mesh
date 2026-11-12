@@ -112,7 +112,19 @@ jobs:
             --version "${{ steps.version.outputs.VERSION }}" \
             --app-version "${{ steps.version.outputs.VERSION }}" \
             -d /tmp/chart-pkg
-          helm push /tmp/chart-pkg/agent-mesh-${{ steps.version.outputs.VERSION }}.tgz "oci://ghcr.io/${{ steps.version.outputs.OWNER_LC }}/charts"
+          for attempt in $(seq 1 5); do
+            echo "Attempting helm push to GHCR (attempt $attempt/5)..."
+            if helm push /tmp/chart-pkg/agent-mesh-${{ steps.version.outputs.VERSION }}.tgz "oci://ghcr.io/${{ steps.version.outputs.OWNER_LC }}/charts"; then
+              echo "Helm push succeeded."
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "Helm push failed after 5 attempts."
+              exit 1
+            fi
+            echo "Helm push failed due to registry propagation delay; retrying in 5 seconds..."
+            sleep 5
+          done
 
   publish-cli-and-release:
     name: Build Cross-Platform CLI Binaries & Create GitHub Release
