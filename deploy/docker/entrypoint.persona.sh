@@ -43,7 +43,7 @@ if [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_TOKEN" ] || [ -n "$COPILOT_GITHUB_TOKEN" 
     COPILOT_AUTH_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-$GITHUB_TOKEN}}"
     if [ -n "$COPILOT_AUTH_TOKEN" ] && [ ! -s /root/.copilot/config.json ]; then
         mkdir -p /root/.copilot
-        printf '{"token":"%s"}\n' "$COPILOT_AUTH_TOKEN" > /root/.copilot/config.json
+        printf '{"token":"%s","authTokens":{"https://github.com":{"token":"%s"}}}\n' "$COPILOT_AUTH_TOKEN" "$COPILOT_AUTH_TOKEN" > /root/.copilot/config.json
         chmod 600 /root/.copilot/config.json
     fi
 fi

@@ -1637,6 +1637,19 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         void ParseLine(string line)
         {
+            if (line.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    proc.StandardInput.WriteLine("y");
+                    proc.StandardInput.Flush();
+                }
+                catch { }
+            }
+
             var match = Regex.Match(line, @"https?://[^\s""'>]+");
             if (match.Success && capturedUrl == null)
             {
@@ -1812,6 +1825,15 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 {
                     await session.Writer.WriteLineAsync(code.Trim());
                     await session.Writer.FlushAsync();
+                }
+                else if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+                {
+                    try
+                    {
+                        await session.Writer.WriteLineAsync("y");
+                        await session.Writer.FlushAsync();
+                    }
+                    catch { }
                 }
 
                 using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));

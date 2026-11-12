@@ -587,13 +587,68 @@ public class AgentsController(
                 var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
                 var driverToken = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{agent.Id}.oauth");
 
-                if (System.IO.File.Exists(copilotConfig) || System.IO.File.Exists(copilotApps) || System.IO.File.Exists(copilotHosts) || System.IO.File.Exists(driverToken) ||
-                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                string? foundCopilotToken = null;
+                if (view.HasOAuthToken)
+                {
+                    foundCopilotToken = DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, view.Sidecar).OAuthToken;
+                }
+                else if (System.IO.File.Exists(driverToken))
+                {
+                    try { foundCopilotToken = (await System.IO.File.ReadAllTextAsync(driverToken, ct)).Trim(); } catch { }
+                }
+                else if (System.IO.File.Exists(copilotConfig))
+                {
+                    try
+                    {
+                        var json = await System.IO.File.ReadAllTextAsync(copilotConfig, ct);
+                        var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
+                        if (match.Success) foundCopilotToken = match.Groups[1].Value.Trim();
+                    }
+                    catch { }
+                }
+                else if (System.IO.File.Exists(copilotHosts))
+                {
+                    try
+                    {
+                        var json = await System.IO.File.ReadAllTextAsync(copilotHosts, ct);
+                        var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
+                        if (match.Success) foundCopilotToken = match.Groups[1].Value.Trim();
+                    }
+                    catch { }
+                }
+                else if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                {
+                    foundCopilotToken = Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN");
+                }
+
+                if (string.IsNullOrWhiteSpace(foundCopilotToken) && containerManager != null)
+                {
+                    var boundPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
+                    if (boundPersonaId != null)
+                    {
+                        var (chkExit, chkOut, _) = await containerManager.ExecInContainerAsync(
+                            boundPersonaId,
+                            "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')",
+                            ct);
+                        if (chkExit == 0 && !string.IsNullOrWhiteSpace(chkOut))
+                        {
+                            var clean = chkOut.Trim().Split('\n')[0].Trim();
+                            if (!string.IsNullOrWhiteSpace(clean))
+                            {
+                                foundCopilotToken = clean;
+                                await SaveDriverOAuthTokenAsync(agent, clean, ct);
+                                await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
+                            }
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(foundCopilotToken))
                 {
                     steps.Add(new PersonaDriverVerificationStep(
                         "Authentication Check",
                         "success",
-                        "GitHub Copilot credentials active on API host"));
+                        "GitHub Copilot credentials active"));
                 }
                 else
                 {
@@ -809,6 +864,19 @@ public class AgentsController(
 
             void ParseLine(string line)
             {
+                if (line.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        proc.StandardInput.WriteLine("y");
+                        proc.StandardInput.Flush();
+                    }
+                    catch { }
+                }
+
                 var match = Regex.Match(line, @"https?://[^\s""'>]+");
                 if (match.Success && capturedUrl == null)
                 {
@@ -873,7 +941,7 @@ public class AgentsController(
                     try { await Task.Delay(200, ct); } catch { }
                 }
 
-                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode, tempHome);
+                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode, tempHome, errBuilder);
                 return Ok(new PersonaAuthStartResult(
                     normalizedId,
                     normalizedId,
@@ -951,6 +1019,15 @@ public class AgentsController(
                     try
                     {
                         await session.Writer.WriteLineAsync(req.Code.Trim());
+                        await session.Writer.FlushAsync(ct);
+                    }
+                    catch { }
+                }
+                else if (adapter == DriverAdapters.Copilot)
+                {
+                    try
+                    {
+                        await session.Writer.WriteLineAsync("y");
                         await session.Writer.FlushAsync(ct);
                     }
                     catch { }
@@ -1071,7 +1148,8 @@ public class AgentsController(
 
                 _activeHostAuthSessions.TryRemove(normalizedId, out _);
                 await session.DisposeAsync();
-                return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: "Authentication process exited before completing."));
+                var errDetail = session.GetErrorDetails();
+                return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: !string.IsNullOrWhiteSpace(errDetail) ? errDetail : "Authentication process exited before completing."));
             }
             catch (Exception ex) when (ex is InvalidOperationException || ex is ObjectDisposedException)
             {
@@ -1310,6 +1388,27 @@ public class AgentsController(
             catch { }
         }
 
+        else if (containerManager != null && adapter == DriverAdapters.Copilot)
+        {
+            try
+            {
+                var (tokExit, tokOut, _) = await containerManager.ExecInContainerAsync(
+                    personaId,
+                    "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')",
+                    ct);
+                if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
+                {
+                    var cleanTok = tokOut.Trim().Split('\n')[0].Trim();
+                    if (!string.IsNullOrWhiteSpace(cleanTok))
+                    {
+                        await SaveDriverOAuthTokenAsync(agent, cleanTok, ct);
+                        await SeedDriverCredentialsToBoundPersonasAsync(agent.Id, ct);
+                    }
+                }
+            }
+            catch { }
+        }
+
         await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
     }
 
@@ -1326,6 +1425,19 @@ public class AgentsController(
             var hostDir = Path.GetDirectoryName(hostAgyToken);
             if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
             await System.IO.File.WriteAllTextAsync(hostAgyToken, rawToken, ct);
+
+            var hostCopilotDir = Path.Combine(userHome, ".copilot");
+            Directory.CreateDirectory(hostCopilotDir);
+            var hostCopilotConfig = Path.Combine(hostCopilotDir, "config.json");
+            var copilotJson = new JsonObject
+            {
+                ["token"] = rawToken,
+                ["authTokens"] = new JsonObject
+                {
+                    ["https://github.com"] = new JsonObject { ["token"] = rawToken }
+                }
+            };
+            await System.IO.File.WriteAllTextAsync(hostCopilotConfig, copilotJson.ToJsonString(), ct);
         }
         catch { }
 
@@ -1527,7 +1639,7 @@ public class AgentsController(
         return RunHostCommandAsync("/bin/bash", $"-c \"{escaped}\"", ct);
     }
 
-    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null, string? tempHome = null) : IAsyncDisposable
+    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null, string? tempHome = null, StringBuilder? errBuilder = null) : IAsyncDisposable
     {
         private bool _disposed;
         public Process Process { get; } = process;
@@ -1538,6 +1650,7 @@ public class AgentsController(
         public string? TempHome { get; } = tempHome;
         public SemaphoreSlim Lock { get; } = new(1, 1);
         public bool IsDisposed => _disposed;
+        public string GetErrorDetails() => errBuilder?.ToString().Trim() ?? string.Empty;
 
         public bool SafeHasExited
         {

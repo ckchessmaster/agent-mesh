@@ -1607,6 +1607,21 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         if (read <= 0) break;
                         var chunk = Encoding.UTF8.GetString(buf, 0, read);
                         capturedOutput.Append(chunk);
+
+                        if (chunk.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
+                            chunk.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                            chunk.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
+                            chunk.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                var yBytes = Encoding.UTF8.GetBytes("y\n");
+                                await stdInStream.WriteAsync(yBytes, 0, yBytes.Length, CancellationToken.None);
+                                await stdInStream.FlushAsync(CancellationToken.None);
+                            }
+                            catch { }
+                        }
+
                         var match = Regex.Match(capturedOutput.ToString(), @"https?://[^\s""'>]+");
                         if (match.Success)
                         {
@@ -1821,6 +1836,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     var codeBytes = Encoding.UTF8.GetBytes(code.Trim() + "\n");
                     await session.StdIn.WriteAsync(codeBytes, 0, codeBytes.Length, ct);
                     await session.StdIn.FlushAsync(ct);
+                }
+                else if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+                {
+                    try
+                    {
+                        var yBytes = Encoding.UTF8.GetBytes("y\n");
+                        await session.StdIn.WriteAsync(yBytes, 0, yBytes.Length, ct);
+                        await session.StdIn.FlushAsync(ct);
+                    }
+                    catch { }
                 }
 
                 // Poll for token creation or auth check up to 5 seconds
