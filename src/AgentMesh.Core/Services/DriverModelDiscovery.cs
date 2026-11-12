@@ -265,8 +265,100 @@ public static class DriverModelDiscovery
         }
     }
 
+    /// <summary>
+    /// Context tiers supported by GitHub Copilot CLI via <c>--context</c>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> CopilotContextSizes =
+        new[] { "default", "long_context", "128k", "200k", "1m" };
+
+    /// <summary>
+    /// Extracts model capabilities from a GitHub Copilot <c>/models</c> payload.
+    /// Preserves or prepends the "auto" model option supported by the Copilot CLI.
+    /// </summary>
+    public static IReadOnlyList<DriverModelCapability> ParseCopilotModels(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+
+            JsonElement data;
+            if (!TryGetPropertyCaseInsensitive(doc.RootElement, "data", out data) ||
+                data.ValueKind != JsonValueKind.Array)
+            {
+                if (!TryGetPropertyCaseInsensitive(doc.RootElement, "models", out data) ||
+                    data.ValueKind != JsonValueKind.Array)
+                {
+                    return Array.Empty<DriverModelCapability>();
+                }
+            }
+
+            var result = new List<DriverModelCapability>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var hasAuto = false;
+
+            foreach (var item in data.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+
+                string? modelId = null;
+                if (TryGetPropertyCaseInsensitive(item, "id", out var idProp) &&
+                    idProp.ValueKind == JsonValueKind.String)
+                {
+                    modelId = idProp.GetString()?.Trim();
+                }
+
+                if (string.IsNullOrWhiteSpace(modelId)) continue;
+
+                string displayName = modelId;
+                if (TryGetPropertyCaseInsensitive(item, "name", out var nameProp) &&
+                    nameProp.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(nameProp.GetString()))
+                {
+                    displayName = nameProp.GetString()!.Trim();
+                }
+
+                if (!seen.Add(modelId)) continue;
+
+                if (string.Equals(modelId, "auto", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasAuto = true;
+                    displayName = "Auto (Copilot picks the model)";
+                }
+
+                var maxContext = ExtractModelContextLimit(item);
+                if (maxContext is > 0)
+                {
+                    ModelContextLimits.RecordLearnedLimit(modelId, maxContext.Value);
+                }
+
+                result.Add(new DriverModelCapability(
+                    Id: modelId,
+                    Name: displayName,
+                    Efforts: Array.Empty<string>(),
+                    ContextSizes: CopilotContextSizes));
+            }
+
+            if (!hasAuto && result.Count > 0)
+            {
+                result.Insert(0, new DriverModelCapability(
+                    Id: "auto",
+                    Name: "Auto (Copilot picks the model)",
+                    Efforts: Array.Empty<string>(),
+                    ContextSizes: CopilotContextSizes));
+            }
+
+            return result;
+        }
+        catch (JsonException)
+        {
+            return Array.Empty<DriverModelCapability>();
+        }
+    }
+
     private static readonly string[] ContextLimitFieldNames =
     {
+        "max_context_window_tokens",
+        "max_prompt_tokens",
         "max_model_len",
         "context_length",
         "max_context_length",
@@ -278,9 +370,10 @@ public static class DriverModelDiscovery
 
     private static readonly string[] NestedContextContainerNames =
     {
+        "capabilities",
+        "limits",
         "top_provider",
         "architecture",
-        "limits",
         "model_info"
     };
 
@@ -304,6 +397,21 @@ public static class DriverModelDiscovery
                     if (TryGetPositiveInt(nested, field, out var nestedVal))
                     {
                         return nestedVal;
+                    }
+                }
+
+                foreach (var subContainer in NestedContextContainerNames)
+                {
+                    if (TryGetPropertyCaseInsensitive(nested, subContainer, out var subNested) &&
+                        subNested.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var field in ContextLimitFieldNames)
+                        {
+                            if (TryGetPositiveInt(subNested, field, out var subVal))
+                            {
+                                return subVal;
+                            }
+                        }
                     }
                 }
             }

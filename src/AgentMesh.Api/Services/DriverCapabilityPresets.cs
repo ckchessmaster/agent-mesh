@@ -67,7 +67,7 @@ public static class DriverCapabilityPresets
     /// so advertising it would promise a window the driver cannot request.
     /// </remarks>
     public static readonly IReadOnlyList<string> CopilotContextSizes =
-        new[] { "default", "long_context", "128k", "200k", "1m" };
+        DriverModelDiscovery.CopilotContextSizes;
 
     /// <summary>
     /// A preset reading for an adapter, or null when we have no verified opinion about it.

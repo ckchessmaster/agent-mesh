@@ -1887,9 +1887,14 @@ public class ClaudeAdapter : IAgentAdapter
     }
 }
 
-public class CopilotAdapter : IAgentAdapter
+public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
 {
     public string AdapterType => "copilot";
+
+    public Task<DriverCapabilityDeclaration> DescribeCapabilitiesAsync(
+        AgentPresetConfig preset,
+        CancellationToken ct = default)
+        => DriverCapabilityDescriber.DescribeCopilotAsync(preset, ct);
 
     public async Task ExecutePromptAsync(
         AgentPresetConfig preset,

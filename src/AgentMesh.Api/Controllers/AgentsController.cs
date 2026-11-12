@@ -709,12 +709,26 @@ public class AgentsController(
                             "Google AI Pro OAuth token active on API host");
                     }
                 }
+                else if (adapter == DriverAdapters.Copilot && reading.ModelSource == CapabilitySourceKind.Probed)
+                {
+                    var authIdx = steps.FindIndex(s => s.Name == "Authentication Check" && s.Status == "warning");
+                    if (authIdx >= 0)
+                    {
+                        steps[authIdx] = new PersonaDriverVerificationStep(
+                            "Authentication Check",
+                            "success",
+                            "GitHub Copilot credentials active");
+                    }
+                }
 
                 var sample = string.Join(", ", reading.Models.Take(5).Select(m => m.Id));
+                var catalogDetail = reading.ModelSource == CapabilitySourceKind.StaticPreset
+                    ? $"Using bundled preset ({reading.Models.Count} models): {sample}"
+                    : $"Discovered {reading.Models.Count} model(s): {sample}";
                 steps.Add(new PersonaDriverVerificationStep(
                     "Model Catalog Discovery",
                     "success",
-                    $"Discovered {reading.Models.Count} model(s): {sample}"));
+                    catalogDetail));
             }
             else
             {
@@ -1437,13 +1451,55 @@ public class AgentsController(
                     personaId,
                     "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')",
                     ct);
+                string? cleanTok = null;
                 if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
                 {
-                    var cleanTok = tokOut.Trim().Split('\n')[0].Trim();
+                    cleanTok = tokOut.Trim().Split('\n')[0].Trim();
                     if (!string.IsNullOrWhiteSpace(cleanTok))
                     {
                         await SaveDriverOAuthTokenAsync(agent, cleanTok, ct);
                         await SeedDriverCredentialsToBoundPersonasAsync(agent.Id, ct);
+                    }
+                }
+
+                cleanTok ??= DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, null).OAuthToken;
+
+                if (!string.IsNullOrWhiteSpace(cleanTok))
+                {
+                    var (modExit, modOut, _) = await containerManager.ExecInContainerAsync(
+                        personaId,
+                        $"curl -s -m 10 -H \"Authorization: Bearer {cleanTok}\" -H \"Editor-Version: vscode/1.95.0\" -H \"User-Agent: GitHubCopilotChat/0.22.0\" -H \"Copilot-Integration-Id: vscode-chat\" https://api.githubcopilot.com/models",
+                        ct);
+                    if (modExit == 0 && !string.IsNullOrWhiteSpace(modOut))
+                    {
+                        var parsed = DriverModelDiscovery.ParseCopilotModels(modOut);
+                        if (parsed.Count > 0)
+                        {
+                            var declaration = new DriverCapabilityDeclaration
+                            {
+                                Adapter = DriverAdapters.Copilot,
+                                ObservedAt = DateTimeOffset.UtcNow,
+                                SupportsContextSelection = true,
+                                Source = "copilot-models-api",
+                                Models = parsed.Select(m => new DriverCapabilityDeclaration.DeclaredModel
+                                {
+                                    Id = m.Id,
+                                    Name = m.Name,
+                                    Efforts = m.Efforts.ToList()
+                                }).ToList()
+                            };
+
+                            var patch = new JsonObject
+                            {
+                                ["declared"] = JsonSerializer.SerializeToNode(declaration)
+                            };
+                            agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+                                ?? agent.CapabilitiesJson;
+                            agent.UpdatedAt = DateTimeOffset.UtcNow;
+                            await db.SaveChangesAsync(ct);
+                            CapabilityProbe.InvalidateCache();
+                            return;
+                        }
                     }
                 }
             }

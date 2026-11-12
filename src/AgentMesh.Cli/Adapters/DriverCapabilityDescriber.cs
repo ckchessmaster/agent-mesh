@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
 using AgentMesh.Core.Services;
 
@@ -53,17 +54,14 @@ internal static class DriverCapabilityDescriber
     internal static Func<string, string?, CancellationToken, Task<(int StatusCode, string Body, string? Error)>>
         ModelsEndpointReader = ReadModelsEndpointAsync;
 
-    /// <summary>
-    /// Locates the driver binary on this machine.
-    /// </summary>
-    /// <remarks>
-    /// Injectable for the same reason as the other two seams, and it has to be its own seam rather
-    /// than being covered by <see cref="AgyModelsRunner"/>: resolution happens <em>first</em>, so a
-    /// test that overrode only the runner would still short-circuit to "not installed" on a machine
-    /// without agy - which is every CI runner and every API container. Those tests passed locally
-    /// and would have failed in CI, which is the precise failure mode this seam exists to prevent.
-    /// </remarks>
+    /// <summary>Locates the driver binary on this machine.</summary>
     internal static Func<string, string?> AgyExecutableResolver = AgentAdapterFactory.ResolveExecutablePath;
+
+    /// <summary>Resolves GitHub Copilot token on the runner machine.</summary>
+    internal static Func<AgentPresetConfig, string?> CopilotTokenResolver = ResolveCopilotCliToken;
+
+    /// <summary>Exchanges a GitHub PAT/OAuth token for a Copilot session token.</summary>
+    internal static Func<string, CancellationToken, Task<string?>> CopilotTokenExchanger = ExchangeCopilotTokenAsync;
 
     /// <summary>
     /// Declares what the local <c>agy</c> install can run.
@@ -233,6 +231,164 @@ internal static class DriverCapabilityDescriber
         catch (Exception ex)
         {
             return Unavailable(DriverAdapters.OpenAi, $"Could not reach {endpoint}: {ex.Message}", endpoint);
+        }
+    }
+
+    /// <summary>
+    /// Declares what GitHub Copilot can run on this runner.
+    /// </summary>
+    internal static async Task<DriverCapabilityDeclaration> DescribeCopilotAsync(
+        AgentPresetConfig preset,
+        CancellationToken ct = default)
+    {
+        var token = CopilotTokenResolver(preset);
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return Unavailable(
+                DriverAdapters.Copilot,
+                "GitHub Copilot is not authenticated on this runner. Run copilot or gh auth login to sign in.");
+        }
+
+        try
+        {
+            var (statusCode, body, error) = await ModelsEndpointReader(
+                "https://api.githubcopilot.com/models",
+                token,
+                ct);
+
+            if (statusCode != 200)
+            {
+                var exchanged = await CopilotTokenExchanger(token, ct);
+                if (!string.IsNullOrWhiteSpace(exchanged))
+                {
+                    (statusCode, body, error) = await ModelsEndpointReader(
+                        "https://api.githubcopilot.com/models",
+                        exchanged,
+                        ct);
+                }
+            }
+
+            if (statusCode == (int)HttpStatusCode.Unauthorized || statusCode == (int)HttpStatusCode.Forbidden)
+            {
+                return Unavailable(
+                    DriverAdapters.Copilot,
+                    "GitHub Copilot authentication failed (HTTP " + statusCode + "). Please re-authenticate.");
+            }
+
+            if (statusCode != 200)
+            {
+                return Unavailable(
+                    DriverAdapters.Copilot,
+                    error ?? $"GitHub Copilot API returned HTTP {statusCode}.");
+            }
+
+            var discovered = DriverModelDiscovery.ParseCopilotModels(body);
+            if (discovered.Count == 0)
+            {
+                return Unavailable(
+                    DriverAdapters.Copilot,
+                    "GitHub Copilot API returned no models.");
+            }
+
+            return new DriverCapabilityDeclaration
+            {
+                Adapter = DriverAdapters.Copilot,
+                Models = discovered.Select(ToDeclared).ToList(),
+                SupportsContextSelection = ModelContextLimits.SupportsContextSelection(DriverAdapters.Copilot),
+                Source = "copilot-models-api",
+                ObservedAt = DateTimeOffset.UtcNow
+            };
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return Unavailable(DriverAdapters.Copilot, $"Could not read Copilot model list: {ex.Message}");
+        }
+    }
+
+    internal static string? ResolveCopilotCliToken(AgentPresetConfig preset)
+    {
+        var envToken = Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN");
+        if (!string.IsNullOrWhiteSpace(envToken)) return envToken.Trim();
+
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        if (!string.IsNullOrWhiteSpace(ghToken)) return ghToken.Trim();
+
+        try
+        {
+            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+            if (Directory.Exists(tokensDir) && !string.IsNullOrWhiteSpace(preset.Id))
+            {
+                var driverOauth = Path.Combine(tokensDir, $"driver-{preset.Id.Trim().ToLowerInvariant()}.oauth");
+                if (File.Exists(driverOauth))
+                {
+                    var token = File.ReadAllText(driverOauth).Trim();
+                    if (!string.IsNullOrWhiteSpace(token)) return token;
+                }
+            }
+
+            var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
+            if (File.Exists(copilotConfig))
+            {
+                var json = File.ReadAllText(copilotConfig);
+                var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
+                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+
+            var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
+            if (File.Exists(copilotHosts))
+            {
+                var json = File.ReadAllText(copilotHosts);
+                var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
+                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    internal static async Task<string?> ExchangeCopilotTokenAsync(string token, CancellationToken ct)
+    {
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(EndpointTimeout);
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/copilot_internal/v2/token");
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+            request.Headers.TryAddWithoutValidation("User-Agent", "GitHubCopilotChat/0.22.0");
+            request.Headers.TryAddWithoutValidation("Editor-Version", "vscode/1.95.0");
+            request.Headers.TryAddWithoutValidation("Editor-Plugin-Version", "copilot-chat/0.22.0");
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+
+            using var client = CreateDirectClient();
+            using var response = await client.SendAsync(request, timeoutCts.Token);
+            if (!response.IsSuccessStatusCode) return null;
+
+            var body = await response.Content.ReadAsStringAsync(timeoutCts.Token);
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("token", out var tokProp) &&
+                tokProp.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                return tokProp.GetString();
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -410,6 +566,9 @@ internal static class DriverCapabilityDescriber
             {
                 request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             }
+            request.Headers.TryAddWithoutValidation("Editor-Version", "vscode/1.95.0");
+            request.Headers.TryAddWithoutValidation("User-Agent", "GitHubCopilotChat/0.22.0");
+            request.Headers.TryAddWithoutValidation("Copilot-Integration-Id", "vscode-chat");
 
             // No proxy: a model listing is a request to a server the operator named explicitly,
             // and routing it through a corporate proxy is how it comes back as an HTML login page.

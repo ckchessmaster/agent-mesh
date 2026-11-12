@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -232,6 +233,8 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     private readonly Func<string, string, TimeSpan, CancellationToken, Task<string?>> _cliRunner;
     private readonly Func<string, string?, CancellationToken, Task<IReadOnlyList<string>?>> _httpModelLister;
     private readonly bool _hasCustomHttpLister;
+    private readonly Func<string, CancellationToken, Task<string?>> _copilotModelLister;
+    private readonly bool _hasCustomCopilotModelLister;
     private readonly IPersonaContainerManager? _containerManager;
 
     public DriverCapabilityProbe(IPersonaContainerManager? containerManager = null)
@@ -246,7 +249,8 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         Func<string?> agyExecutableResolver,
         Func<string, string, TimeSpan, CancellationToken, Task<string?>> cliRunner,
         Func<string, string?, CancellationToken, Task<IReadOnlyList<string>?>>? httpModelLister = null,
-        int maxConcurrentProbes = MaxConcurrentProbes)
+        int maxConcurrentProbes = MaxConcurrentProbes,
+        Func<string, CancellationToken, Task<string?>>? copilotModelLister = null)
     {
         _ttlProvider = ttlProvider;
         _negativeTtlProvider = negativeTtlProvider;
@@ -254,6 +258,8 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         _cliRunner = cliRunner;
         _hasCustomHttpLister = httpModelLister != null;
         _httpModelLister = httpModelLister ?? ListOpenAiModelsAsync;
+        _hasCustomCopilotModelLister = copilotModelLister != null;
+        _copilotModelLister = copilotModelLister ?? FetchCopilotModelsHttpAsync;
         _gate = new SemaphoreSlim(maxConcurrentProbes, maxConcurrentProbes);
     }
 
@@ -350,6 +356,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 {
                     DriverAdapters.Agy => await ProbeAgyAsync(request, ct),
                     DriverAdapters.OpenAi => await ProbeOpenAiAsync(request, ct),
+                    DriverAdapters.Copilot => await ProbeCopilotAsync(request, ct),
                     _ => PresetOnly(adapter, request)
                 };
         }
@@ -424,6 +431,12 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     internal static string BuildCacheKey(string adapter, DriverCapabilityProbeRequest request)
     {
         if (adapter == DriverAdapters.Agy) return DriverAdapters.Agy;
+        if (adapter == DriverAdapters.Copilot)
+        {
+            return !string.IsNullOrWhiteSpace(request.DriverId)
+                ? $"{DriverAdapters.Copilot}:{request.DriverId.Trim().ToLowerInvariant()}"
+                : DriverAdapters.Copilot;
+        }
 
         // Normalization is shared with a declaration's endpoint binding
         // (DriverModelDiscovery.NormalizeEndpoint) on purpose: both decide whether two spellings
@@ -595,6 +608,171 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 // An OpenAI /models response has no effort surface at all.
                 EffortSource: null),
             request);
+    }
+
+    private async Task<DriverCapabilityReading?> ProbeCopilotAsync(
+        DriverCapabilityProbeRequest request,
+        CancellationToken ct)
+    {
+        var token = ResolveCopilotToken(request);
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            try
+            {
+                var json = await _copilotModelLister(token, ct);
+                if (!string.IsNullOrWhiteSpace(json))
+                {
+                    var parsed = DriverModelDiscovery.ParseCopilotModels(json);
+                    if (parsed.Count > 0)
+                    {
+                        return WithOperatorModels(
+                            new DriverCapabilityReading(
+                                Adapter: DriverAdapters.Copilot,
+                                Models: parsed,
+                                ModelSource: CapabilitySourceKind.Probed,
+                                ObservedAt: DateTimeOffset.UtcNow,
+                                SupportsContextSelection: true,
+                                EffortSource: null),
+                            request);
+                    }
+                }
+            }
+            catch
+            {
+                // Fall through to preset fallback
+            }
+        }
+
+        return PresetOnly(DriverAdapters.Copilot, request);
+    }
+
+    internal static string? ResolveCopilotToken(DriverCapabilityProbeRequest request)
+    {
+        if (!string.IsNullOrWhiteSpace(request.OAuthToken))
+        {
+            return request.OAuthToken.Trim();
+        }
+
+        try
+        {
+            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+            if (Directory.Exists(tokensDir) && !string.IsNullOrWhiteSpace(request.DriverId))
+            {
+                var driverOauth = Path.Combine(tokensDir, $"driver-{request.DriverId.Trim().ToLowerInvariant()}.oauth");
+                if (File.Exists(driverOauth))
+                {
+                    var token = File.ReadAllText(driverOauth).Trim();
+                    if (!string.IsNullOrWhiteSpace(token)) return token;
+                }
+            }
+
+            var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
+            if (File.Exists(copilotConfig))
+            {
+                var json = File.ReadAllText(copilotConfig);
+                var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
+                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+
+            var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
+            if (File.Exists(copilotHosts))
+            {
+                var json = File.ReadAllText(copilotHosts);
+                var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
+                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
+                {
+                    return match.Groups[1].Value.Trim();
+                }
+            }
+        }
+        catch { }
+
+        var envToken = Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN");
+        if (!string.IsNullOrWhiteSpace(envToken)) return envToken.Trim();
+
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        if (!string.IsNullOrWhiteSpace(ghToken)) return ghToken.Trim();
+
+        return null;
+    }
+
+    private static async Task<string?> FetchCopilotModelsHttpAsync(string token, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(token)) return null;
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(ProbeTimeout);
+
+        // Attempt 1: Query models endpoint directly with token
+        var modelsJson = await QueryCopilotModelsEndpointAsync(token, timeoutCts.Token);
+        if (!string.IsNullOrWhiteSpace(modelsJson))
+        {
+            return modelsJson;
+        }
+
+        // Attempt 2: If direct call failed or token is a GitHub token, exchange for a Copilot session token
+        var exchangedToken = await ExchangeGithubTokenForCopilotTokenAsync(token, timeoutCts.Token);
+        if (!string.IsNullOrWhiteSpace(exchangedToken))
+        {
+            return await QueryCopilotModelsEndpointAsync(exchangedToken, timeoutCts.Token);
+        }
+
+        return null;
+    }
+
+    private static async Task<string?> QueryCopilotModelsEndpointAsync(string token, CancellationToken ct)
+    {
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.githubcopilot.com/models");
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+            req.Headers.TryAddWithoutValidation("Editor-Version", "vscode/1.95.0");
+            req.Headers.TryAddWithoutValidation("User-Agent", "GitHubCopilotChat/0.22.0");
+            req.Headers.TryAddWithoutValidation("Copilot-Integration-Id", "vscode-chat");
+
+            using var res = await SharedHttp.SendAsync(req, ct);
+            if (!res.IsSuccessStatusCode) return null;
+
+            return await res.Content.ReadAsStringAsync(ct);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async Task<string?> ExchangeGithubTokenForCopilotTokenAsync(string githubToken, CancellationToken ct)
+    {
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/copilot_internal/v2/token");
+            req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {githubToken}");
+            req.Headers.TryAddWithoutValidation("User-Agent", "GitHubCopilotChat/0.22.0");
+            req.Headers.TryAddWithoutValidation("Editor-Version", "vscode/1.95.0");
+            req.Headers.TryAddWithoutValidation("Editor-Plugin-Version", "copilot-chat/0.22.0");
+            req.Headers.TryAddWithoutValidation("Accept", "application/json");
+
+            using var res = await SharedHttp.SendAsync(req, ct);
+            if (!res.IsSuccessStatusCode) return null;
+
+            var body = await res.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("token", out var tokProp) &&
+                tokProp.ValueKind == JsonValueKind.String)
+            {
+                return tokProp.GetString();
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
