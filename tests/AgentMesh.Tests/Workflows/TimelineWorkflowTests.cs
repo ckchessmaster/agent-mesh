@@ -82,6 +82,76 @@ public class TimelineWorkflowTests
         var result = await handle.GetResultAsync<JobExecutionResult>();
         result.Success.Should().BeTrue();
         timeline.TaskStepInputs.Should().NotBeEmpty("Child tasks must be dispatched after plan approval");
+        execution.CodingInputs.Should().NotBeEmpty("Child tasks must invoke coding turn");
+        execution.CodingInputs[0].PersonaId.Should().Be("lead-agent", "Child task must inherit AssignedAgentId as PersonaId");
+    }
+
+    [Fact]
+    public void ChildTaskExecutionInput_CarriesAssignedAgentIdAsPersonaId()
+    {
+        var input = new ChildTaskExecutionInput(
+            JobId: "job-123",
+            TaskId: "task-1",
+            TaskIndex: 0,
+            TaskTitle: "First Task",
+            AssignedAgentId: "rook",
+            WorkspacePath: "/workspace",
+            TargetBranch: "main"
+        );
+
+        input.PersonaId.Should().Be("rook");
+        input.AgentId.Should().Be("rook");
+    }
+
+    [Fact]
+    public void ExtractQuestionsFromText_WithAskQuestionJsonBlock_ExtractsStructuredQuestionsAndOptions()
+    {
+        var text = """
+        I have inspected the repository.
+        ```ask_question
+        {
+          "questions": [
+            {
+              "question": "Which database engine should be targeted?",
+              "options": ["PostgreSQL", "SQLite", "MySQL"]
+            },
+            {
+              "question": "Should migrations run automatically?",
+              "options": ["Yes", "No"]
+            }
+          ]
+        }
+        ```
+        """;
+
+        var questions = TimelineActivities.ExtractQuestionsFromText(text);
+
+        questions.Should().HaveCount(2);
+        questions[0].Question.Should().Be("Which database engine should be targeted?");
+        questions[0].Options.Should().ContainInOrder("PostgreSQL", "SQLite", "MySQL");
+        questions[1].Question.Should().Be("Should migrations run automatically?");
+        questions[1].Options.Should().ContainInOrder("Yes", "No");
+    }
+
+    [Fact]
+    public void ExtractQuestionsFromText_WithNumberedQuestionsAndParentheses_ExtractsOptions()
+    {
+        var text = """
+        Here are my questions before beginning implementation:
+        1. Which test framework should we configure? (xUnit, NUnit, or MSTest)
+        2. Should we support SQLite fallback? (yes/no)
+        """;
+
+        var questions = TimelineActivities.ExtractQuestionsFromText(text);
+
+        questions.Should().HaveCount(2);
+        questions[0].Question.Should().Contain("Which test framework should we configure?");
+        questions[0].Options.Should().Contain("xUnit");
+        questions[0].Options.Should().Contain("NUnit");
+        questions[0].Options.Should().Contain("MSTest");
+        questions[1].Question.Should().Contain("Should we support SQLite fallback?");
+        questions[1].Options.Should().Contain("yes");
+        questions[1].Options.Should().Contain("no");
     }
 
     [Fact]
@@ -446,11 +516,13 @@ public class TimelineWorkflowTests
 
     private sealed class FakeExecutionActivities : IExecutionActivities
     {
+        public List<TaskExecutionInput> CodingInputs { get; } = new();
         public Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>? CustomCodingHandler { get; set; }
 
         [Activity]
         public Task<TurnOutcome> RunAgentCodingTurnAsync(TaskExecutionInput input, ChatMessageSignal? pendingReply)
         {
+            CodingInputs.Add(input);
             if (CustomCodingHandler != null)
             {
                 return CustomCodingHandler(input, pendingReply);

@@ -117,11 +117,6 @@ public class MacroTurnController(
             return BadRequest(new { error = "prompt is required." });
         }
 
-        if (string.IsNullOrWhiteSpace(req.PersonaId))
-        {
-            return BadRequest(new { error = "personaId is required: a turn runs as a persona, not as an anonymous agent." });
-        }
-
         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId, ct);
         if (job is null) return NotFound(new { error = $"Job '{jobId}' not found." });
 
@@ -129,25 +124,30 @@ public class MacroTurnController(
             .FirstOrDefaultAsync(p => p.Id == job.ProjectId, ct);
         if (project is null) return NotFound(new { error = $"Project '{job.ProjectId}' not found." });
 
-        var persona = await db.Personas.AsNoTracking()
-            .FirstOrDefaultAsync(p => p.Id == req.PersonaId.Trim().ToLowerInvariant(), ct);
-        if (persona is null)
+        Persona? persona = null;
+        if (!string.IsNullOrWhiteSpace(req.PersonaId))
         {
-            if (!string.IsNullOrWhiteSpace(job.AssignedAgentId))
-            {
-                persona = await db.Personas.AsNoTracking()
-                    .FirstOrDefaultAsync(p => p.Id == job.AssignedAgentId.Trim().ToLowerInvariant(), ct);
-            }
-            if (persona is null && !string.IsNullOrWhiteSpace(project.DefaultLeadPersonaId))
-            {
-                persona = await db.Personas.AsNoTracking()
-                    .FirstOrDefaultAsync(p => p.Id == project.DefaultLeadPersonaId.Trim().ToLowerInvariant(), ct);
-            }
-            persona ??= await db.Personas.AsNoTracking().FirstOrDefaultAsync(ct);
+            persona = await db.Personas.AsNoTracking()
+                .FirstOrDefaultAsync(p => p.Id == req.PersonaId.Trim().ToLowerInvariant(), ct);
         }
+
+        if (persona is null && !string.IsNullOrWhiteSpace(job.AssignedAgentId))
+        {
+            persona = await db.Personas.AsNoTracking()
+                .FirstOrDefaultAsync(p => p.Id == job.AssignedAgentId.Trim().ToLowerInvariant(), ct);
+        }
+
+        if (persona is null && !string.IsNullOrWhiteSpace(project.DefaultLeadPersonaId))
+        {
+            persona = await db.Personas.AsNoTracking()
+                .FirstOrDefaultAsync(p => p.Id == project.DefaultLeadPersonaId.Trim().ToLowerInvariant(), ct);
+        }
+
+        persona ??= await db.Personas.AsNoTracking().FirstOrDefaultAsync(ct);
+
         if (persona is null)
         {
-            return NotFound(new { error = $"Persona '{req.PersonaId}' not found." });
+            return BadRequest(new { error = "personaId is required: no persona was provided, assigned to the job, or found in the project." });
         }
 
         // ── Re-attach before dispatching ─────────────────────────────────────────

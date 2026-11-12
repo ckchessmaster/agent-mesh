@@ -94,6 +94,7 @@ public record ChildTaskExecutionInput : TaskExecutionInput
             ProjectId: ProjectId ?? JobId,
             WorkspacePath: WorkspacePath,
             TargetBranch: TargetBranch,
+            PersonaId: AssignedAgentId,
             TaskIndex: TaskIndex,
             TaskTitle: TaskTitle)
     {

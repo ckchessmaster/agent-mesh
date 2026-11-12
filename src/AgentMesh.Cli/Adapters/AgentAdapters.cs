@@ -1929,6 +1929,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             {
                 FileName = executablePath,
                 WorkingDirectory = cwd,
+                RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -1998,12 +1999,29 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             using var proc = new Process { StartInfo = psi };
             using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
             proc.Start();
+            proc.StandardInput.Close();
 
             try
             {
                 var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
                 var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
-                await proc.WaitForExitAsync(ct);
+
+                var sw = Stopwatch.StartNew();
+                var lastHeartbeat = TimeSpan.Zero;
+                while (!proc.HasExited)
+                {
+                    await Task.WhenAny(Task.Delay(3000, ct), proc.WaitForExitAsync(ct));
+                    if (!proc.HasExited && sw.Elapsed - lastHeartbeat >= TimeSpan.FromSeconds(20))
+                    {
+                        lastHeartbeat = sw.Elapsed;
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[GitHub Copilot CLI @{preset.Id}] Analyzing workspace and reasoning ({sw.Elapsed.TotalSeconds:F0}s elapsed)..."
+                        });
+                    }
+                }
+
                 var stdOut = await stdOutTask;
                 var stdErr = await stdErrTask;
 
