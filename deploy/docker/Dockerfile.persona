@@ -20,6 +20,7 @@ RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\nAcquire::http::Ti
     unzip \
     ca-certificates \
     gnupg \
+    bsdutils \
     procps \
     iproute2 \
     dnsutils \

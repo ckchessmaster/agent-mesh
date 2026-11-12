@@ -842,9 +842,22 @@ public class AgentsController(
             }
             else if (adapter == DriverAdapters.Copilot)
             {
-                psi.FileName = hostBinPath!;
-                psi.ArgumentList.Add("login");
-                psi.ArgumentList.Add("--device-code");
+                var scriptBin = FindHostBinary("script");
+                if (OperatingSystem.IsLinux() && !string.IsNullOrWhiteSpace(scriptBin))
+                {
+                    psi.FileName = scriptBin;
+                    psi.ArgumentList.Add("-q");
+                    psi.ArgumentList.Add("-e");
+                    psi.ArgumentList.Add("-c");
+                    psi.ArgumentList.Add($"{hostBinPath} login --device-code");
+                    psi.ArgumentList.Add("/dev/null");
+                }
+                else
+                {
+                    psi.FileName = hostBinPath!;
+                    psi.ArgumentList.Add("login");
+                    psi.ArgumentList.Add("--device-code");
+                }
                 psi.Environment.Remove("GH_TOKEN");
                 psi.Environment.Remove("GITHUB_TOKEN");
                 psi.Environment.Remove("COPILOT_GITHUB_TOKEN");
@@ -862,12 +875,12 @@ public class AgentsController(
             string? capturedUserCode = null;
             var errBuilder = new StringBuilder();
 
-            void ParseLine(string line)
+            void CheckPlaintextPrompt(string text)
             {
-                if (line.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
-                    line.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
-                    line.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
-                    line.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+                if (text.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
+                    text.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                    text.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
+                    text.Contains("Store token", StringComparison.OrdinalIgnoreCase))
                 {
                     try
                     {
@@ -876,6 +889,11 @@ public class AgentsController(
                     }
                     catch { }
                 }
+            }
+
+            void ParseLine(string line)
+            {
+                CheckPlaintextPrompt(line);
 
                 var match = Regex.Match(line, @"https?://[^\s""'>]+");
                 if (match.Success && capturedUrl == null)
@@ -906,10 +924,30 @@ public class AgentsController(
             {
                 try
                 {
-                    string? line;
-                    while ((line = await proc.StandardOutput.ReadLineAsync()) != null)
+                    var buf = new char[1024];
+                    int read;
+                    var lineBuffer = new StringBuilder();
+                    while ((read = await proc.StandardOutput.ReadAsync(buf, 0, buf.Length)) > 0)
                     {
-                        ParseLine(line);
+                        var chunk = new string(buf, 0, read);
+                        CheckPlaintextPrompt(chunk);
+                        lineBuffer.Append(chunk);
+                        var content = lineBuffer.ToString();
+                        var lastNewline = content.LastIndexOf('\n');
+                        if (lastNewline >= 0)
+                        {
+                            var completeLines = content.Substring(0, lastNewline);
+                            foreach (var line in completeLines.Split('\n'))
+                            {
+                                ParseLine(line.TrimEnd('\r'));
+                            }
+                            lineBuffer.Clear();
+                            lineBuffer.Append(content.Substring(lastNewline + 1));
+                        }
+                        else
+                        {
+                            ParseLine(content);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -922,11 +960,14 @@ public class AgentsController(
             {
                 try
                 {
-                    string? line;
-                    while ((line = await proc.StandardError.ReadLineAsync()) != null)
+                    var buf = new char[1024];
+                    int read;
+                    while ((read = await proc.StandardError.ReadAsync(buf, 0, buf.Length)) > 0)
                     {
-                        errBuilder.AppendLine(line);
-                        ParseLine(line);
+                        var chunk = new string(buf, 0, read);
+                        errBuilder.Append(chunk);
+                        CheckPlaintextPrompt(chunk);
+                        ParseLine(chunk);
                     }
                 }
                 catch { }

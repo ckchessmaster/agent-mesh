@@ -1565,7 +1565,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
             else if (driverId.StartsWith("copilot") || adapterType == "copilot")
             {
-                authCmd = new[] { "env", "-u", "GITHUB_TOKEN", "-u", "GH_TOKEN", "-u", "COPILOT_GITHUB_TOKEN", "copilot", "login", "--device-code" };
+                authCmd = new[] { "script", "-q", "-e", "-c", "copilot login --device-code", "/dev/null" };
             }
             else
             {
