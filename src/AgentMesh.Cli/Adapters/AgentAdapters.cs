@@ -1925,174 +1925,15 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 Content = $"[GitHub Copilot CLI @{preset.Id}] Running prompt via {(isViaGh ? "gh copilot" : executablePath)}..."
             });
 
-            var psi = new ProcessStartInfo
-            {
-                FileName = executablePath,
-                WorkingDirectory = cwd,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            if (isViaGh)
-            {
-                psi.ArgumentList.Add("copilot");
-                psi.ArgumentList.Add("--");
-            }
-
-            // Session ID resumption for multi-turn conversations
-            if (AgyAdapter.GetSessionConversationId(promptEvent.SessionId) is string existingConvId &&
-                !string.IsNullOrWhiteSpace(existingConvId))
-            {
-                psi.ArgumentList.Add($"--resume={existingConvId}");
-            }
-
-            if (!string.IsNullOrWhiteSpace(promptEvent.Model))
-            {
-                psi.ArgumentList.Add("--model");
-                psi.ArgumentList.Add(promptEvent.Model.Trim());
-            }
-
-            if (!string.IsNullOrWhiteSpace(promptEvent.Mode))
-            {
-                var modeVal = promptEvent.Mode.Trim().ToLowerInvariant();
-                if (modeVal == "plan")
-                {
-                    psi.ArgumentList.Add("--mode");
-                    psi.ArgumentList.Add("plan");
-                }
-                else if (modeVal is "auto" or "autopilot")
-                {
-                    psi.ArgumentList.Add("--mode");
-                    psi.ArgumentList.Add("autopilot");
-                }
-            }
-
-            if (!string.IsNullOrWhiteSpace(promptEvent.ContextSize))
-            {
-                var ctxVal = promptEvent.ContextSize.Trim().ToLowerInvariant();
-                var copilotContextTier = ctxVal is "long_context" or "500k" or "1m" or "2m"
-                    ? "long_context"
-                    : "default";
-                psi.ArgumentList.Add("--context");
-                psi.ArgumentList.Add(copilotContextTier);
-            }
-
-            var promptEnvelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(
-                promptEvent.Prompt,
-                preset.Id,
-                promptEvent.Mode,
-                promptEvent.PersonaId,
-                promptEvent.PersonaName,
-                promptEvent.PersonaRole,
-                promptEvent.PersonaPrompt,
-                promptEvent.SessionId,
-                promptEvent.Attachments);
-
-            psi.ArgumentList.Add("-p");
-            psi.ArgumentList.Add(promptEnvelope);
-            psi.ArgumentList.Add("--allow-all");
-            psi.ArgumentList.Add("--no-color");
-
-            using var proc = new Process { StartInfo = psi };
-            using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
-            proc.Start();
-            proc.StandardInput.Close();
-
-            try
-            {
-                var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
-                var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
-
-                var sw = Stopwatch.StartNew();
-                var lastHeartbeat = TimeSpan.Zero;
-                while (!proc.HasExited)
-                {
-                    await Task.WhenAny(Task.Delay(3000, ct), proc.WaitForExitAsync(ct));
-                    if (!proc.HasExited && sw.Elapsed - lastHeartbeat >= TimeSpan.FromSeconds(20))
-                    {
-                        lastHeartbeat = sw.Elapsed;
-                        await onEvent(new TrajectoryEventPayload
-                        {
-                            EventType = "thought",
-                            Content = $"[GitHub Copilot CLI @{preset.Id}] Analyzing workspace and reasoning ({sw.Elapsed.TotalSeconds:F0}s elapsed)..."
-                        });
-                    }
-                }
-
-                var stdOut = await stdOutTask;
-                var stdErr = await stdErrTask;
-
-                ct.ThrowIfCancellationRequested();
-
-                var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut.Trim() : stdErr.Trim();
-
-                // Check if Copilot asked questions
-                var questions = AgentAdapterFactory.ExtractQuestionsFromOutput(output);
-                if (questions.Count > 0)
-                {
-                    var questionsJson = JsonSerializer.Serialize(new
-                    {
-                        questions = questions.Select(q => new
-                        {
-                            question = q.Question,
-                            options = q.Options,
-                            is_multi_select = q.IsMultiSelect
-                        })
-                    });
-
-                    var cleanedOutput = Regex.Replace(output, @"\(?Note:?\s*I can't see your replies in this non-interactive session\.?.*?(\)|$)", "", RegexOptions.IgnoreCase).Trim();
-
-                    var copilotPayloadJson = JsonSerializer.Serialize(new
-                    {
-                        model = promptEvent.Model ?? "gpt-4o",
-                        tier = promptEvent.Tier,
-                        mode = promptEvent.Mode,
-                        contextSize = promptEvent.ContextSize
-                    });
-
-                    await onEvent(new TrajectoryEventPayload
-                    {
-                        EventType = "response",
-                        Content = string.IsNullOrWhiteSpace(cleanedOutput) ? output : cleanedOutput,
-                        StructuredPayloadJson = copilotPayloadJson
-                    });
-
-                    await onEvent(new TrajectoryEventPayload
-                    {
-                        EventType = "tool_call",
-                        ToolName = "ask_question",
-                        Content = $"Asking {questions.Count} question{(questions.Count == 1 ? "" : "s")}",
-                        ToolArgsJson = questionsJson
-                    });
-                    return;
-                }
-
-                var defaultCopilotPayloadJson = JsonSerializer.Serialize(new
-                {
-                    model = promptEvent.Model ?? "gpt-4o",
-                    tier = promptEvent.Tier,
-                    mode = promptEvent.Mode,
-                    contextSize = promptEvent.ContextSize
-                });
-
-                await onEvent(new TrajectoryEventPayload
-                {
-                    EventType = "response",
-                    Content = string.IsNullOrWhiteSpace(output)
-                        ? $"Copilot CLI finished (exit code {proc.ExitCode})."
-                        : output,
-                    StructuredPayloadJson = defaultCopilotPayloadJson
-                });
-                return;
-            }
-            catch (OperationCanceledException)
-            {
-                AgentAdapterFactory.KillProcessTree(proc);
-                throw;
-            }
+            await ExecuteCopilotInvocationAsync(
+                executablePath,
+                isViaGh,
+                cwd,
+                preset,
+                promptEvent,
+                onEvent,
+                ct);
+            return;
         }
 
         await onEvent(new TrajectoryEventPayload
@@ -2105,6 +1946,562 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         {
             EventType = "response",
             Content = $"**Error: GitHub Copilot CLI (`copilot`) is not installed.**\n\nPlease install it using:\n```bash\nnpm install -g @github/copilot\n```"
+        });
+    }
+
+    private static async Task ExecuteCopilotInvocationAsync(
+        string executablePath,
+        bool isViaGh,
+        string cwd,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        var promptEnvelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(
+            promptEvent.Prompt,
+            preset.Id,
+            promptEvent.Mode,
+            promptEvent.PersonaId,
+            promptEvent.PersonaName,
+            promptEvent.PersonaRole,
+            promptEvent.PersonaPrompt,
+            promptEvent.SessionId,
+            promptEvent.Attachments);
+
+        var (exitCode, stdout, stderr, runSucceeded) = await RunCopilotSubprocessAsync(
+            executablePath,
+            isViaGh,
+            cwd,
+            preset,
+            promptEvent,
+            promptEnvelope,
+            useJsonFormat: true,
+            onEvent,
+            ct);
+
+        if (!runSucceeded && (stderr.Contains("unexpected argument '--output-format'") || stderr.Contains("unknown option '--output-format'")))
+        {
+            await RunCopilotSubprocessAsync(
+                executablePath,
+                isViaGh,
+                cwd,
+                preset,
+                promptEvent,
+                promptEnvelope,
+                useJsonFormat: false,
+                onEvent,
+                ct);
+        }
+    }
+
+    internal static ProcessStartInfo BuildCopilotProcessStartInfo(
+        string executablePath,
+        bool isViaGh,
+        string cwd,
+        PromptReceivedEvent promptEvent,
+        string promptEnvelope,
+        bool useJsonFormat)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            WorkingDirectory = cwd,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        if (isViaGh)
+        {
+            psi.ArgumentList.Add("copilot");
+            psi.ArgumentList.Add("--");
+        }
+
+        if (AgyAdapter.GetSessionConversationId(promptEvent.SessionId) is string existingConvId &&
+            !string.IsNullOrWhiteSpace(existingConvId))
+        {
+            psi.ArgumentList.Add($"--resume={existingConvId}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.Model))
+        {
+            psi.ArgumentList.Add("--model");
+            psi.ArgumentList.Add(promptEvent.Model.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.Mode))
+        {
+            var modeVal = promptEvent.Mode.Trim().ToLowerInvariant();
+            if (modeVal == "plan")
+            {
+                psi.ArgumentList.Add("--mode");
+                psi.ArgumentList.Add("plan");
+            }
+            else if (modeVal is "auto" or "autopilot")
+            {
+                psi.ArgumentList.Add("--mode");
+                psi.ArgumentList.Add("autopilot");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.ContextSize))
+        {
+            var ctxVal = promptEvent.ContextSize.Trim().ToLowerInvariant();
+            var copilotContextTier = ctxVal is "long_context" or "500k" or "1m" or "2m"
+                ? "long_context"
+                : "default";
+            psi.ArgumentList.Add("--context");
+            psi.ArgumentList.Add(copilotContextTier);
+        }
+
+        psi.ArgumentList.Add("-p");
+        psi.ArgumentList.Add(promptEnvelope);
+        psi.ArgumentList.Add("--allow-all");
+        psi.ArgumentList.Add("--no-color");
+
+        if (useJsonFormat)
+        {
+            psi.ArgumentList.Add("--output-format");
+            psi.ArgumentList.Add("json");
+            psi.ArgumentList.Add("--stream");
+            psi.ArgumentList.Add("on");
+        }
+
+        return psi;
+    }
+
+    private static async Task<(int ExitCode, string StdOut, string StdErr, bool Succeeded)> RunCopilotSubprocessAsync(
+        string executablePath,
+        bool isViaGh,
+        string cwd,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        string promptEnvelope,
+        bool useJsonFormat,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        var psi = BuildCopilotProcessStartInfo(executablePath, isViaGh, cwd, promptEvent, promptEnvelope, useJsonFormat);
+
+        using var proc = new Process { StartInfo = psi };
+        using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
+        proc.Start();
+        proc.StandardInput.Close();
+
+        var streamedResponseBuilder = new StringBuilder();
+        var rawStdOutBuilder = new StringBuilder();
+        var stdErrBuilder = new StringBuilder();
+        var lastActivity = Stopwatch.GetTimestamp();
+        var lastHeartbeatTime = Stopwatch.GetTimestamp();
+        var sw = Stopwatch.StartNew();
+        string? copilotSessionId = null;
+        string? terminalUsageJson = null;
+
+        var readStdOutTask = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await proc.StandardOutput.ReadLineAsync(ct);
+                if (line == null) break;
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                lastActivity = Stopwatch.GetTimestamp();
+                lock (rawStdOutBuilder)
+                {
+                    rawStdOutBuilder.AppendLine(line);
+                }
+
+                if (TryParseCopilotJsonLine(line, out var evType, out var evContent, out var toolName, out var toolArgs, out var toolRes, out var sid, out var usage))
+                {
+                    if (!string.IsNullOrWhiteSpace(sid))
+                    {
+                        copilotSessionId = sid;
+                        AgyAdapter.SetSessionConversationId(promptEvent.SessionId, sid);
+                    }
+                    if (!string.IsNullOrWhiteSpace(usage))
+                    {
+                        terminalUsageJson = usage;
+                    }
+
+                    if (evType == "thought" && !string.IsNullOrWhiteSpace(evContent))
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = evContent.Trim()
+                        });
+                    }
+                    else if (evType == "tool_call" && !string.IsNullOrWhiteSpace(toolName))
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "tool_call",
+                            ToolName = toolName,
+                            ToolArgsJson = toolArgs,
+                            Content = evContent ?? $"Calling {toolName}..."
+                        });
+                    }
+                    else if (evType == "tool_result")
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "tool_result",
+                            ToolName = toolName,
+                            ToolResultJson = toolRes,
+                            Content = TruncateLine(toolRes, 120)
+                        });
+                    }
+                    else if (evType == "message" && !string.IsNullOrWhiteSpace(evContent))
+                    {
+                        lock (streamedResponseBuilder)
+                        {
+                            streamedResponseBuilder.Append(evContent);
+                        }
+                    }
+                    else if (evType == "result" && !string.IsNullOrWhiteSpace(evContent))
+                    {
+                        lock (streamedResponseBuilder)
+                        {
+                            if (streamedResponseBuilder.Length == 0)
+                            {
+                                streamedResponseBuilder.Append(evContent);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    var trimmed = line.Trim();
+                    if (trimmed.StartsWith("Running ", StringComparison.OrdinalIgnoreCase) ||
+                        trimmed.StartsWith("Executing ", StringComparison.OrdinalIgnoreCase) ||
+                        trimmed.StartsWith("Reading ", StringComparison.OrdinalIgnoreCase) ||
+                        trimmed.StartsWith("Writing ", StringComparison.OrdinalIgnoreCase) ||
+                        trimmed.StartsWith("Searching ", StringComparison.OrdinalIgnoreCase) ||
+                        trimmed.StartsWith("Inspecting ", StringComparison.OrdinalIgnoreCase) ||
+                        trimmed.StartsWith("> ", StringComparison.Ordinal))
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = trimmed
+                        });
+                    }
+
+                    lock (streamedResponseBuilder)
+                    {
+                        streamedResponseBuilder.AppendLine(line);
+                    }
+                }
+            }
+        }, ct);
+
+        var readStdErrTask = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await proc.StandardError.ReadLineAsync(ct);
+                if (line == null) break;
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                lastActivity = Stopwatch.GetTimestamp();
+                lock (stdErrBuilder)
+                {
+                    stdErrBuilder.AppendLine(line);
+                }
+            }
+        }, ct);
+
+        try
+        {
+            while (!proc.HasExited)
+            {
+                await Task.WhenAny(Task.Delay(1000, ct), proc.WaitForExitAsync(ct));
+                if (proc.HasExited) break;
+
+                var now = Stopwatch.GetTimestamp();
+                var silentDuration = Stopwatch.GetElapsedTime(lastActivity);
+                var sinceLastHeartbeat = Stopwatch.GetElapsedTime(lastHeartbeatTime);
+
+                // Only emit heartbeat if Copilot has produced NO output for at least 60 seconds
+                if (silentDuration >= TimeSpan.FromSeconds(60) && sinceLastHeartbeat >= TimeSpan.FromSeconds(60))
+                {
+                    lastHeartbeatTime = now;
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = $"[GitHub Copilot CLI @{preset.Id}] Still working... ({sw.Elapsed.TotalSeconds:F0}s elapsed)"
+                    });
+                }
+            }
+
+            await Task.WhenAll(readStdOutTask, readStdErrTask);
+            ct.ThrowIfCancellationRequested();
+
+            string rawStdOut;
+            lock (rawStdOutBuilder) { rawStdOut = rawStdOutBuilder.ToString().Trim(); }
+            string stdErr;
+            lock (stdErrBuilder) { stdErr = stdErrBuilder.ToString().Trim(); }
+
+            if (proc.ExitCode != 0 && (stdErr.Contains("unexpected argument '--output-format'") || stdErr.Contains("unknown option '--output-format'")))
+            {
+                return (proc.ExitCode, rawStdOut, stdErr, false);
+            }
+
+            string output;
+            lock (streamedResponseBuilder) { output = streamedResponseBuilder.ToString().Trim(); }
+            if (string.IsNullOrWhiteSpace(output))
+            {
+                output = !string.IsNullOrWhiteSpace(rawStdOut) ? rawStdOut : stdErr;
+            }
+
+            // Check if Copilot asked questions
+            var questions = AgentAdapterFactory.ExtractQuestionsFromOutput(output);
+            if (questions.Count > 0)
+            {
+                var questionsJson = JsonSerializer.Serialize(new
+                {
+                    questions = questions.Select(q => new
+                    {
+                        question = q.Question,
+                        options = q.Options,
+                        is_multi_select = q.IsMultiSelect
+                    })
+                });
+
+                var cleanedOutput = Regex.Replace(output, @"\(?Note:?\s*I can't see your replies in this non-interactive session\.?.*?(\)|$)", "", RegexOptions.IgnoreCase).Trim();
+
+                var copilotPayloadJson = BuildPayloadJson(promptEvent, copilotSessionId, terminalUsageJson);
+
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "response",
+                    Content = string.IsNullOrWhiteSpace(cleanedOutput) ? output : cleanedOutput,
+                    StructuredPayloadJson = copilotPayloadJson
+                });
+
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "tool_call",
+                    ToolName = "ask_question",
+                    Content = $"Asking {questions.Count} question{(questions.Count == 1 ? "" : "s")}",
+                    ToolArgsJson = questionsJson
+                });
+                return (proc.ExitCode, rawStdOut, stdErr, true);
+            }
+
+            var defaultCopilotPayloadJson = BuildPayloadJson(promptEvent, copilotSessionId, terminalUsageJson);
+
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "response",
+                Content = string.IsNullOrWhiteSpace(output)
+                    ? $"Copilot CLI finished (exit code {proc.ExitCode})."
+                    : output,
+                StructuredPayloadJson = defaultCopilotPayloadJson
+            });
+
+            return (proc.ExitCode, rawStdOut, stdErr, true);
+        }
+        catch (OperationCanceledException)
+        {
+            AgentAdapterFactory.KillProcessTree(proc);
+            throw;
+        }
+    }
+
+    internal static bool TryParseCopilotJsonLine(
+        string line,
+        out string? eventType,
+        out string? content,
+        out string? toolName,
+        out string? toolArgsJson,
+        out string? toolResultJson,
+        out string? sessionId,
+        out string? usageJson)
+    {
+        eventType = null;
+        content = null;
+        toolName = null;
+        toolArgsJson = null;
+        toolResultJson = null;
+        sessionId = null;
+        usageJson = null;
+
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        var trimmed = line.Trim();
+        if (!trimmed.StartsWith('{') || !trimmed.EndsWith('}')) return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(trimmed);
+            var root = doc.RootElement;
+
+            var rawType = root.TryGetProperty("type", out var tProp)
+                ? tProp.GetString()
+                : (root.TryGetProperty("event", out var evProp)
+                    ? evProp.GetString()
+                    : (root.TryGetProperty("eventType", out var etProp) ? etProp.GetString() : null));
+
+            if (string.IsNullOrWhiteSpace(rawType)) return false;
+
+            var data = root.TryGetProperty("data", out var dProp) ? dProp : root;
+
+            if (root.TryGetProperty("sessionId", out var sidRoot) && sidRoot.ValueKind == JsonValueKind.String)
+            {
+                sessionId = sidRoot.GetString();
+            }
+            else if (data.TryGetProperty("sessionId", out var sidData) && sidData.ValueKind == JsonValueKind.String)
+            {
+                sessionId = sidData.GetString();
+            }
+
+            if (root.TryGetProperty("usage", out var uRoot))
+            {
+                usageJson = uRoot.GetRawText();
+            }
+            else if (data.TryGetProperty("usage", out var uData))
+            {
+                usageJson = uData.GetRawText();
+            }
+
+            var lower = rawType.ToLowerInvariant();
+
+            if (lower == "session.start")
+            {
+                eventType = "session.start";
+                return true;
+            }
+
+            if (lower is "assistant.reasoning" or "thought" or "reasoning")
+            {
+                eventType = "thought";
+                content = data.TryGetProperty("content", out var c) ? c.GetString() : (data.TryGetProperty("text", out var t) ? t.GetString() : null);
+                return !string.IsNullOrWhiteSpace(content);
+            }
+
+            if (lower.Contains("tool") && (lower.Contains("call") || lower.Contains("execution") || lower.Contains("start") || lower.Contains("use")))
+            {
+                eventType = "tool_call";
+                toolName = data.TryGetProperty("tool", out var tn) ? tn.GetString() : (data.TryGetProperty("name", out var n) ? n.GetString() : "tool");
+                if (data.TryGetProperty("args", out var a) || data.TryGetProperty("arguments", out a) || data.TryGetProperty("input", out a))
+                {
+                    toolArgsJson = a.ValueKind == JsonValueKind.String ? a.GetString() : a.GetRawText();
+                }
+                content = FormatToolCallSummary(toolName, toolArgsJson);
+                return true;
+            }
+
+            if (lower.Contains("tool") && (lower.Contains("result") || lower.Contains("output") || lower.Contains("finish") || lower.Contains("done")))
+            {
+                eventType = "tool_result";
+                toolName = data.TryGetProperty("tool", out var tn) ? tn.GetString() : (data.TryGetProperty("name", out var n) ? n.GetString() : null);
+                if (data.TryGetProperty("result", out var r) || data.TryGetProperty("output", out r) || data.TryGetProperty("content", out r) || data.TryGetProperty("stdout", out r))
+                {
+                    toolResultJson = r.ValueKind == JsonValueKind.String ? r.GetString() : r.GetRawText();
+                }
+                content = TruncateLine(toolResultJson, 120);
+                return true;
+            }
+
+            if (lower is "assistant.message" or "message" or "content.delta" or "assistant.turn")
+            {
+                eventType = "message";
+                content = data.TryGetProperty("content", out var c) ? c.GetString() : (data.TryGetProperty("text", out var t) ? t.GetString() : (data.TryGetProperty("delta", out var d) ? d.GetString() : null));
+                return !string.IsNullOrWhiteSpace(content);
+            }
+
+            if (lower is "result" or "workflow.result")
+            {
+                eventType = "result";
+                if (data.TryGetProperty("result", out var res) && res.ValueKind == JsonValueKind.String)
+                {
+                    content = res.GetString();
+                }
+                else if (data.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String)
+                {
+                    content = c.GetString();
+                }
+                return true;
+            }
+
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string FormatToolCallSummary(string? toolName, string? toolArgsJson)
+    {
+        if (string.IsNullOrWhiteSpace(toolName)) return "Calling tool...";
+        if (string.IsNullOrWhiteSpace(toolArgsJson)) return $"Calling {toolName}...";
+
+        try
+        {
+            using var doc = JsonDocument.Parse(toolArgsJson);
+            var root = doc.RootElement;
+            if (string.Equals(toolName, "shell", StringComparison.OrdinalIgnoreCase) && root.TryGetProperty("command", out var cmd))
+            {
+                return $"Running shell: {cmd.GetString()}";
+            }
+            if (string.Equals(toolName, "read", StringComparison.OrdinalIgnoreCase) && (root.TryGetProperty("path", out var rPath) || root.TryGetProperty("file", out rPath)))
+            {
+                return $"Reading file: {rPath.GetString()}";
+            }
+            if (string.Equals(toolName, "write", StringComparison.OrdinalIgnoreCase) && (root.TryGetProperty("path", out var wPath) || root.TryGetProperty("file", out wPath)))
+            {
+                return $"Writing file: {wPath.GetString()}";
+            }
+        }
+        catch { }
+
+        return $"Calling {toolName}...";
+    }
+
+    private static string TruncateLine(string? input, int maxLen)
+    {
+        if (string.IsNullOrEmpty(input)) return string.Empty;
+        var clean = Regex.Replace(input, @"\s+", " ").Trim();
+        return clean.Length <= maxLen ? clean : clean[..Math.Max(0, maxLen - 3)] + "...";
+    }
+
+    private static string BuildPayloadJson(PromptReceivedEvent promptEvent, string? copilotSessionId, string? terminalUsageJson)
+    {
+        JsonElement? usageElem = null;
+        if (!string.IsNullOrWhiteSpace(terminalUsageJson))
+        {
+            try
+            {
+                using var uDoc = JsonDocument.Parse(terminalUsageJson);
+                usageElem = uDoc.RootElement.Clone();
+            }
+            catch { }
+        }
+
+        if (usageElem.HasValue)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                model = promptEvent.Model ?? "gpt-4o",
+                tier = promptEvent.Tier,
+                mode = promptEvent.Mode,
+                contextSize = promptEvent.ContextSize,
+                conversationId = copilotSessionId,
+                usage = usageElem.Value
+            });
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            model = promptEvent.Model ?? "gpt-4o",
+            tier = promptEvent.Tier,
+            mode = promptEvent.Mode,
+            contextSize = promptEvent.ContextSize,
+            conversationId = copilotSessionId
         });
     }
 }
