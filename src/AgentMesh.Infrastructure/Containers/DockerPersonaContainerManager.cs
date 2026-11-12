@@ -1795,30 +1795,45 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
         if (_activeAuthSessions.TryGetValue(normPersonaId, out var session))
         {
+            if (session.IsDisposed)
+            {
+                return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
+            }
+
+            await session.Lock.WaitAsync(ct);
             try
             {
+                if (session.IsDisposed)
+                {
+                    return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
+                }
+
                 if (!string.IsNullOrWhiteSpace(code) && !info.DriverId.StartsWith("copilot") && info.AdapterType != "copilot")
                 {
                     await session.Writer.WriteLineAsync(code.Trim());
                     await session.Writer.FlushAsync();
                 }
 
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
                 try
                 {
-                    await session.Process.WaitForExitAsync(linkedCts.Token);
+                    if (!session.SafeHasExited)
+                    {
+                        await session.Process.WaitForExitAsync(linkedCts.Token);
+                    }
                 }
                 catch (OperationCanceledException) { }
+                catch (InvalidOperationException) { }
 
                 await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
 
                 if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
                 {
-                    var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || test -n \"$GH_TOKEN\" || test -n \"$GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
-                    if (cpExit == 0 || (session.Process.HasExited && session.Process.ExitCode == 0))
+                    var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
+                    if (cpExit == 0 || (session.SafeHasExited && session.SafeExitCode == 0))
                     {
-                        var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -o '\"token\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
+                        var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
                         if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
                         {
                             try
@@ -1852,7 +1867,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     }
                 }
 
-                if (!session.Process.HasExited)
+                if (!session.SafeHasExited)
                 {
                     return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
                 }
@@ -1887,20 +1902,30 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                     return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials!");
                 }
 
-                if (session.Process.ExitCode == 0)
+                if (session.SafeExitCode == 0)
                 {
+                    _activeAuthSessions.TryRemove(normPersonaId, out _);
+                    await session.DisposeAsync();
                     return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication completed successfully!");
                 }
 
+                _activeAuthSessions.TryRemove(normPersonaId, out _);
+                await session.DisposeAsync();
                 return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: "Authorization code was submitted, but authentication could not be verified.");
+            }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is ObjectDisposedException)
+            {
+                return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
             }
             catch (Exception ex)
             {
+                _activeAuthSessions.TryRemove(normPersonaId, out _);
+                await session.DisposeAsync();
                 return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: ex.Message);
             }
             finally
             {
-                await session.DisposeAsync();
+                try { session.Lock.Release(); } catch { }
             }
         }
 
@@ -2632,24 +2657,44 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
     private sealed class ActiveAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null) : IAsyncDisposable
     {
+        private bool _disposed;
         public Process Process { get; } = process;
         public StreamWriter Writer { get; } = writer;
         public Task ReaderTask { get; } = readerTask;
         public string AuthUrl { get; } = authUrl;
         public string? UserCode { get; } = userCode;
+        public SemaphoreSlim Lock { get; } = new(1, 1);
+        public bool IsDisposed => _disposed;
+
+        public bool SafeHasExited
+        {
+            get
+            {
+                if (_disposed) return true;
+                try { return Process.HasExited; }
+                catch { return true; }
+            }
+        }
+
+        public int? SafeExitCode
+        {
+            get
+            {
+                if (_disposed) return null;
+                try { return Process.ExitCode; }
+                catch { return null; }
+            }
+        }
 
         public async ValueTask DisposeAsync()
         {
-            try
-            {
-                if (!Process.HasExited)
-                {
-                    Process.Kill(true);
-                }
-            }
-            catch { }
+            if (_disposed) return;
+            _disposed = true;
+            try { if (!SafeHasExited) Process.Kill(true); } catch { }
             try { Writer.Dispose(); } catch { }
             try { Process.Dispose(); } catch { }
+            try { Lock.Dispose(); } catch { }
+            await ValueTask.CompletedTask;
         }
     }
 }
