@@ -1435,6 +1435,23 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             }
             else if (driverId.StartsWith("copilot") || adapterType == "copilot")
             {
+                var (mExit, mOut, _) = await ExecInContainerAsync(
+                    normPersonaId,
+                    "COPILOT_TOKEN=$(cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}') || echo \"$COPILOT_GITHUB_TOKEN\"); [ -n \"$COPILOT_TOKEN\" ] && curl -s -m 10 -H \"Authorization: Bearer $COPILOT_TOKEN\" -H \"Editor-Version: vscode/1.95.0\" -H \"User-Agent: GitHubCopilotChat/0.22.0\" -H \"Copilot-Integration-Id: vscode-chat\" https://api.githubcopilot.com/models",
+                    ct);
+                if (mExit == 0 && !string.IsNullOrWhiteSpace(mOut) && mOut.Contains("\"data\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    var modelList = ParseModelsFromBody(mOut);
+                    if (modelList != null && modelList.Count > 0)
+                    {
+                        var sample = string.Join(", ", modelList.Take(5));
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Model Catalog Discovery",
+                            "success",
+                            $"Copilot API returned {modelList.Count} model(s): {sample}"));
+                    }
+                }
+
                 var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(normPersonaId, "timeout 15 copilot -p \"hello\" --allow-all 2>&1", ct);
                 if (dryExit == 0)
                 {

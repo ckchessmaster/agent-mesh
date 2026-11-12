@@ -20,7 +20,7 @@ namespace AgentMesh.Cli.Adapters;
 /// </para>
 /// <para>
 /// Deliberately an opt-in marker rather than a member of <see cref="IAgentAdapter"/>: adapters
-/// with no discovery surface (<c>claude</c>, <c>copilot</c>, <c>generic</c>) must not be pushed
+/// with no discovery surface (<c>claude</c>, <c>generic</c>) must not be pushed
 /// into inventing an answer to satisfy an interface. They return no declaration and the API keeps
 /// doing what it does today for them.
 /// </para>

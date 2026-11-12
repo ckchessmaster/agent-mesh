@@ -9,8 +9,17 @@ namespace AgentMesh.Tests.Services;
 /// Capability resolution per driver: what gets probed, what gets cached, and what must never be
 /// invented when a provider cannot be read.
 /// </summary>
-public class DriverCapabilityProbeTests
+public class DriverCapabilityProbeTests : IDisposable
 {
+    public DriverCapabilityProbeTests()
+    {
+        ModelContextLimits.ClearLearnedLimits();
+    }
+
+    public void Dispose()
+    {
+        ModelContextLimits.ClearLearnedLimits();
+    }
     private const string SampleAgyModels = """
         Fetching available models...
         gemini-4-argon-low      Gemini 4 Argon (low)
@@ -27,14 +36,16 @@ public class DriverCapabilityProbeTests
         Func<string, string?, CancellationToken, Task<IReadOnlyList<string>?>>? lister = null,
         TimeSpan? ttl = null,
         TimeSpan? negativeTtl = null,
-        int maxConcurrent = 2)
+        int maxConcurrent = 2,
+        Func<string, CancellationToken, Task<string?>>? copilotLister = null)
         => new(
             () => ttl ?? TimeSpan.FromMinutes(10),
             () => negativeTtl ?? TimeSpan.FromMinutes(2),
             executableResolver ?? (() => "/usr/local/bin/agy"),
             cliRunner ?? ((_, _, _, _) => Task.FromResult<string?>(SampleAgyModels)),
             lister,
-            maxConcurrent);
+            maxConcurrent,
+            copilotLister);
 
     private static DriverCapabilityProbeRequest Agy(
         string id = "agy",
@@ -42,6 +53,14 @@ public class DriverCapabilityProbeTests
         DriverCapabilityDeclaration? declared = null)
         => new(DriverId: id, RuntimeType: RuntimeType.CliAgy, Adapter: "agy", Endpoint: null,
             ForceRefresh: refresh, Declared: declared);
+
+    private static DriverCapabilityProbeRequest Copilot(
+        string id = "copilot",
+        string? oauthToken = null,
+        bool refresh = false,
+        DriverCapabilityDeclaration? declared = null)
+        => new(DriverId: id, RuntimeType: RuntimeType.CliAgy, Adapter: "copilot", Endpoint: null,
+            OAuthToken: oauthToken, ForceRefresh: refresh, Declared: declared);
 
     private static DriverCapabilityProbeRequest OpenAi(
         string id = "openai",
@@ -1368,4 +1387,101 @@ public class DriverCapabilityProbeTests
         req.LearnedContextLimits.Should().ContainKey("private-model").WhoseValue.Should().Be(524_288);
     }
 
+    [Fact]
+    public async Task Copilot_WhenUnauthenticated_ReturnsStaticPreset()
+    {
+        var reading = await Probe().ProbeAsync(Copilot(oauthToken: null));
+
+        reading.Should().NotBeNull();
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.StaticPreset);
+        reading.Models.Select(m => m.Id).Should().Contain(new[] { "auto", "claude-3.7-sonnet", "gpt-4o" });
+        reading.SupportsContextSelection.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Copilot_WhenAuthenticatedAndModelsReturned_ReturnsProbedModels()
+    {
+        const string copilotModelsJson = """
+            {
+              "data": [
+                {
+                  "id": "claude-3.7-sonnet",
+                  "name": "Claude 3.7 Sonnet",
+                  "capabilities": {
+                    "limits": {
+                      "max_context_window_tokens": 200000
+                    }
+                  }
+                },
+                {
+                  "id": "o1",
+                  "name": "OpenAI o1",
+                  "capabilities": {
+                    "limits": {
+                      "max_context_window_tokens": 128000
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        var probe = Probe(copilotLister: (tok, _) => Task.FromResult<string?>(copilotModelsJson));
+        var reading = await probe.ProbeAsync(Copilot(oauthToken: "gho_test_token"));
+
+        reading.Should().NotBeNull();
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.Probed);
+        reading.Models.Select(m => m.Id).Should().Equal("auto", "claude-3.7-sonnet", "o1");
+        reading.SupportsContextSelection.Should().BeTrue();
+        reading.Models.First(m => m.Id == "claude-3.7-sonnet").Name.Should().Be("Claude 3.7 Sonnet");
+    }
+
+    [Fact]
+    public async Task Copilot_WhenModelDiscoveryFails_FallsBackToStaticPreset()
+    {
+        var probe = Probe(copilotLister: (tok, _) => Task.FromResult<string?>(null));
+        var reading = await probe.ProbeAsync(Copilot(oauthToken: "invalid_token"));
+
+        reading.Should().NotBeNull();
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.StaticPreset);
+        reading.Models.Select(m => m.Id).Should().Contain("auto");
+    }
+
+    [Fact]
+    public void Copilot_BuildCacheKey_SeparatesDriversWithDifferentIds()
+    {
+        var key1 = DriverCapabilityProbe.BuildCacheKey(DriverAdapters.Copilot, Copilot("copilot-dev"));
+        var key2 = DriverCapabilityProbe.BuildCacheKey(DriverAdapters.Copilot, Copilot("copilot-prod"));
+
+        key1.Should().Be("copilot:copilot-dev");
+        key2.Should().Be("copilot:copilot-prod");
+    }
+
+    [Fact]
+    public void DriverModelDiscovery_ParseCopilotModels_HandlesCapabilitiesLimits()
+    {
+        const string json = """
+            {
+              "data": [
+                {
+                  "id": "o3-mini",
+                  "name": "OpenAI o3-mini",
+                  "capabilities": {
+                    "limits": {
+                      "max_context_window_tokens": 200000,
+                      "max_prompt_tokens": 100000
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        var models = DriverModelDiscovery.ParseCopilotModels(json);
+        models.Should().HaveCount(2); // auto prepended + o3-mini
+        models[0].Id.Should().Be("auto");
+        models[1].Id.Should().Be("o3-mini");
+        models[1].Name.Should().Be("OpenAI o3-mini");
+        models[1].ContextSizes.Should().Equal("default", "long_context", "128k", "200k", "1m");
+    }
 }

@@ -41,6 +41,8 @@ public sealed class DriverCapabilityDescriberTests : IDisposable
     private readonly Func<string, IReadOnlyList<string>, TimeSpan, CancellationToken, Task<(int ExitCode, string StdOut, string StdErr)>> _originalAgyRunner;
     private readonly Func<string, string?, CancellationToken, Task<(int StatusCode, string Body, string? Error)>> _originalLister;
     private readonly Func<string, string?> _originalResolver;
+    private readonly Func<AgentPresetConfig, string?> _originalCopilotTokenResolver;
+    private readonly Func<string, CancellationToken, Task<string?>> _originalCopilotTokenExchanger;
 
     public DriverCapabilityDescriberTests()
     {
@@ -49,6 +51,8 @@ public sealed class DriverCapabilityDescriberTests : IDisposable
         _originalAgyRunner = DriverCapabilityDescriber.AgyModelsRunner;
         _originalLister = DriverCapabilityDescriber.ModelsEndpointReader;
         _originalResolver = DriverCapabilityDescriber.AgyExecutableResolver;
+        _originalCopilotTokenResolver = DriverCapabilityDescriber.CopilotTokenResolver;
+        _originalCopilotTokenExchanger = DriverCapabilityDescriber.CopilotTokenExchanger;
     }
 
     public void Dispose()
@@ -56,6 +60,8 @@ public sealed class DriverCapabilityDescriberTests : IDisposable
         DriverCapabilityDescriber.AgyModelsRunner = _originalAgyRunner;
         DriverCapabilityDescriber.ModelsEndpointReader = _originalLister;
         DriverCapabilityDescriber.AgyExecutableResolver = _originalResolver;
+        DriverCapabilityDescriber.CopilotTokenResolver = _originalCopilotTokenResolver;
+        DriverCapabilityDescriber.CopilotTokenExchanger = _originalCopilotTokenExchanger;
     }
 
     /// <summary>
@@ -649,14 +655,93 @@ public sealed class DriverCapabilityDescriberTests : IDisposable
     }
 
     [Fact]
-    public void Describers_OnlyAgyAndOpenAiOptIn()
+    public void Describers_AgyOpenAiAndCopilotOptIn()
     {
-        // Adapters with no discovery surface must not be pushed into inventing an answer to satisfy
-        // an interface. They declare nothing and the API keeps doing what it does today for them.
         AgentAdapterFactory.Create(Preset("agy")).Should().BeAssignableTo<IDescribesOwnCapabilities>();
         AgentAdapterFactory.Create(Preset("openai", "http://h/v1")).Should().BeAssignableTo<IDescribesOwnCapabilities>();
+        AgentAdapterFactory.Create(Preset("copilot")).Should().BeAssignableTo<IDescribesOwnCapabilities>();
         AgentAdapterFactory.Create(Preset("claude")).Should().NotBeAssignableTo<IDescribesOwnCapabilities>();
-        AgentAdapterFactory.Create(Preset("copilot")).Should().NotBeAssignableTo<IDescribesOwnCapabilities>();
         AgentAdapterFactory.Create(Preset("generic")).Should().NotBeAssignableTo<IDescribesOwnCapabilities>();
+    }
+
+    [Fact]
+    public async Task Copilot_WhenUnauthenticated_ReturnsUnavailableReason()
+    {
+        DriverCapabilityDescriber.CopilotTokenResolver = _ => null;
+
+        var decl = await DriverCapabilityDescriber.DescribeCopilotAsync(Preset("copilot"));
+
+        decl.Adapter.Should().Be("copilot");
+        decl.Models.Should().BeEmpty();
+        decl.UnavailableReason.Should().Contain("not authenticated");
+    }
+
+    [Fact]
+    public async Task Copilot_WhenAuthenticated_ReturnsDiscoveredModels()
+    {
+        DriverCapabilityDescriber.CopilotTokenResolver = _ => "test-token";
+        DriverCapabilityDescriber.ModelsEndpointReader = (url, token, _) =>
+        {
+            url.Should().Be("https://api.githubcopilot.com/models");
+            token.Should().Be("test-token");
+            return Task.FromResult((200, """
+                {
+                  "data": [
+                    { "id": "claude-3.7-sonnet", "name": "Claude 3.7 Sonnet" }
+                  ]
+                }
+                """, (string?)null));
+        };
+
+        var decl = await DriverCapabilityDescriber.DescribeCopilotAsync(Preset("copilot"));
+
+        decl.Adapter.Should().Be("copilot");
+        decl.Models.Select(m => m.Id).Should().Equal("auto", "claude-3.7-sonnet");
+        decl.Source.Should().Be("copilot-models-api");
+        decl.SupportsContextSelection.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Copilot_WhenDirectCallFails_PerformsTokenExchange()
+    {
+        DriverCapabilityDescriber.CopilotTokenResolver = _ => "github-pat";
+        DriverCapabilityDescriber.CopilotTokenExchanger = (tok, _) => Task.FromResult<string?>("exchanged-session-tok");
+        DriverCapabilityDescriber.ModelsEndpointReader = (url, token, _) =>
+        {
+            if (token == "github-pat")
+            {
+                return Task.FromResult((401, string.Empty, (string?)"Unauthorized"));
+            }
+            if (token == "exchanged-session-tok")
+            {
+                return Task.FromResult((200, """
+                    {
+                      "data": [
+                        { "id": "gpt-4o", "name": "GPT-4o" }
+                      ]
+                    }
+                    """, (string?)null));
+            }
+            return Task.FromResult((400, string.Empty, (string?)"Bad request"));
+        };
+
+        var decl = await DriverCapabilityDescriber.DescribeCopilotAsync(Preset("copilot"));
+
+        decl.Adapter.Should().Be("copilot");
+        decl.Models.Select(m => m.Id).Should().Equal("auto", "gpt-4o");
+        decl.Source.Should().Be("copilot-models-api");
+    }
+
+    [Fact]
+    public async Task Copilot_WhenTokenExchangeFails_ReturnsUnavailable()
+    {
+        DriverCapabilityDescriber.CopilotTokenResolver = _ => "github-pat";
+        DriverCapabilityDescriber.CopilotTokenExchanger = (_, _) => Task.FromResult<string?>(null);
+        DriverCapabilityDescriber.ModelsEndpointReader = (_, _, _) => Task.FromResult((401, string.Empty, (string?)"Unauthorized"));
+
+        var decl = await DriverCapabilityDescriber.DescribeCopilotAsync(Preset("copilot"));
+
+        decl.Models.Should().BeEmpty();
+        decl.UnavailableReason.Should().Contain("authentication failed");
     }
 }
