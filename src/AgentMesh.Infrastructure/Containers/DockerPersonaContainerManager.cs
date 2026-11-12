@@ -1611,16 +1611,12 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
         else if (driverId.StartsWith("copilot") || adapterType == "copilot")
         {
-            psi.ArgumentList.Add("env");
-            psi.ArgumentList.Add("-u");
-            psi.ArgumentList.Add("GITHUB_TOKEN");
-            psi.ArgumentList.Add("-u");
-            psi.ArgumentList.Add("GH_TOKEN");
-            psi.ArgumentList.Add("-u");
-            psi.ArgumentList.Add("COPILOT_GITHUB_TOKEN");
-            psi.ArgumentList.Add("copilot");
-            psi.ArgumentList.Add("login");
-            psi.ArgumentList.Add("--device-code");
+            psi.ArgumentList.Add("script");
+            psi.ArgumentList.Add("-q");
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("copilot login --device-code");
+            psi.ArgumentList.Add("/dev/null");
         }
         else
         {
@@ -1635,12 +1631,12 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         string? capturedUserCode = null;
         var errBuilder = new StringBuilder();
 
-        void ParseLine(string line)
+        void CheckPlaintextPrompt(string text)
         {
-            if (line.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
-                line.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
-                line.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
-                line.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+            if (text.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("Store token", StringComparison.OrdinalIgnoreCase))
             {
                 try
                 {
@@ -1649,6 +1645,11 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 }
                 catch { }
             }
+        }
+
+        void ParseLine(string line)
+        {
+            CheckPlaintextPrompt(line);
 
             var match = Regex.Match(line, @"https?://[^\s""'>]+");
             if (match.Success && capturedUrl == null)
@@ -1679,10 +1680,30 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         {
             try
             {
-                string? line;
-                while ((line = await proc.StandardOutput.ReadLineAsync()) != null)
+                var buf = new char[1024];
+                int read;
+                var lineBuffer = new StringBuilder();
+                while ((read = await proc.StandardOutput.ReadAsync(buf, 0, buf.Length)) > 0)
                 {
-                    ParseLine(line);
+                    var chunk = new string(buf, 0, read);
+                    CheckPlaintextPrompt(chunk);
+                    lineBuffer.Append(chunk);
+                    var content = lineBuffer.ToString();
+                    var lastNewline = content.LastIndexOf('\n');
+                    if (lastNewline >= 0)
+                    {
+                        var completeLines = content.Substring(0, lastNewline);
+                        foreach (var line in completeLines.Split('\n'))
+                        {
+                            ParseLine(line.TrimEnd('\r'));
+                        }
+                        lineBuffer.Clear();
+                        lineBuffer.Append(content.Substring(lastNewline + 1));
+                    }
+                    else
+                    {
+                        ParseLine(content);
+                    }
                 }
 
                 await Task.Delay(1000);
