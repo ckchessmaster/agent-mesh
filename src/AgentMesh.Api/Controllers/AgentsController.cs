@@ -730,9 +730,9 @@ public class AgentsController(
         var hostBinPath = FindHostBinary(cliBin);
         if (hostBinPath != null || !string.IsNullOrWhiteSpace(loginCmd))
         {
-            if (_activeHostAuthSessions.TryGetValue(normalizedId, out var existing) && !existing.Process.HasExited)
+            if (_activeHostAuthSessions.TryGetValue(normalizedId, out var existing))
             {
-                if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
+                if (!existing.SafeHasExited && !string.IsNullOrWhiteSpace(existing.AuthUrl))
                 {
                     return Ok(new PersonaAuthStartResult(
                         normalizedId,
@@ -921,8 +921,31 @@ public class AgentsController(
 
         if (_activeHostAuthSessions.TryGetValue(normalizedId, out var session))
         {
+            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var driverToken = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{agent.Id}.oauth");
+            var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
+
+            if (session.IsDisposed)
+            {
+                if (System.IO.File.Exists(driverToken) || System.IO.File.Exists(copilotConfig) || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                {
+                    return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed models!"));
+                }
+                return Ok(new PersonaAuthSubmitResult(normalizedId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again."));
+            }
+
+            await session.Lock.WaitAsync(ct);
             try
             {
+                if (session.IsDisposed)
+                {
+                    if (System.IO.File.Exists(driverToken) || System.IO.File.Exists(copilotConfig) || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                    {
+                        return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed models!"));
+                    }
+                    return Ok(new PersonaAuthSubmitResult(normalizedId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again."));
+                }
+
                 if (!string.IsNullOrWhiteSpace(req.Code) && adapter != DriverAdapters.Copilot)
                 {
                     try
@@ -933,15 +956,18 @@ public class AgentsController(
                     catch { }
                 }
 
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
                 try
                 {
-                    await session.Process.WaitForExitAsync(linkedCts.Token);
+                    if (!session.SafeHasExited)
+                    {
+                        await session.Process.WaitForExitAsync(linkedCts.Token);
+                    }
                 }
                 catch (OperationCanceledException) { }
+                catch (InvalidOperationException) { }
 
-                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 var candidateTokens = new List<string>();
                 if (!string.IsNullOrWhiteSpace(session.TempHome))
                 {
@@ -950,7 +976,6 @@ public class AgentsController(
                 candidateTokens.Add(Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
 
                 // For GitHub Copilot: check ~/.copilot/config.json and ~/.config/github-copilot
-                var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
                 var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
                 var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
                 if (System.IO.File.Exists(copilotConfig) || System.IO.File.Exists(copilotHosts) || System.IO.File.Exists(copilotApps))
@@ -1030,15 +1055,16 @@ public class AgentsController(
                     }
                 }
 
-                if (session.Process.HasExited && session.Process.ExitCode == 0)
+                if (session.SafeHasExited && session.SafeExitCode == 0)
                 {
+                    await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
                     await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
                     _activeHostAuthSessions.TryRemove(normalizedId, out _);
                     await session.DisposeAsync();
                     return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Driver authentication completed successfully!"));
                 }
 
-                if (!session.Process.HasExited)
+                if (!session.SafeHasExited)
                 {
                     return Ok(new PersonaAuthSubmitResult(normalizedId, "waiting", "Authorization is still pending in browser. Once you approve on GitHub, click again."));
                 }
@@ -1047,9 +1073,21 @@ public class AgentsController(
                 await session.DisposeAsync();
                 return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: "Authentication process exited before completing."));
             }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is ObjectDisposedException)
+            {
+                if (System.IO.File.Exists(driverToken) || System.IO.File.Exists(copilotConfig) || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                {
+                    return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed models!"));
+                }
+                return Ok(new PersonaAuthSubmitResult(normalizedId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again."));
+            }
             catch (Exception ex)
             {
                 return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: ex.Message));
+            }
+            finally
+            {
+                try { session.Lock.Release(); } catch { }
             }
         }
 
@@ -1491,22 +1529,48 @@ public class AgentsController(
 
     private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null, string? tempHome = null) : IAsyncDisposable
     {
+        private bool _disposed;
         public Process Process { get; } = process;
         public StreamWriter Writer { get; } = writer;
         public Task ReaderTask { get; } = readerTask;
         public string AuthUrl { get; } = authUrl;
         public string? UserCode { get; } = userCode;
         public string? TempHome { get; } = tempHome;
+        public SemaphoreSlim Lock { get; } = new(1, 1);
+        public bool IsDisposed => _disposed;
+
+        public bool SafeHasExited
+        {
+            get
+            {
+                if (_disposed) return true;
+                try { return Process.HasExited; }
+                catch { return true; }
+            }
+        }
+
+        public int? SafeExitCode
+        {
+            get
+            {
+                if (_disposed) return null;
+                try { return Process.ExitCode; }
+                catch { return null; }
+            }
+        }
 
         public async ValueTask DisposeAsync()
         {
-            try { if (!Process.HasExited) Process.Kill(true); } catch { }
+            if (_disposed) return;
+            _disposed = true;
+            try { if (!SafeHasExited) Process.Kill(true); } catch { }
             try { Writer.Dispose(); } catch { }
             try { Process.Dispose(); } catch { }
             if (!string.IsNullOrWhiteSpace(TempHome))
             {
                 try { if (Directory.Exists(TempHome)) Directory.Delete(TempHome, recursive: true); } catch { }
             }
+            try { Lock.Dispose(); } catch { }
             await ValueTask.CompletedTask;
         }
     }

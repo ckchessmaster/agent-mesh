@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   X,
   Save,
@@ -119,6 +119,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [wizardApiKeySaving, setWizardApiKeySaving] = useState(false);
   const [authSuccessMessage, setAuthSuccessMessage] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+  const pollInFlightRef = useRef(false);
 
   useEffect(() => {
     if (!showAuthWizard || authMode !== 'oauth' || !authStartResult?.userCode) {
@@ -127,6 +128,8 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
 
     let isMounted = true;
     const interval = setInterval(async () => {
+      if (pollInFlightRef.current || authSubmitting) return;
+      pollInFlightRef.current = true;
       try {
         const res = await api.submitDriverAuthCode(agent.id, authStartResult.userCode || '');
         if (!isMounted) return;
@@ -139,6 +142,8 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
         }
       } catch {
         // Silently keep waiting during background device polling
+      } finally {
+        pollInFlightRef.current = false;
       }
     }, 3000);
 
@@ -146,7 +151,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       isMounted = false;
       clearInterval(interval);
     };
-  }, [showAuthWizard, authMode, authStartResult?.userCode, agent.id]);
+  }, [showAuthWizard, authMode, authStartResult?.userCode, agent.id, authSubmitting]);
 
   const handleVerifyDriver = async () => {
     try {
@@ -206,6 +211,8 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
 
   const handleSubmitDriverAuthCode = async () => {
     if (!authStartResult?.userCode && !authCodeInput.trim()) return;
+    if (pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
     try {
       setAuthSubmitting(true);
       setError(null);
@@ -231,6 +238,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
     } catch (err: any) {
       setError(err?.message || 'Failed to submit authorization code.');
     } finally {
+      pollInFlightRef.current = false;
       setAuthSubmitting(false);
     }
   };
