@@ -106,9 +106,21 @@ public record GitHubMergeRequest(
 /// so the caller can tell a fresh merge from an idempotent replay without parsing the message.
 /// </param>
 /// <param name="FailureReason">
-/// Machine-readable cause (<c>no_credentials</c>, <c>not_found</c>, <c>not_mergeable</c>,
-/// <c>sha_mismatch</c>, <c>api_error</c>) so the workflow can distinguish "the reviewer changed the
-/// PR and it now conflicts" from "GitHub was briefly unreachable".
+/// Machine-readable cause (<c>no_credentials</c>, <c>not_found</c>, <c>pr_closed</c>,
+/// <c>merge_conflict</c>, <c>sha_moved</c>, <c>not_mergeable</c>, <c>api_error</c>) so the workflow can
+/// distinguish "the reviewer changed the PR", "the branch now conflicts with main" and "GitHub was
+/// briefly unreachable". The three route differently: a conflict is work an agent can do, a moved head
+/// invalidates an approval, and an API error is a retry.
+/// <para>
+/// <strong>Why <c>merge_conflict</c> and <c>sha_moved</c> are separate codes.</strong> GitHub answers
+/// both with HTTP 409, and the previous single <c>sha_mismatch</c> code conflated them — its own message
+/// admitted it ("the head commit changed since the reviewed state, <em>or the branch now conflicts with
+/// the base</em>"). They need opposite handling under the job-level review loop: a conflict means "merge
+/// main into the branch and resolve it", which is a task; a moved head means the code the reviewer
+/// signed off is gone, which must go back to a human, because auto-generating a task for it would merge
+/// unreviewed work. A conflated code makes the orchestrator guess, and either guess is wrong half the
+/// time.
+/// </para>
 /// </param>
 public record GitHubMergeResult(
     bool Success,
@@ -500,6 +512,12 @@ public partial class GitHubPullRequestService(
 
         var (state, headSha, mergedSha) = TryReadPullRequestState(getBody);
 
+        // Read the mergeability fields in the same pass over the body we already hold. GitHub computes
+        // them asynchronously, so `mergeable` can be null while it works; a null therefore means "the
+        // pre-read settled nothing", and the 409 classifier below falls back to other facts rather than
+        // treating unknown as clean.
+        var (preReadMergeable, preReadMergeableState) = TryReadMergeability(getBody);
+
         if (string.Equals(state, "merged", StringComparison.OrdinalIgnoreCase))
         {
             logger.LogInformation(
@@ -579,15 +597,104 @@ public partial class GitHubPullRequestService(
                 MergeCommitSha: commitSha);
         }
 
-        // 409 with a sha we sent means the head moved after approval — the guard doing its job, not a
-        // transient error. Naming it separately stops the workflow's retry policy from hammering a
-        // merge that will never succeed without a fresh review.
+        // A 409 is not one condition, and the review loop routes its two halves in opposite
+        // directions, so classify it from facts we can establish rather than returning one code for
+        // both. The previous `sha_mismatch` conflated them and its own message said so ("the head
+        // commit changed since the reviewed state, or the branch now conflicts with the base").
+        //
+        //   head moved after approval  -> `sha_moved`      -> a human must re-review. Auto-generating
+        //                                                  work here would merge code nobody signed off.
+        //   branch behind/conflicting  -> `merge_conflict` -> an agent can fix it: merge main into the
+        //                                                  branch. Fed back as a task, like a comment.
         if (mergeResponse.StatusCode == System.Net.HttpStatusCode.Conflict)
         {
-            return MergeFailure("sha_mismatch",
-                $"GitHub refused to merge pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}: " +
-                "the head commit changed since the reviewed state, or the branch now conflicts with the base. " +
-                "A re-review is required.", mergeBody, token);
+            var approvedSha = request.Sha?.Trim();
+            var pr = prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            // Provable first, GitHub's prose second: an approval-SHA that no longer matches the head we
+            // just read is unambiguous, and it outranks a conflict because the approval is already void.
+            // Written as nested conditions rather than one hoisted boolean so the compiler keeps the
+            // non-null narrowing for both SHAs inside the message.
+            if (!string.IsNullOrWhiteSpace(approvedSha) && !string.IsNullOrWhiteSpace(headSha) &&
+                !string.Equals(approvedSha, headSha, StringComparison.OrdinalIgnoreCase))
+            {
+                return MergeFailure("sha_moved",
+                    $"Pull request #{pr} head is {Truncate(headSha, 12)}, not the approved {Truncate(approvedSha, 12)}: " +
+                    "the author pushed after the review, so the approval no longer covers what is on the " +
+                    "branch. A re-review is required.", mergeBody, token);
+            }
+
+            // `dirty` = conflicting files, `behind` = no conflicts but the base has moved. Both are
+            // agent-fixable by the same action (merge the base in), and `behind` arrives with
+            // `mergeable: true`, so a mergeable-only check would misroute the commonest case — a PR
+            // whose approval is perfectly intact and which merely needs main merged into it — to a
+            // human re-review that has nothing new to review.
+            //
+            // `blocked` is deliberately absent: under branch protection it usually means failing
+            // required checks or a missing approving review, which merging main does not fix, and
+            // `unknown`/null means GitHub is still computing.
+            var needsBaseMerge = preReadMergeableState is "dirty" or "behind";
+            var conflicts = preReadMergeable == false || needsBaseMerge;
+
+            if (conflicts)
+            {
+                var remedy = string.Equals(preReadMergeableState, "behind", StringComparison.OrdinalIgnoreCase)
+                    ? "the base branch has moved ahead of it: merge the current base into the head branch, " +
+                      "then request a re-review of the resulting head"
+                    : "files conflict with the base branch: merge the current base into the head branch, " +
+                      "resolve the conflicts, then request a re-review";
+
+                return MergeFailure("merge_conflict",
+                    $"Pull request #{pr} cannot merge because {remedy} (GitHub reports " +
+                    $"'{preReadMergeableState ?? "not mergeable"}').", mergeBody, token);
+            }
+
+            // The pre-read settled nothing (mergeable is null while GitHub recomputes, or the body was
+            // unreadable), so fall back to what GitHub actually said. Its two 409 shapes are distinct
+            // prose and each names its own remedy, which is a better signal than inferring a cause from
+            // whether the caller happened to supply an approval SHA.
+            var saidOutOfDate = mergeBody.Contains("out of date", StringComparison.OrdinalIgnoreCase) ||
+                                mergeBody.Contains("conflict", StringComparison.OrdinalIgnoreCase);
+            var saidStaleSha = mergeBody.Contains("expected sha", StringComparison.OrdinalIgnoreCase) ||
+                               mergeBody.Contains("head commit", StringComparison.OrdinalIgnoreCase);
+
+            if (saidOutOfDate && !saidStaleSha)
+            {
+                return MergeFailure("merge_conflict",
+                    $"Pull request #{pr} is behind or conflicting with its base branch: merge the current " +
+                    "base into the head branch, resolve whatever it reports, then request a re-review.",
+                    mergeBody, token);
+            }
+
+            if (saidStaleSha && !saidOutOfDate)
+            {
+                return MergeFailure("sha_moved",
+                    $"GitHub refused to merge pull request #{pr}: the head commit no longer matches the " +
+                    "approved state. A re-review is required.", mergeBody, token);
+            }
+
+            // Nothing distinguishes the two, so refuse on the reading that cannot ship unreviewed code:
+            // when an approval SHA was in play, treat the refusal as a stale approval and send it back to
+            // the human. Guessing "conflict" instead would spend an agent turn merging main for a PR whose
+            // real problem is that nobody reviewed the current head.
+            if (!string.IsNullOrWhiteSpace(approvedSha))
+            {
+                return MergeFailure("sha_moved",
+                    $"GitHub refused to merge pull request #{pr} at the approved commit " +
+                    $"{Truncate(approvedSha, 12)} without naming a conflict: the head may have moved while " +
+                    "the merge was in flight. A re-review is required.", mergeBody, token);
+            }
+
+            // No approval SHA was supplied, so the SHA guard cannot have fired; the remaining causes of a
+            // 409 are conflicting files or a branch GitHub considers out of date against the base. Both
+            // are fixed by the same action, so naming it a conflict hands the orchestrator work it can
+            // dispatch, and the merge stays blocked until a reviewer signs off on the new head.
+            return MergeFailure("merge_conflict",
+                $"GitHub refused to merge pull request #{pr} because the head branch is not up to date " +
+                "with its base or conflicts with it: merge the current base into the head branch, " +
+                "resolve whatever it reports, then request a re-review. See the recorded GitHub " +
+                "response body for the offending paths.",
+                mergeBody, token);
         }
 
         if (mergeResponse.StatusCode == System.Net.HttpStatusCode.MethodNotAllowed)
@@ -651,6 +758,59 @@ public partial class GitHubPullRequestService(
         catch (JsonException)
         {
             return (null, null, null);
+        }
+    }
+
+    /// <summary>
+    /// Extracts <c>mergeable</c> and <c>mergeable_state</c> from a pull-request payload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// These two fields are how a 409 merge refusal is classified into "conflicts with base" (agent
+    /// work) versus "the approval went stale" (reviewer work), which the job-level review loop routes
+    /// differently.
+    /// </para>
+    /// <para>
+    /// <strong><c>mergeable: null</c> is genuinely tri-state and is preserved as null, not coerced to
+    /// true or false.</strong> GitHub computes mergeability asynchronously, so a freshly-pushed PR
+    /// answers <c>null</c> with <c>mergeable_state: "unknown"</c> or <c>"blocked"</c> while it works.
+    /// A null means only "the read settled nothing" — a PR reported <c>mergeable_state: "clean"</c> can
+    /// still be refused for branch-protection reasons, and a null with state "dirty" still proves a
+    /// conflict, so the caller must read both fields together. Treating null as false would refuse good
+    /// merges during GitHub's recompute window; treating it as true would misclassify conflicts as
+    /// generic API errors, which is the failure this classification exists to prevent.
+    /// </para>
+    /// </remarks>
+    internal static (bool? Mergeable, string? MergeableState) TryReadMergeability(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return (null, null);
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
+
+            bool? mergeable = null;
+            if (doc.RootElement.TryGetProperty("mergeable", out var m))
+            {
+                mergeable = m.ValueKind switch
+                {
+                    JsonValueKind.True => true,
+                    JsonValueKind.False => false,
+                    _ => null, // null, missing, or an unexpected shape: unsettled, not "clean"
+                };
+            }
+
+            var mergeableState = doc.RootElement.TryGetProperty("mergeable_state", out var ms) &&
+                                 ms.ValueKind == JsonValueKind.String
+                ? ms.GetString()
+                : null;
+
+            return (mergeable, mergeableState);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
         }
     }
 

@@ -969,26 +969,107 @@ public class GitHubPullRequestServiceTests
     }
 
     /// <summary>
-    /// A 409 on the merge is the SHA guard rejecting a moved head, not a transient fault.
+    /// A 409 on a merge is two different conditions wearing one status code, and the review loop routes
+    /// them in opposite directions — so the service must classify, not collapse.
     /// </summary>
     /// <remarks>
-    /// Naming it separately is what stops the workflow's retry policy from hammering a merge that will
-    /// never succeed without a fresh review.
+    /// <para>
+    /// <strong>The defect this replaces.</strong> One code (<c>sha_mismatch</c>) covered both "the author
+    /// pushed after the approval" and "the branch conflicts with main"; its own message admitted the
+    /// conflation by joining them with "or". Under the job-level review loop those need opposite
+    /// handling: a conflict or a stale base is <em>work an agent can do</em> (merge the base in), while a
+    /// moved head <em>invalidates a human approval</em> and must go back to a reviewer — auto-generating
+    /// a task for that would merge code nobody signed off. Guessing from one shared code is wrong half
+    /// the time, in the dangerous direction.
+    /// </para>
+    /// <para>
+    /// Classification is layered by trustworthiness: a supplied approval SHA that no longer matches the
+    /// head we just read is proof; <c>mergeable_state</c> is GitHub's own verdict; GitHub's prose is the
+    /// fallback; and an unresolvable 409 with an approval SHA in play fails closed to the reviewer, since
+    /// the alternative guess can ship unreviewed code.
+    /// </para>
     /// </remarks>
-    [Fact]
-    public async Task Merge_WhenHeadMovedAfterApproval_ReportsShaMismatch()
+    [Theory]
+    // Proof: the reviewed head is not the current head. The approval is void regardless of anything else.
+    [InlineData("""{"state":"open","head":{"sha":"zzz999"},"mergeable":true,"mergeable_state":"clean"}""", "aaa111", 409, """{"message":"Head SHA doesn't match the most recent branch"}""", "sha_moved")]
+    // GitHub says the files conflict. Agent work.
+    [InlineData("""{"state":"open","head":{"sha":"aaa111"},"mergeable":false,"mergeable_state":"dirty"}""", "aaa111", 409, """{"message":"Unknown"}""", "merge_conflict")]
+    // The base moved ahead: mergeable is TRUE here, so a mergeable-only check would misroute the single
+    // most common case — a perfectly good, approved PR that merely needs main merged into it.
+    [InlineData("""{"state":"open","head":{"sha":"aaa111"},"mergeable":true,"mergeable_state":"behind"}""", "aaa111", 409, """{"message":"Unknown"}""", "merge_conflict")]
+    // Pre-read still computing (mergeable null), so fall through to GitHub's prose: "out of date at
+    // commit" is the behind-base wording, and the supplied SHA still matches the head. Agent work.
+    [InlineData("""{"state":"open","head":{"sha":"aaa111"}}""", "aaa111", 409, """{"message":"Pull Request is out of date at commit"}""", "merge_conflict")]
+    // Same unsettled pre-read, opposite prose: a head-SHA guard refusal is reviewer work.
+    [InlineData("""{"state":"open","head":{"sha":"aaa111"}}""", "aaa111", 409, """{"message":"Expected sha \"bbb222\" but head commit is \"aaa111\""}""", "sha_moved")]
+    // Nothing to go on at all and no approval SHA: the least dangerous guess is agent work, because the
+    // merge stays blocked until a reviewer signs off on whatever the agent produces.
+    [InlineData("""{"state":"open","head":{"sha":"aaa111"}}""", null, 409, """{"message":"Validation Failed"}""", "merge_conflict")]
+    // Nothing to go on AND an approval SHA in play: fail closed to the human instead of spending an
+    // agent turn merging main onto a PR whose real problem is an unreviewed head.
+    [InlineData("""{"state":"open","head":{"sha":"aaa111"}}""", "aaa111", 409, """{"message":"Validation Failed"}""", "sha_moved")]
+    public async Task Merge_WhenRefusedWithConflict_ClassifiesIntoTheRightRemedy(
+        string preReadBody, string? approvedSha, int mergeStatus, string mergeBody, string expectedReason)
     {
         var handler = new StubHttpHandler()
-            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"aaa"}}""")
-            .Respond(HttpMethod.Put, MergePath, 409, """{"message":"Pull Request is out of date at commit"}""");
+            .Respond(HttpMethod.Get, ReadPath, 200, preReadBody)
+            .Respond(HttpMethod.Put, MergePath, mergeStatus, mergeBody);
 
         var result = await BuildService(TokenConfig(), handler: handler)
-            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl, Sha: "aaa"));
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl, Sha: approvedSha));
 
         result.Success.Should().BeFalse();
-        result.FailureReason.Should().Be("sha_mismatch");
-        result.Message.Should().Contain("re-review",
-            "the operator needs to know a fresh review is required, not that GitHub was briefly down");
+        result.FailureReason.Should().Be(expectedReason);
+
+        // Every classification must state the remedy, not just the failure: these messages reach both the
+        // job chat and the derived task text, where "could not merge" is not actionable.
+        result.Message.Should().NotBeNullOrWhiteSpace();
+        if (expectedReason == "merge_conflict")
+        {
+            result.Message.Should().Match("*base*",
+                "a conflict or stale base must name the fix — merge the current base in");
+        }
+        else
+        {
+            result.Message.Should().Contain("re-review",
+                "a stale approval must send the work back to a human, never to an agent");
+        }
+    }
+
+    [Fact]
+    public async Task Merge_ClassificationNeverTreatsAConflictAsATransientRetry()
+    {
+        // Retry hammering is the operational failure this split exists to prevent: a conflict never
+        // resolves itself, so a merge attempt that returns retryable would burn the activity's
+        // MaximumAttempts against a state GitHub will keep reporting identically.
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200,
+                """{"state":"open","head":{"sha":"aaa"},"mergeable":false,"mergeable_state":"dirty"}""")
+            .Respond(HttpMethod.Put, MergePath, 409, """{"message":"Conflicting files"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.FailureReason.Should().Be("merge_conflict");
+        // Only one merge attempt was made; retryable causes are the `api_error` branch's job.
+        handler.Requests.Count(r => r.Method == HttpMethod.Put).Should().Be(1);
+    }
+
+    [Theory]
+    [InlineData("""{"mergeable":false,"mergeable_state":"dirty"}""", false, "dirty")]
+    [InlineData("""{"mergeable":true,"mergeable_state":"behind"}""", true, "behind")]
+    // Tri-state preserved: null means "GitHub is still computing", and the caller must not read that as
+    // clean or as conflicting. Coercing it either way is the bug this pins.
+    [InlineData("""{"mergeable":null,"mergeable_state":"unknown"}""", null, "unknown")]
+    [InlineData("""{"state":"open"}""", null, null)]
+    [InlineData("not json at all", null, null)]
+    [InlineData(null, null, null)]
+    public void TryReadMergeability_PreservesTheTriStateAndNeverThrows(
+        string? json, bool? expectedMergeable, string? expectedState)
+    {
+        var (mergeable, state) = GitHubPullRequestService.TryReadMergeability(json);
+        mergeable.Should().Be(expectedMergeable);
+        state.Should().Be(expectedState);
     }
 
     [Fact]

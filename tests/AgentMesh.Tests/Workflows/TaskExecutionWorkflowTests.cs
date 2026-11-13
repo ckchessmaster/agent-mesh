@@ -1,4 +1,4 @@
-using AgentMesh.Core.Activities;
+﻿using AgentMesh.Core.Activities;
 using AgentMesh.Tests.Sandbox;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Worker.Workflows;
@@ -158,9 +158,12 @@ public class TaskExecutionWorkflowTests
     /// turn activity already gets, applied to the merge.
     /// </para>
     /// </remarks>
+    // `sha_moved` is the renamed `sha_mismatch`: the code now says what happened to the *approval*
+    // rather than to a hash, and it is one of two distinct 409 outcomes (the other being
+    // `merge_conflict`, which the job-level review loop turns into work instead of a re-review).
     [Theory]
     [InlineData("merge_conflict", "The head branch has conflicts with the base branch.")]
-    [InlineData("sha_mismatch", "The head moved after approval; re-review required.")]
+    [InlineData("sha_moved", "The head moved after approval; re-review required.")]
     [InlineData("not_mergeable", "GitHub reports this PR cannot be merged.")]
     public async Task Workflow_NonRetryableMergeRejection_HaltsWithReason(
         string errorType, string reason)
