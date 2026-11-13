@@ -229,9 +229,6 @@ public partial class GitHubPullRequestService(
     ILogger<GitHubPullRequestService> logger,
     Func<GitCommandRequest, CancellationToken, Task<GitCommandResult>>? gitRunner = null) : IGitHubPullRequestService
 {
-    /// <summary>The number handed back when there are no credentials to open a real PR with.</summary>
-    public const int SimulatedPrNumber = 999;
-
     public const string HttpClientName = "agentmesh-github";
 
     private const int DefaultPushTimeoutSeconds = 120;
@@ -327,25 +324,26 @@ public partial class GitHubPullRequestService(
 
         var (owner, repo) = ResolveRepository(request, options);
 
-        // No credentials and no target repository: this is the local-Aspire path. Say so plainly
-        // and do not touch git — a developer's working copy is not a job workspace, and pushing it
-        // would be a destructive surprise in exchange for a PR nobody asked GitHub for.
+        // Simulated PR #999 path is permanently retired: missing control-plane credentials return a real
+        // refusal directing the persona container to execute `agentmesh pr open` with its own credentials.
         if (string.IsNullOrWhiteSpace(token))
         {
             logger.LogWarning(
-                "open_pull_request running WITHOUT credentials: simulated PR #{PrNumber} for '{Branch}'. " +
-                "Set GitHub:Token (or a persona GitHub token) to open a real pull request.",
-                SimulatedPrNumber, headBranch);
+                "open_pull_request refused WITHOUT credentials for '{Branch}': simulated PRs are disabled. " +
+                "Run 'agentmesh pr open' in the persona container or configure GitHub:Token.",
+                headBranch);
 
             return new GitHubPullRequestResult(
-                Success: true,
-                PrNumber: SimulatedPrNumber,
-                PrUrl: $"https://github.com/{owner ?? "your-org"}/{repo ?? "your-repo"}/pull/{SimulatedPrNumber}",
+                Success: false,
+                PrNumber: null,
+                PrUrl: null,
                 HeadBranch: headBranch,
                 BaseBranch: baseBranch,
-                Message: $"Simulated PR #{SimulatedPrNumber} (no GitHub token configured, so nothing was pushed " +
-                         "and no review was requested). Configure GitHub:Token to open a real pull request.",
-                Simulated: true);
+                Message: "No GitHub token is configured on the control plane (simulated PRs are disabled). " +
+                         "Run `agentmesh pr open` inside your persona container (which holds your persona GitHub credentials) " +
+                         "to sync main, push the branch, create the real PR, and register its URL/number.",
+                Simulated: false,
+                FailureReason: "no_credentials");
         }
 
         if (owner is null || repo is null)

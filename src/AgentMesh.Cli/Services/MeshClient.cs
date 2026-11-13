@@ -157,6 +157,11 @@ public class MeshClient
                 ["maxRetries"] = preset.MaxRetries,
                 ["retryDelayMilliseconds"] = preset.RetryDelayMilliseconds,
                 ["maxSteps"] = preset.MaxSteps,
+                ["contextWindowTokens"] = preset.ContextWindowTokens,
+                ["defaultContextSize"] = preset.DefaultContextSize,
+                ["compactionThresholdPercent"] = preset.CompactionThresholdPercent,
+                ["streamChunkIdleTimeoutSeconds"] = preset.StreamChunkIdleTimeoutSeconds,
+                ["openAi"] = preset.OpenAi,
                 ["sidecar"] = preset.Sidecar,
                 ["capabilities"] = preset.Capabilities
             };
@@ -301,11 +306,11 @@ public class MeshClient
             using var upsertReq = CreateRequest(HttpMethod.Post, "api/agents", preset.Token ?? _config.MasterToken, preset.Id);
             upsertReq.Content = JsonContent.Create(registerPayload);
             using var upsertRes = await _http.SendAsync(upsertReq, ct);
-            upsertRes.EnsureSuccessStatusCode();
+            await EnsureSuccessWithBodySnippetAsync(upsertRes, "POST api/agents", ct);
         }
         else
         {
-            regRes.EnsureSuccessStatusCode();
+            await EnsureSuccessWithBodySnippetAsync(regRes, "POST api/agents/register", ct);
         }
 
         return preset.Token ?? _config.MasterToken;
@@ -367,7 +372,38 @@ public class MeshClient
         });
 
         using var res = await _http.SendAsync(req, ct);
-        res.EnsureSuccessStatusCode();
+        await EnsureSuccessWithBodySnippetAsync(res, $"POST api/sessions/{sessionId}/events ({ev.EventType})", ct);
+    }
+
+    internal static async Task EnsureSuccessWithBodySnippetAsync(
+        HttpResponseMessage response,
+        string operation,
+        CancellationToken ct = default)
+    {
+        if (response.IsSuccessStatusCode) return;
+
+        const int maxErrorSnippetChars = 500;
+        var rawBody = string.Empty;
+        try
+        {
+            rawBody = await response.Content.ReadAsStringAsync(ct);
+        }
+        catch
+        {
+            // Ignore read failure on disposed/broken error body stream
+        }
+
+        var snippet = rawBody?.Trim() ?? string.Empty;
+        if (snippet.Length > maxErrorSnippetChars)
+        {
+            snippet = snippet[..maxErrorSnippetChars] + "...";
+        }
+
+        var detail = string.IsNullOrWhiteSpace(snippet) ? "(empty response body)" : snippet;
+        throw new HttpRequestException(
+            $"{operation} failed with HTTP {(int)response.StatusCode} ({response.ReasonPhrase ?? response.StatusCode.ToString()}): {detail}",
+            null,
+            response.StatusCode);
     }
 
     public async Task<List<PromptReceivedEvent>> GetPendingPromptsForAgentAsync(string agentId, string? agentToken, CancellationToken ct = default)

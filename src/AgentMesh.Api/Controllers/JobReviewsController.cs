@@ -10,7 +10,6 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Temporalio.Client;
-using Temporalio.Common;
 
 namespace AgentMesh.Api.Controllers;
 
@@ -24,17 +23,18 @@ public record SubmitJobPrReviewRequest(
     string? ReviewerId = null,
     bool IsApproved = true,
     string? ReviewComments = null,
-    int? PrNumber = null
+    int? PrNumber = null,
+    string? ApprovedHeadSha = null
 );
 
 [ApiController]
 [Route("api/jobs")]
 [Authorize]
-public class JobChatController(
+public class JobReviewsController(
     AgentMeshDbContext dbContext,
     ITemporalClient? temporalClient = null,
     IHubContext<AgentMeshHub>? hubContext = null,
-    ILogger<JobChatController>? logger = null,
+    ILogger<JobReviewsController>? logger = null,
     JobTurnDispatcher? turnDispatcher = null,
     IWorkflowSignalRouter? workflows = null) : ControllerBase
 {
@@ -56,10 +56,20 @@ public class JobChatController(
 
     private string? ResolveCallerId()
     {
-        var claim = User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
+        var personaHeader = Request?.Headers.TryGetValue(PlatformCallContextResolver.PersonaIdHeader, out var ph) == true
+            ? ph.ToString()
+            : null;
+        var isDriverOrMaster = User?.HasClaim("IsMasterKey", "true") == true || User?.IsInRole("Driver") == true;
+        if (isDriverOrMaster && !string.IsNullOrWhiteSpace(personaHeader))
+        {
+            return personaHeader.Trim();
+        }
+
+        var claim = User?.FindFirst("PersonaId")?.Value
+                    ?? User?.FindFirst("persona_id")?.Value
+                    ?? User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
                     ?? User?.FindFirst("AgentId")?.Value
                     ?? User?.FindFirst("agent_id")?.Value
-                    ?? User?.FindFirst("PersonaId")?.Value
                     ?? User?.FindFirst(ClaimTypes.Name)?.Value
                     ?? User?.FindFirst(ClaimTypes.Email)?.Value
                     ?? User?.FindFirst("email")?.Value
@@ -76,7 +86,6 @@ public class JobChatController(
 
     private async Task<string> ResolveCallerRoleAsync(string callerId)
     {
-        // 1. Check roles/claims on the authenticated principal
         if (User.IsInRole("Operator") || User.IsInRole("Admin") ||
             User.HasClaim("IsMasterKey", "true") ||
             User.Claims.Any(c => (c.Type == ClaimTypes.Role || c.Type.Equals("role", StringComparison.OrdinalIgnoreCase) || c.Type.Equals("roles", StringComparison.OrdinalIgnoreCase) || c.Type.Equals("groups", StringComparison.OrdinalIgnoreCase) || c.Type.EndsWith("/role", StringComparison.OrdinalIgnoreCase)) && OperatorRoles.Contains(c.Value)))
@@ -84,10 +93,8 @@ public class JobChatController(
             return "operator";
         }
 
-        // An explicit agent token / agent principal is not an operator unless granted an operator role above
         var isExplicitAgent = User.HasClaim(c => c.Type == "agent_id" || c.Type == "AgentId" || c.Type == "persona_id" || c.Type == "PersonaId");
 
-        // Authenticated human users (e.g. from OIDC with email address)
         if (!isExplicitAgent && (User.HasClaim(c => c.Type == ClaimTypes.Email || c.Type.Equals("email", StringComparison.OrdinalIgnoreCase)) || callerId.Contains('@')))
         {
             return "operator";
@@ -99,7 +106,6 @@ public class JobChatController(
             return "tech_lead";
         }
 
-        // 2. Check persona in database to determine if they hold the tech_lead role
         var persona = await dbContext.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == callerId.ToLowerInvariant());
         if (persona != null && !string.IsNullOrWhiteSpace(persona.Role) && TechLeadRoles.Contains(persona.Role.Trim()))
         {
@@ -107,131 +113,6 @@ public class JobChatController(
         }
 
         return "agent";
-    }
-
-    [HttpPost("{jobId}/chat")]
-    public async Task<IActionResult> PostChatMessage(string jobId, [FromBody] PostMessageRequest request)
-    {
-        if (request is null || string.IsNullOrWhiteSpace(request.Content))
-        {
-            return BadRequest(new { error = "Message content is required." });
-        }
-
-        Guid? parsedGuid = Guid.TryParse(jobId, out var g) ? g : null;
-
-        // Try finding as AgentJob first, then ProjectJob
-        AgentJob? agentJob = null;
-        ProjectJob? projectJob = null;
-
-        if (parsedGuid.HasValue)
-        {
-            agentJob = await dbContext.AgentJobs.FindAsync([parsedGuid.Value]);
-            projectJob = await dbContext.ProjectJobs.FindAsync([parsedGuid.Value]);
-        }
-
-        if (agentJob is null && projectJob is null)
-        {
-            return NotFound(new { error = $"Job '{jobId}' not found." });
-        }
-
-        var senderId = ResolveCallerId();
-        if (string.IsNullOrWhiteSpace(senderId))
-        {
-            return Unauthorized(new { error = "unauthorized", message = "Caller identity claim is missing." });
-        }
-
-        // 1. Record message to job_messages ledger and broadcast via SignalR group
-        var messageRecord = new JobMessageRecord(jobId, senderId, request.Content, DateTimeOffset.UtcNow);
-
-        if (parsedGuid.HasValue)
-        {
-            var message = new JobMessage
-            {
-                Id = Guid.NewGuid(),
-                JobId = parsedGuid.Value,
-                SenderType = string.Equals(senderId, "operator", StringComparison.OrdinalIgnoreCase) || string.Equals(senderId, "user", StringComparison.OrdinalIgnoreCase) ? "user" : "persona",
-                SenderId = senderId,
-                Content = request.Content,
-                CreatedAt = DateTimeOffset.UtcNow
-            };
-            dbContext.JobMessages.Add(message);
-            await dbContext.SaveChangesAsync();
-        }
-
-        if (hubContext is not null)
-        {
-            await hubContext.Clients.Group(jobId).SendAsync("ReceiveJobChatMessage", messageRecord);
-        }
-
-        // 2. SignalWithStart to ensure Temporal workflow handles the message
-        if (temporalClient is not null)
-        {
-            var workflowId = $"job-{jobId}";
-            var projectId = agentJob?.ProjectId ?? projectJob?.ProjectId ?? "default";
-            var assignedAgentId = agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId;
-            if (string.IsNullOrWhiteSpace(assignedAgentId) || assignedAgentId.Equals("implementer", StringComparison.OrdinalIgnoreCase))
-            {
-                var prj = await dbContext.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == projectId);
-                assignedAgentId = prj?.DefaultLeadPersonaId;
-            }
-            if (string.IsNullOrWhiteSpace(assignedAgentId) || assignedAgentId.Equals("implementer", StringComparison.OrdinalIgnoreCase))
-            {
-                var anyPersona = await dbContext.Personas.AsNoTracking().Select(p => p.Id).FirstOrDefaultAsync();
-                assignedAgentId = anyPersona ?? "astra";
-            }
-            var workspacePath = agentJob?.WorkingDirectory ?? projectJob?.WorkingDirectory ?? $"/workspace/repos/{projectId}";
-            var targetBranch = agentJob?.TargetBranch ?? projectJob?.TargetBranch ?? "main";
-            var approvalPolicy = agentJob?.ApprovalPolicy ?? projectJob?.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman;
-
-            var chatSignal = new ChatMessageSignal(
-                SenderId: senderId,
-                Content: request.Content,
-                Timestamp: DateTimeOffset.UtcNow
-            );
-
-            var options = new WorkflowOptions(workflowId, WorkflowSignalRouter.TaskQueue)
-            {
-                IdReusePolicy = Temporalio.Api.Enums.V1.WorkflowIdReusePolicy.AllowDuplicate,
-                StartSignal = "ReceiveChatMessage",
-                StartSignalArgs = new object?[] { chatSignal },
-                Memo = new Dictionary<string, object> { ["personaId"] = assignedAgentId }
-            };
-
-            try
-            {
-                try
-                {
-                    await temporalClient.StartWorkflowAsync(
-                        (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
-                            JobId: jobId,
-                            AssignedAgentId: assignedAgentId,
-                            ProjectId: projectId,
-                            WorkspacePath: workspacePath,
-                            InitialPrompt: request.Content,
-                            TargetBranch: targetBranch,
-                            ApprovalPolicy: approvalPolicy
-                        )),
-                        options
-                    );
-                }
-                catch (Temporalio.Exceptions.WorkflowAlreadyStartedException)
-                {
-                    var handle = temporalClient.GetWorkflowHandle<JobExecutionWorkflow>(workflowId);
-                    await handle.SignalAsync(wf => wf.ReceiveChatMessageAsync(chatSignal));
-                }
-            }
-            catch (Exception ex)
-            {
-                logger?.LogError(ex, "Failed to dispatch or signal workflow for job {JobId}", jobId);
-                return StatusCode(StatusCodes.Status502BadGateway, new
-                {
-                    error = "workflow_dispatch_failed",
-                    message = $"Failed to dispatch or signal workflow {workflowId}: {ex.Message}"
-                });
-            }
-        }
-
-        return Ok(new { success = true });
     }
 
     [HttpPost("{jobId}/approve-plan")]
@@ -262,7 +143,6 @@ public class JobChatController(
         var policy = agentJob?.ApprovalPolicy ?? projectJob?.ApprovalPolicy ?? PlanApprovalPolicy.LeadOrHuman;
         var approverRole = await ResolveCallerRoleAsync(approverId);
 
-        // Self-approval guard: an implementer cannot approve their own plan
         var implementer = (agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId)?.Trim().ToLowerInvariant();
         if (!string.IsNullOrEmpty(implementer) && string.Equals(approverId.ToLowerInvariant(), implementer, StringComparison.OrdinalIgnoreCase))
         {
@@ -368,8 +248,8 @@ public class JobChatController(
             if (projectJob != null)
             {
                 var project = await dbContext.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == projectJob.ProjectId);
-                var msgCount = await dbContext.JobMessages.CountAsync(m => m.JobId == projectJob.Id);
-                var dto = ProjectJobsController.ToDto(projectJob, project?.Name, msgCount);
+                var cardCount = await dbContext.JobTimelineCards.CountAsync(c => c.JobId == projectJob.Id.ToString());
+                var dto = ProjectJobsController.ToDto(projectJob, project?.Name, cardCount);
                 await hubContext.Clients.All.SendAsync("JobUpdated", dto);
             }
         }
@@ -432,10 +312,18 @@ public class JobChatController(
             return BadRequest(new { error = "Review request body is required." });
         }
 
-        var reviewer = ResolveCallerId()?.ToLowerInvariant();
+        var reviewer = (ResolveCallerId() ?? request.ReviewerId)?.Trim().TrimStart('@').ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(reviewer))
         {
             return Unauthorized(new { error = "unauthorized", message = "Caller identity claim is missing." });
+        }
+
+        // If caller authenticated via a generic/master principal and passed ReviewerId explicitly,
+        // honour request.ReviewerId unless caller is the authoring agent attempting to spoof ReviewerId.
+        var authenticatedId = ResolveCallerId()?.Trim().TrimStart('@').ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(request.ReviewerId))
+        {
+            reviewer = request.ReviewerId.Trim().TrimStart('@').ToLowerInvariant();
         }
 
         Guid? parsedGuid = Guid.TryParse(jobId, out var g) ? g : null;
@@ -455,41 +343,52 @@ public class JobChatController(
         }
 
         var author = (agentJob?.AssignedAgentId ?? projectJob?.AssignedAgentId)?.Trim().ToLowerInvariant();
+        string? cardHeadSha = null;
 
-        if (string.IsNullOrEmpty(author) && parsedGuid.HasValue)
+        if (parsedGuid.HasValue)
         {
-            var prRows = await dbContext.JobMessages
+            var jobIdStr = parsedGuid.Value.ToString();
+            var prCards = await dbContext.JobTimelineCards
                 .AsNoTracking()
-                .Where(m => m.JobId == parsedGuid.Value && m.SenderType == "persona" && m.StructuredPayloadJson != null)
-                .OrderByDescending(m => m.CreatedAt)
+                .Where(c => c.JobId == jobIdStr)
+                .OrderByDescending(c => c.UpdatedAt)
+                .ThenByDescending(c => c.CreatedAt)
                 .ToListAsync();
 
-            foreach (var row in prRows)
+            foreach (var card in prCards)
             {
-                if (!TryReadPrLinkage(row.StructuredPayloadJson, out _, out var rowPrNum)) continue;
+                if (!TryReadPrLinkage(card.StructuredPayloadJson, out var cardAuthor, out _, out var rowPrNum, out var rowHeadSha)) continue;
                 if (request.PrNumber.HasValue && rowPrNum.HasValue && rowPrNum.Value != request.PrNumber.Value) continue;
 
-                if (!string.IsNullOrWhiteSpace(row.SenderId))
+                cardHeadSha ??= rowHeadSha;
+                if (string.IsNullOrEmpty(author) && !string.IsNullOrWhiteSpace(cardAuthor))
                 {
-                    author = row.SenderId.Trim().ToLowerInvariant();
+                    author = cardAuthor.Trim().ToLowerInvariant();
+                }
+
+                if (!string.IsNullOrEmpty(author) && cardHeadSha is not null)
+                {
                     break;
                 }
             }
         }
 
-        var reviewerRole = await ResolveCallerRoleAsync(reviewer);
+        var reviewerRole = await ResolveCallerRoleAsync(authenticatedId ?? reviewer);
 
-        // Self-review guard
-        if (!string.IsNullOrEmpty(author) && string.Equals(reviewer, author, StringComparison.OrdinalIgnoreCase))
+        // Enforce Two-Man Rule: reject self-approval/self-review when either the authenticated principal
+        // or the claimed reviewerId matches the authoring persona (including driver-<persona> aliases).
+        if (!string.IsNullOrEmpty(author) &&
+            (IsSameAgentOrPersona(reviewer, author) ||
+             (!string.IsNullOrEmpty(authenticatedId) && IsSameAgentOrPersona(authenticatedId, author))))
         {
+            var matchedAuthor = IsSameAgentOrPersona(reviewer, author) ? reviewer : authenticatedId!;
             return StatusCode(StatusCodes.Status403Forbidden, new
             {
                 error = "self_review_not_allowed",
-                message = $"'{reviewer}' is the author of this pull request and cannot approve its own merge."
+                message = $"'{matchedAuthor}' is the author of this pull request and cannot approve its own merge."
             });
         }
 
-        // If author is unrecorded and caller is not an operator, reject to enforce two-man review
         if (string.IsNullOrEmpty(author) && reviewerRole != "operator")
         {
             return StatusCode(StatusCodes.Status403Forbidden, new
@@ -504,10 +403,25 @@ public class JobChatController(
             IsApproved: request.IsApproved,
             ReviewComments: request.ReviewComments,
             Timestamp: DateTimeOffset.UtcNow,
-            PrNumber: request.PrNumber
+            PrNumber: request.PrNumber,
+            ApprovedHeadSha: !string.IsNullOrWhiteSpace(request.ApprovedHeadSha) ? request.ApprovedHeadSha.Trim() : cardHeadSha
         );
 
-        if (temporalClient is not null)
+        if (workflows is not null && parsedGuid.HasValue)
+        {
+            var delivery = await workflows.SendPrReviewAsync(parsedGuid.Value, signal);
+            if (!delivery.Delivered)
+            {
+                return Conflict(new
+                {
+                    error = "review_not_delivered",
+                    delivery.Status,
+                    detail = delivery.Detail,
+                    workflowId = delivery.WorkflowId,
+                });
+            }
+        }
+        else if (temporalClient is not null)
         {
             var workflowId = $"job-{jobId}";
             try
@@ -529,13 +443,29 @@ public class JobChatController(
         return Ok(new { success = true, isApproved = request.IsApproved, reviewer });
     }
 
+    private static bool IsSameAgentOrPersona(string a, string b)
+    {
+        static string Norm(string s)
+        {
+            var t = s.Trim().TrimStart('@').ToLowerInvariant();
+            return t.StartsWith("driver-", StringComparison.Ordinal) && t.Length > "driver-".Length
+                ? t["driver-".Length..]
+                : t;
+        }
+        return string.Equals(Norm(a), Norm(b), StringComparison.Ordinal);
+    }
+
     private static bool TryReadPrLinkage(
         string? structuredPayloadJson,
+        out string? authorPersona,
         out string? prUrl,
-        out int? prNumber)
+        out int? prNumber,
+        out string? headSha)
     {
+        authorPersona = null;
         prUrl = null;
         prNumber = null;
+        headSha = null;
         if (string.IsNullOrWhiteSpace(structuredPayloadJson)) return false;
 
         try
@@ -554,6 +484,28 @@ public class JobChatController(
                 number.TryGetInt32(out var parsed))
             {
                 prNumber = parsed;
+            }
+
+            foreach (var shaKey in new[] { "headSha", "head_sha" })
+            {
+                if (doc.RootElement.TryGetProperty(shaKey, out var shaProp) &&
+                    shaProp.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(shaProp.GetString()))
+                {
+                    headSha = shaProp.GetString()!.Trim();
+                    break;
+                }
+            }
+
+            foreach (var authorKey in new[] { "authorPersonaId", "senderPersona", "senderId", "author" })
+            {
+                if (doc.RootElement.TryGetProperty(authorKey, out var prop) &&
+                    prop.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(prop.GetString()))
+                {
+                    authorPersona = prop.GetString()!.Trim().ToLowerInvariant();
+                    break;
+                }
             }
 
             return prUrl is not null || prNumber is not null;

@@ -329,7 +329,7 @@ public class ProjectDocumentSchemaTests
     /// means the next migration stacked on top shows up as a failure to re-check rather than a silent
     /// assumption that the snapshot is current.
     /// </remarks>
-    private const string TipMigrationId = "20261111052729_AddJobTimelineCardsAndComments";
+    private const string TipMigrationId = "20261113220211_WidenJobPromptsAndDropJobMessages";
 
     [Fact]
     public void MigrationSequence_KeepsMigrationsInOrder()

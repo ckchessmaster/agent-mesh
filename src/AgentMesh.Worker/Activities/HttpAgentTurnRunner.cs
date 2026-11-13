@@ -693,39 +693,36 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             .Select(m => new { m.ToolName, m.ToolArgsJson, m.CreatedAt })
             .ToListAsync(ct);
 
-        // The ledger rows this turn produced.
+        // The timeline cards this turn produced.
         //
-        // Scoped by turn session first, because PlatformMcpTools stamps TurnSessionId on every row it
-        // inserts and that association is exact.
-        var jobMessages = await db.JobMessages.AsNoTracking()
-            .Where(m => m.JobId == jobId && m.TurnSessionId == sessionId)
-            .OrderBy(m => m.CreatedAt)
-            .Select(m => new { m.StructuredPayloadJson, m.Content, m.CreatedAt, m.TurnSessionId })
+        // Scoped by turn session first, because PlatformMcpTools stamps turnSessionId into
+        // StructuredPayloadJson on every timeline card it inserts and that association is exact.
+        var jobIdStr = jobId.ToString();
+        var candidateCards = await db.JobTimelineCards.AsNoTracking()
+            .Where(c => c.JobId == jobIdStr)
+            .OrderBy(c => c.CreatedAt)
+            .Select(c => new { c.StructuredPayloadJson, c.Title, c.CreatedAt })
             .ToListAsync(ct);
 
-        var ledgerScopedToSession = true;
+        var sessionMatchedCards = candidateCards
+            .Where(c => ReadTurnSessionId(c.StructuredPayloadJson) == sessionId)
+            .ToList();
 
-        if (jobMessages.Count == 0 && session is not null)
+        var ledgerScopedToSession = true;
+        var resolvedCards = sessionMatchedCards;
+
+        if (resolvedCards.Count == 0 && session is not null)
         {
-            // The exact match found nothing, which has a mundane cause: the session id is resolved from
-            // the optional X-Session-Id header (PlatformCallContextResolver), so a runner that does not
-            // send it posts to the job ledger with TurnSessionId = null. Filtering strictly on the
-            // session would then never see the requires_reply row, the workflow would never pause, and
-            // the agent's question would go permanently unanswered — the precise idle-burn this job
-            // exists to remove, reintroduced as a filter that is too correct for reality.
-            //
-            // The fallback is a time window bounded below by this session's own creation, and it
-            // excludes rows that are positively attributed to a *different* session. That leaves
-            // unattributed rows only, which is the set we are actually looking for.
             var from = ledgerFloor == default ? session.CreatedAt : ledgerFloor;
 
-            jobMessages = await db.JobMessages.AsNoTracking()
-                .Where(m => m.JobId == jobId
-                            && m.CreatedAt >= from
-                            && (m.TurnSessionId == null || m.TurnSessionId == sessionId))
-                .OrderBy(m => m.CreatedAt)
-                .Select(m => new { m.StructuredPayloadJson, m.Content, m.CreatedAt, m.TurnSessionId })
-                .ToListAsync(ct);
+            resolvedCards = candidateCards
+                .Where(c => c.CreatedAt >= from)
+                .Where(c =>
+                {
+                    var cardSessionId = ReadTurnSessionId(c.StructuredPayloadJson);
+                    return cardSessionId is null || cardSessionId == sessionId;
+                })
+                .ToList();
 
             ledgerScopedToSession = false;
         }
@@ -760,8 +757,11 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             ToolCalls: toolCalls
                 .Select(t => new ToolCallRecord(t.ToolName ?? string.Empty, t.ToolArgsJson, t.CreatedAt))
                 .ToList(),
-            JobMessages: jobMessages
-                .Select(m => new JobLedgerRecord(m.StructuredPayloadJson, m.Content, m.CreatedAt))
+            JobMessages: resolvedCards
+                .Select(c => new JobLedgerRecord(
+                    c.StructuredPayloadJson,
+                    ReadStringProperty(c.StructuredPayloadJson, "content") ?? c.Title,
+                    c.CreatedAt))
                 .ToList(),
             LastActivityAt: lastActivity,
             LedgerScopedToSession: ledgerScopedToSession,
@@ -815,7 +815,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
 
         if (prCall is not null || prFromLedger is not null)
         {
-            var (url, number) = ReadPrFacts(prCall?.ArgsJson, prFromLedger?.StructuredPayloadJson);
+            var (url, number, headSha) = ReadPrFactsWithSha(prCall?.ArgsJson, prFromLedger?.StructuredPayloadJson);
 
             // The tool's own result is the authority on whether a PR exists; the call alone is not,
             // because open_pull_request can fail (no credentials, dirty tree) and record the attempt as
@@ -827,7 +827,8 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
                     url,
                     number,
                     $"Pull request {(number is null ? url : $"#{number.Value.ToString(CultureInfo.InvariantCulture)}")} " +
-                    "opened; awaiting code review.");
+                    "opened; awaiting code review.",
+                    headSha);
             }
         }
 
@@ -934,6 +935,12 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             "question; continuing to the next step.");
     }
 
+    private static Guid? ReadTurnSessionId(string? structuredPayloadJson)
+    {
+        var raw = ReadStringProperty(structuredPayloadJson, "turnSessionId");
+        return Guid.TryParse(raw, out var parsed) && parsed != Guid.Empty ? parsed : null;
+    }
+
     private async Task EscalateErrorToJobChatAsync(
         TaskExecutionInput input,
         Guid sessionId,
@@ -944,77 +951,74 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
 
         try
         {
-            // Avoid duplicate escalations for the same session
-            var alreadyPosted = await db.JobMessages.AnyAsync(
-                m => m.JobId == jobId && m.TurnSessionId == sessionId && m.Content.Contains("⚠️"), ct);
-            if (alreadyPosted) return;
+            var jobIdStr = jobId.ToString();
+            var existingPayloads = await db.JobTimelineCards.AsNoTracking()
+                .Where(c => c.JobId == jobIdStr && c.CardType == TimelineCardType.Escalation3R)
+                .Select(c => c.StructuredPayloadJson)
+                .ToListAsync(ct);
+
+            if (existingPayloads.Any(p => ReadTurnSessionId(p) == sessionId &&
+                                          (ReadStringProperty(p, "source") == "worker:error_escalation" ||
+                                           (ReadStringProperty(p, "content")?.Contains("⚠️") ?? false))))
+            {
+                return;
+            }
 
             var personaName = input.PersonaId ?? input.AgentId ?? "implementer";
-            var escalationContent = $"⚠️ **Agent @{personaName} encountered an error and paused for assistance:**\n\n> {detail}\n\nPlease reply in Job Chat to provide guidance or resolve the blocker.";
+            var escalationContent = $"⚠️ **Agent @{personaName} encountered an error and paused for assistance:**\n\n> {detail}\n\nPlease reply on this timeline card to provide guidance or resolve the blocker.";
+
+            var now = DateTimeOffset.UtcNow;
+            var card = new JobTimelineCard
+            {
+                Id = Guid.NewGuid(),
+                JobId = jobIdStr,
+                TaskId = input.TaskId,
+                CardType = TimelineCardType.Escalation3R,
+                Status = TimelineCardStatus.PendingInput,
+                Title = $"Agent @{personaName} paused on error",
+                StructuredPayloadJson = JsonSerializer.Serialize(new
+                {
+                    content = escalationContent,
+                    requiresReply = true,
+                    targetPersona = "operator",
+                    senderPersona = personaName,
+                    authorPersonaId = personaName,
+                    driverId = input.AgentId,
+                    turnSessionId = sessionId,
+                    source = "worker:error_escalation"
+                }, JsonOpts),
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+
+            db.JobTimelineCards.Add(card);
+            await db.SaveChangesAsync(ct);
 
             var baseUrl = ResolveApiBaseUrl(config);
-            var postedViaHttp = false;
-
             if (!string.IsNullOrWhiteSpace(baseUrl))
             {
                 try
                 {
-                    var payload = new
-                    {
-                        content = escalationContent,
-                        senderType = "system",
-                        senderName = "AgentMesh Platform",
-                        turnSessionId = sessionId
-                    };
-
-                    using var message = new HttpRequestMessage(
+                    using var req = new HttpRequestMessage(
                         HttpMethod.Post,
-                        $"{baseUrl.TrimEnd('/')}/api/project-jobs/{jobId}/messages")
-                    {
-                        Content = new StringContent(JsonSerializer.Serialize(payload, JsonOpts), Encoding.UTF8, "application/json")
-                    };
-
+                        $"{baseUrl.TrimEnd('/')}/api/jobs/{Uri.EscapeDataString(jobIdStr)}/timeline/cards/{card.Id}/notify-updated");
                     var apiKey = ResolveApiKey(config);
                     if (!string.IsNullOrWhiteSpace(apiKey))
                     {
-                        message.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);
-                        message.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+                        req.Headers.TryAddWithoutValidation("X-Api-Key", apiKey);
+                        req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
                     }
-
-                    using var res = await httpClient.SendAsync(message, ct);
-                    if (res.IsSuccessStatusCode)
-                    {
-                        postedViaHttp = true;
-                    }
+                    using var _ = await httpClient.SendAsync(req, ct);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogWarning(ex, "Failed to post error escalation via HTTP for job {JobId}", jobId);
+                    logger.LogWarning(ex, "Failed to notify timeline card update via HTTP for job {JobId}", jobId);
                 }
-            }
-
-            if (!postedViaHttp)
-            {
-                var jobMsg = new JobMessage
-                {
-                    Id = Guid.NewGuid(),
-                    JobId = jobId,
-                    SenderType = "system",
-                    SenderId = "temporal-worker",
-                    SenderName = "AgentMesh Platform",
-                    Content = escalationContent,
-                    TurnSessionId = sessionId,
-                    StructuredPayloadJson = JsonSerializer.Serialize(new { requiresReply = true, targetPersona = "operator" }, JsonOpts),
-                    CreatedAt = DateTimeOffset.UtcNow
-                };
-
-                db.JobMessages.Add(jobMsg);
-                await db.SaveChangesAsync(ct);
             }
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Failed to escalate error to Job Chat for job {JobId} session {SessionId}", jobId, sessionId);
+            logger.LogError(ex, "Failed to escalate error to timeline for job {JobId} session {SessionId}", jobId, sessionId);
         }
     }
 
@@ -1053,13 +1057,22 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
     /// <summary>Reads the PR URL and number, preferring the ledger row the tool wrote.</summary>
     internal static (string? Url, int? Number) ReadPrFacts(string? toolArgsJson, string? ledgerPayloadJson)
     {
+        var (url, number, _) = ReadPrFactsWithSha(toolArgsJson, ledgerPayloadJson);
+        return (url, number);
+    }
+
+    internal static (string? Url, int? Number, string? HeadSha) ReadPrFactsWithSha(string? toolArgsJson, string? ledgerPayloadJson)
+    {
         var url = ReadStringProperty(ledgerPayloadJson, "prUrl")
                   ?? ReadStringProperty(toolArgsJson, "pr_url");
 
         var number = ReadIntProperty(ledgerPayloadJson, "prNumber")
                      ?? ReadIntProperty(toolArgsJson, "pr_number");
 
-        return (url, number);
+        var headSha = ReadStringProperty(ledgerPayloadJson, "headSha")
+                      ?? ReadStringProperty(toolArgsJson, "head_sha");
+
+        return (url, number, headSha);
     }
 
     private static readonly Regex GitHubPrRegex = new(

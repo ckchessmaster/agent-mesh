@@ -50,6 +50,18 @@ public record TurnInterventionSignal(
     string? AdditionalContext = null
 );
 
+public record JobExecutionContinuationState(
+    int ReviewRound,
+    Guid? InitCardId,
+    Guid? PrCardId,
+    string? ActivePrUrl,
+    int? ActivePrNumber,
+    string? CandidateHeadSha,
+    int CompletedTaskOffset,
+    IReadOnlyList<ProposedChecklistItem> PendingTasks,
+    string? RemediationContext = null
+);
+
 [method: JsonConstructor]
 public record JobExecutionInput(
     string JobId,
@@ -58,7 +70,9 @@ public record JobExecutionInput(
     string InitialPrompt,
     string TargetBranch,
     string AssignedAgentId,
-    string ApprovalPolicy = "LeadOrHuman"
+    string ApprovalPolicy = "LeadOrHuman",
+    JobExecutionContinuationState? Continuation = null,
+    int? ContinueAsNewAfterRounds = null
 )
 {
     public JobExecutionInput(
@@ -86,7 +100,8 @@ public record ChildTaskExecutionInput : TaskExecutionInput
         string AssignedAgentId,
         string WorkspacePath,
         string TargetBranch,
-        string? ProjectId = null)
+        string? ProjectId = null,
+        string? RemediationContext = null)
         : base(
             JobId: JobId,
             TaskId: TaskId,
@@ -96,7 +111,8 @@ public record ChildTaskExecutionInput : TaskExecutionInput
             TargetBranch: TargetBranch,
             PersonaId: AssignedAgentId,
             TaskIndex: TaskIndex,
-            TaskTitle: TaskTitle)
+            TaskTitle: TaskTitle,
+            RemediationContext: RemediationContext)
     {
     }
 }
@@ -142,13 +158,17 @@ public record CodingTurnInput(
 public record MergePullRequestInput(
     string JobId,
     string TargetBranch,
-    string? PrUrl = null
+    string? PrUrl = null,
+    string? ApprovedHeadSha = null
 );
 
 public record JobWorkflowState(
     int CurrentTaskIndex,
     int TotalTasks,
-    string CurrentHeartbeat
+    string CurrentHeartbeat,
+    int ReviewRound = 0,
+    string? ActivePrUrl = null,
+    int IgnoredSelfReviewCount = 0
 );
 
 [Workflow("JobExecutionWorkflow")]

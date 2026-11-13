@@ -210,16 +210,91 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     }
 
     /// <summary>
-    /// Resolves the token budget for a run.
+    /// Resolves the token budget for a run, respecting explicit options and agent/driver profile
+    /// context sizes (including 512k / 524,288) without clamping to legacy 131,072 tables.
     /// </summary>
-    /// <remarks>
-    /// Delegates to <see cref="ModelContextLimits"/> so the API that renders the context picker and
-    /// the adapter that honours the choice read one table. They used to hold separate tables, which
-    /// is how the picker could advertise 256k while the run was clamped to 128k with nothing in the
-    /// response saying so.
-    /// </remarks>
-    public static int ResolveModelContextLimit(string model, string? contextSizeOption)
-        => ModelContextLimits.ResolveTokens(model, contextSizeOption);
+    public static int ResolveModelContextLimit(string model, string? contextSizeOption, AgentPresetConfig? preset = null)
+    {
+        if (ModelContextLimits.ParseOption(contextSizeOption) is int explicitTokens && explicitTokens > 0)
+        {
+            return explicitTokens;
+        }
+
+        if (preset?.ContextWindowTokens is int presetTokens && presetTokens > 0)
+        {
+            return presetTokens;
+        }
+
+        if (preset?.OpenAi?.ContextWindowTokens is int settingsTokens && settingsTokens > 0)
+        {
+            return settingsTokens;
+        }
+
+        if (ModelContextLimits.ParseOption(preset?.DefaultContextSize) is int presetOptionTokens && presetOptionTokens > 0)
+        {
+            return presetOptionTokens;
+        }
+
+        if (ModelContextLimits.ParseOption(preset?.OpenAi?.DefaultContextSize) is int settingsOptionTokens && settingsOptionTokens > 0)
+        {
+            return settingsOptionTokens;
+        }
+
+        var envWindow = Environment.GetEnvironmentVariable("OPENAI_CONTEXT_WINDOW")
+                        ?? Environment.GetEnvironmentVariable("OPENAI_MAX_CONTEXT_TOKENS");
+        if (ModelContextLimits.ParseOption(envWindow) is int envTokens && envTokens > 0)
+        {
+            return envTokens;
+        }
+
+        return ModelContextLimits.ResolveTokens(model, contextSizeOption);
+    }
+
+    /// <summary>
+    /// Resolves the dynamic compaction threshold percentage (default 75%).
+    /// </summary>
+    public static int ResolveCompactionThresholdPercent(AgentPresetConfig? preset = null)
+    {
+        if (preset?.CompactionThresholdPercent is int configured && configured > 0)
+        {
+            return Math.Clamp(configured, 10, 95);
+        }
+
+        if (preset?.OpenAi?.CompactionThresholdPercent is int fromSettings && fromSettings > 0)
+        {
+            return Math.Clamp(fromSettings, 10, 95);
+        }
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_COMPACTION_THRESHOLD_PERCENT"), out var envPct) && envPct > 0)
+        {
+            return Math.Clamp(envPct, 10, 95);
+        }
+
+        return OpenAISettings.DefaultCompactionThresholdPercent;
+    }
+
+    /// <summary>
+    /// Resolves the post-first-byte SSE chunk idle timeout in seconds (default 120s).
+    /// </summary>
+    public static int ResolveStreamChunkIdleTimeoutSeconds(AgentPresetConfig? preset = null)
+    {
+        if (preset?.StreamChunkIdleTimeoutSeconds is int configured && configured > 0)
+        {
+            return configured;
+        }
+
+        if (preset?.OpenAi?.StreamChunkIdleTimeoutSeconds is int fromSettings && fromSettings > 0)
+        {
+            return fromSettings;
+        }
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_STREAM_CHUNK_IDLE_TIMEOUT_SECONDS"), out var envSec) && envSec > 0)
+        {
+            return envSec;
+        }
+
+        return OpenAISettings.DefaultStreamChunkIdleTimeoutSeconds;
+    }
 
     /// <summary>
     /// The credential this adapter would authenticate a run with.
@@ -700,9 +775,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
 
         var endpoint = !string.IsNullOrWhiteSpace(preset.Endpoint)
             ? preset.Endpoint.Trim()
@@ -725,7 +798,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
         var timeoutSeconds = ResolveTimeoutSeconds(preset);
         var maxRetries = ResolveMaxRetries(preset);
-        var modelContextLimit = ResolveModelContextLimit(effectiveModel, promptEvent.ContextSize);
+        var modelContextLimit = ResolveModelContextLimit(effectiveModel, promptEvent.ContextSize, preset);
+        var compactionThresholdPercent = ResolveCompactionThresholdPercent(preset);
+        var streamChunkIdleTimeoutSeconds = ResolveStreamChunkIdleTimeoutSeconds(preset);
 
         ct.ThrowIfCancellationRequested();
         await onEvent(new TrajectoryEventPayload
@@ -937,8 +1012,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         {
             ct.ThrowIfCancellationRequested();
 
-            // Proactive history compaction
-            var targetMaxTokens = (int)(modelContextLimit * 0.80);
+            // Proactive history compaction at configured percentage of resolved context window (default 75%)
+            var targetMaxTokens = (int)Math.Floor(modelContextLimit * (compactionThresholdPercent / 100.0));
             if (EstimateTotalTokens(history) > targetMaxTokens)
             {
                 var beforeEst = EstimateTotalTokens(history);
@@ -949,17 +1024,26 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "thought",
-                        Content = $"[@{preset.Id}] Proactively {(summarized ? "summarized" : "truncated")} conversation history ({beforeEst} -> {afterEst} tokens) to remain within {modelContextLimit} context limit."
+                        Content = $"[@{preset.Id}] Proactively {(summarized ? "summarized" : "truncated")} conversation history ({beforeEst} -> {afterEst} tokens, threshold {compactionThresholdPercent}%) to remain within {modelContextLimit} context limit."
                     });
                 }
             }
 
             HttpResponseMessage? httpRes = null;
+            CancellationTokenSource? outerRequestCts = null;
             var retryAttempt = 0;
+            var contentBuilder = new StringBuilder();
+            var reasoningBuilder = new StringBuilder();
+            var toolCallsByIndex = new SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)>();
+            Exception? streamDropped = null;
 
+            try
+            {
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
+                outerRequestCts?.Dispose();
+                outerRequestCts = null;
 
                 // Strict boundary rule, enforced at the last moment before serialisation.
                 //
@@ -1022,14 +1106,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 var jsonContent = JsonSerializer.Serialize(reqBody);
                 httpReq.Content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                // Outer HTTP timeout covers both initial TCP/TLS handshake AND prompt prefill (TTFT)
+                // up until the first SSE data chunk arrives.
+                outerRequestCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, outerRequestCts.Token);
 
                 try
                 {
                     httpRes = await HttpClientInstance.SendAsync(httpReq, HttpCompletionOption.ResponseHeadersRead, linkedCts.Token);
                 }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested && outerRequestCts.IsCancellationRequested)
                 {
                     if (retryAttempt < maxRetries)
                     {
@@ -1150,33 +1236,45 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             using var activeResponse = httpRes!;
 
-            var contentBuilder = new StringBuilder();
-            var reasoningBuilder = new StringBuilder();
-            var toolCallsByIndex = new SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)>();
-
-            Exception? streamDropped = null;
-            using (var stream = await activeResponse.Content.ReadAsStreamAsync(ct))
+            var firstChunkReceived = false;
+            var chunkIdleTimeout = TimeSpan.FromSeconds(streamChunkIdleTimeoutSeconds);
+            using (var prefillLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, outerRequestCts!.Token))
+            using (var stream = await activeResponse.Content.ReadAsStreamAsync(prefillLinkedCts.Token))
             using (var reader = new StreamReader(stream))
             {
-                var streamReadTimeout = TimeSpan.FromSeconds(Math.Max(120, timeoutSeconds));
                 while (true)
                 {
                     ct.ThrowIfCancellationRequested();
-                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    readCts.CancelAfter(streamReadTimeout);
+                    using var chunkIdleCts = firstChunkReceived
+                        ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+                        : null;
+                    chunkIdleCts?.CancelAfter(chunkIdleTimeout);
+
+                    var readToken = firstChunkReceived ? chunkIdleCts!.Token : prefillLinkedCts.Token;
 
                     string? line;
                     try
                     {
-                        line = await reader.ReadLineAsync(readCts.Token);
+                        line = await reader.ReadLineAsync(readToken);
                     }
-                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && readCts.IsCancellationRequested)
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && firstChunkReceived && chunkIdleCts!.IsCancellationRequested)
                     {
                         await onEvent(new TrajectoryEventPayload
                         {
                             EventType = "thought",
-                            Content = $"[@{preset.Id}] Streaming response timed out after {streamReadTimeout.TotalSeconds:F0}s of inactivity from server."
+                            Content = $"[@{preset.Id}] SSE stream stalled for {streamChunkIdleTimeoutSeconds}s after first chunk; cancelling and retrying..."
                         });
+                        streamDropped = new TimeoutException($"SSE stream stalled after {streamChunkIdleTimeoutSeconds}s of chunk inactivity.");
+                        break;
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && !firstChunkReceived && outerRequestCts.IsCancellationRequested)
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] Initial prompt prefill (TTFT) timed out after {timeoutSeconds}s waiting for first SSE chunk."
+                        });
+                        streamDropped = new TimeoutException($"Prompt prefill timed out after {timeoutSeconds}s before first SSE chunk.");
                         break;
                     }
                     catch (Exception ex) when (ex is IOException || ex is HttpRequestException)
@@ -1193,8 +1291,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var trimmed = line.Trim();
                     if (trimmed.StartsWith('{'))
                     {
+                        firstChunkReceived = true;
                         // The server returned a direct JSON body rather than SSE lines
-                        var rest = await reader.ReadToEndAsync(ct);
+                        using var restCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        restCts.CancelAfter(chunkIdleTimeout);
+                        var rest = await reader.ReadToEndAsync(restCts.Token);
                         var fullJson = trimmed + "\n" + rest;
                         try
                         {
@@ -1208,6 +1309,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     if (!trimmed.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) continue;
 
                     var data = trimmed.Length > 5 ? trimmed[5..].Trim() : "";
+                    firstChunkReceived = true;
                     if (data == "[DONE]") break;
 
                     try
@@ -1220,6 +1322,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         // Ignore malformed chunk
                     }
                 }
+            }
+            }
+            finally
+            {
+                outerRequestCts?.Dispose();
             }
 
             if (streamDropped != null)
@@ -1938,7 +2045,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 function = new
                 {
                     name = "manage_task",
-                    description = "Manage the living task checklist and task statuses for the active job. In Stage 1 Discovery, decompose the job into 3 to 6 atomic tasks and register them via action='set_checklist'. In Stage 3, update task status with action='update_task_status'.",
+                    description = "Manage the living task checklist and task statuses for the active job. In Stage 1 Discovery, decompose the objective into atomic, verifiable tasks sized to the scope of the work (typically 3-6 tasks, or more/fewer as needed) and register them via action='set_checklist'. In Stage 3, update task status with action='update_task_status'.",
                     parameters = new
                     {
                         type = "object",
@@ -1947,13 +2054,13 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             action = new
                             {
                                 type = "string",
-                                description = "The action to perform: 'set_checklist' (to register 3-6 tasks), 'update_task_status', 'get_checklist', or 'get_details'.",
+                                description = "The action to perform: 'set_checklist' (to register checklist tasks), 'update_task_status', 'get_checklist', or 'get_details'.",
                                 @enum = new[] { "set_checklist", "update_task_status", "get_checklist", "get_details", "set_status", "list_all" }
                             },
                             tasks = new
                             {
                                 type = "array",
-                                description = "List of 3 to 6 atomic tasks when action is 'set_checklist'.",
+                                description = "List of atomic, verifiable tasks when action is 'set_checklist' (1..25 tasks; typically 3-6 for standard features).",
                                 items = new
                                 {
                                     type = "object",
@@ -2026,6 +2133,29 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         required = new[] { "category", "key", "value" }
                     }
                 }
+            },
+            new
+            {
+                type = "function",
+                function = new
+                {
+                    name = "list_memories",
+                    description = "List or search saved persistent memories (both project-scoped and global '*') for your persona so you can inspect or update stale environment entries without duplicating keys.",
+                    parameters = new
+                    {
+                        type = "object",
+                        properties = new
+                        {
+                            query = new { type = "string", description = "Optional case-insensitive substring filter matched against memory keys and values." },
+                            category = new
+                            {
+                                type = "string",
+                                description = "Optional category filter: 'environment', 'build_and_test', or 'codebase_gotcha'.",
+                                @enum = new[] { "environment", "build_and_test", "codebase_gotcha" }
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -2078,7 +2208,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 function = new
                 {
                     name = "open_pull_request",
-                    description = "Submit the active branch for review (Stage 4 Two-Man Review Gate). Concludes implementation turn.",
+                    description = "Register a real GitHub Pull Request opened via 'agentmesh pr open' (or submit the active branch for Stage 4 Two-Man Review Gate). Run 'agentmesh pr open' in your persona container first.",
                     parameters = new
                     {
                         type = "object",
@@ -2097,7 +2227,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                 },
                                 required = new[] { "result", "reasoning", "risk" }
                             },
-                            branch_name = new { type = "string", description = "The local task branch to push (optional; defaults to the job's git branch)." }
+                            branch_name = new { type = "string", description = "The local task/job branch (optional; defaults to the job's git branch)." },
+                            pr_url = new { type = "string", description = "Real GitHub Pull Request URL returned by 'agentmesh pr open'." },
+                            pr_number = new { type = "integer", description = "Real GitHub Pull Request number returned by 'agentmesh pr open'." },
+                            head_sha = new { type = "string", description = "Current HEAD commit SHA pushed for this PR." }
                         },
                         required = new[] { "title", "summary_3r" }
                     }
@@ -2152,6 +2285,18 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return false;
     }
 
+    internal static string ResolveDefaultToolWorkingDirectory(string? cwd)
+    {
+        if (!string.IsNullOrWhiteSpace(cwd) &&
+            !string.Equals(cwd.Trim(), "/workspace", StringComparison.Ordinal) &&
+            !string.Equals(cwd.Trim(), "/workspace/repo", StringComparison.Ordinal))
+        {
+            return cwd.Trim();
+        }
+
+        return AgentAdapterFactory.ResolveWorkspaceDirectory();
+    }
+
     public static async Task<string> ExecuteToolLocallyAsync(
         string toolName,
         string argsJson,
@@ -2183,6 +2328,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string? agentId = null,
         bool isDiscoveryPhase = false)
     {
+        cwd = ResolveDefaultToolWorkingDirectory(cwd);
+
         try
         {
             using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
@@ -2218,6 +2365,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 case "post_job_message":
                 case "open_pull_request":
                 case "save_memory":
+                case "list_memories":
+                case "search_memory":
                 {
                     if (PlatformToolExecutor != null)
                     {
@@ -2468,7 +2617,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     {
         if (string.IsNullOrWhiteSpace(toolName)) return true;
         var name = toolName.Trim().ToLowerInvariant();
-        if (name is "read_file" or "view_file" or "ask_question" or "save_memory") return true;
+        if (name is "read_file" or "view_file" or "ask_question" or "save_memory" or "list_memories" or "search_memory") return true;
         if (name is "manage_task")
         {
             if (!string.IsNullOrWhiteSpace(argsJson))

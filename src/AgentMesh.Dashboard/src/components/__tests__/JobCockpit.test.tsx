@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { JobCockpit, getActiveMentionQuery, resolveTargetTaskId } from '../JobCockpit';
-import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type JobMessage, type Persona } from '../../types';
+import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type Persona } from '../../types';
 
 vi.mock('../../services/api', () => ({
   api: {
@@ -119,9 +119,7 @@ describe('JobCockpit - Header, Status, and Timeline Workspace', () => {
     project: mockProject,
     job: mockJob,
     tasks: mockJob.tasks,
-    messages: [] as JobMessage[],
     personas: mockPersonas,
-    onSendMessage: vi.fn(),
     onAddTask: vi.fn(),
     onToggleTask: vi.fn(),
     onDeleteTask: vi.fn(),

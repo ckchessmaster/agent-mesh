@@ -4,7 +4,6 @@ import type {
   AgentUsageResponse,
   DriverConfig,
   DriverSidecarConfig,
-  JobMessage,
   JobTask,
   AssignJobTaskResult,
   Persona,
@@ -1367,12 +1366,6 @@ export const api = {
     return res.json();
   },
 
-  async getJobMessages(id: string): Promise<JobMessage[]> {
-    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, { headers: getHeaders() });
-    if (!res.ok) throw new Error(`Failed to load job messages: ${res.statusText}`);
-    return res.json();
-  },
-
   /**
    * A job's artifacts — the job twin of `getSessionArtifacts`.
    *
@@ -1518,23 +1511,6 @@ export const api = {
         createdAt
       };
     });
-  },
-
-  async postJobMessage(id: string, req: {
-    content: string;
-    senderType?: string;
-    senderId?: string;
-    senderName?: string;
-    turnSessionId?: string;
-    attachments?: SessionAttachment[];
-  }): Promise<JobMessage> {
-    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/messages`, {
-      method: 'POST',
-      headers: getHeaders(),
-      body: JSON.stringify(req)
-    });
-    if (!res.ok) throw new Error(`Failed to post job message: ${res.statusText}`);
-    return res.json();
   },
 
   async approvePlan(jobId: string, approverRole?: string, comments?: string): Promise<{ success: boolean; approverId?: string; approverRole?: string }> {

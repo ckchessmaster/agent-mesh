@@ -49,7 +49,8 @@ public record PrReviewSignal(
     bool IsApproved,
     string? ReviewComments,
     DateTimeOffset Timestamp,
-    int? PrNumber = null);
+    int? PrNumber = null,
+    string? ApprovedHeadSha = null);
 
 /// <summary>
 /// Everything the workflow needs to drive one task to completion.
@@ -90,7 +91,8 @@ public record TaskExecutionInput(
     string? PersonaId = null,
     string? TurnSessionId = null,
     int? TaskIndex = null,
-    string? TaskTitle = null);
+    string? TaskTitle = null,
+    string? RemediationContext = null);
 
 /// <summary>
 /// The workflow's terminal result.
@@ -101,7 +103,9 @@ public record TaskExecutionResult(
     string? ErrorMessage = null,
     string? TaskId = null,
     string? FinalPrUrl = null,
-    string? Summary = null)
+    string? Summary = null,
+    int? PrNumber = null,
+    string? HeadSha = null)
 {
     public TaskExecutionResult(bool Success, string TaskId, string? FinalPrUrl, string Summary)
         : this(Success, Summary, TaskId, FinalPrUrl, Summary)

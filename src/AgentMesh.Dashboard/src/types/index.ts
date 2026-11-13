@@ -561,20 +561,6 @@ export interface ProjectJob {
   updatedAt: string;
 }
 
-export interface JobMessage {
-  id: string;
-  jobId: string;
-  senderType: 'user' | 'persona' | string;
-  senderId?: string | null;
-  senderName?: string | null;
-  content: string;
-  mentions: string[];
-  turnSessionId?: string | null;
-  structuredPayloadJson?: string | null;
-  attachments?: SessionAttachment[] | null;
-  createdAt: string;
-}
-
 export interface QueuedPromptItem {
   id: string;
   prompt: string;

@@ -66,8 +66,6 @@ vi.mock('../services/api', () => ({
     updateProject: vi.fn(),
     deleteProject: vi.fn(),
     createProjectJob: vi.fn(),
-    getProjectJobMessages: vi.fn().mockResolvedValue([]),
-    postProjectJobMessage: vi.fn(),
     getProjectJobTasks: vi.fn().mockResolvedValue([]),
     createProjectJobTask: vi.fn(),
     updateProjectJobTask: vi.fn(),

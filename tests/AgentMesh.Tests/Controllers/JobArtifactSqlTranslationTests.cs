@@ -43,26 +43,31 @@ public class JobArtifactSqlTranslationTests
     /// <c>job_messages</c>, not by a scan of <c>agent_sessions</c>.
     /// </remarks>
     [Fact]
-    public void TurnSessionLookup_RendersAgainstJobMessages_AndCarriesNoSessionScan()
+    public void TurnSessionLookup_RendersAgainstJobTimelineCardsAndWorkspaceStates_AndCarriesNoSessionScan()
     {
         using var db = Postgres();
         var jobId = Guid.NewGuid();
+        var jobIdStr = jobId.ToString();
 
-        var sql = db.JobMessages
+        var cardSql = db.JobTimelineCards
             .AsNoTracking()
-            .Where(m => m.JobId == jobId && m.TurnSessionId != null)
-            .Select(m => m.TurnSessionId!.Value)
-            .Distinct()
+            .Where(c => c.JobId == jobIdStr)
+            .Select(c => c.StructuredPayloadJson)
             .ToQueryString();
 
-        sql.Should().Contain("FROM job_messages");
-        sql.Should().Contain("WHERE");
-        sql.Should().Contain("turn_session_id");
-        sql.Should().Contain("DISTINCT");
-        // The whole point of keying history off job_messages: this lookup must never touch the sessions
-        // table, let alone sort it.
-        sql.Should().NotContain("agent_sessions");
-        sql.Should().NotContain("ORDER BY");
+        cardSql.Should().Contain("FROM job_timeline_cards");
+        cardSql.Should().Contain("WHERE");
+        cardSql.Should().NotContain("agent_sessions");
+        cardSql.Should().NotContain("ORDER BY");
+
+        var wsSql = db.JobWorkspaceStates
+            .AsNoTracking()
+            .Where(w => w.JobId == jobId)
+            .Select(w => new { w.LastSavedTurnSessionId, w.CheckpointTurnSessionId })
+            .ToQueryString();
+
+        wsSql.Should().Contain("FROM job_workspace_states");
+        wsSql.Should().NotContain("agent_sessions");
     }
 
     /// <summary>

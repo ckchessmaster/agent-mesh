@@ -15,8 +15,6 @@ import {
 } from 'lucide-react';
 import type {
   AgentSession,
-  AskQuestionItem,
-  JobMessage,
   JobTask,
   Persona,
   Project,
@@ -25,103 +23,8 @@ import type {
   SessionAttachment
 } from '../types';
 import { ProjectJobStatus } from '../types';
-import { parseTextQuestions } from './QuestionCard';
 import { JobSettingsModal } from './JobSettingsModal';
 import { CockpitLayout } from './cockpit/CockpitLayout';
-
-export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem[] {
-  if (msg.senderType === 'user') return [];
-
-  if (msg.structuredPayloadJson) {
-    try {
-      let p = JSON.parse(msg.structuredPayloadJson);
-      if (typeof p === 'string') {
-        try {
-          p = JSON.parse(p);
-        } catch {}
-      }
-      if (p) {
-        if (Array.isArray(p.questions)) return p.questions as AskQuestionItem[];
-        if (Array.isArray(p.Questions)) return p.Questions as AskQuestionItem[];
-        if (typeof p.questions === 'string') {
-          try {
-            const inner = JSON.parse(p.questions);
-            if (Array.isArray(inner)) return inner;
-          } catch {}
-        }
-        if (p.question) {
-          return [
-            {
-              question: p.question,
-              options: Array.isArray(p.options) ? p.options : [],
-              is_multi_select: !!p.is_multi_select
-            }
-          ];
-        }
-        if (Array.isArray(p) && p.length > 0 && (p[0].question || p[0].Question)) {
-          return p as AskQuestionItem[];
-        }
-        if (p.toolArgs && typeof p.toolArgs === 'object') {
-          if (Array.isArray(p.toolArgs.questions)) return p.toolArgs.questions;
-        }
-      }
-    } catch {}
-  }
-
-  return parseTextQuestions(msg.content);
-}
-
-export function extractJobMessageAttachments(msg: JobMessage): SessionAttachment[] {
-  if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
-    return msg.attachments;
-  }
-  if (!msg.structuredPayloadJson) return [];
-  try {
-    const parsed = JSON.parse(msg.structuredPayloadJson);
-    const rawList = Array.isArray(parsed?.attachments)
-      ? parsed.attachments
-      : Array.isArray(parsed?.Attachments)
-      ? parsed.Attachments
-      : null;
-
-    if (Array.isArray(rawList)) {
-      return rawList.map((item: any) => {
-        const id = item.id || item.Id || '';
-        const fileName = item.fileName || item.FileName || item.name || item.Name || '';
-        const contentType = item.contentType || item.ContentType || '';
-        const sizeBytes =
-          typeof item.sizeBytes === 'number'
-            ? item.sizeBytes
-            : typeof item.SizeBytes === 'number'
-            ? item.SizeBytes
-            : typeof item.size === 'number'
-            ? item.size
-            : 0;
-        const s3Key = item.s3Key || item.S3Key || '';
-        const targetId = id || fileName;
-        const downloadUrl =
-          item.downloadUrl ||
-          item.DownloadUrl ||
-          (targetId
-            ? `/api/project-jobs/${encodeURIComponent(msg.jobId)}/attachments/${encodeURIComponent(targetId)}/content`
-            : '');
-        const createdAt = item.createdAt || item.CreatedAt || msg.createdAt;
-
-        return {
-          id,
-          sessionId: msg.jobId,
-          fileName,
-          contentType,
-          sizeBytes,
-          s3Key,
-          downloadUrl,
-          createdAt
-        };
-      });
-    }
-  } catch {}
-  return [];
-}
 
 export interface StagedJobAttachmentItem {
   localId: string;
@@ -170,12 +73,10 @@ export interface JobCockpitProps {
   project: Project;
   job: ProjectJob;
   tasks: JobTask[];
-  messages: JobMessage[];
   personas?: Persona[];
   allowManualTaskCreation?: boolean;
   userRole?: string;
   onStartJob?: () => Promise<void>;
-  onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
   onAddTask?: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
   onToggleTask?: (taskId: string, isCompleted: boolean) => Promise<void>;
   onUpdateTask?: (

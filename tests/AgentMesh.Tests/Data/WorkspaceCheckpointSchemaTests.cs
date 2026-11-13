@@ -67,6 +67,23 @@ public class WorkspaceCheckpointSchemaTests
         Column("projects", "working_directory").GetColumnType().Should().Be("character varying(256)");
     }
 
+    [Fact]
+    public void JobPrompts_AreWidenedToUnboundedText_AndLegacyJobMessagesTableIsDropped()
+    {
+        Column("project_jobs", "description").GetColumnType().Should().Be("text");
+        Column("agent_jobs", "initial_prompt").GetColumnType().Should().Be("text");
+        Column("agent_jobs", "message_text").GetColumnType().Should().Be("text");
+
+        using var db = TestDbContextFactory.Postgres();
+        var tables = db.Model.GetEntityTypes().Select(e => e.GetTableName()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        tables.Should().NotContain("job_messages", "legacy flat-chat job_messages table was superseded by job_timeline_cards");
+        tables.Should().Contain("job_timeline_cards");
+        tables.Should().Contain("job_card_comments");
+        tables.Should().Contain("session_messages", "session_messages must remain untouched");
+        tables.Should().Contain("job_workspace_states", "job_workspace_states must remain untouched");
+    }
+
     /// <summary>
     /// The deviation from the spec's SQL sketch, pinned. See the class remarks.
     /// </summary>

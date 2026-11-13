@@ -74,10 +74,25 @@ public static class PlatformToolCallNormalizer
             else if (TryGetString(args, "headBranch", out var hb2)) args["branch_name"] = JsonSerializer.SerializeToElement(hb2);
         }
 
-        // Job ID aliases
+        // Job ID & PR linkage aliases
         if (!args.ContainsKey("job_id") && TryGetString(args, "jobId", out var jid))
         {
             args["job_id"] = JsonSerializer.SerializeToElement(jid);
+        }
+        if (!args.ContainsKey("pr_url") && TryGetString(args, "prUrl", out var pu))
+        {
+            args["pr_url"] = JsonSerializer.SerializeToElement(pu);
+        }
+        if (!args.ContainsKey("pr_number") && args.TryGetValue("prNumber", out var pnElem))
+        {
+            if (pnElem.ValueKind == JsonValueKind.Number && pnElem.TryGetInt32(out var pnNum))
+                args["pr_number"] = JsonSerializer.SerializeToElement(pnNum);
+            else if (pnElem.ValueKind == JsonValueKind.String && int.TryParse(pnElem.GetString(), out var pnParsed))
+                args["pr_number"] = JsonSerializer.SerializeToElement(pnParsed);
+        }
+        if (!args.ContainsKey("head_sha") && TryGetString(args, "headSha", out var hs))
+        {
+            args["head_sha"] = JsonSerializer.SerializeToElement(hs);
         }
 
         // Summary 3-R

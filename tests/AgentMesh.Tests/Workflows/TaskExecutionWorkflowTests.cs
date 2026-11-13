@@ -96,10 +96,11 @@ public class TaskExecutionWorkflowTests
     }
 
     /// <summary>
-    /// The workflow halts at PR creation and runs the merge activity when approved.
+    /// Child and macro task workflows never gate or merge per-task PRs: PR review and merge belong
+    /// exclusively to <see cref="JobExecutionWorkflow"/> Stage 4 once all checklist tasks complete.
     /// </summary>
     [Fact]
-    public async Task Workflow_BlocksOnPrReview_AndMergesWhenApproved()
+    public async Task Workflow_CompletesTaskWithoutPerTaskPrReviewOrMerge_AndPropagatesRecordedPrMetadata()
     {
         await using var env = await NewEnvironmentAsync();
         var turns = new FakeTurnActivity();
@@ -107,254 +108,20 @@ public class TaskExecutionWorkflowTests
         await using var worker = TestWorker.Start(env, turns, git);
 
         turns.Enqueue(TurnOutcome.AwaitingReview(
-            "https://github.com/ckchessmaster/agent-mesh/pull/18", 18, "PR opened for review."));
+            "https://github.com/ckchessmaster/agent-mesh/pull/18",
+            18,
+            "PR opened for job-level review.",
+            headSha: "abc1234567890"));
 
         var handle = await StartWorkflowAsync(env);
-
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
-        git.Calls.Should().BeEmpty("no review has arrived, so nothing may be merged");
-
-        var awaiting = await handle.QueryAsync(w => w.GetTaskStatus());
-        awaiting.PrUrl.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/18",
-            "the dashboard links the reviewer straight to the diff");
-
-        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
-            new PrReviewSignal("sorren", IsApproved: true, "Clean. Ship it.", DateTimeOffset.UtcNow, PrNumber: 18)));
-
         var result = await handle.GetResultAsync<TaskExecutionResult>();
 
         result.Success.Should().BeTrue();
         result.FinalPrUrl.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/18");
-        // ContainSingle + Be, not Equal(url, because): Equal's params overload would read the
-        // because-string as a second expected element and demand two merges.
-        git.Calls.Should().ContainSingle()
-            .Which.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/18",
-                "exactly one merge, against the PR the review was for");
-        result.Summary.Should().Contain("merged", "the summary reports what actually happened");
-
-        // One turn only. A second turn after approval would re-dispatch an agent onto work that has
-        // already landed, and it would push onto a branch whose PR is closed.
+        result.PrNumber.Should().Be(18);
+        result.HeadSha.Should().Be("abc1234567890");
+        git.Calls.Should().BeEmpty("TaskExecutionWorkflow must never merge per-task pull requests");
         turns.Calls.Should().Be(1);
-    }
-
-    /// <summary>
-    /// A non-retryable merge rejection halts the task with the reason, rather than crashing the run.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// <strong>The defect this pins.</strong> <c>GitActivities.MergePullRequestAsync</c> raises a
-    /// rejection — merge conflict, head moved after approval, not mergeable, no PR URL — as a
-    /// non-retryable <c>ApplicationFailureException</c>, and its comment states the workflow "catches
-    /// [it] and turns [it] into a halted task with the reason intact". It did not: the merge call sits
-    /// outside the <c>try/catch (IsTurnHalt)</c> that wraps the turn activity, so the exception escaped
-    /// the run and the workflow ended <em>Failed</em> with an unhandled <c>ActivityFailureException</c>.
-    /// </para>
-    /// <para>
-    /// That is not merely untidy. A crashed workflow returns no <see cref="TaskExecutionResult"/>, so
-    /// <c>_currentStatus</c> is never set to "Halted: …" and the operator polling the status endpoint
-    /// sees the last value written before the crash — <c>"Merging PR"</c> — forever. The one rejection
-    /// class that is <em>actionable by a human</em> ("the head moved after your approval, re-review
-    /// required") was reported as a stuck merge in progress. The fix is the same halt translation the
-    /// turn activity already gets, applied to the merge.
-    /// </para>
-    /// </remarks>
-    // `sha_moved` is the renamed `sha_mismatch`: the code now says what happened to the *approval*
-    // rather than to a hash, and it is one of two distinct 409 outcomes (the other being
-    // `merge_conflict`, which the job-level review loop turns into work instead of a re-review).
-    [Theory]
-    [InlineData("merge_conflict", "The head branch has conflicts with the base branch.")]
-    [InlineData("sha_moved", "The head moved after approval; re-review required.")]
-    [InlineData("not_mergeable", "GitHub reports this PR cannot be merged.")]
-    public async Task Workflow_NonRetryableMergeRejection_HaltsWithReason(
-        string errorType, string reason)
-    {
-        await using var env = await NewEnvironmentAsync();
-        var turns = new FakeTurnActivity();
-        var git = new FakeGitActivity
-        {
-            Failure = new Temporalio.Exceptions.ApplicationFailureException(
-                reason, nonRetryable: true, errorType: errorType),
-        };
-        await using var worker = TestWorker.Start(env, turns, git);
-
-        turns.Enqueue(TurnOutcome.AwaitingReview(
-            "https://github.com/ckchessmaster/agent-mesh/pull/18", 18, "PR opened for review."));
-
-        var handle = await StartWorkflowAsync(env);
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
-
-        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
-            new PrReviewSignal("sorren", IsApproved: true, "Clean. Ship it.", DateTimeOffset.UtcNow, 18)));
-
-        // The decisive assertion: GetResultAsync returns a result rather than throwing. Before the fix
-        // this line raised ActivityFailureException, because a crashed workflow has no result to hand
-        // back — which is exactly why the reason was unreachable for whoever was watching.
-        var result = await handle.GetResultAsync<TaskExecutionResult>();
-
-        result.Success.Should().BeFalse("a rejected merge is not a completed task");
-        result.Summary.Should().Contain(reason,
-            "the operator must see which rejection occurred, not that the workflow died");
-        result.FinalPrUrl.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/18",
-            "the PR still exists and still needs attention; dropping the URL would lose the pointer " +
-            "to the thing the human has to fix");
-
-        // And the status query must agree with the result, since the status endpoint is what a
-        // dashboard polls. "Merging PR" as a terminal state is the bug being fixed.
-        var status = await handle.QueryAsync(w => w.GetTaskStatus());
-        status.Status.Should().StartWith("Halted:").And.Contain(reason);
-        status.LastOutcome.Should().Be(TurnOutcomeStatus.Failed);
-
-        git.Calls.Should().ContainSingle()
-            .Which.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/18");
-        turns.Calls.Should().Be(1,
-            "a halted task must not start another coding turn after a rejected merge");
-    }
-
-    /// <summary>
-    /// A <em>transient</em> merge failure is still retried, and still exhausts into a visible failure.
-    /// </summary>
-    /// <remarks>
-    /// The counterpart to the rejection tests, and the reason the fix must be a filtered catch rather
-    /// than <c>catch (Exception)</c>. Rate limits and 5xx responses are raised as ordinary exceptions so
-    /// the merge activity's <c>RetryPolicy</c> applies; if the halt translation swallowed those, a
-    /// GitHub blip would be reported to the operator as a rejected merge and the task would halt
-    /// without ever retrying. This asserts the retry actually happens — three attempts, then the
-    /// workflow fails visibly, which is the correct outcome for an outage.
-    /// </remarks>
-    [Fact]
-    public async Task Workflow_TransientMergeFailure_IsRetriedAndFailsVisibly()
-    {
-        await using var env = await NewEnvironmentAsync();
-        var turns = new FakeTurnActivity();
-        var git = new FakeGitActivity
-        {
-            // Exactly what GitActivities throws for FailureReason == "api_error".
-            Failure = new InvalidOperationException(
-                "Merge of https://github.com/ckchessmaster/agent-mesh/pull/18 failed transiently " +
-                "(api_error): GitHub returned 503."),
-        };
-        await using var worker = TestWorker.Start(env, turns, git);
-
-        turns.Enqueue(TurnOutcome.AwaitingReview(
-            "https://github.com/ckchessmaster/agent-mesh/pull/18", 18, "PR opened for review."));
-
-        var handle = await StartWorkflowAsync(env);
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
-
-        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
-            new PrReviewSignal("sorren", IsApproved: true, "Clean. Ship it.", DateTimeOffset.UtcNow, 18)));
-
-        // No result to await: the workflow is expected to end Failed, which is the point. A catch-all
-        // here would return Success=false and make an outage look like a rejection.
-        //
-        // The type is WorkflowFailedException, not ActivityFailureException. Measured, not assumed: the
-        // client wraps the exhausted activity failure one level up when the workflow lets it escape the
-        // run, so asserting the inner type would fail for a reason unrelated to the behaviour under test.
-        // The 503 is still in the chain, which is what makes the failure diagnosable.
-        var act = async () => await handle.GetResultAsync<TaskExecutionResult>();
-
-        // Chain, measured: WorkflowFailedException -> ActivityFailureException("Activity task failed")
-        // -> ApplicationFailureException carrying the 503 text. Asserting the outermost type plus the
-        // deepest message covers both halves of the claim — the run failed rather than halted, and it
-        // failed for the reason the activity reported — without depending on how many wrappers the client
-        // happens to add.
-        var thrown = (await act.Should().ThrowAsync<Temporalio.Exceptions.WorkflowFailedException>());
-        thrown.WithInnerException<Temporalio.Exceptions.ActivityFailureException>();
-        thrown.And.Should().Match<Exception>(
-            e => Flatten(e).Contains("503"),
-            "the operator has to be able to see why the merge died; a bare 'Workflow failed' would make " +
-            "a GitHub outage indistinguishable from a bug in the workflow");
-
-        git.Calls.Should().HaveCount(3,
-            "MaximumAttempts = 3 on the merge RetryPolicy; a single attempt would mean the transient " +
-            "classification was lost and a GitHub blip halted a task that could have recovered");
-    }
-
-    /// <summary>
-    /// A real workflow cancellation during the merge propagates rather than becoming a halted result.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// The guarantee: an operator stopping a run must end it as <em>Cancelled</em>, not as
-    /// "Halted: …". The merge reuses <c>IsTurnHalt</c> rather than writing its own filter, and that
-    /// predicate explicitly refuses <c>CanceledFailureException</c> — so the guarantee carries over to
-    /// the new call site for free. It still needs a test of its own because the obvious implementation
-    /// of the new catch, <c>catch (Exception)</c>, would silently convert a human's stop into an agent
-    /// failure, and the merge sits in a branch of the run the turn-side tests cannot reach.
-    /// </para>
-    /// <para>
-    /// <strong>Why this cancels the workflow instead of throwing from the activity.</strong> An earlier
-    /// version of this test had the merge activity throw <c>OperationCanceledException</c> and asserted
-    /// the workflow ended cancelled. That premise was wrong, and the measurement is worth recording: the
-    /// .NET SDK converts an activity-side <c>OperationCanceledException</c> into a <em>non-retryable</em>
-    /// <c>ApplicationFailureException</c> before the workflow ever sees it (chain:
-    /// <c>ActivityFailureException → ApplicationFailureException("merge activity was cancelled")</c>), so
-    /// <c>IsTurnHalt</c> correctly reads it as a halt and the run ends "Halted: …". That is the right
-    /// outcome — an activity that abandons itself is a failed activity, not a cancelled workflow — but it
-    /// means the test proved nothing about cancellation. A genuine cancellation is a
-    /// <c>CanceledFailureException> raised in the workflow's own scope, which only a real
-    /// <c>CancelAsync</c> produces.
-    /// </para>
-    /// <para>
-    /// The activity therefore blocks on the SDK's own cancellation signal
-    /// (<c>ActivityExecutionContext.Current.CancellationToken</c>) rather than on a delay, so the test has
-    /// no timing dependency: the interface deliberately takes no cancellation-token parameter for
-    /// serialization reasons, and the execution context is the supported way to observe one.
-    /// </para>
-    /// </remarks>
-    [Fact]
-    public async Task Workflow_CancelledDuringMerge_PropagatesRatherThanHalting()
-    {
-        await using var env = await NewEnvironmentAsync();
-        var turns = new FakeTurnActivity();
-        var git = new FakeGitActivity { BlockUntilCancelled = true };
-        await using var worker = TestWorker.Start(env, turns, git);
-
-        turns.Enqueue(TurnOutcome.AwaitingReview(
-            "https://github.com/ckchessmaster/agent-mesh/pull/18", 18, "PR opened for review."));
-
-        var handle = await StartWorkflowAsync(env);
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
-
-        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
-            new PrReviewSignal("sorren", IsApproved: true, "Clean. Ship it.", DateTimeOffset.UtcNow, 18)));
-
-        // The merge is genuinely in flight before the cancel is issued, so the cancellation lands inside
-        // the try/catch added for the rejection handling rather than somewhere else in the run.
-        await WaitUntilAsync(handle, s => s.Status == "Merging PR");
-        await git.Entered.WaitAsync(TimeSpan.FromSeconds(20));
-
-        await handle.CancelAsync();
-
-        var act = async () => await handle.GetResultAsync<TaskExecutionResult>();
-
-        // The client surfaces a cancelled run as WorkflowFailedException wrapping
-        // CanceledFailureException("Workflow canceled"). The inner type is the whole assertion: had the
-        // new catch swallowed the cancellation, the run would have ended COMPLETED with a
-        // TaskExecutionResult and there would be no failure at all to unwrap — and the chain would name
-        // an ActivityFailureException instead, which is what a halt looks like.
-        (await act.Should().ThrowAsync<Temporalio.Exceptions.WorkflowFailedException>())
-            .WithInnerException<Temporalio.Exceptions.CanceledFailureException>()
-            .WithMessage("Workflow canceled");
-
-        // The activity was demonstrably in flight when the cancel was issued (Entered gated that above),
-        // and the run ended cancelled rather than returning a result. That is the claim.
-        //
-        // What is deliberately NOT asserted: that the activity itself observed its cancellation token.
-        // The merge activity is dispatched with the SDK default ActivityCancellationType.TryCancel, which
-        // tells the workflow "your task is cancelled" without waiting for the activity to acknowledge —
-        // so GetResultAsync throws while the activity may still be unwinding, and reading a flag it sets
-        // in its catch block is a race that loses more often than it wins. Asserting it would have made
-        // this test flaky without making it prove anything more: the branch under test is the workflow's
-        // catch filter, and the workflow's own terminal state is what that filter decides.
-
-        // And the status must not read as a halt. Asserted after the fact rather than as a live poll:
-        // a closed workflow still answers its queries from history, so this is the value the run ended
-        // with, not a race against teardown.
-        var status = await handle.QueryAsync(w => w.GetTaskStatus());
-        status.Status.Should().Be("Merging PR",
-            "the last status written before the cancellation is all there is; promoting it to " +
-            "'Halted: …' would report an operator's stop as an agent failure");
     }
 
     /// <summary>
@@ -598,73 +365,6 @@ public class TaskExecutionWorkflowTests
 
         var result = await handle.GetResultAsync<TaskExecutionResult>();
         result.Success.Should().BeTrue();
-    }
-
-    /// <summary>
-    /// A workflow that has no PR URL cannot be merged, and halts rather than crashing.
-    /// </summary>
-    /// <remarks>
-    /// Exercises the <c>no_pr_url</c> rejection class end to end. The activity throws non-retryable for it,
-    /// so without the merge-side halt translation this would crash the run exactly like a conflict did.
-    /// </remarks>
-    [Fact]
-    public async Task Workflow_MergeWithoutAPrUrl_HaltsRatherThanCrashing()
-    {
-        await using var env = await NewEnvironmentAsync();
-        var turns = new FakeTurnActivity();
-        var git = new FakeGitActivity
-        {
-            Failure = new Temporalio.Exceptions.ApplicationFailureException(
-                "Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url"),
-        };
-        await using var worker = TestWorker.Start(env, turns, git);
-
-        // AwaitingReview with no URL: reachable in production, because the ledger row can carry the flag
-        // without a link if the push succeeded and the gh call did not.
-        turns.Enqueue(new TurnOutcome(TurnOutcomeStatus.PrOpenedAwaitingReview, "PR up.", PrNumber: null));
-
-        var handle = await StartWorkflowAsync(env);
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
-
-        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
-            new PrReviewSignal("sorren", IsApproved: true, "Ship it.", DateTimeOffset.UtcNow, 18)));
-
-        var result = await handle.GetResultAsync<TaskExecutionResult>();
-
-        result.Success.Should().BeFalse();
-        result.Summary.Should().Contain("pull request URL");
-    }
-
-    /// <summary>
-    /// Changes requested sends the review comments back into a coding turn instead of merging.
-    /// </summary>
-    [Fact]
-    public async Task Workflow_ChangesRequested_ResumesCodingTurnWithReviewComments()
-    {
-        await using var env = await NewEnvironmentAsync();
-        var turns = new FakeTurnActivity();
-        var git = new FakeGitActivity();
-        await using var worker = TestWorker.Start(env, turns, git);
-
-        turns.Enqueue(TurnOutcome.AwaitingReview("https://github.com/o/r/pull/9", 9, "PR up."));
-        turns.Enqueue(TurnOutcome.Completed("Addressed the review."));
-
-        var handle = await StartWorkflowAsync(env);
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
-
-        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
-            new PrReviewSignal("sorren", IsApproved: false, "Line 42 leaks the token.", DateTimeOffset.UtcNow, 9)));
-
-        var result = await handle.GetResultAsync<TaskExecutionResult>();
-
-        git.Calls.Should().BeEmpty("a rejected review must never merge");
-        result.Success.Should().BeTrue();
-
-        // The feedback has to arrive as the resumed turn's pending reply. If it were dropped, the agent
-        // would re-open the PR unchanged and the reviewer would be asked to review the same diff twice.
-        turns.PendingReplyAt(1).Should().NotBeNull();
-        turns.PendingReplyAt(1)!.Content.Should().Contain("Line 42 leaks the token");
-        turns.PendingReplyAt(1)!.SenderId.Should().Be("sorren");
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -985,41 +685,6 @@ public class TaskExecutionWorkflowTests
         await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
             new ChatMessageSignal("operator", "answer", DateTimeOffset.UtcNow, "m-1")));
         await handle.GetResultAsync<TaskExecutionResult>();
-    }
-
-    /// <summary>
-    /// A non-retryable merge failure halts the task cleanly with status and structured result rather than crashing with an unhandled exception.
-    /// </summary>
-    [Fact]
-    public async Task Workflow_NonRetryableMergeFailure_HaltsCleanlyAndReportsReason()
-    {
-        await using var env = await NewEnvironmentAsync();
-        var turns = new FakeTurnActivity();
-        var git = new FakeGitActivity
-        {
-            FailureToThrow = new Temporalio.Exceptions.ApplicationFailureException(
-                "Merge conflict detected on https://github.com/o/r/pull/18",
-                nonRetryable: true,
-                errorType: "merge_conflict")
-        };
-        await using var worker = TestWorker.Start(env, turns, git);
-
-        turns.Enqueue(TurnOutcome.AwaitingReview("https://github.com/o/r/pull/18", 18, "Review ready"));
-
-        var handle = await StartWorkflowAsync(env);
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
-
-        await handle.SignalAsync(w => w.ReceivePrReviewSignalAsync(
-            new PrReviewSignal("sorren", IsApproved: true, "Approved", DateTimeOffset.UtcNow, 18)));
-
-        var result = await handle.GetResultAsync<TaskExecutionResult>();
-
-        result.Success.Should().BeFalse();
-        result.Summary.Should().Contain("Merge conflict detected");
-        git.Calls.Should().ContainSingle();
-
-        var finalStatus = await handle.QueryAsync(w => w.GetTaskStatus());
-        finalStatus.Status.Should().StartWith("Halted: ").And.Contain("Merge conflict detected");
     }
 
     /// <summary>

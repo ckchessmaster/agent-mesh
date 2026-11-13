@@ -216,32 +216,55 @@ public class PlatformMcpTools(
             string.Equals(firstToken[1..].TrimEnd(':', ','), target, StringComparison.OrdinalIgnoreCase);
         var renderedContent = alreadyMentioned ? body : $"@{target} {body}";
 
+        var authorPersonaId = sender.PersonaId ?? sender.AgentId ?? "unknown";
+        var driverId = context.Context.DriverId ?? sender.AgentId;
+        var cardType = requires_reply
+            ? TimelineCardType.Escalation3R
+            : (target != OperatorPersonaId
+                ? TimelineCardType.InternalConsultation
+                : TimelineCardType.TaskStep);
+        var cardStatus = requires_reply
+            ? TimelineCardStatus.PendingInput
+            : TimelineCardStatus.Active;
+
         var payload = new Dictionary<string, object?>
         {
+            ["content"] = renderedContent,
             ["requiresReply"] = requires_reply,
             ["targetPersona"] = target,
-            ["senderPersona"] = sender.PersonaId,
-            ["senderAgent"] = sender.AgentId,
+            ["senderPersona"] = authorPersonaId,
+            ["authorPersonaId"] = authorPersonaId,
+            ["driverId"] = driverId,
+            ["turnSessionId"] = context.Context.SessionId,
+            ["mentions"] = new[] { target },
             ["source"] = "mcp:post_job_message",
         };
 
-        var message = new JobMessage
+        var cardTitle = requires_reply
+            ? $"Escalation from @{authorPersonaId} to @{target}"
+            : (target != OperatorPersonaId
+                ? $"Consultation: @{authorPersonaId} -> @{target}"
+                : $"Update from @{authorPersonaId}");
+        if (cardTitle.Length > 256)
+        {
+            cardTitle = cardTitle[..256];
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var card = new JobTimelineCard
         {
             Id = Guid.NewGuid(),
-            JobId = job.Id,
-            SenderType = "persona",
-            SenderId = sender.PersonaId,
-            SenderName = sender.DisplayName,
-            Content = renderedContent,
-            // The mention list is what the Cockpit parses to highlight a recipient; the operator is
-            // recorded too so a reply can be routed back, even though nothing pings a human.
-            MentionsJson = JsonSerializer.Serialize(new[] { target }, BlobOptions),
-            TurnSessionId = context.Context.SessionId,
+            JobId = job.Id.ToString(),
+            TaskId = context.Context.TaskId ?? job.CurrentTaskId,
+            CardType = cardType,
+            Status = cardStatus,
+            Title = cardTitle,
             StructuredPayloadJson = JsonSerializer.Serialize(payload, JsonOptions),
-            CreatedAt = DateTimeOffset.UtcNow,
+            CreatedAt = now,
+            UpdatedAt = now,
         };
 
-        db.JobMessages.Add(message);
+        db.JobTimelineCards.Add(card);
 
         var parkedSession = requires_reply ? await ParkSessionAsync(context.Context.SessionId, ct) : null;
         if (requires_reply && IsJobInDiscoveryPhase(job, context.Context))
@@ -268,50 +291,35 @@ public class PlatformMcpTools(
         await db.SaveChangesAsync(ct);
 
         logger.LogInformation(
-            "post_job_message: job={JobId} from={Sender} to={Target} requiresReply={RequiresReply} message={MessageId}",
-            job.Id, sender.PersonaId, target, requires_reply, message.Id);
+            "post_job_message: job={JobId} from={Persona} (driver={Driver}) to={Target} requiresReply={RequiresReply} card={CardId} type={CardType}",
+            job.Id, authorPersonaId, driverId ?? "(none)", target, requires_reply, card.Id, card.CardType);
 
-        await hubContext.Clients.All.SendAsync("JobMessageCreated", ProjectJobsController.ToMessageDto(message), ct);
+        await hubContext.Clients.Group($"job-{job.Id}")
+            .SendAsync("ReceiveTimelineCardUpdated", card, ct);
 
         if (parkedSession is not null)
         {
             await hubContext.Clients.All.SendAsync("SessionUpdated", parkedSession, ct);
         }
 
-        // Route into a parked macro workflow, if this job has one.
-        //
-        // This is the escalation channel, so it is the one that mattered. An orchestrated agent blocks
-        // with post_job_message(requires_reply: true, target_persona: "astra") and parks in
-        // AwaitingInput; the only party who can answer is another persona, and another persona answers
-        // through THIS tool, not through the REST endpoint. Routing only the REST path therefore left
-        // every cross-persona escalation — the normal shape of two-man review in this product —
-        // undeliverable, and the task sat for the full seven days.
-        //
-        // Every message is offered, including the sender's own escalation, and the workflow decides.
-        // That is not sloppiness: an escalation from the orchestrated persona arrives while its own turn
-        // is still running, so the workflow has not reached WaitConditionAsync yet and the signal would
-        // be buffered into _chatInbox — which releases the park the instant it is entered, making the
-        // durable pause a no-op that costs a turn. TaskExecutionWorkflow.ReceiveChatMessageAsync drops
-        // self-sent signals and counts the drop, so the ordering hazard is closed at the one place that
-        // knows who the run belongs to. Filtering here instead would need this tool to resolve the
-        // workflow's persona, which it cannot do without a second round trip.
-        //
-        // Never fails the tool. The message is committed and broadcast above; a Temporal outage must not
-        // make a delivered message look undeliverable to the agent that sent it.
-        await RouteReplyToWorkflowAsync(job.Id, message, sender, target, ct);
+        await RouteReplyToWorkflowAsync(job.Id, card, renderedContent, sender, target, ct);
 
         return JsonSerializer.Serialize(new
         {
             success = true,
-            messageId = message.Id,
+            cardId = card.Id,
+            messageId = card.Id,
+            cardType = card.CardType.ToString(),
+            cardStatus = card.Status.ToString(),
             jobId = job.Id,
+            authorPersona = authorPersonaId,
             targetPersona = target,
             requiresReply = requires_reply,
             sessionStatus = parkedSession?.Status,
             message = requires_reply
-                ? $"Message posted to the Job Chat and addressed to @{target}. The session is now waiting for input; " +
+                ? $"Escalation card posted to the Job Timeline and addressed to @{target}. The session is now waiting for input; " +
                   "conclude your turn and continue when the reply arrives."
-                : $"Message posted to the Job Chat and addressed to @{target}.",
+                : $"Timeline card posted to the Job Timeline and addressed to @{target}.",
             resolvedFrom = ResolveProvenance(context.Context),
         }, JsonOptions);
     }
@@ -371,7 +379,8 @@ public class PlatformMcpTools(
     /// </remarks>
     private async Task RouteReplyToWorkflowAsync(
         Guid jobId,
-        JobMessage message,
+        JobTimelineCard card,
+        string renderedContent,
         SenderIdentity sender,
         string? targetPersona,
         CancellationToken ct)
@@ -391,12 +400,9 @@ public class PlatformMcpTools(
                 jobId,
                 new Core.Workflows.ChatMessageSignal(
                     SenderId: sender.PersonaId ?? sender.AgentId ?? "unknown",
-                    Content: message.Content,
-                    Timestamp: message.CreatedAt,
-                    // The persisted row's id is the dedup key, matching the REST path: a retried call
-                    // re-sends the same id and the workflow drops the duplicate rather than rendering the
-                    // same reply twice.
-                    MessageId: message.Id.ToString(),
+                    Content: renderedContent,
+                    Timestamp: card.CreatedAt,
+                    MessageId: card.Id.ToString(),
                     TargetPersonaIds: targetPersonaIds),
                 timeoutCts.Token);
 
@@ -419,15 +425,18 @@ public class PlatformMcpTools(
     // Tool 2: manage_task
     // ──────────────────────────────────────────────────────────────────────────────
 
+    public const int MinChecklistTasks = 1;
+    public const int MaxChecklistTasks = 25;
+
     [McpServerTool(Name = "manage_task")]
     [Description(
-        "Inspect, set or update checklist tasks in the current active job. Use set_checklist to register 3-6 tasks, " +
+        "Inspect, set or update checklist tasks in the current active job. Use set_checklist to register atomic tasks sized to the scope of the work (typically 3-6, up to 25), " +
         "list_all or get_checklist to see tasks, get_details for one task, and update_task_status (or set_status) to move a task through " +
         "todo -> in_progress -> awaiting_review -> completed.")]
     public Task<string> ManageTask(
         [Description("Action to perform: 'set_checklist', 'update_task_status', 'get_checklist', 'get_details', 'set_status', or 'list_all'.")]
         string action,
-        [Description("List of 3 to 6 atomic tasks when action is 'set_checklist'.")]
+        [Description("List of atomic, verifiable tasks when action is 'set_checklist' (1 to 25 tasks; typically 3-6 for standard features).")]
         IReadOnlyList<ChecklistTaskItem>? tasks = null,
         [Description("The task identifier (required for get_details and update_task_status). Run get_checklist first to obtain it.")]
         string? task_id = null,
@@ -482,23 +491,16 @@ public class PlatformMcpTools(
 
         if (normalizedAction == PlatformToolSchema.ActionSetChecklist)
         {
-            if (args.Tasks is null || args.Tasks.Count == 0)
+            if (args.Tasks is null || args.Tasks.Count < MinChecklistTasks)
             {
                 return Error("missing_tasks", "set_checklist requires a non-empty list of tasks.");
             }
 
-            if (args.Tasks.Count > 6)
+            if (args.Tasks.Count > MaxChecklistTasks)
             {
                 return Error("task_count_exceeded",
-                    $"Breakdown exceeds maximum of 6 tasks (received {args.Tasks.Count}). Please consolidate tasks into 3 to 6 atomic, verifiable tasks.",
-                    details: new { taskCount = args.Tasks.Count, minTasks = 3, maxTasks = 6 });
-            }
-
-            if (args.Tasks.Count < 3)
-            {
-                return Error("task_count_below_minimum",
-                    $"Breakdown requires a minimum of 3 tasks (received {args.Tasks.Count}). Please decompose the job into 3 to 6 atomic, verifiable tasks.",
-                    details: new { taskCount = args.Tasks.Count, minTasks = 3, maxTasks = 6 });
+                    $"Breakdown exceeds sanity ceiling of {MaxChecklistTasks} tasks (received {args.Tasks.Count}). Keep tasks atomic and focused (typically 3–6 tasks for standard features, up to {MaxChecklistTasks} max).",
+                    details: new { taskCount = args.Tasks.Count, minTasks = MinChecklistTasks, maxTasks = MaxChecklistTasks });
             }
 
             var newTasks = args.Tasks.Select(item => new JobTaskDto
@@ -920,23 +922,26 @@ public class PlatformMcpTools(
 
     [McpServerTool(Name = "open_pull_request")]
     [Description(
-        "Pushes the current working branch and opens a GitHub Pull Request against the base branch, using " +
-        "credentials held by the control plane rather than by your container. Formats the PR body with the " +
-        "3-R template and requests review from the project's lead. Commit your work first: this pushes " +
-        "what is already committed and does not stage or commit anything.")]
+        "Registers a real GitHub Pull Request opened via 'agentmesh pr open' (with pr_url, pr_number, head_sha) on the active job, " +
+        "or pushes and opens a PR when control-plane credentials and workspace access are configured. Prefer running " +
+        "'agentmesh pr open' in your persona container first so base-branch sync, git push, and PR creation use your persona credentials.")]
     public Task<string> OpenPullRequest(
         [Description("Conventional commit title, e.g. 'feat(dashboard): add lazy paging to session list'.")]
         string title,
         [Description("The structured 3-R summary that becomes the PR body.")]
         Summary3R summary_3r,
-        [Description("The local task branch to push, e.g. 'feat/task-205-session-paging'. If omitted, uses the branch recorded for this job.")]
+        [Description("The local task/job branch, e.g. 'mesh/job-a5b3ad3f'. If omitted, uses the branch recorded for this job.")]
         string? branch_name = null,
         [Description("Optional job GUID. Only needed when calling outside a dispatched job turn.")]
         string? job_id = null,
+        [Description("Real GitHub Pull Request URL created by 'agentmesh pr open'.")]
+        string? pr_url = null,
+        [Description("Real GitHub Pull Request number created by 'agentmesh pr open'.")]
+        int? pr_number = null,
+        [Description("Current HEAD commit SHA pushed for this PR.")]
+        string? head_sha = null,
         CancellationToken ct = default) =>
-        // 'summary_3r' is spelled with the underscore because the library derives the published
-        // property name from the parameter name; the spec fixes that name on the wire.
-        OpenPullRequestAsync(new OpenPullRequestArgs(title, summary_3r, branch_name), job_id, ct);
+        OpenPullRequestAsync(new OpenPullRequestArgs(title, summary_3r, branch_name, pr_url, pr_number, head_sha), job_id, ct);
 
     /// <summary>
     /// The domain entry point behind <c>open_pull_request</c>.
@@ -1004,75 +1009,149 @@ public class PlatformMcpTools(
 
         var (owner, repo) = ResolveRepository(remoteUrl);
         var reviewer = await ResolveReviewerAsync(project, ct);
-
         var sender = SenderIdentity.For(context.Context);
+        var authorPersonaId = sender?.PersonaId ?? sender?.AgentId ?? "agentmesh";
+        var driverId = context.Context.DriverId ?? sender?.AgentId;
 
-        var result = await pullRequests.PushBranchAndCreatePrAsync(new GitHubPullRequestRequest(
-            Title: title.Trim(),
-            Summary: summary_3r,
-            HeadBranch: headBranch.Trim(),
-            BaseBranch: baseBranch,
-            WorkingDirectory: workspace,
-            RemoteUrl: remoteUrl,
-            RepositoryOwner: owner,
-            RepositoryName: repo,
-            ReviewerLogin: reviewer.Login,
-            SenderAgentId: sender?.PersonaId ?? sender?.AgentId,
-            TeamLeadAgentId: reviewer.Login), ct);
+        int resolvedPrNumber;
+        string resolvedPrUrl;
+        string resolvedHeadBranch = headBranch.Trim();
+        string resolvedBaseBranch = baseBranch;
+        string resolvedMessage;
+        string linkageSource;
 
-        if (!result.Success)
+        if (!string.IsNullOrWhiteSpace(args.PrUrl) && args.PrNumber is int explicitPrNumber && explicitPrNumber > 0)
         {
-            logger.LogWarning(
-                "open_pull_request failed for job {JobId}: {Reason} — {Message}",
-                job.Id, result.FailureReason, result.Message);
-
-            return Error(result.FailureReason ?? "pr_failed", result.Message, details: new
+            resolvedPrNumber = explicitPrNumber;
+            resolvedPrUrl = args.PrUrl.Trim();
+            linkageSource = "cli:agentmesh_pr_open";
+            resolvedMessage = $"PR #{resolvedPrNumber} opened: {resolvedPrUrl}";
+            if (!string.IsNullOrWhiteSpace(reviewer.Login))
             {
-                headBranch,
-                baseBranch,
-                workspaceDirectory = workspace,
-                repository = owner is not null && repo is not null ? $"{owner}/{repo}" : null,
-                hint = result.FailureReason == "no_working_directory"
-                    ? "The control plane cannot see a checkout for this job. Save the workspace first " +
-                      "(POST /api/job-workspace/{jobId}/save), or run the API and the runner on the same filesystem."
-                    : null,
-            });
+                resolvedMessage += $". Awaiting review from @{reviewer.Login}.";
+            }
+        }
+        else
+        {
+            var result = await pullRequests.PushBranchAndCreatePrAsync(new GitHubPullRequestRequest(
+                Title: title.Trim(),
+                Summary: summary_3r,
+                HeadBranch: headBranch.Trim(),
+                BaseBranch: baseBranch,
+                WorkingDirectory: workspace,
+                RemoteUrl: remoteUrl,
+                RepositoryOwner: owner,
+                RepositoryName: repo,
+                ReviewerLogin: reviewer.Login,
+                SenderAgentId: sender?.PersonaId ?? sender?.AgentId,
+                TeamLeadAgentId: reviewer.Login), ct);
+
+            if (!result.Success || result.Simulated || result.PrNumber is null || string.IsNullOrWhiteSpace(result.PrUrl))
+            {
+                var reason = result.FailureReason ?? "pr_requires_persona_cli";
+                logger.LogWarning(
+                    "open_pull_request failed for job {JobId}: {Reason} — {Message}",
+                    job.Id, reason, result.Message);
+
+                var cliInstruction =
+                    $"Run `agentmesh pr open --title \"{title.Trim().Replace("\"", "'")}\" " +
+                    $"--result \"{summary_3r.Result.Trim().Replace("\"", "'")}\" " +
+                    $"--reasoning \"{(summary_3r.Reasoning ?? "").Trim().Replace("\"", "'")}\" " +
+                    $"--risk \"{(summary_3r.Risk ?? "").Trim().Replace("\"", "'")}\"` " +
+                    "inside your persona container to sync main, push the branch with your persona credentials, and open/register the real GitHub PR.";
+
+                return Error(reason, $"{result.Message} {cliInstruction}", details: new
+                {
+                    headBranch,
+                    baseBranch,
+                    workspaceDirectory = workspace,
+                    repository = owner is not null && repo is not null ? $"{owner}/{repo}" : null,
+                    recommendedCommand = cliInstruction,
+                    hint = reason == "no_working_directory"
+                        ? $"Run `agentmesh pr open` inside your persona container (or Save the workspace first via POST /api/job-workspace/{job.Id}/save)."
+                        : cliInstruction,
+                });
+            }
+
+            resolvedPrNumber = result.PrNumber.Value;
+            resolvedPrUrl = result.PrUrl;
+            resolvedHeadBranch = result.HeadBranch ?? headBranch.Trim();
+            resolvedBaseBranch = result.BaseBranch ?? baseBranch;
+            resolvedMessage = result.Message;
+            linkageSource = "mcp:open_pull_request";
         }
 
-        // Linkage. The job and task rows have no PR column, and adding one means a migration; the
-        // durable, already-rendered place to put it is the job ledger, which is what the Cockpit
-        // reads and what a later turn re-reads. The active task also carries the note so
-        // get_details answers "where is this work?".
         var activeTask = ProjectJobsController.ResolveTargetTask(
             ProjectJobsController.ParseTasks(job.TasksJson), sender?.PersonaId);
 
         var linkage = new Dictionary<string, object?>
         {
-            ["prNumber"] = result.PrNumber,
-            ["prUrl"] = result.PrUrl,
-            ["headBranch"] = result.HeadBranch,
-            ["baseBranch"] = result.BaseBranch,
+            ["prNumber"] = resolvedPrNumber,
+            ["prUrl"] = resolvedPrUrl,
+            ["headSha"] = string.IsNullOrWhiteSpace(args.HeadSha) ? null : args.HeadSha.Trim(),
+            ["headBranch"] = resolvedHeadBranch,
+            ["baseBranch"] = resolvedBaseBranch,
             ["reviewer"] = reviewer.Login,
-            ["simulated"] = result.Simulated,
-            ["source"] = "mcp:open_pull_request",
+            ["simulated"] = false,
+            ["senderPersona"] = authorPersonaId,
+            ["authorPersonaId"] = authorPersonaId,
+            ["driverId"] = driverId,
+            ["turnSessionId"] = context.Context.SessionId,
+            ["content"] = resolvedMessage,
+            ["summary3R"] = summary_3r,
+            ["mentions"] = string.IsNullOrWhiteSpace(reviewer.Login) ? Array.Empty<string>() : new[] { reviewer.Login },
+            ["source"] = linkageSource,
         };
 
-        var notification = new JobMessage
+        var cardTitle = $"PR #{resolvedPrNumber}: {title.Trim()}";
+        if (cardTitle.Length > 256)
         {
-            Id = Guid.NewGuid(),
-            JobId = job.Id,
-            SenderType = "persona",
-            SenderId = sender?.PersonaId ?? sender?.AgentId ?? "agentmesh",
-            SenderName = sender?.DisplayName ?? "AgentMesh",
-            Content = result.Message,
-            MentionsJson = JsonSerializer.Serialize(
-                string.IsNullOrWhiteSpace(reviewer.Login) ? Array.Empty<string>() : new[] { reviewer.Login }, BlobOptions),
-            TurnSessionId = context.Context.SessionId,
-            StructuredPayloadJson = JsonSerializer.Serialize(linkage, JsonOptions),
-            CreatedAt = DateTimeOffset.UtcNow,
-        };
+            cardTitle = cardTitle[..256];
+        }
 
-        db.JobMessages.Add(notification);
+        var now = DateTimeOffset.UtcNow;
+        var jobIdStr = job.Id.ToString();
+        var existingCards = await db.JobTimelineCards
+            .Where(c => c.JobId == jobIdStr && c.CardType == TimelineCardType.PrReview)
+            .OrderByDescending(c => c.CreatedAt)
+            .ToListAsync(ct);
+
+        var prCard = existingCards.FirstOrDefault(c =>
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(c.StructuredPayloadJson);
+                return doc.RootElement.ValueKind == JsonValueKind.Object &&
+                       doc.RootElement.TryGetProperty("prNumber", out var p) &&
+                       p.TryGetInt32(out var n) &&
+                       n == resolvedPrNumber;
+            }
+            catch { return false; }
+        });
+
+        if (prCard is not null)
+        {
+            prCard.Status = TimelineCardStatus.PendingInput;
+            prCard.Title = cardTitle;
+            prCard.StructuredPayloadJson = JsonSerializer.Serialize(linkage, JsonOptions);
+            prCard.UpdatedAt = now;
+        }
+        else
+        {
+            prCard = new JobTimelineCard
+            {
+                Id = Guid.NewGuid(),
+                JobId = jobIdStr,
+                TaskId = activeTask?.Id.ToString() ?? context.Context.TaskId ?? job.CurrentTaskId,
+                CardType = TimelineCardType.PrReview,
+                Status = TimelineCardStatus.PendingInput,
+                Title = cardTitle,
+                StructuredPayloadJson = JsonSerializer.Serialize(linkage, JsonOptions),
+                CreatedAt = now,
+                UpdatedAt = now,
+            };
+            db.JobTimelineCards.Add(prCard);
+        }
 
         if (activeTask is not null)
         {
@@ -1080,16 +1159,17 @@ public class PlatformMcpTools(
             var match = tasks.FirstOrDefault(t => t.Id == activeTask.Id);
             if (match is not null)
             {
-                match.StatusNotes = result.Message;
+                match.StatusNotes = $"[@{authorPersonaId}] {resolvedMessage}";
                 job.TasksJson = JsonSerializer.Serialize(tasks, BlobOptions);
             }
         }
 
-        job.ProgressHeartbeat = $"Awaiting pull request review (PR #{result.PrNumber})";
-        job.UpdatedAt = DateTimeOffset.UtcNow;
+        job.ProgressHeartbeat = $"Awaiting pull request review (PR #{resolvedPrNumber})";
+        job.UpdatedAt = now;
         await db.SaveChangesAsync(ct);
 
-        await hubContext.Clients.All.SendAsync("JobMessageCreated", ProjectJobsController.ToMessageDto(notification), ct);
+        await hubContext.Clients.Group($"job-{job.Id}")
+            .SendAsync("ReceiveTimelineCardUpdated", prCard, ct);
         await hubContext.Clients.All.SendAsync("ProgressHeartbeatUpdated", new
         {
             jobId = job.Id,
@@ -1104,25 +1184,23 @@ public class PlatformMcpTools(
         }
 
         logger.LogInformation(
-            "open_pull_request: job={JobId} branch={Branch} -> {Base} as PR #{PrNumber} (simulated={Simulated})",
-            job.Id, result.HeadBranch, result.BaseBranch, result.PrNumber, result.Simulated);
+            "open_pull_request: job={JobId} branch={Branch} -> {Base} as PR #{PrNumber} (headSha={HeadSha}, source={Source})",
+            job.Id, resolvedHeadBranch, resolvedBaseBranch, resolvedPrNumber, args.HeadSha ?? "(none)", linkageSource);
 
         return JsonSerializer.Serialize(new
         {
             success = true,
-            pr_number = result.PrNumber,
-            pr_url = result.PrUrl,
+            cardId = prCard.Id,
+            pr_number = resolvedPrNumber,
+            pr_url = resolvedPrUrl,
+            head_sha = args.HeadSha,
             status = "awaiting_review",
-            simulated = result.Simulated,
-            headBranch = result.HeadBranch,
-            baseBranch = result.BaseBranch,
+            simulated = false,
+            headBranch = resolvedHeadBranch,
+            baseBranch = resolvedBaseBranch,
             reviewer = reviewer.Login,
-            message = result.Message,
-            nextStep = result.Simulated
-                ? "Nothing was pushed and no review was requested (no GitHub token configured). Configure " +
-                  "GitHub:Token before relying on this result."
-                : "Call manage_task with action='set_status' and status='awaiting_review' when you are ready " +
-                  "for the checklist item to show as in review.",
+            message = resolvedMessage,
+            nextStep = "Await Two-Man Review approval before merging.",
             resolvedFrom = ResolveProvenance(context.Context) with { workspace = workspace },
         }, JsonOptions);
     }
@@ -1289,6 +1367,7 @@ public class PlatformMcpTools(
 
     private sealed record Provenance(
         string? persona,
+        string? driver,
         string? agent,
         string? session,
         string? job,
@@ -1296,6 +1375,7 @@ public class PlatformMcpTools(
 
     private static Provenance ResolveProvenance(PlatformCallContext context) => new(
         persona: context.PersonaIdSource,
+        driver: context.DriverIdSource,
         agent: context.AgentIdSource,
         session: context.SessionIdSource,
         job: context.JobIdSource,

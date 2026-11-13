@@ -1,3 +1,4 @@
+using AgentMesh.Cli.Commands;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
 using AgentMesh.Cli.UI;
@@ -18,6 +19,16 @@ public static class Program
 
         var configStore = new ConfigStore();
         var config = configStore.Load();
+
+        // Dispatch `agentmesh pr <sync|open|merge>` directly before generic runner flags consume short switches
+        if (args.Length > 0 && string.Equals(args[0], "pr", StringComparison.OrdinalIgnoreCase))
+        {
+            return await PrCommand.ExecuteAsync(
+                args.Skip(1).ToList(),
+                config,
+                configStore,
+                ct: cts.Token);
+        }
 
         // Parse global options (--url, --token, --command, --role, --adapter, --name, --once, --persona, --driver, --headless)
         var positional = new List<string>();
@@ -378,6 +389,7 @@ public static class Program
         AnsiConsole.MarkupLine("  [cyan]agentmesh[/]                             Launch interactive multi-agent TUI dashboard");
         AnsiConsole.MarkupLine("  [cyan]agentmesh tui [[agent1 agent2...]][/]      Launch TUI and immediately start specified agents");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start <agent1> [[agent2...]][/]  Start and connect one or more agents (e.g. agy, claude, test)");
+        AnsiConsole.MarkupLine("  [cyan]agentmesh pr <sync|open|merge>[/]         Sync base branch, push & open 3-R PR, or merge with SHA guard");
         AnsiConsole.MarkupLine("  [cyan]agentmesh run --persona <id> [[options]][/] Start as a dedicated persona runner");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start --all[/]                 Start all configured agent presets concurrently");
         AnsiConsole.MarkupLine("  [cyan]agentmesh list[/]                        Show all local presets and live Mesh connection status");

@@ -44,14 +44,16 @@ public class JobHandoffServiceTests : IDisposable
         db.Personas.Add(new Persona { Id = "sorrn", Name = "Sorrn", Role = "Architect", DriverId = "runner-sorrn" });
         db.Agents.Add(new Agent { Id = "runner-rook", Name = "Rook Runner", RuntimeType = RuntimeType.CliAgy });
         db.Agents.Add(new Agent { Id = "runner-sorrn", Name = "Sorrn Runner", RuntimeType = RuntimeType.CliAgy });
-        db.JobMessages.Add(new JobMessage
+        db.JobTimelineCards.Add(new JobTimelineCard
         {
             Id = Guid.NewGuid(),
-            JobId = jobId,
-            SenderType = "persona",
-            SenderId = "rook",
-            Content = "Pushed the retry logic, @sorrn please review the ordering assumptions.",
-            CreatedAt = DateTimeOffset.UtcNow
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.InternalConsultation,
+            Status = TimelineCardStatus.Active,
+            Title = "Consultation (@rook -> @sorrn)",
+            StructuredPayloadJson = "{\"content\":\"Pushed the retry logic, @sorrn please review the ordering assumptions.\",\"authorPersonaId\":\"rook\",\"senderPersona\":\"rook\",\"targetPersona\":\"sorrn\"}",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
         });
         db.SaveChanges();
     }
@@ -85,7 +87,7 @@ public class JobHandoffServiceTests : IDisposable
 
         // The gate is the whole point: no session may exist for the incoming persona yet.
         db.AgentSessions.Should().NotContain(s => s.PersonaId == "sorrn");
-        db.JobMessages.Should().Contain(m => m.SenderType == "system" && m.Content.Contains("@Sorrn"));
+        db.JobTimelineCards.Should().Contain(c => c.CardType == TimelineCardType.InternalConsultation && c.StructuredPayloadJson.Contains("@Sorrn"));
     }
 
     [Fact]

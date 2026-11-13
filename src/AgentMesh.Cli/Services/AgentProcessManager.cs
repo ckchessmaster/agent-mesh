@@ -575,12 +575,8 @@ public class AgentRunnerInstance : IAsyncDisposable
                 AgyAdapter.SetSessionConversationId(ev.SessionId, ev.ConversationId);
             }
 
-            // Resolve working directory: explicit working directory or persistent sandbox workspace
-            var effectiveWorkDir = !string.IsNullOrWhiteSpace(ev.WorkingDirectory)
-                ? ev.WorkingDirectory.Trim()
-                : (Directory.Exists("/workspace")
-                    ? "/workspace"
-                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".agentmesh", "workspaces", ev.SessionId.ToString()));
+            // Resolve working directory: explicit working directory or active project's /workspace/repos/<project> checkout
+            var effectiveWorkDir = AgentProcessManager.ResolveEffectiveWorkingDirectory(ev);
 
             try
             {
@@ -984,6 +980,64 @@ public class AgentProcessManager : IAsyncDisposable
         _runners.TryGetValue(agentId, out var r) &&
         r.State.State is RunnerConnectionState.Online or RunnerConnectionState.Busy or RunnerConnectionState.Connecting;
 
+    internal static string ResolveEffectiveWorkingDirectory(
+        PromptReceivedEvent ev,
+        Func<string, bool>? directoryExists = null)
+    {
+        var exists = directoryExists ?? Directory.Exists;
+
+        if (!string.IsNullOrWhiteSpace(ev.WorkingDirectory))
+        {
+            var trimmed = AgentMesh.Core.Models.WorkspacePathResolver.Normalize(ev.WorkingDirectory.Trim());
+            if (!string.Equals(trimmed, "/workspace", StringComparison.Ordinal) &&
+                !string.Equals(trimmed, "/workspace/repo", StringComparison.Ordinal))
+            {
+                return trimmed;
+            }
+        }
+
+        var repoOrProject = !string.IsNullOrWhiteSpace(ev.RepositoryName)
+            ? ev.RepositoryName
+            : ev.ProjectId;
+
+        if (exists("/workspace"))
+        {
+            if (!string.IsNullOrWhiteSpace(repoOrProject))
+            {
+                return AgentMesh.Core.Models.WorkspacePathResolver.FromRepositoryName(repoOrProject);
+            }
+
+            var envRepo = Environment.GetEnvironmentVariable("AGENTMESH_REPOSITORY_NAME")
+                          ?? Environment.GetEnvironmentVariable("AGENTMESH_PROJECT_ID");
+            if (!string.IsNullOrWhiteSpace(envRepo))
+            {
+                return AgentMesh.Core.Models.WorkspacePathResolver.FromRepositoryName(envRepo);
+            }
+
+            if (exists(AgentMesh.Core.Models.WorkspacePathResolver.ReposRoot))
+            {
+                var defaultRepoDir = $"{AgentMesh.Core.Models.WorkspacePathResolver.ReposRoot}/{AgentMesh.Core.Models.Project.DefaultRepositoryName}";
+                if (exists(defaultRepoDir))
+                {
+                    return defaultRepoDir;
+                }
+            }
+
+            return "/workspace";
+        }
+
+        if (!string.IsNullOrWhiteSpace(ev.WorkingDirectory))
+        {
+            return AgentMesh.Core.Models.WorkspacePathResolver.Normalize(ev.WorkingDirectory.Trim());
+        }
+
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".agentmesh",
+            "workspaces",
+            ev.SessionId.ToString());
+    }
+
     public async Task<AgentRuntimeState> StartAgentAsync(
         string agentId,
         string? customCommand = null,
@@ -1105,6 +1159,10 @@ public class AgentProcessManager : IAsyncDisposable
         if (!string.IsNullOrWhiteSpace(customCommand)) preset.Command = customCommand;
         if (!string.IsNullOrWhiteSpace(customModel)) preset.DefaultModel = customModel;
         else if (!string.IsNullOrWhiteSpace(remotePersona?.DefaultModel)) preset.DefaultModel = remotePersona.DefaultModel;
+        if (string.IsNullOrWhiteSpace(preset.DefaultContextSize) && !string.IsNullOrWhiteSpace(remotePersona?.DefaultContextSize))
+        {
+            preset.DefaultContextSize = remotePersona.DefaultContextSize;
+        }
 
         if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) &&
             (preset.Capabilities == null || preset.Capabilities.Count == 0 ||

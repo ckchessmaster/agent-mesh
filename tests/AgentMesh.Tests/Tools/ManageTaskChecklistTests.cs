@@ -67,10 +67,14 @@ public class ManageTaskChecklistTests
         );
     }
 
-    [Fact]
-    public async Task ManageTask_SetChecklist_EnforcesTaskCountCeiling()
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(7)]
+    [InlineData(12)]
+    [InlineData(25)]
+    public async Task ManageTask_SetChecklist_AcceptsFlexibleTaskCountsWithinSanityBound(int count)
     {
-        // Arrange
         using var db = CreateInMemoryDb();
         var jobId = Guid.NewGuid();
 
@@ -78,7 +82,7 @@ public class ManageTaskChecklistTests
         {
             Id = jobId,
             ProjectId = "proj-1",
-            Title = "Job Decomposition Test",
+            Title = "Flexible Decomposition Test",
             AssignedAgentId = "implementer",
             Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
         };
@@ -87,31 +91,22 @@ public class ManageTaskChecklistTests
 
         var tools = BuildTools(db, jobId);
 
-        // Attempt to register 7 tasks (exceeds max ceiling of 6)
-        var sevenTasks = Enumerable.Range(1, 7)
+        var tasks = Enumerable.Range(1, count)
             .Select(i => new ChecklistTaskItem($"Task {i}", $"src/File{i}.cs", $"test-{i}"))
             .ToList();
 
-        var args = new ManageTaskArgs(
-            Action: "set_checklist",
-            Tasks: sevenTasks,
-            ProgressNote: "Proposed 7 tasks"
-        );
+        var rawResult = await tools.ManageTaskAsync(
+            new ManageTaskArgs(Action: "set_checklist", Tasks: tasks, ProgressNote: $"Proposed {count} tasks"),
+            jobId.ToString());
 
-        // Act
-        var rawResult = await tools.ManageTaskAsync(args, jobId.ToString());
         using var doc = JsonDocument.Parse(rawResult);
-        var root = doc.RootElement;
-
-        // Assert: Must reject with task_count_exceeded error
-        root.GetProperty("error").GetString().Should().Be("task_count_exceeded");
-        root.GetProperty("message").GetString().Should().Contain("consolidate tasks into 3 to 6 atomic");
+        doc.RootElement.GetProperty("success").GetBoolean().Should().BeTrue();
+        doc.RootElement.GetProperty("taskCount").GetInt32().Should().Be(count);
     }
 
     [Fact]
-    public async Task ManageTask_SetChecklist_EnforcesTaskCountMinimum()
+    public async Task ManageTask_SetChecklist_RejectsOnlyAboveGenerousSanityCeiling()
     {
-        // Arrange
         using var db = CreateInMemoryDb();
         var jobId = Guid.NewGuid();
 
@@ -119,7 +114,7 @@ public class ManageTaskChecklistTests
         {
             Id = jobId,
             ProjectId = "proj-1",
-            Title = "Job Decomposition Test",
+            Title = "Sanity Ceiling Test",
             AssignedAgentId = "implementer",
             Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
         };
@@ -128,25 +123,25 @@ public class ManageTaskChecklistTests
 
         var tools = BuildTools(db, jobId);
 
-        // Attempt to register 2 tasks (below minimum of 3)
-        var twoTasks = Enumerable.Range(1, 2)
+        var twentySixTasks = Enumerable.Range(1, 26)
             .Select(i => new ChecklistTaskItem($"Task {i}", $"src/File{i}.cs", $"test-{i}"))
             .ToList();
 
-        var args = new ManageTaskArgs(
-            Action: "set_checklist",
-            Tasks: twoTasks,
-            ProgressNote: "Proposed 2 tasks"
-        );
+        var rawResult = await tools.ManageTaskAsync(
+            new ManageTaskArgs(Action: "set_checklist", Tasks: twentySixTasks),
+            jobId.ToString());
 
-        // Act
-        var rawResult = await tools.ManageTaskAsync(args, jobId.ToString());
         using var doc = JsonDocument.Parse(rawResult);
-        var root = doc.RootElement;
+        doc.RootElement.GetProperty("error").GetString().Should().Be("task_count_exceeded");
+        doc.RootElement.GetProperty("details").GetProperty("maxTasks").GetInt32().Should().Be(25);
+    }
 
-        // Assert: Must reject with task_count_below_minimum error
-        root.GetProperty("error").GetString().Should().Be("task_count_below_minimum");
-        root.GetProperty("message").GetString().Should().Contain("requires a minimum of 3 tasks");
+    [Fact]
+    public void PlatformPrompts_FramesTaskDecompositionAsAFlexibleGuideline()
+    {
+        AgentMesh.Worker.Prompts.PlatformPrompts.PlatformInvariants
+            .Should().Contain("typically 3–6 tasks for standard features, or more/fewer as needed")
+            .And.NotContain("**3 to 6 atomic, verifiable tasks**");
     }
 
     [Fact]

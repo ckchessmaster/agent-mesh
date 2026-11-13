@@ -69,17 +69,27 @@ public class ProjectModelTests
         };
         db.ProjectJobs.Add(job);
 
-        // 4. Create Job Message
-        var message = new JobMessage
+        // 4. Create Job Timeline Card + Comment (unbounded prompt/description)
+        job.Description = new string('A', 4096) + " - Full unbounded spec";
+        var card = new JobTimelineCard
         {
             Id = Guid.NewGuid(),
-            JobId = job.Id,
-            SenderType = "user",
-            SenderId = "user",
-            Content = "@astra please implement the OAuth endpoints",
-            MentionsJson = "[\"astra\"]"
+            JobId = job.Id.ToString(),
+            CardType = TimelineCardType.InternalConsultation,
+            Status = TimelineCardStatus.Active,
+            Title = "Initial OAuth consultation",
+            StructuredPayloadJson = "{\"content\":\"@astra please implement the OAuth endpoints\",\"authorPersonaId\":\"rook\",\"targetPersona\":\"astra\"}"
         };
-        db.JobMessages.Add(message);
+        var comment = new JobCardComment
+        {
+            Id = Guid.NewGuid(),
+            CardId = card.Id,
+            SenderId = "operator",
+            SenderType = "operator",
+            Content = "@astra please implement the OAuth endpoints"
+        };
+        db.JobTimelineCards.Add(card);
+        db.JobCardComments.Add(comment);
 
         await db.SaveChangesAsync();
 
@@ -96,11 +106,12 @@ public class ProjectModelTests
         var savedJob = await db.ProjectJobs.FirstOrDefaultAsync(j => j.ProjectId == "agent-mesh");
         savedJob.Should().NotBeNull();
         savedJob!.Title.Should().Be("Implement OAuth2 Flow");
+        savedJob.Description.Length.Should().BeGreaterThan(4096);
         savedJob.GitBranchName.Should().Be("mesh/job-auth-oauth2");
 
-        var savedMessages = await db.JobMessages.Where(m => m.JobId == job.Id).ToListAsync();
-        savedMessages.Should().ContainSingle();
-        savedMessages[0].Content.Should().Contain("@astra");
-        savedMessages[0].MentionsJson.Should().Contain("astra");
+        var savedCards = await db.JobTimelineCards.Include(c => c.Comments).Where(c => c.JobId == job.Id.ToString()).ToListAsync();
+        savedCards.Should().ContainSingle();
+        savedCards[0].StructuredPayloadJson.Should().Contain("@astra");
+        savedCards[0].Comments.Should().ContainSingle(m => m.Content.Contains("@astra"));
     }
 }

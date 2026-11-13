@@ -209,4 +209,135 @@ public class CopilotAdapterStreamingTests
 
         parsed.Should().BeFalse();
     }
+
+    [Fact]
+    public void TryParseCopilotJsonLine_ToolExecutionStartAndComplete_MapsStartToToolCall_AndCompleteToToolResult()
+    {
+        const string startLine = """{"type":"tool.execution_start","data":{"toolName":"bash","arguments":{"command":"dotnet test"}}}""";
+        var startParsed = CopilotAdapter.TryParseCopilotJsonLine(
+            startLine,
+            out var startEvType,
+            out _,
+            out var startToolName,
+            out var startArgs,
+            out _,
+            out _,
+            out _);
+
+        startParsed.Should().BeTrue();
+        startEvType.Should().Be("tool_call");
+        startToolName.Should().Be("bash");
+        startArgs.Should().Contain("dotnet test");
+
+        const string completeLine = """{"type":"tool.execution_complete","data":{"toolName":"bash","result":{"content":"Passed! 42 tests"}}}""";
+        var completeParsed = CopilotAdapter.TryParseCopilotJsonLine(
+            completeLine,
+            out var completeEvType,
+            out _,
+            out var completeToolName,
+            out _,
+            out var completeResult,
+            out _,
+            out _);
+
+        completeParsed.Should().BeTrue();
+        completeEvType.Should().Be("tool_result", "tool.execution_complete must not match tool_call's 'execution' substring");
+        completeToolName.Should().Be("bash");
+        completeResult.Should().Contain("Passed! 42 tests");
+    }
+
+    [Fact]
+    public async Task RunCopilotSubprocessAsync_ToolOnlyStreamEndingWithTaskComplete_EmitsTaskCompleteSummaryInsteadOfRawJsonl()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "copilot-stream-test-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        var fakeScript = Path.Combine(tempDir, "fake-copilot.sh");
+
+        var hugeToolOutput = new string('Z', 120_000);
+        const string scriptTemplate = """
+            #!/usr/bin/env bash
+            echo '{"type":"session.start","data":{"sessionId":"cop-sess-99"}}'
+            echo '{"type":"tool.execution_start","data":{"toolName":"bash","arguments":{"command":"cat big.log"}}}'
+            echo '{"type":"tool.execution_complete","data":{"toolName":"bash","result":{"content":"__HUGE_OUTPUT__"}}}'
+            echo '{"type":"session.task_complete","data":{"summary":"Completed stabilizing CopilotAdapter JSONL parsing and verified all unit tests."}}'
+            """;
+        var scriptContent = scriptTemplate.Replace("__HUGE_OUTPUT__", hugeToolOutput);
+        await File.WriteAllTextAsync(fakeScript, scriptContent);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(fakeScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            var preset = new AgentPresetConfig { Id = "copilot-cli", AdapterType = "copilot" };
+            var promptEvent = new PromptReceivedEvent { SessionId = Guid.NewGuid(), Prompt = "Fix bug" };
+
+            var (exitCode, _, _, succeeded) = await CopilotAdapter.RunCopilotSubprocessAsync(
+                fakeScript,
+                isViaGh: false,
+                cwd: tempDir,
+                preset,
+                promptEvent,
+                promptEnvelope: "Fix bug",
+                useJsonFormat: true,
+                ev => { events.Add(ev); return Task.CompletedTask; },
+                CancellationToken.None);
+
+            exitCode.Should().Be(0);
+            succeeded.Should().BeTrue();
+
+            events.Count(e => e.EventType == "tool_call").Should().Be(1);
+            events.Count(e => e.EventType == "tool_result").Should().Be(1);
+
+            var responseEvent = events.Single(e => e.EventType == "response");
+            responseEvent.Content.Should().Be("Completed stabilizing CopilotAdapter JSONL parsing and verified all unit tests.");
+            responseEvent.Content.Should().NotContain(hugeToolOutput);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ResolveFinalCopilotOutput_WhenStreamedAndTaskCompleteAreEmpty_BoundsLargeRawJsonlFallbackTo16Kb()
+    {
+        var sb = new System.Text.StringBuilder();
+        for (var i = 0; i < 1500; i++)
+        {
+            sb.AppendLine($$$"""{"type":"tool.execution_complete","data":{"toolName":"bash","result":"line-{{{i}}}-{{{new string('a', 90)}}}"}}""");
+        }
+        var rawJsonl = sb.ToString();
+        rawJsonl.Length.Should().BeGreaterThan(100_000);
+
+        var resolved = CopilotAdapter.ResolveFinalCopilotOutput(
+            streamedResponse: string.Empty,
+            taskCompleteSummary: null,
+            rawStdOut: rawJsonl,
+            stdErr: string.Empty);
+
+        resolved.Length.Should().BeLessThanOrEqualTo(CopilotAdapter.MaxRawFallbackPreviewChars);
+        resolved.Should().Contain("line-1499-", "bounded fallback keeps the tail where exit diagnostics appear");
+    }
+
+    [Fact]
+    public async Task MeshClient_EnsureSuccessWithBodySnippetAsync_IncludesTruncatedResponseBodyOn400()
+    {
+        var errorBody = "{\"error\":\"validation_failed\",\"detail\":\"" + new string('E', 800) + "\"}";
+        using var response = new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.BadRequest)
+        {
+            ReasonPhrase = "Bad Request",
+            Content = new System.Net.Http.StringContent(errorBody)
+        };
+
+        var act = async () => await AgentMesh.Cli.Services.MeshClient.EnsureSuccessWithBodySnippetAsync(
+            response, "POST api/sessions/123/events (response)");
+
+        var ex = await act.Should().ThrowAsync<System.Net.Http.HttpRequestException>();
+        ex.Which.Message.Should().Contain("400");
+        ex.Which.Message.Should().Contain("validation_failed");
+        ex.Which.Message.Length.Should().BeLessThan(650);
+    }
 }

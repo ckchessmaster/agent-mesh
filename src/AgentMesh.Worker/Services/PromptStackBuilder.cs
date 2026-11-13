@@ -167,7 +167,7 @@ public class PromptStackBuilder(
         var persona = await SafeLoadPersonaAsync(context, ct);
         var job = await SafeLoadJobAsync(context, ct);
         var roster = await SafeLoadRosterAsync(context, ct);
-        var memoryLines = await SafeLoadMemoriesAsync(context, ct);
+        var (memoryLines, memoryKeys) = await SafeLoadMemoriesWithKeysAsync(context, ct);
         var checkpoint = await SafeLoadCheckpointAsync(context, ct);
 
         // Pre-turn, not post-turn: the note has to be in the text the model reads first, or the agent
@@ -195,7 +195,8 @@ public class PromptStackBuilder(
             checkpoint,
             report,
             window,
-            windowSize);
+            windowSize,
+            memoryKeys);
 
         return new AssembledPromptStack(
             CachedSystemPrompt: cachedSystemPrompt,
@@ -474,6 +475,7 @@ public class PromptStackBuilder(
     {
         var sb = new StringBuilder();
         sb.Append("[LAYER 5: PERSISTENT MEMORY & NOTES (project: ").Append(context.ProjectId).Append(")]\n");
+        sb.Append("[PERSISTENT MEMORY & ENVIRONMENT NOTES]\n");
 
         if (memoryLines.Count == 0)
         {
@@ -483,8 +485,8 @@ public class PromptStackBuilder(
             return sb.ToString();
         }
 
-        sb.Append("Lessons you saved earlier. These are still true unless you disprove them; do not " +
-                  "re-derive them.\n");
+        sb.Append("Lessons you saved earlier (ordered by recency). These are still true unless you disprove them; do not " +
+                  "re-derive them. Use list_memories/save_memory to update stale keys in place.\n");
         foreach (var line in memoryLines)
         {
             sb.Append("* ").Append(line).Append('\n');
@@ -530,7 +532,8 @@ public class PromptStackBuilder(
         TaskWorkingCheckpoint? checkpoint,
         WorkspaceReconciliationReport? report,
         IReadOnlyList<SessionMessage> window,
-        int windowSize)
+        int windowSize,
+        IReadOnlyList<string>? savedMemoryKeys = null)
     {
         var sb = new StringBuilder();
         var focus = ResolveFocusTask(job, context.TaskId);
@@ -550,6 +553,11 @@ public class PromptStackBuilder(
             sb.Append("* Acceptance Criteria: ").Append(CollapseWhitespace(focus.AcceptanceCriteria)).Append('\n');
         }
         sb.Append("* Status: ").Append(focus?.EffectiveStatus ?? job?.Status.ToString() ?? "unknown").Append('\n');
+        if (savedMemoryKeys is { Count: > 0 })
+        {
+            sb.Append("* Saved Memory Keys: ").Append(string.Join(", ", savedMemoryKeys))
+              .Append(" (use list_memories to inspect or save_memory with the same key to update)\n");
+        }
 
         if (job is not null && !string.IsNullOrWhiteSpace(job.Description))
         {
@@ -561,7 +569,7 @@ public class PromptStackBuilder(
             sb.Append("\n[STAGE 1: DISCOVERY & DECOMPOSITION]\n");
             sb.Append("* Phase: Read-only Discovery. Inspect the codebase (grep, find, read_file, git log).\n");
             sb.Append("* Guardrail: File modification tools (write_file, edit_file) and git mutations are disabled during discovery.\n");
-            sb.Append("* Objective: Decompose the job into 3 to 6 atomic tasks and register them with manage_task(set_checklist).\n");
+            sb.Append("* Objective: Decompose the objective into atomic, verifiable tasks sized to the scope of the work (typically 3–6 tasks for standard features, or more/fewer as needed) and register them with manage_task(set_checklist).\n");
             sb.Append("* Post plan & questions via post_job_message(requires_reply: true), then conclude your turn. Do not begin implementation.\n");
         }
 
@@ -677,23 +685,35 @@ public class PromptStackBuilder(
 
         if (string.Equals(context.TaskId?.Trim(), "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
         {
-            return "Explore the codebase in read-only mode, decompose the job into 3 to 6 atomic tasks " +
+            return "Explore the codebase in read-only mode, decompose the objective into atomic, verifiable tasks " +
+                   "sized to the scope of the work (typically 3–6 tasks for standard features, or more/fewer as needed) " +
                    "using manage_task(action='set_checklist'), and post your plan or questions via " +
                    "post_job_message. Do not reply that you are waiting for instructions — this envelope " +
                    "is the instruction.";
         }
 
+        if (context.TaskId?.StartsWith("stage-4-pr-open", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            return "All checklist items for this round are complete. Sync the base branch (`agentmesh pr sync`), " +
+                   "verify `git status --porcelain` is clean, run final verification, and open or update the " +
+                   "single job-level pull request using `agentmesh pr open --title \"...\" --result \"...\" " +
+                   "--reasoning \"...\" --risk \"...\"`. Do not reply that you are waiting for instructions — " +
+                   "this envelope is the instruction.";
+        }
+
         if (focus is not null && !string.IsNullOrWhiteSpace(focus.Title))
         {
             return $"Work the checklist item above to completion: {focus.Title.Trim()}\n" +
-                   "Report with the 3-R shape, update the item's status with manage_task, and open a " +
-                   "PR for review when the scoped tests pass. Do not reply that you are waiting for " +
-                   "instructions — this envelope is the instruction.";
+                   "Implement, verify with scoped tests, commit cleanly to the active job branch, report with " +
+                   "the 3-R shape, and mark the item's status `completed` with manage_task. Do NOT open a pull " +
+                   "request per task — a single job-level PR is opened in Stage 4 once all checklist items are " +
+                   "complete. Do not reply that you are waiting for instructions — this envelope is the instruction.";
         }
 
-        return "Continue the task named above. Report with the 3-R shape, update the checklist status " +
-               "with manage_task, and open a PR for review when the scoped tests pass. Do not reply " +
-               "that you are waiting for instructions — this envelope is the instruction.";
+        return "Continue the task named above. Implement, verify with scoped tests, commit cleanly to the active " +
+               "job branch, report with the 3-R shape, and update the checklist status with manage_task. Do NOT " +
+               "open a pull request per task — a single job-level PR is opened once all checklist items are " +
+               "complete. Do not reply that you are waiting for instructions — this envelope is the instruction.";
     }
 
     /// <summary>The branch to state: the job's own branch when it has one, else the input's.</summary>
@@ -1064,43 +1084,73 @@ public class PromptStackBuilder(
         }
     }
 
-    private async Task<IReadOnlyList<string>> SafeLoadMemoriesAsync(PromptStackContext context, CancellationToken ct)
+    private async Task<(IReadOnlyList<string> Lines, IReadOnlyList<string> Keys)> SafeLoadMemoriesWithKeysAsync(
+        PromptStackContext context,
+        CancellationToken ct)
     {
-        if (memories is null) return [];
+        if (memories is null) return ([], []);
 
         try
         {
-            // Agent first, persona second. Memories are written under whichever identity the caller
-            // resolved (MemoryContextResolver prefers the authenticated claim, then X-Agent-Id), and a
-            // driver row and a persona row can both legitimately own lessons for the same project.
-            // Reading both is what makes the layer useful after a persona change on the same task.
-            var agentMemories = await memories.GetMemoriesForAgentAsync(context.AgentId, context.ProjectId, ct);
-            var personaMemories = string.IsNullOrWhiteSpace(context.PersonaId) ||
-                                  string.Equals(context.PersonaId, context.AgentId, StringComparison.OrdinalIgnoreCase)
+            // Persona first, driver fallback second: persistent memories belong to the active PersonaId
+            // (both project-scoped and global "*"), ordered by UpdatedAt DESC. Driver-keyed rows are kept
+            // only as a fallback when no persona-owned entry exists for that key.
+            var personaMemories = !string.IsNullOrWhiteSpace(context.PersonaId)
+                ? await memories.GetMemoriesForAgentAsync(context.PersonaId!, context.ProjectId, ct)
+                : [];
+            var agentMemories = string.IsNullOrWhiteSpace(context.AgentId) ||
+                                string.Equals(context.PersonaId, context.AgentId, StringComparison.OrdinalIgnoreCase)
                 ? []
-                : await memories.GetMemoriesForAgentAsync(context.PersonaId!, context.ProjectId, ct);
+                : await memories.GetMemoriesForAgentAsync(context.AgentId, context.ProjectId, ct);
+
+            var merged = new List<AgentMemory>();
+            var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var m in personaMemories.OrderByDescending(m => m.UpdatedAt).ThenBy(m => m.Category, StringComparer.Ordinal).ThenBy(m => m.Id))
+            {
+                if (seenKeys.Add($"{m.ProjectId}:{m.Key}"))
+                {
+                    merged.Add(m);
+                }
+            }
+
+            foreach (var m in agentMemories.OrderByDescending(m => m.UpdatedAt).ThenBy(m => m.Category, StringComparer.Ordinal).ThenBy(m => m.Id))
+            {
+                if (seenKeys.Add($"{m.ProjectId}:{m.Key}"))
+                {
+                    merged.Add(m);
+                }
+            }
+
+            var ordered = merged
+                .OrderByDescending(m => m.UpdatedAt)
+                .ThenBy(m => m.Category, StringComparer.Ordinal)
+                .ThenBy(m => m.Id)
+                .ToList();
 
             var lines = new List<string>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var keys = new List<string>();
+            var seenValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seenKeyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var memory in agentMemories.Concat(personaMemories))
+            foreach (var memory in ordered)
             {
                 var value = CollapseWhitespace(memory.Value);
-                if (value.Length == 0 || !seen.Add($"{memory.Key}:{value}")) continue;
+                if (value.Length == 0 || !seenValues.Add($"{memory.Key}:{value}")) continue;
 
-                // The spec's format is `[category/key]: value` — one bracket, slash-separated — which
-                // reads as a path into the memory store and keeps the line to one scannable unit.
-                // Category is free text on the model and an uncategorised lesson is common:
-                // save_memory accepts a category but does not require one. Rendering a blank one as
-                // "[/key]: value" puts an empty heading where a reader expects a label, so the slash
-                // half is omitted entirely when there is nothing to say.
+                var trimmedKey = memory.Key.Trim();
+                if (seenKeyNames.Add(trimmedKey))
+                {
+                    keys.Add(trimmedKey);
+                }
+
                 var category = memory.Category?.Trim();
                 var tag = string.IsNullOrEmpty(category) ? string.Empty : $"{category}/";
 
-                lines.Add($"[{tag}{memory.Key.Trim()}]: {value}");
+                lines.Add($"[{tag}{trimmedKey}]: {value}");
             }
 
-            return CapMemories(lines);
+            return (CapMemories(lines), keys.Take(MaxRenderedMemories).ToList());
         }
         catch (OperationCanceledException)
         {
@@ -1108,8 +1158,9 @@ public class PromptStackBuilder(
         }
         catch (Exception ex)
         {
-            logger?.LogWarning(ex, "Could not load memories for agent {AgentId} project {ProjectId}", context.AgentId, context.ProjectId);
-            return [];
+            logger?.LogWarning(ex, "Could not load memories for persona {PersonaId} / agent {AgentId} project {ProjectId}",
+                context.PersonaId, context.AgentId, context.ProjectId);
+            return ([], []);
         }
     }
 

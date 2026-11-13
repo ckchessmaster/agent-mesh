@@ -448,35 +448,36 @@ public class GitHubPullRequestServiceTests
         (await service.ResolveTokenAsyncPublic(service.ReadOptions())).Should().BeNull();
     }
 
-    // ── Simulated (no-credentials) path ───────────────────────────────────────────
+    // ── No-credentials refusal (Simulated PR #999 permanently retired) ────────────
 
     [Fact]
-    public async Task PushBranchAndCreatePr_WithoutCredentials_SimulatesAndNeverTouchesGit()
+    public async Task PushBranchAndCreatePr_WithoutCredentials_RefusesWithNoCredentialsAndNeverTouchesGit()
     {
         var gitCalls = new List<GitCommandRequest>();
         var service = BuildService(new Dictionary<string, string?>(), gitRunner: CaptureGit(gitCalls));
 
         var result = await service.PushBranchAndCreatePrAsync(Request(workingDirectory: CreateScratchRepository()));
 
-        result.Success.Should().BeTrue("a local Aspire run must not dead-end the agent");
-        result.Simulated.Should().BeTrue();
-        result.PrNumber.Should().Be(GitHubPullRequestService.SimulatedPrNumber);
-        result.Message.Should().Contain("Simulated")
-            .And.Contain("no GitHub token configured")
-            .And.Contain("nothing was pushed");
-        gitCalls.Should().BeEmpty("pushing a developer's working copy to get a fake PR is destructive");
+        result.Success.Should().BeFalse("simulated PR #999 is retired so fabricated PRs never pollute job state");
+        result.Simulated.Should().BeFalse();
+        result.PrNumber.Should().BeNull();
+        result.PrUrl.Should().BeNull();
+        result.FailureReason.Should().Be("no_credentials");
+        result.Message.Should().Contain("agentmesh pr open");
+        gitCalls.Should().BeEmpty("a missing control-plane token must never touch git");
     }
 
     [Fact]
-    public async Task PushBranchAndCreatePr_SimulatedResult_StillReportsTheResolvedBranches()
+    public async Task PushBranchAndCreatePr_NoCredentialsRefusal_StillReportsTheResolvedBranches()
     {
         var service = BuildService(new Dictionary<string, string?>(), gitRunner: CapturedGit(GitOk));
 
         var result = await service.PushBranchAndCreatePrAsync(Request(headBranch: "feat/x", baseBranch: "main"));
 
+        result.Success.Should().BeFalse();
+        result.FailureReason.Should().Be("no_credentials");
         result.HeadBranch.Should().Be("feat/x");
         result.BaseBranch.Should().Be("main");
-        result.PrUrl.Should().EndWith("/pull/999");
     }
 
     // ── Validation refusals ───────────────────────────────────────────────────────

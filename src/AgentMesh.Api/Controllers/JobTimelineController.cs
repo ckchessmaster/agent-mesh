@@ -43,7 +43,8 @@ public record InterventionRequest(
 public class JobTimelineController(
     AgentMeshDbContext db,
     ITemporalClient temporalClient,
-    IHubContext<AgentMeshHub>? hubContext = null) : ControllerBase
+    IHubContext<AgentMeshHub>? hubContext = null,
+    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null) : ControllerBase
 {
     private WorkflowHandle<IJobExecutionWorkflow> GetWorkflowHandle(string jobId)
     {
@@ -92,30 +93,81 @@ public class JobTimelineController(
     }
 
     [HttpPost("cards/{cardId}/comments")]
-    public async Task<IActionResult> AddComment(string jobId, Guid cardId, [FromBody] AddCommentRequest req)
+    public async Task<IActionResult> AddComment(
+        string jobId,
+        Guid cardId,
+        [FromBody] AddCommentRequest req,
+        CancellationToken ct = default)
     {
         if (req == null || string.IsNullOrWhiteSpace(req.Content))
         {
             return BadRequest(new { error = "Comment content cannot be empty." });
         }
 
+        var personaHeader = Request?.Headers.TryGetValue(AgentMesh.Api.Services.PlatformCallContextResolver.PersonaIdHeader, out var ph) == true
+            ? ph.ToString()
+            : null;
+        var resolvedSenderId = !string.IsNullOrWhiteSpace(personaHeader)
+            ? personaHeader.Trim().TrimStart('@').ToLowerInvariant()
+            : (string.IsNullOrWhiteSpace(req.SenderId) ? "operator" : req.SenderId.Trim());
+        var resolvedSenderType = !string.IsNullOrWhiteSpace(personaHeader)
+            ? "agent"
+            : (string.IsNullOrWhiteSpace(req.SenderType) ? "operator" : req.SenderType.Trim());
+
         var comment = new JobCardComment
         {
             Id = Guid.NewGuid(),
             CardId = cardId,
-            SenderId = string.IsNullOrWhiteSpace(req.SenderId) ? "user" : req.SenderId,
-            SenderType = string.IsNullOrWhiteSpace(req.SenderType) ? "user" : req.SenderType,
-            Content = req.Content,
+            SenderId = resolvedSenderId,
+            SenderType = resolvedSenderType,
+            Content = req.Content.Trim(),
             CreatedAt = DateTimeOffset.UtcNow
         };
 
         db.JobCardComments.Add(comment);
-        await db.SaveChangesAsync();
+
+        var card = await db.JobTimelineCards
+            .Include(c => c.Comments)
+            .FirstOrDefaultAsync(c => c.Id == cardId && c.JobId == jobId, ct);
+
+        if (card != null && card.Status == TimelineCardStatus.PendingInput &&
+            card.CardType is TimelineCardType.Escalation3R or TimelineCardType.InternalConsultation)
+        {
+            card.Status = TimelineCardStatus.Resolved;
+            card.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+
+        await db.SaveChangesAsync(ct);
 
         if (hubContext != null)
         {
             await hubContext.Clients.Group($"job-{jobId}")
-                .SendAsync("ReceiveTimelineComment", jobId, cardId, comment);
+                .SendAsync("ReceiveTimelineComment", jobId, cardId, comment, ct);
+            if (card != null)
+            {
+                await BroadcastCardUpdatedAsync(jobId, card);
+            }
+        }
+
+        if (workflows != null &&
+            !string.Equals(resolvedSenderType, "system", StringComparison.OrdinalIgnoreCase) &&
+            Guid.TryParse(jobId, out var parsedJobId))
+        {
+            try
+            {
+                await workflows.SendChatMessageAsync(
+                    parsedJobId,
+                    new ChatMessageSignal(
+                        SenderId: resolvedSenderId,
+                        Content: comment.Content,
+                        Timestamp: comment.CreatedAt,
+                        MessageId: comment.Id.ToString()),
+                    ct);
+            }
+            catch
+            {
+                // Best-effort workflow routing; persisted comment remains durable.
+            }
         }
 
         return Ok(comment);

@@ -38,8 +38,6 @@ vi.mock('../services/api', () => ({
     updateJobTask: vi.fn(),
     assignJobTask: vi.fn(),
     deleteJobTask: vi.fn(),
-    getJobMessages: vi.fn(),
-    postJobMessage: vi.fn(),
     uploadJobAttachments: vi.fn(),
     completeJob: vi.fn(),
     submitQuestionAnswer: vi.fn(),
@@ -162,7 +160,6 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     vi.mocked(api.getAgentUsage).mockResolvedValue(mockUsage);
     vi.mocked(api.getProjects).mockResolvedValue([mockProject]);
     vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob]);
-    vi.mocked(api.getJobMessages).mockResolvedValue([]);
     vi.mocked(api.getJobTasks).mockResolvedValue([]);
   });
 
@@ -255,10 +252,8 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
         project={mockProject}
         job={mockJob}
         tasks={[]}
-        messages={[]}
         personas={[mockPersona]}
         sessions={[]}
-        onSendMessage={vi.fn()}
         onAddTask={vi.fn()}
         onToggleTask={vi.fn()}
         onDeleteTask={vi.fn()}
@@ -290,10 +285,8 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
             verificationMethod: 'vitest test'
           }
         ]}
-        messages={[]}
         personas={[mockPersona]}
         sessions={[]}
-        onSendMessage={vi.fn()}
         onAddTask={vi.fn()}
         onToggleTask={vi.fn()}
         onDeleteTask={vi.fn()}

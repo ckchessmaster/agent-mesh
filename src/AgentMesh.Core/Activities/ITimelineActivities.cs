@@ -62,6 +62,13 @@ public record TaskStepCardInput(
     string? StepDetails = null
 );
 
+public record AppendRemediationTasksInput(
+    string JobId,
+    int Round,
+    string Source,
+    IReadOnlyList<ProposedChecklistItem> Tasks
+);
+
 public interface ITimelineActivities
 {
     [Activity]
@@ -81,4 +88,8 @@ public interface ITimelineActivities
 
     [Activity]
     Task<Guid> UpdateTaskStepCardAsync(TaskStepCardInput input);
+
+    [Activity]
+    Task<IReadOnlyList<ProposedChecklistItem>> AppendRemediationTasksAsync(AppendRemediationTasksInput input) =>
+        Task.FromResult(input.Tasks);
 }
