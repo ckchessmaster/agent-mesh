@@ -61,8 +61,8 @@ public class GitActivities(
             : default;
 
         logger.LogInformation(
-            "Merging PR for job {JobId} into target branch {Branch}",
-            input.JobId, input.TargetBranch);
+            "Merging PR for job {JobId} into target branch {Branch} (approvedSha={ApprovedSha})",
+            input.JobId, input.TargetBranch, input.ApprovedHeadSha ?? "(none)");
 
         var prUrl = input.PrUrl;
         if (string.IsNullOrWhiteSpace(prUrl))
@@ -71,7 +71,7 @@ public class GitActivities(
                 "Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
         }
 
-        return await MergePullRequestAsync(prUrl);
+        return await MergePullRequestInternalAsync(prUrl, input.ApprovedHeadSha, cancellationToken);
     }
 
     [Activity]
@@ -81,31 +81,33 @@ public class GitActivities(
             ? ActivityExecutionContext.Current.CancellationToken
             : default;
 
+        return await MergePullRequestInternalAsync(prUrl, approvedHeadSha: null, cancellationToken);
+    }
+
+    private async Task<string> MergePullRequestInternalAsync(
+        string prUrl,
+        string? approvedHeadSha,
+        CancellationToken cancellationToken)
+    {
         if (string.IsNullOrWhiteSpace(prUrl))
         {
-            // Nothing to merge and nothing to retry: the workflow asked to merge a null URL, which
-            // means it reached this branch without recording a PR. That is a workflow bug, and
-            // reporting it as a halt is more honest than reporting it as a merge failure the operator
-            // would then try to fix by re-reviewing a PR that does not exist.
             throw new ApplicationFailureException(
                 "Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
         }
 
-        var (repository, sha) = await ResolveMergeContextAsync(cancellationToken);
+        var (repository, contextSha) = await ResolveMergeContextAsync(cancellationToken);
+        var effectiveSha = !string.IsNullOrWhiteSpace(approvedHeadSha) ? approvedHeadSha.Trim() : contextSha;
 
         logger.LogInformation(
             "Merging approved pull request {PrUrl} (repository {Repository}, approvedSha {Sha})",
-            prUrl, repository ?? "(resolved from config/url)", sha ?? "(not recorded)");
+            prUrl, repository ?? "(resolved from config/url)", effectiveSha ?? "(not recorded)");
 
         var result = await pullRequests.MergePullRequestAsync(
             new GitHubMergeRequest(
                 PrUrlOrNumber: prUrl.Trim(),
                 Repository: repository,
-                // Squash matches this repository's own history (feature commits squashed onto main) and
-                // keeps the base branch linear, which is what makes a reverted task easy to find and
-                // back out.
                 Method: ReadMergeMethod(),
-                Sha: sha),
+                Sha: effectiveSha),
             cancellationToken);
 
         if (!result.Success)

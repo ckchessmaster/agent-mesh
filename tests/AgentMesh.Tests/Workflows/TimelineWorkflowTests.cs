@@ -26,6 +26,7 @@ public class TimelineWorkflowTests
         await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
         var timeline = new FakeTimelineActivities();
         var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
 
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity((Func<CreateTimelineCardInput, Task<JobTimelineCard>>)timeline.CreateCardAsync)
@@ -34,7 +35,9 @@ public class TimelineWorkflowTests
             .AddActivity((Func<DecompositionActivityInput, Task<DecompositionActivityResult>>)timeline.ExecuteDecompositionActivityAsync)
             .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
             .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
+            .AddActivity((Func<AppendRemediationTasksInput, Task<IReadOnlyList<ProposedChecklistItem>>>)timeline.AppendRemediationTasksAsync)
             .AddActivity((Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>)execution.RunAgentCodingTurnAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>()
             .AddWorkflow<TaskExecutionWorkflow>();
         workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
@@ -75,9 +78,13 @@ public class TimelineWorkflowTests
         await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
         timeline.DecompositionInputs.Should().HaveCount(1);
 
-        // 4. Approve plan
+        // 4. Approve plan -> tasks execute -> wait for job-level PR review gate -> approve PR
         await handle.SignalAsync(wf => wf.SubmitPlanDecisionAsync(
             new PlanApprovalSignal(timeline.PlanCardId, true, "Plan approved", "operator")));
+
+        await WaitUntilAsync(handle, s => s.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase));
+        await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+            new PrReviewSignal("operator", true, "LGTM", DateTimeOffset.UtcNow, 42, "abc1234567")));
 
         var result = await handle.GetResultAsync<JobExecutionResult>();
         result.Success.Should().BeTrue();
@@ -188,6 +195,7 @@ public class TimelineWorkflowTests
         timeline.CustomDiscoveryQuestions = []; // 0 discovery questions
         var execution = new FakeExecutionActivities();
 
+        var git = new FakeGitActivities();
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity((Func<CreateTimelineCardInput, Task<JobTimelineCard>>)timeline.CreateCardAsync)
             .AddActivity((Func<UpdateTimelineCardStatusInput, Task>)timeline.UpdateCardStatusAsync)
@@ -195,7 +203,9 @@ public class TimelineWorkflowTests
             .AddActivity((Func<DecompositionActivityInput, Task<DecompositionActivityResult>>)timeline.ExecuteDecompositionActivityAsync)
             .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
             .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
+            .AddActivity((Func<AppendRemediationTasksInput, Task<IReadOnlyList<ProposedChecklistItem>>>)timeline.AppendRemediationTasksAsync)
             .AddActivity((Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>)execution.RunAgentCodingTurnAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>()
             .AddWorkflow<TaskExecutionWorkflow>();
 
@@ -230,6 +240,16 @@ public class TimelineWorkflowTests
             await handle.SignalAsync((IJobExecutionWorkflow wf) => wf.SubmitPlanDecisionAsync(
                 new PlanApprovalSignal(timeline.PlanCardId, true, "Plan approved immediately", "operator")));
 
+            var prDeadline = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < prDeadline)
+            {
+                var st = await handle.QueryAsync((IJobExecutionWorkflow wf) => wf.GetCurrentState());
+                if (st.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase)) break;
+                await Task.Delay(50);
+            }
+            await handle.SignalAsync((IJobExecutionWorkflow wf) => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("operator", true, "LGTM", DateTimeOffset.UtcNow, 42, "abc1234567")));
+
             var result = await handle.GetResultAsync<JobExecutionResult>();
             result.Success.Should().BeTrue();
             timeline.TaskStepInputs.Should().NotBeEmpty();
@@ -244,6 +264,7 @@ public class TimelineWorkflowTests
         var timeline = new FakeTimelineActivities();
         var execution = new FakeExecutionActivities();
 
+        var git = new FakeGitActivities();
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity((Func<CreateTimelineCardInput, Task<JobTimelineCard>>)timeline.CreateCardAsync)
             .AddActivity((Func<UpdateTimelineCardStatusInput, Task>)timeline.UpdateCardStatusAsync)
@@ -251,7 +272,9 @@ public class TimelineWorkflowTests
             .AddActivity((Func<DecompositionActivityInput, Task<DecompositionActivityResult>>)timeline.ExecuteDecompositionActivityAsync)
             .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
             .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
+            .AddActivity((Func<AppendRemediationTasksInput, Task<IReadOnlyList<ProposedChecklistItem>>>)timeline.AppendRemediationTasksAsync)
             .AddActivity((Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>)execution.RunAgentCodingTurnAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>()
             .AddWorkflow<TaskExecutionWorkflow>();
         workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
@@ -298,6 +321,10 @@ public class TimelineWorkflowTests
         // Approve on second round
         await handle.SignalAsync(wf => wf.SubmitPlanDecisionAsync(
             new PlanApprovalSignal(timeline.PlanCardId, true, "Revised plan approved", "operator")));
+
+        await WaitUntilAsync(handle, s => s.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase));
+        await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+            new PrReviewSignal("operator", true, "LGTM", DateTimeOffset.UtcNow, 42, "abc1234567")));
 
         var result = await handle.GetResultAsync<JobExecutionResult>();
         result.Success.Should().BeTrue();
@@ -401,6 +428,7 @@ public class TimelineWorkflowTests
             }
         };
 
+        var git = new FakeGitActivities();
         var workerOptions = new TemporalWorkerOptions(Queue)
             .AddActivity((Func<CreateTimelineCardInput, Task<JobTimelineCard>>)timeline.CreateCardAsync)
             .AddActivity((Func<UpdateTimelineCardStatusInput, Task>)timeline.UpdateCardStatusAsync)
@@ -408,7 +436,9 @@ public class TimelineWorkflowTests
             .AddActivity((Func<DecompositionActivityInput, Task<DecompositionActivityResult>>)timeline.ExecuteDecompositionActivityAsync)
             .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
             .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
+            .AddActivity((Func<AppendRemediationTasksInput, Task<IReadOnlyList<ProposedChecklistItem>>>)timeline.AppendRemediationTasksAsync)
             .AddActivity((Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>)execution.RunAgentCodingTurnAsync)
+            .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>()
             .AddWorkflow<TaskExecutionWorkflow>();
         workerOptions.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
@@ -471,6 +501,10 @@ public class TimelineWorkflowTests
 
         // Task 2 should now execute and finish without being interrupted
         await task2Started.Task;
+
+        await WaitUntilAsync(handle, s => s.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase));
+        await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+            new PrReviewSignal("operator", true, "LGTM", DateTimeOffset.UtcNow, 42, "abc1234567")));
 
         var result = await handle.GetResultAsync<JobExecutionResult>();
         result.Success.Should().BeTrue("Job should complete successfully across both tasks");
@@ -598,6 +632,26 @@ public class TimelineWorkflowTests
             TaskStepInputs.Add(input);
             return Task.FromResult(Guid.NewGuid());
         }
+
+        [Activity]
+        public Task<IReadOnlyList<ProposedChecklistItem>> AppendRemediationTasksAsync(AppendRemediationTasksInput input) =>
+            Task.FromResult(input.Tasks);
+    }
+
+    private sealed class FakeGitActivities : IGitActivities
+    {
+        public List<MergePullRequestInput> MergeInputs { get; } = [];
+
+        [Activity]
+        public Task<string> MergePullRequestAsync(string prUrl) =>
+            Task.FromResult($"Merged {prUrl}");
+
+        [Activity("MergeJobPullRequest")]
+        public Task<string> MergeJobPullRequestAsync(MergePullRequestInput input)
+        {
+            MergeInputs.Add(input);
+            return Task.FromResult($"Merged {input.PrUrl}");
+        }
     }
 
     private sealed class FakeExecutionActivities : IExecutionActivities
@@ -609,6 +663,14 @@ public class TimelineWorkflowTests
         public Task<TurnOutcome> RunAgentCodingTurnAsync(TaskExecutionInput input, ChatMessageSignal? pendingReply)
         {
             CodingInputs.Add(input);
+            if (input.TaskId.StartsWith("stage-4-pr-open", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(TurnOutcome.AwaitingReview(
+                    "https://github.com/ckchessmaster/agent-mesh/pull/42",
+                    42,
+                    "Opened job-level PR #42",
+                    "abc1234567"));
+            }
             if (CustomCodingHandler != null)
             {
                 return CustomCodingHandler(input, pendingReply);

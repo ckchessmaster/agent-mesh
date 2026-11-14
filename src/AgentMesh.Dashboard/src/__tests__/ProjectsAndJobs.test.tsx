@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
-import type { Persona, Project, ProjectJob, JobTask, JobMessage, JobArtifact } from '../types';
+import type { Persona, Project, ProjectJob, JobTask, JobArtifact } from '../types';
 import { WorkspaceType, ProjectJobStatus } from '../types';
 
 vi.mock('../services/api', () => ({
@@ -33,7 +33,6 @@ vi.mock('../services/api', () => ({
     updateJobTask: vi.fn(),
     assignJobTask: vi.fn(),
     deleteJobTask: vi.fn(),
-    getJobMessages: vi.fn(),
     // Job artifacts. Declared here because this file replaces the whole api module: without it,
     // api.getJobArtifacts is undefined and App's fetch throws into its catch, so every job would render
     // "Artifacts (0)" and the tests below could not tell a broken panel from an unmocked one.
@@ -44,7 +43,6 @@ vi.mock('../services/api', () => ({
     // rather than the state the test is actually asserting.
     getJobChanges: vi.fn(),
     getJobChangePatch: vi.fn(),
-    postJobMessage: vi.fn(),
     uploadJobAttachments: vi.fn(),
     completeJob: vi.fn(),
     submitQuestionAnswer: vi.fn()
@@ -145,28 +143,6 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     updatedAt: new Date().toISOString()
   };
 
-  const mockMessages: JobMessage[] = [
-    {
-      id: 'm-1',
-      jobId: 'job-101',
-      senderType: 'user',
-      content: '@astra please implement the OAuth endpoints',
-      mentions: ['astra'],
-      createdAt: new Date().toISOString()
-    },
-    {
-      id: 'm-2',
-      jobId: 'job-101',
-      senderType: 'persona',
-      senderId: 'astra',
-      senderName: 'Astra',
-      content: 'I have finished the OAuth controller. @qa-tester please test token exchange edge cases.',
-      mentions: ['qa-tester'],
-      turnSessionId: 'sess-turn-456',
-      createdAt: new Date().toISOString()
-    }
-  ];
-
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(api.getStatus).mockResolvedValue({
@@ -208,7 +184,6 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
     vi.mocked(api.getProjects).mockResolvedValue([mockProject]);
     vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob]);
     vi.mocked(api.getJobTasks).mockResolvedValue(mockTasks);
-    vi.mocked(api.getJobMessages).mockResolvedValue(mockMessages);
     // Default: the job has no artifacts. Tests that exercise the panel override this.
     vi.mocked(api.getJobArtifacts).mockResolvedValue([]);
     vi.mocked(api.getJobArtifact).mockResolvedValue({} as any);
@@ -323,20 +298,6 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       dispatchedToNewAssignee: false,
       job: reassignedJob
     });
-
-    const messagesAfterHandover: JobMessage[] = [
-      ...mockMessages,
-      {
-        id: 'm-system-1',
-        jobId: 'job-101',
-        senderType: 'system',
-        senderName: 'System',
-        content: 'Task "Write integration test coverage" reassigned from @Astra to @QA Tester — moved 1 queued turn to @QA Tester.',
-        mentions: ['astra', 'qa-tester'],
-        createdAt: new Date().toISOString()
-      }
-    ];
-    vi.mocked(api.getJobMessages).mockResolvedValue(messagesAfterHandover);
 
     render(<App />);
 

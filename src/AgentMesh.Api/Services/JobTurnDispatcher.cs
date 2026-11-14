@@ -143,12 +143,18 @@ public class JobTurnDispatcher(
             }
         }
 
+        var resolvedWorkingDirectory = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
+            ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
+            : project.GetResolvedWorkingDirectory();
+
         var turnMetadata = new Dictionary<string, object?>
         {
             ["jobId"] = job.Id.ToString(),
             ["taskId"] = req.TaskId,
             ["projectId"] = project.Id,
             ["projectName"] = project.Name,
+            ["repositoryName"] = project.RepositoryName,
+            ["workingDirectory"] = resolvedWorkingDirectory,
             ["workspaceType"] = project.WorkspaceType.ToString(),
             ["gitBranch"] = job.GitBranchName,
             ["gitUrl"] = project.GitRepositoryUrl,
@@ -277,6 +283,10 @@ public class JobTurnDispatcher(
             contextSize = persona.DefaultContextSize,
             jobId = job.Id,
             projectId = project.Id,
+            repositoryName = project.RepositoryName,
+            workingDirectory = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
+                ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
+                : project.GetResolvedWorkingDirectory(),
             gitBranch = job.GitBranchName,
             gitAuthorName = persona.GitAuthorName,
             gitAuthorEmail = persona.GitAuthorEmail,

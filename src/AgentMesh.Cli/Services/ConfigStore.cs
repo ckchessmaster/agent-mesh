@@ -171,6 +171,32 @@ public class ConfigStore
                     {
                         preset.MaxSteps = msVal;
                     }
+                    if ((root.TryGetProperty("contextWindowTokens", out var cwt) || root.TryGetProperty("contextTokens", out cwt)) && cwt.TryGetInt32(out var cwtVal) && cwtVal > 0)
+                    {
+                        preset.ContextWindowTokens = cwtVal;
+                    }
+                    if ((root.TryGetProperty("defaultContextSize", out var dcs) || root.TryGetProperty("contextSize", out dcs)) && dcs.ValueKind == JsonValueKind.String)
+                    {
+                        preset.DefaultContextSize = dcs.GetString();
+                    }
+                    if (root.TryGetProperty("compactionThresholdPercent", out var ctp) && ctp.TryGetInt32(out var ctpVal) && ctpVal > 0)
+                    {
+                        preset.CompactionThresholdPercent = ctpVal;
+                    }
+                    if (root.TryGetProperty("streamChunkIdleTimeoutSeconds", out var scit) && scit.TryGetInt32(out var scitVal) && scitVal > 0)
+                    {
+                        preset.StreamChunkIdleTimeoutSeconds = scitVal;
+                    }
+                    if (root.TryGetProperty("openAi", out var oa) && oa.ValueKind == JsonValueKind.Object)
+                    {
+                        try
+                        {
+                            preset.OpenAi = JsonSerializer.Deserialize<AgentMesh.Cli.Adapters.OpenAISettings>(
+                                oa.GetRawText(),
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        }
+                        catch { }
+                    }
                     if (root.TryGetProperty("sidecar", out var sc) && sc.ValueKind == JsonValueKind.Object)
                     {
                         try

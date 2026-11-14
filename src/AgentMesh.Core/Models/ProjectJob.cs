@@ -122,7 +122,4 @@ public class ProjectJob
 
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
-
-    [JsonIgnore]
-    public ICollection<JobMessage> Messages { get; set; } = new List<JobMessage>();
 }

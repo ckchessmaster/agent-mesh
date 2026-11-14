@@ -171,6 +171,14 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(32)")
                         .HasColumnName("execution_status");
 
+                    b.Property<string>("InitialPrompt")
+                        .HasColumnType("text")
+                        .HasColumnName("initial_prompt");
+
+                    b.Property<string>("MessageText")
+                        .HasColumnType("text")
+                        .HasColumnName("message_text");
+
                     b.Property<string>("PayloadJson")
                         .IsRequired()
                         .HasColumnType("jsonb")
@@ -542,73 +550,6 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDatabaseName("ix_job_handoffs_status_deadline");
 
                     b.ToTable("job_handoffs", (string)null);
-                });
-
-            modelBuilder.Entity("AgentMesh.Core.Models.JobMessage", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid")
-                        .HasColumnName("id");
-
-                    b.Property<string>("Content")
-                        .IsRequired()
-                        .HasColumnType("text")
-                        .HasColumnName("content");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("timestamp with time zone")
-                        .HasColumnName("created_at")
-                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
-
-                    b.Property<Guid>("JobId")
-                        .HasColumnType("uuid")
-                        .HasColumnName("job_id");
-
-                    b.Property<string>("MentionsJson")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("jsonb")
-                        .HasDefaultValue("[]")
-                        .HasColumnName("mentions");
-
-                    b.Property<string>("SenderId")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)")
-                        .HasColumnName("sender_id");
-
-                    b.Property<string>("SenderName")
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)")
-                        .HasColumnName("sender_name");
-
-                    b.Property<string>("SenderType")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasMaxLength(32)
-                        .HasColumnType("character varying(32)")
-                        .HasDefaultValue("user")
-                        .HasColumnName("sender_type");
-
-                    b.Property<string>("StructuredPayloadJson")
-                        .HasColumnType("jsonb")
-                        .HasColumnName("structured_payload");
-
-                    b.Property<Guid?>("TurnSessionId")
-                        .HasColumnType("uuid")
-                        .HasColumnName("turn_session_id");
-
-                    b.HasKey("Id")
-                        .HasName("pk_job_messages");
-
-                    b.HasIndex("JobId")
-                        .HasDatabaseName("ix_job_messages_job_id");
-
-                    b.HasIndex("TurnSessionId")
-                        .HasDatabaseName("ix_job_messages_turn_session_id");
-
-                    b.ToTable("job_messages", (string)null);
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.JobTimelineCard", b =>
@@ -1130,8 +1071,7 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Property<string>("Description")
                         .IsRequired()
                         .ValueGeneratedOnAdd()
-                        .HasMaxLength(1024)
-                        .HasColumnType("character varying(1024)")
+                        .HasColumnType("text")
                         .HasDefaultValue("")
                         .HasColumnName("description");
 

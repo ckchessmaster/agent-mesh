@@ -943,12 +943,15 @@ public class SessionsController(
 
         var callerAgentId = !string.IsNullOrWhiteSpace(req.DriverId)
             ? req.DriverId.Trim().ToLowerInvariant()
-            : !string.IsNullOrWhiteSpace(req.CreatorAgentId)
-                ? req.CreatorAgentId.Trim().ToLowerInvariant()
-                : persona?.DriverId
-                  ?? User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
-                  ?? User?.FindFirst("AgentId")?.Value
-                  ?? "agy";
+            : (persona != null && (string.IsNullOrWhiteSpace(req.CreatorAgentId) ||
+                                   string.Equals(req.CreatorAgentId.Trim(), persona.Id, StringComparison.OrdinalIgnoreCase))
+                ? persona.DriverId.Trim().ToLowerInvariant()
+                : (!string.IsNullOrWhiteSpace(req.CreatorAgentId)
+                    ? req.CreatorAgentId.Trim().ToLowerInvariant()
+                    : persona?.DriverId
+                      ?? User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                      ?? User?.FindFirst("AgentId")?.Value
+                      ?? "agy"));
 
         var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : null;
         var effectiveModel = !string.IsNullOrWhiteSpace(req.Model) ? req.Model : persona?.DefaultModel;
@@ -2168,42 +2171,34 @@ public class SessionsController(
                         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
                         if (job != null)
                         {
-                            var answerMsg = new JobMessage
+                            var now = DateTimeOffset.UtcNow;
+                            var answerContent = $"User answered question:\n{answerSummary}";
+                            var answerCard = new JobTimelineCard
                             {
                                 Id = Guid.NewGuid(),
-                                JobId = jobId,
-                                SenderType = "user",
-                                SenderId = senderId,
-                                SenderName = "You",
-                                Content = $"User answered question:\n{answerSummary}",
-                                MentionsJson = "[]",
-                                TurnSessionId = session.Id,
+                                JobId = jobId.ToString(),
+                                TaskId = job.CurrentTaskId,
+                                CardType = TimelineCardType.DiscoveryQa,
+                                Status = TimelineCardStatus.Approved,
+                                Title = "Question Answered",
                                 StructuredPayloadJson = JsonSerializer.Serialize(new
                                 {
+                                    content = answerContent,
+                                    senderId = senderId,
+                                    turnSessionId = session.Id,
                                     toolCallId = req.ToolCallId,
                                     answers = req.Answers,
                                     toolName = "ask_question"
                                 }, JsonOptions),
-                                CreatedAt = DateTimeOffset.UtcNow
+                                CreatedAt = now,
+                                UpdatedAt = now
                             };
-                            db.JobMessages.Add(answerMsg);
-                            job.UpdatedAt = DateTimeOffset.UtcNow;
+                            db.JobTimelineCards.Add(answerCard);
+                            job.UpdatedAt = now;
                             await db.SaveChangesAsync();
 
-                            var answerDto = new JobMessageDto(
-                                answerMsg.Id,
-                                answerMsg.JobId,
-                                answerMsg.SenderType,
-                                answerMsg.SenderId,
-                                answerMsg.SenderName,
-                                answerMsg.Content,
-                                new List<string>(),
-                                answerMsg.TurnSessionId,
-                                answerMsg.StructuredPayloadJson,
-                                answerMsg.CreatedAt
-                            );
-
-                            await hubContext.Clients.All.SendAsync("JobMessageAdded", answerDto);
+                            await hubContext.Clients.Group($"job-{jobId}")
+                                .SendAsync("ReceiveTimelineCardUpdated", answerCard);
 
                             if (isJobDrivenByWorkflow && workflows is not null)
                             {
@@ -2211,9 +2206,9 @@ public class SessionsController(
                                     jobId,
                                     new Core.Workflows.ChatMessageSignal(
                                         SenderId: senderId,
-                                        Content: answerMsg.Content,
-                                        Timestamp: answerMsg.CreatedAt,
-                                        MessageId: answerMsg.Id.ToString()),
+                                        Content: answerContent,
+                                        Timestamp: answerCard.CreatedAt,
+                                        MessageId: answerCard.Id.ToString()),
                                     HttpContext.RequestAborted);
 
                                 logger?.LogInformation(
@@ -2845,58 +2840,82 @@ public class SessionsController(
             var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
             if (job == null) return;
 
-            var alreadyPosted = await db.JobMessages.AnyAsync(m => m.JobId == jobId && m.TurnSessionId == session.Id && m.Content == responseMessage.Content);
+            var existingCards = await db.JobTimelineCards
+                .AsNoTracking()
+                .Where(c => c.JobId == jobIdStr)
+                .OrderByDescending(c => c.CreatedAt)
+                .Take(20)
+                .ToListAsync();
+
+            var alreadyPosted = existingCards.Any(c =>
+            {
+                try
+                {
+                    using var payloadDoc = JsonDocument.Parse(c.StructuredPayloadJson);
+                    var r = payloadDoc.RootElement;
+                    if (r.ValueKind != JsonValueKind.Object) return false;
+                    var sid = r.TryGetProperty("turnSessionId", out var sp) ? sp.GetString() : null;
+                    var cnt = r.TryGetProperty("content", out var cp) ? cp.GetString() : null;
+                    return sid == session.Id.ToString() && cnt == responseMessage.Content;
+                }
+                catch { return false; }
+            });
             if (alreadyPosted) return;
 
             var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
+            var authorPersonaId = pId ?? session.PersonaId ?? session.DriverId ?? "agent";
 
             var matches = Regex.Matches(responseMessage.Content, @"@([a-zA-Z0-9_\-]+)");
             var mentions = matches.Select(m => m.Groups[1].Value.ToLowerInvariant()).Distinct().ToList();
 
-            var jobMsg = new JobMessage
+            var now = DateTimeOffset.UtcNow;
+            var responseCard = new JobTimelineCard
             {
                 Id = Guid.NewGuid(),
-                JobId = jobId,
-                SenderType = "persona",
-                SenderId = pId ?? session.PersonaId,
-                SenderName = pName ?? session.PersonaId,
-                Content = responseMessage.Content,
-                MentionsJson = JsonSerializer.Serialize(mentions, JsonOptions),
-                TurnSessionId = session.Id,
-                CreatedAt = DateTimeOffset.UtcNow
+                JobId = jobIdStr,
+                TaskId = job.CurrentTaskId,
+                CardType = mentions.Count > 0 ? TimelineCardType.InternalConsultation : TimelineCardType.TaskStep,
+                Status = TimelineCardStatus.Active,
+                Title = $"Turn update (@{authorPersonaId})",
+                StructuredPayloadJson = JsonSerializer.Serialize(new
+                {
+                    content = responseMessage.Content,
+                    senderPersona = authorPersonaId,
+                    authorPersonaId = authorPersonaId,
+                    senderName = pName ?? authorPersonaId,
+                    driverId = session.DriverId,
+                    turnSessionId = session.Id,
+                    mentions = mentions,
+                    source = "session_response"
+                }, JsonOptions),
+                CreatedAt = now,
+                UpdatedAt = now
             };
 
-            db.JobMessages.Add(jobMsg);
-            job.UpdatedAt = DateTimeOffset.UtcNow;
+            db.JobTimelineCards.Add(responseCard);
+            job.UpdatedAt = now;
             await db.SaveChangesAsync();
 
-            var msgDto = new JobMessageDto(
-                jobMsg.Id,
-                jobMsg.JobId,
-                jobMsg.SenderType,
-                jobMsg.SenderId,
-                jobMsg.SenderName,
-                jobMsg.Content,
-                mentions,
-                jobMsg.TurnSessionId,
-                jobMsg.StructuredPayloadJson,
-                jobMsg.CreatedAt
-            );
-
-            await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
+            await hubContext.Clients.Group($"job-{jobId}")
+                .SendAsync("ReceiveTimelineCardUpdated", responseCard);
 
             // Autonomous Handoff & Progress Checkpoint Continuation Check
             var isCheckpointRollover = responseMessage.Content.Contains("Progress Checkpoint") ||
                                        responseMessage.Content.Contains("Continuing to next turn autonomously");
 
-            var recentMessages = await db.JobMessages
-                .AsNoTracking()
-                .Where(m => m.JobId == jobId)
-                .OrderByDescending(m => m.CreatedAt)
-                .Take(20)
-                .ToListAsync();
-
-            var consecutivePersonaCount = recentMessages.TakeWhile(m => m.SenderType == "persona").Count();
+            var consecutivePersonaCount = 1 + existingCards.TakeWhile(c =>
+            {
+                try
+                {
+                    using var payloadDoc = JsonDocument.Parse(c.StructuredPayloadJson);
+                    var r = payloadDoc.RootElement;
+                    return r.ValueKind == JsonValueKind.Object &&
+                           r.TryGetProperty("authorPersonaId", out var ap) &&
+                           !string.IsNullOrWhiteSpace(ap.GetString()) &&
+                           !string.Equals(ap.GetString(), "operator", StringComparison.OrdinalIgnoreCase);
+                }
+                catch { return false; }
+            }).Count();
             var maxAllowedHops = isCheckpointRollover ? 50 : 5;
             if (consecutivePersonaCount < maxAllowedHops)
             {
@@ -2925,8 +2944,8 @@ public class SessionsController(
                                 new Core.Workflows.ChatMessageSignal(
                                     SenderId: pId ?? "agent",
                                     Content: responseMessage.Content,
-                                    Timestamp: jobMsg.CreatedAt,
-                                    MessageId: jobMsg.Id.ToString(),
+                                    Timestamp: responseCard.CreatedAt,
+                                    MessageId: responseCard.Id.ToString(),
                                     TargetPersonaIds: [nextPersonaId]));
                         }
 
@@ -3129,46 +3148,65 @@ public class SessionsController(
             if (job == null) return;
 
             var payload = questionMessage.ToolArgsJson ?? questionMessage.StructuredPayloadJson;
-            var alreadyPosted = await db.JobMessages.AnyAsync(m => m.JobId == jobId && m.TurnSessionId == session.Id && m.StructuredPayloadJson == payload);
+            var existingQuestionCards = await db.JobTimelineCards
+                .AsNoTracking()
+                .Where(c => c.JobId == jobIdStr && c.CardType == TimelineCardType.Escalation3R)
+                .Select(c => c.StructuredPayloadJson)
+                .ToListAsync();
+
+            var alreadyPosted = existingQuestionCards.Any(p =>
+            {
+                try
+                {
+                    using var pDoc = JsonDocument.Parse(p);
+                    var r = pDoc.RootElement;
+                    if (r.ValueKind != JsonValueKind.Object) return false;
+                    var sid = r.TryGetProperty("turnSessionId", out var sp) ? sp.GetString() : null;
+                    var raw = r.TryGetProperty("rawQuestionPayload", out var rp) ? rp.GetString() : null;
+                    return sid == session.Id.ToString() && raw == payload;
+                }
+                catch { return false; }
+            });
             if (alreadyPosted) return;
 
             var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
+            var authorPersonaId = pId ?? session.PersonaId ?? session.DriverId ?? "agent";
 
             var (content, normalizedPayload) = ProcessJobTurnQuestionPayload(payload, questionMessage.Content);
+            var now = DateTimeOffset.UtcNow;
 
-            var jobMsg = new JobMessage
+            var questionCard = new JobTimelineCard
             {
                 Id = Guid.NewGuid(),
-                JobId = jobId,
-                SenderType = "persona",
-                SenderId = pId ?? session.PersonaId,
-                SenderName = pName ?? session.PersonaId,
-                Content = content,
-                MentionsJson = "[]",
-                TurnSessionId = session.Id,
-                StructuredPayloadJson = normalizedPayload,
-                CreatedAt = DateTimeOffset.UtcNow
+                JobId = jobIdStr,
+                TaskId = job.CurrentTaskId,
+                CardType = TimelineCardType.Escalation3R,
+                Status = TimelineCardStatus.PendingInput,
+                Title = $"Question from @{authorPersonaId}",
+                StructuredPayloadJson = JsonSerializer.Serialize(new
+                {
+                    content = content,
+                    requiresReply = true,
+                    targetPersona = "operator",
+                    senderPersona = authorPersonaId,
+                    authorPersonaId = authorPersonaId,
+                    senderName = pName ?? authorPersonaId,
+                    driverId = session.DriverId,
+                    turnSessionId = session.Id,
+                    rawQuestionPayload = payload,
+                    normalizedQuestionPayload = normalizedPayload,
+                    source = "session_question"
+                }, JsonOptions),
+                CreatedAt = now,
+                UpdatedAt = now
             };
 
-            db.JobMessages.Add(jobMsg);
-            job.UpdatedAt = DateTimeOffset.UtcNow;
+            db.JobTimelineCards.Add(questionCard);
+            job.UpdatedAt = now;
             await db.SaveChangesAsync();
 
-            var msgDto = new JobMessageDto(
-                jobMsg.Id,
-                jobMsg.JobId,
-                jobMsg.SenderType,
-                jobMsg.SenderId,
-                jobMsg.SenderName,
-                jobMsg.Content,
-                new List<string>(),
-                jobMsg.TurnSessionId,
-                jobMsg.StructuredPayloadJson,
-                jobMsg.CreatedAt
-            );
-
-            await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
-            await hubContext.Clients.All.SendAsync("JobMessageCreated", msgDto);
+            await hubContext.Clients.Group($"job-{jobId}")
+                .SendAsync("ReceiveTimelineCardUpdated", questionCard);
         }
         catch { }
     }

@@ -102,21 +102,29 @@ public class JobHandoffService(
         var fromName = await DisplayNameAsync(req.FromPersonaId, ct);
         var toName = await DisplayNameAsync(req.ToPersonaId, ct);
 
-        var notice = new JobMessage
+        var noticeContent = $"@{fromName} is handing this job to @{toName}. Waiting for @{fromName} to save " +
+                            $"the workspace and confirm — up to {(int)Options.Grace.TotalSeconds}s before it " +
+                            "proceeds without confirmation.";
+        var notice = new JobTimelineCard
         {
             Id = Guid.NewGuid(),
-            JobId = job.Id,
-            SenderType = "system",
-            SenderId = "handoff",
-            SenderName = "Handoff",
-            Content = $"@{fromName} is handing this job to @{toName}. Waiting for @{fromName} to save " +
-                      $"the workspace and confirm — up to {(int)Options.Grace.TotalSeconds}s before it " +
-                      "proceeds without confirmation.",
-            MentionsJson = "[]",
-            TurnSessionId = req.FromTurnSessionId,
-            CreatedAt = now
+            JobId = job.Id.ToString(),
+            CardType = TimelineCardType.InternalConsultation,
+            Status = TimelineCardStatus.Active,
+            Title = $"Handoff: @{req.FromPersonaId} -> @{req.ToPersonaId}",
+            StructuredPayloadJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                content = noticeContent,
+                senderPersona = req.FromPersonaId,
+                authorPersonaId = req.FromPersonaId,
+                targetPersona = req.ToPersonaId,
+                turnSessionId = req.FromTurnSessionId,
+                source = "handoff"
+            }),
+            CreatedAt = now,
+            UpdatedAt = now
         };
-        db.JobMessages.Add(notice);
+        db.JobTimelineCards.Add(notice);
 
         await db.SaveChangesAsync(ct);
 
@@ -301,14 +309,40 @@ public class JobHandoffService(
                                : "Durable workspace: none recorded yet — start from the project branch.\n") +
                            (!string.IsNullOrWhiteSpace(note) ? $"Notes from @{fromName}: {note}\n" : "");
 
-            var lastFromPersona = await db.JobMessages.AsNoTracking()
-                .Where(m => m.JobId == job.Id && m.SenderType == "persona" && m.SenderId == handoff.FromPersonaId)
-                .OrderByDescending(m => m.CreatedAt)
-                .FirstOrDefaultAsync(ct);
+            var jobIdStr = job.Id.ToString();
+            var recentCards = await db.JobTimelineCards.AsNoTracking()
+                .Where(c => c.JobId == jobIdStr)
+                .OrderByDescending(c => c.CreatedAt)
+                .Take(20)
+                .ToListAsync(ct);
+
+            string? lastFromPersonaContent = null;
+            foreach (var card in recentCards)
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(card.StructuredPayloadJson);
+                    if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) continue;
+                    var author = doc.RootElement.TryGetProperty("authorPersonaId", out var aProp) && aProp.ValueKind == System.Text.Json.JsonValueKind.String
+                        ? aProp.GetString()
+                        : (doc.RootElement.TryGetProperty("senderPersona", out var sProp) && sProp.ValueKind == System.Text.Json.JsonValueKind.String
+                            ? sProp.GetString()
+                            : null);
+                    if (!string.Equals(author, handoff.FromPersonaId, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (doc.RootElement.TryGetProperty("source", out var srcProp) &&
+                        string.Equals(srcProp.GetString(), "handoff", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (doc.RootElement.TryGetProperty("content", out var cProp) && cProp.ValueKind == System.Text.Json.JsonValueKind.String)
+                    {
+                        lastFromPersonaContent = cProp.GetString();
+                        break;
+                    }
+                }
+                catch { }
+            }
 
             var prompt = $"Continue this job from @{fromName}.\n\n" +
-                         (lastFromPersona != null
-                             ? $"[Last message from @{fromName}]:\n{lastFromPersona.Content}\n"
+                         (!string.IsNullOrWhiteSpace(lastFromPersonaContent)
+                             ? $"[Last message from @{fromName}]:\n{lastFromPersonaContent}\n"
                              : string.Empty);
 
             var dispatched = await turns.DispatchAsync(new JobTurnRequest(
@@ -363,23 +397,15 @@ public class JobHandoffService(
         return persona?.Name ?? personaId;
     }
 
-    private async Task PublishHandoffAsync(Guid jobId, JobHandoff handoff, JobMessage? notice, CancellationToken ct)
+    private async Task PublishHandoffAsync(Guid jobId, JobHandoff handoff, JobTimelineCard? notice, CancellationToken ct)
     {
         if (hubContext == null) return;
         var dto = ToDto(handoff);
         await hubContext.Clients.All.SendAsync("JobHandoffUpdated", dto, ct);
         if (notice != null)
         {
-            await hubContext.Clients.All.SendAsync("JobMessageAdded", new
-            {
-                notice.Id,
-                notice.JobId,
-                SenderType = notice.SenderType,
-                SenderId = notice.SenderId,
-                SenderName = notice.SenderName,
-                notice.Content,
-                CreatedAt = notice.CreatedAt
-            }, ct);
+            await hubContext.Clients.Group($"job-{jobId}")
+                .SendAsync("ReceiveTimelineCardUpdated", notice, ct);
         }
     }
 

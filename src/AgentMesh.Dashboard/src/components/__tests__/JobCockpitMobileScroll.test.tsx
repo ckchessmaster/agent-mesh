@@ -1,7 +1,7 @@
 import { render, screen, act, cleanup } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { JobCockpit } from '../JobCockpit';
-import { ProjectJobStatus, type Project, type ProjectJob, type JobMessage } from '../../types';
+import { ProjectJobStatus, type Project, type ProjectJob } from '../../types';
 import type { JobTimelineCard } from '../../types/timeline';
 
 const mockCards: JobTimelineCard[] = [
@@ -85,8 +85,6 @@ const baseProps = {
   tasks: [],
   personas: [],
   sessions: [],
-  messages: [] as JobMessage[],
-  onSendMessage: vi.fn().mockResolvedValue(undefined),
   onAddTask: vi.fn().mockResolvedValue(undefined),
   onToggleTask: vi.fn().mockResolvedValue(undefined),
   onDeleteTask: vi.fn().mockResolvedValue(undefined),

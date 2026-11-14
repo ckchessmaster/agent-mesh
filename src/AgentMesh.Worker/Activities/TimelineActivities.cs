@@ -128,13 +128,27 @@ public class TimelineActivities(
             {
                 if (card.CardType == TimelineCardType.JobInitialized && input.Status == TimelineCardStatus.Resolved)
                 {
-                    job.ProgressHeartbeat = "Completed all tasks successfully";
+                    job.Status = ProjectJobStatus.Completed;
+                    job.ProgressHeartbeat = "Pull request merged; job completed";
                 }
                 else if (card.CardType == TimelineCardType.PlanApproval && input.Status == TimelineCardStatus.Approved)
                 {
                     job.ProgressHeartbeat = "Plan approved. Starting implementation.";
                 }
                 job.UpdatedAt = DateTimeOffset.UtcNow;
+            }
+
+            if (card.CardType == TimelineCardType.JobInitialized &&
+                input.Status == TimelineCardStatus.Resolved &&
+                Guid.TryParse(card.JobId?.Trim(), out var agentJobGuid))
+            {
+                var agentJob = await dbContext.AgentJobs.FirstOrDefaultAsync(j => j.Id == agentJobGuid);
+                if (agentJob != null)
+                {
+                    agentJob.ExecutionStatus = ExecutionStatus.Completed;
+                    agentJob.ProgressHeartbeat = "Pull request merged; job completed";
+                    agentJob.UpdatedAt = DateTimeOffset.UtcNow;
+                }
             }
 
             await dbContext.SaveChangesAsync();
@@ -194,12 +208,37 @@ public class TimelineActivities(
                 var outcome = await turnRunner.RunTurnAsync(request, ct);
                 agentSummary = outcome.Message;
 
-                recentMessage = await dbContext.JobMessages
+                var latestCardPayloads = await dbContext.JobTimelineCards
                     .AsNoTracking()
-                    .Where(m => m.JobId == job.Id && (m.SenderType == "persona" || m.SenderType == "agent"))
-                    .OrderByDescending(m => m.CreatedAt)
-                    .Select(m => m.Content)
-                    .FirstOrDefaultAsync(ct);
+                    .Where(c => c.JobId == job.Id.ToString() &&
+                                (c.CardType == TimelineCardType.Escalation3R ||
+                                 c.CardType == TimelineCardType.InternalConsultation ||
+                                 c.CardType == TimelineCardType.TaskStep))
+                    .OrderByDescending(c => c.CreatedAt)
+                    .Select(c => c.StructuredPayloadJson)
+                    .Take(5)
+                    .ToListAsync(ct);
+
+                foreach (var cardPayload in latestCardPayloads)
+                {
+                    if (string.IsNullOrWhiteSpace(cardPayload)) continue;
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(cardPayload);
+                        if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                            doc.RootElement.TryGetProperty("content", out var contentProp) &&
+                            contentProp.ValueKind == JsonValueKind.String &&
+                            !string.IsNullOrWhiteSpace(contentProp.GetString()))
+                        {
+                            recentMessage = contentProp.GetString();
+                            break;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore malformed card payload
+                    }
+                }
 
                 // Also check if any ask_question tool call was logged in session messages
                 var recentToolCallArgs = await (from sm in dbContext.SessionMessages.AsNoTracking()
@@ -854,6 +893,67 @@ public class TimelineActivities(
         {
             // Ignore malformed JSON
         }
+    }
+
+    [Activity]
+    public async Task<IReadOnlyList<ProposedChecklistItem>> AppendRemediationTasksAsync(AppendRemediationTasksInput input)
+    {
+        if (input.Tasks.Count == 0)
+        {
+            return input.Tasks;
+        }
+
+        var job = await TryLoadJobAsync(input.JobId);
+        if (job == null)
+        {
+            return input.Tasks;
+        }
+
+        List<JobTaskDto> existing;
+        try
+        {
+            existing = JsonSerializer.Deserialize<List<JobTaskDto>>(
+                string.IsNullOrWhiteSpace(job.TasksJson) ? "[]" : job.TasksJson,
+                JsonOptions) ?? [];
+        }
+        catch
+        {
+            existing = [];
+        }
+
+        var resolvedItems = new List<ProposedChecklistItem>(input.Tasks.Count);
+        foreach (var proposed in input.Tasks)
+        {
+            var id = Guid.TryParse(proposed.TaskId, out var parsed) && parsed != Guid.Empty
+                ? parsed
+                : Guid.NewGuid();
+
+            existing.Add(new JobTaskDto
+            {
+                Id = id,
+                Title = proposed.Title,
+                TargetFile = proposed.TargetFile,
+                VerificationMethod = proposed.VerificationMethod,
+                AcceptanceCriteria = proposed.VerificationMethod,
+                Status = JobTaskStatus.Todo,
+                IsCompleted = false,
+                StatusChangedAt = DateTimeOffset.UtcNow
+            });
+
+            resolvedItems.Add(proposed with { TaskId = id.ToString("D") });
+        }
+
+        job.TasksJson = JsonSerializer.Serialize(existing, JsonOptions);
+        job.CurrentTaskId = resolvedItems[0].TaskId;
+        job.ProgressHeartbeat = $"Round {input.Round} remediation ({input.Source}): {resolvedItems.Count} task(s) queued";
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+
+        await dbContext.SaveChangesAsync();
+        logger.LogInformation(
+            "Appended {Count} remediation checklist task(s) for job {JobId} (round {Round}, source {Source})",
+            resolvedItems.Count, input.JobId, input.Round, input.Source);
+
+        return resolvedItems;
     }
 }
 

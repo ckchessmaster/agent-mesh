@@ -15,7 +15,6 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     public DbSet<Project> Projects => Set<Project>();
     public DbSet<ProjectPersona> ProjectPersonas => Set<ProjectPersona>();
     public DbSet<ProjectJob> ProjectJobs => Set<ProjectJob>();
-    public DbSet<JobMessage> JobMessages => Set<JobMessage>();
     public DbSet<JobWorkspaceState> JobWorkspaceStates => Set<JobWorkspaceState>();
     public DbSet<JobHandoff> JobHandoffs => Set<JobHandoff>();
     public DbSet<AgentMemory> AgentMemories => Set<AgentMemory>();

@@ -141,21 +141,69 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
                 onAddComment={onAddComment}
               />
             );
-          default:
+          default: {
+            let parsedPayload: Record<string, unknown> | null = null;
+            try {
+              parsedPayload = card.structuredPayloadJson
+                ? (JSON.parse(card.structuredPayloadJson) as Record<string, unknown>)
+                : null;
+            } catch {
+              parsedPayload = null;
+            }
+            const authorPersona =
+              (typeof parsedPayload?.authorPersonaId === 'string' && parsedPayload.authorPersonaId) ||
+              (typeof parsedPayload?.senderPersona === 'string' && parsedPayload.senderPersona) ||
+              null;
+            const targetPersona =
+              typeof parsedPayload?.targetPersona === 'string' ? parsedPayload.targetPersona : null;
+            const textContent =
+              typeof parsedPayload?.content === 'string' ? parsedPayload.content : null;
+            const prUrl = typeof parsedPayload?.prUrl === 'string' ? parsedPayload.prUrl : null;
+
             return (
               <div
                 key={card.id}
                 className="p-4 rounded-lg bg-slate-900/80 border border-slate-800 text-slate-200 mb-4"
               >
-                <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-                  <h4 className="text-sm font-semibold text-slate-100">{card.title}</h4>
-                  <span className="px-2 py-0.5 text-xs font-mono rounded bg-slate-800 text-slate-400">
+                <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <h4 className="text-sm font-semibold text-slate-100 truncate">{card.title}</h4>
+                    {authorPersona && (
+                      <span className="px-2 py-0.5 text-[11px] font-mono rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
+                        @{authorPersona}
+                      </span>
+                    )}
+                    {targetPersona && (
+                      <span className="px-2 py-0.5 text-[11px] font-mono rounded bg-slate-800 text-slate-300">
+                        -&gt; @{targetPersona}
+                      </span>
+                    )}
+                  </div>
+                  <span className="px-2 py-0.5 text-xs font-mono rounded bg-slate-800 text-slate-400 shrink-0">
                     {card.cardType}
                   </span>
                 </div>
-                <div className="mt-2 text-xs font-mono text-slate-400 max-h-36 overflow-y-auto whitespace-pre-wrap">
-                  {card.structuredPayloadJson}
-                </div>
+                {textContent ? (
+                  <div className="mt-2 text-xs text-slate-200 whitespace-pre-wrap">
+                    {textContent}
+                  </div>
+                ) : (
+                  <div className="mt-2 text-xs font-mono text-slate-400 max-h-36 overflow-y-auto whitespace-pre-wrap">
+                    {card.structuredPayloadJson}
+                  </div>
+                )}
+                {prUrl && (
+                  <div className="mt-2">
+                    <a
+                      href={prUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs font-mono text-sky-400 hover:underline"
+                    >
+                      {prUrl}
+                    </a>
+                  </div>
+                )}
                 <CardComments
                   cardId={card.id}
                   comments={card.comments}
@@ -163,6 +211,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
                 />
               </div>
             );
+          }
         }
       })}
     </main>

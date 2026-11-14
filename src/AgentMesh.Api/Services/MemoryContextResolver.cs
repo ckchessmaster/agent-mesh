@@ -71,6 +71,8 @@ public class MemoryContextResolver(
     /// <summary>The turn session the caller is running inside; resolved to its project.</summary>
     public const string SessionIdHeader = "X-Session-Id";
 
+    public const string PersonaIdHeader = "X-Persona-Id";
+
     public const string AgentIdHeader = "X-Agent-Id";
 
     private const string UnknownSource = "none";
@@ -79,7 +81,7 @@ public class MemoryContextResolver(
     {
         var httpContext = httpContextAccessor?.HttpContext;
 
-        var (agentId, agentSource) = ResolveAgentId(httpContext);
+        var (agentId, agentSource) = await ResolveIdentityAsync(httpContext, ct);
 
         if (isGlobal == true)
         {
@@ -90,16 +92,60 @@ public class MemoryContextResolver(
         return new MemoryCallScope(agentId, projectId, agentSource, projectSource);
     }
 
-    private static (string? AgentId, string Source) ResolveAgentId(HttpContext? httpContext)
+    private async Task<(string? AgentId, string Source)> ResolveIdentityAsync(
+        HttpContext? httpContext,
+        CancellationToken ct)
     {
         if (httpContext is null)
         {
             return (null, "no http context");
         }
 
+        // 1. If running inside a dispatched turn session with a PersonaId, the session row was created
+        // by the control plane for that persona — attribute memories to PersonaId rather than DriverId.
+        if (db is not null &&
+            httpContext.Request.Headers.TryGetValue(SessionIdHeader, out var sessionHeader) &&
+            Guid.TryParse(sessionHeader.ToString().Trim(), out var sessionId))
+        {
+            var sessionInfo = await db.AgentSessions
+                .AsNoTracking()
+                .Where(s => s.Id == sessionId)
+                .Select(s => new { s.PersonaId, s.MetadataJson })
+                .FirstOrDefaultAsync(ct);
+
+            if (!string.IsNullOrWhiteSpace(sessionInfo?.PersonaId))
+            {
+                return (Normalize(sessionInfo.PersonaId), $"session {sessionId} personaId");
+            }
+
+            var metaPersona = ExtractMetadataProperty(sessionInfo?.MetadataJson, "personaId");
+            if (!string.IsNullOrWhiteSpace(metaPersona))
+            {
+                return (metaPersona, $"session {sessionId} metadata.personaId");
+            }
+        }
+
         var user = httpContext.User;
+        var isDriverOrMasterKey = user?.HasClaim("IsMasterKey", "true") == true ||
+                                  user?.IsInRole("Driver") == true;
+
+        // 2. When authenticated as a Driver runner or MasterKey (or unauthenticated dev mode),
+        // X-Persona-Id identifies the persona hosted on that driver.
+        if ((isDriverOrMasterKey || user?.Identity?.IsAuthenticated != true) &&
+            httpContext.Request.Headers.TryGetValue(PersonaIdHeader, out var personaHeader) &&
+            !string.IsNullOrWhiteSpace(personaHeader))
+        {
+            return (Normalize(personaHeader.ToString()), $"{PersonaIdHeader} header");
+        }
+
         if (user?.Identity?.IsAuthenticated == true)
         {
+            var personaClaim = user.FindFirst("PersonaId")?.Value ?? user.FindFirst("persona_id")?.Value;
+            if (!string.IsNullOrWhiteSpace(personaClaim))
+            {
+                return (Normalize(personaClaim), "authenticated persona claim");
+            }
+
             var claim = user.FindFirst(ClaimTypes.NameIdentifier)?.Value
                 ?? user.FindFirst("AgentId")?.Value;
 
@@ -177,7 +223,10 @@ public class MemoryContextResolver(
     /// blob must degrade to "no project context" (which produces an actionable tool error) rather than
     /// throw inside a tool call.
     /// </remarks>
-    internal string? ExtractProjectId(string? metadataJson)
+    internal string? ExtractProjectId(string? metadataJson) =>
+        ExtractMetadataProperty(metadataJson, "projectId");
+
+    private string? ExtractMetadataProperty(string? metadataJson, string propertyName)
     {
         if (string.IsNullOrWhiteSpace(metadataJson))
         {
@@ -188,20 +237,20 @@ public class MemoryContextResolver(
         {
             using var document = System.Text.Json.JsonDocument.Parse(metadataJson);
             if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object ||
-                !document.RootElement.TryGetProperty("projectId", out var projectIdElement))
+                !document.RootElement.TryGetProperty(propertyName, out var propElement))
             {
                 return null;
             }
 
-            var value = projectIdElement.ValueKind == System.Text.Json.JsonValueKind.String
-                ? projectIdElement.GetString()
-                : projectIdElement.ToString();
+            var value = propElement.ValueKind == System.Text.Json.JsonValueKind.String
+                ? propElement.GetString()
+                : propElement.ToString();
 
             return string.IsNullOrWhiteSpace(value) ? null : Normalize(value);
         }
         catch (System.Text.Json.JsonException)
         {
-            logger?.LogWarning("Session metadata is not valid JSON; skipping project resolution");
+            logger?.LogWarning("Session metadata is not valid JSON; skipping '{Property}' resolution", propertyName);
             return null;
         }
     }

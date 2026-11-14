@@ -248,14 +248,45 @@ public static class JobArtifactMirror
         Guid jobId,
         CancellationToken ct)
     {
-        var linkedIds = await db.JobMessages
+        var jobIdStr = jobId.ToString();
+        var cardPayloads = await db.JobTimelineCards
             .AsNoTracking()
-            .Where(m => m.JobId == jobId && m.TurnSessionId != null)
-            .Select(m => m.TurnSessionId!.Value)
-            .Distinct()
+            .Where(c => c.JobId == jobIdStr)
+            .Select(c => c.StructuredPayloadJson)
             .ToListAsync(ct);
 
-        var needle = jobId.ToString().ToLowerInvariant();
+        var linkedIds = new HashSet<Guid>();
+        foreach (var payload in cardPayloads)
+        {
+            if (TryExtractTurnSessionId(payload, out var sid))
+            {
+                linkedIds.Add(sid);
+            }
+        }
+
+        var workspaceSessionIds = await db.JobWorkspaceStates
+            .AsNoTracking()
+            .Where(w => w.JobId == jobId)
+            .Select(w => new { w.LastSavedTurnSessionId, w.CheckpointTurnSessionId })
+            .ToListAsync(ct);
+        foreach (var ws in workspaceSessionIds)
+        {
+            if (ws.LastSavedTurnSessionId.HasValue) linkedIds.Add(ws.LastSavedTurnSessionId.Value);
+            if (ws.CheckpointTurnSessionId.HasValue) linkedIds.Add(ws.CheckpointTurnSessionId.Value);
+        }
+
+        var handoffSessionIds = await db.JobHandoffs
+            .AsNoTracking()
+            .Where(h => h.JobId == jobId)
+            .Select(h => new { h.FromTurnSessionId, h.ToTurnSessionId })
+            .ToListAsync(ct);
+        foreach (var h in handoffSessionIds)
+        {
+            if (h.FromTurnSessionId.HasValue) linkedIds.Add(h.FromTurnSessionId.Value);
+            if (h.ToTurnSessionId.HasValue) linkedIds.Add(h.ToTurnSessionId.Value);
+        }
+
+        var needle = jobIdStr.ToLowerInvariant();
 
         // Materialise the (small, index-bounded) active set, then match the envelope in memory: EF cannot
         // translate a jsonb property read here without a value converter on the column, and the codebase
@@ -278,6 +309,25 @@ public static class JobArtifactMirror
             .Where(s => sessionIds.Contains(s.Id))
             .OrderBy(s => s.CreatedAt)
             .ToListAsync(ct);
+    }
+
+    private static bool TryExtractTurnSessionId(string? structuredPayloadJson, out Guid sessionId)
+    {
+        sessionId = Guid.Empty;
+        if (string.IsNullOrWhiteSpace(structuredPayloadJson)) return false;
+
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(structuredPayloadJson);
+            if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) return false;
+            if (!doc.RootElement.TryGetProperty("turnSessionId", out var prop)) return false;
+            var raw = prop.ValueKind == System.Text.Json.JsonValueKind.String ? prop.GetString() : prop.ToString();
+            return Guid.TryParse(raw, out sessionId) && sessionId != Guid.Empty;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -340,10 +390,24 @@ public static class JobArtifactMirror
 
         try
         {
-            var msg = db.JobMessages
+            var ws = db.JobWorkspaceStates
                 .AsNoTracking()
-                .FirstOrDefault(m => m.TurnSessionId == session.Id);
-            return msg?.JobId;
+                .FirstOrDefault(w => w.LastSavedTurnSessionId == session.Id || w.CheckpointTurnSessionId == session.Id);
+            if (ws != null) return ws.JobId;
+
+            var handoff = db.JobHandoffs
+                .AsNoTracking()
+                .FirstOrDefault(h => h.FromTurnSessionId == session.Id || h.ToTurnSessionId == session.Id);
+            if (handoff != null) return handoff.JobId;
+
+            var sessionIdStr = session.Id.ToString();
+            var card = db.JobTimelineCards
+                .AsNoTracking()
+                .OrderByDescending(c => c.CreatedAt)
+                .Take(100)
+                .AsEnumerable()
+                .FirstOrDefault(c => TryExtractTurnSessionId(c.StructuredPayloadJson, out var sid) && sid == session.Id);
+            return card != null && Guid.TryParse(card.JobId, out var cardJobId) ? cardJobId : null;
         }
         catch
         {

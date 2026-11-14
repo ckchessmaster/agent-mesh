@@ -66,7 +66,6 @@ import type {
   AgentSession,
   AgentUsageResponse,
   AskQuestionItem,
-  JobMessage,
   JobTask,
   Persona,
   Project,
@@ -384,7 +383,6 @@ export default function App() {
   const handleMobileBack = useCallback(() => {
     setIsMobileDetailView(false);
   }, []);
-  const [jobMessages, setJobMessages] = useState<JobMessage[]>([]);
   const [jobTasks, setJobTasks] = useState<JobTask[]>([]);
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [editingProject, setEditingProject] = useState<Project | null>(null);
@@ -1033,28 +1031,22 @@ export default function App() {
 
   useEffect(() => {
     if (selectedJobId) {
-      Promise.all([
-        api.getJobMessages(selectedJobId),
-        api.getJobTasks(selectedJobId)
-      ]).then(([msgs, tasks]) => {
-        setJobMessages(msgs);
-        setJobTasks(tasks);
-      }).catch((err) => {
-        console.error('Failed to load job details:', err);
-      });
-      // Deliberately not in the Promise.all above: a server without the artifact endpoint would reject
-      // the whole group and take the messages and checklist down with it, leaving the cockpit empty
-      // rather than just the panel. fetchJobArtifacts swallows its own failure.
+      api.getJobTasks(selectedJobId)
+        .then((tasks) => {
+          setJobTasks(tasks);
+        })
+        .catch((err) => {
+          console.error('Failed to load job details:', err);
+        });
       fetchJobArtifacts(selectedJobId);
     } else {
-      setJobMessages([]);
       setJobTasks([]);
       setJobArtifacts([]);
       setSelectedJobArtifactId(null);
     }
   }, [selectedJobId, fetchJobArtifacts]);
 
-  // Active job polling effect: keeps job messages, tasks, and sessions live every 3s while job is active
+  // Active job polling effect: keeps job tasks and sessions live every 3s while job is active
   useEffect(() => {
     if (!selectedJobId) return;
 
@@ -1070,16 +1062,7 @@ export default function App() {
 
     const interval = setInterval(async () => {
       try {
-        const [msgs, tasks] = await Promise.all([
-          api.getJobMessages(selectedJobId),
-          api.getJobTasks(selectedJobId)
-        ]);
-        setJobMessages((prev) => {
-          if (prev.length === msgs.length && prev[prev.length - 1]?.id === msgs[msgs.length - 1]?.id) {
-            return prev;
-          }
-          return msgs;
-        });
+        const tasks = await api.getJobTasks(selectedJobId);
         setJobTasks((prev) => {
           if (JSON.stringify(prev) === JSON.stringify(tasks)) {
             return prev;
@@ -1152,22 +1135,8 @@ export default function App() {
     });
     if (selectedJobId === jobId) {
       setSelectedJobId(null);
-      setJobMessages([]);
       setJobTasks([]);
     }
-  };
-
-  const handleSendJobMessage = async (content: string, attachments?: SessionAttachment[]) => {
-    if (!selectedJobId) return;
-    const msg = await api.postJobMessage(selectedJobId, {
-      content,
-      senderType: 'user',
-      attachments
-    });
-    setJobMessages((prev) => {
-      if (prev.some((m) => m.id === msg.id)) return prev;
-      return [...prev, msg];
-    });
   };
 
   const handleUpdateJob = async (updates: {
@@ -1227,16 +1196,19 @@ export default function App() {
     }
 
     if (!answered && selectedJobId) {
-      await api.postJobMessage(selectedJobId, {
-        content: `User answered question:\n${payload.answerSummary}\nPlease proceed with this answer.`,
-        senderType: 'user'
-      });
+      try {
+        const cards = await api.getTimelineCards(selectedJobId);
+        const pendingCard = cards.find((c) => c.status === 'PendingInput') || cards[cards.length - 1];
+        if (pendingCard) {
+          await api.addTimelineComment(selectedJobId, pendingCard.id, {
+            senderId: 'operator',
+            senderType: 'operator',
+            content: `User answered question:\n${payload.answerSummary}\nPlease proceed with this answer.`
+          });
+        }
+      } catch {}
     }
 
-    if (selectedJobId) {
-      const msgs = await api.getJobMessages(selectedJobId);
-      setJobMessages(msgs);
-    }
     await fetchAllData();
   };
 
@@ -1273,13 +1245,7 @@ export default function App() {
         applyJobFromServer(result.job);
         setJobTasks(result.job.tasks || []);
       } else {
-        // No DTO to trust (older server): fall back to the single row rather than clearing
-        // the whole checklist.
         setJobTasks((prev) => prev.map((t) => (t.id === taskId ? result.task : t)));
-      }
-      if (result.movedQueuedTurnCount > 0) {
-        const msgs = await api.getJobMessages(selectedJobId);
-        setJobMessages(msgs);
       }
     } catch (err) {
       console.error('Failed to assign task:', err);
@@ -1305,9 +1271,8 @@ export default function App() {
       }
       return next;
     });
-    // Immediately pull latest sessions, tasks, and messages
+    // Immediately pull latest sessions and tasks
     fetchAllData();
-    api.getJobMessages(selectedJobId).then(setJobMessages).catch(console.error);
     api.getJobTasks(selectedJobId).then(setJobTasks).catch(console.error);
   };
 
@@ -1408,8 +1373,6 @@ export default function App() {
           return next;
         });
       }
-      const msgs = await api.getJobMessages(targetId);
-      setJobMessages(msgs);
     } catch (err) {
       console.error('Failed to cancel queued turn:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turn');
@@ -1422,8 +1385,6 @@ export default function App() {
     try {
       const job = await api.cancelQueuedJobTurns(targetId, personaId);
       if (job) applyJobFromServer(job);
-      const msgs = await api.getJobMessages(targetId);
-      setJobMessages(msgs);
     } catch (err) {
       console.error('Failed to cancel queued turns:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turns');
@@ -1656,16 +1617,6 @@ export default function App() {
       });
     };
 
-    const handleJobMessageAdded = (msg: JobMessage) => {
-      setJobMessages((prev) => {
-        if (msg.jobId === selectedJobIdRef.current) {
-          if (prev.some((m) => m.id === msg.id)) return prev;
-          return [...prev, msg];
-        }
-        return prev;
-      });
-    };
-
     const handleJobTaskUpdated = (data: { jobId: string; tasks: JobTask[] }) => {
       if (data.jobId === selectedJobIdRef.current) {
         const unique = (data.tasks || []).filter(
@@ -1777,8 +1728,6 @@ export default function App() {
     connection.on('PersonaUpdated', handleSessionUpdated);
     connection.on('PersonaDeleted', handleSessionUpdated);
     connection.on('MeshReset', handleMeshReset);
-    connection.on('JobMessageAdded', handleJobMessageAdded);
-    connection.on('JobMessageCreated', handleJobMessageAdded);
     connection.on('JobTaskUpdated', handleJobTaskUpdated);
     connection.on('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
     connection.on('JobCreated', handleJobCreated);
@@ -1806,8 +1755,6 @@ export default function App() {
       connection.off('PersonaUpdated', handleSessionUpdated);
       connection.off('PersonaDeleted', handleSessionUpdated);
       connection.off('MeshReset', handleMeshReset);
-      connection.off('JobMessageAdded', handleJobMessageAdded);
-      connection.off('JobMessageCreated', handleJobMessageAdded);
       connection.off('JobTaskUpdated', handleJobTaskUpdated);
       connection.off('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
       connection.off('JobCreated', handleJobCreated);
@@ -3968,11 +3915,9 @@ export default function App() {
                       project={activeProj}
                       job={activeJ}
                       tasks={jobTasks}
-                      messages={jobMessages}
                       personas={personas}
                       sessions={sessions}
                       onStartJob={handleStartJob}
-                      onSendMessage={handleSendJobMessage}
                       onAddTask={handleAddTask}
                       onToggleTask={handleToggleTask}
                       onUpdateTask={handleUpdateTask}

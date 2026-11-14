@@ -78,9 +78,52 @@ public static class AgentAdapterFactory
     public static bool IsExecutableOnPath(string command) =>
         ResolveExecutablePath(command) != null;
 
-    public static string ResolveWorkspaceDirectory()
+    public static string ResolveWorkspaceDirectory(PromptReceivedEvent? promptEvent = null)
     {
+        if (!string.IsNullOrWhiteSpace(promptEvent?.WorkingDirectory))
+        {
+            return WorkspacePathResolver.Normalize(promptEvent.WorkingDirectory.Trim());
+        }
+
+        var repoOrProject = !string.IsNullOrWhiteSpace(promptEvent?.RepositoryName)
+            ? promptEvent!.RepositoryName
+            : promptEvent?.ProjectId;
+        if (!string.IsNullOrWhiteSpace(repoOrProject) &&
+            (Directory.Exists("/workspace") || string.Equals(Environment.CurrentDirectory, "/workspace", StringComparison.Ordinal)))
+        {
+            return WorkspacePathResolver.FromRepositoryName(repoOrProject);
+        }
+
+        var envRepo = Environment.GetEnvironmentVariable("AGENTMESH_REPOSITORY_NAME")
+                      ?? Environment.GetEnvironmentVariable("AGENTMESH_PROJECT_ID");
+        if (!string.IsNullOrWhiteSpace(envRepo) && Directory.Exists("/workspace"))
+        {
+            return WorkspacePathResolver.FromRepositoryName(envRepo);
+        }
+
         var cwd = Environment.CurrentDirectory;
+        if (string.Equals(cwd, "/workspace", StringComparison.Ordinal) ||
+            string.Equals(cwd, "/workspace/repo", StringComparison.Ordinal))
+        {
+            if (Directory.Exists(WorkspacePathResolver.ReposRoot))
+            {
+                try
+                {
+                    var subdirs = Directory.GetDirectories(WorkspacePathResolver.ReposRoot);
+                    if (subdirs.Length == 1)
+                    {
+                        return WorkspacePathResolver.Normalize(subdirs[0]);
+                    }
+                    var defaultRepoDir = Path.Combine(WorkspacePathResolver.ReposRoot, Project.DefaultRepositoryName);
+                    if (Directory.Exists(defaultRepoDir))
+                    {
+                        return WorkspacePathResolver.Normalize(defaultRepoDir);
+                    }
+                }
+                catch { }
+            }
+        }
+
         // If user launched the binary from inside dist/cli/linux-x64, walk up to repo root if applicable
         var normalized = cwd.Replace('\\', '/');
         var distIdx = normalized.IndexOf("/dist/cli", StringComparison.OrdinalIgnoreCase);
@@ -845,9 +888,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
 
         var agyPath = (string.Equals(preset.AdapterType, "agy", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(preset.Command))
             ? (AgentAdapterFactory.ResolveExecutablePath(preset.Command) ?? AgentAdapterFactory.ResolveExecutablePath("agy"))
@@ -1779,9 +1820,7 @@ public class ClaudeAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
         var claudePath = AgentAdapterFactory.ResolveExecutablePath(preset.Command ?? "claude");
 
         if (claudePath != null)
@@ -1902,9 +1941,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
         string? copilotPath = null;
         if (!string.IsNullOrWhiteSpace(preset.Command) && !string.Equals(preset.Command, "gh", StringComparison.OrdinalIgnoreCase))
         {
@@ -2073,7 +2110,10 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return psi;
     }
 
-    private static async Task<(int ExitCode, string StdOut, string StdErr, bool Succeeded)> RunCopilotSubprocessAsync(
+    internal const int MaxRawFallbackPreviewChars = 16_384;
+    private const int MaxToolResultPayloadChars = 32_768;
+
+    internal static async Task<(int ExitCode, string StdOut, string StdErr, bool Succeeded)> RunCopilotSubprocessAsync(
         string executablePath,
         bool isViaGh,
         string cwd,
@@ -2099,6 +2139,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var sw = Stopwatch.StartNew();
         string? copilotSessionId = null;
         string? terminalUsageJson = null;
+        string? taskCompleteSummary = null;
 
         var readStdOutTask = Task.Run(async () =>
         {
@@ -2114,7 +2155,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     rawStdOutBuilder.AppendLine(line);
                 }
 
-                if (TryParseCopilotJsonLine(line, out var evType, out var evContent, out var toolName, out var toolArgs, out var toolRes, out var sid, out var usage))
+                if (TryParseCopilotJsonLine(line, out var evType, out var evContent, out var toolName, out var toolArgs, out var toolRes, out var sid, out var usage, out var parsedTaskSummary))
                 {
                     if (!string.IsNullOrWhiteSpace(sid))
                     {
@@ -2124,6 +2165,10 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     if (!string.IsNullOrWhiteSpace(usage))
                     {
                         terminalUsageJson = usage;
+                    }
+                    if (!string.IsNullOrWhiteSpace(parsedTaskSummary))
+                    {
+                        taskCompleteSummary = parsedTaskSummary.Trim();
                     }
 
                     if (evType == "thought" && !string.IsNullOrWhiteSpace(evContent))
@@ -2146,11 +2191,12 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                     else if (evType == "tool_result")
                     {
+                        var boundedToolResult = BoundPreviewTail(toolRes, MaxToolResultPayloadChars);
                         await onEvent(new TrajectoryEventPayload
                         {
                             EventType = "tool_result",
                             ToolName = toolName,
-                            ToolResultJson = toolRes,
+                            ToolResultJson = boundedToolResult,
                             Content = TruncateLine(toolRes, 120)
                         });
                     }
@@ -2250,12 +2296,9 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return (proc.ExitCode, rawStdOut, stdErr, false);
             }
 
-            string output;
-            lock (streamedResponseBuilder) { output = streamedResponseBuilder.ToString().Trim(); }
-            if (string.IsNullOrWhiteSpace(output))
-            {
-                output = !string.IsNullOrWhiteSpace(rawStdOut) ? rawStdOut : stdErr;
-            }
+            string streamedOutput;
+            lock (streamedResponseBuilder) { streamedOutput = streamedResponseBuilder.ToString().Trim(); }
+            var output = ResolveFinalCopilotOutput(streamedOutput, taskCompleteSummary, rawStdOut, stdErr);
 
             // Check if Copilot asked questions
             var questions = AgentAdapterFactory.ExtractQuestionsFromOutput(output);
@@ -2312,6 +2355,62 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
     }
 
+    internal static string ResolveFinalCopilotOutput(
+        string? streamedResponse,
+        string? taskCompleteSummary,
+        string? rawStdOut,
+        string? stdErr,
+        int maxFallbackChars = MaxRawFallbackPreviewChars)
+    {
+        if (!string.IsNullOrWhiteSpace(streamedResponse))
+        {
+            return streamedResponse.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(taskCompleteSummary))
+        {
+            return taskCompleteSummary.Trim();
+        }
+
+        // Extract non-JSON plain-text lines from rawStdOut first; never emit unbounded multi-MB JSONL streams.
+        if (!string.IsNullOrWhiteSpace(rawStdOut))
+        {
+            var plainLines = new List<string>();
+            foreach (var rawLine in rawStdOut.Split('\n'))
+            {
+                var t = rawLine.Trim();
+                if (string.IsNullOrEmpty(t)) continue;
+                if (t.StartsWith('{') && t.EndsWith('}')) continue;
+                plainLines.Add(rawLine.TrimEnd('\r'));
+            }
+
+            if (plainLines.Count > 0)
+            {
+                return BoundPreviewTail(string.Join("\n", plainLines).Trim(), maxFallbackChars)!;
+            }
+        }
+
+        var fallback = !string.IsNullOrWhiteSpace(stdErr) ? stdErr.Trim() : (rawStdOut?.Trim() ?? string.Empty);
+        return BoundPreviewTail(fallback, maxFallbackChars) ?? string.Empty;
+    }
+
+    internal static string? BoundPreviewTail(string? text, int maxChars = MaxRawFallbackPreviewChars)
+    {
+        if (string.IsNullOrEmpty(text) || text.Length <= maxChars)
+        {
+            return text;
+        }
+
+        const string prefix = "[... Earlier output omitted ...]\n";
+        if (maxChars <= prefix.Length)
+        {
+            return text[^maxChars..];
+        }
+
+        var tailLen = maxChars - prefix.Length;
+        return prefix + text[^tailLen..];
+    }
+
     internal static bool TryParseCopilotJsonLine(
         string line,
         out string? eventType,
@@ -2320,7 +2419,28 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         out string? toolArgsJson,
         out string? toolResultJson,
         out string? sessionId,
-        out string? usageJson)
+        out string? usageJson) =>
+        TryParseCopilotJsonLine(
+            line,
+            out eventType,
+            out content,
+            out toolName,
+            out toolArgsJson,
+            out toolResultJson,
+            out sessionId,
+            out usageJson,
+            out _);
+
+    internal static bool TryParseCopilotJsonLine(
+        string line,
+        out string? eventType,
+        out string? content,
+        out string? toolName,
+        out string? toolArgsJson,
+        out string? toolResultJson,
+        out string? sessionId,
+        out string? usageJson,
+        out string? taskCompleteSummary)
     {
         eventType = null;
         content = null;
@@ -2329,6 +2449,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         toolResultJson = null;
         sessionId = null;
         usageJson = null;
+        taskCompleteSummary = null;
 
         if (string.IsNullOrWhiteSpace(line)) return false;
         var trimmed = line.Trim();
@@ -2375,6 +2496,14 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return true;
             }
 
+            if (lower is "session.task_complete" or "task_complete" or "task.complete")
+            {
+                eventType = "task_complete";
+                taskCompleteSummary = ExtractTaskCompleteSummary(data) ?? ExtractTaskCompleteSummary(root);
+                content = taskCompleteSummary;
+                return true;
+            }
+
             if (lower is "assistant.reasoning" or "thought" or "reasoning")
             {
                 eventType = "thought";
@@ -2382,27 +2511,41 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return !string.IsNullOrWhiteSpace(content);
             }
 
-            if (lower.Contains("tool") && (lower.Contains("call") || lower.Contains("execution") || lower.Contains("start") || lower.Contains("use")))
-            {
-                eventType = "tool_call";
-                toolName = data.TryGetProperty("tool", out var tn) ? tn.GetString() : (data.TryGetProperty("name", out var n) ? n.GetString() : "tool");
-                if (data.TryGetProperty("args", out var a) || data.TryGetProperty("arguments", out a) || data.TryGetProperty("input", out a))
-                {
-                    toolArgsJson = a.ValueKind == JsonValueKind.String ? a.GetString() : a.GetRawText();
-                }
-                content = FormatToolCallSummary(toolName, toolArgsJson);
-                return true;
-            }
-
-            if (lower.Contains("tool") && (lower.Contains("result") || lower.Contains("output") || lower.Contains("finish") || lower.Contains("done")))
+            // Evaluate tool_result BEFORE tool_call so events like "tool.execution_complete"
+            // map to tool_result rather than matching "execution" in tool_call!
+            if (lower.Contains("tool") && (lower.Contains("result") || lower.Contains("output") || lower.Contains("finish") || lower.Contains("done") || lower.Contains("complete")))
             {
                 eventType = "tool_result";
-                toolName = data.TryGetProperty("tool", out var tn) ? tn.GetString() : (data.TryGetProperty("name", out var n) ? n.GetString() : null);
+                toolName = ExtractToolName(data);
                 if (data.TryGetProperty("result", out var r) || data.TryGetProperty("output", out r) || data.TryGetProperty("content", out r) || data.TryGetProperty("stdout", out r))
                 {
                     toolResultJson = r.ValueKind == JsonValueKind.String ? r.GetString() : r.GetRawText();
                 }
+
+                if (IsTaskCompleteToolName(toolName))
+                {
+                    taskCompleteSummary = ExtractTaskCompleteSummary(data) ?? ExtractTaskCompleteSummaryFromJson(toolResultJson);
+                }
+
                 content = TruncateLine(toolResultJson, 120);
+                return true;
+            }
+
+            if (lower.Contains("tool") && (lower.Contains("call") || lower.Contains("execution") || lower.Contains("start") || lower.Contains("use")))
+            {
+                eventType = "tool_call";
+                toolName = ExtractToolName(data) ?? "tool";
+                if (data.TryGetProperty("args", out var a) || data.TryGetProperty("arguments", out a) || data.TryGetProperty("input", out a))
+                {
+                    toolArgsJson = a.ValueKind == JsonValueKind.String ? a.GetString() : a.GetRawText();
+                }
+
+                if (IsTaskCompleteToolName(toolName))
+                {
+                    taskCompleteSummary = ExtractTaskCompleteSummary(data) ?? ExtractTaskCompleteSummaryFromJson(toolArgsJson);
+                }
+
+                content = FormatToolCallSummary(toolName, toolArgsJson);
                 return true;
             }
 
@@ -2432,6 +2575,85 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         catch
         {
             return false;
+        }
+    }
+
+    private static string? ExtractToolName(JsonElement data)
+    {
+        if (data.TryGetProperty("toolName", out var tnProp) && tnProp.ValueKind == JsonValueKind.String)
+            return tnProp.GetString();
+        if (data.TryGetProperty("tool", out var tProp) && tProp.ValueKind == JsonValueKind.String)
+            return tProp.GetString();
+        if (data.TryGetProperty("name", out var nProp) && nProp.ValueKind == JsonValueKind.String)
+            return nProp.GetString();
+        return null;
+    }
+
+    private static bool IsTaskCompleteToolName(string? toolName) =>
+        !string.IsNullOrWhiteSpace(toolName) &&
+        (string.Equals(toolName, "task_complete", StringComparison.OrdinalIgnoreCase) ||
+         toolName.EndsWith(".task_complete", StringComparison.OrdinalIgnoreCase) ||
+         toolName.EndsWith("/task_complete", StringComparison.OrdinalIgnoreCase));
+
+    private static string? ExtractTaskCompleteSummary(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object) return null;
+
+        if (element.TryGetProperty("summary", out var sProp) && sProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(sProp.GetString()))
+        {
+            return sProp.GetString();
+        }
+
+        if (element.TryGetProperty("arguments", out var argsProp))
+        {
+            var fromArgs = argsProp.ValueKind == JsonValueKind.String
+                ? ExtractTaskCompleteSummaryFromJson(argsProp.GetString())
+                : ExtractTaskCompleteSummary(argsProp);
+            if (!string.IsNullOrWhiteSpace(fromArgs)) return fromArgs;
+        }
+
+        if (element.TryGetProperty("args", out var aProp))
+        {
+            var fromArgs = aProp.ValueKind == JsonValueKind.String
+                ? ExtractTaskCompleteSummaryFromJson(aProp.GetString())
+                : ExtractTaskCompleteSummary(aProp);
+            if (!string.IsNullOrWhiteSpace(fromArgs)) return fromArgs;
+        }
+
+        if (element.TryGetProperty("result", out var resProp))
+        {
+            if (resProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(resProp.GetString()))
+                return resProp.GetString();
+            if (resProp.ValueKind == JsonValueKind.Object)
+            {
+                if (resProp.TryGetProperty("summary", out var rsProp) && rsProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(rsProp.GetString()))
+                    return rsProp.GetString();
+                if (resProp.TryGetProperty("content", out var rcProp) && rcProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(rcProp.GetString()))
+                    return rcProp.GetString();
+            }
+        }
+
+        if (element.TryGetProperty("content", out var cProp) && cProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(cProp.GetString()))
+        {
+            return cProp.GetString();
+        }
+
+        return null;
+    }
+
+    private static string? ExtractTaskCompleteSummaryFromJson(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        var trimmed = json.Trim();
+        if (!trimmed.StartsWith('{')) return trimmed;
+        try
+        {
+            using var doc = JsonDocument.Parse(trimmed);
+            return ExtractTaskCompleteSummary(doc.RootElement);
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -2516,9 +2738,7 @@ public class GenericCommandAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
 
         // If user configured a custom command (not empty and not default 'agy'), run it and parse JSONL or plain text output
         if (!string.IsNullOrWhiteSpace(preset.Command) &&

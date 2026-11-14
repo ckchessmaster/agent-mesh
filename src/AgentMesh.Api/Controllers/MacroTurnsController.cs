@@ -25,7 +25,8 @@ public record SubmitPrReviewRequest(
     bool Approved,
     string? Comments = null,
     int? PrNumber = null,
-    string? ReviewerId = null);
+    string? ReviewerId = null,
+    string? ApprovedHeadSha = null);
 
 /// <summary>Request to put one checklist task under macro workflow orchestration.</summary>
 public record StartTaskWorkflowRequest(
@@ -97,7 +98,7 @@ public class MacroTurnsController(
         var job = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == jobId, ct);
         if (job is null) return NotFound(new { error = $"Job '{jobId}' not found." });
 
-        var (authorPersona, prUrl, prNumber) = await FindOpenPullRequestAsync(jobId, req.PrNumber, ct);
+        var (authorPersona, prUrl, prNumber, prHeadSha) = await FindOpenPullRequestAsync(jobId, req.PrNumber, ct);
         var assignedPersonas = await LoadProjectPersonasAsync(job.ProjectId, ct);
 
         var reviewer = ResolveReviewerIdentity(req.ReviewerId);
@@ -154,7 +155,8 @@ public class MacroTurnsController(
                 IsApproved: req.Approved,
                 ReviewComments: req.Comments,
                 Timestamp: DateTimeOffset.UtcNow,
-                PrNumber: req.PrNumber ?? prNumber),
+                PrNumber: req.PrNumber ?? prNumber,
+                ApprovedHeadSha: !string.IsNullOrWhiteSpace(req.ApprovedHeadSha) ? req.ApprovedHeadSha.Trim() : prHeadSha),
             ct);
 
         if (!delivery.Delivered)
@@ -332,65 +334,48 @@ public class MacroTurnsController(
     /// the caller treats as "cannot prove a self-review" rather than as "definitely not one" — see the
     /// comment at the call site for why that asymmetry is the safe direction.
     /// </remarks>
-    private async Task<(string? AuthorPersona, string? PrUrl, int? PrNumber)> FindOpenPullRequestAsync(
+    private async Task<(string? AuthorPersona, string? PrUrl, int? PrNumber, string? HeadSha)> FindOpenPullRequestAsync(
         Guid jobId,
         int? prNumber,
         CancellationToken ct)
     {
-        var query = db.JobMessages
+        var jobIdStr = jobId.ToString();
+        var cards = await db.JobTimelineCards
             .AsNoTracking()
-            .Where(m => m.JobId == jobId && m.SenderType == "persona" && m.StructuredPayloadJson != null);
+            .Where(c => c.JobId == jobIdStr)
+            .OrderByDescending(c => c.UpdatedAt)
+            .ThenByDescending(c => c.CreatedAt)
+            .ToListAsync(ct);
 
-        if (prNumber is not null)
+        foreach (var card in cards)
         {
-            // Filtered in memory rather than translated to SQL: the linkage lives inside a jsonb blob and
-            // the in-memory provider the tests run on cannot translate a json path, so a SQL-side filter
-            // would make this the untested path. Bounded by the job's own message count.
-            var rows = await query.OrderByDescending(m => m.CreatedAt).ToListAsync(ct);
-
-            foreach (var row in rows)
+            if (!TryReadPrLinkage(card.StructuredPayloadJson, out var cardAuthor, out var rowUrl, out var rowNumber, out var rowHeadSha))
             {
-                if (!TryReadPrLinkage(row.StructuredPayloadJson, out var rowUrl, out var rowNumber)) continue;
-                if (rowNumber != prNumber.Value) continue;
-
-                return (row.SenderId, rowUrl, rowNumber);
+                continue;
             }
 
-            return (null, null, prNumber);
+            if (prNumber is not null && rowNumber != prNumber.Value)
+            {
+                continue;
+            }
+
+            return (cardAuthor, rowUrl, rowNumber ?? prNumber, rowHeadSha);
         }
 
-        // No number supplied: the most recent row that actually carries a PR linkage.
-        //
-        // Not "the most recent persona row with any structured payload". The ledger is append-only and
-        // the persona keeps talking after it opens the PR — an attachment post, a status note, a
-        // requiresReply prompt, anything that writes structured_payload. Taking the newest row and then
-        // testing it for linkage therefore returns "author unknown" for almost every real job, and
-        // "unknown" is the direction this guard deliberately does *not* block on (see the class
-        // remarks). The combination silently disables the self-review check the moment the author sends
-        // any later message — the exact bypass this endpoint exists to close.
-        //
-        // Filtered in memory for the same reason as the numbered branch above: the linkage lives inside
-        // a jsonb blob, and a SQL-side json path would not translate on the in-memory provider the
-        // tests run on. Bounded by the job's own message count.
-        var candidates = await query.OrderByDescending(m => m.CreatedAt).ToListAsync(ct);
-
-        foreach (var row in candidates)
-        {
-            if (!TryReadPrLinkage(row.StructuredPayloadJson, out var rowUrl, out var rowNumber)) continue;
-
-            return (row.SenderId, rowUrl, rowNumber);
-        }
-
-        return (null, null, null);
+        return (null, null, prNumber, null);
     }
 
     private static bool TryReadPrLinkage(
         string? structuredPayloadJson,
+        out string? authorPersona,
         out string? prUrl,
-        out int? prNumber)
+        out int? prNumber,
+        out string? headSha)
     {
+        authorPersona = null;
         prUrl = null;
         prNumber = null;
+        headSha = null;
         if (string.IsNullOrWhiteSpace(structuredPayloadJson)) return false;
 
         try
@@ -409,6 +394,28 @@ public class MacroTurnsController(
                 number.TryGetInt32(out var parsed))
             {
                 prNumber = parsed;
+            }
+
+            foreach (var shaKey in new[] { "headSha", "head_sha" })
+            {
+                if (doc.RootElement.TryGetProperty(shaKey, out var shaProp) &&
+                    shaProp.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(shaProp.GetString()))
+                {
+                    headSha = shaProp.GetString()!.Trim();
+                    break;
+                }
+            }
+
+            foreach (var authorKey in new[] { "authorPersonaId", "senderPersona", "senderId", "author" })
+            {
+                if (doc.RootElement.TryGetProperty(authorKey, out var prop) &&
+                    prop.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(prop.GetString()))
+                {
+                    authorPersona = prop.GetString()!.Trim().ToLowerInvariant();
+                    break;
+                }
             }
 
             return prUrl is not null || prNumber is not null;

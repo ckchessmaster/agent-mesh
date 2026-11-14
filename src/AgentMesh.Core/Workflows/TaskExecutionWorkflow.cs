@@ -183,77 +183,10 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                     break;
 
                 case TurnOutcomeStatus.PrOpenedAwaitingReview:
+                case TurnOutcomeStatus.TaskCompleted:
                     _activePrUrl = outcome.PrUrl ?? _activePrUrl;
                     _activePrNumber = outcome.PrNumber ?? _activePrNumber;
-                    _currentStatus = "Awaiting PR Review";
-                    _awaitingSince = Workflow.UtcNow;
 
-                    var gotReview = await Workflow.WaitConditionAsync(
-                        () => _prReview != null, MaxWait);
-
-                    _awaitingSince = null;
-
-                    if (!gotReview)
-                    {
-                        var reviewTimeout =
-                            $"No review on {_activePrUrl ?? "the open pull request"} within " +
-                            $"{MaxWait.TotalDays} days; halting.";
-                        _currentStatus = $"Halted: {reviewTimeout}";
-                        _lastOutcome = TurnOutcomeStatus.Failed;
-                        return new TaskExecutionResult(false, input.TaskId, _activePrUrl, reviewTimeout);
-                    }
-
-                    var review = _prReview!;
-                    _prReview = null;
-
-                    if (review.IsApproved)
-                    {
-                        _currentStatus = "Merging PR";
-
-                        string? mergeResult;
-                        try
-                        {
-                            mergeResult = await Workflow.ExecuteActivityAsync(
-                                (IGitActivities act) => act.MergePullRequestAsync(_activePrUrl!),
-                                new ActivityOptions
-                                {
-                                    StartToCloseTimeout = TimeSpan.FromMinutes(5),
-                                    RetryPolicy = new()
-                                    {
-                                        InitialInterval = TimeSpan.FromSeconds(5),
-                                        MaximumInterval = TimeSpan.FromMinutes(1),
-                                        MaximumAttempts = 3,
-                                    },
-                                });
-                        }
-                        catch (Exception ex) when (IsTurnHalt(ex))
-                        {
-                            var reason = $"Approved merge could not complete: {HaltReasonOf(ex)}";
-                            _currentStatus = $"Halted: {reason}";
-                            _lastOutcome = TurnOutcomeStatus.Failed;
-                            _isTerminated = true;
-
-                            return new TaskExecutionResult(false, input.TaskId, _activePrUrl, reason);
-                        }
-
-                        _currentStatus = "Completed";
-                        _isTerminated = true;
-
-                        return new TaskExecutionResult(
-                            true, input.TaskId, _activePrUrl,
-                            mergeResult ?? "Pull request merged; task completed.");
-                    }
-
-                    _currentStatus = "Changes requested on PR; resuming coding turn";
-
-                    _chatInbox.Enqueue(new ChatMessageSignal(
-                        SenderId: string.IsNullOrWhiteSpace(review.ReviewerId) ? "reviewer" : review.ReviewerId,
-                        Content: $"Review feedback on PR {_activePrUrl}:\n{review.ReviewComments ?? "(no comments provided)"}",
-                        Timestamp: review.Timestamp,
-                        MessageId: null));
-                    break;
-
-                case TurnOutcomeStatus.TaskCompleted:
                     if (isTimelineTask)
                     {
                         await Workflow.ExecuteActivityAsync(
@@ -272,9 +205,15 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                     _currentStatus = "Completed";
                     _isTerminated = true;
 
+                    var completionSummary = outcome.Message ?? "Task completed and committed to job branch.";
                     return new TaskExecutionResult(
-                        true, input.TaskId, outcome.PrUrl ?? _activePrUrl,
-                        outcome.Message ?? "Task completed and verified successfully.");
+                        Success: true,
+                        ErrorMessage: completionSummary,
+                        TaskId: input.TaskId,
+                        FinalPrUrl: _activePrUrl,
+                        Summary: completionSummary,
+                        PrNumber: _activePrNumber,
+                        HeadSha: outcome.HeadSha);
 
                 case TurnOutcomeStatus.StuckLoopDetected:
                 case TurnOutcomeStatus.Failed:

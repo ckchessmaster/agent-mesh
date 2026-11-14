@@ -147,14 +147,104 @@ public class MemoryTools(
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // A memory write is best-effort from the agent's point of view: it must never take a turn down
-            // with it, and it must say so plainly so the agent can fall back to reporting the finding in
-            // its response text instead of silently believing it was persisted.
             logger.LogError(
                 ex,
                 "save_memory failed for agent {AgentId} project {ProjectId} key {Key}",
                 scope.AgentId, scope.ProjectId, key);
             return Error("storage_unavailable", $"Memory could not be persisted: {ex.Message}");
+        }
+    }
+
+    [McpServerTool(Name = "list_memories")]
+    [Description("List or search saved persistent memories (project-scoped and global '*') for the active persona, ordered by UpdatedAt DESC, so you can inspect or update stale environment entries without duplicating keys.")]
+    public Task<string> ListMemories(
+        [Description("Optional case-insensitive substring filter matched against memory keys and values.")]
+        string? query = null,
+        [Description("Optional category filter: 'environment', 'build_and_test', or 'codebase_gotcha'.")]
+        string? category = null,
+        CancellationToken ct = default) =>
+        QueryMemoriesAsync(query, category, ct);
+
+    [McpServerTool(Name = "search_memory")]
+    [Description("Search saved persistent memories (project-scoped and global '*') for the active persona by keyword or category.")]
+    public Task<string> SearchMemory(
+        [Description("Optional case-insensitive substring filter matched against memory keys and values.")]
+        string? query = null,
+        [Description("Optional category filter: 'environment', 'build_and_test', or 'codebase_gotcha'.")]
+        string? category = null,
+        CancellationToken ct = default) =>
+        QueryMemoriesAsync(query, category, ct);
+
+    private async Task<string> QueryMemoriesAsync(string? query, string? category, CancellationToken ct)
+    {
+        var scope = await scopeResolver.ResolveAsync(isGlobal: null, ct);
+
+        if (string.IsNullOrWhiteSpace(scope.AgentId))
+        {
+            return Error(
+                "unauthorized",
+                "Could not resolve the calling persona or agent. Present a bearer token or send the 'X-Persona-Id' / 'X-Agent-Id' header.",
+                details: new { agentIdSource = scope.AgentIdSource });
+        }
+
+        string? normalizedCategory = null;
+        if (!string.IsNullOrWhiteSpace(category))
+        {
+            if (!AgentMemoryCategories.TryNormalize(category, out var parsedCategory))
+            {
+                return Error(
+                    "invalid_category",
+                    $"Invalid category '{category}'. Allowed values: {AgentMemoryCategories.AllowedValuesHint()}.",
+                    details: new { allowedCategories = AgentMemoryCategories.All });
+            }
+            normalizedCategory = parsedCategory;
+        }
+
+        try
+        {
+            var rows = await memories.GetMemoriesForAgentAsync(scope.AgentId, scope.ProjectId, ct);
+
+            IEnumerable<AgentMemory> filtered = rows;
+            if (!string.IsNullOrWhiteSpace(normalizedCategory))
+            {
+                filtered = filtered.Where(m => string.Equals(m.Category, normalizedCategory, StringComparison.OrdinalIgnoreCase));
+            }
+            if (!string.IsNullOrWhiteSpace(query))
+            {
+                var q = query.Trim();
+                filtered = filtered.Where(m =>
+                    m.Key.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    m.Value.Contains(q, StringComparison.OrdinalIgnoreCase));
+            }
+
+            var ordered = filtered
+                .OrderByDescending(m => m.UpdatedAt)
+                .ThenBy(m => m.Key, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                agentId = scope.AgentId,
+                projectId = scope.ProjectId ?? AgentMemory.GlobalProjectId,
+                count = ordered.Count,
+                keys = ordered.Select(m => m.Key).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                memories = ordered.Select(m => new
+                {
+                    id = m.Id,
+                    category = m.Category,
+                    key = m.Key,
+                    value = m.Value,
+                    projectId = m.ProjectId,
+                    isGlobal = m.IsGlobal,
+                    updatedAt = m.UpdatedAt
+                }).ToList()
+            }, JsonOptions);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(ex, "list_memories failed for agent {AgentId} project {ProjectId}", scope.AgentId, scope.ProjectId);
+            return Error("storage_unavailable", $"Memories could not be queried: {ex.Message}");
         }
     }
 

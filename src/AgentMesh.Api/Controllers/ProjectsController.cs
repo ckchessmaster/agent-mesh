@@ -372,8 +372,9 @@ public class ProjectsController(
 
         if (jobIds.Count > 0)
         {
-            var messages = await db.JobMessages.Where(m => jobIds.Contains(m.JobId)).ToListAsync();
-            db.JobMessages.RemoveRange(messages);
+            var jobIdStrings = jobIds.Select(id => id.ToString()).ToList();
+            var cards = await db.JobTimelineCards.Where(c => jobIdStrings.Contains(c.JobId)).ToListAsync();
+            db.JobTimelineCards.RemoveRange(cards);
             db.ProjectJobs.RemoveRange(jobs);
         }
 

@@ -136,12 +136,12 @@ public class ProjectsControllerTests
 
         var project = new Project { Id = "proj-del", Name = "To Delete" };
         var job = new ProjectJob { Id = Guid.NewGuid(), ProjectId = "proj-del", Title = "Job" };
-        var message = new JobMessage { Id = Guid.NewGuid(), JobId = job.Id, Content = "Hello" };
+        var card = new JobTimelineCard { Id = Guid.NewGuid(), JobId = job.Id.ToString(), CardType = TimelineCardType.TaskStep, Title = "Hello" };
         var assignment = new ProjectPersona { ProjectId = "proj-del", PersonaId = "p1" };
 
         db.Projects.Add(project);
         db.ProjectJobs.Add(job);
-        db.JobMessages.Add(message);
+        db.JobTimelineCards.Add(card);
         db.ProjectPersonas.Add(assignment);
         await db.SaveChangesAsync();
 
@@ -151,7 +151,7 @@ public class ProjectsControllerTests
 
         (await db.Projects.FindAsync("proj-del")).Should().BeNull();
         (await db.ProjectJobs.FindAsync(job.Id)).Should().BeNull();
-        (await db.JobMessages.FindAsync(message.Id)).Should().BeNull();
+        (await db.JobTimelineCards.FindAsync(card.Id)).Should().BeNull();
         (await db.ProjectPersonas.FirstOrDefaultAsync(pp => pp.ProjectId == "proj-del")).Should().BeNull();
     }
 }

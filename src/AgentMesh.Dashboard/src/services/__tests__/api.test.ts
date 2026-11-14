@@ -79,8 +79,12 @@ describe('API Service & Auth Interceptor', () => {
     );
 
     await expect(
-      api.postJobMessage('job-123', { content: 'Hello world' })
-    ).rejects.toThrow('Failed to post job message: Unauthorized');
+      api.addTimelineComment('job-123', 'card-1', {
+        senderId: 'operator',
+        senderType: 'operator',
+        content: 'Hello world'
+      })
+    ).rejects.toThrow('Failed to post timeline comment: Unauthorized');
 
     expect(unauthorizedCallback).toHaveBeenCalledTimes(1);
   });
@@ -91,15 +95,19 @@ describe('API Service & Auth Interceptor', () => {
     setUnauthorizedHandler(unauthorizedCallback);
 
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ id: 'msg-1', content: 'Hello world' }), {
+      new Response(JSON.stringify({ id: 'comment-1', content: 'Hello world' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
       })
     );
 
-    const result = await api.postJobMessage('job-123', { content: 'Hello world' });
+    const result = await api.addTimelineComment('job-123', 'card-1', {
+      senderId: 'operator',
+      senderType: 'operator',
+      content: 'Hello world'
+    });
 
-    expect(result.id).toBe('msg-1');
+    expect(result.id).toBe('comment-1');
     expect(unauthorizedCallback).not.toHaveBeenCalled();
   });
 

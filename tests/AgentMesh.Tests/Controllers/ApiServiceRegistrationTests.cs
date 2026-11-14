@@ -350,13 +350,26 @@ public class ApiServiceRegistrationTests : IClassFixture<WebApplicationFactory<A
             Title = "Orchestrated task",
             TasksJson = "[]",
         });
+        var cardId = Guid.NewGuid();
+        db.JobTimelineCards.Add(new AgentMesh.Core.Models.JobTimelineCard
+        {
+            Id = cardId,
+            JobId = jobId.ToString(),
+            CardType = AgentMesh.Core.Models.TimelineCardType.Escalation3R,
+            Status = AgentMesh.Core.Models.TimelineCardStatus.PendingInput,
+            Title = "Escalation",
+            StructuredPayloadJson = "{\"requiresReply\":true,\"targetPersona\":\"operator\"}",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
         await db.SaveChangesAsync();
 
-        var controller = ActivatorUtilities.CreateInstance<ProjectJobsController>(scope.ServiceProvider);
+        var controller = ActivatorUtilities.CreateInstance<JobTimelineController>(scope.ServiceProvider);
 
-        var result = await controller.PostJobMessage(
-            jobId,
-            new PostJobMessageRequest(Content: "Use OIDC, not passwords.", SenderType: "user"),
+        var result = await controller.AddComment(
+            jobId.ToString(),
+            cardId,
+            new AddCommentRequest("operator", "operator", "Use OIDC, not passwords."),
             CancellationToken.None);
 
         result.Should().BeOfType<Microsoft.AspNetCore.Mvc.OkObjectResult>(

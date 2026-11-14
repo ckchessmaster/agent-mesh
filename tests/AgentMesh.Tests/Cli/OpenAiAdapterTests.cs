@@ -55,7 +55,7 @@ public class OpenAiAdapterTests
     public void OpenAiAdapter_GetToolDefinitions_ContainsAllRequiredAutonomousTools()
     {
         var tools = OpenAiAdapter.GetToolDefinitions();
-        tools.Should().HaveCount(9);
+        tools.Should().HaveCount(10);
 
         var toolNames = new List<string>();
         foreach (var t in tools)
@@ -78,6 +78,31 @@ public class OpenAiAdapterTests
         toolNames.Should().Contain("post_job_message");
         toolNames.Should().Contain("open_pull_request");
         toolNames.Should().Contain("save_memory");
+        toolNames.Should().Contain("list_memories");
+    }
+
+    [Fact]
+    public void ResolveEffectiveWorkingDirectory_DefaultsContainerSessionsToProjectRepoUnderWorkspaceRepos()
+    {
+        var ev = new PromptReceivedEvent
+        {
+            SessionId = Guid.NewGuid(),
+            ProjectId = "payments-api",
+            RepositoryName = "payments-api",
+            WorkingDirectory = null
+        };
+
+        var resolved = AgentProcessManager.ResolveEffectiveWorkingDirectory(
+            ev,
+            directoryExists: path => path == "/workspace" || path == "/workspace/repos");
+
+        resolved.Should().Be("/workspace/repos/payments-api");
+
+        // Even if a legacy caller passed "/workspace", an active project resolves to /workspace/repos/<repo>
+        ev.WorkingDirectory = "/workspace";
+        AgentProcessManager.ResolveEffectiveWorkingDirectory(
+            ev,
+            directoryExists: path => path == "/workspace").Should().Be("/workspace/repos/payments-api");
     }
 
     [Fact]
@@ -1506,6 +1531,226 @@ public class OpenAiAdapterTests
             OpenAiAdapter.ResetHttpClientForTest();
             OpenAiAdapter.PlatformToolExecutor = null;
         }
+    }
+
+    [Fact]
+    public void ResolveModelContextLimit_RespectsConfigured512kProfileWithoutClampingTo128k()
+    {
+        var presetWithTokens = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            AdapterType = "openai",
+            DefaultModel = "llama3.3",
+            ContextWindowTokens = 524_288
+        };
+
+        var presetWithSettings = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            AdapterType = "openai",
+            DefaultModel = "deepseek-r1",
+            OpenAi = new OpenAISettings { DefaultContextSize = "512k" }
+        };
+
+        OpenAiAdapter.ResolveModelContextLimit("llama3.3", null, presetWithTokens).Should().Be(524_288);
+        OpenAiAdapter.ResolveModelContextLimit("deepseek-r1", "default", presetWithSettings).Should().Be(524_288);
+        OpenAiAdapter.ResolveModelContextLimit("qwen2.5-coder", "524288", presetWithTokens).Should().Be(524_288);
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_TriggersCompactionAt75PercentOfContextWindow_WithoutCappingThinkingTokens()
+    {
+        var sessionId = Guid.NewGuid();
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "qwen3.8-flash-next",
+            ContextWindowTokens = 4_000,
+            CompactionThresholdPercent = 75
+        };
+
+        OpenAiAdapter.ResolveCompactionThresholdPercent(preset).Should().Be(75);
+
+        // Pre-seed >3,000 estimated tokens (>75% of 4,000, <80% of 4,000 = 3,200) so 75% triggers compaction
+        // whereas the old 80% threshold would NOT have triggered!
+        var seeded = new List<OpenAiMessage>
+        {
+            new() { Role = "system", Content = "You are Rook." },
+            new() { Role = "user", Content = "[TASK ENVELOPE & WORKING ENVIRONMENT]\nTask: implement compaction" },
+            new() { Role = "assistant", Content = "Reading file", ToolCalls = [new OpenAiToolCall { Id = "c1", Function = new OpenAiFunctionCall { Name = "read_file", Arguments = "{}" } }] },
+            new() { Role = "tool", ToolCallId = "c1", Content = new string('x', 10_900) },
+            new() { Role = "user", Content = "Continue1" },
+            new() { Role = "assistant", Content = "Ack1" },
+            new() { Role = "user", Content = "Continue2" },
+            new() { Role = "assistant", Content = "Ack2" }
+        };
+        OpenAiAdapter.SaveHistoryToDisk(sessionId, seeded);
+
+        string? mainRequestBody = null;
+        var mockClient = new HttpClient(new MockHttpMessageHandler(req =>
+        {
+            var body = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (body.Contains("\"stream\":false"))
+            {
+                // Summarizer request fails gracefully -> CompactHistory truncates tool output
+                return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
+            }
+
+            mainRequestBody = body;
+            var sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Deep unbounded reasoning...\",\"content\":\"Done.\"}}]}\n\ndata: [DONE]\n\n";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(
+                preset,
+                new PromptReceivedEvent { SessionId = sessionId, Prompt = "Proceed", Model = "qwen3.8-flash-next" },
+                ev => { events.Add(ev); return Task.CompletedTask; },
+                CancellationToken.None);
+
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("threshold 75%"));
+            mainRequestBody.Should().NotBeNull();
+            mainRequestBody.Should().NotContain("\"max_tokens\"", "main agent turn must never cap reasoning/thinking tokens");
+            mainRequestBody.Should().NotContain("\"max_completion_tokens\"");
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+        }
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_EnforcesPostFirstByteChunkIdleWatchdog_AndRetriesStalledStream()
+    {
+        var sessionId = Guid.NewGuid();
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "qwen3.8-flash-next",
+            TimeoutSeconds = 30,
+            StreamChunkIdleTimeoutSeconds = 1,
+            MaxRetries = 1,
+            RetryDelayMilliseconds = 10
+        };
+
+        var attempt = 0;
+        var mockClient = new HttpClient(new AsyncStreamingHttpMessageHandler(async (_, ct) =>
+        {
+            var currentAttempt = Interlocked.Increment(ref attempt);
+            if (currentAttempt == 1)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new StallingSseContent("data: {\"choices\":[{\"delta\":{\"content\":\"First chunk\"}}]}\n\n", TimeSpan.FromSeconds(5))
+                };
+            }
+
+            await Task.Yield();
+            var sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered response after retry.\"}}]}\n\ndata: [DONE]\n\n";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(
+                preset,
+                new PromptReceivedEvent { SessionId = sessionId, Prompt = "Test watchdog", Model = "qwen3.8-flash-next" },
+                ev => { events.Add(ev); return Task.CompletedTask; },
+                CancellationToken.None);
+
+            attempt.Should().Be(2, "stalled stream after first SSE chunk must cancel and retry");
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("SSE stream stalled"));
+            events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Recovered response after retry."));
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+        }
+    }
+
+    private sealed class AsyncStreamingHttpMessageHandler(
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> handler) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            handler(request, cancellationToken);
+    }
+
+    private sealed class StallingSseContent(string firstChunk, TimeSpan stallDuration) : HttpContent
+    {
+        protected override async Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(firstChunk);
+            await stream.WriteAsync(bytes);
+            await stream.FlushAsync();
+            await Task.Delay(stallDuration);
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken)
+        {
+            return Task.FromResult<Stream>(new StallingReadStream(firstChunk, stallDuration));
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = -1;
+            return false;
+        }
+    }
+
+    private sealed class StallingReadStream(string firstChunk, TimeSpan stallDuration) : Stream
+    {
+        private readonly byte[] _firstBytes = System.Text.Encoding.UTF8.GetBytes(firstChunk);
+        private int _offset;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => _offset; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => ReadAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_offset < _firstBytes.Length)
+            {
+                var toCopy = Math.Min(buffer.Length, _firstBytes.Length - _offset);
+                _firstBytes.AsMemory(_offset, toCopy).CopyTo(buffer);
+                _offset += toCopy;
+                return toCopy;
+            }
+
+            await Task.Delay(stallDuration, cancellationToken);
+            return 0;
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            await ReadAsync(buffer.AsMemory(offset, count), cancellationToken);
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler

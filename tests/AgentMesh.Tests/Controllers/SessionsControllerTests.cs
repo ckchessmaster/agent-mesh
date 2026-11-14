@@ -1120,38 +1120,40 @@ public class SessionsControllerTests
             StructuredPayloadJson: questionsPayload
         ));
 
-        // Assert 1: Session transitions to waiting_for_input and JobMessage is created
+        // Assert 1: Session transitions to waiting_for_input and JobTimelineCard is created
         toolCallRes.Should().BeOfType<CreatedAtActionResult>();
         session.Status.Should().Be("waiting_for_input");
 
-        var jobMsgs = db.JobMessages.Where(m => m.JobId == job.Id).ToList();
-        jobMsgs.Should().ContainSingle();
-        var qMsg = jobMsgs[0];
-        qMsg.SenderType.Should().Be("persona");
-        qMsg.SenderId.Should().Be(persona.Id);
-        qMsg.TurnSessionId.Should().Be(session.Id);
-        qMsg.StructuredPayloadJson.Should().Contain("Which DB?");
+        var jobCards = db.JobTimelineCards.Where(c => c.JobId == job.Id.ToString()).ToList();
+        jobCards.Should().ContainSingle();
+        var qCard = jobCards[0];
+        qCard.CardType.Should().Be(TimelineCardType.Escalation3R);
+        qCard.Status.Should().Be(TimelineCardStatus.PendingInput);
+        qCard.StructuredPayloadJson.Should().Contain(persona.Id);
+        qCard.StructuredPayloadJson.Should().Contain(session.Id.ToString());
+        qCard.StructuredPayloadJson.Should().Contain("Which DB?");
 
         // Act 2: Human submits answer to the question
         var answerRes = await controller.SubmitAnswer(session.Id, new SubmitAnswerRequest(
-            ToolCallId: qMsg.Id,
+            ToolCallId: qCard.Id,
             Answers: new List<QuestionAnswerDto>
             {
                 new(0, "Which DB?", new List<string> { "PG" }, "")
             }
         ));
 
-        // Assert 2: Session transitions back to thinking, answer is forwarded to JobMessages
+        // Assert 2: Session transitions back to thinking, answer is forwarded to JobTimelineCards
         answerRes.Should().BeOfType<OkObjectResult>();
         session.Status.Should().Be("thinking");
 
-        var allJobMsgs = db.JobMessages.Where(m => m.JobId == job.Id).OrderBy(m => m.CreatedAt).ToList();
-        allJobMsgs.Should().HaveCount(2);
-        var aMsg = allJobMsgs[1];
-        aMsg.SenderType.Should().Be("user");
-        aMsg.Content.Should().Contain("User answered question:");
-        aMsg.Content.Should().Contain("Which DB? -> A: PG");
-        aMsg.TurnSessionId.Should().Be(session.Id);
+        var allJobCards = db.JobTimelineCards.Where(c => c.JobId == job.Id.ToString()).OrderBy(c => c.CreatedAt).ToList();
+        allJobCards.Should().HaveCount(2);
+        var aCard = allJobCards[1];
+        using var aDoc = System.Text.Json.JsonDocument.Parse(aCard.StructuredPayloadJson);
+        aDoc.RootElement.GetProperty("content").GetString().Should()
+            .Contain("User answered question:")
+            .And.Contain("Which DB? -> A: PG");
+        aCard.StructuredPayloadJson.Should().Contain(session.Id.ToString());
     }
 
     [Fact]
@@ -1312,10 +1314,10 @@ public class SessionsControllerTests
         // Assert
         result.Should().BeOfType<CreatedAtActionResult>();
 
-        // 1. Verify JobMessage was posted
-        var jobMsg = db.JobMessages.FirstOrDefault(m => m.JobId == job.Id && m.Content == checkpointResponse);
-        jobMsg.Should().NotBeNull();
-        jobMsg!.SenderId.Should().Be(persona.Id);
+        // 1. Verify JobTimelineCard was posted
+        var jobCard = db.JobTimelineCards.FirstOrDefault(c => c.JobId == job.Id.ToString() && c.StructuredPayloadJson.Contains("Progress Checkpoint"));
+        jobCard.Should().NotBeNull();
+        jobCard!.StructuredPayloadJson.Should().Contain(persona.Id);
 
         // 2. Verify next turn session was dispatched autonomously for the same persona
         var nextSession = db.AgentSessions.FirstOrDefault(s => s.Id != session.Id && s.PersonaId == persona.Id);
@@ -1436,9 +1438,9 @@ public class SessionsControllerTests
         // Assert
         result.Should().BeOfType<CreatedAtActionResult>();
 
-        // 1. Verify JobMessage was posted
-        var jobMsg = db.JobMessages.FirstOrDefault(m => m.JobId == job.Id && m.Content == checkpointResponse);
-        jobMsg.Should().NotBeNull();
+        // 1. Verify JobTimelineCard was posted
+        var jobCard = db.JobTimelineCards.FirstOrDefault(c => c.JobId == job.Id.ToString() && c.StructuredPayloadJson.Contains("Progress Checkpoint"));
+        jobCard.Should().NotBeNull();
 
         // 2. Verify NO next turn session was dispatched autonomously because plan approval is pending
         var nextSession = db.AgentSessions.FirstOrDefault(s => s.Id != session.Id && s.PersonaId == persona.Id);

@@ -78,28 +78,21 @@ public class PlatformMcpToolsTests
         var result = Parse(json);
         result.GetProperty("success").GetBoolean().Should().BeTrue(result.ToString());
 
-        // The spec named public.session_messages; the shared Job Chat the Cockpit renders is
-        // job_messages, and that is the ledger this writes to. Asserting the row lands in the
-        // table the reader actually reads is the whole point of the deviation.
-        var stored = await ReadBackAsync(dbName, d => d.JobMessages.Where(m => m.JobId == job.Id).ToListAsync());
-        var message = stored.Should().ContainSingle().Subject;
+        var stored = await ReadBackAsync(dbName, d => d.JobTimelineCards.Where(c => c.JobId == job.Id.ToString()).ToListAsync());
+        var card = stored.Should().ContainSingle().Subject;
 
-        message.SenderType.Should().Be("persona");
-        message.SenderId.Should().Be("rook");
-        message.Content.Should().Be("@astra Build is green, ready for review.");
-        message.MentionsJson.Should().Contain("astra");
-        message.StructuredPayloadJson.Should().NotBeNull();
+        card.CardType.Should().Be(TimelineCardType.InternalConsultation);
+        card.Status.Should().Be(TimelineCardStatus.Active);
 
-        var payload = JsonDocument.Parse(message.StructuredPayloadJson!).RootElement;
+        var payload = JsonDocument.Parse(card.StructuredPayloadJson).RootElement;
+        payload.GetProperty("content").GetString().Should().Be("@astra Build is green, ready for review.");
+        payload.GetProperty("authorPersonaId").GetString().Should().Be("rook");
         payload.GetProperty("requiresReply").GetBoolean().Should().BeFalse();
         payload.GetProperty("targetPersona").GetString().Should().Be("astra");
 
-        // The event name the React Cockpit already subscribes to (App.tsx: JobMessageCreated).
-        _sent.Should().Contain(e => e.Name == "JobMessageCreated");
-        _sent.Single(e => e.Name == "JobMessageCreated").Payload!.GetType().Name
-            .Should().Be("JobMessageDto",
-                "the Cockpit's handler is typed against the controller's DTO; a different shape " +
-                "renders an empty message row rather than failing loudly");
+        _sent.Should().Contain(e => e.Name == "ReceiveTimelineCardUpdated");
+        _sent.Single(e => e.Name == "ReceiveTimelineCardUpdated").Payload
+            .Should().BeOfType<JobTimelineCard>();
     }
 
     [Fact]
@@ -114,9 +107,10 @@ public class PlatformMcpToolsTests
         var tools = BuildTools(db, Context(jobId: job.Id, personaId: "rook", sessionId: sessionId));
         await tools.PostJobMessage("Question about the schema.", "astra", requires_reply: false);
 
-        var stored = await ReadBackAsync(dbName, d => d.JobMessages.SingleAsync(m => m.JobId == job.Id));
-        stored.TurnSessionId.Should().Be(sessionId,
-            "JobCockpit resolves the sending runner off turnSessionId; without it the message has no avatar");
+        var stored = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        var payload = JsonDocument.Parse(stored.StructuredPayloadJson).RootElement;
+        payload.GetProperty("turnSessionId").GetGuid().Should().Be(sessionId);
+        payload.GetProperty("authorPersonaId").GetString().Should().Be("rook");
     }
 
     [Fact]
@@ -137,12 +131,42 @@ public class PlatformMcpToolsTests
         result.GetProperty("requiresReply").GetBoolean().Should().BeTrue();
         result.GetProperty("sessionStatus").GetString().Should().Be(PlatformMcpTools.WaitingForInputStatus);
 
+        var card = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        card.CardType.Should().Be(TimelineCardType.Escalation3R);
+        card.Status.Should().Be(TimelineCardStatus.PendingInput);
+
         var session = await ReadBackAsync(dbName, d => d.AgentSessions.SingleAsync(s => s.Id == sessionId));
         session.Status.Should().Be("waiting_for_input",
             "the Cockpit and Job D's wait gate both key off this exact string, not 'AwaitingInput'");
 
         _sent.Should().Contain(e => e.Name == "SessionUpdated",
             "the runner's status chip must flip without a page refresh");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_ToOperatorWithoutReply_CreatesActiveTaskStepCard_AndPreservesPersonaVsDriverSplit()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db);
+        var ctx = Context(jobId: job.Id, personaId: "rook", agentId: "spence-ai") with
+        {
+            DriverId = "spence-ai",
+            DriverIdSource = "session:driverId"
+        };
+        var tools = BuildTools(db, ctx);
+
+        var result = Parse(await tools.PostJobMessage("Completed schema migration.", "operator", requires_reply: false));
+        result.GetProperty("success").GetBoolean().Should().BeTrue();
+
+        var card = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        card.CardType.Should().Be(TimelineCardType.TaskStep);
+        card.Status.Should().Be(TimelineCardStatus.Active);
+        card.Title.Should().Contain("@rook").And.NotContain("spence-ai");
+
+        var payload = JsonDocument.Parse(card.StructuredPayloadJson).RootElement;
+        payload.GetProperty("authorPersonaId").GetString().Should().Be("rook");
+        payload.GetProperty("driverId").GetString().Should().Be("spence-ai");
     }
 
     // ── Durable-workflow routing (escalation release) ────────────────────────────
@@ -233,8 +257,8 @@ public class PlatformMcpToolsTests
         result.GetProperty("success").GetBoolean().Should().BeTrue();
         result.GetProperty("messageId").GetGuid().Should().NotBeEmpty();
 
-        var stored = await ReadBackAsync(dbName, d => d.JobMessages.SingleAsync(m => m.JobId == job.Id));
-        stored.Content.Should().Contain("Answering your escalation.");
+        var stored = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        stored.StructuredPayloadJson.Should().Contain("Answering your escalation.");
     }
 
     /// <summary>
@@ -283,7 +307,7 @@ public class PlatformMcpToolsTests
         var result = Parse(await tools.PostJobMessage("No router here.", "rook", requires_reply: false));
 
         result.GetProperty("success").GetBoolean().Should().BeTrue();
-        _sent.Should().Contain(e => e.Name == "JobMessageCreated");
+        _sent.Should().Contain(e => e.Name == "ReceiveTimelineCardUpdated");
     }
 
     [Fact]
@@ -381,7 +405,7 @@ public class PlatformMcpToolsTests
         result.GetProperty("error").GetString().Should().Be("unknown_target_persona");
         result.GetProperty("message").GetString().Should().Contain("vane").And.Contain("astra").And.Contain("sorren");
 
-        (await ReadBackAsync(dbName, d => d.JobMessages.CountAsync(m => m.JobId == job.Id))).Should().Be(0,
+        (await ReadBackAsync(dbName, d => d.JobTimelineCards.CountAsync(c => c.JobId == job.Id.ToString()))).Should().Be(0,
             "a refused message must not half-write itself into the ledger");
         _sent.Should().BeEmpty();
     }
@@ -400,9 +424,10 @@ public class PlatformMcpToolsTests
 
         await tools.PostJobMessage(content, "astra", requires_reply: false);
 
-        var stored = await ReadBackAsync(dbName, d => d.JobMessages.SingleAsync(m => m.JobId == job.Id));
-        stored.Content.Should().Be(expected);
-        stored.Content.Should().NotMatch(@"^@astra @astra", "a doubled mention renders as noise in the chat");
+        var stored = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        var actualContent = JsonDocument.Parse(stored.StructuredPayloadJson).RootElement.GetProperty("content").GetString();
+        actualContent.Should().Be(expected);
+        actualContent.Should().NotMatch(@"^@astra @astra", "a doubled mention renders as noise in the chat");
     }
 
     [Fact]
@@ -895,14 +920,13 @@ public class PlatformMcpToolsTests
         var tools = BuildTools(db, Context(jobId: job.Id, personaId: "rook", sessionId: sessionId, branch: "feat/x"));
         await tools.OpenPullRequest("feat(api): x", new Summary3R("r", "r", "r"));
 
-        var message = await ReadBackAsync(dbName, d => d.JobMessages.SingleAsync(m => m.JobId == job.Id));
-        message.Content.Should().Contain("PR #42 opened");
-        message.MentionsJson.Should().Contain("astra");
-        message.TurnSessionId.Should().Be(sessionId);
+        var card = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        card.CardType.Should().Be(TimelineCardType.PrReview);
+        card.Status.Should().Be(TimelineCardStatus.PendingInput);
 
-        // The job and task rows have no PR column, so the durable linkage lives in the message
-        // payload — which is what the Cockpit renders and a later turn re-reads.
-        var linkage = JsonDocument.Parse(message.StructuredPayloadJson!).RootElement;
+        var linkage = JsonDocument.Parse(card.StructuredPayloadJson).RootElement;
+        linkage.GetProperty("content").GetString().Should().Contain("PR #42 opened");
+        linkage.GetProperty("turnSessionId").GetGuid().Should().Be(sessionId);
         linkage.GetProperty("prNumber").GetInt32().Should().Be(42);
         linkage.GetProperty("prUrl").GetString().Should().EndWith("/pull/42");
         linkage.GetProperty("simulated").GetBoolean().Should().BeFalse();
@@ -911,12 +935,51 @@ public class PlatformMcpToolsTests
         ProjectJobsController.ParseTasks(persistedJob.TasksJson).Single().StatusNotes
             .Should().Contain("PR #42", "get_details must answer 'where is this work?'");
 
-        _sent.Should().Contain(e => e.Name == "JobMessageCreated");
+        _sent.Should().Contain(e => e.Name == "ReceiveTimelineCardUpdated");
         _sent.Should().Contain(e => e.Name == "JobTaskUpdated");
     }
 
     [Fact]
-    public async Task OpenPullRequest_WhenSimulated_SaysSoLoudlyAndStillReturnsTheNumber()
+    public async Task OpenPullRequest_WithRealPrMetadataFromCli_RegistersPrReviewCardIdempotently()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, personas: ["rook"]);
+
+        var tools = BuildTools(db, Context(jobId: job.Id, personaId: "rook", branch: "mesh/job-101"));
+
+        var first = Parse(await tools.OpenPullRequest(
+            "feat(cli): add agentmesh pr harness",
+            new Summary3R("Built CLI PR harness", "Persona container owns git credentials", "Low"),
+            branch_name: "mesh/job-101",
+            pr_url: "https://github.com/ckchessmaster/agent-mesh/pull/101",
+            pr_number: 101,
+            head_sha: "abc1234567890"));
+
+        first.GetProperty("success").GetBoolean().Should().BeTrue();
+        first.GetProperty("pr_number").GetInt32().Should().Be(101);
+        first.GetProperty("pr_url").GetString().Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/101");
+        first.GetProperty("head_sha").GetString().Should().Be("abc1234567890");
+        first.GetProperty("simulated").GetBoolean().Should().BeFalse();
+
+        // Re-registering after pushing a new commit updates the same PrReview card idempotently
+        var second = Parse(await tools.OpenPullRequest(
+            "feat(cli): add agentmesh pr harness",
+            new Summary3R("Updated after review", "Addressed nit", "Low"),
+            branch_name: "mesh/job-101",
+            pr_url: "https://github.com/ckchessmaster/agent-mesh/pull/101",
+            pr_number: 101,
+            head_sha: "def9876543210"));
+
+        second.GetProperty("success").GetBoolean().Should().BeTrue();
+        var cards = await ReadBackAsync(dbName, d => d.JobTimelineCards.Where(c => c.JobId == job.Id.ToString()).ToListAsync());
+        cards.Should().ContainSingle("re-registering the same PR number updates the existing PrReview card");
+        cards[0].StructuredPayloadJson.Should().Contain("def9876543210");
+        _pullRequests.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task OpenPullRequest_WithoutRealPrWhenControlPlaneHasNoCredentials_DirectsPersonaToRunAgentMeshPrOpen()
     {
         var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
         using var db = NewDb(dbName);
@@ -924,19 +987,16 @@ public class PlatformMcpToolsTests
 
         _pullRequests
             .Setup(s => s.PushBranchAndCreatePrAsync(It.IsAny<GitHubPullRequestRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new GitHubPullRequestResult(true, 999, "https://github.com/your-org/your-repo/pull/999",
-                "feat/x", "main", "Simulated PR #999 (no GitHub token configured, so nothing was pushed).", Simulated: true));
+            .ReturnsAsync(new GitHubPullRequestResult(false, null, null, "feat/x", "main",
+                "No GitHub token is configured on the control plane.", Simulated: false, FailureReason: "no_credentials"));
 
         var tools = BuildTools(db, Context(jobId: job.Id, personaId: "rook", branch: "feat/x"));
 
         var result = Parse(await tools.OpenPullRequest("feat(api): x", new Summary3R("r", "r", "r")));
 
-        result.GetProperty("success").GetBoolean().Should().BeTrue();
-        result.GetProperty("pr_number").GetInt32().Should().Be(999);
-        // An agent that believes it opened PR #999 will report a review that never arrives. The
-        // flag and the nextStep text are what keep a local run honest.
-        result.GetProperty("simulated").GetBoolean().Should().BeTrue();
-        result.GetProperty("nextStep").GetString().Should().Contain("Nothing was pushed");
+        result.GetProperty("success").GetBoolean().Should().BeFalse();
+        result.GetProperty("error").GetString().Should().Be("no_credentials");
+        result.GetProperty("message").GetString().Should().Contain("agentmesh pr open");
     }
 
     [Fact]
@@ -959,7 +1019,7 @@ public class PlatformMcpToolsTests
         result.GetProperty("error").GetString().Should().Be("no_working_directory");
         result.GetProperty("details").GetProperty("hint").GetString().Should().Contain("Save the workspace");
 
-        (await ReadBackAsync(dbName, d => d.JobMessages.CountAsync(m => m.JobId == job.Id))).Should().Be(0,
+        (await ReadBackAsync(dbName, d => d.JobTimelineCards.CountAsync(c => c.JobId == job.Id.ToString()))).Should().Be(0,
             "a failed PR must not announce itself as opened");
         _sent.Should().BeEmpty();
     }

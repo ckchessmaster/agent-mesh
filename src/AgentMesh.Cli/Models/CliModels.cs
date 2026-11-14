@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using AgentMesh.Cli.Adapters;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 
@@ -37,6 +38,11 @@ public class AgentPresetConfig
     public int? MaxRetries { get; set; }
     public int? RetryDelayMilliseconds { get; set; }
     public int? MaxSteps { get; set; }
+    public int? ContextWindowTokens { get; set; }
+    public string? DefaultContextSize { get; set; }
+    public int? CompactionThresholdPercent { get; set; }
+    public int? StreamChunkIdleTimeoutSeconds { get; set; }
+    public OpenAISettings? OpenAi { get; set; }
     public string? LoginCommand { get; set; }
     public string? AuthCheckCommand { get; set; }
     public DriverSidecarConfig? Sidecar { get; set; }
@@ -112,6 +118,9 @@ public class PromptReceivedEvent
 
     [JsonPropertyName("projectId")]
     public string? ProjectId { get; set; }
+
+    [JsonPropertyName("repositoryName")]
+    public string? RepositoryName { get; set; }
 
     [JsonPropertyName("gitBranch")]
     public string? GitBranch { get; set; }
