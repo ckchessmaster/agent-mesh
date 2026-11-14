@@ -148,4 +148,115 @@ public class CopilotCredentialHelperTests
             .And.Contain("user: git")
             .And.Contain("git_protocol: https");
     }
+
+    [Fact]
+    public void HasActiveCopilotConfigLogin_WhenLoggedInUsersWithoutCopilotTokens_ReturnsFalseEvenIfAuthTokensPresent()
+    {
+        // Reproduces the exact broken state that causes Copilot CLI to ignore authTokens and fail
+        // with "Saved sign-in could not be read from credential storage".
+        var brokenConfig = """
+        {
+          "logged_in_users": [{ "host": "https://github.com", "login": "CKingdon_bee" }],
+          "last_logged_in_user": { "host": "https://github.com", "login": "CKingdon_bee" },
+          "authTokens": { "https://github.com": { "token": "gho_validToken123" } }
+        }
+        """;
+
+        CopilotCredentialHelper.HasActiveCopilotConfigLogin(brokenConfig).Should().BeFalse();
+
+        var cleanAuthTokensOnly = """
+        {
+          "authTokens": { "https://github.com": { "token": "gho_validToken123" } },
+          "trusted_folders": ["/workspace"]
+        }
+        """;
+
+        CopilotCredentialHelper.HasActiveCopilotConfigLogin(cleanAuthTokensOnly).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ScrubClassicPatFromConfigJson_WhenPruningOrphans_RemovesLoggedInUsersWithoutMatchingCopilotTokens()
+    {
+        var poisonedWithOrphanedUser = """
+        {
+          "copilot_tokens": { "https://github.com:CKingdon_bee": "ghp_classicPoison" },
+          "logged_in_users": [{ "host": "https://github.com", "login": "CKingdon_bee" }],
+          "last_logged_in_user": { "host": "https://github.com", "login": "CKingdon_bee" },
+          "trusted_folders": ["/workspace"]
+        }
+        """;
+
+        var cleaned = CopilotCredentialHelper.ScrubClassicPatFromConfigJson(
+            poisonedWithOrphanedUser,
+            out var modified,
+            pruneOrphanedLoggedInUsers: true);
+
+        modified.Should().BeTrue();
+        cleaned.Should().NotBeNull();
+        cleaned.Should().NotContain("logged_in_users");
+        cleaned.Should().NotContain("last_logged_in_user");
+        cleaned.Should().NotContain("ghp_");
+        cleaned.Should().Contain("/workspace");
+    }
+
+    [Fact]
+    public void MergeCopilotTokenIntoConfigJson_PrunesOrphanedLoggedInUsers_AndOverwritesStaleSeededAuthTokens()
+    {
+        var brokenConfig = """
+        {
+          "logged_in_users": [{ "host": "https://github.com", "login": "stale_user" }],
+          "last_logged_in_user": { "host": "https://github.com", "login": "stale_user" },
+          "authTokens": { "https://github.com": { "token": "gho_oldToken" } },
+          "trusted_folders": ["/workspace"]
+        }
+        """;
+
+        var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+            brokenConfig,
+            "gho_freshToken",
+            overwriteExisting: false);
+
+        merged.Should().NotBeNull();
+        merged.Should().NotContain("logged_in_users");
+        merged.Should().NotContain("last_logged_in_user");
+        merged.Should().Contain("/workspace");
+        CopilotCredentialHelper.HasActiveCopilotConfigLogin(merged).Should().BeTrue();
+        CopilotCredentialHelper.TryExtractCopilotTokenFromJson(merged).Should().Be("gho_freshToken");
+    }
+
+    [Fact]
+    public void MergeCopilotTokenIntoConfigJson_WhenOverwriteTrue_ReplacesStaleInteractiveCopilotTokens()
+    {
+        var oldInteractive = """
+        {
+          "copilot_tokens": { "https://github.com:old_user": "gho_oldInteractive" },
+          "logged_in_users": [{ "host": "https://github.com", "login": "old_user" }],
+          "last_logged_in_user": { "host": "https://github.com", "login": "old_user" }
+        }
+        """;
+
+        var replaced = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+            oldInteractive,
+            "gho_newDriverAuth",
+            overwriteExisting: true);
+
+        replaced.Should().NotContain("old_user");
+        replaced.Should().NotContain("gho_oldInteractive");
+        CopilotCredentialHelper.HasActiveCopilotConfigLogin(replaced).Should().BeTrue();
+        CopilotCredentialHelper.TryExtractCopilotTokenFromJson(replaced).Should().Be("gho_newDriverAuth");
+    }
+
+    [Fact]
+    public void EnsurePlaintextStorageSettingsJson_SetsStoreTokenPlaintextTrue_AndPreservesExistingSettings()
+    {
+        var existing = """{"model":"claude-sonnet-5","theme":"github"}""";
+        var updated = CopilotCredentialHelper.EnsurePlaintextStorageSettingsJson(existing, out var modified);
+
+        modified.Should().BeTrue();
+        updated.Should().Contain("\"storeTokenPlaintext\":true");
+        updated.Should().Contain("\"model\":\"claude-sonnet-5\"");
+
+        CopilotCredentialHelper.EnsurePlaintextStorageSettingsJson(updated, out var modifiedAgain);
+        modifiedAgain.Should().BeFalse();
+    }
 }

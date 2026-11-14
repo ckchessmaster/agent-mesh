@@ -329,6 +329,16 @@ internal static class DriverCapabilityDescriber
         try
         {
             var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrWhiteSpace(preset.Id))
+            {
+                var driverCopilotConfig = Path.Combine(userHome, ".agentmesh", "copilot-homes", preset.Id.Trim().ToLowerInvariant(), "config.json");
+                if (File.Exists(driverCopilotConfig))
+                {
+                    var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(driverCopilotConfig));
+                    if (tok != null) return tok;
+                }
+            }
+
             var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
             if (File.Exists(copilotConfig))
             {

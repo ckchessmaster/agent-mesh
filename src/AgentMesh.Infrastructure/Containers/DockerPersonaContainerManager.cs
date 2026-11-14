@@ -831,10 +831,12 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
     {
         try
         {
+            await EnsureContainerCopilotPlaintextSettingsAsync(normPersonaId, ct);
+
             var (_, existingCfg, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null || true", ct);
             var targetCfg = CopilotCredentialHelper.IsSupportedCopilotToken(driverCopilotToken)
                 ? CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, driverCopilotToken!, overwriteExisting: false)
-                : CopilotCredentialHelper.ScrubClassicPatFromConfigJson(existingCfg, out _);
+                : CopilotCredentialHelper.ScrubClassicPatFromConfigJson(existingCfg, out _, pruneOrphanedLoggedInUsers: true);
 
             if (string.IsNullOrWhiteSpace(targetCfg))
             {
@@ -1541,7 +1543,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
                 var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(
                     normPersonaId,
-                    "env -u GITHUB_TOKEN -u GH_TOKEN /bin/bash -c 'if [[ \"${COPILOT_GITHUB_TOKEN:-}\" == ghp_* ]] || [[ \"${COPILOT_GITHUB_TOKEN:-}\" == GHP_* ]]; then unset COPILOT_GITHUB_TOKEN; fi; timeout 15 copilot -p \"hello\" --allow-all' 2>&1",
+                    "env -u GITHUB_TOKEN -u GH_TOKEN /bin/bash -c 'if [[ \"${COPILOT_GITHUB_TOKEN:-}\" == ghp_* ]] || [[ \"${COPILOT_GITHUB_TOKEN:-}\" == GHP_* ]] || { [ -n \"${AGENTMESH_GITHUB_TOKEN:-}\" ] && [ \"${COPILOT_GITHUB_TOKEN:-}\" = \"${AGENTMESH_GITHUB_TOKEN}\" ]; }; then unset COPILOT_GITHUB_TOKEN; fi; if [ -z \"${COPILOT_GITHUB_TOKEN:-}\" ] && [ -n \"${COPILOT_OAUTH_TOKEN:-}\" ] && ! grep -qE \"\\\"(copilot_tokens|authTokens)\\\"\" /root/.copilot/config.json 2>/dev/null; then export COPILOT_GITHUB_TOKEN=\"$COPILOT_OAUTH_TOKEN\"; fi; timeout 15 copilot -p \"hello\" --allow-all' 2>&1",
                     ct);
                 if (dryExit == 0)
                 {
@@ -1716,11 +1718,12 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         }
         else if (driverId.StartsWith("copilot") || adapterType == "copilot")
         {
+            await EnsureContainerCopilotPlaintextSettingsAsync(normPersonaId, ct);
             psi.ArgumentList.Add("script");
             psi.ArgumentList.Add("-q");
             psi.ArgumentList.Add("-e");
             psi.ArgumentList.Add("-c");
-            psi.ArgumentList.Add("env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN copilot login --device-code");
+            psi.ArgumentList.Add("ISO_GH=$(mktemp -d) && trap 'rm -rf \"$ISO_GH\"' EXIT && env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN -u COPILOT_OAUTH_TOKEN GH_CONFIG_DIR=\"$ISO_GH\" copilot login --device-code");
             psi.ArgumentList.Add("/dev/null");
         }
         else
@@ -1735,20 +1738,30 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         string? capturedUrl = null;
         string? capturedUserCode = null;
         var errBuilder = new StringBuilder();
+        var promptBuffer = new StringBuilder();
+        var plaintextConfirmed = false;
 
         void CheckPlaintextPrompt(string text)
         {
-            if (text.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
-                text.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
-                text.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
-                text.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+            if (plaintextConfirmed) return;
+            promptBuffer.Append(text);
+            var acc = promptBuffer.ToString();
+            if (acc.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("Store token", StringComparison.OrdinalIgnoreCase))
             {
+                plaintextConfirmed = true;
                 try
                 {
                     proc.StandardInput.WriteLine("y");
                     proc.StandardInput.Flush();
                 }
                 catch { }
+            }
+            if (promptBuffer.Length > 4096)
+            {
+                promptBuffer.Remove(0, promptBuffer.Length - 2048);
             }
         }
 
@@ -1954,14 +1967,6 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 {
                     var (_, cpReadOut, _) = await ExecInContainerAsync(normPersonaId, CopilotCredentialHelper.BuildContainerCopilotReadCommand(), ct);
                     var cpTok = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
-                    if (session.SafeHasExited && session.SafeExitCode == 0 && !string.IsNullOrWhiteSpace(cpTok))
-                    {
-                        PersistHostDriverCopilotToken(info.DriverId, cpTok);
-                        _activeAuthSessions.TryRemove(normPersonaId, out _);
-                        await session.DisposeAsync();
-                        return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "GitHub Copilot CLI authentication completed successfully!");
-                    }
-
                     if (!session.SafeHasExited)
                     {
                         return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
@@ -1969,11 +1974,18 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
 
                     if (!string.IsNullOrWhiteSpace(cpTok))
                     {
-                        PersistHostDriverCopilotToken(info.DriverId, cpTok);
+                        await PersistHostDriverCopilotTokenAsync(info.DriverId, cpTok, ct);
                         _activeAuthSessions.TryRemove(normPersonaId, out _);
                         await session.DisposeAsync();
                         return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "GitHub Copilot CLI authentication completed successfully!");
                     }
+
+                    _activeAuthSessions.TryRemove(normPersonaId, out _);
+                    await session.DisposeAsync();
+                    return new PersonaAuthSubmitResult(
+                        normPersonaId,
+                        "failed",
+                        ErrorMessage: "GitHub Copilot login exited without storing an authentication token. Verify plaintext credential storage is permitted and retry.");
                 }
 
                 if (!string.IsNullOrWhiteSpace(authCheckCmd))
@@ -2055,7 +2067,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             var cpTok = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
             if (!string.IsNullOrWhiteSpace(cpTok))
             {
-                PersistHostDriverCopilotToken(info.DriverId, cpTok);
+                await PersistHostDriverCopilotTokenAsync(info.DriverId, cpTok, ct);
                 return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "GitHub Copilot CLI authentication confirmed and persisted to workspace!");
             }
         }
@@ -2063,17 +2075,49 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
         return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: "No active authentication session found for this persona. Please click Authenticate Driver first.");
     }
 
-    private static void PersistHostDriverCopilotToken(string? driverId, string copilotToken)
+    private async Task PersistHostDriverCopilotTokenAsync(string? driverId, string copilotToken, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(driverId) || !CopilotCredentialHelper.IsSupportedCopilotToken(copilotToken))
             return;
 
+        var clean = copilotToken.Trim();
         try
         {
+            var normDriverId = driverId.Trim().ToLowerInvariant();
             var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
             Directory.CreateDirectory(tokensDir);
-            File.WriteAllText(Path.Combine(tokensDir, $"driver-{driverId.Trim().ToLowerInvariant()}.oauth"), copilotToken.Trim());
+            File.WriteAllText(Path.Combine(tokensDir, $"driver-{normDriverId}.oauth"), clean);
+
+            using var scope = _serviceProvider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+            var driver = await db.Agents.FirstOrDefaultAsync(a => a.Id == normDriverId, ct);
+            if (driver != null)
+            {
+                driver.CapabilitiesJson = CopilotCredentialHelper.MergeOAuthTokenIntoDriverCapabilitiesJson(
+                    driver.CapabilitiesJson,
+                    clean);
+                driver.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+            }
+        }
+        catch { }
+    }
+
+    private async Task EnsureContainerCopilotPlaintextSettingsAsync(string normPersonaId, CancellationToken ct)
+    {
+        try
+        {
+            var (_, existingSettings, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/settings.json 2>/dev/null || true", ct);
+            var targetSettings = CopilotCredentialHelper.EnsurePlaintextStorageSettingsJson(existingSettings, out var modified);
+            if (modified || string.IsNullOrWhiteSpace(existingSettings))
+            {
+                var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(targetSettings + "\n"));
+                await ExecInContainerAsync(
+                    normPersonaId,
+                    $"mkdir -p /root/.copilot /workspace/.agentmesh/state/.copilot && printf '%s' '{b64}' | base64 -d > /root/.copilot/settings.json && cp /root/.copilot/settings.json /workspace/.agentmesh/state/.copilot/settings.json && chmod 600 /root/.copilot/settings.json /workspace/.agentmesh/state/.copilot/settings.json",
+                    ct);
+            }
         }
         catch { }
     }
@@ -2095,6 +2139,7 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             }
 
             await EnsureRunningAsync(normPersonaId, ct);
+            await EnsureContainerCopilotPlaintextSettingsAsync(normPersonaId, ct);
             var (_, existingCfg, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null || true", ct);
             var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, apiKey.Trim(), overwriteExisting: true);
             if (!string.IsNullOrWhiteSpace(merged))

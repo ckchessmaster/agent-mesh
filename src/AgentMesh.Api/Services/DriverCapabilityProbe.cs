@@ -667,6 +667,18 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 }
             }
 
+            if (!string.IsNullOrWhiteSpace(request.DriverId))
+            {
+                var driverCopilotConfig = Path.Combine(
+                    userHome, ".agentmesh", "copilot-homes",
+                    request.DriverId.Trim().ToLowerInvariant(), "config.json");
+                if (File.Exists(driverCopilotConfig))
+                {
+                    var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(driverCopilotConfig));
+                    if (tok != null) return tok;
+                }
+            }
+
             var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
             if (File.Exists(copilotConfig))
             {
