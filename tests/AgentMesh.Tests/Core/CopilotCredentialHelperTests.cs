@@ -137,6 +137,11 @@ public class CopilotCredentialHelperTests
             $"{{\"copilot_tokens\":{{\"https://github.com:CKingdon_bee\":\"gho_emuToken\"}}}}\n{d}\n\n{d}\n\n{d}\n\n{d}\nghp_personalRepoPat";
         CopilotCredentialHelper.ParseContainerCopilotReadOutput(validCopilotWithSeparatePat)
             .Should().Be("gho_emuToken");
+
+        var legacyHostsJsonOnly =
+            $"\n{d}\n{{\"github.com\":{{\"oauth_token\":\"ghu_legacyVsCodeToken\"}}}}\n{d}\n\n{d}\n\n{d}\nghp_personalRepoPat";
+        CopilotCredentialHelper.ParseContainerCopilotReadOutput(legacyHostsJsonOnly)
+            .Should().BeNull("legacy github-copilot hosts.json/apps.json are not read by Copilot CLI 1.x");
     }
 
     [Fact]

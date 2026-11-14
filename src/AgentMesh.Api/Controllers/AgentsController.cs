@@ -642,24 +642,6 @@ public class AgentsController(
                     }
                     catch { }
                 }
-                if (foundCopilotToken == null && System.IO.File.Exists(copilotHosts))
-                {
-                    try
-                    {
-                        foundCopilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
-                            await System.IO.File.ReadAllTextAsync(copilotHosts, ct));
-                    }
-                    catch { }
-                }
-                if (foundCopilotToken == null && System.IO.File.Exists(copilotApps))
-                {
-                    try
-                    {
-                        foundCopilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
-                            await System.IO.File.ReadAllTextAsync(copilotApps, ct));
-                    }
-                    catch { }
-                }
                 if (foundCopilotToken == null)
                 {
                     var oauthEnv = Environment.GetEnvironmentVariable(CopilotCredentialHelper.CopilotOAuthTokenEnvVar);
@@ -691,6 +673,7 @@ public class AgentsController(
 
                 if (!string.IsNullOrWhiteSpace(foundCopilotToken))
                 {
+                    await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct, overwriteCopilotConfig: false);
                     steps.Add(new PersonaDriverVerificationStep(
                         "Authentication Check",
                         "success",
@@ -702,6 +685,29 @@ public class AgentsController(
                         "Authentication Check",
                         "warning",
                         "GitHub Copilot is not authenticated. Click 'Authenticate Driver' to sign in."));
+                }
+
+                // Also verify the bound running persona container itself (where prompts actually run)
+                if (containerManager != null)
+                {
+                    var boundPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
+                    if (boundPersonaId != null)
+                    {
+                        var st = await containerManager.GetStatusAsync(boundPersonaId, ct);
+                        if (st.Status == "running")
+                        {
+                            var containerVerify = await containerManager.VerifyDriverAsync(boundPersonaId, ct);
+                            var containerDryRun = containerVerify.Steps.FirstOrDefault(s =>
+                                s.Name.Contains("Dry-Run", StringComparison.OrdinalIgnoreCase));
+                            if (containerDryRun != null)
+                            {
+                                steps.Add(new PersonaDriverVerificationStep(
+                                    $"Persona Container (@{boundPersonaId}) Dry-Run",
+                                    containerDryRun.Status,
+                                    containerDryRun.Details));
+                            }
+                        }
+                    }
                 }
             }
             else if (!string.IsNullOrWhiteSpace(view.AuthCheckCommand))
@@ -954,6 +960,7 @@ public class AgentsController(
             string? capturedUrl = null;
             string? capturedUserCode = null;
             var errBuilder = new StringBuilder();
+            var outBuilder = new StringBuilder();
             var promptBuffer = new StringBuilder();
             var plaintextConfirmed = false;
 
@@ -962,10 +969,14 @@ public class AgentsController(
                 if (plaintextConfirmed) return;
                 promptBuffer.Append(text);
                 var acc = promptBuffer.ToString();
-                if (acc.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
-                    acc.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                if (acc.Contains("plaintext", StringComparison.OrdinalIgnoreCase) ||
+                    acc.Contains("plain text", StringComparison.OrdinalIgnoreCase) ||
+                    acc.Contains("keychain", StringComparison.OrdinalIgnoreCase) ||
+                    acc.Contains("credential stor", StringComparison.OrdinalIgnoreCase) ||
                     acc.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
-                    acc.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+                    acc.Contains("[y/N]", StringComparison.OrdinalIgnoreCase) ||
+                    acc.Contains("Store token", StringComparison.OrdinalIgnoreCase) ||
+                    acc.Contains("store your token", StringComparison.OrdinalIgnoreCase))
                 {
                     plaintextConfirmed = true;
                     try
@@ -1020,6 +1031,14 @@ public class AgentsController(
                     while ((read = await proc.StandardOutput.ReadAsync(buf, 0, buf.Length)) > 0)
                     {
                         var chunk = new string(buf, 0, read);
+                        lock (outBuilder)
+                        {
+                            outBuilder.Append(chunk);
+                            if (outBuilder.Length > 8192)
+                            {
+                                outBuilder.Remove(0, outBuilder.Length - 4096);
+                            }
+                        }
                         CheckPlaintextPrompt(chunk);
                         lineBuffer.Append(chunk);
                         var content = lineBuffer.ToString();
@@ -1072,7 +1091,7 @@ public class AgentsController(
                     try { await Task.Delay(200, ct); } catch { }
                 }
 
-                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode, tempHome, errBuilder, copilotHome);
+                _activeHostAuthSessions[normalizedId] = new HostAuthSession(proc, proc.StandardInput, readerTask, authUrl, capturedUserCode, tempHome, errBuilder, copilotHome, outBuilder);
                 return Ok(new PersonaAuthStartResult(
                     normalizedId,
                     normalizedId,
@@ -1197,15 +1216,6 @@ public class AgentsController(
                     }
                     catch { }
                 }
-                else if (adapter == DriverAdapters.Copilot)
-                {
-                    try
-                    {
-                        await session.Writer.WriteLineAsync("y");
-                        await session.Writer.FlushAsync(ct);
-                    }
-                    catch { }
-                }
 
                 using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
@@ -1219,6 +1229,11 @@ public class AgentsController(
                 catch (OperationCanceledException) { }
                 catch (InvalidOperationException) { }
 
+                if (session.SafeHasExited)
+                {
+                    try { await Task.WhenAny(session.ReaderTask, Task.Delay(500, ct)); } catch { }
+                }
+
                 var candidateTokens = new List<string>();
                 if (!string.IsNullOrWhiteSpace(session.TempHome))
                 {
@@ -1227,16 +1242,11 @@ public class AgentsController(
                 candidateTokens.Add(Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
 
                 // For GitHub Copilot: check ONLY driver's isolated COPILOT_HOME / ~/.copilot/config.json
-                // and ~/.config/github-copilot (never fall back to ~/.config/gh/hosts.yml, which holds
-                // repository GitHub PATs).
+                // (never fall back to ~/.config/gh/hosts.yml or legacy VS Code hosts.json/apps.json).
                 if (adapter == DriverAdapters.Copilot)
                 {
-                    var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
-                    var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
                     if (System.IO.File.Exists(copilotConfig) ||
-                        System.IO.File.Exists(sharedCopilotConfig) ||
-                        System.IO.File.Exists(copilotHosts) ||
-                        System.IO.File.Exists(copilotApps))
+                        System.IO.File.Exists(sharedCopilotConfig))
                     {
                         try
                         {
@@ -1252,16 +1262,6 @@ public class AgentsController(
                             {
                                 copilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
                                     await System.IO.File.ReadAllTextAsync(sharedCopilotConfig, ct));
-                            }
-                            if (copilotToken == null && System.IO.File.Exists(copilotHosts))
-                            {
-                                copilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
-                                    await System.IO.File.ReadAllTextAsync(copilotHosts, ct));
-                            }
-                            if (copilotToken == null && System.IO.File.Exists(copilotApps))
-                            {
-                                copilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
-                                    await System.IO.File.ReadAllTextAsync(copilotApps, ct));
                             }
 
                             if (!string.IsNullOrWhiteSpace(copilotToken) && session.SafeHasExited)
@@ -1339,16 +1339,29 @@ public class AgentsController(
             }
         }
 
-        var targetContainerId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct)
-            ?? (HasContainerOrCustomConfig(view) ? normalizedId : null);
-        if (containerManager != null && targetContainerId != null)
+        var cliBin = adapter switch
         {
-            var res = await containerManager.SubmitAuthCodeAsync(targetContainerId, req.Code, ct);
-            if (res.Status == "authenticated")
+            DriverAdapters.Claude => "claude",
+            DriverAdapters.Copilot => "copilot",
+            _ => "agy"
+        };
+        var loginCmd = !string.IsNullOrWhiteSpace(view.LoginCommand) ? view.LoginCommand : view.Sidecar?.LoginCommand;
+        var usedHostAuth = !HasContainerOrCustomConfig(view) &&
+                           (FindHostBinary(cliBin) != null || !string.IsNullOrWhiteSpace(loginCmd));
+
+        if (!usedHostAuth)
+        {
+            var targetContainerId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct)
+                ?? (HasContainerOrCustomConfig(view) ? normalizedId : null);
+            if (containerManager != null && targetContainerId != null)
             {
-                await SyncDriverCapabilitiesFromContainerOrProbeAsync(agent, targetContainerId, adapter, ct);
+                var res = await containerManager.SubmitAuthCodeAsync(targetContainerId, req.Code ?? string.Empty, ct);
+                if (res.Status == "authenticated")
+                {
+                    await SyncDriverCapabilitiesFromContainerOrProbeAsync(agent, targetContainerId, adapter, ct);
+                }
+                return Ok(res with { PersonaId = normalizedId });
             }
-            return Ok(res with { PersonaId = normalizedId });
         }
 
         return Ok(new PersonaAuthSubmitResult(normalizedId, "failed", ErrorMessage: "No active authentication session found for this driver. Click 'Authenticate Driver' first."));
@@ -1608,7 +1621,7 @@ public class AgentsController(
                 if (!string.IsNullOrWhiteSpace(cleanTok))
                 {
                     await SaveDriverOAuthTokenAsync(agent, cleanTok, ct, DriverAdapters.Copilot);
-                    await SeedDriverCredentialsToBoundPersonasAsync(agent.Id, ct);
+                    await SeedDriverCredentialsToBoundPersonasAsync(agent.Id, ct, overwriteCopilotConfig: true);
                 }
 
                 if (string.IsNullOrWhiteSpace(cleanTok))
@@ -1861,7 +1874,7 @@ public class AgentsController(
             foreach (var pId in personas)
             {
                 var st = await containerManager.GetStatusAsync(pId, ct);
-                if (st.Status == "running")
+                if (st.Status is "running" or "starting")
                 {
                     if (overwriteCopilotConfig && !string.IsNullOrWhiteSpace(copilotOAuthToken))
                     {
@@ -1963,7 +1976,7 @@ public class AgentsController(
         catch { }
     }
 
-    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null, string? tempHome = null, StringBuilder? errBuilder = null, string? copilotHome = null) : IAsyncDisposable
+    private sealed class HostAuthSession(Process process, StreamWriter writer, Task readerTask, string authUrl, string? userCode = null, string? tempHome = null, StringBuilder? errBuilder = null, string? copilotHome = null, StringBuilder? outBuilder = null) : IAsyncDisposable
     {
         private bool _disposed;
         public Process Process { get; } = process;
@@ -1975,7 +1988,23 @@ public class AgentsController(
         public string? CopilotHome { get; } = copilotHome;
         public SemaphoreSlim Lock { get; } = new(1, 1);
         public bool IsDisposed => _disposed;
-        public string GetErrorDetails() => errBuilder?.ToString().Trim() ?? string.Empty;
+
+        public string GetErrorDetails()
+        {
+            var err = errBuilder?.ToString().Trim() ?? string.Empty;
+            string ptyOut = string.Empty;
+            if (outBuilder != null)
+            {
+                lock (outBuilder)
+                {
+                    ptyOut = Regex.Replace(outBuilder.ToString(), @"\x1B\[[0-9;?]*[A-Za-z]", "").Trim();
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(err) && !string.IsNullOrWhiteSpace(ptyOut))
+                return $"{err}\n{ptyOut}";
+            return !string.IsNullOrWhiteSpace(err) ? err : ptyOut;
+        }
 
         public bool SafeHasExited
         {

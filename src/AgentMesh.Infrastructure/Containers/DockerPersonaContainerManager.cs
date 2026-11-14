@@ -1746,10 +1746,14 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
             if (plaintextConfirmed) return;
             promptBuffer.Append(text);
             var acc = promptBuffer.ToString();
-            if (acc.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
-                acc.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+            if (acc.Contains("plaintext", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("plain text", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("keychain", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("credential stor", StringComparison.OrdinalIgnoreCase) ||
                 acc.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
-                acc.Contains("Store token", StringComparison.OrdinalIgnoreCase))
+                acc.Contains("[y/N]", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("Store token", StringComparison.OrdinalIgnoreCase) ||
+                acc.Contains("store your token", StringComparison.OrdinalIgnoreCase))
             {
                 plaintextConfirmed = true;
                 try
@@ -1938,15 +1942,6 @@ public class DockerPersonaContainerManager : IPersonaContainerManager
                 {
                     await session.Writer.WriteLineAsync(code.Trim());
                     await session.Writer.FlushAsync();
-                }
-                else if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
-                {
-                    try
-                    {
-                        await session.Writer.WriteLineAsync("y");
-                        await session.Writer.FlushAsync();
-                    }
-                    catch { }
                 }
 
                 using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
