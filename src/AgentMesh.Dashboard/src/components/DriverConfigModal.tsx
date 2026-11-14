@@ -139,7 +139,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
           setAuthStartResult(null);
           setShowAuthWizard(false);
           await handleVerifyDriver();
-        } else if (res.status === 'failed' || res.status === 'error') {
+        } else if (res.status === 'failed') {
           setAuthStartResult(null);
           setError(res.errorMessage || 'Authentication failed.');
         }
