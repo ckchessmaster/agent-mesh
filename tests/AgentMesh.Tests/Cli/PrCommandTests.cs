@@ -244,4 +244,35 @@ public class PrCommandTests
         calls.Should().Contain("gh pr merge 77 --squash --match-head-commit abcdef1234567890");
         stdout.ToString().Should().Contain("PR_MERGED");
     }
+
+    [Fact]
+    public void BuildProcessEnvironment_UsesAgentMeshGitHubTokenOrPersistedPat_WhenGhTokenIsStrippedByCopilotAdapter()
+    {
+        var tempHome = Path.Combine(Path.GetTempPath(), $"pr-cmd-pat-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(tempHome, ".agentmesh"));
+        File.WriteAllText(Path.Combine(tempHome, ".agentmesh", "github-pat"), "ghp_fromPersistedPatFile\n");
+
+        try
+        {
+            var fromAgentMeshEnv = PrCommand.BuildProcessEnvironment(
+                key => key switch
+                {
+                    "AGENTMESH_GITHUB_TOKEN" => "ghp_personaRepoToken",
+                    "COPILOT_GITHUB_TOKEN" => "gho_emuCopilotToken",
+                    _ => null
+                },
+                tempHome);
+
+            fromAgentMeshEnv["GH_TOKEN"].Should().Be("ghp_personaRepoToken");
+            fromAgentMeshEnv["GITHUB_TOKEN"].Should().Be("ghp_personaRepoToken");
+
+            var fromPersistedFile = PrCommand.BuildProcessEnvironment(_ => null, tempHome);
+            fromPersistedFile["GH_TOKEN"].Should().Be("ghp_fromPersistedPatFile");
+            fromPersistedFile["GITHUB_TOKEN"].Should().Be("ghp_fromPersistedPatFile");
+        }
+        finally
+        {
+            Directory.Delete(tempHome, recursive: true);
+        }
+    }
 }

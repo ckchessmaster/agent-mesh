@@ -287,9 +287,25 @@ public class AgentsController(
             patch["capabilities"] = caps;
         }
 
+        var currentView = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var effectiveAdapter = !string.IsNullOrWhiteSpace(req.Adapter)
+            ? DriverAdapters.ResolveAdapter(req.Adapter, agent.Id, req.Endpoint ?? currentView.Endpoint, agent.RuntimeType)
+            : ResolveAdapterType(agent, currentView);
+
         // The key is write-only from the dashboard's point of view: an empty/absent value means
         // "leave what's stored", never "erase". Clearing it requires the CLI's local config.
-        if (!string.IsNullOrWhiteSpace(req.ApiKey)) patch["apiKey"] = req.ApiKey;
+        if (!string.IsNullOrWhiteSpace(req.ApiKey))
+        {
+            if (effectiveAdapter == DriverAdapters.Copilot && CopilotCredentialHelper.IsClassicGitHubPat(req.ApiKey))
+            {
+                return BadRequest(new { error = CopilotCredentialHelper.ClassicPatUnsupportedMessage });
+            }
+            patch["apiKey"] = req.ApiKey;
+            if (effectiveAdapter == DriverAdapters.Copilot && CopilotCredentialHelper.IsSupportedCopilotToken(req.ApiKey))
+            {
+                patch["oauthToken"] = req.ApiKey.Trim();
+            }
+        }
 
         if (req.Adapter is not null) patch["adapter"] = req.Adapter;
         if (req.LoginCommand is not null) patch["loginCommand"] = req.LoginCommand;
@@ -586,39 +602,62 @@ public class AgentsController(
                 var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
                 var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
                 var driverToken = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{agent.Id}.oauth");
+                var personaGhToken = Environment.GetEnvironmentVariable(CopilotCredentialHelper.PersonaGitHubTokenEnvVar)
+                                     ?? Environment.GetEnvironmentVariable("GH_TOKEN")
+                                     ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
 
                 string? foundCopilotToken = null;
                 if (view.HasOAuthToken)
                 {
-                    foundCopilotToken = DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, view.Sidecar).OAuthToken;
+                    var storedTok = DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, view.Sidecar).OAuthToken;
+                    if (CopilotCredentialHelper.IsSupportedCopilotToken(storedTok))
+                        foundCopilotToken = storedTok!.Trim();
                 }
-                else if (System.IO.File.Exists(driverToken))
-                {
-                    try { foundCopilotToken = (await System.IO.File.ReadAllTextAsync(driverToken, ct)).Trim(); } catch { }
-                }
-                else if (System.IO.File.Exists(copilotConfig))
+                if (foundCopilotToken == null && System.IO.File.Exists(driverToken))
                 {
                     try
                     {
-                        var json = await System.IO.File.ReadAllTextAsync(copilotConfig, ct);
-                        var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
-                        if (match.Success) foundCopilotToken = match.Groups[1].Value.Trim();
+                        var tok = (await System.IO.File.ReadAllTextAsync(driverToken, ct)).Trim();
+                        if (CopilotCredentialHelper.IsSupportedCopilotToken(tok))
+                            foundCopilotToken = tok;
                     }
                     catch { }
                 }
-                else if (System.IO.File.Exists(copilotHosts))
+                if (foundCopilotToken == null && System.IO.File.Exists(copilotConfig))
                 {
                     try
                     {
-                        var json = await System.IO.File.ReadAllTextAsync(copilotHosts, ct);
-                        var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
-                        if (match.Success) foundCopilotToken = match.Groups[1].Value.Trim();
+                        foundCopilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
+                            await System.IO.File.ReadAllTextAsync(copilotConfig, ct));
                     }
                     catch { }
                 }
-                else if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                if (foundCopilotToken == null && System.IO.File.Exists(copilotHosts))
                 {
-                    foundCopilotToken = Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN");
+                    try
+                    {
+                        foundCopilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
+                            await System.IO.File.ReadAllTextAsync(copilotHosts, ct));
+                    }
+                    catch { }
+                }
+                if (foundCopilotToken == null && System.IO.File.Exists(copilotApps))
+                {
+                    try
+                    {
+                        foundCopilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
+                            await System.IO.File.ReadAllTextAsync(copilotApps, ct));
+                    }
+                    catch { }
+                }
+                if (foundCopilotToken == null)
+                {
+                    var oauthEnv = Environment.GetEnvironmentVariable(CopilotCredentialHelper.CopilotOAuthTokenEnvVar);
+                    foundCopilotToken = CopilotCredentialHelper.IsSupportedCopilotToken(oauthEnv)
+                        ? oauthEnv!.Trim()
+                        : CopilotCredentialHelper.SanitizeCopilotEnvToken(
+                            Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN"),
+                            personaGhToken);
                 }
 
                 if (string.IsNullOrWhiteSpace(foundCopilotToken) && containerManager != null)
@@ -626,19 +665,16 @@ public class AgentsController(
                     var boundPersonaId = await ResolveTargetPersonaForDriverAsync(normalizedId, ct);
                     if (boundPersonaId != null)
                     {
-                        var (chkExit, chkOut, _) = await containerManager.ExecInContainerAsync(
+                        var (_, chkOut, _) = await containerManager.ExecInContainerAsync(
                             boundPersonaId,
-                            "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')",
+                            CopilotCredentialHelper.BuildContainerCopilotReadCommand(),
                             ct);
-                        if (chkExit == 0 && !string.IsNullOrWhiteSpace(chkOut))
+                        var clean = CopilotCredentialHelper.ParseContainerCopilotReadOutput(chkOut);
+                        if (!string.IsNullOrWhiteSpace(clean))
                         {
-                            var clean = chkOut.Trim().Split('\n')[0].Trim();
-                            if (!string.IsNullOrWhiteSpace(clean))
-                            {
-                                foundCopilotToken = clean;
-                                await SaveDriverOAuthTokenAsync(agent, clean, ct);
-                                await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
-                            }
+                            foundCopilotToken = clean;
+                            await SaveDriverOAuthTokenAsync(agent, clean, ct, DriverAdapters.Copilot);
+                            await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
                         }
                     }
                 }
@@ -1048,9 +1084,38 @@ public class AgentsController(
             var driverToken = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{agent.Id}.oauth");
             var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
 
+            bool HasActiveHostAuthToken()
+            {
+                if (System.IO.File.Exists(driverToken))
+                {
+                    try
+                    {
+                        var tok = System.IO.File.ReadAllText(driverToken).Trim();
+                        if (adapter != DriverAdapters.Copilot ? !string.IsNullOrWhiteSpace(tok) : CopilotCredentialHelper.IsSupportedCopilotToken(tok))
+                            return true;
+                    }
+                    catch { }
+                }
+                if (adapter == DriverAdapters.Copilot && System.IO.File.Exists(copilotConfig))
+                {
+                    try
+                    {
+                        if (CopilotCredentialHelper.TryExtractCopilotTokenFromJson(System.IO.File.ReadAllText(copilotConfig)) != null)
+                            return true;
+                    }
+                    catch { }
+                }
+                if (adapter == DriverAdapters.Copilot)
+                {
+                    return CopilotCredentialHelper.SanitizeCopilotEnvToken(
+                        Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")) != null;
+                }
+                return false;
+            }
+
             if (session.IsDisposed)
             {
-                if (System.IO.File.Exists(driverToken) || System.IO.File.Exists(copilotConfig) || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                if (HasActiveHostAuthToken())
                 {
                     return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed models!"));
                 }
@@ -1062,7 +1127,7 @@ public class AgentsController(
             {
                 if (session.IsDisposed)
                 {
-                    if (System.IO.File.Exists(driverToken) || System.IO.File.Exists(copilotConfig) || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                    if (HasActiveHostAuthToken())
                     {
                         return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed models!"));
                     }
@@ -1107,82 +1172,64 @@ public class AgentsController(
                 }
                 candidateTokens.Add(Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
 
-                // For GitHub Copilot: check ~/.copilot/config.json and ~/.config/github-copilot
-                var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
-                var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
-                if (System.IO.File.Exists(copilotConfig) || System.IO.File.Exists(copilotHosts) || System.IO.File.Exists(copilotApps))
+                // For GitHub Copilot: check ONLY ~/.copilot/config.json and ~/.config/github-copilot
+                // (never fall back to ~/.config/gh/hosts.yml, which holds repository GitHub PATs).
+                if (adapter == DriverAdapters.Copilot)
                 {
-                    try
+                    var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
+                    var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
+                    if (System.IO.File.Exists(copilotConfig) || System.IO.File.Exists(copilotHosts) || System.IO.File.Exists(copilotApps))
                     {
-                        string? copilotToken = null;
-                        if (System.IO.File.Exists(copilotConfig))
+                        try
                         {
-                            var json = await System.IO.File.ReadAllTextAsync(copilotConfig, ct);
-                            var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
-                            if (match.Success) copilotToken = match.Groups[1].Value;
-                        }
-                        if (copilotToken == null && System.IO.File.Exists(copilotHosts))
-                        {
-                            var json = await System.IO.File.ReadAllTextAsync(copilotHosts, ct);
-                            var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
-                            if (match.Success) copilotToken = match.Groups[1].Value;
-                        }
-                        if (copilotToken == null && System.IO.File.Exists(copilotApps))
-                        {
-                            var json = await System.IO.File.ReadAllTextAsync(copilotApps, ct);
-                            var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
-                            if (match.Success) copilotToken = match.Groups[1].Value;
-                        }
+                            string? copilotToken = null;
+                            if (System.IO.File.Exists(copilotConfig))
+                            {
+                                copilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
+                                    await System.IO.File.ReadAllTextAsync(copilotConfig, ct));
+                            }
+                            if (copilotToken == null && System.IO.File.Exists(copilotHosts))
+                            {
+                                copilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
+                                    await System.IO.File.ReadAllTextAsync(copilotHosts, ct));
+                            }
+                            if (copilotToken == null && System.IO.File.Exists(copilotApps))
+                            {
+                                copilotToken = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(
+                                    await System.IO.File.ReadAllTextAsync(copilotApps, ct));
+                            }
 
-                        if (!string.IsNullOrWhiteSpace(copilotToken))
-                        {
-                            var cleanTok = copilotToken.Trim();
-                            await SaveDriverOAuthTokenAsync(agent, cleanTok, ct);
-                            await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
-                            await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
-                            _activeHostAuthSessions.TryRemove(normalizedId, out _);
-                            await session.DisposeAsync();
-                            return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated GitHub Copilot driver and refreshed models!"));
+                            if (!string.IsNullOrWhiteSpace(copilotToken) && session.SafeHasExited)
+                            {
+                                var cleanTok = copilotToken.Trim();
+                                await SaveDriverOAuthTokenAsync(agent, cleanTok, ct, DriverAdapters.Copilot);
+                                await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
+                                await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                                _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                                await session.DisposeAsync();
+                                return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated GitHub Copilot driver and refreshed models!"));
+                            }
                         }
+                        catch { }
                     }
-                    catch { }
                 }
 
-                // Fallback check for gh hosts.yml
-                var ghHostsFile = Path.Combine(userHome, ".config", "gh", "hosts.yml");
-                if (System.IO.File.Exists(ghHostsFile))
+                if (adapter == DriverAdapters.Agy)
                 {
-                    try
+                    foreach (var tokenPath in candidateTokens)
                     {
-                        var ghYaml = await System.IO.File.ReadAllTextAsync(ghHostsFile, ct);
-                        var tokMatch = Regex.Match(ghYaml, @"oauth_token:\s*([^\s]+)");
-                        if (tokMatch.Success && !string.IsNullOrWhiteSpace(tokMatch.Groups[1].Value))
+                        if (System.IO.File.Exists(tokenPath))
                         {
-                            var ghToken = tokMatch.Groups[1].Value.Trim();
-                            await SaveDriverOAuthTokenAsync(agent, ghToken, ct);
-                            await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
-                            await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
-                            _activeHostAuthSessions.TryRemove(normalizedId, out _);
-                            await session.DisposeAsync();
-                            return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated GitHub Copilot driver and refreshed models!"));
-                        }
-                    }
-                    catch { }
-                }
-
-                foreach (var tokenPath in candidateTokens)
-                {
-                    if (System.IO.File.Exists(tokenPath))
-                    {
-                        var rawTok = (await System.IO.File.ReadAllTextAsync(tokenPath, ct)).Trim();
-                        if (!string.IsNullOrWhiteSpace(rawTok))
-                        {
-                            await SaveDriverOAuthTokenAsync(agent, rawTok, ct);
-                            await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
-                            await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
-                            _activeHostAuthSessions.TryRemove(normalizedId, out _);
-                            await session.DisposeAsync();
-                            return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed model catalog!"));
+                            var rawTok = (await System.IO.File.ReadAllTextAsync(tokenPath, ct)).Trim();
+                            if (!string.IsNullOrWhiteSpace(rawTok))
+                            {
+                                await SaveDriverOAuthTokenAsync(agent, rawTok, ct, DriverAdapters.Agy);
+                                await SeedDriverCredentialsToBoundPersonasAsync(normalizedId, ct);
+                                await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+                                _activeHostAuthSessions.TryRemove(normalizedId, out _);
+                                await session.DisposeAsync();
+                                return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed model catalog!"));
+                            }
                         }
                     }
                 }
@@ -1208,7 +1255,7 @@ public class AgentsController(
             }
             catch (Exception ex) when (ex is InvalidOperationException || ex is ObjectDisposedException)
             {
-                if (System.IO.File.Exists(driverToken) || System.IO.File.Exists(copilotConfig) || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+                if (HasActiveHostAuthToken())
                 {
                     return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "Successfully authenticated driver and refreshed models!"));
                 }
@@ -1257,9 +1304,47 @@ public class AgentsController(
             return NotFound(new { error = $"Driver '{id}' not found." });
         }
 
+        var view = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var adapter = ResolveAdapterType(agent, view);
+        var cleanKey = req.ApiKey.Trim();
+
+        if (adapter == DriverAdapters.Copilot ||
+            (!string.IsNullOrWhiteSpace(req.Provider) && req.Provider.Contains("copilot", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (CopilotCredentialHelper.IsClassicGitHubPat(cleanKey))
+            {
+                return Ok(new PersonaAuthSubmitResult(
+                    normalizedId,
+                    "failed",
+                    ErrorMessage: CopilotCredentialHelper.ClassicPatUnsupportedMessage));
+            }
+
+            await SaveDriverOAuthTokenAsync(agent, cleanKey, ct, DriverAdapters.Copilot);
+
+            if (containerManager != null)
+            {
+                var boundPersonas = await db.Personas.AsNoTracking().Where(p => p.DriverId == normalizedId).Select(p => p.Id).ToListAsync(ct);
+                foreach (var pId in boundPersonas)
+                {
+                    try
+                    {
+                        var st = await containerManager.GetStatusAsync(pId, ct);
+                        if (st.Status == "running")
+                        {
+                            await containerManager.ConfigureApiKeyAsync(pId, cleanKey, DriverAdapters.Copilot, ct);
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+            return Ok(new PersonaAuthSubmitResult(normalizedId, "authenticated", "GitHub Copilot CLI fine-grained token saved and model catalog refreshed!"));
+        }
+
         var patch = new JsonObject
         {
-            ["apiKey"] = req.ApiKey.Trim()
+            ["apiKey"] = cleanKey
         };
 
         agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
@@ -1277,7 +1362,7 @@ public class AgentsController(
                     var st = await containerManager.GetStatusAsync(pId, ct);
                     if (st.Status == "running")
                     {
-                        await containerManager.ConfigureApiKeyAsync(pId, req.ApiKey.Trim(), req.Provider ?? normalizedId, ct);
+                        await containerManager.ConfigureApiKeyAsync(pId, cleanKey, req.Provider ?? normalizedId, ct);
                     }
                 }
                 catch { }
@@ -1447,28 +1532,30 @@ public class AgentsController(
         {
             try
             {
-                var (tokExit, tokOut, _) = await containerManager.ExecInContainerAsync(
+                var (_, tokOut, _) = await containerManager.ExecInContainerAsync(
                     personaId,
-                    "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')",
+                    CopilotCredentialHelper.BuildContainerCopilotReadCommand(),
                     ct);
-                string? cleanTok = null;
-                if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
+                var cleanTok = CopilotCredentialHelper.ParseContainerCopilotReadOutput(tokOut);
+                if (!string.IsNullOrWhiteSpace(cleanTok))
                 {
-                    cleanTok = tokOut.Trim().Split('\n')[0].Trim();
-                    if (!string.IsNullOrWhiteSpace(cleanTok))
-                    {
-                        await SaveDriverOAuthTokenAsync(agent, cleanTok, ct);
-                        await SeedDriverCredentialsToBoundPersonasAsync(agent.Id, ct);
-                    }
+                    await SaveDriverOAuthTokenAsync(agent, cleanTok, ct, DriverAdapters.Copilot);
+                    await SeedDriverCredentialsToBoundPersonasAsync(agent.Id, ct);
                 }
 
-                cleanTok ??= DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, null).OAuthToken;
+                if (string.IsNullOrWhiteSpace(cleanTok))
+                {
+                    var storedTok = DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, null).OAuthToken;
+                    if (CopilotCredentialHelper.IsSupportedCopilotToken(storedTok))
+                        cleanTok = storedTok!.Trim();
+                }
 
                 if (!string.IsNullOrWhiteSpace(cleanTok))
                 {
+                    var escapedTok = cleanTok.Replace("\"", "\\\"").Replace("$", "\\$");
                     var (modExit, modOut, _) = await containerManager.ExecInContainerAsync(
                         personaId,
-                        $"curl -s -m 10 -H \"Authorization: Bearer {cleanTok}\" -H \"Editor-Version: vscode/1.95.0\" -H \"User-Agent: GitHubCopilotChat/0.22.0\" -H \"Copilot-Integration-Id: vscode-chat\" https://api.githubcopilot.com/models",
+                        $"curl -s -m 10 -H \"Authorization: Bearer {escapedTok}\" -H \"Editor-Version: vscode/1.95.0\" -H \"User-Agent: GitHubCopilotChat/0.22.0\" -H \"Copilot-Integration-Id: vscode-chat\" https://api.githubcopilot.com/models",
                         ct);
                     if (modExit == 0 && !string.IsNullOrWhiteSpace(modOut))
                     {
@@ -1509,32 +1596,45 @@ public class AgentsController(
         await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
     }
 
-    private async Task SaveDriverOAuthTokenAsync(Agent agent, string rawToken, CancellationToken ct)
+    private async Task SaveDriverOAuthTokenAsync(Agent agent, string rawToken, CancellationToken ct, string? adapter = null)
     {
+        var effectiveAdapter = adapter ?? ResolveAdapterType(agent, DriverCapabilities.Parse(agent.CapabilitiesJson));
+        if (effectiveAdapter == DriverAdapters.Copilot && !CopilotCredentialHelper.IsSupportedCopilotToken(rawToken))
+        {
+            return;
+        }
+
         try
         {
             var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
             Directory.CreateDirectory(tokensDir);
-            await System.IO.File.WriteAllTextAsync(Path.Combine(tokensDir, $"driver-{agent.Id}.oauth"), rawToken, ct);
+            await System.IO.File.WriteAllTextAsync(Path.Combine(tokensDir, $"driver-{agent.Id}.oauth"), rawToken.Trim(), ct);
 
-            var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
-            var hostDir = Path.GetDirectoryName(hostAgyToken);
-            if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
-            await System.IO.File.WriteAllTextAsync(hostAgyToken, rawToken, ct);
-
-            var hostCopilotDir = Path.Combine(userHome, ".copilot");
-            Directory.CreateDirectory(hostCopilotDir);
-            var hostCopilotConfig = Path.Combine(hostCopilotDir, "config.json");
-            var copilotJson = new JsonObject
+            if (effectiveAdapter == DriverAdapters.Agy)
             {
-                ["token"] = rawToken,
-                ["authTokens"] = new JsonObject
+                var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+                var hostDir = Path.GetDirectoryName(hostAgyToken);
+                if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
+                await System.IO.File.WriteAllTextAsync(hostAgyToken, rawToken.Trim(), ct);
+            }
+            else if (effectiveAdapter == DriverAdapters.Copilot)
+            {
+                var hostCopilotDir = Path.Combine(userHome, ".copilot");
+                Directory.CreateDirectory(hostCopilotDir);
+                var hostCopilotConfig = Path.Combine(hostCopilotDir, "config.json");
+                var existingJson = System.IO.File.Exists(hostCopilotConfig)
+                    ? await System.IO.File.ReadAllTextAsync(hostCopilotConfig, ct)
+                    : null;
+                var mergedJson = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+                    existingJson,
+                    rawToken.Trim(),
+                    overwriteExisting: true);
+                if (!string.IsNullOrWhiteSpace(mergedJson))
                 {
-                    ["https://github.com"] = new JsonObject { ["token"] = rawToken }
+                    await System.IO.File.WriteAllTextAsync(hostCopilotConfig, mergedJson, ct);
                 }
-            };
-            await System.IO.File.WriteAllTextAsync(hostCopilotConfig, copilotJson.ToJsonString(), ct);
+            }
         }
         catch { }
 

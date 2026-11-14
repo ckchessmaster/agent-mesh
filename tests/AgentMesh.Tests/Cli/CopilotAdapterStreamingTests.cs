@@ -340,4 +340,89 @@ public class CopilotAdapterStreamingTests
         ex.Which.Message.Should().Contain("validation_failed");
         ex.Which.Message.Length.Should().BeLessThan(650);
     }
+
+    [Fact]
+    public void IsolateCopilotEnvironment_WhenClassicPatInGhAndCopilotEnvVars_StripsThemAndPreservesAgentMeshGitHubToken()
+    {
+        var env = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["GH_TOKEN"] = "ghp_classicRepoPat12345",
+            ["GITHUB_TOKEN"] = "ghp_classicRepoPat12345",
+            ["COPILOT_GITHUB_TOKEN"] = "ghp_classicRepoPat12345"
+        };
+
+        var tempHome = Path.Combine(Path.GetTempPath(), $"copilot-env-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempHome);
+        try
+        {
+            CopilotAdapter.IsolateCopilotEnvironment(env, tempHome);
+
+            env.Should().NotContainKey("GH_TOKEN");
+            env.Should().NotContainKey("GITHUB_TOKEN");
+            env.Should().NotContainKey("COPILOT_GITHUB_TOKEN");
+            env["AGENTMESH_GITHUB_TOKEN"].Should().Be("ghp_classicRepoPat12345");
+        }
+        finally
+        {
+            Directory.Delete(tempHome, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void IsolateCopilotEnvironment_WhenSeparateFineGrainedPersonaPatAndCopilotOAuth_KeepsBothIdentitiesSeparate()
+    {
+        var tempHome = Path.Combine(Path.GetTempPath(), $"copilot-env-sep-{Guid.NewGuid():N}");
+        var copilotDir = Path.Combine(tempHome, ".copilot");
+        Directory.CreateDirectory(copilotDir);
+        File.WriteAllText(
+            Path.Combine(copilotDir, "config.json"),
+            """{"copilot_tokens":{"https://github.com:CKingdon_bee":"gho_emuCopilotLogin"}}""");
+
+        try
+        {
+            var env = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["AGENTMESH_GITHUB_TOKEN"] = "github_pat_ckchessmaster_repo",
+                ["GH_TOKEN"] = "github_pat_ckchessmaster_repo",
+                ["GITHUB_TOKEN"] = "github_pat_ckchessmaster_repo"
+            };
+
+            CopilotAdapter.IsolateCopilotEnvironment(env, tempHome);
+
+            env.Should().NotContainKey("GH_TOKEN", "GH_TOKEN would override ~/.copilot/config.json inside Copilot CLI");
+            env.Should().NotContainKey("GITHUB_TOKEN");
+            env.Should().NotContainKey("COPILOT_GITHUB_TOKEN");
+            env["AGENTMESH_GITHUB_TOKEN"].Should().Be("github_pat_ckchessmaster_repo");
+        }
+        finally
+        {
+            Directory.Delete(tempHome, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void IsolateCopilotEnvironment_WhenCopilotOAuthTokenSetWithoutConfigFile_ForwardsToCopilotGitHubToken()
+    {
+        var tempHome = Path.Combine(Path.GetTempPath(), $"copilot-env-oauth-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempHome);
+        try
+        {
+            var env = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["AGENTMESH_GITHUB_TOKEN"] = "ghp_classicRepoPat12345",
+                ["GH_TOKEN"] = "ghp_classicRepoPat12345",
+                ["COPILOT_OAUTH_TOKEN"] = "gho_driverSeededCopilotToken"
+            };
+
+            CopilotAdapter.IsolateCopilotEnvironment(env, tempHome);
+
+            env.Should().NotContainKey("GH_TOKEN");
+            env["COPILOT_GITHUB_TOKEN"].Should().Be("gho_driverSeededCopilotToken");
+            env["AGENTMESH_GITHUB_TOKEN"].Should().Be("ghp_classicRepoPat12345");
+        }
+        finally
+        {
+            Directory.Delete(tempHome, recursive: true);
+        }
+    }
 }

@@ -217,6 +217,8 @@ public class PersonasController(
             persona.TrustTier = req.TrustTier.Value;
         }
 
+        var gitIdentityChanged = req.GitHubToken != null || req.GitAuthorName != null || req.GitAuthorEmail != null;
+
         if (req.GitHubToken != null)
         {
             if (string.IsNullOrWhiteSpace(req.GitHubToken))
@@ -241,6 +243,24 @@ public class PersonasController(
 
         persona.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        if (gitIdentityChanged && containerManager != null)
+        {
+            var ct = HttpContext?.RequestAborted ?? CancellationToken.None;
+            try
+            {
+                var envStatus = await containerManager.GetStatusAsync(normalizedId, ct);
+                if (envStatus.Status == "error")
+                {
+                    await containerManager.RestartAsync(normalizedId, ct);
+                }
+                else if (envStatus.Status is "running" or "starting")
+                {
+                    await containerManager.EnsureRunningAsync(normalizedId, ct);
+                }
+            }
+            catch { }
+        }
 
         var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(d => d.Id == persona.DriverId);
         var sessionCount = await db.AgentSessions.CountAsync(s => s.PersonaId == normalizedId);

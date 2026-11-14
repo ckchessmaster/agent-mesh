@@ -6477,7 +6477,7 @@ export default function App() {
                       className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white font-mono text-xs focus:outline-none focus:border-sky-500"
                     />
                     <p className="text-[10px] text-slate-500">
-                      Fine-grained or classic token with repository contents/pull requests permissions. Stored encrypted at rest.
+                      Fine-grained or classic token with repository contents/pull requests permissions (kept separate from Copilot CLI driver sign-in). Stored encrypted at rest.
                     </p>
                   </div>
 

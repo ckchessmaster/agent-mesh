@@ -290,6 +290,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         await EnsurePersistentVolumeClaimAsync(normPersonaId, labels, ct);
 
         var agentToken = await ProvisionAgentTokenAsync(normPersonaId, ct);
+        await SyncPersonaGitHubCredentialsAsync(normPersonaId, ct);
 
         var env = new List<V1EnvVar>
         {
@@ -615,6 +616,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
         await EnsurePersistentVolumeClaimAsync(normPersonaId, labels, ct);
         var agentToken = await ProvisionAgentTokenAsync(normPersonaId, ct);
+        await SyncPersonaGitHubCredentialsAsync(normPersonaId, ct);
 
         var env = new List<V1EnvVar>
         {
@@ -1245,14 +1247,15 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
         else if (driverId.StartsWith("copilot") || adapterType == "copilot")
         {
-            var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || test -n \"$GH_TOKEN\" || test -n \"$GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
-            if (cpExit == 0)
+            var (_, cpReadOut, _) = await ExecInContainerAsync(normPersonaId, CopilotCredentialHelper.BuildContainerCopilotReadCommand(), ct);
+            var cpToken = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
+            if (!string.IsNullOrWhiteSpace(cpToken))
             {
-                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", "GitHub Copilot credentials active"));
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", "GitHub Copilot CLI credentials active"));
             }
             else
             {
-                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "No GitHub Copilot credentials found. Click 'Authenticate Driver' in the UI or run /login in terminal to log in."));
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "No GitHub Copilot CLI credentials found. Click 'Authenticate Driver' in the UI or run /login in terminal to log in."));
             }
         }
         else if (adapterType == "openai")
@@ -1386,24 +1389,33 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
             else if (driverId.StartsWith("copilot") || adapterType == "copilot")
             {
-                var (mExit, mOut, _) = await ExecInContainerAsync(
-                    normPersonaId,
-                    "COPILOT_TOKEN=$(cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}') || echo \"$COPILOT_GITHUB_TOKEN\"); [ -n \"$COPILOT_TOKEN\" ] && curl -s -m 10 -H \"Authorization: Bearer $COPILOT_TOKEN\" -H \"Editor-Version: vscode/1.95.0\" -H \"User-Agent: GitHubCopilotChat/0.22.0\" -H \"Copilot-Integration-Id: vscode-chat\" https://api.githubcopilot.com/models",
-                    ct);
-                if (mExit == 0 && !string.IsNullOrWhiteSpace(mOut) && mOut.Contains("\"data\"", StringComparison.OrdinalIgnoreCase))
+                var (_, cpReadOut, _) = await ExecInContainerAsync(normPersonaId, CopilotCredentialHelper.BuildContainerCopilotReadCommand(), ct);
+                var copilotToken = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
+                if (!string.IsNullOrWhiteSpace(copilotToken))
                 {
-                    var modelList = ParseModelsFromBody(mOut);
-                    if (modelList != null && modelList.Count > 0)
+                    var escapedTok = copilotToken.Replace("\"", "\\\"").Replace("$", "\\$");
+                    var (mExit, mOut, _) = await ExecInContainerAsync(
+                        normPersonaId,
+                        $"curl -s -m 10 -H \"Authorization: Bearer {escapedTok}\" -H \"Editor-Version: vscode/1.95.0\" -H \"User-Agent: GitHubCopilotChat/0.22.0\" -H \"Copilot-Integration-Id: vscode-chat\" https://api.githubcopilot.com/models",
+                        ct);
+                    if (mExit == 0 && !string.IsNullOrWhiteSpace(mOut) && mOut.Contains("\"data\"", StringComparison.OrdinalIgnoreCase))
                     {
-                        var sample = string.Join(", ", modelList.Take(5));
-                        steps.Add(new PersonaDriverVerificationStep(
-                            "Model Catalog Discovery",
-                            "success",
-                            $"Copilot API returned {modelList.Count} model(s): {sample}"));
+                        var modelList = ParseModelsFromBody(mOut);
+                        if (modelList != null && modelList.Count > 0)
+                        {
+                            var sample = string.Join(", ", modelList.Take(5));
+                            steps.Add(new PersonaDriverVerificationStep(
+                                "Model Catalog Discovery",
+                                "success",
+                                $"Copilot API returned {modelList.Count} model(s): {sample}"));
+                        }
                     }
                 }
 
-                var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(normPersonaId, "timeout 15 copilot -p \"hello\" --allow-all 2>&1", ct);
+                var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(
+                    normPersonaId,
+                    "env -u GITHUB_TOKEN -u GH_TOKEN /bin/bash -c 'if [[ \"${COPILOT_GITHUB_TOKEN:-}\" == ghp_* ]] || [[ \"${COPILOT_GITHUB_TOKEN:-}\" == GHP_* ]]; then unset COPILOT_GITHUB_TOKEN; fi; timeout 15 copilot -p \"hello\" --allow-all' 2>&1",
+                    ct);
                 if (dryExit == 0)
                 {
                     var summary = !string.IsNullOrWhiteSpace(dryOut) ? dryOut.Split('\n')[0].Trim() : "completed";
@@ -1527,11 +1539,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
         else if (driverId.StartsWith("copilot") || adapterType == "copilot")
         {
-            var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || test -n \"$GH_TOKEN\" || test -n \"$GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
-            if (chkExit == 0)
-            {
-                return new PersonaAuthStartResult(normPersonaId, driverId, "already_authenticated", Instructions: "Driver is already authenticated with GitHub Copilot.");
-            }
+            // Always allow starting an isolated `copilot login --device-code` flow when the operator
+            // explicitly clicks Authenticate Driver, stripped of GH_TOKEN/GITHUB_TOKEN.
         }
 
         if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var existing) && !existing.IsCompleted)
@@ -1582,7 +1591,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
             else if (driverId.StartsWith("copilot") || adapterType == "copilot")
             {
-                authCmd = new[] { "script", "-q", "-e", "-c", "copilot login --device-code", "/dev/null" };
+                authCmd = new[] { "script", "-q", "-e", "-c", "env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN copilot login --device-code", "/dev/null" };
             }
             else
             {
@@ -1818,32 +1827,6 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
         }
 
-        if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
-        {
-            var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
-            if (cpExit == 0)
-            {
-                var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
-                if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
-                {
-                    try
-                    {
-                        var cpTok = tokOut.Trim();
-                        var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                        var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
-                        Directory.CreateDirectory(tokensDir);
-                        File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), cpTok);
-                        if (!string.IsNullOrWhiteSpace(info.DriverId))
-                        {
-                            File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), cpTok);
-                        }
-                    }
-                    catch { }
-                }
-                return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication confirmed and credentials persisted to workspace!");
-            }
-        }
-
         if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var session))
         {
             try
@@ -1872,29 +1855,15 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
                     if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
                     {
-                        var (cpExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -s /root/.copilot/config.json || test -d /root/.config/github-copilot || test -n \"$COPILOT_GITHUB_TOKEN\" || (gh auth status >/dev/null 2>&1)", ct);
-                        if (cpExit == 0)
+                        var (_, cpReadOut, _) = await ExecInContainerAsync(normPersonaId, CopilotCredentialHelper.BuildContainerCopilotReadCommand(), ct);
+                        var cpTok = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
+                        if (session.IsCompleted && !string.IsNullOrWhiteSpace(cpTok))
                         {
-                            var (tokExit, tokOut, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null | grep -oE '\"(token|oauth_token|access_token)\"[[:space:]]*:[[:space:]]*\"[^\"]*' | cut -d'\"' -f4 || gh auth token 2>/dev/null || (grep oauth_token /root/.config/gh/hosts.yml 2>/dev/null | awk '{print $2}')", ct);
-                            if (tokExit == 0 && !string.IsNullOrWhiteSpace(tokOut))
-                            {
-                                try
-                                {
-                                    var cpTok = tokOut.Trim();
-                                    var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                                    var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
-                                    Directory.CreateDirectory(tokensDir);
-                                    File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), cpTok);
-                                    if (!string.IsNullOrWhiteSpace(info.DriverId))
-                                    {
-                                        File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), cpTok);
-                                    }
-                                }
-                                catch { }
-                            }
+                            await PersistK8sCopilotTokenAsync(normPersonaId, info.DriverId, cpTok, ct);
+                            await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
                             _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
                             await session.DisposeAsync();
-                            return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Driver authentication completed successfully!");
+                            return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "GitHub Copilot CLI authentication completed successfully!");
                         }
                     }
 
@@ -1910,43 +1879,64 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         }
                     }
 
-                    var (chkExit, outStr, _) = await ExecInContainerAsync(
-                        normPersonaId,
-                        "if [ -s /tmp/agy-auth/.gemini/antigravity-cli/antigravity-oauth-token ]; then mkdir -p /root/.gemini/antigravity-cli && cp /tmp/agy-auth/.gemini/antigravity-cli/antigravity-oauth-token /root/.gemini/antigravity-cli/antigravity-oauth-token; fi && cat /root/.gemini/antigravity-cli/antigravity-oauth-token",
-                        ct);
-                    if (chkExit == 0 && !string.IsNullOrWhiteSpace(outStr))
+                    if (info.AdapterType == "agy" || info.DriverId.StartsWith("agy"))
                     {
-                        var trimmedToken = outStr.Trim();
-                        await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
+                        var (chkExit, outStr, _) = await ExecInContainerAsync(
+                            normPersonaId,
+                            "if [ -s /tmp/agy-auth/.gemini/antigravity-cli/antigravity-oauth-token ]; then mkdir -p /root/.gemini/antigravity-cli && cp /tmp/agy-auth/.gemini/antigravity-cli/antigravity-oauth-token /root/.gemini/antigravity-cli/antigravity-oauth-token; fi && cat /root/.gemini/antigravity-cli/antigravity-oauth-token",
+                            ct);
+                        if (chkExit == 0 && !string.IsNullOrWhiteSpace(outStr))
                         {
-                            ["antigravity-oauth-token"] = Encoding.UTF8.GetBytes(trimmedToken),
-                            ["ANTIGRAVITY_OAUTH_TOKEN"] = Encoding.UTF8.GetBytes(trimmedToken)
-                        }, ct);
-
-                        try
-                        {
-                            var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                            var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
-                            Directory.CreateDirectory(tokensDir);
-                            File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), trimmedToken);
-                            if (!string.IsNullOrWhiteSpace(info.DriverId))
+                            var trimmedToken = outStr.Trim();
+                            await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
                             {
-                                File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), trimmedToken);
-                            }
-                            var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
-                            var hostDir = Path.GetDirectoryName(hostAgyToken);
-                            if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
-                            File.WriteAllText(hostAgyToken, trimmedToken);
-                        }
-                        catch { }
+                                ["antigravity-oauth-token"] = Encoding.UTF8.GetBytes(trimmedToken),
+                                ["ANTIGRAVITY_OAUTH_TOKEN"] = Encoding.UTF8.GetBytes(trimmedToken)
+                            }, ct);
 
-                        _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
-                        await session.DisposeAsync();
-                        return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials and persisted in Kubernetes secret!");
+                            try
+                            {
+                                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                                var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                                Directory.CreateDirectory(tokensDir);
+                                File.WriteAllText(Path.Combine(tokensDir, $"{normPersonaId}.oauth"), trimmedToken);
+                                if (!string.IsNullOrWhiteSpace(info.DriverId))
+                                {
+                                    File.WriteAllText(Path.Combine(tokensDir, $"driver-{info.DriverId}.oauth"), trimmedToken);
+                                }
+                                var hostAgyToken = Path.Combine(userHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+                                var hostDir = Path.GetDirectoryName(hostAgyToken);
+                                if (!string.IsNullOrEmpty(hostDir)) Directory.CreateDirectory(hostDir);
+                                File.WriteAllText(hostAgyToken, trimmedToken);
+                            }
+                            catch { }
+
+                            _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
+                            await session.DisposeAsync();
+                            return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "Successfully authenticated Google AI Pro credentials and persisted in Kubernetes secret!");
+                        }
                     }
                 }
 
                 await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
+
+                if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+                {
+                    if (!session.IsCompleted)
+                    {
+                        return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
+                    }
+
+                    var (_, cpReadOut, _) = await ExecInContainerAsync(normPersonaId, CopilotCredentialHelper.BuildContainerCopilotReadCommand(), ct);
+                    var cpTok = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
+                    if (!string.IsNullOrWhiteSpace(cpTok))
+                    {
+                        await PersistK8sCopilotTokenAsync(normPersonaId, info.DriverId, cpTok, ct);
+                        _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
+                        await session.DisposeAsync();
+                        return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "GitHub Copilot CLI authentication completed successfully!");
+                    }
+                }
 
                 if (!session.IsCompleted)
                 {
@@ -1975,12 +1965,98 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             }
         }
 
+        if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+        {
+            var (_, cpReadOut, _) = await ExecInContainerAsync(normPersonaId, CopilotCredentialHelper.BuildContainerCopilotReadCommand(), ct);
+            var cpTok = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
+            if (!string.IsNullOrWhiteSpace(cpTok))
+            {
+                await PersistK8sCopilotTokenAsync(normPersonaId, info.DriverId, cpTok, ct);
+                return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "GitHub Copilot CLI authentication confirmed and persisted to workspace!");
+            }
+        }
+
         return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: "No active authentication session found. Please click Authenticate Driver first.");
+    }
+
+    private async Task PersistK8sCopilotTokenAsync(string normPersonaId, string? driverId, string copilotToken, CancellationToken ct)
+    {
+        if (!CopilotCredentialHelper.IsSupportedCopilotToken(copilotToken)) return;
+        var clean = copilotToken.Trim();
+
+        try
+        {
+            await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
+            {
+                ["copilot-oauth-token"] = Encoding.UTF8.GetBytes(clean),
+                [CopilotCredentialHelper.CopilotOAuthTokenEnvVar] = Encoding.UTF8.GetBytes(clean)
+            }, ct, keysToRemove: new[] { "COPILOT_GITHUB_TOKEN" });
+        }
+        catch { }
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(driverId))
+            {
+                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var tokensDir = Path.Combine(userHome, ".agentmesh", "tokens");
+                Directory.CreateDirectory(tokensDir);
+                await File.WriteAllTextAsync(Path.Combine(tokensDir, $"driver-{driverId.Trim().ToLowerInvariant()}.oauth"), clean, ct);
+            }
+        }
+        catch { }
     }
 
     public async Task<PersonaAuthSubmitResult> ConfigureApiKeyAsync(string personaId, string apiKey, string? provider = null, CancellationToken ct = default)
     {
         var normPersonaId = personaId.Trim().ToLowerInvariant();
+        var providerNorm = provider?.Trim().ToLowerInvariant() ?? string.Empty;
+
+        if (providerNorm.Contains("copilot"))
+        {
+            if (CopilotCredentialHelper.IsClassicGitHubPat(apiKey))
+            {
+                return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: CopilotCredentialHelper.ClassicPatUnsupportedMessage);
+            }
+
+            await EnsureRunningAsync(normPersonaId, ct);
+
+            for (var i = 0; i < 15; i++)
+            {
+                try
+                {
+                    var checkPods = await _client.CoreV1.ListNamespacedPodAsync(
+                        _namespace,
+                        labelSelector: $"agentmesh.io/persona-id={normPersonaId}",
+                        cancellationToken: ct);
+                    if (checkPods.Items.Any(p => p.Metadata.DeletionTimestamp == null && p.Status?.Phase == "Running"))
+                        break;
+                }
+                catch { }
+                await Task.Delay(1000, ct);
+            }
+
+            var cleanKey = apiKey.Trim();
+            await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
+            {
+                ["copilot-oauth-token"] = Encoding.UTF8.GetBytes(cleanKey),
+                [CopilotCredentialHelper.CopilotOAuthTokenEnvVar] = Encoding.UTF8.GetBytes(cleanKey)
+            }, ct, keysToRemove: new[] { "COPILOT_GITHUB_TOKEN" });
+
+            var (_, existingCfg, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null || true", ct);
+            var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, cleanKey, overwriteExisting: true);
+            if (!string.IsNullOrWhiteSpace(merged))
+            {
+                var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(merged + "\n"));
+                await ExecInContainerAsync(
+                    normPersonaId,
+                    $"mkdir -p /root/.copilot /workspace/.agentmesh/state/.copilot && printf '%s' '{b64}' | base64 -d > /root/.copilot/config.json && cp /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json && chmod 600 /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json",
+                    ct);
+            }
+
+            return new PersonaAuthSubmitResult(normPersonaId, "authenticated", "GitHub Copilot CLI fine-grained token configured and persisted in Kubernetes secret!");
+        }
+
         await EnsureRunningAsync(normPersonaId, ct);
 
         // Wait up to 15 seconds for a running pod if a rollout or restart was just triggered
@@ -2000,9 +2076,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             await Task.Delay(1000, ct);
         }
 
-        var keyName = (!string.IsNullOrWhiteSpace(provider) && (provider.ToLowerInvariant().Contains("claude") || provider.ToLowerInvariant().Contains("anthropic")))
+        var keyName = (providerNorm.Contains("claude") || providerNorm.Contains("anthropic"))
             ? "ANTHROPIC_API_KEY"
-            : (!string.IsNullOrWhiteSpace(provider) && provider.ToLowerInvariant().Contains("gemini"))
+            : providerNorm.Contains("gemini")
             ? "GEMINI_API_KEY"
             : "OPENAI_API_KEY";
 
@@ -2161,13 +2237,24 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         return session;
     }
 
-    private async Task UpsertPersonaSecretAsync(string normPersonaId, Dictionary<string, byte[]> data, CancellationToken ct)
+    private async Task UpsertPersonaSecretAsync(
+        string normPersonaId,
+        Dictionary<string, byte[]> data,
+        CancellationToken ct,
+        IReadOnlyCollection<string>? keysToRemove = null)
     {
         var secretName = $"agentmesh-persona-{normPersonaId}-creds";
         try
         {
             var existing = await _client.CoreV1.ReadNamespacedSecretAsync(secretName, _namespace, cancellationToken: ct);
             existing.Data ??= new Dictionary<string, byte[]>();
+            if (keysToRemove != null)
+            {
+                foreach (var rmKey in keysToRemove)
+                {
+                    existing.Data.Remove(rmKey);
+                }
+            }
             foreach (var (k, v) in data)
             {
                 existing.Data[k] = v;
@@ -2177,6 +2264,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
         catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
+            if (data.Count == 0) return;
+
             var newSecret = new V1Secret
             {
                 Metadata = new V1ObjectMeta
@@ -2337,63 +2426,210 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         await db.SaveChangesAsync(ct);
     }
 
+    internal static (Dictionary<string, byte[]> Upserts, List<string> Removals) BuildPersonaSecretUpdates(
+        string? personaGitHubToken,
+        string? authorName,
+        string? authorEmail,
+        string? driverAdapter,
+        string? driverOAuthToken)
+    {
+        var upserts = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        // Always scrub legacy COPILOT_GITHUB_TOKEN from the Kubernetes secret so a Persona's
+        // GitHub PAT (especially classic ghp_ PATs) never leaks into Copilot CLI startup.
+        var removals = new List<string> { "COPILOT_GITHUB_TOKEN" };
+
+        if (!string.IsNullOrWhiteSpace(personaGitHubToken))
+        {
+            var patBytes = Encoding.UTF8.GetBytes(personaGitHubToken.Trim());
+            upserts[CopilotCredentialHelper.PersonaGitHubTokenEnvVar] = patBytes;
+            upserts["GITHUB_TOKEN"] = patBytes;
+            upserts["GH_TOKEN"] = patBytes;
+        }
+        else
+        {
+            removals.Add(CopilotCredentialHelper.PersonaGitHubTokenEnvVar);
+            removals.Add("GITHUB_TOKEN");
+            removals.Add("GH_TOKEN");
+        }
+
+        if (string.Equals(driverAdapter, DriverAdapters.Copilot, StringComparison.OrdinalIgnoreCase) &&
+            CopilotCredentialHelper.IsSupportedCopilotToken(driverOAuthToken))
+        {
+            var cpBytes = Encoding.UTF8.GetBytes(driverOAuthToken!.Trim());
+            upserts["copilot-oauth-token"] = cpBytes;
+            upserts[CopilotCredentialHelper.CopilotOAuthTokenEnvVar] = cpBytes;
+        }
+
+        if (!string.IsNullOrWhiteSpace(authorName))
+        {
+            var nameBytes = Encoding.UTF8.GetBytes(authorName);
+            upserts["GIT_AUTHOR_NAME"] = nameBytes;
+            upserts["GIT_COMMITTER_NAME"] = nameBytes;
+        }
+
+        if (!string.IsNullOrWhiteSpace(authorEmail))
+        {
+            var emailBytes = Encoding.UTF8.GetBytes(authorEmail);
+            upserts["GIT_AUTHOR_EMAIL"] = emailBytes;
+            upserts["GIT_COMMITTER_EMAIL"] = emailBytes;
+        }
+
+        return (upserts, removals);
+    }
+
     private async Task SeedCredentialsFromSecretAsync(string normPersonaId, CancellationToken ct)
     {
         try
         {
+            await SyncPersonaGitHubCredentialsAsync(normPersonaId, ct);
+
             var personaSecretName = $"agentmesh-persona-{normPersonaId}-creds";
-            byte[]? tokenBytes = null;
+            V1Secret? secret = null;
             try
             {
-                var secret = await _client.CoreV1.ReadNamespacedSecretAsync(personaSecretName, _namespace, cancellationToken: ct);
-                if (secret?.Data != null && secret.Data.TryGetValue("antigravity-oauth-token", out var sb))
+                secret = await _client.CoreV1.ReadNamespacedSecretAsync(personaSecretName, _namespace, cancellationToken: ct);
+            }
+            catch { }
+
+            string driverAdapter = DriverAdapters.Agy;
+            string? driverStoredOAuth = null;
+            string? personaGitHubToken = null;
+            string? authorName = null;
+            string? authorEmail = null;
+
+            try
+            {
+                using var scope = _serviceProvider.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+                var encService = scope.ServiceProvider.GetService<ICredentialEncryptionService>();
+                var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
+                if (persona != null)
                 {
-                    tokenBytes = sb;
+                    if (!string.IsNullOrWhiteSpace(persona.GitHubTokenEncrypted) && encService != null)
+                    {
+                        personaGitHubToken = encService.Decrypt(persona.GitHubTokenEncrypted);
+                    }
+                    authorName = !string.IsNullOrWhiteSpace(persona.GitAuthorName) ? persona.GitAuthorName : persona.Name;
+                    authorEmail = !string.IsNullOrWhiteSpace(persona.GitAuthorEmail) ? persona.GitAuthorEmail : $"{normPersonaId}-bot@agentmesh.local";
+
+                    var driverId = persona.DriverId?.Trim().TrimStart('@').ToLowerInvariant();
+                    if (!string.IsNullOrWhiteSpace(driverId))
+                    {
+                        var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
+                        string? explicitAdapter = null;
+                        string? endpoint = null;
+                        if (driver != null && !string.IsNullOrWhiteSpace(driver.CapabilitiesJson))
+                        {
+                            using var doc = JsonDocument.Parse(driver.CapabilitiesJson);
+                            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                            {
+                                if (doc.RootElement.TryGetProperty("adapter", out var adProp) && adProp.ValueKind == JsonValueKind.String)
+                                    explicitAdapter = adProp.GetString();
+                                if (doc.RootElement.TryGetProperty("endpoint", out var epProp) && epProp.ValueKind == JsonValueKind.String)
+                                    endpoint = epProp.GetString();
+                                if (doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
+                                    tokProp.ValueKind == JsonValueKind.String &&
+                                    !string.IsNullOrWhiteSpace(tokProp.GetString()))
+                                {
+                                    driverStoredOAuth = tokProp.GetString()!.Trim();
+                                }
+                            }
+                        }
+                        driverAdapter = DriverAdapters.ResolveAdapter(explicitAdapter, driverId, endpoint, driver?.RuntimeType);
+                    }
                 }
             }
             catch { }
 
-            if (tokenBytes == null || tokenBytes.Length == 0)
+            if (driverAdapter == DriverAdapters.Agy)
             {
-                try
+                byte[]? tokenBytes = null;
+                if (secret?.Data != null && secret.Data.TryGetValue("antigravity-oauth-token", out var sb))
                 {
-                    using var scope = _serviceProvider.CreateScope();
-                    var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
-                    var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
-                    var driverId = persona?.DriverId?.Trim().TrimStart('@').ToLowerInvariant();
-                    if (!string.IsNullOrWhiteSpace(driverId))
+                    tokenBytes = sb;
+                }
+                else if (!string.IsNullOrWhiteSpace(driverStoredOAuth))
+                {
+                    tokenBytes = Encoding.UTF8.GetBytes(driverStoredOAuth);
+                    await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
                     {
-                        var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
-                        if (driver != null && !string.IsNullOrWhiteSpace(driver.CapabilitiesJson))
-                        {
-                            using var doc = JsonDocument.Parse(driver.CapabilitiesJson);
-                            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                                doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
-                                tokProp.ValueKind == JsonValueKind.String &&
-                                !string.IsNullOrWhiteSpace(tokProp.GetString()))
-                            {
-                                var rawTok = tokProp.GetString()!.Trim();
-                                tokenBytes = Encoding.UTF8.GetBytes(rawTok);
-                                await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
-                                {
-                                    ["antigravity-oauth-token"] = tokenBytes,
-                                    ["ANTIGRAVITY_OAUTH_TOKEN"] = tokenBytes
-                                }, ct);
-                            }
-                        }
+                        ["antigravity-oauth-token"] = tokenBytes,
+                        ["ANTIGRAVITY_OAUTH_TOKEN"] = tokenBytes
+                    }, ct);
+                }
+
+                if (tokenBytes != null && tokenBytes.Length > 0)
+                {
+                    var base64 = Convert.ToBase64String(tokenBytes);
+                    await ExecInContainerAsync(normPersonaId, $"mkdir -p /root/.gemini/antigravity-cli && echo '{base64}' | base64 -d > /root/.gemini/antigravity-cli/antigravity-oauth-token && chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
+                    _logger.LogInformation("Seeded Google AI Pro OAuth token into pod for @{PersonaId}", normPersonaId);
+                }
+            }
+            else if (driverAdapter == DriverAdapters.Copilot)
+            {
+                var copilotTok = driverStoredOAuth;
+                if (string.IsNullOrWhiteSpace(copilotTok) &&
+                    secret?.Data != null &&
+                    secret.Data.TryGetValue("copilot-oauth-token", out var cpBytes))
+                {
+                    copilotTok = Encoding.UTF8.GetString(cpBytes).Trim();
+                }
+
+                var (_, existingCfg, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null || true", ct);
+                var targetCfg = CopilotCredentialHelper.IsSupportedCopilotToken(copilotTok)
+                    ? CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, copilotTok!, overwriteExisting: false)
+                    : CopilotCredentialHelper.ScrubClassicPatFromConfigJson(existingCfg, out _);
+
+                if (string.IsNullOrWhiteSpace(targetCfg))
+                {
+                    if (!string.IsNullOrWhiteSpace(existingCfg))
+                    {
+                        await ExecInContainerAsync(
+                            normPersonaId,
+                            "rm -f /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json && sed -i '/^export COPILOT_GITHUB_TOKEN=\"ghp_/Id' /root/.bashrc 2>/dev/null || true",
+                            ct);
                     }
                 }
-                catch { }
+                else if (!string.Equals(existingCfg?.Trim(), targetCfg.Trim(), StringComparison.Ordinal))
+                {
+                    var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(targetCfg + "\n"));
+                    await ExecInContainerAsync(
+                        normPersonaId,
+                        $"mkdir -p /root/.copilot /workspace/.agentmesh/state/.copilot && printf '%s' '{b64}' | base64 -d > /root/.copilot/config.json && cp /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json && chmod 600 /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json && (sed -i '/^export COPILOT_GITHUB_TOKEN=\"ghp_/Id' /root/.bashrc 2>/dev/null || true)",
+                        ct);
+                }
             }
 
-            if (tokenBytes != null && tokenBytes.Length > 0)
+            // Live-seed Persona GitHub PAT into running pod (/root/.agentmesh/github-pat + ~/.config/gh/hosts.yml)
+            // without touching /root/.copilot/config.json
+            var escapedName = (authorName ?? normPersonaId).Trim().Replace("\"", "\\\"");
+            var escapedEmail = (authorEmail ?? $"{normPersonaId}-bot@agentmesh.local").Trim().Replace("\"", "\\\"");
+            if (!string.IsNullOrWhiteSpace(personaGitHubToken))
             {
-                var base64 = Convert.ToBase64String(tokenBytes);
-                await ExecInContainerAsync(normPersonaId, $"mkdir -p /root/.gemini/antigravity-cli && echo '{base64}' | base64 -d > /root/.gemini/antigravity-cli/antigravity-oauth-token && chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token", ct);
-                _logger.LogInformation("Seeded Google AI Pro OAuth token into pod for @{PersonaId}", normPersonaId);
+                var cleanPat = personaGitHubToken.Trim();
+                var patB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(cleanPat + "\n"));
+                var hostsYamlB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(CopilotCredentialHelper.FormatGhHostsYaml(cleanPat)));
+                await ExecInContainerAsync(
+                    normPersonaId,
+                    $"mkdir -p /root/.config/gh /root/.agentmesh && " +
+                    $"printf '%s' '{patB64}' | base64 -d > /root/.agentmesh/github-pat && " +
+                    $"printf '%s' '{hostsYamlB64}' | base64 -d > /root/.config/gh/hosts.yml && " +
+                    $"chmod 600 /root/.agentmesh/github-pat /root/.config/gh/hosts.yml && " +
+                    $"git config --global user.name \"{escapedName}\" && " +
+                    $"git config --global user.email \"{escapedEmail}\" && " +
+                    $"(env -u GITHUB_TOKEN -u GH_TOKEN gh auth setup-git 2>/dev/null || gh auth setup-git 2>/dev/null || true)",
+                    ct);
             }
-
-            await SyncPersonaGitHubCredentialsAsync(normPersonaId, ct);
+            else
+            {
+                await ExecInContainerAsync(
+                    normPersonaId,
+                    $"rm -f /root/.agentmesh/github-pat /root/.config/gh/hosts.yml && " +
+                    $"git config --global user.name \"{escapedName}\" && " +
+                    $"git config --global user.email \"{escapedEmail}\" && " +
+                    $"(git config --global --unset-all credential.helper 2>/dev/null || true)",
+                    ct);
+            }
         }
         catch { }
     }
@@ -2408,44 +2644,53 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var persona = await db.Personas.AsNoTracking().FirstOrDefaultAsync(p => p.Id == normPersonaId, ct);
             if (persona == null) return;
 
-            string? token = null;
+            // Strictly use ONLY the persona's dedicated GitHub PAT for repository git/PR operations.
+            // Never fall back to driver OAuth tokens (such as Copilot EMU logins or Google OAuth).
+            string? personaGitHubToken = null;
             if (!string.IsNullOrWhiteSpace(persona.GitHubTokenEncrypted) && encService != null)
             {
-                token = encService.Decrypt(persona.GitHubTokenEncrypted);
+                personaGitHubToken = encService.Decrypt(persona.GitHubTokenEncrypted);
             }
 
-            if (string.IsNullOrWhiteSpace(token))
+            string? driverAdapter = null;
+            string? driverOAuthToken = null;
+            if (!string.IsNullOrWhiteSpace(persona.DriverId))
             {
-                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                var personaOauthFile = Path.Combine(userHome, ".agentmesh", "tokens", $"{normPersonaId}.oauth");
-                if (File.Exists(personaOauthFile))
+                var driverId = persona.DriverId.Trim().TrimStart('@').ToLowerInvariant();
+                var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
+                string? explicitAdapter = null;
+                string? endpoint = null;
+                if (driver != null && !string.IsNullOrWhiteSpace(driver.CapabilitiesJson))
                 {
-                    try { token = (await File.ReadAllTextAsync(personaOauthFile, ct)).Trim(); } catch { }
-                }
-
-                if (string.IsNullOrWhiteSpace(token) && !string.IsNullOrWhiteSpace(persona.DriverId))
-                {
-                    var driverId = persona.DriverId.Trim().TrimStart('@').ToLowerInvariant();
-                    var driverOauthFile = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{driverId}.oauth");
-                    if (File.Exists(driverOauthFile))
+                    try
                     {
-                        try { token = (await File.ReadAllTextAsync(driverOauthFile, ct)).Trim(); } catch { }
-                    }
-
-                    if (string.IsNullOrWhiteSpace(token))
-                    {
-                        var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == driverId, ct);
-                        if (driver != null && !string.IsNullOrWhiteSpace(driver.CapabilitiesJson))
+                        using var doc = JsonDocument.Parse(driver.CapabilitiesJson);
+                        if (doc.RootElement.ValueKind == JsonValueKind.Object)
                         {
-                            using var doc = JsonDocument.Parse(driver.CapabilitiesJson);
-                            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                                doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
+                            if (doc.RootElement.TryGetProperty("adapter", out var adProp) && adProp.ValueKind == JsonValueKind.String)
+                                explicitAdapter = adProp.GetString();
+                            if (doc.RootElement.TryGetProperty("endpoint", out var epProp) && epProp.ValueKind == JsonValueKind.String)
+                                endpoint = epProp.GetString();
+                            if (doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
                                 tokProp.ValueKind == JsonValueKind.String &&
                                 !string.IsNullOrWhiteSpace(tokProp.GetString()))
                             {
-                                token = tokProp.GetString()!.Trim();
+                                driverOAuthToken = tokProp.GetString()!.Trim();
                             }
                         }
+                    }
+                    catch { }
+                }
+
+                driverAdapter = DriverAdapters.ResolveAdapter(explicitAdapter, driverId, endpoint, driver?.RuntimeType);
+
+                if (string.IsNullOrWhiteSpace(driverOAuthToken))
+                {
+                    var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    var driverOauthFile = Path.Combine(userHome, ".agentmesh", "tokens", $"driver-{driverId}.oauth");
+                    if (File.Exists(driverOauthFile))
+                    {
+                        try { driverOAuthToken = (await File.ReadAllTextAsync(driverOauthFile, ct)).Trim(); } catch { }
                     }
                 }
             }
@@ -2453,27 +2698,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var authorName = !string.IsNullOrWhiteSpace(persona.GitAuthorName) ? persona.GitAuthorName : persona.Name;
             var authorEmail = !string.IsNullOrWhiteSpace(persona.GitAuthorEmail) ? persona.GitAuthorEmail : $"{normPersonaId}-bot@agentmesh.local";
 
-            var secretData = new Dictionary<string, byte[]>();
-            if (!string.IsNullOrWhiteSpace(token))
-            {
-                secretData["GITHUB_TOKEN"] = Encoding.UTF8.GetBytes(token);
-                secretData["GH_TOKEN"] = Encoding.UTF8.GetBytes(token);
-                secretData["COPILOT_GITHUB_TOKEN"] = Encoding.UTF8.GetBytes(token);
-            }
-            if (!string.IsNullOrWhiteSpace(authorName))
-            {
-                secretData["GIT_AUTHOR_NAME"] = Encoding.UTF8.GetBytes(authorName);
-                secretData["GIT_COMMITTER_NAME"] = Encoding.UTF8.GetBytes(authorName);
-            }
-            if (!string.IsNullOrWhiteSpace(authorEmail))
-            {
-                secretData["GIT_AUTHOR_EMAIL"] = Encoding.UTF8.GetBytes(authorEmail);
-                secretData["GIT_COMMITTER_EMAIL"] = Encoding.UTF8.GetBytes(authorEmail);
-            }
+            var (upserts, removals) = BuildPersonaSecretUpdates(
+                personaGitHubToken,
+                authorName,
+                authorEmail,
+                driverAdapter,
+                driverOAuthToken);
 
-            if (secretData.Count > 0)
+            if (upserts.Count > 0 || removals.Count > 0)
             {
-                await UpsertPersonaSecretAsync(normPersonaId, secretData, ct);
+                await UpsertPersonaSecretAsync(normPersonaId, upserts, ct, removals);
             }
         }
         catch (Exception ex)

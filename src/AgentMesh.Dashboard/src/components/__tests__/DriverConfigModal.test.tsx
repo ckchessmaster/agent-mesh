@@ -391,4 +391,44 @@ describe('DriverConfigModal', () => {
       expect(screen.getByText(/Successfully authenticated driver and refreshed models!/i)).toBeInTheDocument();
     });
   });
+
+  it('warns and disables Save Key when a classic ghp_ PAT is pasted into Copilot driver Direct API Key', async () => {
+    const copilotAgent: Agent = {
+      id: 'beeline-gh-copilot',
+      name: 'GitHub Copilot CLI',
+      runtimeType: 0,
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({ adapter: 'copilot' }),
+      config: { adapter: 'copilot', capabilities: ['bash'], hasApiKey: false }
+    };
+
+    vi.spyOn(api, 'startDriverAuth').mockResolvedValueOnce({
+      personaId: 'beeline-gh-copilot',
+      driverId: 'beeline-gh-copilot',
+      status: 'waiting_code',
+      authUrl: 'https://github.com/login/device',
+      userCode: 'ABCD-1234'
+    });
+
+    render(
+      <DriverConfigModal
+        agent={copilotAgent}
+        initialConfig={copilotAgent.config}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Authenticate Driver/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Direct API Key/i })).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /Direct API Key/i }));
+
+    const keyInput = screen.getByPlaceholderText(/Fine-grained Copilot PAT/i);
+    fireEvent.change(keyInput, { target: { value: 'ghp_classicPatShouldNotBeUsedForCopilot' } });
+
+    expect(screen.getByText(/not supported by GitHub Copilot CLI/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Save Key/i })).toBeDisabled();
+  });
 });
