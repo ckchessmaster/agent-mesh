@@ -481,4 +481,36 @@ public class AgentsControllerConfigTests
         sc.GetProperty("authKey").GetString().Should().Be("tskey-auth-secret-test");
         sc.GetProperty("hostname").GetString().Should().Be("kingdom-agent-mesh-01");
     }
+
+    [Fact]
+    public async Task CopilotDriver_RejectsClassicGitHubPatOnDriverAuthAndConfig_WithClearPersonaGuidance()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Agents.Add(new Agent
+        {
+            Id = "beeline-gh-copilot",
+            Name = "GitHub Copilot CLI",
+            Role = "Driver",
+            Status = "online",
+            RuntimeType = RuntimeType.CliAgy,
+            CapabilitiesJson = """{"adapter":"copilot"}"""
+        });
+        db.SaveChanges();
+
+        var controller = new AgentsController(db, _apiKeyService);
+
+        var configRes = await controller.UpdateDriverConfig(
+            "beeline-gh-copilot",
+            new UpdateDriverConfigRequest(ApiKey: "ghp_classicToken123456"));
+        configRes.Should().BeOfType<BadRequestObjectResult>();
+
+        var authRes = await controller.ConfigureDriverApiKey(
+            "beeline-gh-copilot",
+            new PersonasController.ConfigureApiKeyRequest("ghp_classicToken123456", "copilot"));
+        var submit = authRes.Should().BeOfType<OkObjectResult>().Subject.Value
+            .Should().BeOfType<PersonaAuthSubmitResult>().Subject;
+        submit.Status.Should().Be("failed");
+        submit.ErrorMessage.Should().Contain("Classic GitHub Personal Access Tokens (ghp_) are not supported")
+            .And.Contain("Persona");
+    }
 }

@@ -266,4 +266,59 @@ public class KubernetesPersonaContainerManagerTests
         var models = KubernetesPersonaContainerManager.ParseModelsFromBody(input);
         models.Should().BeNull();
     }
+
+    [Fact]
+    public void BuildPersonaSecretUpdates_SeparatesPersonaGitHubPatFromCopilotOAuth_AndScrubsCopilotGitHubToken()
+    {
+        var (upserts, removals) = KubernetesPersonaContainerManager.BuildPersonaSecretUpdates(
+            personaGitHubToken: "ghp_classicRepoPat999",
+            authorName: "Bee",
+            authorEmail: "bee@example.com",
+            driverAdapter: "copilot",
+            driverOAuthToken: "gho_emuCopilotLogin123");
+
+        removals.Should().Contain("COPILOT_GITHUB_TOKEN");
+        upserts.Should().NotContainKey("COPILOT_GITHUB_TOKEN");
+        System.Text.Encoding.UTF8.GetString(upserts["AGENTMESH_GITHUB_TOKEN"]).Should().Be("ghp_classicRepoPat999");
+        System.Text.Encoding.UTF8.GetString(upserts["GITHUB_TOKEN"]).Should().Be("ghp_classicRepoPat999");
+        System.Text.Encoding.UTF8.GetString(upserts["GH_TOKEN"]).Should().Be("ghp_classicRepoPat999");
+        System.Text.Encoding.UTF8.GetString(upserts["COPILOT_OAUTH_TOKEN"]).Should().Be("gho_emuCopilotLogin123");
+        System.Text.Encoding.UTF8.GetString(upserts["copilot-oauth-token"]).Should().Be("gho_emuCopilotLogin123");
+    }
+
+    [Fact]
+    public void BuildPersonaSecretUpdates_WhenPersonaHasNoGitHubPat_NeverLeaksCopilotDriverOAuthIntoGitHubTokens()
+    {
+        var (upserts, removals) = KubernetesPersonaContainerManager.BuildPersonaSecretUpdates(
+            personaGitHubToken: null,
+            authorName: "Bee",
+            authorEmail: "bee@example.com",
+            driverAdapter: "copilot",
+            driverOAuthToken: "gho_emuCopilotLogin123");
+
+        upserts.Should().NotContainKey("GITHUB_TOKEN");
+        upserts.Should().NotContainKey("GH_TOKEN");
+        upserts.Should().NotContainKey("AGENTMESH_GITHUB_TOKEN");
+        removals.Should().Contain(new[] { "COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "AGENTMESH_GITHUB_TOKEN" });
+        System.Text.Encoding.UTF8.GetString(upserts["COPILOT_OAUTH_TOKEN"]).Should().Be("gho_emuCopilotLogin123");
+    }
+
+    [Fact]
+    public void DockerApplyPersonaAndDriverEnvVars_KeepsCopilotOAuthAndPersonaGitHubPatStrictlySeparate()
+    {
+        var env = new List<string>();
+        DockerPersonaContainerManager.ApplyPersonaAndDriverEnvVars(
+            env,
+            personaGitHubToken: "ghp_classicRepoPat999",
+            authorName: "Bee",
+            authorEmail: "bee@example.com",
+            driverAdapter: "copilot",
+            driverOAuthToken: "gho_emuCopilotLogin123");
+
+        env.Should().Contain("AGENTMESH_GITHUB_TOKEN=ghp_classicRepoPat999");
+        env.Should().Contain("GITHUB_TOKEN=ghp_classicRepoPat999");
+        env.Should().Contain("GH_TOKEN=ghp_classicRepoPat999");
+        env.Should().Contain("COPILOT_OAUTH_TOKEN=gho_emuCopilotLogin123");
+        env.Should().NotContain(e => e.StartsWith("COPILOT_GITHUB_TOKEN=", StringComparison.OrdinalIgnoreCase));
+    }
 }

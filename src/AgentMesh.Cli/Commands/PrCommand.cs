@@ -7,6 +7,7 @@ using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Commands;
 
@@ -605,11 +606,22 @@ public static class PrCommand
                 ? Environment.GetEnvironmentVariable("AGENTMESH_BASE_BRANCH")!.Trim()
                 : "main");
 
-    private static IReadOnlyDictionary<string, string?> BuildProcessEnvironment()
+    internal static IReadOnlyDictionary<string, string?> BuildProcessEnvironment(
+        Func<string, string?>? getEnv = null,
+        string? homeDirectory = null)
     {
-        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN");
-        var githubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-        var effectiveToken = !string.IsNullOrWhiteSpace(ghToken) ? ghToken : githubToken;
+        var envReader = getEnv ?? Environment.GetEnvironmentVariable;
+        var personaGitHubToken = envReader(CopilotCredentialHelper.PersonaGitHubTokenEnvVar);
+        var ghToken = envReader("GH_TOKEN");
+        var githubToken = envReader("GITHUB_TOKEN");
+
+        var effectiveToken = !string.IsNullOrWhiteSpace(personaGitHubToken)
+            ? personaGitHubToken.Trim()
+            : !string.IsNullOrWhiteSpace(ghToken)
+                ? ghToken.Trim()
+                : !string.IsNullOrWhiteSpace(githubToken)
+                    ? githubToken.Trim()
+                    : TryReadPersistedPersonaGitHubPat(homeDirectory);
 
         var env = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
@@ -623,6 +635,25 @@ public static class PrCommand
         }
 
         return env;
+    }
+
+    private static string? TryReadPersistedPersonaGitHubPat(string? homeDirectory)
+    {
+        try
+        {
+            var home = homeDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrWhiteSpace(home)) return null;
+
+            var patPath = Path.Combine(home, ".agentmesh", "github-pat");
+            if (!File.Exists(patPath)) return null;
+
+            var raw = File.ReadAllText(patPath).Trim();
+            return string.IsNullOrWhiteSpace(raw) ? null : raw;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string CombineOutput(PrProcessResult res)
