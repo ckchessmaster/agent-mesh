@@ -179,9 +179,10 @@ public static class CopilotCredentialHelper
 
     /// <summary>
     /// Returns true when <paramref name="configJson"/> contains a Copilot CLI login entry that
-    /// <c>copilot</c> CLI natively recognizes (<c>copilot_tokens</c> or <c>authTokens</c>).
-    /// Note that a bare top-level <c>{"token":"..."}</c> without <c>authTokens</c> or
-    /// <c>copilot_tokens</c> is ignored by Copilot CLI 1.x.
+    /// <c>copilot</c> CLI natively recognizes without failing credential storage lookup.
+    /// When <c>logged_in_users</c> or <c>last_logged_in_user</c> is present, Copilot CLI requires a
+    /// matching token in <c>copilot_tokens</c> (otherwise it ignores <c>authTokens</c> and fails with
+    /// "Saved sign-in could not be read from credential storage").
     /// </summary>
     public static bool HasActiveCopilotConfigLogin(string? configJson)
     {
@@ -193,6 +194,7 @@ public static class CopilotCredentialHelper
             if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
             var root = doc.RootElement;
 
+            var validCopilotTokenKeys = new HashSet<string>(StringComparer.Ordinal);
             if (root.TryGetProperty("copilot_tokens", out var ctObj) && ctObj.ValueKind == JsonValueKind.Object)
             {
                 foreach (var prop in ctObj.EnumerateObject())
@@ -200,9 +202,52 @@ public static class CopilotCredentialHelper
                     if (prop.Value.ValueKind == JsonValueKind.String &&
                         IsSupportedCopilotToken(prop.Value.GetString()))
                     {
+                        validCopilotTokenKeys.Add(prop.Name);
+                    }
+                }
+            }
+
+            var hasLoggedInUsers = root.TryGetProperty("logged_in_users", out var usersArr) &&
+                                   usersArr.ValueKind == JsonValueKind.Array &&
+                                   usersArr.GetArrayLength() > 0;
+            var hasLastLoggedInUser = root.TryGetProperty("last_logged_in_user", out var lastUserObj) &&
+                                      lastUserObj.ValueKind == JsonValueKind.Object;
+
+            if (hasLoggedInUsers || hasLastLoggedInUser)
+            {
+                if (validCopilotTokenKeys.Count == 0)
+                {
+                    return false;
+                }
+
+                if (hasLastLoggedInUser)
+                {
+                    var key = BuildUserTokenKey(lastUserObj);
+                    if (key != null && validCopilotTokenKeys.Contains(key))
+                    {
                         return true;
                     }
                 }
+
+                if (hasLoggedInUsers)
+                {
+                    foreach (var user in usersArr.EnumerateArray())
+                    {
+                        if (user.ValueKind != JsonValueKind.Object) continue;
+                        var key = BuildUserTokenKey(user);
+                        if (key != null && validCopilotTokenKeys.Contains(key))
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
+
+            if (validCopilotTokenKeys.Count > 0)
+            {
+                return true;
             }
 
             if (root.TryGetProperty("authTokens", out var atObj) && atObj.ValueKind == JsonValueKind.Object)
@@ -225,12 +270,59 @@ public static class CopilotCredentialHelper
         return false;
     }
 
+    private static string? BuildUserTokenKey(JsonElement userObj)
+    {
+        var host = userObj.TryGetProperty("host", out var hProp) && hProp.ValueKind == JsonValueKind.String
+            ? hProp.GetString()?.Trim().TrimEnd('/')
+            : "https://github.com";
+        var login = userObj.TryGetProperty("login", out var lProp) && lProp.ValueKind == JsonValueKind.String
+            ? lProp.GetString()?.Trim()
+            : null;
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(login))
+        {
+            return null;
+        }
+        return $"{host}:{login}";
+    }
+
+    private static string? BuildUserTokenKey(JsonObject userObj)
+    {
+        var host = userObj.TryGetPropertyValue("host", out var hNode) &&
+                   hNode is JsonValue hjv &&
+                   hjv.TryGetValue<string>(out var hStr) &&
+                   !string.IsNullOrWhiteSpace(hStr)
+            ? hStr.Trim().TrimEnd('/')
+            : "https://github.com";
+        var login = userObj.TryGetPropertyValue("login", out var lNode) &&
+                    lNode is JsonValue ljv &&
+                    ljv.TryGetValue<string>(out var lStr)
+            ? lStr.Trim()
+            : null;
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(login))
+        {
+            return null;
+        }
+        return $"{host}:{login}";
+    }
+
     /// <summary>
     /// Removes any poisoned classic PAT (<c>ghp_...</c>) entries from a <c>~/.copilot/config.json</c>
     /// document while preserving valid Copilot tokens, <c>logged_in_users</c>, and <c>trusted_folders</c>.
     /// Also upgrades a bare legacy <c>{"token":"gho_..."}</c> into <c>authTokens</c>.
     /// </summary>
     public static string? ScrubClassicPatFromConfigJson(string? existingJson, out bool modified)
+        => ScrubClassicPatFromConfigJson(existingJson, out modified, pruneOrphanedLoggedInUsers: false);
+
+    /// <summary>
+    /// Removes poisoned classic PAT (<c>ghp_...</c>) entries from <c>~/.copilot/config.json</c>, and
+    /// optionally prunes orphaned <c>logged_in_users</c>/<c>last_logged_in_user</c> entries that have
+    /// no matching entry in <c>copilot_tokens</c> (which in headless containers without an OS keyring
+    /// cause Copilot CLI to fail with "Saved sign-in could not be read from credential storage").
+    /// </summary>
+    public static string? ScrubClassicPatFromConfigJson(
+        string? existingJson,
+        out bool modified,
+        bool pruneOrphanedLoggedInUsers)
     {
         modified = false;
         if (string.IsNullOrWhiteSpace(existingJson)) return existingJson;
@@ -309,6 +401,54 @@ public static class CopilotCredentialHelper
             }
         }
 
+        if (pruneOrphanedLoggedInUsers)
+        {
+            var validTokenKeys = new HashSet<string>(StringComparer.Ordinal);
+            if (obj.TryGetPropertyValue("copilot_tokens", out var remainingCp) && remainingCp is JsonObject remainingCpObj)
+            {
+                foreach (var (userKey, tokNode) in remainingCpObj)
+                {
+                    if (tokNode is JsonValue tokJv &&
+                        tokJv.TryGetValue<string>(out var tokStr) &&
+                        IsSupportedCopilotToken(tokStr))
+                    {
+                        validTokenKeys.Add(userKey);
+                    }
+                }
+            }
+
+            if (obj.TryGetPropertyValue("logged_in_users", out var usersNode) && usersNode is JsonArray usersArr)
+            {
+                for (var i = usersArr.Count - 1; i >= 0; i--)
+                {
+                    if (usersArr[i] is not JsonObject uObj ||
+                        BuildUserTokenKey(uObj) is not string key ||
+                        !validTokenKeys.Contains(key))
+                    {
+                        usersArr.RemoveAt(i);
+                        modified = true;
+                    }
+                }
+
+                if (usersArr.Count == 0)
+                {
+                    obj.Remove("logged_in_users");
+                    modified = true;
+                }
+            }
+
+            if (obj.TryGetPropertyValue("last_logged_in_user", out var lastNode))
+            {
+                if (lastNode is not JsonObject lastObj ||
+                    BuildUserTokenKey(lastObj) is not string lastKey ||
+                    !validTokenKeys.Contains(lastKey))
+                {
+                    obj.Remove("last_logged_in_user");
+                    modified = true;
+                }
+            }
+        }
+
         // Upgrade legacy bare {"token": "gho_..."} into authTokens so Copilot CLI 1.x recognizes it
         if (!HasActiveCopilotConfigLogin(obj.ToJsonString()) &&
             obj.TryGetPropertyValue("token", out var legacyTokNode) &&
@@ -334,16 +474,17 @@ public static class CopilotCredentialHelper
 
     /// <summary>
     /// Merges a supported Copilot token into <c>~/.copilot/config.json</c> without clobbering
-    /// <c>logged_in_users</c>, <c>copilot_tokens</c>, or <c>trusted_folders</c>.
-    /// When <paramref name="overwriteExisting"/> is false, an existing valid Copilot login in
-    /// <c>config.json</c> is preserved untouched.
+    /// <c>trusted_folders</c>. Orphaned <c>logged_in_users</c> entries without matching
+    /// <c>copilot_tokens</c> are always pruned so Copilot CLI never fails credential storage lookup.
+    /// When <paramref name="overwriteExisting"/> is false, an existing valid interactive
+    /// <c>copilot_tokens</c> login is preserved untouched; seeded <c>authTokens</c> is kept in sync.
     /// </summary>
     public static string? MergeCopilotTokenIntoConfigJson(
         string? existingJson,
         string copilotToken,
         bool overwriteExisting = false)
     {
-        var scrubbed = ScrubClassicPatFromConfigJson(existingJson, out _);
+        var scrubbed = ScrubClassicPatFromConfigJson(existingJson, out _, pruneOrphanedLoggedInUsers: true);
         if (!IsSupportedCopilotToken(copilotToken))
         {
             return scrubbed;
@@ -361,9 +502,35 @@ public static class CopilotCredentialHelper
             obj = new JsonObject();
         }
 
-        if (!overwriteExisting && HasActiveCopilotConfigLogin(obj.ToJsonString()))
+        if (!overwriteExisting && HasValidInteractiveCopilotTokens(obj))
         {
             return obj.ToJsonString();
+        }
+
+        if (overwriteExisting)
+        {
+            var tokenAlreadyActiveInCopilotTokens = false;
+            if (obj.TryGetPropertyValue("copilot_tokens", out var cpNode) && cpNode is JsonObject cpObj)
+            {
+                foreach (var (_, valNode) in cpObj)
+                {
+                    if (valNode is JsonValue jv &&
+                        jv.TryGetValue<string>(out var s) &&
+                        string.Equals(s.Trim(), cleanToken, StringComparison.Ordinal))
+                    {
+                        tokenAlreadyActiveInCopilotTokens = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!tokenAlreadyActiveInCopilotTokens)
+            {
+                obj.Remove("copilot_tokens");
+                obj.Remove("logged_in_users");
+                obj.Remove("last_logged_in_user");
+                obj.Remove("token");
+            }
         }
 
         var authObj = obj["authTokens"] as JsonObject ?? new JsonObject();
@@ -372,6 +539,92 @@ public static class CopilotCredentialHelper
             ["token"] = cleanToken
         };
         obj["authTokens"] = authObj;
+        return obj.ToJsonString();
+    }
+
+    private static bool HasValidInteractiveCopilotTokens(JsonObject obj)
+    {
+        if (!obj.TryGetPropertyValue("copilot_tokens", out var cpNode) || cpNode is not JsonObject cpObj)
+        {
+            return false;
+        }
+
+        foreach (var (_, valNode) in cpObj)
+        {
+            if (valNode is JsonValue jv &&
+                jv.TryGetValue<string>(out var s) &&
+                IsSupportedCopilotToken(s))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Ensures <c>~/.copilot/settings.json</c> sets <c>storeTokenPlaintext: true</c> so
+    /// <c>copilot login --device-code</c> persists tokens in headless containers without an OS keyring.
+    /// </summary>
+    public static string EnsurePlaintextStorageSettingsJson(string? existingSettingsJson, out bool modified)
+    {
+        modified = false;
+        JsonObject? obj = null;
+        if (!string.IsNullOrWhiteSpace(existingSettingsJson))
+        {
+            try
+            {
+                obj = JsonNode.Parse(existingSettingsJson) as JsonObject;
+            }
+            catch (JsonException)
+            {
+                obj = null;
+            }
+        }
+
+        if (obj == null)
+        {
+            obj = new JsonObject();
+            modified = true;
+        }
+
+        if (!obj.TryGetPropertyValue("storeTokenPlaintext", out var existingVal) ||
+            existingVal is not JsonValue jv ||
+            !jv.TryGetValue<bool>(out var b) ||
+            !b)
+        {
+            obj["storeTokenPlaintext"] = true;
+            modified = true;
+        }
+
+        return obj.ToJsonString();
+    }
+
+    /// <summary>
+    /// Safely merges <c>oauthToken</c> into an <c>Agent.CapabilitiesJson</c> blob without
+    /// clobbering existing capability fields or array-shaped capability lists.
+    /// </summary>
+    public static string MergeOAuthTokenIntoDriverCapabilitiesJson(string? existingCapabilitiesJson, string oauthToken)
+    {
+        var obj = new JsonObject();
+        if (!string.IsNullOrWhiteSpace(existingCapabilitiesJson))
+        {
+            try
+            {
+                var node = JsonNode.Parse(existingCapabilitiesJson);
+                if (node is JsonObject existingObj)
+                {
+                    obj = existingObj;
+                }
+                else if (node is JsonArray existingArr && existingArr.Count > 0)
+                {
+                    obj["capabilities"] = existingArr;
+                }
+            }
+            catch (JsonException) { }
+        }
+
+        obj["oauthToken"] = oauthToken.Trim();
         return obj.ToJsonString();
     }
 

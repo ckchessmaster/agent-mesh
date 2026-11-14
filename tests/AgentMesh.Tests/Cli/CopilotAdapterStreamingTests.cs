@@ -425,4 +425,66 @@ public class CopilotAdapterStreamingTests
             Directory.Delete(tempHome, recursive: true);
         }
     }
+
+    [Fact]
+    public void IsolateCopilotEnvironment_WhenConfigHasOrphanedLoggedInUsersAndAuthTokens_ForwardsCopilotOAuthToken()
+    {
+        var tempHome = Path.Combine(Path.GetTempPath(), $"copilot-env-orphan-{Guid.NewGuid():N}");
+        var copilotDir = Path.Combine(tempHome, ".copilot");
+        Directory.CreateDirectory(copilotDir);
+        File.WriteAllText(
+            Path.Combine(copilotDir, "config.json"),
+            """{"logged_in_users":[{"host":"https://github.com","login":"emu_user"}],"authTokens":{"https://github.com":{"token":"gho_stale"}}}""");
+
+        try
+        {
+            var env = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["AGENTMESH_GITHUB_TOKEN"] = "ghp_personaRepoPat",
+                ["GH_TOKEN"] = "ghp_personaRepoPat",
+                ["COPILOT_OAUTH_TOKEN"] = "gho_freshDriverOAuth"
+            };
+
+            CopilotAdapter.IsolateCopilotEnvironment(env, tempHome);
+
+            env.Should().NotContainKey("GH_TOKEN");
+            env.Should().NotContainKey("GITHUB_TOKEN");
+            env["COPILOT_GITHUB_TOKEN"].Should().Be("gho_freshDriverOAuth");
+            env["AGENTMESH_GITHUB_TOKEN"].Should().Be("ghp_personaRepoPat");
+        }
+        finally
+        {
+            Directory.Delete(tempHome, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void IsolateCopilotEnvironment_WhenDriverSpecificCopilotHomeExists_UsesIsolatedCopilotHome()
+    {
+        var tempHome = Path.Combine(Path.GetTempPath(), $"copilot-env-drvhome-{Guid.NewGuid():N}");
+        var driverHome = Path.Combine(tempHome, ".agentmesh", "copilot-homes", "beeline-gh-copilot");
+        Directory.CreateDirectory(driverHome);
+        File.WriteAllText(
+            Path.Combine(driverHome, "config.json"),
+            """{"copilot_tokens":{"https://github.com:emu_user":"gho_emuToken"},"logged_in_users":[{"host":"https://github.com","login":"emu_user"}]}""");
+
+        try
+        {
+            var env = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["GH_TOKEN"] = "ghp_personaRepoPat"
+            };
+
+            CopilotAdapter.IsolateCopilotEnvironment(env, tempHome, driverId: "beeline-gh-copilot");
+
+            env.Should().NotContainKey("GH_TOKEN");
+            env.Should().NotContainKey("COPILOT_GITHUB_TOKEN");
+            env["COPILOT_HOME"].Should().Be(driverHome);
+            env["AGENTMESH_GITHUB_TOKEN"].Should().Be("ghp_personaRepoPat");
+        }
+        finally
+        {
+            Directory.Delete(tempHome, recursive: true);
+        }
+    }
 }

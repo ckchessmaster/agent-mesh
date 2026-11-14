@@ -30,6 +30,8 @@ RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\nAcquire::http::Ti
     && curl -4fsSL --retry 5 --retry-all-errors https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
     && chmod +x /usr/local/bin/agy \
     && mkdir -p /root/.gemini/antigravity-cli /root/.claude /root/.copilot /root/.config /root/.agentmesh/tokens \
+    && printf '{"storeTokenPlaintext":true}\n' > /root/.copilot/settings.json \
+    && chmod 600 /root/.copilot/settings.json \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

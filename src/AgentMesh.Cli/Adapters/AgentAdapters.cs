@@ -2038,7 +2038,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string cwd,
         PromptReceivedEvent promptEvent,
         string promptEnvelope,
-        bool useJsonFormat)
+        bool useJsonFormat,
+        string? driverId = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -2107,12 +2108,15 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             psi.ArgumentList.Add("on");
         }
 
-        IsolateCopilotEnvironment(psi.Environment);
+        IsolateCopilotEnvironment(psi.Environment, driverId: driverId ?? promptEvent.DriverId);
 
         return psi;
     }
 
-    internal static void IsolateCopilotEnvironment(IDictionary<string, string?> environment, string? homeDirectory = null)
+    internal static void IsolateCopilotEnvironment(
+        IDictionary<string, string?> environment,
+        string? homeDirectory = null,
+        string? driverId = null)
     {
         environment.TryGetValue(CopilotCredentialHelper.PersonaGitHubTokenEnvVar, out var personaGhToken);
         environment.TryGetValue("GH_TOKEN", out var ghToken);
@@ -2134,6 +2138,47 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         environment.Remove("GH_TOKEN");
         environment.Remove("GITHUB_TOKEN");
 
+        var home = homeDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var copilotHome = environment.TryGetValue("COPILOT_HOME", out var explicitCopilotHome) &&
+                          !string.IsNullOrWhiteSpace(explicitCopilotHome)
+            ? explicitCopilotHome.Trim()
+            : (!string.IsNullOrWhiteSpace(home) ? Path.Combine(home, ".copilot") : null);
+
+        var hasFileLogin = false;
+        if (!string.IsNullOrWhiteSpace(copilotHome))
+        {
+            var configPath = Path.Combine(copilotHome, "config.json");
+            if (File.Exists(configPath))
+            {
+                try
+                {
+                    hasFileLogin = CopilotCredentialHelper.HasActiveCopilotConfigLogin(File.ReadAllText(configPath));
+                }
+                catch { }
+            }
+        }
+
+        var normalizedDriverId = string.IsNullOrWhiteSpace(driverId)
+            ? null
+            : driverId.Trim().TrimStart('@').ToLowerInvariant();
+        if (!hasFileLogin && !string.IsNullOrWhiteSpace(normalizedDriverId) && !string.IsNullOrWhiteSpace(home))
+        {
+            var driverCopilotHome = Path.Combine(home, ".agentmesh", "copilot-homes", normalizedDriverId);
+            var driverConfigPath = Path.Combine(driverCopilotHome, "config.json");
+            if (File.Exists(driverConfigPath))
+            {
+                try
+                {
+                    if (CopilotCredentialHelper.HasActiveCopilotConfigLogin(File.ReadAllText(driverConfigPath)))
+                    {
+                        environment["COPILOT_HOME"] = driverCopilotHome;
+                        hasFileLogin = true;
+                    }
+                }
+                catch { }
+            }
+        }
+
         environment.TryGetValue("COPILOT_GITHUB_TOKEN", out var rawCopilotEnv);
         var sanitizedCopilotEnv = CopilotCredentialHelper.SanitizeCopilotEnvToken(
             rawCopilotEnv,
@@ -2143,34 +2188,99 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         {
             environment.Remove("COPILOT_GITHUB_TOKEN");
 
+            string? fallbackOAuth = null;
             if (environment.TryGetValue(CopilotCredentialHelper.CopilotOAuthTokenEnvVar, out var oauthTok) &&
                 CopilotCredentialHelper.IsSupportedCopilotToken(oauthTok))
             {
-                var home = homeDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                var hasFileLogin = false;
-                if (!string.IsNullOrWhiteSpace(home))
+                fallbackOAuth = oauthTok!.Trim();
+            }
+            else if (!hasFileLogin && !string.IsNullOrWhiteSpace(normalizedDriverId) && !string.IsNullOrWhiteSpace(home))
+            {
+                var driverTokenPath = Path.Combine(home, ".agentmesh", "tokens", $"driver-{normalizedDriverId}.oauth");
+                if (File.Exists(driverTokenPath))
                 {
-                    var configPath = Path.Combine(home, ".copilot", "config.json");
-                    if (File.Exists(configPath))
+                    try
                     {
-                        try
+                        var fileTok = File.ReadAllText(driverTokenPath).Trim();
+                        if (CopilotCredentialHelper.IsSupportedCopilotToken(fileTok))
                         {
-                            hasFileLogin = CopilotCredentialHelper.HasActiveCopilotConfigLogin(File.ReadAllText(configPath));
+                            fallbackOAuth = fileTok;
                         }
-                        catch { }
                     }
+                    catch { }
                 }
+            }
 
-                if (!hasFileLogin)
-                {
-                    environment["COPILOT_GITHUB_TOKEN"] = oauthTok!.Trim();
-                }
+            if (!hasFileLogin && !string.IsNullOrWhiteSpace(fallbackOAuth))
+            {
+                environment["COPILOT_GITHUB_TOKEN"] = fallbackOAuth;
             }
         }
         else
         {
             environment["COPILOT_GITHUB_TOKEN"] = sanitizedCopilotEnv;
         }
+    }
+
+    internal static void SelfHealContainerCopilotConfig(IDictionary<string, string?> environment)
+    {
+        try
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrWhiteSpace(home)) return;
+
+            var copilotHome = environment.TryGetValue("COPILOT_HOME", out var explicitHome) &&
+                              !string.IsNullOrWhiteSpace(explicitHome)
+                ? explicitHome.Trim()
+                : Path.Combine(home, ".copilot");
+
+            var inContainer = File.Exists("/.dockerenv") ||
+                              !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("KUBERNETES_SERVICE_HOST")) ||
+                              string.Equals(Environment.GetEnvironmentVariable("REMOTE_CONTAINERS"), "true", StringComparison.OrdinalIgnoreCase) ||
+                              Directory.Exists("/workspace/.agentmesh/state");
+
+            var configPath = Path.Combine(copilotHome, "config.json");
+            if (!File.Exists(configPath)) return;
+
+            var existingJson = File.ReadAllText(configPath);
+            // Only prune orphaned logged_in_users outside containers if authTokens is also present
+            // (which indicates an AgentMesh-merged file rather than an OS keychain desktop login).
+            var pruneOrphans = inContainer || existingJson.Contains("\"authTokens\"", StringComparison.Ordinal);
+
+            environment.TryGetValue(CopilotCredentialHelper.CopilotOAuthTokenEnvVar, out var oauthEnv);
+            string? cleanedJson;
+            var changed = false;
+
+            if (!CopilotCredentialHelper.HasActiveCopilotConfigLogin(existingJson) &&
+                CopilotCredentialHelper.IsSupportedCopilotToken(oauthEnv))
+            {
+                cleanedJson = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+                    existingJson,
+                    oauthEnv!,
+                    overwriteExisting: false);
+                changed = !string.Equals(existingJson.Trim(), cleanedJson?.Trim(), StringComparison.Ordinal);
+            }
+            else
+            {
+                cleanedJson = CopilotCredentialHelper.ScrubClassicPatFromConfigJson(
+                    existingJson,
+                    out changed,
+                    pruneOrphanedLoggedInUsers: pruneOrphans);
+            }
+
+            if (changed)
+            {
+                if (string.IsNullOrWhiteSpace(cleanedJson))
+                {
+                    File.Delete(configPath);
+                }
+                else
+                {
+                    File.WriteAllText(configPath, cleanedJson + "\n");
+                }
+            }
+        }
+        catch { }
     }
 
     internal const int MaxRawFallbackPreviewChars = 16_384;
@@ -2187,7 +2297,10 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var psi = BuildCopilotProcessStartInfo(executablePath, isViaGh, cwd, promptEvent, promptEnvelope, useJsonFormat);
+        var psi = BuildCopilotProcessStartInfo(executablePath, isViaGh, cwd, promptEvent, promptEnvelope, useJsonFormat, preset.Id);
+        SelfHealContainerCopilotConfig(psi.Environment);
+        // Re-evaluate COPILOT_GITHUB_TOKEN / COPILOT_HOME after self-heal so env matches healed config.json
+        IsolateCopilotEnvironment(psi.Environment, driverId: preset.Id ?? promptEvent.DriverId);
 
         using var proc = new Process { StartInfo = psi };
         using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));

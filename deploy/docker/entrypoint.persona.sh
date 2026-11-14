@@ -96,9 +96,28 @@ elif [ -z "${COPILOT_OAUTH_TOKEN:-}" ] && [ -n "$PERSONA_GH_TOKEN" ] && [ "${COP
     unset COPILOT_GITHUB_TOKEN
 fi
 
-# Self-heal any poisoned classic PAT (ghp_) entries in ~/.copilot/config.json from older builds
+# Self-heal any poisoned classic PAT (ghp_) or orphaned logged_in_users entries (without copilot_tokens)
+# in ~/.copilot/config.json, and ensure storeTokenPlaintext: true in ~/.copilot/settings.json
+for cp_settings in /root/.copilot/settings.json /workspace/.agentmesh/state/.copilot/settings.json; do
+    mkdir -p "$(dirname "$cp_settings")"
+    if [ -s "$cp_settings" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            TMP_SET=$(mktemp)
+            if jq '.storeTokenPlaintext = true' "$cp_settings" > "$TMP_SET" 2>/dev/null; then
+                mv "$TMP_SET" "$cp_settings"
+            else
+                rm -f "$TMP_SET"
+                printf '{"storeTokenPlaintext":true}\n' > "$cp_settings"
+            fi
+        fi
+    else
+        printf '{"storeTokenPlaintext":true}\n' > "$cp_settings"
+    fi
+    chmod 600 "$cp_settings" 2>/dev/null || true
+done
+
 for cp_cfg in /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json; do
-    if [ -s "$cp_cfg" ] && grep -qi 'ghp_' "$cp_cfg" 2>/dev/null; then
+    if [ -s "$cp_cfg" ] && grep -qiE 'ghp_|logged_in_users|last_logged_in_user' "$cp_cfg" 2>/dev/null; then
         if command -v jq >/dev/null 2>&1; then
             TMP_CP=$(mktemp)
             if jq '
@@ -106,7 +125,19 @@ for cp_cfg in /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/co
                 (if (.authTokens | type) == "object" then .authTokens |= with_entries(select((((.value.token // "") | ascii_downcase | startswith("ghp_")) | not))) else . end) |
                 (if (.authTokens | type) == "object" and (.authTokens | length) == 0 then del(.authTokens) else . end) |
                 (if (.copilot_tokens | type) == "object" then .copilot_tokens |= with_entries(select((((.value // "") | tostring | ascii_downcase | startswith("ghp_")) | not))) else . end) |
-                (if (.copilot_tokens | type) == "object" and (.copilot_tokens | length) == 0 then del(.copilot_tokens) else . end)
+                (if (.copilot_tokens | type) == "object" and (.copilot_tokens | length) == 0 then del(.copilot_tokens) else . end) |
+                (.copilot_tokens // {}) as $ct |
+                (if (.logged_in_users | type) == "array" then
+                    .logged_in_users |= map(select(
+                        (((.host // "https://github.com") | rtrimstr("/")) + ":" + (.login // "")) as $k |
+                        (($ct[$k] // "") | tostring | length > 0)
+                    ))
+                else . end) |
+                (if (.logged_in_users | type) == "array" and (.logged_in_users | length) == 0 then del(.logged_in_users) else . end) |
+                (if (.last_logged_in_user | type) == "object" then
+                    (((.last_logged_in_user.host // "https://github.com") | rtrimstr("/")) + ":" + (.last_logged_in_user.login // "")) as $lk |
+                    if (($ct[$lk] // "") | tostring | length > 0) then . else del(.last_logged_in_user) end
+                else . end)
             ' "$cp_cfg" > "$TMP_CP" 2>/dev/null; then
                 if [ "$(jq 'length' "$TMP_CP" 2>/dev/null || echo 0)" = "0" ]; then
                     rm -f "$cp_cfg" "$TMP_CP"
@@ -117,7 +148,7 @@ for cp_cfg in /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/co
             else
                 rm -f "$cp_cfg" "$TMP_CP"
             fi
-        else
+        elif grep -qi 'ghp_' "$cp_cfg" 2>/dev/null; then
             rm -f "$cp_cfg"
         fi
     fi
@@ -136,10 +167,19 @@ fi
 
 if [ -n "$COPILOT_AUTH_TOKEN" ]; then
     mkdir -p /root/.copilot
-    if [ ! -s /root/.copilot/config.json ] || ! grep -qE '"(copilot_tokens|authTokens)"' /root/.copilot/config.json 2>/dev/null; then
+    HAS_INTERACTIVE_CP=0
+    if [ -s /root/.copilot/config.json ] && command -v jq >/dev/null 2>&1; then
+        if jq -e '(.copilot_tokens | type == "object" and length > 0)' /root/.copilot/config.json >/dev/null 2>&1; then
+            HAS_INTERACTIVE_CP=1
+        fi
+    elif [ -s /root/.copilot/config.json ] && grep -q '"copilot_tokens"' /root/.copilot/config.json 2>/dev/null; then
+        HAS_INTERACTIVE_CP=1
+    fi
+
+    if [ "$HAS_INTERACTIVE_CP" -eq 0 ]; then
         if command -v jq >/dev/null 2>&1 && [ -s /root/.copilot/config.json ]; then
             TMP_CP=$(mktemp)
-            if jq --arg tok "$COPILOT_AUTH_TOKEN" '.authTokens = ((.authTokens // {}) + {"https://github.com": {"token": $tok}})' /root/.copilot/config.json > "$TMP_CP" 2>/dev/null; then
+            if jq --arg tok "$COPILOT_AUTH_TOKEN" 'del(.logged_in_users, .last_logged_in_user) | .authTokens = ((.authTokens // {}) + {"https://github.com": {"token": $tok}})' /root/.copilot/config.json > "$TMP_CP" 2>/dev/null; then
                 mv "$TMP_CP" /root/.copilot/config.json
             else
                 rm -f "$TMP_CP"
@@ -212,14 +252,19 @@ fi
 if ! grep -q 'REMOTE_CONTAINERS' /root/.bashrc 2>/dev/null; then
     echo 'export REMOTE_CONTAINERS="true"' >> /root/.bashrc
 fi
-if ! grep -q '# agentmesh-copilot-wrapper-v2' /root/.bashrc 2>/dev/null; then
-    sed -i '/^copilot() {/,/^}/d' /root/.bashrc 2>/dev/null || true
+if ! grep -q '# agentmesh-copilot-wrapper-v3' /root/.bashrc 2>/dev/null; then
+    sed -i '/^# agentmesh-copilot-wrapper/d;/^copilot() {/,/^}/d' /root/.bashrc 2>/dev/null || true
     cat << 'EOF' >> /root/.bashrc
-# agentmesh-copilot-wrapper-v2
+# agentmesh-copilot-wrapper-v3
 copilot() {
     if [ "$1" = "login" ]; then
-        env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN command copilot login --device-code "${@:2}"
-    elif [[ "${COPILOT_GITHUB_TOKEN:-}" == ghp_* ]] || [[ "${COPILOT_GITHUB_TOKEN:-}" == GHP_* ]]; then
+        local _iso_gh
+        _iso_gh=$(mktemp -d 2>/dev/null || echo "/tmp/copilot-gh-iso-$$")
+        env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN -u COPILOT_OAUTH_TOKEN GH_CONFIG_DIR="$_iso_gh" command copilot login --device-code "${@:2}"
+        local _rc=$?
+        rm -rf "$_iso_gh" 2>/dev/null || true
+        return $_rc
+    elif [[ "${COPILOT_GITHUB_TOKEN:-}" == ghp_* ]] || [[ "${COPILOT_GITHUB_TOKEN:-}" == GHP_* ]] || { [ -n "${AGENTMESH_GITHUB_TOKEN:-}" ] && [ "${COPILOT_GITHUB_TOKEN:-}" = "${AGENTMESH_GITHUB_TOKEN}" ]; }; then
         env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN command copilot "$@"
     else
         env -u GITHUB_TOKEN -u GH_TOKEN command copilot "$@"
