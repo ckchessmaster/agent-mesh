@@ -1543,7 +1543,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             // explicitly clicks Authenticate Driver, stripped of GH_TOKEN/GITHUB_TOKEN.
         }
 
-        if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var existing) && !existing.IsCompleted)
+        if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var existing) && !existing.HasProcessExited)
         {
             if (!string.IsNullOrWhiteSpace(existing.AuthUrl))
             {
@@ -1623,10 +1623,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             demuxer.Start();
 
             var tcsUrl = new TaskCompletionSource<string>();
-            var session = new ActiveK8sAuthSession(webSocket, demuxer, stdInStream, tcsUrl);
+            var capturedOutput = new StringBuilder();
+            var session = new ActiveK8sAuthSession(webSocket, demuxer, stdInStream, tcsUrl, capturedOutput);
             _activeK8sAuthSessions[normPersonaId] = session;
 
-            var capturedOutput = new StringBuilder();
             var plaintextConfirmed = false;
 
             _ = Task.Run(async () =>
@@ -1639,14 +1639,21 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         var read = await stdOutStream.ReadAsync(buf, 0, buf.Length, CancellationToken.None);
                         if (read <= 0) break;
                         var chunk = Encoding.UTF8.GetString(buf, 0, read);
-                        capturedOutput.Append(chunk);
+                        lock (capturedOutput)
+                        {
+                            capturedOutput.Append(chunk);
+                        }
 
                         var acc = capturedOutput.ToString();
                         if (!plaintextConfirmed &&
-                            (acc.Contains("plaintext config file", StringComparison.OrdinalIgnoreCase) ||
-                             acc.Contains("keychain unavailable", StringComparison.OrdinalIgnoreCase) ||
+                            (acc.Contains("plaintext", StringComparison.OrdinalIgnoreCase) ||
+                             acc.Contains("plain text", StringComparison.OrdinalIgnoreCase) ||
+                             acc.Contains("keychain", StringComparison.OrdinalIgnoreCase) ||
+                             acc.Contains("credential stor", StringComparison.OrdinalIgnoreCase) ||
                              acc.Contains("(y/N)", StringComparison.OrdinalIgnoreCase) ||
-                             acc.Contains("Store token", StringComparison.OrdinalIgnoreCase)))
+                             acc.Contains("[y/N]", StringComparison.OrdinalIgnoreCase) ||
+                             acc.Contains("Store token", StringComparison.OrdinalIgnoreCase) ||
+                             acc.Contains("store your token", StringComparison.OrdinalIgnoreCase)))
                         {
                             plaintextConfirmed = true;
                             try
@@ -1658,7 +1665,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                             catch { }
                         }
 
-                        var match = Regex.Match(capturedOutput.ToString(), @"https?://[^\s""'>]+");
+                        var match = Regex.Match(acc, @"https?://[^\s""'>]+");
                         if (match.Success)
                         {
                             session.AuthUrl = match.Value;
@@ -1667,15 +1674,14 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
                         if (session.UserCode == null)
                         {
-                            var text = capturedOutput.ToString();
-                            var codeMatch = Regex.Match(text, @"(?:one-time code:\s*|code:\s*)([A-Za-z0-9-]+)", RegexOptions.IgnoreCase);
+                            var codeMatch = Regex.Match(acc, @"(?:one-time code:\s*|code:\s*)([A-Za-z0-9-]+)", RegexOptions.IgnoreCase);
                             if (codeMatch.Success)
                             {
                                 session.UserCode = codeMatch.Groups[1].Value.Trim();
                             }
                             else
                             {
-                                var altMatch = Regex.Match(text, @"\b([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\b");
+                                var altMatch = Regex.Match(acc, @"\b([A-Za-z0-9]{4}-[A-Za-z0-9]{4})\b");
                                 if (altMatch.Success)
                                 {
                                     session.UserCode = altMatch.Groups[1].Value.Trim();
@@ -1684,6 +1690,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         }
                     }
 
+                    session.MarkProcessExited();
                     await Task.Delay(1000);
                     await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, CancellationToken.None);
                     if (!string.IsNullOrWhiteSpace(sidecar?.CompanionCommand))
@@ -1709,6 +1716,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 }
                 catch (Exception ex)
                 {
+                    session.MarkProcessExited();
                     tcsUrl.TrySetException(ex);
                 }
             });
@@ -1816,7 +1824,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         var authCheckCmd = info.AuthCheckCommand;
         var sidecar = info.Sidecar;
 
-        if (!string.IsNullOrWhiteSpace(authCheckCmd))
+        var isCopilot = info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot";
+
+        if (!isCopilot && !string.IsNullOrWhiteSpace(authCheckCmd))
         {
             var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, authCheckCmd, ct);
             if (chkExit == 0)
@@ -1841,21 +1851,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             try
             {
-                if (!string.IsNullOrWhiteSpace(code) && !info.DriverId.StartsWith("copilot") && info.AdapterType != "copilot")
+                if (!string.IsNullOrWhiteSpace(code) && !isCopilot)
                 {
                     var codeBytes = Encoding.UTF8.GetBytes(code.Trim() + "\n");
                     await session.StdIn.WriteAsync(codeBytes, 0, codeBytes.Length, ct);
                     await session.StdIn.FlushAsync(ct);
-                }
-                else if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
-                {
-                    try
-                    {
-                        var yBytes = Encoding.UTF8.GetBytes("y\n");
-                        await session.StdIn.WriteAsync(yBytes, 0, yBytes.Length, ct);
-                        await session.StdIn.FlushAsync(ct);
-                    }
-                    catch { }
                 }
 
                 // Poll for token creation or auth check up to 5 seconds
@@ -1863,11 +1863,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 {
                     await Task.Delay(1000, ct);
 
-                    if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+                    if (isCopilot)
                     {
                         var (_, cpReadOut, _) = await ExecInContainerAsync(normPersonaId, CopilotCredentialHelper.BuildContainerCopilotReadCommand(), ct);
                         var cpTok = CopilotCredentialHelper.ParseContainerCopilotReadOutput(cpReadOut);
-                        if (session.IsCompleted && !string.IsNullOrWhiteSpace(cpTok))
+                        if (session.HasProcessExited && !string.IsNullOrWhiteSpace(cpTok))
                         {
                             await PersistK8sCopilotTokenAsync(normPersonaId, info.DriverId, cpTok, ct);
                             await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
@@ -1930,9 +1930,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
                 await ExecInContainerAsync(normPersonaId, PersonaContainerExtensions.SyncPersonaStateCommand, ct);
 
-                if (info.DriverId.StartsWith("copilot") || info.AdapterType == "copilot")
+                if (isCopilot)
                 {
-                    if (!session.IsCompleted)
+                    if (!session.HasProcessExited)
                     {
                         return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
                     }
@@ -1949,13 +1949,14 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
                     _activeK8sAuthSessions.TryRemove(normPersonaId, out _);
                     await session.DisposeAsync();
-                    return new PersonaAuthSubmitResult(
-                        normPersonaId,
-                        "failed",
-                        ErrorMessage: "GitHub Copilot login exited without storing an authentication token. Verify plaintext credential storage is permitted and retry.");
+                    var detail = session.GetOutputSummary();
+                    var msg = string.IsNullOrWhiteSpace(detail)
+                        ? "GitHub Copilot login exited without storing an authentication token. Verify plaintext credential storage is permitted and retry."
+                        : $"GitHub Copilot login exited without storing an authentication token. Output: {detail}";
+                    return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: msg);
                 }
 
-                if (!session.IsCompleted)
+                if (!session.HasProcessExited)
                 {
                     return new PersonaAuthSubmitResult(normPersonaId, "waiting", "Authorization is still pending in browser. Once approved on GitHub, click again.");
                 }
@@ -2000,6 +2001,25 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
     {
         if (!CopilotCredentialHelper.IsSupportedCopilotToken(copilotToken)) return;
         var clean = copilotToken.Trim();
+
+        try
+        {
+            await EnsureContainerCopilotPlaintextSettingsAsync(normPersonaId, ct);
+            var (_, existingCfg, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null || true", ct);
+            if (!CopilotCredentialHelper.HasActiveCopilotConfigLogin(existingCfg))
+            {
+                var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, clean, overwriteExisting: false);
+                if (!string.IsNullOrWhiteSpace(merged))
+                {
+                    var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(merged + "\n"));
+                    await ExecInContainerAsync(
+                        normPersonaId,
+                        $"mkdir -p /root/.copilot /workspace/.agentmesh/state/.copilot && printf '%s' '{b64}' | base64 -d > /root/.copilot/config.json && cp /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json && chmod 600 /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json",
+                        ct);
+                }
+            }
+        }
+        catch { }
 
         try
         {
@@ -3339,12 +3359,27 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         };
     }
 
-    private sealed class ActiveK8sAuthSession(WebSocket webSocket, StreamDemuxer demuxer, Stream stdIn, TaskCompletionSource<string> tcs) : IAsyncDisposable
+    private sealed class ActiveK8sAuthSession(WebSocket webSocket, StreamDemuxer demuxer, Stream stdIn, TaskCompletionSource<string> tcs, StringBuilder? output = null) : IAsyncDisposable
     {
+        private volatile bool _processExited;
         public Stream StdIn => stdIn;
         public string? AuthUrl { get; set; }
         public string? UserCode { get; set; }
         public bool IsCompleted => tcs.Task.IsCompleted;
+        public bool HasProcessExited => _processExited || webSocket.State != WebSocketState.Open;
+        public void MarkProcessExited() => _processExited = true;
+
+        public string GetOutputSummary()
+        {
+            if (output == null) return string.Empty;
+            string raw;
+            lock (output)
+            {
+                raw = output.ToString();
+            }
+            var stripped = Regex.Replace(raw, @"\x1B\[[0-9;?]*[A-Za-z]", "").Trim();
+            return stripped.Length > 1000 ? stripped[^1000..] : stripped;
+        }
 
         public async ValueTask DisposeAsync()
         {

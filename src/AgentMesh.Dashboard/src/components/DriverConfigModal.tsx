@@ -139,6 +139,9 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
           setAuthStartResult(null);
           setShowAuthWizard(false);
           await handleVerifyDriver();
+        } else if (res.status === 'failed' || res.status === 'error') {
+          setAuthStartResult(null);
+          setError(res.errorMessage || 'Authentication failed.');
         }
       } catch {
         // Silently keep waiting during background device polling
@@ -233,6 +236,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       } else if (res.status === 'waiting') {
         setError(res.message || 'Authorization is still pending in browser. Once approved on GitHub, click again.');
       } else {
+        setAuthStartResult(null);
         setError(res.errorMessage || 'Failed to verify authorization code.');
       }
     } catch (err: any) {

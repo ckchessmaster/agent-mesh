@@ -676,18 +676,13 @@ public static class CopilotCredentialHelper
         var personaGhToken = segments.Length > 4 ? segments[4].Trim() : null;
 
         // Only treat ~/.copilot/config.json as active if it has copilot_tokens or authTokens
-        // (or a non-ghp_ top-level token).
+        // (never fall back to legacy ~/.config/github-copilot/hosts.json or apps.json, which
+        // @github/copilot CLI 1.x does not read and would create false-positive auth checks).
         if (HasActiveCopilotConfigLogin(copilotConfig))
         {
             var tok = TryExtractCopilotTokenFromJson(copilotConfig);
             if (tok != null) return tok;
         }
-
-        var hostsTok = TryExtractCopilotTokenFromJson(copilotHosts);
-        if (hostsTok != null) return hostsTok;
-
-        var appsTok = TryExtractCopilotTokenFromJson(copilotApps);
-        if (appsTok != null) return appsTok;
 
         var sanitizedEnv = SanitizeCopilotEnvToken(copilotEnv, personaGhToken);
         if (sanitizedEnv != null) return sanitizedEnv;

@@ -431,4 +431,51 @@ describe('DriverConfigModal', () => {
     expect(screen.getByText(/not supported by GitHub Copilot CLI/i)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Save Key/i })).toBeDisabled();
   });
+
+  it('stops polling and shows error when submitDriverAuthCode returns failed', async () => {
+    const copilotAgent: Agent = {
+      id: 'beeline-gh-copilot',
+      name: 'GitHub Copilot CLI',
+      runtimeType: 0,
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({ adapter: 'copilot' }),
+      config: { adapter: 'copilot', capabilities: ['bash'], hasApiKey: false }
+    };
+
+    vi.spyOn(api, 'startDriverAuth').mockResolvedValueOnce({
+      personaId: 'beeline-gh-copilot',
+      driverId: 'beeline-gh-copilot',
+      status: 'waiting_code',
+      authUrl: 'https://github.com/login/device',
+      userCode: 'FAIL-1234'
+    });
+
+    const submitSpy = vi.spyOn(api, 'submitDriverAuthCode').mockResolvedValueOnce({
+      personaId: 'beeline-gh-copilot',
+      status: 'failed',
+      errorMessage: 'GitHub Copilot login exited without storing an authentication token.'
+    });
+
+    render(
+      <DriverConfigModal
+        agent={copilotAgent}
+        initialConfig={copilotAgent.config}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Authenticate Driver/i }));
+    await waitFor(() => expect(screen.getByTestId('device-user-code')).toHaveTextContent('FAIL-1234'));
+
+    fireEvent.click(screen.getByRole('button', { name: /I Have Authorized in Browser/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/GitHub Copilot login exited without storing an authentication token/i)).toBeInTheDocument();
+    });
+
+    expect(submitSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('device-user-code')).not.toBeInTheDocument();
+  });
 });

@@ -252,22 +252,22 @@ fi
 if ! grep -q 'REMOTE_CONTAINERS' /root/.bashrc 2>/dev/null; then
     echo 'export REMOTE_CONTAINERS="true"' >> /root/.bashrc
 fi
-if ! grep -q '# agentmesh-copilot-wrapper-v3' /root/.bashrc 2>/dev/null; then
-    sed -i '/^# agentmesh-copilot-wrapper/d;/^copilot() {/,/^}/d' /root/.bashrc 2>/dev/null || true
+if ! grep -q '# agentmesh-copilot-wrapper-v4' /root/.bashrc 2>/dev/null; then
+    sed -i '/^# agentmesh-copilot-wrapper/,/^}/d;/^copilot() {/,/^}/d' /root/.bashrc 2>/dev/null || true
     cat << 'EOF' >> /root/.bashrc
-# agentmesh-copilot-wrapper-v3
+# agentmesh-copilot-wrapper-v4
 copilot() {
     if [ "$1" = "login" ]; then
         local _iso_gh
         _iso_gh=$(mktemp -d 2>/dev/null || echo "/tmp/copilot-gh-iso-$$")
-        env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN -u COPILOT_OAUTH_TOKEN GH_CONFIG_DIR="$_iso_gh" command copilot login --device-code "${@:2}"
+        command env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN -u COPILOT_OAUTH_TOKEN GH_CONFIG_DIR="$_iso_gh" copilot login --device-code "${@:2}"
         local _rc=$?
         rm -rf "$_iso_gh" 2>/dev/null || true
         return $_rc
     elif [[ "${COPILOT_GITHUB_TOKEN:-}" == ghp_* ]] || [[ "${COPILOT_GITHUB_TOKEN:-}" == GHP_* ]] || { [ -n "${AGENTMESH_GITHUB_TOKEN:-}" ] && [ "${COPILOT_GITHUB_TOKEN:-}" = "${AGENTMESH_GITHUB_TOKEN}" ]; }; then
-        env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN command copilot "$@"
+        command env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN copilot "$@"
     else
-        env -u GITHUB_TOKEN -u GH_TOKEN command copilot "$@"
+        command env -u GITHUB_TOKEN -u GH_TOKEN copilot "$@"
     fi
 }
 EOF
