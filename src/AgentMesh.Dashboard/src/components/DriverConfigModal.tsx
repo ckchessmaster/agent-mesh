@@ -531,7 +531,9 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                   )}
                 </div>
                 <p className="text-[10px] text-slate-400 mt-0.5">
-                  Authenticate once for this driver and automatically discover available models for all bound personas.
+                  {driverAdapter === 'copilot'
+                    ? 'Authenticates the Copilot CLI model runtime only (separate from Persona GitHub PATs used for git push & PRs).'
+                    : 'Authenticate once for this driver and automatically discover available models for all bound personas.'}
                 </p>
               </div>
               <div className="flex items-center gap-1.5">
@@ -647,22 +649,41 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                 </div>
 
                 {authMode === 'apikey' ? (
-                  <div className="flex items-center gap-2 pt-1">
-                    <input
-                      type="password"
-                      value={wizardApiKeyInput}
-                      onChange={(e) => setWizardApiKeyInput(e.target.value)}
-                      placeholder="Paste API key..."
-                      className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-purple-500"
-                    />
-                    <button
-                      type="button"
-                      onClick={handleSaveWizardApiKey}
-                      disabled={wizardApiKeySaving || !wizardApiKeyInput.trim()}
-                      className="px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs disabled:opacity-50 cursor-pointer"
-                    >
-                      {wizardApiKeySaving ? 'Saving...' : 'Save Key'}
-                    </button>
+                  <div className="space-y-1.5 pt-1">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="password"
+                        value={wizardApiKeyInput}
+                        onChange={(e) => setWizardApiKeyInput(e.target.value)}
+                        placeholder={
+                          driverAdapter === 'copilot'
+                            ? 'Fine-grained Copilot PAT (github_pat_...)'
+                            : 'Paste API key...'
+                        }
+                        className="flex-1 px-2.5 py-1.5 rounded bg-slate-950 border border-slate-700 text-white text-xs font-mono focus:outline-none focus:border-purple-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleSaveWizardApiKey}
+                        disabled={
+                          wizardApiKeySaving ||
+                          !wizardApiKeyInput.trim() ||
+                          (driverAdapter === 'copilot' && wizardApiKeyInput.trim().toLowerCase().startsWith('ghp_'))
+                        }
+                        className="px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs disabled:opacity-50 cursor-pointer"
+                      >
+                        {wizardApiKeySaving ? 'Saving...' : 'Save Key'}
+                      </button>
+                    </div>
+                    {driverAdapter === 'copilot' && wizardApiKeyInput.trim().toLowerCase().startsWith('ghp_') ? (
+                      <p className="text-[10px] text-amber-300">
+                        Classic PATs (<code className="font-mono">ghp_</code>) are not supported by GitHub Copilot CLI. Use Interactive OAuth Login or a fine-grained PAT (<code className="font-mono">github_pat_...</code>) with Copilot Requests permission. Configure repository Git/PR PATs on each Persona instead.
+                      </p>
+                    ) : driverAdapter === 'copilot' ? (
+                      <p className="text-[10px] text-slate-400">
+                        For Copilot CLI only (requires <code className="font-mono">Copilot Requests</code> permission). Repository push/PR PATs (<code className="font-mono">ghp_...</code> or <code className="font-mono">github_pat_...</code>) belong on each Persona.
+                      </p>
+                    ) : null}
                   </div>
                 ) : authStarting ? (
                   <div className="p-3 text-center text-slate-400 text-[11px] font-mono">

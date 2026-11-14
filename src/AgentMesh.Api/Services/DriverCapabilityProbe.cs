@@ -648,9 +648,9 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
 
     internal static string? ResolveCopilotToken(DriverCapabilityProbeRequest request)
     {
-        if (!string.IsNullOrWhiteSpace(request.OAuthToken))
+        if (CopilotCredentialHelper.IsSupportedCopilotToken(request.OAuthToken))
         {
-            return request.OAuthToken.Trim();
+            return request.OAuthToken!.Trim();
         }
 
         try
@@ -663,41 +663,46 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 if (File.Exists(driverOauth))
                 {
                     var token = File.ReadAllText(driverOauth).Trim();
-                    if (!string.IsNullOrWhiteSpace(token)) return token;
+                    if (CopilotCredentialHelper.IsSupportedCopilotToken(token)) return token;
                 }
             }
 
             var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
             if (File.Exists(copilotConfig))
             {
-                var json = File.ReadAllText(copilotConfig);
-                var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
-                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
-                {
-                    return match.Groups[1].Value.Trim();
-                }
+                var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(copilotConfig));
+                if (tok != null) return tok;
             }
 
             var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
             if (File.Exists(copilotHosts))
             {
-                var json = File.ReadAllText(copilotHosts);
-                var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
-                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
-                {
-                    return match.Groups[1].Value.Trim();
-                }
+                var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(copilotHosts));
+                if (tok != null) return tok;
+            }
+
+            var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
+            if (File.Exists(copilotApps))
+            {
+                var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(copilotApps));
+                if (tok != null) return tok;
             }
         }
         catch { }
 
-        var envToken = Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN");
-        if (!string.IsNullOrWhiteSpace(envToken)) return envToken.Trim();
+        var oauthEnv = Environment.GetEnvironmentVariable(CopilotCredentialHelper.CopilotOAuthTokenEnvVar);
+        if (CopilotCredentialHelper.IsSupportedCopilotToken(oauthEnv))
+        {
+            return oauthEnv!.Trim();
+        }
 
-        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-        if (!string.IsNullOrWhiteSpace(ghToken)) return ghToken.Trim();
+        var personaGitHubToken = Environment.GetEnvironmentVariable(CopilotCredentialHelper.PersonaGitHubTokenEnvVar)
+                                 ?? Environment.GetEnvironmentVariable("GH_TOKEN")
+                                 ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
 
-        return null;
+        return CopilotCredentialHelper.SanitizeCopilotEnvToken(
+            Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN"),
+            personaGitHubToken);
     }
 
     private static async Task<string?> FetchCopilotModelsHttpAsync(string token, CancellationToken ct)

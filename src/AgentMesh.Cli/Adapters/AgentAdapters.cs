@@ -2107,7 +2107,70 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             psi.ArgumentList.Add("on");
         }
 
+        IsolateCopilotEnvironment(psi.Environment);
+
         return psi;
+    }
+
+    internal static void IsolateCopilotEnvironment(IDictionary<string, string?> environment, string? homeDirectory = null)
+    {
+        environment.TryGetValue(CopilotCredentialHelper.PersonaGitHubTokenEnvVar, out var personaGhToken);
+        environment.TryGetValue("GH_TOKEN", out var ghToken);
+        environment.TryGetValue("GITHUB_TOKEN", out var githubToken);
+
+        var effectivePersonaGitHubToken = !string.IsNullOrWhiteSpace(personaGhToken)
+            ? personaGhToken
+            : (!string.IsNullOrWhiteSpace(ghToken) ? ghToken : githubToken);
+
+        if (!string.IsNullOrWhiteSpace(effectivePersonaGitHubToken) &&
+            string.IsNullOrWhiteSpace(personaGhToken))
+        {
+            environment[CopilotCredentialHelper.PersonaGitHubTokenEnvVar] = effectivePersonaGitHubToken.Trim();
+        }
+
+        // Copilot CLI checks COPILOT_GITHUB_TOKEN, GH_TOKEN, and GITHUB_TOKEN ahead of
+        // ~/.copilot/config.json and exits immediately if any of them contains a classic PAT (ghp_).
+        // Keep GitHub repository PAT auth isolated from Copilot CLI auth.
+        environment.Remove("GH_TOKEN");
+        environment.Remove("GITHUB_TOKEN");
+
+        environment.TryGetValue("COPILOT_GITHUB_TOKEN", out var rawCopilotEnv);
+        var sanitizedCopilotEnv = CopilotCredentialHelper.SanitizeCopilotEnvToken(
+            rawCopilotEnv,
+            effectivePersonaGitHubToken);
+
+        if (sanitizedCopilotEnv == null)
+        {
+            environment.Remove("COPILOT_GITHUB_TOKEN");
+
+            if (environment.TryGetValue(CopilotCredentialHelper.CopilotOAuthTokenEnvVar, out var oauthTok) &&
+                CopilotCredentialHelper.IsSupportedCopilotToken(oauthTok))
+            {
+                var home = homeDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var hasFileLogin = false;
+                if (!string.IsNullOrWhiteSpace(home))
+                {
+                    var configPath = Path.Combine(home, ".copilot", "config.json");
+                    if (File.Exists(configPath))
+                    {
+                        try
+                        {
+                            hasFileLogin = CopilotCredentialHelper.HasActiveCopilotConfigLogin(File.ReadAllText(configPath));
+                        }
+                        catch { }
+                    }
+                }
+
+                if (!hasFileLogin)
+                {
+                    environment["COPILOT_GITHUB_TOKEN"] = oauthTok!.Trim();
+                }
+            }
+        }
+        else
+        {
+            environment["COPILOT_GITHUB_TOKEN"] = sanitizedCopilotEnv;
+        }
     }
 
     internal const int MaxRawFallbackPreviewChars = 16_384;
