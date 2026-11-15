@@ -96,14 +96,24 @@ elif [ -z "${COPILOT_OAUTH_TOKEN:-}" ] && [ -n "$PERSONA_GH_TOKEN" ] && [ "${COP
     unset COPILOT_GITHUB_TOKEN
 fi
 
-# Self-heal any poisoned classic PAT (ghp_) or orphaned logged_in_users entries (without copilot_tokens)
-# in ~/.copilot/config.json, and ensure storeTokenPlaintext: true in ~/.copilot/settings.json
+# Ensure storeTokenPlaintext: true in ~/.copilot/settings.json (headless containers have no OS
+# keyring, so interactive logins and re-runs need plaintext persistence). Comment-tolerant: the Copilot
+# CLI writes these files as JSONC with "//" header lines.
+#
+# NOTE: This entrypoint deliberately does NOT seed or rewrite ~/.copilot/config.json anymore.
+# The real Copilot CLI keys token entries by "https://github.com:<login>" and resolves the active
+# sign-in through lastLoggedInUser/loggedInUsers (camelCase); historical jq/C# seeders wrote bare
+# host keys and only understood legacy snake_case records, producing files the CLI rejects wholesale
+# ("No authentication information found") while AgentMesh checks still passed. Config.json is now
+# owned by the Copilot CLI itself (interactive login) and by AgentMesh's API-side native-format
+# seeding; chat invocations additionally always receive COPILOT_GITHUB_TOKEN in the environment,
+# which the CLI checks first and which wins over any file state.
 for cp_settings in /root/.copilot/settings.json /workspace/.agentmesh/state/.copilot/settings.json; do
     mkdir -p "$(dirname "$cp_settings")"
     if [ -s "$cp_settings" ]; then
         if command -v jq >/dev/null 2>&1; then
             TMP_SET=$(mktemp)
-            if jq '.storeTokenPlaintext = true' "$cp_settings" > "$TMP_SET" 2>/dev/null; then
+            if sed '/^[[:space:]]*\/\//d' "$cp_settings" | jq '.storeTokenPlaintext = true' > "$TMP_SET" 2>/dev/null; then
                 mv "$TMP_SET" "$cp_settings"
             else
                 rm -f "$TMP_SET"
@@ -115,82 +125,6 @@ for cp_settings in /root/.copilot/settings.json /workspace/.agentmesh/state/.cop
     fi
     chmod 600 "$cp_settings" 2>/dev/null || true
 done
-
-for cp_cfg in /root/.copilot/config.json /workspace/.agentmesh/state/.copilot/config.json; do
-    if [ -s "$cp_cfg" ] && grep -qiE 'ghp_|logged_in_users|last_logged_in_user' "$cp_cfg" 2>/dev/null; then
-        if command -v jq >/dev/null 2>&1; then
-            TMP_CP=$(mktemp)
-            if jq '
-                (if ((.token // "") | ascii_downcase | startswith("ghp_")) then del(.token) else . end) |
-                (if (.authTokens | type) == "object" then .authTokens |= with_entries(select((((.value.token // "") | ascii_downcase | startswith("ghp_")) | not))) else . end) |
-                (if (.authTokens | type) == "object" and (.authTokens | length) == 0 then del(.authTokens) else . end) |
-                (if (.copilot_tokens | type) == "object" then .copilot_tokens |= with_entries(select((((.value // "") | tostring | ascii_downcase | startswith("ghp_")) | not))) else . end) |
-                (if (.copilot_tokens | type) == "object" and (.copilot_tokens | length) == 0 then del(.copilot_tokens) else . end) |
-                (.copilot_tokens // {}) as $ct |
-                (if (.logged_in_users | type) == "array" then
-                    .logged_in_users |= map(select(
-                        (((.host // "https://github.com") | rtrimstr("/")) + ":" + (.login // "")) as $k |
-                        (($ct[$k] // "") | tostring | length > 0)
-                    ))
-                else . end) |
-                (if (.logged_in_users | type) == "array" and (.logged_in_users | length) == 0 then del(.logged_in_users) else . end) |
-                (if (.last_logged_in_user | type) == "object" then
-                    (((.last_logged_in_user.host // "https://github.com") | rtrimstr("/")) + ":" + (.last_logged_in_user.login // "")) as $lk |
-                    if (($ct[$lk] // "") | tostring | length > 0) then . else del(.last_logged_in_user) end
-                else . end)
-            ' "$cp_cfg" > "$TMP_CP" 2>/dev/null; then
-                if [ "$(jq 'length' "$TMP_CP" 2>/dev/null || echo 0)" = "0" ]; then
-                    rm -f "$cp_cfg" "$TMP_CP"
-                else
-                    mv "$TMP_CP" "$cp_cfg"
-                    chmod 600 "$cp_cfg" 2>/dev/null || true
-                fi
-            else
-                rm -f "$cp_cfg" "$TMP_CP"
-            fi
-        elif grep -qi 'ghp_' "$cp_cfg" 2>/dev/null; then
-            rm -f "$cp_cfg"
-        fi
-    fi
-done
-
-COPILOT_AUTH_TOKEN="${COPILOT_OAUTH_TOKEN:-}"
-if [ -z "$COPILOT_AUTH_TOKEN" ] && [ -f /etc/agentmesh-creds/copilot-oauth-token ]; then
-    COPILOT_AUTH_TOKEN="$(tr -d '\r\n' < /etc/agentmesh-creds/copilot-oauth-token 2>/dev/null || true)"
-fi
-if [ -z "$COPILOT_AUTH_TOKEN" ] && [ -n "${COPILOT_GITHUB_TOKEN:-}" ]; then
-    COPILOT_AUTH_TOKEN="$COPILOT_GITHUB_TOKEN"
-fi
-if [[ "$COPILOT_AUTH_TOKEN" == ghp_* ]] || [[ "$COPILOT_AUTH_TOKEN" == GHP_* ]]; then
-    COPILOT_AUTH_TOKEN=""
-fi
-
-if [ -n "$COPILOT_AUTH_TOKEN" ]; then
-    mkdir -p /root/.copilot
-    HAS_INTERACTIVE_CP=0
-    if [ -s /root/.copilot/config.json ] && command -v jq >/dev/null 2>&1; then
-        if jq -e '(.copilot_tokens | type == "object" and length > 0)' /root/.copilot/config.json >/dev/null 2>&1; then
-            HAS_INTERACTIVE_CP=1
-        fi
-    elif [ -s /root/.copilot/config.json ] && grep -q '"copilot_tokens"' /root/.copilot/config.json 2>/dev/null; then
-        HAS_INTERACTIVE_CP=1
-    fi
-
-    if [ "$HAS_INTERACTIVE_CP" -eq 0 ]; then
-        if command -v jq >/dev/null 2>&1 && [ -s /root/.copilot/config.json ]; then
-            TMP_CP=$(mktemp)
-            if jq --arg tok "$COPILOT_AUTH_TOKEN" 'del(.logged_in_users, .last_logged_in_user) | .authTokens = ((.authTokens // {}) + {"https://github.com": {"token": $tok}})' /root/.copilot/config.json > "$TMP_CP" 2>/dev/null; then
-                mv "$TMP_CP" /root/.copilot/config.json
-            else
-                rm -f "$TMP_CP"
-                printf '{"authTokens":{"https://github.com":{"token":"%s"}}}\n' "$COPILOT_AUTH_TOKEN" > /root/.copilot/config.json
-            fi
-        else
-            printf '{"authTokens":{"https://github.com":{"token":"%s"}}}\n' "$COPILOT_AUTH_TOKEN" > /root/.copilot/config.json
-        fi
-        chmod 600 /root/.copilot/config.json 2>/dev/null || true
-    fi
-fi
 
 if [ -n "$GIT_AUTHOR_NAME" ]; then
     git config --global user.name "$GIT_AUTHOR_NAME" 2>/dev/null || true
@@ -453,7 +387,7 @@ fi
 # Ensure GitHub Copilot CLI is installed if missing and npm is available
 if command -v npm >/dev/null 2>&1 && ! command -v copilot >/dev/null 2>&1; then
     echo "Ensuring GitHub Copilot CLI is available..."
-    npm install -g @github/copilot 2>/dev/null || true
+    npm install -g @github/copilot@1.0.112 2>/dev/null || true   # pinned: credential file format is validated against this CLI version
     hash -r 2>/dev/null || true
 fi
 
