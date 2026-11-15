@@ -59,6 +59,24 @@ public interface IGitHubPullRequestService
         string? baseRef,
         string? repositoryOverride = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Reads a pull request's state and the review decisions recorded against it on GitHub.
+    /// </summary>
+    /// <remarks>
+    /// The pull half of the review loop. The gate could previously be released only through the
+    /// platform's two review endpoints, so a reviewer who approved (or requested changes) on the
+    /// GitHub PR page was never heard from. This read is what lets a poller observe that decision and
+    /// deliver it as the same <c>PrReviewSignal</c> the endpoints send; the verdict policy itself
+    /// (latest review per reviewer counts, an approval binds to the commit it saw, the PR author
+    /// cannot be the second pair of eyes) lives in the caller so it can be tested without HTTP.
+    /// See <c>GitHubPullRequestService.Reviews.cs</c> for why the repository is resolved
+    /// URL-first here, unlike the merge path.
+    /// </remarks>
+    Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
+        string prUrlOrNumber,
+        string? repositoryOverride = null,
+        CancellationToken ct = default);
 }
 
 /// <summary>Which merge strategy GitHub should apply.</summary>
