@@ -1414,7 +1414,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
                 var (dryExit, dryOut, dryErr) = await ExecInContainerAsync(
                     normPersonaId,
-                    "env -u GITHUB_TOKEN -u GH_TOKEN /bin/bash -c 'if [[ \"${COPILOT_GITHUB_TOKEN:-}\" == ghp_* ]] || [[ \"${COPILOT_GITHUB_TOKEN:-}\" == GHP_* ]] || { [ -n \"${AGENTMESH_GITHUB_TOKEN:-}\" ] && [ \"${COPILOT_GITHUB_TOKEN:-}\" = \"${AGENTMESH_GITHUB_TOKEN}\" ]; }; then unset COPILOT_GITHUB_TOKEN; fi; if [ -z \"${COPILOT_GITHUB_TOKEN:-}\" ] && [ -n \"${COPILOT_OAUTH_TOKEN:-}\" ] && ! grep -qE \"\\\"(copilot_tokens|authTokens)\\\"\" /root/.copilot/config.json 2>/dev/null; then export COPILOT_GITHUB_TOKEN=\"$COPILOT_OAUTH_TOKEN\"; fi; timeout 15 copilot -p \"hello\" --allow-all' 2>&1",
+                    "env -u GITHUB_TOKEN -u GH_TOKEN /bin/bash -c 'if [[ \"${COPILOT_GITHUB_TOKEN:-}\" == ghp_* ]] || [[ \"${COPILOT_GITHUB_TOKEN:-}\" == GHP_* ]] || { [ -n \"${AGENTMESH_GITHUB_TOKEN:-}\" ] && [ \"${COPILOT_GITHUB_TOKEN:-}\" = \"${AGENTMESH_GITHUB_TOKEN}\" ]; }; then unset COPILOT_GITHUB_TOKEN; fi; if [ -z \"${COPILOT_GITHUB_TOKEN:-}\" ] && [ -n \"${COPILOT_OAUTH_TOKEN:-}\" ] && [[ \"${COPILOT_OAUTH_TOKEN:-}\" != ghp_* ]] && [[ \"${COPILOT_OAUTH_TOKEN:-}\" != GHP_* ]] && [ \"${COPILOT_OAUTH_TOKEN:-}\" != \"${AGENTMESH_GITHUB_TOKEN:-}\" ]; then export COPILOT_GITHUB_TOKEN=\"$COPILOT_OAUTH_TOKEN\"; fi; timeout 15 copilot -p \"hello\" --allow-all' 2>&1",
                     ct);
                 if (dryExit == 0)
                 {
@@ -1997,18 +1997,57 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         return new PersonaAuthSubmitResult(normPersonaId, "failed", ErrorMessage: "No active authentication session found. Please click Authenticate Driver first.");
     }
 
+    /// <summary>
+    /// Resolves the GitHub login for a Copilot token so credential files can be written in the
+    /// CLI's native <c>host:login</c> shape. Prefers records already present in the config file,
+    /// then falls back to calling <c>GET /user</c> with the token from inside the persona pod.
+    /// </summary>
+    private async Task<string?> TryResolveCopilotLoginAsync(string normPersonaId, string copilotToken, string? existingConfigJson, CancellationToken ct)
+    {
+        try
+        {
+            var fromFile = CopilotCredentialHelper.TryGetKnownLoginFromConfigJson(existingConfigJson);
+            if (!string.IsNullOrWhiteSpace(fromFile)) return fromFile.Trim();
+        }
+        catch { }
+
+        try
+        {
+            var escapedTok = copilotToken.Trim().Replace("\"", "\\\"").Replace("$", "\\$");
+            var (exit, stdout, _) = await ExecInContainerAsync(
+                normPersonaId,
+                $"curl -s -m 10 -H \"Authorization: Bearer {escapedTok}\" https://api.github.com/user",
+                ct);
+            if (exit == 0 && !string.IsNullOrWhiteSpace(stdout))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(stdout);
+                if (doc.RootElement.TryGetProperty("login", out var loginEl) &&
+                    loginEl.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    var login = loginEl.GetString();
+                    if (!string.IsNullOrWhiteSpace(login)) return login.Trim();
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
     private async Task PersistK8sCopilotTokenAsync(string normPersonaId, string? driverId, string copilotToken, CancellationToken ct)
     {
         if (!CopilotCredentialHelper.IsSupportedCopilotToken(copilotToken)) return;
         var clean = copilotToken.Trim();
+        string? login = null;
 
         try
         {
             await EnsureContainerCopilotPlaintextSettingsAsync(normPersonaId, ct);
             var (_, existingCfg, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null || true", ct);
+            login = await TryResolveCopilotLoginAsync(normPersonaId, clean, existingCfg, ct);
             if (!CopilotCredentialHelper.HasActiveCopilotConfigLogin(existingCfg))
             {
-                var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, clean, overwriteExisting: false);
+                var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, clean, login, overwriteExisting: false);
                 if (!string.IsNullOrWhiteSpace(merged))
                 {
                     var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(merged + "\n"));
@@ -2048,7 +2087,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 {
                     driver.CapabilitiesJson = CopilotCredentialHelper.MergeOAuthTokenIntoDriverCapabilitiesJson(
                         driver.CapabilitiesJson,
-                        clean);
+                        clean,
+                        login);
                     driver.UpdatedAt = DateTimeOffset.UtcNow;
                     await db.SaveChangesAsync(ct);
                 }
@@ -2114,7 +2154,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             await EnsureContainerCopilotPlaintextSettingsAsync(normPersonaId, ct);
 
             var (_, existingCfg, _) = await ExecInContainerAsync(normPersonaId, "cat /root/.copilot/config.json 2>/dev/null || true", ct);
-            var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, cleanKey, overwriteExisting: true);
+            var apiKeyLogin = await TryResolveCopilotLoginAsync(normPersonaId, cleanKey, existingCfg, ct);
+            var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(existingCfg, cleanKey, apiKeyLogin, overwriteExisting: true);
             if (!string.IsNullOrWhiteSpace(merged))
             {
                 var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(merged + "\n"));

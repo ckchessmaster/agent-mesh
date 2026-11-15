@@ -169,6 +169,8 @@ public class CopilotCredentialHelperTests
 
         CopilotCredentialHelper.HasActiveCopilotConfigLogin(brokenConfig).Should().BeFalse();
 
+        // Empirically validated against Copilot CLI 1.0.112: a bare host-keyed authTokens entry
+        // with no sign-in record cannot authenticate either ("Saved sign-in could not be read").
         var cleanAuthTokensOnly = """
         {
           "authTokens": { "https://github.com": { "token": "gho_validToken123" } },
@@ -176,7 +178,56 @@ public class CopilotCredentialHelperTests
         }
         """;
 
-        CopilotCredentialHelper.HasActiveCopilotConfigLogin(cleanAuthTokensOnly).Should().BeTrue();
+        CopilotCredentialHelper.HasActiveCopilotConfigLogin(cleanAuthTokensOnly).Should().BeFalse();
+    }
+
+    [Fact]
+    public void HasActiveCopilotConfigLogin_WhenCamelCaseLoginWithQualifiedHostLoginKey_ReturnsTrue_AndJsonCTolerated()
+    {
+        // The native Copilot CLI 1.0.112 on-disk shape (as written by `copilot login` itself,
+        // including the "//" JSONC header lines that previously broke every AgentMesh parser).
+        var nativeConfig = """
+        // User settings belong in settings.json.
+        // This file is managed automatically.
+        {
+          "authTokens": {
+            "https://github.com:CKingdon_bee": { "token": "gho_validToken123" },
+            "https://github.com:CKingdon_bee:github": { "token": "gho_validToken123" }
+          },
+          "firstLaunchAt": "2026-03-11T00:00:00.000Z",
+          "lastLoggedInUser": { "host": "https://github.com", "login": "CKingdon_bee" },
+          "loggedInUsers": [{ "host": "https://github.com", "login": "CKingdon_bee" }]
+        }
+        """;
+
+        CopilotCredentialHelper.HasActiveCopilotConfigLogin(nativeConfig).Should().BeTrue();
+        CopilotCredentialHelper.TryExtractCopilotTokenFromJson(nativeConfig).Should().Be("gho_validToken123");
+        CopilotCredentialHelper.TryGetKnownLoginFromConfigJson(nativeConfig).Should().Be("CKingdon_bee");
+
+        // The production poison state found in persona pods: camelCase record + plain-host token key.
+        var poisoned = """
+        // User settings belong in settings.json.
+        {
+          "authTokens": { "https://github.com": { "token": "gho_validToken123" } },
+          "lastLoggedInUser": { "host": "https://github.com", "login": "CKingdon_bee" }
+        }
+        """;
+        CopilotCredentialHelper.HasActiveCopilotConfigLogin(poisoned).Should().BeFalse();
+        CopilotCredentialHelper.ParseContainerCopilotReadOutput(
+            poisoned + "\n---AGENTMESH_COPILOT_CRED_SPLIT---\n\n---AGENTMESH_COPILOT_CRED_SPLIT---\n\n---AGENTMESH_COPILOT_CRED_SPLIT---\n\n---AGENTMESH_COPILOT_CRED_SPLIT---\n")
+            .Should().BeNull();
+    }
+
+    [Fact]
+    public void ParseContainerCopilotReadOutput_ActiveNativeLogin_IsReportedAuthenticated()
+    {
+        var native = """
+        {"authTokens":{"https://github.com:octo":{"token":"gho_Active123"}},"lastLoggedInUser":{"host":"https://github.com","login":"octo"}}
+        """;
+        var output = string.Join(
+            "\n---AGENTMESH_COPILOT_CRED_SPLIT---\n",
+            native, "", "", "", "");
+        CopilotCredentialHelper.ParseContainerCopilotReadOutput(output).Should().Be("gho_Active123");
     }
 
     [Fact]
@@ -219,14 +270,36 @@ public class CopilotCredentialHelperTests
         var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
             brokenConfig,
             "gho_freshToken",
+            "fresh_user",
             overwriteExisting: false);
 
         merged.Should().NotBeNull();
+        merged.Should().NotContain("stale_user");
         merged.Should().NotContain("logged_in_users");
         merged.Should().NotContain("last_logged_in_user");
+        merged.Should().Contain("https://github.com:fresh_user");
+        merged.Should().NotContain("\"https://github.com\":"); // plain-host poison key must be gone
         merged.Should().Contain("/workspace");
         CopilotCredentialHelper.HasActiveCopilotConfigLogin(merged).Should().BeTrue();
         CopilotCredentialHelper.TryExtractCopilotTokenFromJson(merged).Should().Be("gho_freshToken");
+    }
+
+    [Fact]
+    public void MergeCopilotTokenIntoConfigJson_WithoutLogin_NeverWritesPlainHostPoisonEntry()
+    {
+        // Writing authTokens keyed by the bare host is the exact seed shape the real CLI cannot
+        // resolve; with no login available the merge must leave the file record-free instead.
+        var merged = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+            null,
+            "gho_freshToken",
+            login: null,
+            overwriteExisting: false);
+
+        if (merged != null)
+        {
+            CopilotCredentialHelper.HasActiveCopilotConfigLogin(merged).Should().BeFalse();
+            merged.Should().NotContain("gho_freshToken");
+        }
     }
 
     [Fact]
@@ -243,12 +316,20 @@ public class CopilotCredentialHelperTests
         var replaced = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
             oldInteractive,
             "gho_newDriverAuth",
+            "new_driver_user",
             overwriteExisting: true);
 
         replaced.Should().NotContain("old_user");
         replaced.Should().NotContain("gho_oldInteractive");
         CopilotCredentialHelper.HasActiveCopilotConfigLogin(replaced).Should().BeTrue();
         CopilotCredentialHelper.TryExtractCopilotTokenFromJson(replaced).Should().Be("gho_newDriverAuth");
+
+        // Overwrite without a resolved login must NOT resurrect the stale identity from the file.
+        var noLoginReplaced = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+            oldInteractive,
+            "gho_anotherToken",
+            overwriteExisting: true);
+        noLoginReplaced.Should().NotContain("gho_anotherToken");
     }
 
     [Fact]

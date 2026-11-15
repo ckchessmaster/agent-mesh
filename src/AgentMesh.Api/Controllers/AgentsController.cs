@@ -1685,6 +1685,8 @@ public class AgentsController(
             return;
         }
 
+        string? copilotLogin = null;
+
         try
         {
             var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -1708,14 +1710,6 @@ public class AgentsController(
                 var existingJson = System.IO.File.Exists(hostCopilotConfig)
                     ? await System.IO.File.ReadAllTextAsync(hostCopilotConfig, ct)
                     : null;
-                var mergedJson = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
-                    existingJson,
-                    rawToken.Trim(),
-                    overwriteExisting: true);
-                if (!string.IsNullOrWhiteSpace(mergedJson))
-                {
-                    await System.IO.File.WriteAllTextAsync(hostCopilotConfig, mergedJson, ct);
-                }
 
                 var driverCopilotDir = Path.Combine(userHome, ".agentmesh", "copilot-homes", agent.Id);
                 Directory.CreateDirectory(driverCopilotDir);
@@ -1724,9 +1718,29 @@ public class AgentsController(
                 var existingDriverJson = System.IO.File.Exists(driverCopilotConfig)
                     ? await System.IO.File.ReadAllTextAsync(driverCopilotConfig, ct)
                     : null;
+
+                // The Copilot CLI resolves its active sign-in via host:login-qualified token keys,
+                // so every config write needs the GitHub login for this token. Prefer the login
+                // the CLI itself recorded in either config file; fall back to GET /user.
+                copilotLogin =
+                    CopilotCredentialHelper.TryGetKnownLoginFromConfigJson(existingJson)
+                    ?? CopilotCredentialHelper.TryGetKnownLoginFromConfigJson(existingDriverJson)
+                    ?? await ResolveCopilotLoginViaUserApiAsync(rawToken.Trim(), ct);
+
+                var mergedJson = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+                    existingJson,
+                    rawToken.Trim(),
+                    copilotLogin,
+                    overwriteExisting: true);
+                if (!string.IsNullOrWhiteSpace(mergedJson))
+                {
+                    await System.IO.File.WriteAllTextAsync(hostCopilotConfig, mergedJson, ct);
+                }
+
                 var mergedDriverJson = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
                     existingDriverJson,
                     rawToken.Trim(),
+                    copilotLogin,
                     overwriteExisting: true);
                 if (!string.IsNullOrWhiteSpace(mergedDriverJson))
                 {
@@ -1740,10 +1754,41 @@ public class AgentsController(
         {
             ["oauthToken"] = rawToken
         };
+        if (effectiveAdapter == DriverAdapters.Copilot && !string.IsNullOrWhiteSpace(copilotLogin))
+        {
+            patch["oauthLogin"] = copilotLogin!.Trim();
+        }
         agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
             ?? agent.CapabilitiesJson;
         agent.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>
+    /// Resolves the GitHub login owning a Copilot token via <c>GET https://api.github.com/user</c>
+    /// (executed with host <c>curl</c>, mirroring the existing host-binary invocation patterns).
+    /// </summary>
+    private static async Task<string?> ResolveCopilotLoginViaUserApiAsync(string copilotToken, CancellationToken ct)
+    {
+        try
+        {
+            var curlBin = FindHostBinary("curl");
+            if (curlBin == null) return null;
+            var (exit, stdout, _) = await RunHostCommandAsync(
+                curlBin,
+                $"-s -m 10 -H \"Authorization: Bearer {copilotToken}\" https://api.github.com/user",
+                ct);
+            if (exit != 0 || string.IsNullOrWhiteSpace(stdout)) return null;
+            using var doc = JsonDocument.Parse(stdout);
+            if (doc.RootElement.TryGetProperty("login", out var loginEl) &&
+                loginEl.ValueKind == JsonValueKind.String)
+            {
+                var login = loginEl.GetString();
+                if (!string.IsNullOrWhiteSpace(login)) return login.Trim();
+            }
+        }
+        catch { }
+        return null;
     }
 
     private async Task EnsureHostAgyTokenFromDriverAsync(Agent agent, CancellationToken ct)

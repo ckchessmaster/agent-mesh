@@ -2184,17 +2184,17 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             rawCopilotEnv,
             effectivePersonaGitHubToken);
 
-        if (sanitizedCopilotEnv == null)
+        string? resolvedCopilotToken = sanitizedCopilotEnv;
+        if (resolvedCopilotToken == null)
         {
             environment.Remove("COPILOT_GITHUB_TOKEN");
 
-            string? fallbackOAuth = null;
             if (environment.TryGetValue(CopilotCredentialHelper.CopilotOAuthTokenEnvVar, out var oauthTok) &&
                 CopilotCredentialHelper.IsSupportedCopilotToken(oauthTok))
             {
-                fallbackOAuth = oauthTok!.Trim();
+                resolvedCopilotToken = oauthTok!.Trim();
             }
-            else if (!hasFileLogin && !string.IsNullOrWhiteSpace(normalizedDriverId) && !string.IsNullOrWhiteSpace(home))
+            else if (!string.IsNullOrWhiteSpace(normalizedDriverId) && !string.IsNullOrWhiteSpace(home))
             {
                 var driverTokenPath = Path.Combine(home, ".agentmesh", "tokens", $"driver-{normalizedDriverId}.oauth");
                 if (File.Exists(driverTokenPath))
@@ -2204,21 +2204,21 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         var fileTok = File.ReadAllText(driverTokenPath).Trim();
                         if (CopilotCredentialHelper.IsSupportedCopilotToken(fileTok))
                         {
-                            fallbackOAuth = fileTok;
+                            resolvedCopilotToken = fileTok;
                         }
                     }
                     catch { }
                 }
             }
-
-            if (!hasFileLogin && !string.IsNullOrWhiteSpace(fallbackOAuth))
-            {
-                environment["COPILOT_GITHUB_TOKEN"] = fallbackOAuth;
-            }
         }
-        else
+
+        // Env-token injection takes precedence over any file state ON PURPOSE (validated against
+        // Copilot CLI 1.0.112: COPILOT_GITHUB_TOKEN wins over config.json, even a poisoned one).
+        // It is injected whenever a supported token is available — even when a config-file login
+        // looks active — so a drifted/corrupted config.json can never deadlock the driver again.
+        if (!string.IsNullOrWhiteSpace(resolvedCopilotToken))
         {
-            environment["COPILOT_GITHUB_TOKEN"] = sanitizedCopilotEnv;
+            environment["COPILOT_GITHUB_TOKEN"] = resolvedCopilotToken.Trim();
         }
     }
 
@@ -2243,9 +2243,13 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!File.Exists(configPath)) return;
 
             var existingJson = File.ReadAllText(configPath);
-            // Only prune orphaned logged_in_users outside containers if authTokens is also present
-            // (which indicates an AgentMesh-merged file rather than an OS keychain desktop login).
-            var pruneOrphans = inContainer || existingJson.Contains("\"authTokens\"", StringComparison.Ordinal);
+            // Only prune orphaned sign-in records outside containers if the file also carries
+            // AgentMesh-managed token maps (any era naming), indicating an AgentMesh-merged file
+            // rather than an OS keychain desktop login.
+            var pruneOrphans = inContainer ||
+                existingJson.Contains("\"authTokens\"", StringComparison.Ordinal) ||
+                existingJson.Contains("\"copilotTokens\"", StringComparison.Ordinal) ||
+                existingJson.Contains("\"copilot_tokens\"", StringComparison.Ordinal);
 
             environment.TryGetValue(CopilotCredentialHelper.CopilotOAuthTokenEnvVar, out var oauthEnv);
             string? cleanedJson;
@@ -2254,9 +2258,13 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!CopilotCredentialHelper.HasActiveCopilotConfigLogin(existingJson) &&
                 CopilotCredentialHelper.IsSupportedCopilotToken(oauthEnv))
             {
+                // Re-key with the login the CLI itself recorded in the file (lastLoggedInUser /
+                // loggedInUsers / host:login-qualified keys) so the healed file is in the native
+                // shape the CLI can resolve. No login => Merge refuses to write the poison shape.
                 cleanedJson = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
                     existingJson,
                     oauthEnv!,
+                    CopilotCredentialHelper.TryGetKnownLoginFromConfigJson(existingJson),
                     overwriteExisting: false);
                 changed = !string.Equals(existingJson.Trim(), cleanedJson?.Trim(), StringComparison.Ordinal);
             }
