@@ -659,6 +659,19 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
             Task.FromResult(GitHubPullRequestService.JobChangeRemoteRead.Fail(
                 "stubbed", "The end-to-end stub performs no remote reads."));
 
+        /// <summary>
+        /// Review-state reading belongs to the poller and the workflow's merge guard, neither of
+        /// which the MCP tool surface touches; the stub answers "nothing was read" for the same
+        /// reason <see cref="ReadBranchComparisonAsync"/> does — no test here asserts on it, and a
+        /// throw would fail the fixture for a reason unrelated to what is under test.
+        /// </summary>
+        public Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
+            string prUrlOrNumber,
+            string? repositoryOverride = null,
+            CancellationToken ct = default) =>
+            Task.FromResult(GitHubPrReviewSnapshot.Failure(
+                "stubbed", "The end-to-end stub reads no review state from GitHub."));
+
         public Task<GitHubMergeResult> MergePullRequestAsync(
             GitHubMergeRequest request,
             CancellationToken ct = default)

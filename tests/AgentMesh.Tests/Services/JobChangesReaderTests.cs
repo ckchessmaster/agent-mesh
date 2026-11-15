@@ -949,5 +949,9 @@ public class JobChangesReaderTests : IDisposable
         public Task<GitHubMergeResult> MergePullRequestAsync(
             GitHubMergeRequest request, CancellationToken ct = default) =>
             throw new NotSupportedException("The change reader must never merge.");
+
+        public Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
+            string prUrlOrNumber, string? repositoryOverride = null, CancellationToken ct = default) =>
+            throw new NotSupportedException("The change reader must never read reviews.");
     }
 }

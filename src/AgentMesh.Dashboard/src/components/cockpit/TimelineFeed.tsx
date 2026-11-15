@@ -4,6 +4,7 @@ import type { JobTimelineCard } from '../../types/timeline';
 import { JobInitializedCard } from './cards/JobInitializedCard';
 import { DiscoveryQaCard } from './cards/DiscoveryQaCard';
 import { PlanApprovalCard } from './cards/PlanApprovalCard';
+import { PrReviewCard } from './cards/PrReviewCard';
 import { TaskStepCard } from './cards/TaskStepCard';
 import { TurnInterruptedCard } from './cards/TurnInterruptedCard';
 import { CardComments } from './cards/CardComments';
@@ -26,6 +27,12 @@ export interface TimelineFeedProps {
     feedback?: string,
     approverId?: string
   ) => Promise<void> | void;
+  onSubmitPrReview?: (
+    cardId: string,
+    approved: boolean,
+    feedback?: string,
+    prNumber?: number
+  ) => Promise<void> | void;
   onSubmitIntervention?: (
     action: 'resume' | 'retry_step' | 'realign',
     additionalContext?: string
@@ -41,6 +48,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   isStarting = false,
   onSubmitAnswers,
   onSubmitPlanDecision,
+  onSubmitPrReview,
   onSubmitIntervention,
   onAddComment
 }) => {
@@ -121,6 +129,15 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
                 key={card.id}
                 card={card}
                 onSubmitPlanDecision={onSubmitPlanDecision}
+                onAddComment={onAddComment}
+              />
+            );
+          case 'PrReview':
+            return (
+              <PrReviewCard
+                key={card.id}
+                card={card}
+                onSubmitPrDecision={onSubmitPrReview}
                 onAddComment={onAddComment}
               />
             );

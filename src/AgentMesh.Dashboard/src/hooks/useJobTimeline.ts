@@ -6,6 +6,7 @@ import type {
   AddCommentRequest,
   DiscoveryAnswersPayload,
   PlanDecisionPayload,
+  PrReviewDecisionPayload,
   AbortTurnRequest,
   InterventionRequest
 } from '../types/timeline';
@@ -158,6 +159,30 @@ export function useJobTimeline(jobId: string) {
     [jobId]
   );
 
+  const submitPrReview = useCallback(
+    async (cardId: string, approved: boolean, feedback?: string, prNumber?: number) => {
+      // Sign as operator (the human at the keyboard), matching submitPlanDecision's approverId.
+      // approvedHeadSha is intentionally omitted: the server binds the approval to the head SHA on
+      // the gate's own card, which is the durable value a stale browser render must not override.
+      const payload: PrReviewDecisionPayload = {
+        isApproved: approved,
+        reviewComments: feedback,
+        reviewerId: 'operator',
+        prNumber,
+      };
+      await api.submitJobPrReview(jobId, payload);
+      // Optimistic flip only until the workflow's own ReceiveTimelineCardUpdated arrives with the
+      // real transition (Approved then Resolved on merge, Rejected into a remediation round). A throw
+      // leaves the card untouched so the operator can read the error and retry.
+      setCards((prev) =>
+        prev.map((c) =>
+          c.id === cardId ? { ...c, status: approved ? 'Approved' : 'Rejected' } : c
+        )
+      );
+    },
+    [jobId]
+  );
+
   const abortActiveTurn = useCallback(
     async (reason = 'Turn interrupted by operator', requestedBy = 'operator') => {
       const req: AbortTurnRequest = { reason, requestedBy };
@@ -183,6 +208,7 @@ export function useJobTimeline(jobId: string) {
     addComment,
     submitAnswers,
     submitPlanDecision,
+    submitPrReview,
     abortActiveTurn,
     submitIntervention
   };

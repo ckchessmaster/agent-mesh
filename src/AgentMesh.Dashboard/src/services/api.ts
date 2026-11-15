@@ -37,6 +37,7 @@ import type {
   AddCommentRequest,
   DiscoveryAnswersPayload,
   PlanDecisionPayload,
+  PrReviewDecisionPayload,
   AbortTurnRequest,
   InterventionRequest
 } from '../types';
@@ -1647,6 +1648,25 @@ export const api = {
     });
     if (!res.ok) {
       throw new Error(await readApiErrorMessage(res, 'Failed to submit plan decision'));
+    }
+  },
+
+  /**
+   * Delivers a PR review decision to the parked review gate.
+   *
+   * Not a card-scoped timeline route: the durable gate is keyed on the job, and the endpoint
+   * (`POST /api/jobs/{id}/reviews`) is the one that enforces the two-man rule against the recorded
+   * PR author and binds the approval to the head SHA on the gate's card. A 403 (self-review) or a
+   * 409 (signal not delivered) surfaces as an error the PrReviewCard renders inline.
+   */
+  async submitJobPrReview(jobId: string, payload: PrReviewDecisionPayload): Promise<void> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/reviews`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to submit PR review'));
     }
   },
 

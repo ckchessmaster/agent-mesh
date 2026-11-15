@@ -157,6 +157,13 @@ builder.Services.AddHttpClient(GitHubPullRequestService.HttpClientName, client =
 });
 builder.Services.AddScoped<IGitHubPullRequestService, GitHubPullRequestService>();
 
+// The GitHub half of the review gate: a decision made on the PR page itself (approval,
+// changes-requested, or a manual merge) is read back and delivered as the same PrReviewSignal the
+// review endpoints send, so a reviewer who never opens the Cockpit still releases the parked
+// workflow. See PrReviewPollingService for the verdict rules and duplicate suppression.
+builder.Services.Configure<PrReviewPollingOptions>(builder.Configuration.GetSection(PrReviewPollingOptions.SectionName));
+builder.Services.AddHostedService<PrReviewPollingService>();
+
 // The Cockpit's Changes tab: what files a job touched, and the diff for each.
 //
 // Three sources answer that question and the API picks between them per request (a checkout it can
