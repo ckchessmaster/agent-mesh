@@ -72,10 +72,17 @@ public interface IGitHubPullRequestService
     /// cannot be the second pair of eyes) lives in the caller so it can be tested without HTTP.
     /// See <c>GitHubPullRequestService.Reviews.cs</c> for why the repository is resolved
     /// URL-first here, unlike the merge path.
+    /// <para>
+    /// <paramref name="tokenOverride"/> reads with an explicit credential (the author persona's PAT,
+    /// which the review poller resolves per job) before consulting deployment configuration. The
+    /// PR's own author can always read its reviews — the account that opened it is a natural reader —
+    /// and a deployment whose control plane holds no token otherwise could never poll at all.
+    /// </para>
     /// </remarks>
     Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
         string prUrlOrNumber,
         string? repositoryOverride = null,
+        string? tokenOverride = null,
         CancellationToken ct = default);
 }
 
@@ -110,13 +117,24 @@ public enum GitHubMergeMethod
 /// GitHub reject the merge if the author pushed since the approval — the check that stops an
 /// unreviewed commit from riding an earlier approval into the base branch.
 /// </param>
+/// <param name="Token">
+/// An explicit credential to merge with, winning over <c>GitHub:Token</c> and the App triple.
+/// The worker merges with the job's <em>author persona</em> PAT (the same credential its container
+/// opened the PR with), which is how a deployment where no control-plane token exists — every GitHub
+/// identity is a persona's — still merges through the platform rather than through an agent turn.
+/// GitHub permits an author to merge its own PR; what the two-man rule gates is the approval, and
+/// that stays a human/operator decision recorded out-of-band. A request-supplied token is the
+/// caller's declared identity for exactly this, and it must never be logged: the same redaction the
+/// push URL gets applies to it.
+/// </param>
 public record GitHubMergeRequest(
     string PrUrlOrNumber,
     string? Repository = null,
     GitHubMergeMethod Method = GitHubMergeMethod.Squash,
     string? CommitTitle = null,
     string? CommitMessage = null,
-    string? Sha = null);
+    string? Sha = null,
+    string? Token = null);
 
 /// <summary>The outcome of a merge attempt.</summary>
 /// <param name="AlreadyMerged">
@@ -498,14 +516,31 @@ public partial class GitHubPullRequestService(
                 "GitHub:Repository is not configured, and the pull request reference is a bare number.");
         }
 
-        var token = await ResolveTokenAsync(options, ct);
+        // An explicit request token wins over the deployment's own credentials: the worker merges as
+        // the job's author persona (whose PAT opened the PR), and a deployment whose only GitHub
+        // identities are persona accounts has no control-plane token to find. The refusal below names
+        // both possibilities because "who was supposed to sign this merge" is the first question an
+        // operator faces when a job halts on no_credentials.
+        var token = !string.IsNullOrWhiteSpace(request.Token) ? request.Token.Trim() : null;
+        var tokenSource = token is not null ? "request-supplied credential" : null;
+        if (token is null)
+        {
+            token = await ResolveTokenAsync(options, ct);
+            tokenSource = string.IsNullOrWhiteSpace(token) ? null : "configured credential";
+        }
+
         if (string.IsNullOrWhiteSpace(token))
         {
             return MergeFailure("no_credentials",
-                "No GitHub credentials are configured (GitHub:Token, or the App id/key/installation " +
-                "triple). A merge is never simulated: reporting success here would mark the task " +
-                "complete while the work sits unmerged on its branch.");
+                "No GitHub credentials available for this merge: the request carried no explicit " +
+                "token (no author-persona PAT was resolved for the job), the job's persona may have no " +
+                "GitHub token stored, and no deployment credential is configured (GitHub:Token, or the " +
+                "App id/key/installation triple). A merge is never simulated: reporting success here " +
+                "would mark the task complete while the work sits unmerged on its branch.");
         }
+
+        logger.LogInformation("Merging {Owner}/{Repo}#{Pr} with {TokenSource}.",
+            target.Owner, target.Repo, prNumber, tokenSource);
 
         // ── Pre-read: distinguish "already merged" from "not mergeable" ───────────
         var getState = await SendAsync(

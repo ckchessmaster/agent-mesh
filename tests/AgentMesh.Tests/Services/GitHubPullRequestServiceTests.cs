@@ -1125,6 +1125,48 @@ public class GitHubPullRequestServiceTests
         handler.Requests.Should().BeEmpty("no credential means no API call at all");
     }
 
+    /// <summary>
+    /// A request-supplied token signs the merge when the deployment configures none — the
+    /// author-persona credential path: the PR was opened by the persona's account, GitHub lets an
+    /// author merge its own PR, and the human decision lives in the review gate, not in the token.
+    /// </summary>
+    [Fact]
+    public async Task Merge_WithRequestToken_SignsWithItWhenConfigurationHasNone()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"abc1234def"}}""")
+            .Respond(HttpMethod.Put, MergePath, 200, """{"merged":true,"sha":"m1"}""");
+
+        // No GitHub:Token anywhere: the empty settings dictionary is the tokenless cluster.
+        var service = BuildService(new Dictionary<string, string?>(), handler: handler);
+
+        var result = await service.MergePullRequestAsync(
+            new GitHubMergeRequest(PrUrl, Token: "ghp_persona_pat"));
+
+        result.Success.Should().BeTrue(result.Message);
+        handler.Requests.Should().NotBeEmpty();
+        handler.Requests.Should().OnlyContain(r => r.Authorization == "Bearer ghp_persona_pat");
+    }
+
+    /// <summary>
+    /// An explicitly carried identity outranks the deployment's own token: when the worker merges as
+    /// the job's persona, the PR's history should name the account that owns the work, not whatever
+    /// service credential the cluster happens to hold.
+    /// </summary>
+    [Fact]
+    public async Task Merge_RequestToken_WinsOverConfiguredToken()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"abc1234def"}}""")
+            .Respond(HttpMethod.Put, MergePath, 200, """{"merged":true,"sha":"m1"}""");
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl, Token: "ghp_persona_pat"));
+
+        result.Success.Should().BeTrue(result.Message);
+        handler.Requests.Should().OnlyContain(r => r.Authorization == "Bearer ghp_persona_pat");
+    }
+
     [Fact]
     public async Task Merge_ResolvesTheRepositoryFromConfigurationWhenTheReferenceIsABareNumber()
     {

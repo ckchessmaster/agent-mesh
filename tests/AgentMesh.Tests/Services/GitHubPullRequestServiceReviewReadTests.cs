@@ -216,6 +216,37 @@ public class GitHubPullRequestServiceReviewReadTests
     }
 
     [Fact]
+    public async Task TokenOverride_ReadsWithItWhenTheDeploymentConfiguresNone()
+    {
+        // The persona-credential deployment: the poller passes the author persona's PAT because the
+        // control plane has no token of its own. The account that opened the PR can read its reviews.
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, "/repos/o/r/pulls/1", 200, OpenPrJson)
+            .Respond(HttpMethod.Get, "/repos/o/r/pulls/1/reviews", 200, ReviewsJson);
+
+        var snapshot = await BuildWithoutCredentials(handler)
+            .ReadPullRequestReviewStateAsync("https://github.com/o/r/pull/1", tokenOverride: "ghp_persona_pat");
+
+        snapshot.Success.Should().BeTrue(snapshot.Message);
+        snapshot.Reviews.Should().HaveCount(3);
+        handler.Requests.Should().OnlyContain(r => r.Authorization == "Bearer ghp_persona_pat");
+    }
+
+    [Fact]
+    public async Task TokenOverride_WinsOverConfiguredToken()
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, "/repos/o/r/pulls/1", 200, OpenPrJson)
+            .Respond(HttpMethod.Get, "/repos/o/r/pulls/1/reviews", 200, "[]");
+
+        var snapshot = await Build(handler)
+            .ReadPullRequestReviewStateAsync("https://github.com/o/r/pull/1", tokenOverride: "ghp_persona_pat");
+
+        snapshot.Success.Should().BeTrue();
+        handler.Requests.Should().OnlyContain(r => r.Authorization == "Bearer ghp_persona_pat");
+    }
+
+    [Fact]
     public async Task ReviewsCallRejected_FailsTheWholeRead_InsteadOfReportingAnEmptyReviewList()
     {
         // Success with zero reviews is the true statement "nobody has said anything yet". A 403 is

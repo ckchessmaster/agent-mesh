@@ -1,6 +1,9 @@
 using AgentMesh.Api.Services;
+using AgentMesh.Core.Models;
 using AgentMesh.Infrastructure.Services;
+using AgentMesh.Tests.Helpers;
 using FluentAssertions;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace AgentMesh.Tests.Services;
@@ -291,9 +294,27 @@ public class PrReviewPollingServiceTests
              "source":"workflow:job_pr_gate"}
             """;
 
-        PrReviewPollingService.TryReadGatePayload(json, out var url, out var number).Should().BeTrue();
+        PrReviewPollingService.TryReadGatePayload(json, out var url, out var number, out var author)
+            .Should().BeTrue();
         url.Should().Be("https://github.com/ckchessmaster/homelab-manager/pull/1");
         number.Should().Be(1);
+        author.Should().Be("bee");
+    }
+
+    [Fact]
+    public void GatePayload_AuthorFallsBackThroughTheToolVariantsKeyOrder()
+    {
+        // Same precedence the review endpoints use for the two-man check: authorPersonaId wins,
+        // then senderPersona/senderId/author; the value arrives normalized for persona lookup.
+        PrReviewPollingService
+            .TryReadGatePayload("""{"prNumber":1,"senderPersona":"@Bee"}""", out _, out _, out var a1)
+            .Should().BeTrue();
+        a1.Should().Be("bee");
+
+        PrReviewPollingService
+            .TryReadGatePayload("""{"prNumber":1,"senderId":"rook","author":"ignored"}""", out _, out _, out var a2)
+            .Should().BeTrue();
+        a2.Should().Be("rook");
     }
 
     [Theory]
@@ -305,20 +326,22 @@ public class PrReviewPollingServiceTests
     [InlineData("""{"prUrl":"","prNumber":null}""")]
     public void GatePayload_UnusableShapes_MeanNothingToPoll(string? json)
     {
-        PrReviewPollingService.TryReadGatePayload(json, out var url, out var number)
+        PrReviewPollingService.TryReadGatePayload(json, out var url, out var number, out var author)
             .Should().BeFalse();
         url.Should().BeNull();
         number.Should().BeNull();
+        author.Should().BeNull();
     }
 
     [Fact]
     public void GatePayload_NumberOnly_CarriesTheSignalTargetAnyway()
     {
         PrReviewPollingService
-            .TryReadGatePayload("""{"prNumber":42}""", out var url, out var number)
+            .TryReadGatePayload("""{"prNumber":42}""", out var url, out var number, out var author)
             .Should().BeTrue();
         url.Should().BeNull();
         number.Should().Be(42);
+        author.Should().BeNull();
     }
 
     // ── Signal dressing ───────────────────────────────────────────────────────────
@@ -347,5 +370,49 @@ public class PrReviewPollingServiceTests
             [Review(1, "techlead", "CHANGES_REQUESTED", body: "   ")], Head, "bee-bot", Parked);
 
         verdict!.Comments.Should().BeNull();
+    }
+
+    // ── Author-persona credential resolution (persona-credential deployments have no
+    //    control-plane token; the account that opened the PR can always read its reviews) ──────
+
+    private static AesCredentialEncryptionService Encryption() => new(new byte[32]);
+
+    [Fact]
+    public async Task AuthorToken_DecryptsThePersonasStoredPat()
+    {
+        var db = TestDbContextFactory.Create();
+        var enc = Encryption();
+        db.Personas.Add(new Persona
+        {
+            Id = "bee",
+            Name = "Bee",
+            DriverId = "claude",
+            GitHubTokenEncrypted = enc.Encrypt("ghp_bee_pat_123"),
+        });
+        await db.SaveChangesAsync();
+
+        // Input carries the @-prefixed/mixed-case shape the tool writes into the card.
+        var token = await PrReviewPollingService.ResolvePersonaGithubTokenAsync(
+            db, enc, "@Bee", NullLogger<PrReviewPollingService>.Instance, CancellationToken.None);
+
+        token.Should().Be("ghp_bee_pat_123");
+    }
+
+    [Fact]
+    public async Task AuthorToken_MissingPersonaOrMissingEncryption_FallsBackQuietly()
+    {
+        var db = TestDbContextFactory.Create();
+        var enc = Encryption();
+        db.Personas.Add(new Persona { Id = "rook", Name = "Rook", DriverId = "claude" }); // no token stored
+        await db.SaveChangesAsync();
+
+        (await PrReviewPollingService.ResolvePersonaGithubTokenAsync(
+            db, enc, "rook", NullLogger<PrReviewPollingService>.Instance, default)).Should().BeNull();
+        (await PrReviewPollingService.ResolvePersonaGithubTokenAsync(
+            db, enc, "nobody", NullLogger<PrReviewPollingService>.Instance, default)).Should().BeNull();
+        (await PrReviewPollingService.ResolvePersonaGithubTokenAsync(
+            db, null, "bee", NullLogger<PrReviewPollingService>.Instance, default)).Should().BeNull();
+        (await PrReviewPollingService.ResolvePersonaGithubTokenAsync(
+            db, enc, null, NullLogger<PrReviewPollingService>.Instance, default)).Should().BeNull();
     }
 }

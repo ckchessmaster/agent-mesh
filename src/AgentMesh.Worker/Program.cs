@@ -61,10 +61,14 @@ builder.Services.AddHttpClient(HttpAgentTurnRunner.HttpClientName, client =>
 });
 
 // Server-side PR merge, used by GitActivities after an approved review signal. The worker holds no
-// interactive credentials of its own; it reads the same GitHub:* settings the API does.
+// interactive credentials of its own: GitActivities signs a merge with the job's author-persona PAT
+// (decrypted from the persona store — the same credential the persona's container opened the PR
+// with), and deployment GitHub:* settings act as the fallback for jobs whose persona carries no token.
+// Singleton because the AES key is process configuration and the service holds no per-request state.
 builder.Services.AddHttpClient(GitHubPullRequestService.HttpClientName, client =>
     client.Timeout = TimeSpan.FromSeconds(30));
 builder.Services.TryAddScoped<IGitHubPullRequestService, GitHubPullRequestService>();
+builder.Services.TryAddSingleton<ICredentialEncryptionService, AesCredentialEncryptionService>();
 
 var temporalHost = builder.Configuration["Temporal:Host"] ?? "localhost:7233";
 var temporalNamespace = builder.Configuration["Temporal:Namespace"] ?? "default";
