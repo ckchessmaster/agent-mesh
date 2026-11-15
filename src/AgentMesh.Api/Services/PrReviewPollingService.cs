@@ -1,4 +1,5 @@
 using System.Text.Json;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
@@ -113,6 +114,13 @@ public class PrReviewPollingService(
     /// </summary>
     private readonly ConcurrentDictionary<Guid, string> _deliveredKeys = new();
 
+    /// <summary>
+    /// Job id → the last verdict key whose non-delivery we logged. Delivery stays retryable (a
+    /// workflow that was mid-restart when the review landed must still receive it), but a job with
+    /// permanently no workflow would otherwise log the same Information line once a minute forever.
+    /// </summary>
+    private readonly ConcurrentDictionary<Guid, string> _loggedUndeliverableKeys = new();
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!options.Value.Enabled)
@@ -164,13 +172,32 @@ public class PrReviewPollingService(
             .ThenByDescending(c => c.CreatedAt)
             .ToListAsync(ct);
 
+        // `open_pull_request` writes a PendingInput ledger card beside the workflow's own gate card,
+        // and only the gate card moves when the workflow merges — so a merged job can leave a stale
+        // pending card behind. A job whose row is Completed/Archived is definitionally not waiting on
+        // a review, and polling its leftover card would mean re-reading GitHub every tick and
+        // reporting NoRunningWorkflow for a job that finished days ago.
+        var candidateJobIds = cards
+            .Where(c => Guid.TryParse(c.JobId, out _))
+            .Select(c => Guid.Parse(c.JobId))
+            .Distinct()
+            .ToList();
+
+        var terminalJobs = new HashSet<Guid>(await db.ProjectJobs
+            .AsNoTracking()
+            .Where(j => candidateJobIds.Contains(j.Id) &&
+                        (j.Status == ProjectJobStatus.Completed || j.Status == ProjectJobStatus.Archived))
+            .Select(j => j.Id)
+            .ToListAsync(ct));
+
         var parkedJobs = new HashSet<Guid>();
 
         foreach (var card in cards)
         {
             ct.ThrowIfCancellationRequested();
 
-            if (!Guid.TryParse(card.JobId, out var jobId) || !parkedJobs.Add(jobId))
+            if (!Guid.TryParse(card.JobId, out var jobId) || !parkedJobs.Add(jobId) ||
+                terminalJobs.Contains(jobId))
             {
                 continue;
             }

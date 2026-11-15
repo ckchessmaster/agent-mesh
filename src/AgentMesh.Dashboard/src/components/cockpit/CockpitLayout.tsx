@@ -39,6 +39,7 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
     addComment,
     submitAnswers,
     submitPlanDecision,
+    submitPrReview,
     abortActiveTurn,
     submitIntervention
   } = useJobTimeline(jobId);
@@ -77,6 +78,7 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
           isStarting={isStarting}
           onSubmitAnswers={submitAnswers}
           onSubmitPlanDecision={submitPlanDecision}
+          onSubmitPrReview={submitPrReview}
           onSubmitIntervention={submitIntervention}
           onAddComment={(cardId, content) => { void addComment(cardId, content); }}
         />
