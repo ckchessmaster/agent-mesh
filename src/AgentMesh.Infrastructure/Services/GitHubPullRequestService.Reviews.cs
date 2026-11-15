@@ -60,6 +60,7 @@ public partial class GitHubPullRequestService
     public async Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
         string prUrlOrNumber,
         string? repositoryOverride = null,
+        string? tokenOverride = null,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(prUrlOrNumber))
@@ -91,11 +92,18 @@ public partial class GitHubPullRequestService
                 "owner/repo, no repository override was passed, and GitHub:Repository is not configured.");
         }
 
-        var token = await ResolveTokenAsync(options, ct);
+        // Same precedence as the merge: an explicitly carried identity wins, configuration backs it.
+        var token = !string.IsNullOrWhiteSpace(tokenOverride) ? tokenOverride.Trim() : null;
+        if (token is null)
+        {
+            token = await ResolveTokenAsync(options, ct);
+        }
+
         if (string.IsNullOrWhiteSpace(token))
         {
             return GitHubPrReviewSnapshot.Failure("no_credentials",
-                "No GitHub credentials are configured, so pull request reviews cannot be read.");
+                "No GitHub credentials available for this review read: no persona token was passed " +
+                "and none is configured, so pull request reviews cannot be read.");
         }
 
         var prResponse = await SendAsync(

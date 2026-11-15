@@ -668,6 +668,7 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         public Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
             string prUrlOrNumber,
             string? repositoryOverride = null,
+            string? tokenOverride = null,
             CancellationToken ct = default) =>
             Task.FromResult(GitHubPrReviewSnapshot.Failure(
                 "stubbed", "The end-to-end stub reads no review state from GitHub."));

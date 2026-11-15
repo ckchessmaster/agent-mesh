@@ -1,6 +1,7 @@
 using System.Text.Json;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Services;
@@ -161,6 +162,9 @@ public class PrReviewPollingService(
         var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
         var github = scope.ServiceProvider.GetRequiredService<IGitHubPullRequestService>();
         var router = scope.ServiceProvider.GetRequiredService<IWorkflowSignalRouter>();
+        // Optional by contract: API hosts that register the persona credential store decrypt author
+        // PATs there; without it the poller still runs wherever GitHub:Token is configured.
+        var encryption = scope.ServiceProvider.GetService<ICredentialEncryptionService>();
 
         // Newest first; the walk below keeps only the first card per job, which is the gate the
         // workflow most recently parked.
@@ -202,7 +206,7 @@ public class PrReviewPollingService(
                 continue;
             }
 
-            if (!TryReadGatePayload(card.StructuredPayloadJson, out var prUrl, out var prNumber))
+            if (!TryReadGatePayload(card.StructuredPayloadJson, out var prUrl, out var prNumber, out var authorPersona))
             {
                 // The gate can park before a PR is registered (the workflow retries opening it); a
                 // card with no pull request in it simply has nothing on GitHub to have been reviewed.
@@ -213,7 +217,12 @@ public class PrReviewPollingService(
                 ? prUrl!
                 : prNumber!.Value.ToString(CultureInfo.InvariantCulture);
 
-            var snapshot = await github.ReadPullRequestReviewStateAsync(prRef, ct: ct);
+            // Read as the PR's own author persona: in persona-credential deployments the control
+            // plane has no GitHub token, but the account that opened the PR can always see its own
+            // reviews. Configured credentials remain the fallback when the persona carries none.
+            var authorToken = await ResolvePersonaGithubTokenAsync(db, encryption, authorPersona, logger, ct);
+
+            var snapshot = await github.ReadPullRequestReviewStateAsync(prRef, tokenOverride: authorToken, ct: ct);
 
             if (!snapshot.Success)
             {
@@ -474,14 +483,22 @@ public class PrReviewPollingService(
         (review.SubmittedAt ?? DateTimeOffset.MinValue, review.Id);
 
     /// <summary>
-    /// Reads <c>prUrl</c>/<c>prNumber</c> out of a gate card's structured payload. The payload is
-    /// written by <c>UpsertPrReviewCardAsync</c> in the workflow; unknown shapes yield false, which
-    /// the caller treats as "nothing to poll", never as "no reviews".
+    /// Reads <c>prUrl</c>/<c>prNumber</c>/<c>authorPersonaId</c> out of a gate card's structured
+    /// payload. The payload is written by <c>UpsertPrReviewCardAsync</c> in the workflow (and by the
+    /// review tool for non-workflow jobs, which uses sibling author keys); unknown shapes yield false,
+    /// which the caller treats as "nothing to poll", never as "no reviews". The author is the persona
+    /// whose stored PAT is used to read the reviews, so the same key precedence the review endpoints
+    /// use to enforce the two-man rule applies here.
     /// </summary>
-    internal static bool TryReadGatePayload(string? payloadJson, out string? prUrl, out int? prNumber)
+    internal static bool TryReadGatePayload(
+        string? payloadJson,
+        out string? prUrl,
+        out int? prNumber,
+        out string? authorPersona)
     {
         prUrl = null;
         prNumber = null;
+        authorPersona = null;
         if (string.IsNullOrWhiteSpace(payloadJson)) return false;
 
         try
@@ -503,11 +520,60 @@ public class PrReviewPollingService(
                 prNumber = parsed;
             }
 
+            foreach (var authorKey in new[] { "authorPersonaId", "senderPersona", "senderId", "author" })
+            {
+                if (doc.RootElement.TryGetProperty(authorKey, out var prop) &&
+                    prop.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(prop.GetString()))
+                {
+                    authorPersona = prop.GetString()!.Trim().TrimStart('@').ToLowerInvariant();
+                    break;
+                }
+            }
+
             return prUrl is not null || prNumber is not null;
         }
         catch (JsonException)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// The persona's decrypted GitHub PAT, or null. Never logs the token; a persona id that is not in
+    /// the store or carries no token is an ordinary fallthrough (configured credentials back it), not
+    /// an error — the poller runs against jobs whose authors may predate per-persona credentials.
+    /// </summary>
+    internal static async Task<string?> ResolvePersonaGithubTokenAsync(
+        AgentMeshDbContext db,
+        ICredentialEncryptionService? encryption,
+        string? authorPersona,
+        ILogger logger,
+        CancellationToken ct)
+    {
+        if (encryption is null || string.IsNullOrWhiteSpace(authorPersona)) return null;
+
+        try
+        {
+            var normalized = authorPersona.Trim().TrimStart('@').ToLowerInvariant();
+            var encrypted = await db.Personas.AsNoTracking()
+                .Where(p => p.Id == normalized)
+                .Select(p => p.GitHubTokenEncrypted)
+                .FirstOrDefaultAsync(ct);
+
+            if (string.IsNullOrWhiteSpace(encrypted)) return null;
+
+            var decrypted = encryption.Decrypt(encrypted);
+            return string.IsNullOrWhiteSpace(decrypted) ? null : decrypted.Trim();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Same posture as the worker's lookup: a credential-store problem degrades to the
+            // configured-credential path, and the read's own failure reason reports the outcome.
+            logger.LogWarning(ex,
+                "Could not resolve a GitHub token for persona '{Persona}'; trying configured credentials.",
+                authorPersona);
+            return null;
         }
     }
 }
