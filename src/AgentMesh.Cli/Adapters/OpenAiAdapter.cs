@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -297,6 +298,54 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     }
 
     /// <summary>
+    /// Per-turn budget for waiting out model-server swaps/reloads. Single-residency swap servers
+    /// (llama-swap class deployments: one model resident, picks evict it) report offline for the
+    /// minutes a multi-shard reload takes — the plain 3-retries-in-7-seconds policy turned every
+    /// swap into a dead job. 0 disables the extended wait and keeps the old behavior.
+    /// </summary>
+    public static int ResolveSwapWaitBudgetSeconds(AgentPresetConfig preset)
+    {
+        if (preset?.SwapWaitSeconds is int configured && configured >= 0) return configured;
+        if (int.TryParse(Environment.GetEnvironmentVariable("AGENTMESH_SWAP_WAIT_SECONDS"), out var env) && env >= 0) return env;
+        return 600;
+    }
+
+    /// <summary>
+    /// A 5xx whose body names a model reload, not just any 5xx: a bare "Service Unavailable"
+    /// must keep the plain transient-retry behavior, or every ordinary blip parks the job for
+    /// the swap budget. Swap/reload servers say so in the body ("(titanium) is offline",
+    /// "loading", "warming up") — that self-description is the signal.
+    /// </summary>
+    internal static bool IsModelServerSwapSignal(int statusCode, string? errorContent) =>
+        statusCode >= 500 && statusCode < 600 && !string.IsNullOrEmpty(errorContent) &&
+            (errorContent.Contains("offline", StringComparison.OrdinalIgnoreCase)
+             || errorContent.Contains("loading", StringComparison.OrdinalIgnoreCase)
+             || errorContent.Contains("swapping", StringComparison.OrdinalIgnoreCase)
+             || errorContent.Contains("warm", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Conservative detector for "response ended the turn while promising to act" — the visible
+    /// half of the dropped-tool-call class (the reasoning/tool parser ate the call and left the
+    /// narration). Past-tense summaries ("I ran the tests and they pass") do not match; a
+    /// question in the closing stretch does not match either — the question heuristics own those.
+    /// </summary>
+    internal static bool LooksLikeUnexecutedIntent(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content) || content.Length > 2000) return false;
+        var tail = content[^Math.Min(400, content.Length)..];
+        if (tail.Contains('?')) return false;
+        var promisesAction = Regex.IsMatch(
+            content,
+            @"\b(I'?ll|I will|let me|I am going to|I'm going to|Next,? I will|Now I (?:will|check|run|read|look))\b",
+            RegexOptions.IgnoreCase);
+        if (!promisesAction) return false;
+        return Regex.IsMatch(
+            content,
+            @"\b(check|inspect|read|open|edit|modify|write|run|add|implement|fix|update|create|apply|test|retry|continue|proceed|look into|verify|submit)\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
     /// The credential this adapter would authenticate a run with.
     /// </summary>
     /// <remarks>
@@ -319,6 +368,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     public static int EstimateMessageTokens(OpenAiMessage message)
     {
         var charCount = (message.Role?.Length ?? 0) + (message.Content?.Length ?? 0);
+        // Round-tripped reasoning is billed input on every later turn — compaction must see it.
+        charCount += message.ReasoningContent?.Length ?? 0;
         if (message.ContentParts != null && message.ContentParts.Count > 0)
         {
             foreach (var part in message.ContentParts)
@@ -802,6 +853,31 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var compactionThresholdPercent = ResolveCompactionThresholdPercent(preset);
         var streamChunkIdleTimeoutSeconds = ResolveStreamChunkIdleTimeoutSeconds(preset);
 
+        // Request-shaping policy for this model+endpoint (Core ModelBehaviorProfiles): explicit
+        // preset override → learned endpoint facts → family table → empty default. An unknown
+        // model gets exactly the pre-registry request shape, so adding a registry row can never
+        // regress a model that row does not name.
+        var isLoopbackEndpoint = endpoint.Contains("localhost") || endpoint.Contains("127.0.0.1") || endpoint.Contains("[::1]");
+        var behaviorProfile = ModelBehaviorProfiles.Resolve(
+            effectiveModel,
+            isLoopbackEndpoint,
+            ParseDialectOverride(preset.SamplingDialect),
+            preset.Sampling,
+            ParseThinkingOverride(preset.ThinkingRoundTrip));
+
+        // Companion pre-flight: fail (or repair) in 20s instead of burning the retry budget — or a
+        // 600s prefill timeout — against a daemon that was never listening.
+        var (companionReady, companionGuidance) = await EnsureCompanionReadyAsync(preset, endpoint, onEvent, ct);
+        if (!companionReady)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "response",
+                Content = $"❌ {companionGuidance}"
+            });
+            return;
+        }
+
         ct.ThrowIfCancellationRequested();
         await onEvent(new TrajectoryEventPayload
         {
@@ -981,7 +1057,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
-        var toolsDefinition = isDirectMode ? null : GetToolDefinitions(isDiscoveryPhase);
+        // Tool schema is FROZEN across phases: the definition array sits inside the cached
+        // system prefix, so swapping it at every stage transition busts the very prefix the
+        // layers-1-5 prompt stack exists to keep warm — and mid-session tool-set churn also
+        // confuses models that learned the earlier list. Stage enforcement belongs in the
+        // executor (ExecuteToolLocallyRawAsync blocks write/edit/git-mutation/PR during
+        // discovery with instructive errors), which is both cache-stable and teaches the model
+        // why a call was refused instead of silently hiding the capability.
+        var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
 
         // Compaction: summarize older turns with the model (lossy fallback to truncation), then persist.
         async Task<(bool Changed, bool Summarized)> CompactAsync(int target, bool aggressive)
@@ -996,6 +1079,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var stepCount = 0;
         var readOnlyStreak = 0;
         var warnedBudget = false;
+        var profilePruneApplied = false;
+        var intentNudgesUsed = 0;
+        var swapWaitSecondsUsed = 0;
+        var swapWaitAttempt = 0;
+        var swapWaitBudgetSeconds = ResolveSwapWaitBudgetSeconds(preset);
+        // The sampling keys THIS request actually carried — the only names a 400 may learn
+        // against; base fields are never prunable.
+        var sentSamplingKeys = new List<string>();
         var streamRetryAttempt = 0;
         var responseEmitted = false;
         var askedQuestion = false;
@@ -1034,6 +1125,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             var retryAttempt = 0;
             var contentBuilder = new StringBuilder();
             var reasoningBuilder = new StringBuilder();
+            var reasoningShape = new ReasoningShapeTracker();
             var toolCallsByIndex = new SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)>();
             Exception? streamDropped = null;
 
@@ -1081,6 +1173,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     ["stream"] = true,
                     ["stream_options"] = new Dictionary<string, object> { ["include_usage"] = true }
                 };
+                // Rebuilt every step, so keys learned-rejected on a 400 moments ago are honored by
+                // the next iteration without extra bookkeeping.
+                sentSamplingKeys = ApplyProfileSampling(reqBody, behaviorProfile, effectiveModel);
 
                 if (toolsDefinition != null && toolsDefinition.Count > 0)
                 {
@@ -1154,9 +1249,15 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
 
                     var errorMsg = $"Failed to connect to OpenAI-compatible endpoint ({chatUrl}): {ex.Message}";
+                    // Hint is derived from the driver profile's own companion commands rather than a
+                    // named daemon binary; only when the profile declares none do we fall back to
+                    // generic proxy advice.
                     var isLocal = endpoint.Contains("localhost") || endpoint.Contains("127.0.0.1");
+                    var companionHint = BuildCompanionAuthHint(preset);
                     var extraHint = isLocal
-                        ? "\n\n💡 If using a driver companion daemon or local proxy (such as `aip proxy`), ensure the companion daemon is active and signed in (`aip login`). You can test and kickstart it via 'Verify Driver' or the interactive terminal in the Persona Environment modal."
+                        ? (companionHint != null
+                            ? $"\n\n💡 {companionHint} You can also test and kickstart the companion via 'Verify Driver' or the interactive terminal in the Persona Environment modal."
+                            : "\n\n💡 If a driver companion daemon or local proxy fronts this endpoint, ensure it is running and signed in. You can test and kickstart it via 'Verify Driver' or the interactive terminal in the Persona Environment modal.")
                         : "";
                     await onEvent(new TrajectoryEventPayload
                     {
@@ -1207,6 +1308,61 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         }
                     }
 
+                    // Profile self-heal: if the endpoint rejected a sampling key we added (or a
+                    // round-tripped reasoning field), learn that endpoint fact, prune, and retry
+                    // the step once. Only our own additions are prunable — base request fields
+                    // are out of reach — and the learning makes every later turn skip what was
+                    // rejected instead of re-triggering the 400.
+                    if (statusCode == 400 && !profilePruneApplied)
+                    {
+                        var didPrune = false;
+                        foreach (var rejectedKey in ParseRejectedRequestParameters(errContent, sentSamplingKeys))
+                        {
+                            if (ModelBehaviorProfiles.RecordRejectedSamplingKey(effectiveModel, rejectedKey))
+                                didPrune = true;
+                        }
+                        if (!didPrune &&
+                            errContent.Contains("reasoning_content", StringComparison.OrdinalIgnoreCase) &&
+                            history.Any(m => m.ReasoningContent != null) &&
+                            !ModelBehaviorProfiles.IsReasoningFieldRejected(effectiveModel))
+                        {
+                            ModelBehaviorProfiles.RecordReasoningFieldRejected(effectiveModel);
+                            didPrune = true;
+                        }
+                        if (didPrune)
+                        {
+                            profilePruneApplied = true;
+                            httpRes.Dispose();
+                            await onEvent(new TrajectoryEventPayload
+                            {
+                                EventType = "thought",
+                                Content = $"[@{preset.Id}] [Profile guard] The endpoint rejected part of the request shape for '{effectiveModel}' (unknown sampling parameter or reasoning field). Pruned it and retried the step — later turns will not send it."
+                            });
+                            continue;
+                        }
+                    }
+
+                    // Park through model swaps instead of dying on them: on a single-residency
+                    // swap server a 503/offline is a minutes-long weight reload, and the plain
+                    // retry policy spent its whole budget inside the first seconds of it. Backed
+                    // off here, the turn resumes on its own; disk-persisted session state makes
+                    // the pause safe. Budget exhausted -> falls through to the normal retry/❌
+                    // path unchanged.
+                    if (IsModelServerSwapSignal(statusCode, errContent) && swapWaitSecondsUsed < swapWaitBudgetSeconds)
+                    {
+                        var swapDelaySeconds = Math.Min(60, 3 * (int)Math.Pow(2, swapWaitAttempt));
+                        swapWaitAttempt++;
+                        swapWaitSecondsUsed += swapDelaySeconds;
+                        httpRes.Dispose();
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] [Swap guard] The model server returned HTTP {statusCode} and describes itself as unavailable — likely a swap/reload, which takes minutes. Paused {swapWaitSecondsUsed}s of a {swapWaitBudgetSeconds}s budget this turn; retrying in {swapDelaySeconds}s. The job is parked, not failed."
+                        });
+                        await Task.Delay(TimeSpan.FromSeconds(swapDelaySeconds), ct);
+                        continue;
+                    }
+
                     if (IsRetryableStatusCode(statusCode) && retryAttempt < maxRetries)
                     {
                         retryAttempt++;
@@ -1222,10 +1378,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
 
                     var errorMsg = $"OpenAI server error (HTTP {statusCode} {httpRes.ReasonPhrase}): {errContent}";
+                    var companionAuthHint = statusCode == 401 ? BuildCompanionAuthHint(preset) : null;
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "response",
-                        Content = $"❌ {errorMsg}"
+                        Content = companionAuthHint == null ? $"❌ {errorMsg}" : $"❌ {errorMsg}\n\n{companionAuthHint}"
                     });
                     httpRes.Dispose();
                     return;
@@ -1300,7 +1457,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         try
                         {
                             using var doc = JsonDocument.Parse(fullJson);
-                            ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens);
+                            ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens, reasoningShape);
                         }
                         catch { }
                         break;
@@ -1315,7 +1472,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     try
                     {
                         using var doc = JsonDocument.Parse(data);
-                        ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens);
+                        ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens, reasoningShape);
                     }
                     catch
                     {
@@ -1514,12 +1671,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 }
 
                 // Add assistant response with tool_calls and corresponding tool output messages
-                history.Add(new OpenAiMessage
+                var nativeAssistantMessage = new OpenAiMessage
                 {
                     Role = "assistant",
                     Content = string.IsNullOrWhiteSpace(finalContent) ? null : finalContent,
                     ToolCalls = executedToolCalls
-                });
+                };
+                MaybeAttachReasoningToHistory(nativeAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                history.Add(nativeAssistantMessage);
 
                 foreach (var (cId, output) in toolResults)
                 {
@@ -1534,6 +1693,17 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                 if (prOpened)
                 {
+                    // The turn must end on a terminal response event. Returning silently made the
+                    // runner treat a SUCCESSFUL PR submission as an unterminated turn, and its
+                    // safety net then blamed whatever stale tool error happened to be recorded
+                    // anywhere in the turn — a PR-opening job filed as ❌ with an unrelated edit
+                    // miss in the message.
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = (string.IsNullOrWhiteSpace(finalContent) ? "" : finalContent.Trim() + "\n\n")
+                            + "Pull request registered for this branch — turn yielded to the review gate."
+                    });
                     return;
                 }
 
@@ -1667,7 +1837,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var isError = IsToolResultError(toolResult);
                     if (!isError)
                     {
-                        history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
+                        var checklistAssistantMessage = new OpenAiMessage { Role = "assistant", Content = finalContent };
+                        MaybeAttachReasoningToHistory(checklistAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                        history.Add(checklistAssistantMessage);
                         history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
                         SaveHistoryToDisk(promptEvent.SessionId, history);
 
@@ -1691,12 +1863,21 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
                         SaveHistoryToDisk(promptEvent.SessionId, history);
 
+                        // Same terminal-event contract as the native tool-call path above.
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = (string.IsNullOrWhiteSpace(finalContent) ? "" : finalContent.Trim() + "\n\n")
+                                + "Pull request registered for this branch — turn yielded to the review gate."
+                        });
                         responseEmitted = true;
                         return;
                     }
                 }
 
-                history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
+                var fallbackAssistantMessage = new OpenAiMessage { Role = "assistant", Content = finalContent };
+                MaybeAttachReasoningToHistory(fallbackAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                history.Add(fallbackAssistantMessage);
                 history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
                 SaveHistoryToDisk(promptEvent.SessionId, history);
                 continue;
@@ -1733,7 +1914,49 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 ? finalContent
                 : (reasoningBuilder.Length > 0 ? reasoningBuilder.ToString().Trim() : "Turn completed.");
 
-            history.Add(new OpenAiMessage { Role = "assistant", Content = effectiveContent });
+            // Continuation nudge for the silent tool-call-drop class: a turn-ending response
+            // that PROMISES action without issuing a tool call is not a conclusion — the call
+            // was likely swallowed server-side (parsers lose these at chunk boundaries, so a
+            // retry frequently succeeds). Re-prompt instead of ending; bounded at 2 per turn so
+            // a genuinely stuck model still concludes. Toolless direct mode is exempt.
+            if (toolsDefinition != null && intentNudgesUsed < 2 && LooksLikeUnexecutedIntent(effectiveContent))
+            {
+                intentNudgesUsed++;
+                var narratedTurn = new OpenAiMessage { Role = "assistant", Content = effectiveContent };
+                MaybeAttachReasoningToHistory(narratedTurn, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                history.Add(narratedTurn);
+                history.Add(new OpenAiMessage
+                {
+                    Role = "user",
+                    Content = "[Harness guard] Your previous message announced an action but no tool call arrived and no result is pending (" + intentNudgesUsed + "/2 nudges). If the tool call was lost in transport, issue it again now. If the work is genuinely finished, reply with your final summary and no action promises."
+                });
+                SaveHistoryToDisk(promptEvent.SessionId, history);
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[@{preset.Id}] [Harness guard] Turn-ending response narrated an unexecuted action — injected continuation nudge ({intentNudgesUsed}/2)."
+                });
+                stepCount++;
+                continue;
+            }
+
+            // Some companion gateways strip streaming `usage` entirely (live forensics: 54 of 62
+            // usage rows had inputTokens=0), which leaves cost telemetry blind and never feeds the
+            // learned-context-limit path. Fall back to the same chars/3.6 estimator compaction uses,
+            // flagged so estimated is never mistaken for measured — and a floor, since the estimate
+            // covers only the final step's prompt, not the cumulative tool loop.
+            var usageEstimated = false;
+            if (totalInputTokens == 0 && totalOutputTokens == 0)
+            {
+                totalInputTokens = EstimateTotalTokens(history);
+                totalOutputTokens = (long)Math.Ceiling(effectiveContent.Length / 3.6);
+                totalTokens = totalInputTokens + totalOutputTokens;
+                usageEstimated = true;
+            }
+
+            var finalAssistantMessage = new OpenAiMessage { Role = "assistant", Content = effectiveContent };
+            MaybeAttachReasoningToHistory(finalAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+            history.Add(finalAssistantMessage);
 
             sw.Stop();
             var duration = sw.Elapsed.TotalSeconds;
@@ -1751,7 +1974,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         inputTokens = totalInputTokens,
                         outputTokens = totalOutputTokens,
                         totalTokens = totalTokens > 0 ? totalTokens : totalInputTokens + totalOutputTokens,
-                        durationSeconds = duration
+                        durationSeconds = duration,
+                        estimated = usageEstimated
                     }
                 });
             }
@@ -1887,6 +2111,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             sw.Stop();
             var duration = sw.Elapsed.TotalSeconds;
+            var checkpointUsageEstimated = false;
+            if (totalInputTokens == 0 && totalOutputTokens == 0)
+            {
+                totalInputTokens = EstimateTotalTokens(history);
+                totalOutputTokens = (long)Math.Ceiling(finalMsg.Length / 3.6);
+                totalTokens = totalInputTokens + totalOutputTokens;
+                checkpointUsageEstimated = true;
+            }
             string? structuredJson = null;
             if (totalTokens > 0 || duration > 0)
             {
@@ -1901,7 +2133,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         inputTokens = totalInputTokens,
                         outputTokens = totalOutputTokens,
                         totalTokens = totalTokens > 0 ? totalTokens : totalInputTokens + totalOutputTokens,
-                        durationSeconds = duration
+                        durationSeconds = duration,
+                        estimated = checkpointUsageEstimated
                     }
                 });
             }
@@ -1963,7 +2196,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return sb.ToString();
     }
 
-    public static List<object> GetToolDefinitions(bool isDiscoveryPhase = false)
+    public static List<object> GetToolDefinitions()
     {
         var tools = new List<object>
         {
@@ -2159,8 +2392,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             }
         };
 
-        if (!isDiscoveryPhase)
         {
+            // Always present regardless of phase — see the tool-schema-freeze note at the
+            // ExecutePromptAsync call site. Stage enforcement lives in the executor, which
+            // returns instructive refusals instead of hiding capabilities from the model.
             tools.Add(new
             {
                 type = "function",
@@ -2187,7 +2422,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 function = new
                 {
                     name = "edit_file",
-                    description = "Replace a target string within an existing file with replacement text.",
+                    description = "Replace a target string within an existing file with replacement text. The target must occur exactly once — include surrounding lines to make it unique — or the edit is refused with the occurrence count, unless replace_all is set.",
                     parameters = new
                     {
                         type = "object",
@@ -2195,7 +2430,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         {
                             path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
                             target = new { type = "string", description = "The exact character sequence in the file to be replaced." },
-                            replacement = new { type = "string", description = "The text to replace target with." }
+                            replacement = new { type = "string", description = "The text to replace target with." },
+                            replace_all = new { type = "boolean", description = "Set true only when every occurrence of the exact target string should be replaced. Default false: an ambiguous target is refused rather than silently replacing everywhere." }
                         },
                         required = new[] { "path", "target", "replacement" }
                     }
@@ -2418,6 +2654,10 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     // The exit code line is what the adapters and existing tests key on. For a timeout the
                     // diagnostic already names 124; repeating it keeps one source of truth for the number.
                     sb.Append($"Exit Code: {result.ExitCode}");
+                    if (result.ExitCode == 1 && IsBenignExitOneCommand(cmd))
+                    {
+                        sb.Append(" — note: exit 1 is a NORMAL RESULT for this command (no matches / files differ / condition false). Treat it as an answer, not a failure.");
+                    }
 
                     if (result.LogFilePath != null && !result.Output.Contains(result.LogFilePath, StringComparison.Ordinal))
                     {
@@ -2491,21 +2731,78 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                     var target = GetPropertyString(root, "target", "Target", "old_string", "oldText", "TargetContent", "target_content", "old_content", "search", "find");
                     var replacement = GetPropertyString(root, "replacement", "Replacement", "new_string", "newText", "ReplacementContent", "replacement_content", "new_content", "replace") ?? string.Empty;
+                    var replaceAll = GetPropertyBool(root, "replace_all", "replaceAll");
 
                     if (string.IsNullOrEmpty(target)) return "Error: 'target' argument is required.";
 
                     var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(cwd, path);
-                    if (!File.Exists(fullPath)) return $"Error: File '{path}' does not exist.";
+                    if (!File.Exists(fullPath)) return $"Error: File '{path}' does not exist. Verify the path with 'run_command' (ls) or read_file before editing; do not edit files you have not confirmed exist.";
 
                     var fileText = await File.ReadAllTextAsync(fullPath, ct);
-                    if (!fileText.Contains(target))
+                    var occurrences = CountSubstringOccurrences(fileText, target);
+                    var viaNormalizedMatch = false;
+                    var normalizedStart = 0;
+                    var normalizedLength = 0;
+
+                    if (occurrences == 0)
                     {
-                        return $"Error: Target string not found in '{path}'.";
+                        // The read_file view prefixes every line with "N: ". A target copied
+                        // straight out of that view carries prefixes the file does not have —
+                        // an exact miss the model cannot diagnose from a bare "not found", and
+                        // an independent reproduction identified precisely this coordinate
+                        // mismatch (line-numbered views vs exact-text edit targets) as the top
+                        // interface failure. If EVERY non-blank target line carries a display
+                        // prefix, try the stripped form; a unique stripped match proceeds and the
+                        // result says so. All-lines-required keeps an ambiguous target that
+                        // legitimately contains "42:" from being silently rewritten.
+                        var strippedTarget = StripDisplayLinePrefixesFromEachLine(target);
+                        var strippedMatches = strippedTarget != target ? FindOccurrencesNormalized(fileText, strippedTarget) : new List<NormalizedMatch>();
+                        if (strippedMatches.Count == 1)
+                        {
+                            viaNormalizedMatch = true;
+                            normalizedStart = strippedMatches[0].Start;
+                            normalizedLength = strippedMatches[0].Length;
+                        }
+                        else if (strippedMatches.Count > 1)
+                        {
+                            return $"Error: Target string appears {strippedMatches.Count} times in '{path}' once display 'N:' line-number prefixes are ignored. Add surrounding lines to make the match unique, or set replace_all=true if every occurrence should be replaced.";
+                        }
+                        else if (strippedTarget != target)
+                        {
+                            return $"Error: Target string not found in '{path}' (0 matches — also checked with 'N:' line-number prefixes stripped from each line). Copy the text AFTER the ': ' prefix when quoting from a read_file view; those prefixes are display-only. If the file changed since you read it, read it again first — indentation itself must match character-for-character.";
+                        }
+                        else
+                        {
+                            return $"Error: Target string not found in '{path}' (0 matches). Re-read the file and copy the exact text including surrounding lines — whitespace and indentation must match character-for-character. If you copied from a read_file view, the leading 'N:' line numbers are display-only and must not be part of the target. If the file changed since you read it, read it again first.";
+                        }
                     }
 
-                    var updatedText = fileText.Replace(target, replacement);
+                    if (!viaNormalizedMatch && occurrences > 1 && !replaceAll)
+                    {
+                        return $"Error: Target string appears {occurrences} times in '{path}'. Add surrounding lines to make the match unique, or set replace_all=true if every occurrence should be replaced.";
+                    }
+
+                    string updatedText;
+                    if (viaNormalizedMatch)
+                    {
+                        updatedText = string.Concat(fileText.AsSpan(0, normalizedStart), replacement, fileText.AsSpan(normalizedStart + normalizedLength));
+                    }
+                    else if (occurrences > 1 && replaceAll)
+                    {
+                        updatedText = fileText.Replace(target, replacement);
+                    }
+                    else
+                    {
+                        // A unique target uses ReplaceFirst so an accidental replace_all=true can
+                        // never widen a single-match edit; multi-site writes require >1 occurrence.
+                        updatedText = ReplaceFirstOrdinal(fileText, target, replacement);
+                    }
                     await File.WriteAllTextAsync(fullPath, updatedText, Encoding.UTF8, ct);
-                    return $"Successfully replaced target in '{path}'.";
+                    if (viaNormalizedMatch)
+                        return $"Successfully replaced target in '{path}' (matched after ignoring the 'N:' line-number prefixes from your copy).";
+                    return occurrences > 1
+                        ? $"Successfully replaced all {occurrences} occurrences in '{path}'."
+                        : $"Successfully replaced target in '{path}'.";
                 }
 
                 case "ask_question":
@@ -2723,7 +3020,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return false;
     }
 
-    private static (bool HasTool, string? Name, string? Args) TryParseFallbackToolCall(string content)
+    internal static (bool HasTool, string? Name, string? Args) TryParseFallbackToolCall(string content)
     {
         if (string.IsNullOrWhiteSpace(content)) return (false, null, null);
 
@@ -2768,7 +3065,41 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             return (true, "ask_question", qMatch.Groups[1].Value);
         }
 
+        // Qwen3-Coder/Next XML tool format — the leak shape reasoning/tool parsers have a long
+        // documented history of dropping into `content` instead of `tool_calls` (and which this
+        // model family demonstrably produced inside this very project session). Served as an
+        // execution path so a leaked call still runs instead of ending the turn as prose.
+        // When several calls leak in one message, only the first executes per step; the loop
+        // re-offers the remaining content to the model, which typically re-emits them.
+        var qwenXmlMatch = Regex.Match(content, @"<function=(?<name>[\w.\-]+)>(?<body>.*?)</function>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (qwenXmlMatch.Success)
+        {
+            var fnName = qwenXmlMatch.Groups["name"].Value.Trim();
+            var argsObj = new Dictionary<string, object?>();
+            foreach (Match p in Regex.Matches(qwenXmlMatch.Groups["body"].Value,
+                         @"<parameter=(?<k>[\w.\-]+)>(?<v>.*?)</parameter>", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+            {
+                argsObj[p.Groups["k"].Value.Trim()] = CoerceXmlParamValue(p.Groups["v"].Value.Trim());
+            }
+            if (!string.IsNullOrWhiteSpace(fnName))
+                return (true, fnName, argsObj.Count == 0 ? "{}" : JsonSerializer.Serialize(argsObj));
+        }
+
         return (false, null, null);
+    }
+
+    internal static object? CoerceXmlParamValue(string raw)
+    {
+        if (raw.Length == 0) return "";
+        if (long.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var l))
+            return l; // integers stay integers so downstream TryGetInt32 keeps working
+        if (double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var d))
+            return d;
+        if (string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)) return true;
+        if (string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.Equals(raw, "null", StringComparison.OrdinalIgnoreCase)) return null;
+        return raw;
     }
 
     internal static string? GetPropertyString(JsonElement root, params string[] names)
@@ -2843,6 +3174,435 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return null;
     }
 
+    internal static bool GetPropertyBool(JsonElement root, params string[] names)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return false;
+        foreach (var prop in root.EnumerateObject())
+        {
+            foreach (var name in names)
+            {
+                if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.True) return true;
+                    if (prop.Value.ValueKind == JsonValueKind.String &&
+                        bool.TryParse(prop.Value.GetString(), out var b) && b)
+                    {
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    internal static int CountSubstringOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+        return count;
+    }
+
+    internal readonly record struct NormalizedMatch(int Start, int Length);
+
+    /// <summary>
+    /// Line-wise match: joins the (already prefix-stripped) target lines with a newline pattern
+    /// so a \n-rendered target can match a \r\n file and vice versa.
+    /// </summary>
+    internal static List<NormalizedMatch> FindOccurrencesNormalized(string text, string targetLinesJoined)
+    {
+        var matches = new List<NormalizedMatch>();
+        if (targetLinesJoined.Length == 0) return matches;
+        var lines = targetLinesJoined.Replace("\r\n", "\n").Split('\n');
+        var pattern = string.Join(@"\r?\n", lines.Select(Regex.Escape));
+        foreach (Match m in Regex.Matches(text, pattern))
+        {
+            // Line-copy semantics: a paste from the numbered view must match from the start of a
+            // real line, so stripping "1: meaning" can never "match" inside an unrelated line
+            // like "42: meaning". Without this guard, normalization would rewrite a substring of
+            // a legitimately-numbered file line — the exact silent corruption the whole guard
+            // exists to prevent.
+            if (m.Index == 0 || text[m.Index - 1] == '\n')
+            {
+                matches.Add(new NormalizedMatch(m.Index, m.Length));
+            }
+        }
+        return matches;
+    }
+
+    /// <summary>
+    /// Strips read_file's "N: " display prefix from every non-blank line, but ONLY when every
+    /// non-blank line carries one (i.e. the target really was pasted from the numbered view);
+    /// otherwise returns the input unchanged so no file content is ever interpreted as chrome.
+    /// </summary>
+    internal static string StripDisplayLinePrefixesFromEachLine(string target)
+    {
+        var lines = target.Split('\n');
+        var sawContentLine = false;
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i].EndsWith('\r') ? lines[i][..^1] : lines[i];
+            if (line.Trim().Length == 0) continue;
+            sawContentLine = true;
+            var stripped = Regex.Replace(line, @"^\s*\d+:\s?", "");
+            if (stripped == line) return target; // a line without a view prefix — not a display copy
+            lines[i] = stripped + (lines[i].EndsWith('\r') ? "\r" : "");
+        }
+        return sawContentLine ? string.Join("\n", lines) : target;
+    }
+
+    /// <summary>
+    /// Commands for which exit 1 is a legitimate ANSWER (no matches / files differ / test false),
+    /// not a failure. Without this classification, a benign `grep` miss reads as "command failed"
+    /// and sends agents into debugging detours — the same per-command classification a leading
+    /// coding harness applies for exactly that reason.
+    /// </summary>
+    internal static bool IsBenignExitOneCommand(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return false;
+        var firstToken = command.TrimStart().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+        var bare = Path.GetFileName(firstToken.TrimEnd('(', ')', '&', ';', '|', '>', '<'));
+        if (bare is "grep" or "egrep" or "fgrep" or "rg" or "ugrep" or "bfs" or "ag" or "ack"
+                   or "diff" or "diff3" or "sdiff" or "cmp" or "comm" or "find" or "test" or "[")
+        {
+            return true;
+        }
+        var oneLine = command.Replace('\n', ' ');
+        return oneLine.Contains("git grep", StringComparison.OrdinalIgnoreCase)
+               || Regex.IsMatch(oneLine, @"git\s+diff\b.*--exit-code");
+    }
+
+    internal static string ReplaceFirstOrdinal(string text, string search, string replace)
+    {
+        var index = text.IndexOf(search, StringComparison.Ordinal);
+        if (index < 0) return text;
+        return string.Concat(text.AsSpan(0, index), replace, text.AsSpan(index + search.Length));
+    }
+
+    internal static async Task<bool> IsTcpPortOpenAsync(string host, int port, CancellationToken ct)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(1000);
+            await client.ConnectAsync(host, port, timeout.Token);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Launches a companion daemon (per its configured command line) detached, with its stdio
+    /// discarded so a long-lived proxy cannot keep the runner's own output pipes open.
+    /// </summary>
+    internal static void StartCompanionDetached(string command)
+    {
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return;
+        try
+        {
+            // Detach at the shell level: the daemon's fds are repointed at /dev/null before exec,
+            // so it cannot hold the runner's own stdout/stderr pipes open past our exit, and the
+            // outer sh returns immediately instead of leaving us a zombie to reap.
+            var psi = new ProcessStartInfo
+            {
+                FileName = "/bin/sh",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add($"( {command} ) </dev/null >/dev/null 2>&1 &");
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(3000);
+        }
+        catch
+        {
+            // Readiness is re-probed on the port; a failed launch surfaces as not-ready.
+        }
+    }
+
+    /// <summary>
+    /// Runs a shell check (e.g. the driver's auth verification command) and reports whether it
+    /// passed. Returns null when the check could not run or timed out — unknown, not failed.
+    /// </summary>
+    internal static async Task<bool?> RunShellCheckAsync(string command, int timeoutSeconds, CancellationToken ct)
+    {
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return null;
+        Process? proc = null;
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "/bin/sh",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("-lc");
+            psi.ArgumentList.Add(command);
+            proc = Process.Start(psi);
+            if (proc == null) return null;
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+            await proc.WaitForExitAsync(timeout.Token);
+            return proc.ExitCode == 0;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return null; // timed out — unknown, not failed; the finally reaps it
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            if (proc != null)
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                proc.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pre-flight for the driver-companion port fronting a loopback OpenAI-compatible endpoint.
+    /// </summary>
+    /// <remarks>
+    /// Every fact here comes from the generic <see cref="DriverSidecarConfig"/> fields — command
+    /// line, port, login and auth-check commands — so no driver binary is named and any companion
+    /// that "listens on a local port, is started by a command, and is verified by a command" gets
+    /// the same treatment. Live-trajectory forensics (2026-11-15) showed persona turns burning
+    /// their retry budget against a companion that was simply not listening; a 20s pre-flight with
+    /// an actionable guidance string is cheaper than three backoffs against a dead socket, and
+    /// catches expired companion logins before they masquerade as model failures.
+    /// </remarks>
+    internal static async Task<(bool Ready, string? Guidance)> EnsureCompanionReadyAsync(
+        AgentPresetConfig preset,
+        string endpoint,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        var sc = preset.Sidecar;
+        if (sc is not { Enabled: true } || sc.CompanionPort is not int companionPort)
+            return (true, null);
+
+        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri) ||
+            !(endpointUri.IsLoopback || endpointUri.Host is "localhost" or "127.0.0.1" or "::1"))
+        {
+            return (true, null); // companion fronts a remote route we cannot health-probe from here
+        }
+
+        if (await IsTcpPortOpenAsync("127.0.0.1", companionPort, ct))
+            return (true, null);
+
+        if (string.IsNullOrWhiteSpace(sc.CompanionCommand))
+        {
+            return (false,
+                $"No driver companion is listening on 127.0.0.1:{companionPort} and the driver profile sets no companion command to start it. " +
+                $"Start the daemon that serves {endpoint} before dispatching again" +
+                (!string.IsNullOrWhiteSpace(sc.LoginCommand) ? $", and verify sign-in with: {sc.LoginCommand}" : "") + ".");
+        }
+
+        await onEvent(new TrajectoryEventPayload
+        {
+            EventType = "thought",
+            Content = $"[@{preset.Id}] Driver companion is not listening on 127.0.0.1:{companionPort}. Starting it: `{sc.CompanionCommand}`..."
+        });
+
+        StartCompanionDetached(sc.CompanionCommand);
+
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        var up = false;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (await IsTcpPortOpenAsync("127.0.0.1", companionPort, ct))
+            {
+                up = true;
+                break;
+            }
+            await Task.Delay(500, ct);
+        }
+
+        if (!up)
+        {
+            return (false,
+                $"Started the driver companion (`{sc.CompanionCommand}`) but nothing came up on 127.0.0.1:{companionPort} within 20s. " +
+                "Check the companion daemon's logs on the host serving " + endpoint +
+                (!string.IsNullOrWhiteSpace(sc.AuthCheckCommand) ? $"; verify with: `{sc.AuthCheckCommand}`" : "") +
+                (!string.IsNullOrWhiteSpace(sc.LoginCommand) ? $", and sign in with: `{sc.LoginCommand}`" : "") + ".");
+        }
+
+        await onEvent(new TrajectoryEventPayload
+        {
+            EventType = "thought",
+            Content = $"[@{preset.Id}] Driver companion ready on 127.0.0.1:{companionPort}."
+        });
+
+        // Only pay the cost of an auth probe when we just (re)started the daemon — a warm companion
+        // that is mid-expiry will still fail fast with a 401, which gets its own hint below.
+        if (!string.IsNullOrWhiteSpace(sc.AuthCheckCommand))
+        {
+            var authOk = await RunShellCheckAsync(sc.AuthCheckCommand, 15, ct);
+            if (authOk == false)
+            {
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[@{preset.Id}] [Companion guard] Auth check `{sc.AuthCheckCommand}` FAILED after a cold companion start. " +
+                              (!string.IsNullOrWhiteSpace(sc.LoginCommand)
+                                  ? $"Sign in with `{sc.LoginCommand}` on the host serving {endpoint} — turns will be rejected until then."
+                                  : "The companion appears to need sign-in on the host serving the endpoint.")
+                });
+            }
+            else if (authOk == true)
+            {
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[@{preset.Id}] Companion auth check passed."
+                });
+            }
+        }
+
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Config-derived guidance for companion auth/connection failures, so hint text describes the
+    /// driver's actual commands instead of naming any particular daemon binary.
+    /// </summary>
+    internal static string? BuildCompanionAuthHint(AgentPresetConfig preset)
+    {
+        var sc = preset.Sidecar;
+        if (sc is not { Enabled: true }) return null;
+        var login = !string.IsNullOrWhiteSpace(sc.LoginCommand) ? sc.LoginCommand : preset.LoginCommand;
+        var authCheck = !string.IsNullOrWhiteSpace(sc.AuthCheckCommand) ? sc.AuthCheckCommand : preset.AuthCheckCommand;
+        if (string.IsNullOrWhiteSpace(login) && string.IsNullOrWhiteSpace(authCheck)) return null;
+        var parts = new List<string> { "The driver companion fronting this endpoint appears not to be signed in." };
+        if (!string.IsNullOrWhiteSpace(authCheck)) parts.Add($"Verify with `{authCheck}`");
+        if (!string.IsNullOrWhiteSpace(login)) parts.Add($"sign in with `{login}`");
+        return string.Join("; ", parts) + " on the host serving the endpoint, then retry.";
+    }
+
+    // ---- model-behavior profile wiring (see Core ModelBehaviorProfiles) ----
+
+    private static SamplingDialect? ParseDialectOverride(string? raw) =>
+        Enum.TryParse<SamplingDialect>(raw, ignoreCase: true, out var d) ? d : null;
+
+    private static ThinkingRoundTrip? ParseThinkingOverride(string? raw) =>
+        Enum.TryParse<ThinkingRoundTrip>(raw, ignoreCase: true, out var t) ? t : null;
+
+    internal static List<string> ApplyProfileSampling(Dictionary<string, object?> reqBody, ModelBehaviorProfile profile, string model)
+    {
+        var sent = new List<string>();
+        if (profile.Sampling == null) return sent;
+        foreach (var kvp in profile.Sampling)
+        {
+            if (!profile.MaySendSamplingKey(model, kvp.Key)) continue;
+            reqBody[kvp.Key] = kvp.Value == Math.Floor(kvp.Value) && Math.Abs(kvp.Value) < 1e15
+                ? (long)kvp.Value
+                : kvp.Value;
+            sent.Add(kvp.Key);
+        }
+        return sent;
+    }
+
+    /// <summary>
+    /// Matches endpoint parameter names against a 400 body, restricted to the keys WE added, so
+    /// learned pruning can never delete a base request field. Requires a parameter-rejection
+    /// phrase in the body to avoid mis-learning on unrelated 400s.
+    /// </summary>
+    internal static List<string> ParseRejectedRequestParameters(string errorContent, IReadOnlyCollection<string> candidateKeys)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrWhiteSpace(errorContent) || candidateKeys.Count == 0) return result;
+        var looksLikeParamRejection =
+            errorContent.Contains("unrecognized", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("unknown parameter", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("extra inputs", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("not permitted", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("additional properties", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("unexpected parameter", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("unsupported parameter", StringComparison.OrdinalIgnoreCase);
+        if (!looksLikeParamRejection) return result;
+        foreach (var key in candidateKeys)
+        {
+            if (Regex.IsMatch(errorContent, $@"\b{Regex.Escape(key)}\b", RegexOptions.IgnoreCase))
+                result.Add(key);
+        }
+        return result;
+    }
+
+    internal sealed class ReasoningShapeTracker
+    {
+        public bool SawField { get; private set; }
+        public bool SawInlineTags { get; private set; }
+
+        public void NoteField() => SawField = true;
+
+        public void NoteInline(string? textChunk)
+        {
+            if (!string.IsNullOrEmpty(textChunk) &&
+                (textChunk.Contains("<think>") || textChunk.Contains("</think>")))
+            {
+                SawInlineTags = true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Round-trips the model's reasoning into assistant history per the resolved policy.
+    /// Qwen's official guidance is that stripping reasoning from multi-step tool history
+    /// measurably degrades quality, so Echo mode mirrors the inbound shape: reasoning that
+    /// arrived as a dedicated field goes back as that field; reasoning that stayed inline in
+    /// content needs no action (it is already there). Inline re-embedding is tag-balanced or
+    /// skipped — an unclosed think block corrupts every later turn's rendering.
+    /// </summary>
+    internal static void MaybeAttachReasoningToHistory(
+        OpenAiMessage assistantMessage,
+        string reasoningText,
+        ReasoningShapeTracker shape,
+        ModelBehaviorProfile profile,
+        string model)
+    {
+        if (string.IsNullOrWhiteSpace(reasoningText)) return;
+        var mode = profile.ThinkingRoundTripMode;
+        if (mode == ThinkingRoundTrip.Off) return;
+
+        var rejected = ModelBehaviorProfiles.IsReasoningFieldRejected(model);
+        var useField = mode switch
+        {
+            ThinkingRoundTrip.Field => !rejected,
+            ThinkingRoundTrip.Inline => false,
+            _ => shape.SawField && !rejected,
+        };
+
+        if (useField)
+        {
+            assistantMessage.ReasoningContent = reasoningText.Trim();
+            return;
+        }
+
+        // Inline: forced mode, or Echo downgraded after the endpoint rejected the field —
+        // which is the vendor's documented workaround verbatim ("pass the content as it is").
+        var safe = ModelBehaviorProfiles.SanitizeInlineThinking(reasoningText);
+        if (safe == null) return;
+        var content = assistantMessage.Content;
+        if (content != null && (content.Contains("<think>") || content.Contains("</think>"))) return; // already inline
+        assistantMessage.Content = $"<think>\n{safe}\n</think>\n\n" + (content ?? "");
+    }
+
     private static void ParseOpenAiChunkOrMessage(
         JsonElement root,
         StringBuilder contentBuilder,
@@ -2850,7 +3610,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)> toolCallsByIndex,
         ref long totalInputTokens,
         ref long totalOutputTokens,
-        ref long totalTokens)
+        ref long totalTokens,
+        ReasoningShapeTracker? shape = null)
     {
         // Check usage in chunk/message
         if (root.TryGetProperty("usage", out var usageElem) && usageElem.ValueKind == JsonValueKind.Object)
@@ -2876,6 +3637,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!string.IsNullOrEmpty(textChunk))
             {
                 contentBuilder.Append(textChunk);
+                shape?.NoteInline(textChunk);
             }
         }
         else if (choice.TryGetProperty("text", out var tProp) && tProp.ValueKind == JsonValueKind.String)
@@ -2884,6 +3646,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!string.IsNullOrEmpty(textChunk))
             {
                 contentBuilder.Append(textChunk);
+                shape?.NoteInline(textChunk);
             }
         }
 
@@ -2898,6 +3661,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!string.IsNullOrEmpty(reasoningChunk))
             {
                 reasoningBuilder.Append(reasoningChunk);
+                shape?.NoteField();
             }
         }
 
@@ -2949,6 +3713,15 @@ public class OpenAiMessage
     [JsonIgnore]
     public List<object>? ContentParts { get; set; }
 
+    /// <summary>
+    /// The model's own reasoning, round-tripped in assistant history per the resolved
+    /// <see cref="ThinkingRoundTrip"/> policy. Emitted only when set — servers that never
+    /// separated reasoning will never see this field.
+    /// </summary>
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; set; }
+
     [JsonPropertyName("tool_call_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ToolCallId { get; set; }
@@ -2970,6 +3743,7 @@ public class OpenAiMessage
     {
         Role = Role,
         Content = Content,
+        ReasoningContent = ReasoningContent,
         ContentParts = ContentParts,
         ToolCallId = ToolCallId,
         ToolCalls = ToolCalls,
@@ -2987,6 +3761,7 @@ public class OpenAiMessage
             dict["content"] = Content;
         }
         if (!string.IsNullOrEmpty(ToolCallId)) dict["tool_call_id"] = ToolCallId;
+        if (ReasoningContent != null) dict["reasoning_content"] = ReasoningContent;
         if (ToolCalls != null && ToolCalls.Count > 0)
         {
             dict["tool_calls"] = ToolCalls.Select(tc => new

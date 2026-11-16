@@ -620,10 +620,16 @@ public class AgentRunnerInstance : IAsyncDisposable
                 }
 
                 if (string.Equals(trajectoryEv.EventType, "tool_result", StringComparison.OrdinalIgnoreCase) &&
-                    trajectoryEv.ToolResultJson != null &&
-                    trajectoryEv.ToolResultJson.TrimStart().StartsWith("Error:", StringComparison.OrdinalIgnoreCase))
+                    trajectoryEv.ToolResultJson != null)
                 {
-                    lastRecordedError = $"{trajectoryEv.ToolName}: {trajectoryEv.ToolResultJson}";
+                    // Only the TRAILING run of failures may be blamed by the fallback below. A
+                    // turn's earlier misses are usually recovered from two steps later; carrying
+                    // one forward and presenting it as the turn's cause turned routine recoveries
+                    // into ❌ "Turn halted due to platform tool error" narratives the model itself
+                    // had already moved past.
+                    lastRecordedError = trajectoryEv.ToolResultJson.TrimStart().StartsWith("Error:", StringComparison.OrdinalIgnoreCase)
+                        ? $"{trajectoryEv.ToolName}: {trajectoryEv.ToolResultJson}"
+                        : null;
                 }
 
                 if (!string.IsNullOrWhiteSpace(trajectoryEv.StructuredPayloadJson))

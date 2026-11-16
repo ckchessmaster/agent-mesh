@@ -35,6 +35,9 @@ public class AgentPresetConfig
     public string? DefaultModel { get; set; }
     public Dictionary<string, string>? CustomHeaders { get; set; }
     public int? TimeoutSeconds { get; set; }
+    // Per-turn budget (seconds) for waiting out model-server swaps/reloads when the server
+    // reports itself offline; 0 disables extended waiting. See ResolveSwapWaitBudgetSeconds.
+    public int? SwapWaitSeconds { get; set; }
     public int? MaxRetries { get; set; }
     public int? RetryDelayMilliseconds { get; set; }
     public int? MaxSteps { get; set; }
@@ -46,6 +49,15 @@ public class AgentPresetConfig
     public string? LoginCommand { get; set; }
     public string? AuthCheckCommand { get; set; }
     public DriverSidecarConfig? Sidecar { get; set; }
+
+    // Request-shaping overrides (see Core ModelBehaviorProfiles). Unset = registry/learned/default.
+    // "auto" | "strict" | "extended"
+    public string? SamplingDialect { get; set; }
+    // Explicit sampling parameters for this deployment; presence implies Extended eligibility
+    // per key (standard keys always sendable, extended keys still dialect-gated).
+    public Dictionary<string, double>? Sampling { get; set; }
+    // "off" | "echo" | "field" | "inline"
+    public string? ThinkingRoundTrip { get; set; }
 }
 
 public class PromptReceivedEvent
