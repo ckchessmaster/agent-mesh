@@ -141,50 +141,62 @@ public class TimelineWorkflowTests
     }
 
     [Fact]
-    public void ExtractQuestionsFromText_WithNumberedQuestionsAndParentheses_ExtractsOptions()
+    public void ExtractQuestionsFromText_WithFencedBlockInsideAPlainResponse_ExtractsQuestionsForSchemalessDrivers()
     {
+        // claude -p, agy and copilot have no function tools at all, so a fenced ask_question block is
+        // their only sanctioned channel and it arrives here as ordinary response text.
         var text = """
-        Here are my questions before beginning implementation:
-        1. Which test framework should we configure? (xUnit, NUnit, or MSTest)
-        2. Should we support SQLite fallback? (yes/no)
+        I inspected the cockpit and the jobs API. Two things need your call before I plan.
+        ```ask_question
+        {
+          "questions": [
+            { "question": "Should the overview be global or per-project?", "options": ["Global", "Per-project"] },
+            { "question": "Add an aggregate endpoint?", "options": ["Yes", "No"] }
+          ]
+        }
+        ```
         """;
 
         var questions = TimelineActivities.ExtractQuestionsFromText(text);
 
         questions.Should().HaveCount(2);
-        questions[0].Question.Should().Contain("Which test framework should we configure?");
-        questions[0].Options.Should().Contain("xUnit");
-        questions[0].Options.Should().Contain("NUnit");
-        questions[0].Options.Should().Contain("MSTest");
-        questions[1].Question.Should().Contain("Should we support SQLite fallback?");
-        questions[1].Options.Should().Contain("yes");
-        questions[1].Options.Should().Contain("no");
+        questions[0].Question.Should().Be("Should the overview be global or per-project?");
+        questions[0].Options!.Should().ContainInOrder("Global", "Per-project");
+        questions[1].Question.Should().Be("Add an aggregate endpoint?");
     }
 
     [Fact]
-    public void ExtractQuestionsFromText_WithDomainTradeoffsAndVs_ExtractsOptionsWithoutLiteralQuestionMark()
+    public void ExtractQuestionsFromText_WithQuestionsWrittenInProse_AskedNothing()
     {
+        // Verbatim shape of a real discovery turn that decided to ask and then asked in prose instead of
+        // calling ask_question: "Q1." lines with inline (a)/(b)/(c) choices, "vs" tradeoff bullets, a
+        // spelled-out "Question 4:". The old scraper rendered all of that as cards; this renders none of
+        // it, because a card the operator answers becomes the spec, and nobody agreed to that spec.
         var text = """
-        Questions to ask (Operator + Architect):
-        - Storage: new 'project_threads' table (migration + Architect) vs. zero-migration reuse of 'AgentSession' + metadata. My default: reuse AgentSession.
-        - Q2: Who answers? Any persona from project team / default lead persona, or the operator picks a persona per thread?
-        - Q3: Read-only enforcement depth - hard refusal in the runner vs. prompt-only instruction (advisory).
+        Now I'm ready. Let me post the plan with questions requiring reply. Questions to ask the operator:
+
+        Q1. Landing page scope: (a) global cross-project overview for the whole mesh (recommended), (b) per-project dashboard replacing the project detail pane, (c) both.
+        Q2. Which widgets for v1 (multi-select): system health strip; needs-your-attention queue; active jobs with progress.
+        Q3. Data source: new aggregate endpoint vs client-side composition of existing endpoints.
+        - Storage: new 'project_threads' table vs. zero-migration reuse of 'AgentSession'.
+        Question 4: who reviews the styling?
         """;
 
-        var questions = TimelineActivities.ExtractQuestionsFromText(text);
+        TimelineActivities.ExtractQuestionsFromText(text).Should().BeEmpty();
+    }
 
-        questions.Should().HaveCount(3);
-        questions[0].Question.Should().Contain("Storage: new 'project_threads' table");
-        questions[0].Options.Should().NotBeNull();
-        questions[0].Options!.Should().Contain("new 'project_threads' table");
-        questions[0].Options!.Should().Contain("zero-migration reuse of 'AgentSession'");
+    [Fact]
+    public void ExtractQuestionsFromText_WithQuestionsTheAgentAskedItself_AskedNothing()
+    {
+        // Reasoning prose is full of self-directed question marks. Scraping it is how a job opened with
+        // "clarifying questions" that were really the agent thinking out loud about a 6,748-line file.
+        var text = """
+        App.tsx is a monolith. I need to understand the current landing page: what is shown on load?
+        Is there routing? Let me grep for view state and tabs. Should I add a chart here? Probably not for v1.
+        What if the operator wants the old tab back? I will keep it reachable either way.
+        """;
 
-        questions[1].Question.Should().Contain("Who answers?");
-
-        questions[2].Question.Should().Contain("Read-only enforcement depth");
-        questions[2].Options.Should().NotBeNull();
-        questions[2].Options!.Should().Contain("hard refusal in the runner");
-        questions[2].Options!.Should().Contain("prompt-only instruction");
+        TimelineActivities.ExtractQuestionsFromText(text).Should().BeEmpty();
     }
 
     [Fact]

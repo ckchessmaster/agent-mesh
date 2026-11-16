@@ -159,6 +159,21 @@ export function useJobTimeline(jobId: string) {
     [jobId]
   );
 
+  /**
+   * Sends a raw message to the agent while its plan gate is still open.
+   *
+   * No optimistic status flip here, unlike every other action in this hook. Guidance is not a decision:
+   * the card stays `PendingInput` and the gate keeps waiting, so pretending otherwise would show the
+   * operator an answered card on a job that is still holding the gate for them. The real transitions —
+   * this card `Resolved`, a newer card `PendingInput` — arrive on `ReceiveTimelineCardUpdated`.
+   */
+  const sendPlanGuidance = useCallback(
+    async (cardId: string, content: string) => {
+      await api.submitTimelinePlanGuidance(jobId, cardId, content);
+    },
+    [jobId]
+  );
+
   const submitPrReview = useCallback(
     async (cardId: string, approved: boolean, feedback?: string, prNumber?: number) => {
       // Sign as operator (the human at the keyboard), matching submitPlanDecision's approverId.
@@ -208,6 +223,7 @@ export function useJobTimeline(jobId: string) {
     addComment,
     submitAnswers,
     submitPlanDecision,
+    sendPlanGuidance,
     submitPrReview,
     abortActiveTurn,
     submitIntervention

@@ -235,6 +235,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     private readonly bool _hasCustomHttpLister;
     private readonly Func<string, CancellationToken, Task<string?>> _copilotModelLister;
     private readonly bool _hasCustomCopilotModelLister;
+    private readonly Func<DriverCapabilityProbeRequest, string?> _copilotTokenResolver;
     private readonly IPersonaContainerManager? _containerManager;
 
     public DriverCapabilityProbe(IPersonaContainerManager? containerManager = null)
@@ -250,7 +251,8 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         Func<string, string, TimeSpan, CancellationToken, Task<string?>> cliRunner,
         Func<string, string?, CancellationToken, Task<IReadOnlyList<string>?>>? httpModelLister = null,
         int maxConcurrentProbes = MaxConcurrentProbes,
-        Func<string, CancellationToken, Task<string?>>? copilotModelLister = null)
+        Func<string, CancellationToken, Task<string?>>? copilotModelLister = null,
+        Func<DriverCapabilityProbeRequest, string?>? copilotTokenResolver = null)
     {
         _ttlProvider = ttlProvider;
         _negativeTtlProvider = negativeTtlProvider;
@@ -260,6 +262,12 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         _httpModelLister = httpModelLister ?? ListOpenAiModelsAsync;
         _hasCustomCopilotModelLister = copilotModelLister != null;
         _copilotModelLister = copilotModelLister ?? FetchCopilotModelsHttpAsync;
+        // Credential *discovery* gets its own seam, apart from the model lister, because the two fail
+        // differently: injecting a lister only stops the outbound call, while ResolveCopilotToken still
+        // reads this machine's ~/.copilot, ~/.config/github-copilot and GH_TOKEN first. So a test that
+        // means "unauthenticated" cannot say so on a host that is signed in — which is how
+        // Copilot_WhenUnauthenticated came to pass on a clean runner and fail on a developer laptop.
+        _copilotTokenResolver = copilotTokenResolver ?? ResolveCopilotToken;
         _gate = new SemaphoreSlim(maxConcurrentProbes, maxConcurrentProbes);
     }
 
@@ -614,7 +622,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         DriverCapabilityProbeRequest request,
         CancellationToken ct)
     {
-        var token = ResolveCopilotToken(request);
+        var token = _copilotTokenResolver(request);
         if (!string.IsNullOrWhiteSpace(token))
         {
             try

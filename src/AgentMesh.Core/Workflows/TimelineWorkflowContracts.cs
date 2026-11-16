@@ -40,6 +40,34 @@ public record PlanApprovalSignal(
     string ApproverId
 );
 
+/// <summary>
+/// Free-form operator guidance delivered while a plan gate is open, which is not a decision.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Before this, the gate had exactly two exits: approve, or reject with feedback. Rejecting marks the
+/// card Rejected and says so on the timeline, so an operator who wanted to add a fact the agent could
+/// not have known ("the billing module is frozen this sprint") had to file it as a criticism of a plan
+/// that was not wrong, and an operator whose job skipped Discovery Q&A entirely had no way to reach
+/// the agent at all until the implementation tasks were already running.
+/// </para>
+/// <para>
+/// Guidance therefore must not borrow <see cref="PlanApprovalSignal"/> with <c>Approved = false</c>:
+/// that would write a Rejected card, and the record of what the operator asked for would be indistinguishable
+/// from a record of what the operator refused. The gate stays open and the card stays waiting.
+/// </para>
+/// </remarks>
+/// <param name="CardId">The PlanApproval card the guidance was written against.</param>
+/// <param name="Content">Raw operator text, handed to Stage 1B as planning context.</param>
+/// <param name="SenderId">Who wrote it; "operator" from the cockpit.</param>
+/// <param name="MessageId">The persisted comment row id, so a retried POST cannot wake the gate twice.</param>
+public record PlanGuidanceSignal(
+    Guid CardId,
+    string Content,
+    string SenderId,
+    string? MessageId = null
+);
+
 public record AbortActiveTurnSignal(
     string Reason,
     string RequestedBy
@@ -182,6 +210,9 @@ public interface IJobExecutionWorkflow
 
     [WorkflowSignal]
     Task SubmitPlanDecisionAsync(PlanApprovalSignal signal);
+
+    [WorkflowSignal]
+    Task SubmitPlanGuidanceAsync(PlanGuidanceSignal signal);
 
     [WorkflowSignal]
     Task AbortTurnAsync(AbortActiveTurnSignal signal);

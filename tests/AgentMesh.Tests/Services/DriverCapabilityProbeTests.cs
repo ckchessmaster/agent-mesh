@@ -37,7 +37,8 @@ public class DriverCapabilityProbeTests : IDisposable
         TimeSpan? ttl = null,
         TimeSpan? negativeTtl = null,
         int maxConcurrent = 2,
-        Func<string, CancellationToken, Task<string?>>? copilotLister = null)
+        Func<string, CancellationToken, Task<string?>>? copilotLister = null,
+        Func<DriverCapabilityProbeRequest, string?>? copilotTokenResolver = null)
         => new(
             () => ttl ?? TimeSpan.FromMinutes(10),
             () => negativeTtl ?? TimeSpan.FromMinutes(2),
@@ -45,7 +46,18 @@ public class DriverCapabilityProbeTests : IDisposable
             cliRunner ?? ((_, _, _, _) => Task.FromResult<string?>(SampleAgyModels)),
             lister,
             maxConcurrent,
-            copilotLister);
+            copilotLister,
+            // Defaults to "this machine has no Copilot credentials on it", because that is the state the
+            // Copilot tests are written against and it is not what a signed-in developer laptop is. The
+            // production resolver reads ~/.copilot, ~/.config/github-copilot and GH_TOKEN before the
+            // probe decides whether it can call out at all, so without this default a test asking for the
+            // static preset silently gets whatever this host happens to be authenticated against, and
+            // passes or fails depending on who ran it. A test that wants a token passes one explicitly via
+            // Copilot(oauthToken: ...); wanting the preset means not passing one.
+            copilotTokenResolver ??
+            (request => CopilotCredentialHelper.IsSupportedCopilotToken(request.OAuthToken)
+                ? request.OAuthToken!.Trim()
+                : null));
 
     private static DriverCapabilityProbeRequest Agy(
         string id = "agy",
@@ -1390,12 +1402,48 @@ public class DriverCapabilityProbeTests : IDisposable
     [Fact]
     public async Task Copilot_WhenUnauthenticated_ReturnsStaticPreset()
     {
-        var reading = await Probe().ProbeAsync(Copilot(oauthToken: null));
+        // "Unauthenticated" has to mean the outbound call was never attempted — not that it was attempted
+        // and happened to fail, which a fallback would paper over. This test used to run against whatever
+        // GitHub credentials the machine had, because credential discovery ran before the probe decided
+        // whether it could call out at all: it passed on a clean runner and failed on a signed-in laptop.
+        var outboundCalls = 0;
+        var probe = Probe(copilotLister: (_, _) =>
+        {
+            outboundCalls++;
+            return Task.FromResult<string?>("""{"data":[{"id":"gpt-5-probe-leak"}]}""");
+        });
+
+        var reading = await probe.ProbeAsync(Copilot(oauthToken: null));
 
         reading.Should().NotBeNull();
         reading!.ModelSource.Should().Be(CapabilitySourceKind.StaticPreset);
         reading.Models.Select(m => m.Id).Should().Contain(new[] { "auto", "claude-3.7-sonnet", "gpt-4o" });
+        reading.Models.Select(m => m.Id).Should().NotContain("gpt-5-probe-leak");
         reading.SupportsContextSelection.Should().BeTrue();
+        outboundCalls.Should().Be(0, "a probe with no token must not reach the network");
+    }
+
+    /// <summary>
+    /// The host's own credentials are a fact about the machine, not about the driver being probed.
+    /// </summary>
+    /// <remarks>
+    /// Production discovery deliberately still consults <c>~/.copilot</c>, <c>~/.config/github-copilot</c>
+    /// and <c>GH_TOKEN</c>: on the API host that is how a shared-credential deployment gets a real model
+    /// list. What it must not be is an input a unit test inherits. This pins both halves — the default
+    /// resolver in <c>Probe()</c> ignores the host, and the production resolver is still the one the
+    /// public constructor wires up.
+    /// </remarks>
+    [Fact]
+    public async Task Copilot_HostCredentialsAreNotConsultedWhenTheTestResolverIsSilent()
+    {
+        var hostToken = DriverCapabilityProbe.ResolveCopilotToken(Copilot(oauthToken: null));
+
+        var reading = await Probe().ProbeAsync(Copilot(oauthToken: null));
+
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.StaticPreset,
+            hostToken is null
+                ? "no token exists here, and the preset is the answer either way"
+                : "this host is signed in to Copilot, which the preset tests must not inherit");
     }
 
     [Fact]

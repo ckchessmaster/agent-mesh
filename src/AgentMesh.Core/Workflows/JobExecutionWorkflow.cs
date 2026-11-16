@@ -45,6 +45,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     private readonly HashSet<string> _seenMessageIds = new(StringComparer.Ordinal);
     private DiscoveryAnswersSignal? _discoveryAnswers;
     private PlanApprovalSignal? _timelinePlanApproval;
+    private PlanGuidanceSignal? _timelinePlanGuidance;
     private PrReviewSignal? _prReview;
     private AbortActiveTurnSignal? _pendingAbort;
     private TurnInterventionSignal? _pendingIntervention;
@@ -456,7 +457,40 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             );
 
             _currentHeartbeat = "Awaiting plan approval";
-            await Workflow.WaitConditionAsync(() => _timelinePlanApproval != null);
+            await Workflow.WaitConditionAsync(() => _timelinePlanApproval != null || _timelinePlanGuidance != null);
+
+            // Guidance is not a decision, so it takes the loop back to Stage 1B without touching the
+            // verdict. Note that the pending-guidance flag is deliberately not cleared at the top of
+            // this loop: an operator who writes while the agent is re-planning is answered by the next
+            // round, not dropped on the floor.
+            if (_timelinePlanApproval is null && _timelinePlanGuidance is { } guidance)
+            {
+                _timelinePlanGuidance = null;
+
+                // Anything the operator typed as a plain comment while the gate was open belongs to the
+                // same request. It would otherwise sit in the inbox until an implementation task drained
+                // it, which is after the plan was already approved on the assumption it was never read.
+                var queued = DequeueJobChatReplies();
+                currentFeedback = ComposePlanGuidance(currentFeedback, guidance.Content, queued?.Content);
+
+                // The superseded card must not stay PendingInput: with two open gates in the feed, the
+                // operator can approve the stale one, and a decision on a card no workflow is holding is
+                // exactly the kind of success that teaches people not to trust the cockpit.
+                await Workflow.ExecuteActivityAsync(
+                    (ITimelineActivities act) => act.UpdateCardStatusAsync(new UpdateTimelineCardStatusInput(
+                        decompositionResult.CardId,
+                        TimelineCardStatus.Resolved
+                    )),
+                    TimelineActivityOptions
+                );
+                continue;
+            }
+
+            // The operator has decided, which is the later and authoritative act: guidance that landed in
+            // the same instant is superseded by it. Dropping the buffer here is what stops a message
+            // answered at this gate from buying one unasked-for round the next time this method runs —
+            // a realign intervention re-enters it.
+            _timelinePlanGuidance = null;
 
             if (_timelinePlanApproval!.Approved)
             {
@@ -479,6 +513,35 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 TimelineActivityOptions
             );
         }
+    }
+
+    /// <summary>
+    /// Folds operator guidance, and anything else waiting in job chat, into Stage 1B's replanning context.
+    /// </summary>
+    /// <remarks>
+    /// Earlier feedback is kept rather than replaced. A revision that only quotes the newest message asks
+    /// the agent to satisfy the last instruction while silently discarding the earlier one, and the
+    /// operator then has to repeat themselves in a rejection — the exact workaround this path exists to
+    /// remove. The header matters too: Stage 1B is told outright that the gate is still open, so it does
+    /// not read the message as a rejected plan it has to defend against.
+    /// </remarks>
+    private static string ComposePlanGuidance(string? priorFeedback, string guidance, string? queuedChat)
+    {
+        var parts = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(priorFeedback))
+        {
+            parts.Add(priorFeedback.Trim());
+        }
+
+        parts.Add($"[OPERATOR GUIDANCE — the plan gate is still open; nothing was rejected]\n{guidance.Trim()}");
+
+        if (!string.IsNullOrWhiteSpace(queuedChat))
+        {
+            parts.Add($"[ALSO WAITING IN JOB CHAT]\n{queuedChat.Trim()}");
+        }
+
+        return string.Join("\n\n", parts);
     }
 
     private readonly record struct PrStageOutcome(bool Success, bool ConflictDetected, string? Message = null)
@@ -883,6 +946,35 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     public Task SubmitPlanDecisionAsync(PlanApprovalSignal signal)
     {
         _timelinePlanApproval = signal;
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Accepts operator guidance while the plan gate is open, without deciding the gate.
+    /// </summary>
+    /// <remarks>
+    /// Buffered rather than validated against the current phase: guidance that lands while Stage 1B is
+    /// already running is still an instruction the operator meant, and the loop consumes it before the
+    /// next wait. Whether a gate is actually open is the endpoint's job, since it can see the card —
+    /// the workflow cannot tell a first plan from a revision.
+    /// </remarks>
+    [WorkflowSignal]
+    public Task SubmitPlanGuidanceAsync(PlanGuidanceSignal signal)
+    {
+        if (signal is null || string.IsNullOrWhiteSpace(signal.Content))
+        {
+            return Task.CompletedTask;
+        }
+
+        // The endpoint persists the comment before signalling, and Temporal delivers at-least-once, so a
+        // retried POST is the normal way to arrive here twice. Without the same id gate the chat path
+        // uses, one typed message would buy one extra decomposition round per retry.
+        if (!string.IsNullOrWhiteSpace(signal.MessageId) && !_seenMessageIds.Add(signal.MessageId))
+        {
+            return Task.CompletedTask;
+        }
+
+        _timelinePlanGuidance = signal;
         return Task.CompletedTask;
     }
 

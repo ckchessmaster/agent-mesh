@@ -39,6 +39,7 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
     addComment,
     submitAnswers,
     submitPlanDecision,
+    sendPlanGuidance,
     submitPrReview,
     abortActiveTurn,
     submitIntervention
@@ -78,6 +79,10 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
           isStarting={isStarting}
           onSubmitAnswers={submitAnswers}
           onSubmitPlanDecision={submitPlanDecision}
+          // Passed straight through rather than fired-and-forgotten: the card renders a rejection as the
+          // reason the gate is still open. `void` here would turn "nobody was told" back into silence,
+          // which is the bug this whole path exists to remove.
+          onSendPlanGuidance={sendPlanGuidance}
           onSubmitPrReview={submitPrReview}
           onSubmitIntervention={submitIntervention}
           onAddComment={(cardId, content) => { void addComment(cardId, content); }}

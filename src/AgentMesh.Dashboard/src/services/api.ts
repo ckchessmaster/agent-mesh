@@ -1652,6 +1652,33 @@ export const api = {
   },
 
   /**
+   * Tells the agent something about the plan without deciding the gate.
+   *
+   * The endpoint saves the message as a card comment either way and answers 409 when no workflow was
+   * parked on the gate to hear it, so the error text this throws is the only thing that distinguishes
+   * "the agent is revising" from "nobody was told". Callers must surface it, not swallow it — that
+   * distinction is the whole reason this route exists alongside a rejection.
+   */
+  async submitTimelinePlanGuidance(
+    jobId: string,
+    cardId: string,
+    content: string,
+    senderId = 'operator'
+  ): Promise<void> {
+    const res = await apiFetch(
+      `/api/jobs/${encodeURIComponent(jobId)}/timeline/cards/${encodeURIComponent(cardId)}/plan-guidance`,
+      {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ content, senderId })
+      }
+    );
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to send plan guidance'));
+    }
+  },
+
+  /**
    * Delivers a PR review decision to the parked review gate.
    *
    * Not a card-scoped timeline route: the durable gate is keyed on the job, and the endpoint

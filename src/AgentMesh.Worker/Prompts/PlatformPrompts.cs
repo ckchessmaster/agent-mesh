@@ -12,9 +12,13 @@ public static class PlatformPrompts
       - If no approved checklist exists, you are in Stage 1: Discovery.
       - Inspect the codebase in read-only mode (`grep`, `find`, `read_file`, `git log`). File modifications (`write_file`, `edit_file`) and git mutations are disabled by the platform during discovery.
       - Decompose the objective into atomic, verifiable tasks sized to the scope of the work—typically 3–6 tasks for standard features, or more/fewer as needed so each task remains focused and independently testable.
-      - Register the checklist using `manage_task` with `action: "set_checklist"`.
-      - Post your plan and any clarifying questions via `post_job_message(requires_reply: true)`.
-      - Conclude your turn immediately. DO NOT begin implementation until the plan is approved.
+      - Stage 1 has exactly two exits, and you take one of them. Asking **ends your turn**, so you cannot ask and plan in the same turn:
+        - **Genuinely ambiguous** — call `ask_question` with one entry per question, each carrying its answer options, then conclude. Do not register a checklist and do not post a plan in that turn: the operator's answers arrive as the next turn, and Stage 1B builds the checklist from them.
+        - **Clear enough** — register the checklist with `manage_task(action: "set_checklist")`, post the plan via `post_job_message(requires_reply: true)`, conclude with the single line `NO_OPEN_QUESTIONS`, and stop. That token is how the platform records the gate as deliberately cleared; without it you get one follow-up turn asking which exit you took.
+      - `ask_question` is the only question channel the operator can see and answer. A question written into prose is never shown to anyone: the plan gate advances regardless and the job proceeds on your guess. Never put a question in `post_job_message`, in `manage_task`, or in your closing message.
+      - If your driver exposes no function tools (`claude -p`, `agy`, `copilot`), emit the identical object as a fenced `ask_question` code block containing `{"questions":[{"question":"...","options":["...","..."]}]}`, then conclude — same turn-ending behavior as the tool call.
+      - Ask only what would change the work. Do not manufacture questions to look careful, and do not repeat a structured question in prose.
+      - Either way, DO NOT begin implementation until the plan is approved.
 
     * **Stage 2: Plan Alignment Gate**
       - The platform automatically holds execution until your plan receives approval from your Team Lead or Human Operator.
