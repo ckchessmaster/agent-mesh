@@ -526,15 +526,33 @@ public class TimelineActivities(
                 if (questions.Count == 0 && !noQuestionsConfirmed &&
                     outcome.Status is not (TurnOutcomeStatus.Failed or TurnOutcomeStatus.StuckLoopDetected))
                 {
-                    var reprompt = await RunNoQuestionsRepromptAsync(taskInput, job.Id, ct);
-                    questions = reprompt.Questions;
-                    noQuestionsConfirmed = reprompt.Confirmed;
-
-                    if (questions.Count > 0 &&
-                        (string.IsNullOrWhiteSpace(agentSummary) || agentSummary.StartsWith("Turn concluded")) &&
-                        !string.IsNullOrWhiteSpace(reprompt.Reply))
+                    // AwaitingInput is the one silence that must not be nudged: the turn parked with a human
+                    // owing it an answer. The nudge is a fresh turn on the same persona, so it does not ask
+                    // the question — it competes with the turn that is already holding it, and the answer the
+                    // operator gives lands on a transcript this stage stopped reading. Job c28eca57 did
+                    // exactly this in November 2026: two questions rendered in the session chat, the operator
+                    // answered them, and the job had already walked into the plan gate five seconds after the
+                    // agent asked. Warning here is honest; dispatching a rival turn is not.
+                    if (outcome.Status == TurnOutcomeStatus.AwaitingInput)
                     {
-                        agentSummary = reprompt.Reply;
+                        logger.LogWarning(
+                            "Discovery turn for job {JobId} parked on an unanswered question this stage could not read " +
+                            "({SessionCount} session(s) [{SessionIds}]). The no-questions follow-up turn is skipped: it would run " +
+                            "against the persona that is holding the question. The job advances on the agent's assumptions.",
+                            input.JobId, jobSessionIds.Count, string.Join(", ", jobSessionIds));
+                    }
+                    else
+                    {
+                        var reprompt = await RunNoQuestionsRepromptAsync(taskInput, job.Id, ct);
+                        questions = reprompt.Questions;
+                        noQuestionsConfirmed = reprompt.Confirmed;
+
+                        if (questions.Count > 0 &&
+                            (string.IsNullOrWhiteSpace(agentSummary) || agentSummary.StartsWith("Turn concluded")) &&
+                            !string.IsNullOrWhiteSpace(reprompt.Reply))
+                        {
+                            agentSummary = reprompt.Reply;
+                        }
                     }
                 }
             }
@@ -681,7 +699,9 @@ public class TimelineActivities(
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Agent decomposition turn encountered an error for job {JobId}; using fallback task breakdown", input.JobId);
+                // No invented breakdown follows: the plan gate says so, and the workflow halts rather than
+                // spending the operator's approval on tasks nobody proposed.
+                logger.LogWarning(ex, "Agent decomposition turn encountered an error for job {JobId}; the plan gate will report that no checklist was registered", input.JobId);
             }
         }
         else if (job != null)
@@ -689,42 +709,23 @@ public class TimelineActivities(
             tasks = ParseTasksFromJobJson(job.TasksJson);
         }
 
-        if (tasks.Count == 0)
-        {
-            tasks =
-            [
-                new(
-                    "task-1",
-                    $"Domain Models & Database Schema ({input.JobId})",
-                    "src/AgentMesh.Core/Models",
-                    "EF Core migration & database update"
-                ),
-                new(
-                    "task-2",
-                    $"Temporal Orchestration & Activities ({input.JobId})",
-                    "src/AgentMesh.Worker/Workflows",
-                    "Temporal unit tests & determinism checks"
-                ),
-                new(
-                    "task-3",
-                    $"API Endpoints & SignalR Broadcasts ({input.JobId})",
-                    "src/AgentMesh.Api/Controllers",
-                    "REST endpoint integration tests"
-                ),
-                new(
-                    "task-4",
-                    $"Cockpit Dashboard & Stateful Cards ({input.JobId})",
-                    "src/AgentMesh.Dashboard",
-                    "Vitest component specs & build validation"
-                )
-            ];
-        }
-
-        var reasoning = !string.IsNullOrWhiteSpace(agentReasoning)
-            ? agentReasoning!
-            : string.IsNullOrWhiteSpace(input.Feedback)
-                ? $"Generated execution decomposition into {tasks.Count} sequential tasks based on initial prompt."
-                : $"Revised execution plan addressing operator feedback: {input.Feedback}";
+        // An empty checklist is reported, never papered over. In November 2026 a Stage 1B decomposition on
+        // the agy driver called that harness's own built-in `manage_task` — a background-shell manager — and
+        // "succeeded", so the job reached the gate with these four AgentMesh-shaped placeholders standing in
+        // for a budget app nobody had planned. Approving them would have spent real turns on files that do
+        // not exist in that repo, and the operator had no way to see the substitution.
+        var noChecklist = tasks.Count == 0;
+        var reasoning = noChecklist
+            ? "No checklist was registered, so there is nothing to approve. The decomposition turn ended " +
+              "without manage_task(action: \"set_checklist\") reaching the platform — a driver with no function " +
+              "tools (agy, claude -p, copilot) must use `agentmesh task set-checklist` from its shell instead. " +
+              "Nothing was invented to fill the gap: rejecting with feedback re-runs the decomposition, and " +
+              "approving an empty checklist halts the job rather than executing a fabricated plan."
+            : !string.IsNullOrWhiteSpace(agentReasoning)
+                ? agentReasoning!
+                : string.IsNullOrWhiteSpace(input.Feedback)
+                    ? $"Generated execution decomposition into {tasks.Count} sequential tasks based on initial prompt."
+                    : $"Revised execution plan addressing operator feedback: {input.Feedback}";
 
         var payload = new PlanApprovalPayload(tasks, reasoning);
         var payloadJson = JsonSerializer.Serialize(payload, JsonOptions);
@@ -735,9 +736,11 @@ public class TimelineActivities(
             JobId = input.JobId,
             CardType = TimelineCardType.PlanApproval,
             Status = TimelineCardStatus.PendingInput,
-            Title = string.IsNullOrWhiteSpace(input.Feedback) 
-                ? "Plan Approval: Proposed Implementation Checklist"
-                : "Plan Approval: Revised Implementation Checklist (Post-Feedback)",
+            Title = noChecklist
+                ? "Plan Approval: No Checklist Registered"
+                : string.IsNullOrWhiteSpace(input.Feedback)
+                    ? "Plan Approval: Proposed Implementation Checklist"
+                    : "Plan Approval: Revised Implementation Checklist (Post-Feedback)",
             StructuredPayloadJson = payloadJson,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow
@@ -748,7 +751,9 @@ public class TimelineActivities(
         if (job != null)
         {
             SyncJobTasksJson(job, tasks);
-            job.ProgressHeartbeat = "Awaiting plan approval";
+            job.ProgressHeartbeat = noChecklist
+                ? "Awaiting plan approval — no checklist registered"
+                : "Awaiting plan approval";
             job.UpdatedAt = DateTimeOffset.UtcNow;
         }
 
@@ -756,6 +761,16 @@ public class TimelineActivities(
         await NotifyCardUpdatedAsync(card);
 
         logger.LogInformation("Created PlanApproval card {CardId} for job {JobId}", card.Id, input.JobId);
+        if (noChecklist)
+        {
+            // The incident this guards against was silent end to end, so the absence is logged loudly: it is
+            // the only place a driver that cannot reach manage_task shows up as anything at all.
+            logger.LogWarning(
+                "PlanApproval card {CardId} for job {JobId} carries an empty checklist: no " +
+                "manage_task(set_checklist) call reached the platform during decomposition. The workflow halts " +
+                "rather than inventing tasks, so expect the job to stop at the plan gate.",
+                card.Id, input.JobId);
+        }
 
         return new DecompositionActivityResult(card.Id, payload);
     }
@@ -883,51 +898,35 @@ public class TimelineActivities(
     /// <c>copilot</c>) have no tool schemas at all, so they emit the same object as a fenced
     /// <c>ask_question</c> block, which reaches here as text.
     /// </para>
+    /// <para>
+    /// Which of the accepted wire shapes each driver produces is <see cref="AskQuestionPayload"/>'s
+    /// business, not this method's. Insisting on the array form here is what made a real Antigravity
+    /// question invisible: <c>{"questions":"[...]"}</c> parsed cleanly, held no array under
+    /// <c>questions</c>, and came back as "no questions" — indistinguishable from an agent that had
+    /// nothing to ask.
+    /// </para>
     /// </remarks>
     internal static List<DiscoveryQuestion> ExtractQuestionsFromText(string text)
     {
         var result = new List<DiscoveryQuestion>();
         if (string.IsNullOrWhiteSpace(text)) return result;
 
-        // 1. Check for ```ask_question or ```json:ask_question blocks or raw json with "questions"
         var jsonBlockMatch = Regex.Match(text, @"```(?:json:)?ask_question\s*([\s\S]*?)```", RegexOptions.IgnoreCase);
-        var jsonCandidate = jsonBlockMatch.Success ? jsonBlockMatch.Groups[1].Value.Trim() : (text.Trim().StartsWith('{') ? text.Trim() : null);
+        var trimmed = text.Trim();
+        var jsonCandidate = jsonBlockMatch.Success
+            ? jsonBlockMatch.Groups[1].Value.Trim()
+            : trimmed.StartsWith('{') || trimmed.StartsWith('[') ? trimmed : null;
 
         if (!string.IsNullOrWhiteSpace(jsonCandidate))
         {
-            try
+            int qIdx = 1;
+            foreach (var question in AskQuestionPayload.Parse(jsonCandidate))
             {
-                using var doc = JsonDocument.Parse(jsonCandidate);
-                if (doc.RootElement.TryGetProperty("questions", out var qArray) && qArray.ValueKind == JsonValueKind.Array)
-                {
-                    int qIdx = 1;
-                    foreach (var qElem in qArray.EnumerateArray())
-                    {
-                        var qText = qElem.TryGetProperty("question", out var qt) ? qt.GetString() : null;
-                        if (string.IsNullOrWhiteSpace(qText) && qElem.TryGetProperty("id", out var idProp))
-                        {
-                            qText = idProp.GetString();
-                        }
-
-                        if (!string.IsNullOrWhiteSpace(qText))
-                        {
-                            var opts = new List<string>();
-                            if (qElem.TryGetProperty("options", out var opArr) && opArr.ValueKind == JsonValueKind.Array)
-                            {
-                                foreach (var o in opArr.EnumerateArray())
-                                {
-                                    var optStr = o.GetString();
-                                    if (!string.IsNullOrWhiteSpace(optStr)) opts.Add(optStr);
-                                }
-                            }
-                            result.Add(new DiscoveryQuestion($"q_{qIdx++}", qText.Trim(), opts.Count > 0 ? opts : null));
-                            if (result.Count >= 5) return result;
-                        }
-                    }
-                    if (result.Count > 0) return result;
-                }
+                result.Add(new DiscoveryQuestion(
+                    $"q_{qIdx++}",
+                    question.Question,
+                    question.Options.Count > 0 ? question.Options : null));
             }
-            catch { }
         }
 
         // Nothing is inferred past this point. A driver that asked in prose rather than through the

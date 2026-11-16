@@ -118,6 +118,69 @@ public class JobExecutionWorkflowTests
     /// was built on an assumption nobody confirmed, and the only exits were "approve it anyway" or
     /// "reject a plan that is not actually wrong". Guidance takes neither of them.
     /// </remarks>
+    /// <summary>
+    /// What happens when an operator approves a plan that has nothing on it.
+    /// </summary>
+    /// <remarks>
+    /// Stage 1B used to answer an empty decomposition with four invented AgentMesh-shaped tasks, so the
+    /// operator's approval authorised work nobody had proposed, in a repository that was not the job's
+    /// <c>budget-app</c>. Approving nothing now stops the job at the gate — before Stage 3 burns turns and
+    /// before Stage 4 opens a pull request for changes that were never made.
+    /// </remarks>
+    [Fact]
+    public async Task JobWorkflow_ApprovedEmptyChecklist_HaltsAtThePlanGate_WithoutExecutingOrMerging()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var timeline = new FakeTimelineActivities
+        {
+            CustomDiscoveryQuestions = [],
+            CustomTasks = []
+        };
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        using var worker = BuildWorker(env, timeline, execution, git);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                    JobId: jobId,
+                    AssignedAgentId: "driver-implementer",
+                    ProjectId: "mesh-core",
+                    WorkspacePath: "/workspace/repos/agent-mesh",
+                    InitialPrompt: "Reallocate a budget line between categories",
+                    TargetBranch: "main",
+                    ApprovalPolicy: PlanApprovalPolicy.LeadOrHuman)),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
+            timeline.DecompositionInputs.Should().ContainSingle();
+
+            await handle.SignalAsync(wf => wf.SubmitPlanDecisionAsync(
+                new PlanApprovalSignal(timeline.PlanCardId, true, "Approved", "astra")));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeFalse("an approved nothing is not a plan");
+            result.Message.Should().Contain(JobExecutionWorkflow.EmptyChecklistHaltMessage)
+                .And.Contain("agentmesh task set-checklist",
+                    "the halt has to name the route the driver was missing, not just that it failed");
+
+            execution.TaskTurnCount.Should().Be(0, "nothing was proposed, so nothing may be executed");
+            git.MergeCalls.Should().BeEmpty();
+            timeline.DecompositionInputs.Should().ContainSingle(
+                "halting is a decision, not another round of decomposition to spend the persona's turn on");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     [Fact]
     public async Task JobWorkflow_PlanGuidance_ReplansWithoutRejectingTheGate()
     {

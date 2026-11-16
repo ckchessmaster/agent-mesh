@@ -2173,6 +2173,25 @@ public class SessionsController(
                         {
                             var now = DateTimeOffset.UtcNow;
                             var answerContent = $"User answered question:\n{answerSummary}";
+
+                            // The cockpit's Discovery Q&A card renders `questions` (each with the options it
+                            // offered) and `answers` keyed by question id — the contract TimelineActivities
+                            // writes. This card is written on a different path, and until now it carried only
+                            // the answer array: the questions the operator had just answered on screen were
+                            // never put on the job's own card, so the timeline showed an empty Q&A card for a
+                            // question that was answered in the session chat. Recover what was asked from the
+                            // tool call that asked it, so both surfaces agree.
+                            var askedPayload = await db.SessionMessages
+                                .AsNoTracking()
+                                .Where(m => m.SessionId == id &&
+                                            m.EventType == "tool_call" &&
+                                            m.ToolName == AskQuestionPayload.ToolName)
+                                .OrderByDescending(m => m.CreatedAt)
+                                .Select(m => m.ToolArgsJson)
+                                .FirstOrDefaultAsync();
+
+                            var (cardQuestions, cardAnswers) = ShapeDiscoveryCard(askedPayload, req.Answers);
+
                             var answerCard = new JobTimelineCard
                             {
                                 Id = Guid.NewGuid(),
@@ -2187,7 +2206,9 @@ public class SessionsController(
                                     senderId = senderId,
                                     turnSessionId = session.Id,
                                     toolCallId = req.ToolCallId,
-                                    answers = req.Answers,
+                                    summary = answerSummary,
+                                    questions = cardQuestions,
+                                    answers = cardAnswers,
                                     toolName = "ask_question"
                                 }, JsonOptions),
                                 CreatedAt = now,
@@ -3209,6 +3230,83 @@ public class SessionsController(
                 .SendAsync("ReceiveTimelineCardUpdated", questionCard);
         }
         catch { }
+    }
+
+    /// <summary>
+    /// Shapes "what the agent asked" and "what the operator picked" into the contract the cockpit's
+    /// Discovery Q&amp;A card renders.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The answer request carries the question text and the choices taken, but never the choices that were
+    /// on offer, and a card without those cannot show what the operator did not pick. So the question set is
+    /// read back from the <c>ask_question</c> tool call that produced it, through
+    /// <see cref="AskQuestionPayload"/> — the same reader the worker uses, which is what lets an Antigravity
+    /// <c>{"questions":"[...]"}</c> call be understood on both surfaces instead of one.
+    /// </para>
+    /// <para>
+    /// Pairing is by question text first and position second, then nothing: an answer whose question cannot
+    /// be recovered still appears on the card (with no options), because losing an answer the operator gave
+    /// is worse than a card that cannot show the alternatives that were declined.
+    /// </para>
+    /// </remarks>
+    private static (List<Core.Workflows.DiscoveryQuestion> Questions, Dictionary<string, string> Answers) ShapeDiscoveryCard(
+        string? askedPayload,
+        List<QuestionAnswerDto>? answers)
+    {
+        var asked = AskQuestionPayload.Parse(askedPayload);
+        var taken = new bool[asked.Count];
+        var questions = new List<Core.Workflows.DiscoveryQuestion>();
+        var answersById = new Dictionary<string, string>();
+
+        void Add(string text, AskQuestion? source, string answer)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            var id = $"q_{questions.Count + 1}";
+            var options = source?.Options is { Count: > 0 } ? source.Options : null;
+            questions.Add(new Core.Workflows.DiscoveryQuestion(id, text.Trim(), options));
+            answersById[id] = string.IsNullOrWhiteSpace(answer) ? "User skipped" : answer;
+        }
+
+        foreach (var answer in answers ?? [])
+        {
+            if (answer is null) continue;
+            var text = answer.Question?.Trim() ?? string.Empty;
+
+            var index = -1;
+            for (var i = 0; i < asked.Count; i++)
+            {
+                if (!taken[i] && string.Equals(asked[i].Question, text, StringComparison.OrdinalIgnoreCase))
+                {
+                    index = i;
+                    break;
+                }
+            }
+
+            if (index < 0 && answer.QuestionIndex >= 0 && answer.QuestionIndex < asked.Count && !taken[answer.QuestionIndex])
+            {
+                index = answer.QuestionIndex;
+            }
+
+            if (index >= 0) taken[index] = true;
+
+            var parts = new List<string>();
+            if (answer.SelectedOptions is { Count: > 0 }) parts.Add(string.Join(", ", answer.SelectedOptions));
+            if (!string.IsNullOrWhiteSpace(answer.CustomText)) parts.Add(answer.CustomText.Trim());
+
+            Add(text.Length > 0 ? text : (index >= 0 ? asked[index].Question : string.Empty),
+                index >= 0 ? asked[index] : null,
+                parts.Count > 0 ? string.Join("; ", parts) : "User skipped");
+        }
+
+        // A question the operator left unanswered is still a question the agent asked; the card has to say
+        // so rather than quietly shrink.
+        for (var i = 0; i < asked.Count; i++)
+        {
+            if (!taken[i]) Add(asked[i].Question, asked[i], "User skipped");
+        }
+
+        return (questions, answersById);
     }
 
     private static (string formattedContent, string normalizedPayload) ProcessJobTurnQuestionPayload(

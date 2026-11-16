@@ -30,6 +30,27 @@ public static class Program
                 ct: cts.Token);
         }
 
+        // `agentmesh task …` and `agentmesh message …` are the control-plane verbs a driver reaches from
+        // its own shell, so they get the same early dispatch as `pr`: no runner flag may swallow their
+        // options, and `--help` must print the verb usage rather than launch a TUI.
+        if (args.Length > 0 && string.Equals(args[0], "task", StringComparison.OrdinalIgnoreCase))
+        {
+            return await PlatformToolCommand.ExecuteTaskAsync(
+                args.Skip(1).ToList(),
+                config,
+                configStore,
+                ct: cts.Token);
+        }
+
+        if (args.Length > 0 && string.Equals(args[0], "message", StringComparison.OrdinalIgnoreCase))
+        {
+            return await PlatformToolCommand.ExecuteMessageAsync(
+                args.Skip(1).ToList(),
+                config,
+                configStore,
+                ct: cts.Token);
+        }
+
         // Parse global options (--url, --token, --command, --role, --adapter, --name, --once, --persona, --driver, --headless)
         var positional = new List<string>();
         string? customCommand = null;
@@ -390,6 +411,8 @@ public static class Program
         AnsiConsole.MarkupLine("  [cyan]agentmesh tui [[agent1 agent2...]][/]      Launch TUI and immediately start specified agents");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start <agent1> [[agent2...]][/]  Start and connect one or more agents (e.g. agy, claude, test)");
         AnsiConsole.MarkupLine("  [cyan]agentmesh pr <sync|open|merge>[/]         Sync base branch, push & open 3-R PR, or merge with SHA guard");
+        AnsiConsole.MarkupLine("  [cyan]agentmesh task <set-checklist|update-status|get-checklist>[/]  Register/track the job checklist from a driver shell");
+        AnsiConsole.MarkupLine("  [cyan]agentmesh message post[/]                Post a job message to a persona or the operator");
         AnsiConsole.MarkupLine("  [cyan]agentmesh run --persona <id> [[options]][/] Start as a dedicated persona runner");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start --all[/]                 Start all configured agent presets concurrently");
         AnsiConsole.MarkupLine("  [cyan]agentmesh list[/]                        Show all local presets and live Mesh connection status");

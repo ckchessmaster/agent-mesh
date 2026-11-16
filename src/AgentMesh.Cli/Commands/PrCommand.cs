@@ -208,7 +208,7 @@ public static class PrCommand
 
         // 5. Build 3-R PR body and check for existing open PR idempotently
         var summary3R = BuildSummary3R(options);
-        var personaId = options.PersonaId ?? Environment.GetEnvironmentVariable("AGENTMESH_PERSONA_ID");
+        var personaId = options.PersonaId ?? Environment.GetEnvironmentVariable(PlatformToolCommand.PersonaIdEnvVar);
         var reviewer = options.Reviewer ?? Environment.GetEnvironmentVariable("AGENTMESH_REVIEWER");
         var prBody = Format3RBody(summary3R, personaId, reviewer);
 
@@ -296,11 +296,11 @@ public static class PrCommand
 
         // 6. Register real PR metadata on the job in AgentMesh API (best-effort if outside a mesh job context,
         // surfaced clearly when job/session context is configured)
-        Guid? sessionId = Guid.TryParse(options.SessionId ?? Environment.GetEnvironmentVariable("AGENTMESH_SESSION_ID"), out var sid)
+        Guid? sessionId = Guid.TryParse(options.SessionId ?? Environment.GetEnvironmentVariable(PlatformToolCommand.SessionIdEnvVar), out var sid)
             ? sid
             : null;
-        var jobId = options.JobId ?? Environment.GetEnvironmentVariable("AGENTMESH_JOB_ID");
-        var agentId = options.AgentId ?? Environment.GetEnvironmentVariable("AGENTMESH_DRIVER_ID") ?? personaId;
+        var jobId = options.JobId ?? Environment.GetEnvironmentVariable(PlatformToolCommand.JobIdEnvVar);
+        var agentId = options.AgentId ?? Environment.GetEnvironmentVariable(PlatformToolCommand.AgentIdEnvVar) ?? personaId;
 
         var mcpArgsJson = JsonSerializer.Serialize(new Dictionary<string, object?>
         {

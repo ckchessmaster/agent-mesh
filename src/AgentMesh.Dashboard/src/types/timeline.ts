@@ -47,8 +47,22 @@ export interface DiscoveryQuestion {
 export interface DiscoveryPayload {
   questions: DiscoveryQuestion[];
   summary: string;
-  answers?: Record<string, string>;
+  /**
+   * Answers keyed by question id. Cards written before November 2026 — and any card written straight from
+   * an answered session question rather than from the Discovery Q&A activity — carry the answer array the
+   * operator submitted instead, which `DiscoveryQaCard` still renders.
+   */
+  answers?: Record<string, string> | DiscoveryAnswerRow[];
   feedback?: string;
+  /** The human-readable Q/A digest, present on cards written when a session question was answered. */
+  content?: string;
+}
+
+export interface DiscoveryAnswerRow {
+  question?: string;
+  questionIndex?: number;
+  selectedOptions?: string[];
+  customText?: string;
 }
 
 export interface ProposedChecklistItem {

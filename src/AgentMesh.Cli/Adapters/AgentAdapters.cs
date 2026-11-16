@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
+using AgentMesh.Cli.Commands;
 using AgentMesh.Cli.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -228,6 +229,121 @@ public static class AgentAdapterFactory
         => SandboxShell.KillProcessTree(proc, processGroupLeaderPid);
 
     /// <summary>
+    /// Stamps a driver child process's environment with the identity of the turn it is serving.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>manage_task</c> and <c>post_job_message</c> reach a driver as function tools only when its
+    /// adapter declares schemas. Subprocess drivers (<c>agy</c>, <c>claude -p</c>, <c>copilot</c>) instead
+    /// call <c>agentmesh task …</c> / <c>agentmesh message …</c> from their own shell, and those verbs need
+    /// the turn's session and job to place the call at all — which is also why a static MCP registration
+    /// cannot carry the context: one persona container serves many jobs, so the identity changes per turn.
+    /// Everything a driver shells out to inherits this environment, which is what makes the shell route work
+    /// for every driver without mounting anything into it.
+    /// </para>
+    /// <para>
+    /// The turn wins over an inherited value when it has one: a persona pod is provisioned with
+    /// <c>AGENTMESH_PERSONA_ID</c> and <c>AGENTMESH_JOB_ID</c> is never ambient, so a stale value must not
+    /// attribute a checklist to the wrong job. <c>AGENTMESH_AGENT_ID</c> is the pre-2.6 name kept for any
+    /// operator script already reading it.
+    /// </para>
+    /// </remarks>
+    /// <param name="env">The <c>ProcessStartInfo.Environment</c> dictionary for the child.</param>
+    /// <param name="promptEvent">The dispatch being served.</param>
+    /// <param name="agentId">Driver identity to report, when the caller has a better one than the event.</param>
+    internal static void ApplyMeshTurnContext(
+        IDictionary<string, string?> env,
+        PromptReceivedEvent promptEvent,
+        string? agentId = null)
+    {
+        foreach (var (key, value) in MeshTurnContext(promptEvent, agentId))
+        {
+            env[key] = value;
+        }
+    }
+
+    /// <summary>
+    /// What every subprocess driver is told about reaching the control plane from its own shell.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// One string rather than a per-adapter copy, because the agy incident was a prompt-contract failure:
+    /// the driver was told to call <c>manage_task</c>, its harness had a built-in by that name, and it
+    /// called the wrong one while every layer reported success. A route only exists if every driver that
+    /// needs it is told about it in the same words, so both envelope paths quote this.
+    /// </para>
+    /// <para>
+    /// The platform's own <c>PlatformPrompts.PlatformInvariants</c> says the same thing for job turns; this
+    /// copy exists because an interactive chat turn has no such layer, and a persona answering a question
+    /// in chat still has to move the checklist it is working on.
+    /// </para>
+    /// </remarks>
+    public const string ControlPlaneShellRouteInstructions =
+        "[AgentMesh Control Plane From Your Shell: If your harness gives you no platform function tools, " +
+        "the job checklist and job messages are still reachable from your shell — " +
+        "`agentmesh task set-checklist --json '[{\"title\":\"…\",\"target_file\":\"…\",\"verification_method\":\"…\"}]'`, " +
+        "`agentmesh task update-status --task <task-id> --status <status>`, `agentmesh task get-checklist`, " +
+        "`agentmesh message post`. This process's environment already carries this turn's session and job, " +
+        "so pass no ids. Never substitute a built-in tool of your harness named `manage_task`: that is a " +
+        "local shell-task manager and it reports nothing to AgentMesh. Questions always go through " +
+        "`ask_question`, never through a message.]";
+
+    /// <summary>
+    /// The turn-context variables themselves, so every driver gets an identical set regardless of how it
+    /// is launched.
+    /// </summary>
+    /// <remarks>
+    /// Blank values are omitted rather than set empty: <c>PrCommand</c> and <c>PlatformToolCommand</c>
+    /// treat a present-but-empty <c>AGENTMESH_JOB_ID</c> as a context they should have, and report its
+    /// absence as a misconfiguration the operator can act on.
+    /// </remarks>
+    internal static IEnumerable<KeyValuePair<string, string>> MeshTurnContext(
+        PromptReceivedEvent promptEvent,
+        string? agentId = null)
+    {
+        if (promptEvent.SessionId != Guid.Empty)
+        {
+            yield return new(PlatformToolCommand.SessionIdEnvVar, promptEvent.SessionId.ToString());
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.JobId))
+        {
+            yield return new(PlatformToolCommand.JobIdEnvVar, promptEvent.JobId.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.PersonaId))
+        {
+            yield return new(PlatformToolCommand.PersonaIdEnvVar, promptEvent.PersonaId.Trim());
+        }
+
+        var driver = FirstNonBlank(agentId, promptEvent.DriverId, promptEvent.AgentId);
+        if (driver is not null)
+        {
+            yield return new(PlatformToolCommand.AgentIdEnvVar, driver);
+            yield return new("AGENTMESH_AGENT_ID", driver);
+        }
+    }
+
+    /// <summary>
+    /// The same turn context as an <c>env</c> prefix, for drivers launched as a command line rather than a
+    /// <see cref="ProcessStartInfo"/>.
+    /// </summary>
+    /// <remarks>
+    /// Values are single-quoted with any embedded quote closed and re-opened, because a persona id is
+    /// operator-supplied and an unquoted apostrophe in one would otherwise rewrite the command line.
+    /// Returns the empty string when there is no context to pass, so a caller can concatenate unconditionally.
+    /// </remarks>
+    internal static string BuildMeshTurnContextPrefix(PromptReceivedEvent promptEvent, string? agentId = null)
+    {
+        var assignments = MeshTurnContext(promptEvent, agentId)
+            .Select(pair => $"{pair.Key}='{pair.Value.Replace("'", "'\\''")}'");
+        return string.Join(" ", assignments);
+    }
+
+    private static string? FirstNonBlank(params string?[] values) =>
+        values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim();
+
+    /// <summary>
     /// Runs a shell command and returns the hardened result: clamped timeout, process-group teardown on
     /// kill, and non-destructive log spillover.
     /// </summary>
@@ -420,6 +536,7 @@ public static class AgentAdapterFactory
         {
             sb.AppendLine($"[Execution Mode: {mode}]");
         }
+        sb.AppendLine(ControlPlaneShellRouteInstructions);
         sb.AppendLine("[Interactive Human-in-the-Loop Instructions: You are running in an interactive session. If the user asks you to ask them questions, or if you need clarifications or decisions before proceeding, ask your questions directly. Format questions as a numbered list (e.g. 1. Question? 2. Question?), or output a ```ask_question JSON block with questions array. Do NOT state that this is a non-interactive session or that you cannot see replies. The user will be presented with interactive UI cards to answer your questions and will send their responses in the next turn.]");
         sb.AppendLine();
         var attachedBlock = FormatAttachedFilesBlock(attachments);
@@ -1204,6 +1321,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, preset.Id);
 
         string? activeConvId = null;
         if (!string.IsNullOrWhiteSpace(promptEvent.ConversationId))
@@ -1246,6 +1364,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             {
                 sb.AppendLine($"[Persona Instructions: {promptEvent.PersonaPrompt.Trim()}]");
             }
+            sb.AppendLine(AgentAdapterFactory.ControlPlaneShellRouteInstructions);
             sb.AppendLine();
             if (!string.IsNullOrWhiteSpace(attachedBlock))
             {
@@ -1858,7 +1977,10 @@ public class ClaudeAdapter : IAgentAdapter
                 || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
             var maxSteps = OpenAiAdapter.ResolveMaxSteps(preset, isDiscovery);
             var maxStepsArg = $" --max-steps {maxSteps}";
-            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\"{autocompactArg}{maxStepsArg} -p \"{escapedPrompt}\"", cwd, ct);
+            // Claude is launched as a command line, not a ProcessStartInfo, so the turn context travels as
+            // an env prefix — otherwise `claude -p` has no route to the control plane either.
+            var turnContext = AgentAdapterFactory.BuildMeshTurnContextPrefix(promptEvent, preset.Id);
+            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"{turnContext} \"{claudePath}\"{autocompactArg}{maxStepsArg} -p \"{escapedPrompt}\"", cwd, ct);
             ct.ThrowIfCancellationRequested();
             var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut : stdErr;
 
@@ -2051,6 +2173,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, driverId);
 
         if (isViaGh)
         {
@@ -2962,8 +3085,7 @@ public class GenericCommandAdapter : IAgentAdapter
             }
 
             psi.Environment["AGENTMESH_PROMPT"] = promptEvent.Prompt;
-            psi.Environment["AGENTMESH_SESSION_ID"] = promptEvent.SessionId.ToString();
-            psi.Environment["AGENTMESH_AGENT_ID"] = preset.Id;
+            AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, preset.Id);
 
             using var proc = new Process { StartInfo = psi };
             using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));

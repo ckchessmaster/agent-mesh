@@ -158,6 +158,16 @@ export const PlanApprovalCard: React.FC<PlanApprovalCardProps> = ({
               )}
             </div>
           ))}
+          {(payload.tasks?.length ?? 0) === 0 && (
+            <div
+              data-testid="plan-card-empty-checklist"
+              className="p-2.5 rounded border border-amber-700/50 bg-amber-950/20 text-[11px] text-amber-200 leading-relaxed"
+            >
+              The persona registered no checklist, so there is nothing here to approve — approving halts the
+              job. Reject with feedback to re-run decomposition; a driver without function tools registers
+              tasks with <span className="font-mono">agentmesh task set-checklist</span>.
+            </div>
+          )}
         </div>
       </div>
 
