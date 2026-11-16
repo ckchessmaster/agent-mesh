@@ -1,3 +1,4 @@
+using AgentMesh.Cli.Adapters;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
@@ -112,5 +113,55 @@ public class StageOneQuestionContractTests
         TimelineActivities.NoQuestionsRepromptText
             .Should().NotContain("```ask_question")
             .And.NotContain("\"questions\"");
+    }
+
+    /// <summary>
+    /// Whether a driver with no function tools has any way to satisfy what Stage 1 asks of it.
+    /// </summary>
+    /// <remarks>
+    /// <c>manage_task</c> is not a shell command, and Antigravity ships a built-in under that exact name for
+    /// background shells. A November 2026 decomposition called the built-in, got a cheerful local answer,
+    /// and the job reached the plan gate with a checklist nobody had written. Asking for a tool a driver
+    /// cannot reach is the same defect as asking for a question channel it cannot use, so the prompt has to
+    /// name the route that exists — and name the impostor.
+    /// </remarks>
+    [Fact]
+    public void PlatformInvariants_GiveADriverWithNoFunctionToolsAControlPlaneRoute()
+    {
+        PlatformPrompts.PlatformInvariants
+            .Should().Contain("agentmesh task set-checklist")
+            .And.Contain("agentmesh task update-status")
+            .And.Contain("agentmesh task get-checklist")
+            .And.Contain("agentmesh message post");
+    }
+
+    [Fact]
+    public void PlatformInvariants_NameTheShadowedToolImpostor()
+    {
+        PlatformPrompts.PlatformInvariants
+            .Should().MatchRegex("(?i)built-in[^.]*`?manage_task`?",
+                "the failure was a harness built-in with the platform tool's name, and an agent cannot avoid what it is not told about");
+    }
+
+    [Fact]
+    public void InteractiveEnvelope_TellsShellOnlyDriversTheSameThingEveryTurn()
+    {
+        var envelope = AgentAdapterFactory.BuildAgentMeshPromptEnvelope(
+            "What is the reallocation endpoint doing?",
+            "agy-default",
+            mode: null,
+            personaId: "astra",
+            sessionId: Guid.NewGuid());
+
+        envelope.Should().Contain(AgentAdapterFactory.ControlPlaneShellRouteInstructions);
+    }
+
+    [Fact]
+    public void TheShellRouteIsNotOfferedAsAQuestionChannel()
+    {
+        // `agentmesh message post` is one keystroke away from "ask the operator in a message", which is the
+        // exact mistake the discovery contract exists to prevent.
+        AgentAdapterFactory.ControlPlaneShellRouteInstructions
+            .Should().MatchRegex("(?i)questions[^.]*ask_question");
     }
 }

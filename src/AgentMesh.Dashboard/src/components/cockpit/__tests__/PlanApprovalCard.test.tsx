@@ -126,4 +126,58 @@ describe('PlanApprovalCard', () => {
     expect(screen.queryByTestId('plan-send-guidance')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /reject with feedback/i })).toBeEnabled();
   });
+
+  /**
+   * The gate as it stands when the persona reached it with nothing registered. Before November 2026 the
+   * worker filled this in with four hardcoded AgentMesh tasks, so a budget-app job asked for approval of
+   * a plan for this repository and an operator could not tell the difference.
+   */
+  function buildEmptyCard(): JobTimelineCard {
+    return {
+      ...buildCard('PendingInput'),
+      title: 'Plan Approval: No Checklist Registered',
+      structuredPayloadJson: JSON.stringify({
+        reasoning:
+          'No checklist was registered, so there is nothing to approve. Nothing was invented to fill the gap.',
+        tasks: [],
+      }),
+    };
+  }
+
+  it('says there is nothing to approve instead of showing an empty list and silence', () => {
+    render(<PlanApprovalCard card={buildEmptyCard()} onSubmitPlanDecision={vi.fn()} onSendGuidance={vi.fn()} />);
+
+    expect(screen.getByText('Proposed Checklist (0 Steps)')).toBeInTheDocument();
+    const warning = screen.getByTestId('plan-card-empty-checklist');
+    expect(warning).toHaveTextContent('no checklist');
+    expect(warning).toHaveTextContent('agentmesh task set-checklist');
+    expect(warning).toHaveTextContent('halts the job');
+  });
+
+  it('still lets the operator reject an empty plan, which is the useful decision', () => {
+    const onSubmitPlanDecision = vi.fn();
+    render(
+      <PlanApprovalCard
+        card={buildEmptyCard()}
+        onSubmitPlanDecision={onSubmitPlanDecision}
+        onSendGuidance={vi.fn()}
+      />
+    );
+
+    fireEvent.change(feedbackBox(), { target: { value: 'Register the checklist with agentmesh task set-checklist.' } });
+    fireEvent.click(screen.getByRole('button', { name: /reject with feedback/i }));
+
+    expect(onSubmitPlanDecision).toHaveBeenCalledWith(
+      'card-plan-1',
+      false,
+      'Register the checklist with agentmesh task set-checklist.',
+      'operator'
+    );
+  });
+
+  it('says nothing about an empty checklist when tasks exist', () => {
+    render(<PlanApprovalCard card={buildCard('PendingInput')} onSubmitPlanDecision={vi.fn()} onSendGuidance={vi.fn()} />);
+
+    expect(screen.queryByTestId('plan-card-empty-checklist')).not.toBeInTheDocument();
+  });
 });

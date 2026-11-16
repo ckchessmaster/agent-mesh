@@ -1156,6 +1156,81 @@ public class SessionsControllerTests
         aCard.StructuredPayloadJson.Should().Contain(session.Id.ToString());
     }
 
+    /// <summary>
+    /// The job's own Q&amp;A card must show the questions the operator just answered.
+    /// </summary>
+    /// <remarks>
+    /// The cockpit renders a Discovery Q&amp;A card from <c>questions</c> (with the options it offered) and
+    /// <c>answers</c> keyed by question id. The card written when a session question was answered carried
+    /// only the answer array, so job c28eca57 showed both questions in the session chat and an empty card on
+    /// the timeline. The question here is asked in the encoded-array shape Antigravity records, because the
+    /// card is built by the same reader the Stage 1 activity uses and both must see the same questions.
+    /// </remarks>
+    [Fact]
+    public async Task SubmitAnswer_EncodedAskQuestion_WritesTheQuestionsAndAnswersOntoTheJobCard()
+    {
+        using var db = TestDbContextFactory.Create();
+        var project = new Project { Id = "proj-card", Name = "Card Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Card Job",
+            GitBranchName = "mesh/job-card"
+        };
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Encoded question session",
+            Status = "waiting_for_input",
+            CreatorAgentId = "agy",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new { jobId = job.Id.ToString() })
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        await controller.PostMessage(session.Id, new PostMessageRequest(
+            Content: "Asking question",
+            SenderAgentId: "agy",
+            EventType: "tool_call",
+            ToolName: "ask_question",
+            ToolArgsJson: """
+                {"questions": "[{\"is_multi_select\":false,\"options\":[\"Clone into repos/budget-app\",\"Re-provision the workspace\"],\"question\":\"How should the repository workspace be resolved?\"}]"}
+                """,
+            StructuredPayloadJson: null));
+
+        var res = await controller.SubmitAnswer(session.Id, new SubmitAnswerRequest(
+            ToolCallId: null,
+            Answers:
+            [
+                new(0, "How should the repository workspace be resolved?",
+                    ["Clone into repos/budget-app"], null)
+            ]));
+
+        res.Should().BeOfType<OkObjectResult>();
+
+        var card = db.JobTimelineCards.Single(c =>
+            c.JobId == job.Id.ToString() && c.CardType == TimelineCardType.DiscoveryQa);
+
+        using var doc = System.Text.Json.JsonDocument.Parse(card.StructuredPayloadJson);
+        var root = doc.RootElement;
+
+        var question = root.GetProperty("questions")[0];
+        question.GetProperty("question").GetString().Should().Be("How should the repository workspace be resolved?");
+        question.GetProperty("id").GetString().Should().Be("q_1");
+        question.GetProperty("options").EnumerateArray().Select(o => o.GetString())
+            // The options are what makes the declined choice visible on the card, which is the whole
+            // reason this card has to carry the question set and not only the answer.
+            .Should().ContainInOrder("Clone into repos/budget-app", "Re-provision the workspace");
+
+        root.GetProperty("answers").GetProperty("q_1").GetString()
+            .Should().Be("Clone into repos/budget-app");
+    }
+
     [Fact]
     public async Task PostMessage_WithNullBytesInToolResultOrContent_StripsNullBytesAndPersistsSuccessfully()
     {

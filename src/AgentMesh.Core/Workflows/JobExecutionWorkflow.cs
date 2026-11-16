@@ -41,6 +41,20 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
         }
     };
 
+    /// <summary>
+    /// Why a job stops at the plan gate when the gate has nothing on it.
+    /// </summary>
+    /// <remarks>
+    /// Stage 1B used to substitute a four-task AgentMesh-shaped placeholder whenever decomposition came back
+    /// empty, so the operator approved a plan no persona had proposed and the job spent real turns on files
+    /// from another repository. Halting is the honest outcome, and the reason names the fix rather than
+    /// leaving the operator to discover which layer dropped the checklist.
+    /// </remarks>
+    public const string EmptyChecklistHaltMessage =
+        "no checklist was registered for this job, so there was nothing to execute. A driver with no " +
+        "function tools (agy, claude -p, copilot) registers tasks from its shell with " +
+        "`agentmesh task set-checklist`; no placeholder tasks were invented.";
+
     private readonly Queue<ChatMessageSignal> _chatInbox = new();
     private readonly HashSet<string> _seenMessageIds = new(StringComparer.Ordinal);
     private DiscoveryAnswersSignal? _discoveryAnswers;
@@ -160,6 +174,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             }
 
             currentTasks = await RunDecompositionAndPlanApprovalAsync(input, planFeedback: null);
+            if (currentTasks.Count == 0)
+            {
+                _currentHeartbeat = $"Halted: {EmptyChecklistHaltMessage}";
+                return new JobExecutionResult(false, EmptyChecklistHaltMessage);
+            }
         }
 
         // Stage 3 (Sequential Task Loop without per-task PRs) + Stage 4 (Job-Level PR & Unbounded Review Loop)
@@ -259,6 +278,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                 if (realigned)
                 {
                     currentTasks = await RunDecompositionAndPlanApprovalAsync(input, realignFeedback);
+                    if (currentTasks.Count == 0)
+                    {
+                        _currentHeartbeat = $"Halted: {EmptyChecklistHaltMessage}";
+                        return new JobExecutionResult(false, EmptyChecklistHaltMessage);
+                    }
                     currentRemediationContext = null;
                     _completedTaskOffset = 0;
                     continue;

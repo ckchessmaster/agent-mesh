@@ -209,6 +209,79 @@ public class DiscoveryNoQuestionsRepromptTests
         result.CardId.Should().BeEmpty();
     }
 
+    /// <summary>
+    /// The Antigravity wire shape: a tool call whose <c>questions</c> parameter is an array serialised as a
+    /// string. Job c28eca57 parked on exactly this on 2026-11-16.
+    /// </summary>
+    private const string EncodedArrayToolArgs =
+        """
+        {"questions": "[{\"is_multi_select\":false,\"options\":[\"Clone into repos/budget-app\",\"Re-provision the workspace\"],\"question\":\"How should the repository workspace be resolved?\"}]"}
+        """;
+
+    [Fact]
+    public async Task TurnThatAskedWithAnEncodedArray_IsStillRecognisedAsAQuestion()
+    {
+        var (db, jobId, sessionId) = Seed();
+        db.SessionMessages.Add(new SessionMessage
+        {
+            SessionId = sessionId,
+            SenderAgentId = "astra",
+            EventType = "tool_call",
+            ToolName = "ask_question",
+            ToolArgsJson = EncodedArrayToolArgs,
+            Content = "Asking question",
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        await db.SaveChangesAsync();
+
+        var runner = new ScriptedTurnRunner(_ => TurnOutcome.Awaiting("operator", "Parked on a question"));
+        var result = await RunAsync(db, jobId, runner, new RecordingPromptStackBuilder());
+
+        result.Payload.Questions.Should().ContainSingle()
+            .Which.Question.Should().Be("How should the repository workspace be resolved?",
+                "a question the driver serialised as a string was still asked, and the operator still has to answer it");
+        result.Payload.Questions[0].Options.Should().ContainInOrder(
+            "Clone into repos/budget-app", "Re-provision the workspace");
+        result.CardId.Should().NotBeEmpty("a card the operator can answer is the only exit that is not a guess");
+        runner.Requests.Should().HaveCount(1, "the question was asked; nothing is owed a follow-up");
+    }
+
+    [Fact]
+    public async Task TurnThatParkedOnAnUnreadableQuestion_IsNotAnsweredWithASecondTurn()
+    {
+        var (db, jobId, sessionId) = Seed();
+        db.SessionMessages.Add(new SessionMessage
+        {
+            SessionId = sessionId,
+            SenderAgentId = "astra",
+            EventType = "system",
+            Content = "Model execution stopped pending operator input",
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        await db.SaveChangesAsync();
+
+        var runner = new ScriptedTurnRunner(_ => TurnOutcome.Awaiting("operator", "Waiting on input"));
+        var result = await RunAsync(db, jobId, runner, new RecordingPromptStackBuilder());
+
+        runner.Requests.Should().HaveCount(1,
+            "the follow-up turn runs on the same persona that is holding the question, so it competes with the answer rather than asking for it");
+        result.CardId.Should().BeEmpty("nothing can be shown that the platform did not actually read");
+        result.Payload.Questions.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task FencedBlockHoldingABareArray_IsRead()
+    {
+        var (db, jobId, _) = Seed();
+        var runner = new ScriptedTurnRunner(_ => TurnOutcome.ContinueTurn(
+            "```ask_question\n[\"Which branch does Stage 3 cut from?\"]\n```"));
+
+        var result = await RunAsync(db, jobId, runner, new RecordingPromptStackBuilder());
+
+        result.Payload.Questions.Should().ContainSingle()
+            .Which.Question.Should().Be("Which branch does Stage 3 cut from?");
+    }
+
     [Fact]
     public async Task SessionsThatBelongToAnotherJob_AreNotReadForItsQuestions()
     {
