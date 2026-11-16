@@ -110,6 +110,83 @@ public class JobExecutionWorkflowTests
         }
     }
 
+    /// <summary>
+    /// Guidance revises the plan without rejecting it, and leaves the gate for the operator to decide.
+    /// </summary>
+    /// <remarks>
+    /// This is the recovery route for a job that skipped Discovery Q&A: nothing was asked, the checklist
+    /// was built on an assumption nobody confirmed, and the only exits were "approve it anyway" or
+    /// "reject a plan that is not actually wrong". Guidance takes neither of them.
+    /// </remarks>
+    [Fact]
+    public async Task JobWorkflow_PlanGuidance_ReplansWithoutRejectingTheGate()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var timeline = new FakeTimelineActivities { CustomDiscoveryQuestions = [] };
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        using var worker = BuildWorker(env, timeline, execution, git);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                AssignedAgentId: "driver-implementer",
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace/repos/agent-mesh",
+                InitialPrompt: "Finish the cockpit gate; the billing module is frozen",
+                TargetBranch: "main",
+                ApprovalPolicy: PlanApprovalPolicy.LeadOrHuman
+            );
+
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
+            timeline.DecompositionInputs.Should().HaveCount(1);
+
+            await handle.SignalAsync(wf => wf.SubmitPlanGuidanceAsync(new PlanGuidanceSignal(
+                timeline.PlanCardId,
+                "The billing module is frozen this sprint - take it off the checklist.",
+                "operator",
+                Guid.NewGuid().ToString())));
+
+            await WaitUntilLocalAsync(
+                () => timeline.DecompositionInputs.Count >= 2,
+                "operator guidance has to send Stage 1B back for a revision");
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
+
+            var revision = timeline.DecompositionInputs[1];
+            revision.Feedback.Should().NotBeNull()
+                .And.Contain("billing module is frozen")
+                .And.Contain("OPERATOR GUIDANCE");
+
+            // The whole point of a separate signal: a revision is not a refusal. Reusing the reject path
+            // would have stamped Rejected across the timeline and left the operator reading their own
+            // correction as a criticism of the plan.
+            timeline.UpdatedCards.Should().Contain(c => c.Status == TimelineCardStatus.Resolved);
+            timeline.UpdatedCards.Should().NotContain(c => c.Status == TimelineCardStatus.Rejected);
+
+            // The gate is still the operator's to decide: approving the revised plan drives the job on.
+            await handle.SignalAsync(wf => wf.ReceivePlanApprovalAsync(
+                new PlanApprovedSignal("astra", "tech_lead", "Now it matches the freeze.", DateTimeOffset.UtcNow)));
+
+            await WaitUntilAsync(handle, s =>
+                s.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase));
+            execution.TaskTurnCount.Should().Be(timeline.CustomTasks.Count);
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     [Fact]
     public async Task JobWorkflow_RespectsHumanOnlyApprovalPolicy_OnReceivePlanApprovalSignal()
     {
@@ -600,6 +677,29 @@ public class JobExecutionWorkflowTests
         throw new TimeoutException($"Workflow did not satisfy predicate within {timeoutMs}ms");
     }
 
+    /// <summary>
+    /// Waits on activity-side bookkeeping rather than on workflow state.
+    /// </summary>
+    /// <remarks>
+    /// The plan gate reports the same heartbeat ("Awaiting plan approval") before and after a guidance
+    /// round, and a rejection looks identical to a revision from outside, so "the loop came back round
+    /// twice" is only observable in what the fakes were asked to do.
+    /// </remarks>
+    private static async Task WaitUntilLocalAsync(
+        Func<bool> predicate,
+        string because,
+        int timeoutMs = 15_000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (predicate()) return;
+            await Task.Delay(100);
+        }
+
+        throw new TimeoutException($"Workflow did not satisfy predicate within {timeoutMs}ms: {because}");
+    }
+
     private static async Task WaitUntilLatestAsync(
         WorkflowHandle<JobExecutionWorkflow> handle,
         Func<JobWorkflowState, bool> predicate,
@@ -629,6 +729,7 @@ public class JobExecutionWorkflowTests
         public Guid PlanCardId { get; set; } = Guid.NewGuid();
         public List<DiscoveryQaActivityInput> DiscoveryQaInputs { get; } = [];
         public List<DecompositionActivityInput> DecompositionInputs { get; } = [];
+        public List<UpdateTimelineCardStatusInput> UpdatedCards { get; } = [];
         public List<AppendRemediationTasksInput> AppendedRemediationBatches { get; } = [];
         public List<DiscoveryQuestion>? CustomDiscoveryQuestions { get; set; }
         public List<ProposedChecklistItem> CustomTasks { get; set; } =
@@ -652,7 +753,11 @@ public class JobExecutionWorkflowTests
             });
 
         [Activity]
-        public Task UpdateCardStatusAsync(UpdateTimelineCardStatusInput input) => Task.CompletedTask;
+        public Task UpdateCardStatusAsync(UpdateTimelineCardStatusInput input)
+        {
+            UpdatedCards.Add(input);
+            return Task.CompletedTask;
+        }
 
         [Activity]
         public Task<DiscoveryQaActivityResult> ExecuteDiscoveryQaActivityAsync(DiscoveryQaActivityInput input)

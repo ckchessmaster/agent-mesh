@@ -27,6 +27,11 @@ export interface TimelineFeedProps {
     feedback?: string,
     approverId?: string
   ) => Promise<void> | void;
+  /**
+   * Free-form operator guidance for a plan gate that stays open. Optional: a feed without it renders the
+   * card with its two original exits.
+   */
+  onSendPlanGuidance?: (cardId: string, content: string) => Promise<void> | void;
   onSubmitPrReview?: (
     cardId: string,
     approved: boolean,
@@ -48,6 +53,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   isStarting = false,
   onSubmitAnswers,
   onSubmitPlanDecision,
+  onSendPlanGuidance,
   onSubmitPrReview,
   onSubmitIntervention,
   onAddComment
@@ -129,6 +135,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
                 key={card.id}
                 card={card}
                 onSubmitPlanDecision={onSubmitPlanDecision}
+                onSendGuidance={onSendPlanGuidance}
                 onAddComment={onAddComment}
               />
             );

@@ -58,6 +58,21 @@ public interface IWorkflowSignalRouter
         Task.FromResult(new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow));
 
     /// <summary>
+    /// Delivers operator guidance into the job workflow that is holding this job's plan gate.
+    /// </summary>
+    /// <remarks>
+    /// Unlike a chat reply, guidance has nowhere else to go: only <c>JobExecutionWorkflow</c> waits on a
+    /// plan gate, so "no running job workflow" is a real refusal rather than the normal buffered case.
+    /// The caller must report that to the operator instead of accepting the message as if the agent had
+    /// been told — an undelivered instruction at a gate is how an operator learns to distrust one.
+    /// </remarks>
+    Task<SignalDelivery> SendPlanGuidanceAsync(
+        Guid jobId,
+        PlanGuidanceSignal signal,
+        CancellationToken ct = default) =>
+        Task.FromResult(new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow));
+
+    /// <summary>
     /// Delivers the living checklist into the job execution workflow.
     /// </summary>
     Task<SignalDelivery> SendSetChecklistAsync(
@@ -307,6 +322,65 @@ public class WorkflowSignalRouter(
             logger?.LogWarning(ex, "Signal for {WorkflowId} was rejected", workflowId);
             return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, ex.Message);
         }
+    }
+
+    public async Task<SignalDelivery> SendPlanGuidanceAsync(
+        Guid jobId,
+        PlanGuidanceSignal signal,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(signal);
+
+        // The same three id spellings the chat path probes, because a job workflow can be started under
+        // any of them and a guidance POST that reports "no workflow" while one is parked on its plan gate
+        // is a lie the operator has no way to check.
+        foreach (var jobWfId in new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}" }.Distinct())
+        {
+            using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeCts.CancelAfter(ProbeTimeout);
+
+            WorkflowExecutionDescription? jobDesc = null;
+            try
+            {
+                jobDesc = await DescribeAsync(jobWfId, probeCts.Token);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                logger?.LogDebug("Probe for job workflow {WorkflowId} timed out or failed: {Detail}", jobWfId, Describe(ex));
+            }
+
+            if (jobDesc is null || jobDesc.Status != WorkflowExecutionStatus.Running)
+            {
+                continue;
+            }
+
+            try
+            {
+                var jobHandle = temporal.GetWorkflowHandle<IJobExecutionWorkflow>(jobWfId);
+                await jobHandle.SignalAsync(
+                    w => w.SubmitPlanGuidanceAsync(signal),
+                    new WorkflowSignalOptions { Rpc = Rpc(ct) });
+
+                logger?.LogInformation(
+                    "Signalled job execution workflow {WorkflowId} with plan guidance from {SenderId} on card {CardId}",
+                    jobWfId, signal.SenderId, signal.CardId);
+
+                return new SignalDelivery(jobWfId, SignalDeliveryStatus.Delivered);
+            }
+            catch (RpcException ex)
+            {
+                return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, Describe(ex));
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                logger?.LogWarning(ex, "Plan guidance signal for {WorkflowId} was rejected", jobWfId);
+                return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, ex.Message);
+            }
+        }
+
+        return new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow,
+            "No running job workflow is holding a plan gate for this job, so no agent was told. " +
+            "The message is saved as a comment on the card.");
     }
 
     public async Task<SignalDelivery> SendPrReviewAsync(

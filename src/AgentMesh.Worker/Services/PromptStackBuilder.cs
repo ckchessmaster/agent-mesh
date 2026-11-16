@@ -570,7 +570,13 @@ public class PromptStackBuilder(
             sb.Append("* Phase: Read-only Discovery. Inspect the codebase (grep, find, read_file, git log).\n");
             sb.Append("* Guardrail: File modification tools (write_file, edit_file) and git mutations are disabled during discovery.\n");
             sb.Append("* Objective: Decompose the objective into atomic, verifiable tasks sized to the scope of the work (typically 3–6 tasks for standard features, or more/fewer as needed) and register them with manage_task(set_checklist).\n");
-            sb.Append("* Post plan & questions via post_job_message(requires_reply: true), then conclude your turn. Do not begin implementation.\n");
+            sb.Append("* Stage 1 has exactly two exits and you take one of them. Asking ends your turn, so you cannot ask and plan in the same turn.\n");
+            sb.Append("* Genuinely ambiguous? Call ask_question — one entry per question, each carrying its answer options — then conclude. Do not register a checklist or post a plan in that turn: the operator's answers arrive as the next turn, and Stage 1B builds the checklist from them.\n");
+            sb.Append("* Clear enough? Register the checklist with manage_task(set_checklist), post the plan via post_job_message(requires_reply: true), conclude with the single line NO_OPEN_QUESTIONS, then stop. Do not begin implementation.\n");
+            sb.Append("* NO_OPEN_QUESTIONS is read by the platform, not by a person: it is how a cleared gate is recorded as a decision. Say it in prose instead and you get one follow-up turn asking which of the two exits you took.\n");
+            sb.Append("* ask_question is the only question channel the operator can see and answer. A question written into prose is never shown to anyone: the plan gate advances regardless and the job proceeds on your guess. Never put a question in post_job_message, in manage_task, or in your closing message.\n");
+            sb.Append("* No function tools in this driver (claude -p, agy, copilot)? Emit the identical object as a fenced code block tagged ask_question containing {\"questions\":[{\"question\":\"...\",\"options\":[\"...\"]}]}, then conclude — it ends the turn exactly like the tool call, and it is the only accepted prose form.\n");
+            sb.Append("* Ask only what would change the work. Do not manufacture questions to look careful, and do not repeat a structured question in prose.\n");
         }
 
         AppendChecklist(sb, job, context.TaskId);
@@ -685,11 +691,19 @@ public class PromptStackBuilder(
 
         if (string.Equals(context.TaskId?.Trim(), "stage-1-discovery", StringComparison.OrdinalIgnoreCase))
         {
-            return "Explore the codebase in read-only mode, decompose the objective into atomic, verifiable tasks " +
-                   "sized to the scope of the work (typically 3–6 tasks for standard features, or more/fewer as needed) " +
-                   "using manage_task(action='set_checklist'), and post your plan or questions via " +
-                   "post_job_message. Do not reply that you are waiting for instructions — this envelope " +
-                   "is the instruction.";
+            return "Explore the codebase in read-only mode, then take exactly one of the two Stage 1 exits. " +
+                   "If the objective is ambiguous enough that guessing wrong would waste real work, call " +
+                   "ask_question with those questions and their options and conclude your turn — asking ends the " +
+                   "turn, so do not also post a plan; the operator's answers arrive as the next turn and Stage 1B " +
+                   "builds the checklist from them. With no function tools, emit a fenced ask_question JSON block " +
+                   "instead, which ends the turn the same way. Otherwise decompose the objective into atomic, " +
+                   "verifiable tasks sized to the scope of the work (typically 3–6 tasks for standard features, or " +
+                   "more/fewer as needed) using manage_task(action='set_checklist'), post the plan via " +
+                   "post_job_message, and conclude with the single line NO_OPEN_QUESTIONS so the platform can " +
+                   "record the gate as deliberately cleared. A question written into prose is never shown to the " +
+                   "operator, and a sentence saying you have no questions is not the token, so either one buys a " +
+                   "follow-up turn. Do not reply that you are " +
+                   "waiting for instructions — this envelope is the instruction.";
         }
 
         if (context.TaskId?.StartsWith("stage-4-pr-open", StringComparison.OrdinalIgnoreCase) == true)
