@@ -109,13 +109,20 @@ Metrics__Prometheus__Enabled=true dotnet run --project src/AgentMesh.Api
 
 In Kubernetes, `api.metrics` in `deploy/helm/agent-mesh/values.yaml` enables the endpoint on
 container port 9464 and creates a PodMonitor when the cluster has the prometheus-operator CRDs.
-Two details are deliberate:
+Three details are deliberate:
 
 * **The metrics port is not part of the `agent-mesh-api` Service.** The scrape endpoint cannot be
   authenticated without handing Prometheus a bearer token, so it stays reachable only from the pod
   network and can never be hit through the Ingress. The listener answers nothing but `/metrics`.
 * **`AddPrometheusExporter` is additive to the OTLP exporter**, so the Aspire dashboard keeps
   working with metrics enabled.
+* **The chart grants Prometheus pod-read access in this namespace** (`api.metrics.podMonitor.rbac`).
+  Discovery is the part people forget: a PodMonitor that syncs happily and shows up in
+  `prometheus.yaml` can still scrape nothing, because listing pods is a permission the operator's
+  own cluster roles may not cover. The symptom is an empty target list plus
+  `pods is forbidden: User "system:serviceaccount:monitoring:prometheus-k8s"` in the Prometheus
+  log. Set `api.metrics.podMonitor.rbac.subjects` if your Prometheus runs under a different
+  service account, or `rbac.create=false` if the namespace is already authorised.
 
 ### Triaging memory and restarts
 
