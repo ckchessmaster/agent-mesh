@@ -770,12 +770,26 @@ public class PrReviewPollingService(
     /// </summary>
     /// <remarks>
     /// Shaped for the reader that will actually get it. <c>BuildReviewRemediationTasks</c> turns each
-    /// bullet into one checklist item and ignores prose, so every failing check gets its own task with
-    /// its own URL, while the framing lines that tell the persona what to do when it is done land in
-    /// the round prompt without becoming tasks of their own. The trailing instruction matters: with
-    /// "the gate re-parks on the new commit" the author knows the loop it is in, and a fix that is
-    /// committed but never pushed would leave everyone waiting on a build of code that no longer exists
-    /// on GitHub.
+    /// bullet into one checklist item and ignores prose, so every failing check gets its own task, while
+    /// the framing lines that tell the persona what to do when it is done land in the round prompt
+    /// without becoming tasks of their own. The trailing instruction matters: with "the gate re-parks on
+    /// the new commit" the author knows the loop it is in, and a fix that is committed but never pushed
+    /// would leave everyone waiting on a build of code that no longer exists on GitHub.
+    /// <para>
+    /// The log URLs are kept off the bullets on purpose, and this is the shape the first production round
+    /// proved necessary. That activity reads a file path out of each bullet with a "first thing containing
+    /// a dot" pattern, and a GitHub Actions log URL always has one, so a bullet carrying its URL produced
+    /// a task whose target file was <c>//github.com</c> — an author told to edit a hostname. Names alone
+    /// resolve to <c>workspace</c>, which is the honest answer for a build failure, and resolve to the
+    /// check's own path when a suite is named after one, which is the better answer.
+    /// </para>
+    /// <para>
+    /// The URLs therefore go in a block quoted with <c>&gt;</c>. A quote was chosen over indentation or a
+    /// plain line because the task builder trims each line before testing it for a list marker, so
+    /// indentation protects nothing, and a check named <c>1. Build</c> would turn its own log line into a
+    /// second task. The quote marker is not one the builder recognises, so no check name can promote a
+    /// log line into work.
+    /// </para>
     /// </remarks>
     internal static string BuildCiFailureNotes(
         string headSha,
@@ -792,10 +806,19 @@ public class PrReviewPollingService(
 
         foreach (var failure in listed)
         {
-            var url = string.IsNullOrWhiteSpace(failure.HtmlUrl) ? null : failure.HtmlUrl!.Trim();
-            lines.Add(url is null
-                ? $"- {CheckLabel(failure)} — failure"
-                : $"- {CheckLabel(failure)} — failure — {url}");
+            lines.Add($"- {CheckLabel(failure)} — failure");
+        }
+
+        var logLines = listed
+            .Where(f => !string.IsNullOrWhiteSpace(f.HtmlUrl))
+            .Select(f => $"> {CheckLabel(f)} — {f.HtmlUrl!.Trim()}")
+            .ToList();
+
+        if (logLines.Count > 0)
+        {
+            lines.Add(string.Empty);
+            lines.Add("Logs for the checks above:");
+            lines.AddRange(logLines);
         }
 
         if (failures.Count > listed.Count)
