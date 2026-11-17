@@ -6,6 +6,7 @@ using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using PrReviewCardPayload = AgentMesh.Core.Services.PrReviewCardPayload;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Services;
 using Microsoft.AspNetCore.SignalR;
@@ -1116,24 +1117,22 @@ public class PlatformMcpTools(
             .OrderByDescending(c => c.CreatedAt)
             .ToListAsync(ct);
 
+        // Matched through the same helper the review gate's activity uses, and on the URL as well as
+        // the number: the gate can park with only a URL, and matching on the number alone left that pair
+        // of cards unable to see each other.
+        var reference = ((int?)resolvedPrNumber, resolvedPrUrl);
         var prCard = existingCards.FirstOrDefault(c =>
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(c.StructuredPayloadJson);
-                return doc.RootElement.ValueKind == JsonValueKind.Object &&
-                       doc.RootElement.TryGetProperty("prNumber", out var p) &&
-                       p.TryGetInt32(out var n) &&
-                       n == resolvedPrNumber;
-            }
-            catch { return false; }
-        });
+            PrReviewCardPayload.IsSamePullRequest(
+                PrReviewCardPayload.ReadReference(c.StructuredPayloadJson), reference));
 
         if (prCard is not null)
         {
             prCard.Status = TimelineCardStatus.PendingInput;
             prCard.Title = cardTitle;
-            prCard.StructuredPayloadJson = JsonSerializer.Serialize(linkage, JsonOptions);
+            // Merge rather than replace, so re-registering an existing pull request does not erase the
+            // review round or reviewer the gate already recorded on this card.
+            prCard.StructuredPayloadJson = PrReviewCardPayload.Merge(
+                prCard.StructuredPayloadJson, JsonSerializer.Serialize(linkage, JsonOptions));
             prCard.UpdatedAt = now;
         }
         else
