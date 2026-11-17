@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { JobCockpit } from '../components/JobCockpit';
 import { api } from '../services/api';
 import type { Project, ProjectJob } from '../types';
@@ -87,7 +87,7 @@ describe('JobCockpit stalled-job recovery', () => {
     expect(screen.queryByTestId('cockpit-recover-job-btn')).not.toBeInTheDocument();
   });
 
-  it('asks before rewriting a running job, and only then calls', () => {
+  it('asks before rewriting a running job, and only then calls', async () => {
     const onRecoverJob = vi.fn().mockResolvedValue(undefined);
     renderCockpit(stalledJob(), onRecoverJob);
 
@@ -100,7 +100,11 @@ describe('JobCockpit stalled-job recovery', () => {
 
     fireEvent.click(screen.getByTestId('cockpit-confirm-recover-btn'));
 
-    return waitFor(() => expect(onRecoverJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onRecoverJob).toHaveBeenCalledTimes(1));
+    // Wait for the component to settle rather than returning the moment the callback fired: a state
+    // update landing after the file tears down makes vitest's worker close its RPC mid-log, which
+    // fails CI as an unhandled error with no failing assertion anywhere.
+    await waitFor(() => expect(screen.getByTestId('cockpit-recover-job-btn')).toBeEnabled());
   });
 
   it('cancels without touching the job', () => {
@@ -115,7 +119,7 @@ describe('JobCockpit stalled-job recovery', () => {
     expect(screen.getByTestId('cockpit-recover-job-btn')).toBeInTheDocument();
   });
 
-  it('reports that it is working while the call is in flight', () => {
+  it('reports that it is working while the call is in flight', async () => {
     let finish: () => void = () => {};
     const onRecoverJob = vi.fn().mockReturnValue(
       new Promise<void>((resolve) => {
@@ -131,11 +135,13 @@ describe('JobCockpit stalled-job recovery', () => {
     expect(confirming).toBeDisabled();
     expect(confirming.textContent).toMatch(/Recovering/);
 
-    finish();
-    return waitFor(() => expect(screen.queryByTestId('cockpit-confirm-recover-btn')).not.toBeInTheDocument());
+    // act(): the resolution lands in React state, and it must resolve before this test returns.
+    act(() => finish());
+    await waitFor(() => expect(screen.queryByTestId('cockpit-confirm-recover-btn')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId('cockpit-recover-job-btn')).toBeEnabled());
   });
 
-  it('keeps offering the confirm row if recovery fails, so the operator can read the error', () => {
+  it('keeps offering the confirm row if recovery fails, so the operator can read the error', async () => {
     const onRecoverJob = vi.fn().mockRejectedValue(new Error('This deployment has no recovery service.'));
     const { container } = renderCockpit(stalledJob(), onRecoverJob);
 
@@ -143,12 +149,12 @@ describe('JobCockpit stalled-job recovery', () => {
     fireEvent.click(screen.getByTestId('cockpit-confirm-recover-btn'));
 
     // The parent surfaces the failure; the cockpit must not optimistically close the row and pretend the
-    // job was recovered, or the operator has to work out that nothing happened.
-    return waitFor(() => {
-      expect(onRecoverJob).toHaveBeenCalled();
-      expect(screen.getByTestId('cockpit-confirm-recover-btn')).toBeInTheDocument();
-      expect(container).toBeTruthy();
-    });
+    // job was recovered, or the operator has to work out that nothing happened. Re-enabling proves the
+    // in-flight flag was cleared on the failure path too, so the operator can retry without a refresh.
+    await waitFor(() => expect(onRecoverJob).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByTestId('cockpit-confirm-recover-btn')).toBeEnabled());
+    expect(screen.getByTestId('cockpit-confirm-recover-btn')).toBeInTheDocument();
+    expect(container).toBeTruthy();
   });
 
   it('never replaces Reset', () => {
