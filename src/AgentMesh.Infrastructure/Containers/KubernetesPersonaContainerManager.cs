@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Text.RegularExpressions;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -24,6 +25,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
     private readonly string _namespace;
     private readonly string _defaultImage;
     private static readonly ConcurrentDictionary<string, ActiveK8sAuthSession> _activeK8sAuthSessions = new();
+
+    /// <summary>Keeps the "claim cannot be shrunk" warning to one line per process; see ResizeWorkspaceClaimAsync.</summary>
+    private static int _shrinkNoticeShown;
 
     public string RuntimeName => "kubernetes";
 
@@ -2838,18 +2842,29 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
     private async Task EnsurePersistentVolumeClaimAsync(string normPersonaId, IDictionary<string, string> labels, CancellationToken ct)
     {
         var pvcName = GetPvcName(normPersonaId);
+        var storageClassName = _config["PersonaContainer:StorageClassName"] ?? _config["Kubernetes:StorageClassName"];
+        var configuredSize = _config["PersonaContainer:WorkspaceSize"] ?? _config["Kubernetes:WorkspaceSize"];
+
+        V1PersistentVolumeClaim? existingClaim = null;
         try
         {
-            await _client.CoreV1.ReadNamespacedPersistentVolumeClaimAsync(pvcName, _namespace, cancellationToken: ct);
-            return;
+            existingClaim = await _client.CoreV1.ReadNamespacedPersistentVolumeClaimAsync(pvcName, _namespace, cancellationToken: ct);
         }
         catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
             // PVC does not exist yet, proceed to create
         }
 
-        var storageClassName = _config["PersonaContainer:StorageClassName"] ?? _config["Kubernetes:StorageClassName"];
-        var storageSize = _config["PersonaContainer:WorkspaceSize"] ?? _config["Kubernetes:WorkspaceSize"] ?? "10Gi";
+        // An existing claim is not simply left alone: a workspace that predates a larger configured size
+        // keeps the old one forever, which makes the chart value look like it does nothing. Growing is the
+        // only direction Kubernetes permits, so see WorkspaceResize for what happens the other way.
+        if (existingClaim is not null)
+        {
+            await ResizeWorkspaceClaimAsync(existingClaim, normPersonaId, configuredSize, ct);
+            return;
+        }
+
+        var storageSize = configuredSize ?? "10Gi";
 
         var pvcLabels = new Dictionary<string, string>(labels)
         {
@@ -2892,6 +2907,175 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             _logger.LogError(ex, "Failed to create PVC {PvcName} for @{PersonaId} in namespace {Namespace}", pvcName, normPersonaId, _namespace);
             throw;
+        }
+    }
+
+    /// <summary>
+    /// What to do about an existing workspace claim's size the next time its persona is reconciled.
+    /// </summary>
+    internal enum WorkspaceResize
+    {
+        /// <summary>Leave it alone: the sizes agree, or the claim's own size could not be read.</summary>
+        None,
+
+        /// <summary>The configured size is larger, so the claim should be raised to it.</summary>
+        Grow,
+
+        /// <summary>
+        /// The configured size is smaller. Reported, never attempted: a claim request can only go up, and
+        /// sending the smaller value would fail the API call on every persona start.
+        /// </summary>
+        ShrinkRequested,
+
+        /// <summary>
+        /// The configured value is absent or not a storage quantity, so no comparison is possible and the
+        /// operator has a config error to find.
+        /// </summary>
+        ConfiguredUnreadable
+    }
+
+    /// <summary>
+    /// The decision half of keeping a workspace claim at the configured size, with no cluster in it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Comparison is numeric because quantity strings do not order or compare as text: <c>10Gi</c> and
+    /// <c>10240Mi</c> are the same claim size written two ways, and <c>1Ti</c> sorts below <c>2Gi</c> in a
+    /// string sort while being five hundred times larger. Parsing is delegated to the Kubernetes client's
+    /// own quantity reader rather than reimplemented, so binary and decimal suffixes, exponents and
+    /// fractional values mean here exactly what they mean to the API server that will receive them.
+    /// </para>
+    /// <para>
+    /// An unreadable <paramref name="currentQuantity"/> is <see cref="WorkspaceResize.None"/> rather than
+    /// a licence to patch: a claim whose size could not be read is a claim whose growth cannot be
+    /// confirmed as safe, and this runs on the path that starts a persona's workspace.
+    /// </para>
+    /// </remarks>
+    internal static WorkspaceResize PlanWorkspaceResize(string? currentQuantity, string? configuredQuantity)
+    {
+        var configured = TryReadWorkspaceBytes(configuredQuantity);
+        if (configured is null)
+        {
+            return WorkspaceResize.ConfiguredUnreadable;
+        }
+
+        var current = TryReadWorkspaceBytes(currentQuantity);
+        if (current is null)
+        {
+            return WorkspaceResize.None;
+        }
+
+        if (configured.Value > current.Value) return WorkspaceResize.Grow;
+        return configured.Value < current.Value ? WorkspaceResize.ShrinkRequested : WorkspaceResize.None;
+    }
+
+    /// <summary>
+    /// A storage quantity in bytes, or null for "not a usable size".
+    /// </summary>
+    /// <remarks>
+    /// Zero and negative values are rejected as unreadable rather than treated as a size request of nil:
+    /// <c>0</c> parses cleanly and would otherwise look like a legitimate instruction to shrink every
+    /// workspace to nothing.
+    /// </remarks>
+    internal static long? TryReadWorkspaceBytes(string? quantity)
+    {
+        if (string.IsNullOrWhiteSpace(quantity)) return null;
+
+        try
+        {
+            var bytes = new ResourceQuantity(quantity.Trim()).ToInt64();
+            return bytes > 0 ? bytes : null;
+        }
+        catch (Exception ex) when (ex is FormatException or OverflowException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Raises a persona's workspace claim to the configured size, or reports why it will not.
+    /// </summary>
+    /// <remarks>
+    /// A refusal is never fatal. This sits on the path that brings a persona's workspace up, and a claim
+    /// that cannot grow is still a usable workspace at the size it already has — which is exactly the
+    /// state the operator was in before they raised the value. The common refusal is a storage class
+    /// without <c>allowVolumeExpansion: true</c>, which the API server rejects as a policy matter rather
+    /// than a transient one, so retrying it on the next persona start would not help either.
+    /// </remarks>
+    private async Task ResizeWorkspaceClaimAsync(
+        V1PersistentVolumeClaim claim,
+        string normPersonaId,
+        string? configuredSize,
+        CancellationToken ct)
+    {
+        var current = claim.Spec?.Resources?.Requests is { } requests && requests.TryGetValue("storage", out var quantity)
+            ? quantity.ToString()
+            : null;
+
+        switch (PlanWorkspaceResize(current, configuredSize))
+        {
+            case WorkspaceResize.None:
+                return;
+
+            case WorkspaceResize.ConfiguredUnreadable:
+                _logger.LogWarning(
+                    "The configured persona workspace size '{Configured}' is not a readable Kubernetes " +
+                    "storage quantity, so {PvcName} for @{PersonaId} stays at {Current}. Set " +
+                    "config.personaRunner.storage.size to a value such as 20Gi.",
+                    configuredSize ?? "<unset>", claim.Metadata.Name, normPersonaId, current ?? "<unreadable>");
+                return;
+
+            case WorkspaceResize.ShrinkRequested:
+                // Warn once per process and go quiet. This runs every time a persona's workspace is
+                // reconciled, which includes every dispatched turn, and the answer is not going to change
+                // without an operator action: shrinking a bound claim is not something Kubernetes can do.
+                if (Interlocked.Exchange(ref _shrinkNoticeShown, 1) == 0)
+                {
+                    _logger.LogWarning(
+                        "{PvcName} for @{PersonaId} is already {Current}, larger than the configured " +
+                        "{Configured}, and a persistent volume claim cannot be shrunk: the smaller value is " +
+                        "ignored. Raise config.personaRunner.storage.size to change workspace capacity, or " +
+                        "delete the claim if it really should be smaller.",
+                        claim.Metadata.Name, normPersonaId, current, configuredSize);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "Workspace claim {PvcName} for @{PersonaId} left at {Current}, above the " +
+                        "configured {Configured}.",
+                        claim.Metadata.Name, normPersonaId, current, configuredSize);
+                }
+                return;
+
+            case WorkspaceResize.Grow:
+                var patchJson = JsonSerializer.Serialize(new
+                {
+                    spec = new { resources = new { requests = new { storage = configuredSize!.Trim() } } }
+                });
+
+                try
+                {
+                    await _client.CoreV1.PatchNamespacedPersistentVolumeClaimAsync(
+                        new V1Patch(patchJson, V1Patch.PatchType.MergePatch),
+                        claim.Metadata.Name, _namespace, cancellationToken: ct);
+
+                    _logger.LogInformation(
+                        "Growing workspace claim {PvcName} for @{PersonaId} from {Current} to {Target}. " +
+                        "A driver with node expansion, such as Longhorn, resizes the filesystem online; " +
+                        "otherwise the extra space appears on the persona's next start.",
+                        claim.Metadata.Name, normPersonaId, current, configuredSize!.Trim());
+                }
+                catch (k8s.Autorest.HttpOperationException ex)
+                {
+                    _logger.LogWarning(
+                        "Could not grow workspace claim {PvcName} for @{PersonaId} from {Current} to " +
+                        "{Target} ({Message}). The persona keeps its current size. A storage class without " +
+                        "allowVolumeExpansion: true refuses a resize, and so does a claim that was " +
+                        "statically provisioned.",
+                        claim.Metadata.Name, normPersonaId, current, configuredSize!.Trim(),
+                        $"HTTP {(int)ex.Response.StatusCode}: {ex.Message}");
+                }
+                return;
         }
     }
 

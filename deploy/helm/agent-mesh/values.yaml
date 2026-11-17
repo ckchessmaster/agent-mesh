@@ -122,7 +122,17 @@ config:
     # Automatically restart and update persona runner containers to the latest configured image when idle
     autoUpdateIdleRunners: true
     storage:
+      # Workspace size each persona's persistent volume claim asks for. Applies when the claim is
+      # created, and to an existing claim that is smaller than this value: the platform raises it on the
+      # persona's next start, so growing an established deployment's workspaces is a chart change rather
+      # than an operator task.
+      #
+      # Increase only. Kubernetes cannot shrink a bound claim, so a value below what a persona already
+      # has is ignored (the API warns about it once) and changing it back later does not undo the growth.
+      # Growing also needs a storage class with allowVolumeExpansion: true; Longhorn's default does, and a
+      # class that does not leaves the workspace at its current size with a warning instead of a failure.
       size: "10Gi"
+      # Leave empty to use the cluster's default storage class.
       storageClassName: ""
 
 # Optional: In-cluster Dex OIDC Provider (turn on if you don't have an external corporate IdP)
