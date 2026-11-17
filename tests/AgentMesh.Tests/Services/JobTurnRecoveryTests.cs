@@ -394,6 +394,13 @@ public class JobTurnRecoveryTests
 
         result.PrUrl.Should().Be("https://github.com/o/r/pull/91");
         result.Message.Should().Contain("pull-request stage");
+
+        // Every checklist item is done, so the offset is one past the end. "Resuming at task 4/3" reads
+        // like a bug in the tool the operator is leaning on, and this is the shape prod's first real
+        // recovery actually had (five tasks done, the turn that was going to open the PR dead).
+        result.Message.Should().NotContain("4/3");
+        (await _db.ProjectJobs.AsNoTracking().FirstAsync(j => j.Id == job.Id))
+            .ProgressHeartbeat.Should().Be("Recovering: resuming at the pull-request stage.");
     }
 
     [Fact]
@@ -409,7 +416,7 @@ public class JobTurnRecoveryTests
         _gateway.Starts.Single().Input.Continuation.Should().BeNull();
         result.Message.Should().Contain("discovery");
         (await _db.ProjectJobs.AsNoTracking().FirstAsync(j => j.Id == job.Id))
-            .ProgressHeartbeat.Should().Contain("discovery");
+            .ProgressHeartbeat.Should().Be("Recovering: resuming at discovery.");
     }
 
     [Fact]

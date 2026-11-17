@@ -346,10 +346,13 @@ public sealed class JobTurnRecovery(
             message: continuation is null
                 ? $"Started a fresh run on {workflowId}: the job has no recorded checklist, so there was " +
                   "nothing to resume from and the persona will run discovery again."
-                : $"Resumed {workflowId} at task {resumedNumber}/{totalTasks}" +
-                  (string.IsNullOrWhiteSpace(resumedTitle) ? "." : $": {resumedTitle}.") +
+                : $"Resumed {workflowId} at {DescribeResumePosition(resumedNumber, totalTasks)}" +
+                  (continuation.PendingTasks.Count > 0 && !string.IsNullOrWhiteSpace(resumedTitle)
+                      ? $": {resumedTitle}."
+                      : ".") +
                   (continuation.PendingTasks.Count == 0
-                      ? " Every checklist task is complete, so the run picks up at the pull-request stage."
+                      ? $" All {totalTasks} checklist task{(totalTasks == 1 ? "" : "s")} are recorded complete, so " +
+                        "the run resumes at verification and the pull-request stage."
                       : string.Empty));
     }
 
@@ -570,6 +573,21 @@ public sealed class JobTurnRecovery(
         };
     }
 
+    /// <summary>
+    /// Names the point a resumed run picked up from, in the words an operator would use.
+    /// </summary>
+    /// <remarks>
+    /// A job whose checklist is entirely finished resumes <em>past the end of it</em>: the offset is the
+    /// task count, so a literal <c>"task 6/5"</c> is what falls out. That reads like an off-by-one in the
+    /// repair rather than like the truth — there is no task left, and the run is going back to open or
+    /// re-check the pull request. Prod's first real recovery is exactly this case, which is why the
+    /// wording is handled instead of left to the fraction.
+    /// </remarks>
+    private static string DescribeResumePosition(int resumedNumber, int totalTasks) =>
+        totalTasks == 0 ? "discovery"
+        : resumedNumber > totalTasks ? "the pull-request stage"
+        : $"task {resumedNumber}/{totalTasks}";
+
     /// <summary>Clears the stall marker and says where the job picked up.</summary>
     /// <remarks>
     /// Overwriting the heartbeat is what makes the cockpit's recovery button disappear, so it has to happen
@@ -586,7 +604,7 @@ public sealed class JobTurnRecovery(
         var live = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == job.Id, ct);
         if (live is null) return;
 
-        var position = totalTasks > 0 ? $"task {resumedNumber}/{totalTasks}" : "discovery";
+        var position = DescribeResumePosition(resumedNumber, totalTasks);
         live.ProgressHeartbeat = $"Recovering: resuming at {position}" +
                                  (string.IsNullOrWhiteSpace(resumedTitle) ? "." : $" - {resumedTitle}");
         live.UpdatedAt = DateTimeOffset.UtcNow;
