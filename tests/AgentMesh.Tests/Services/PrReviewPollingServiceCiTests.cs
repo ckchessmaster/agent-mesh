@@ -254,6 +254,64 @@ public class PrReviewPollingServiceCiTests
     }
 
     [Fact]
+    public void TheBulletsCarryNoUrlsBecauseTheTaskBuilderReadsAFilePathOutOfThem()
+    {
+        var verdict = Evaluate(Ci(Run(".NET 10 Solution Build & Test", "completed", "failure")))!;
+
+        var tasks = JobExecutionWorkflow.BuildReviewRemediationTasks(
+            new PrReviewSignal(
+                ReviewerId: verdict.ReviewerId,
+                IsApproved: verdict.IsApproved,
+                ReviewComments: verdict.Comments,
+                Timestamp: verdict.At ?? Now,
+                PrNumber: 93,
+                ApprovedHeadSha: null),
+            round: 1);
+
+        // What actually went wrong in production: the activity reads a file path out of each bullet as
+        // "the first thing containing a dot", and a GitHub Actions log URL always contains one, so the
+        // author was handed a remediation task whose file to change was `//github.com`. A name with no
+        // dot resolves to `workspace`, which is the honest target for a build failure.
+        tasks.Should().HaveCount(1);
+        tasks[0].TargetFile.Should().Be("workspace");
+        verdict.Comments!.Split('\n').Where(l => l.StartsWith("- ")).Should()
+            .OnlyContain(l => !l.Contains("http"));
+    }
+
+    [Fact]
+    public void TheLogUrlsSurviveOnLinesThatCannotBecomeTasks()
+    {
+        // A log URL is the actionable part of a build failure, so moving it off the bullet has to keep it
+        // readable — and it must not arrive as work. Quoting is what guarantees that: the task builder
+        // trims each line before looking for a list marker, so indentation protects nothing, while `>` is
+        // a marker it does not recognise whatever the check is called.
+        var verdict = Evaluate(Ci(
+            Run("1. Build", "completed", "failure"),
+            Run("Helm", "completed", "failure")))!;
+
+        var comments = verdict.Comments!;
+        comments.Should().Contain("Logs for the checks above:");
+
+        var logLines = comments.Split('\n').Where(l => l.StartsWith("> ")).ToList();
+        logLines.Should().HaveCount(2);
+        logLines.Should().OnlyContain(l => l.Contains("http"));
+        logLines.Should().Contain(l => l.Contains("1. Build"));
+
+        var tasks = JobExecutionWorkflow.BuildReviewRemediationTasks(
+            new PrReviewSignal(
+                ReviewerId: verdict.ReviewerId,
+                IsApproved: verdict.IsApproved,
+                ReviewComments: comments,
+                Timestamp: verdict.At ?? Now,
+                PrNumber: 93,
+                ApprovedHeadSha: null),
+            round: 1);
+
+        // One task per failing check, and the numerically-named suite does not promote its own log line.
+        tasks.Should().HaveCount(2);
+    }
+
+    [Fact]
     public void TheNotesTellTheAuthorToPushBecauseTheGateReParksOnTheNewCommit()
     {
         var verdict = Evaluate(Ci(Run("Build", "completed", "failure")))!;
