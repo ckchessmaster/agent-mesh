@@ -1350,6 +1350,21 @@ export default function App() {
     }));
   }, []);
 
+  const handleRecoverJob = async (jobId?: string, note?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const res = await api.recoverJob(targetId, { note });
+      // The card has to leave "Stalled" in the same paint that reports the recovery, or the operator
+      // clicks Recover and sees the same stalled card staring back at them while the new run starts.
+      // The recovery message itself lives in the job timeline and heartbeat, which the server writes.
+      applyJobFromServer(res?.job);
+    } catch (err) {
+      console.error('Failed to recover job:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to recover job');
+    }
+  };
+
   const handleCancelQueuedJobTurn = async (turnId: string, jobId?: string) => {
     const targetId = jobId || selectedJobId;
     if (!targetId) return;
@@ -3927,6 +3942,7 @@ export default function App() {
                       onArchiveJob={handleArchiveJob}
                       onReopenJob={handleReopenJob}
                       onResetJob={handleResetJob}
+                      onRecoverJob={(note) => handleRecoverJob(activeJ.id, note)}
                       onOpenLightbox={setLightboxAttachment}
                       onStopTurn={handleStopSession}
                       onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}

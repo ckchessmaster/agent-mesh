@@ -465,9 +465,41 @@ export const JobLifecycleStatus = {
   AwaitingReview: 'AwaitingReview',
   Completed: 'Completed',
   Blocked: 'Blocked',
-  Failed: 'Failed'
+  Failed: 'Failed',
+  /**
+   * The job's turn was settled by the platform because nothing was advancing it. Distinct from
+   * `Blocked`, which means a gate is waiting on a human: a stalled job has nobody waiting on anyone,
+   * and the cockpit offers a recovery for it rather than an approval.
+   */
+  Stalled: 'Stalled'
 } as const;
 export type JobLifecycleStatus = (typeof JobLifecycleStatus)[keyof typeof JobLifecycleStatus];
+
+/** What a job recovery did, mirrored from the API's `JobRecoveryResult`. */
+export interface JobRecoveryResult {
+  jobId: string;
+  workflowId?: string | null;
+  action:
+    | 'NothingToDo'
+    | 'SettledOnly'
+    | 'AbortedLiveTurn'
+    | 'Resumed'
+    | 'RestartedFromDiscovery'
+    | 'OrchestratorUnavailable'
+    | string;
+  settledSessions: string[];
+  resumedAtTask?: string | null;
+  resumedAtNumber: number;
+  totalTasks: number;
+  prUrl?: string | null;
+  message: string;
+}
+
+/** Response of `POST /api/project-jobs/{id}/recover`: the recovery plus the job as it now stands. */
+export interface JobRecoveryResponse {
+  recovery: JobRecoveryResult;
+  job?: ProjectJob;
+}
 
 export interface QueuedJobTurnDto {
   id: string;
