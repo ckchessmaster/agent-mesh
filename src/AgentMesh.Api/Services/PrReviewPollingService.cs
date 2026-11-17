@@ -27,6 +27,25 @@ public class PrReviewPollingOptions
     /// <summary>How often parked gates are checked for GitHub-side review decisions.</summary>
     public int IntervalSeconds { get; set; } = 60;
 
+    /// <summary>
+    /// Read CI results for a parked gate's head commit and report a failing build as the
+    /// request-changes review it functionally is. On by default; switch off where CI is not the
+    /// platform's to read (self-hosted runners behind a network policy the API pod cannot reach),
+    /// because a poller that cannot reach CI is silent, and silent is what it was before.
+    /// </summary>
+    public bool CheckCi { get; set; } = true;
+
+    /// <summary>
+    /// How long after a check finished its failure may still be reported for a gate that parked
+    /// afterwards. Floor of 5 minutes: the common case is CI going red while the persona is still
+    /// writing its summary and the park landing a minute later, and a failure that predates the park
+    /// by less than a couple of minutes is this park's business, not history.
+    /// </summary>
+    public int CiFailureLookbackMinutes { get; set; } = 45;
+
+    /// <summary>Clamped <see cref="CiFailureLookbackMinutes"/>; see that property for the floor.</summary>
+    public TimeSpan CiFailureLookback => TimeSpan.FromMinutes(Math.Max(5, CiFailureLookbackMinutes));
+
     /// <summary>Floor of 10s: two GETs per parked PR per tick should never become a hammer.</summary>
     public TimeSpan Interval => TimeSpan.FromSeconds(Math.Max(10, IntervalSeconds));
 }
@@ -79,6 +98,37 @@ public class PrReviewPollingOptions
 /// is not detectable from here, and is documented rather than papered over.
 /// </para>
 /// <para>
+/// <strong>CI is the other thing a parked gate waits on, and it is read the same way.</strong> A build
+/// that failed while the persona was still writing its summary used to sit on the PR page informing
+/// nobody: the author had stopped working, the reviewer had not been asked yet, and the job waited for
+/// a human to notice and type into a review box what GitHub had already said unambiguously. So the
+/// poller reads the head commit's check runs and statuses too, and delivers a failure through the same
+/// <see cref="PrReviewSignal"/> class with <c>IsApproved: false</c>, which makes the workflow take its
+/// existing request-changes branch: review round incremented, one remediation task per failing check,
+/// the author sent back to fix the build, and the gate re-parked on the new head. Nothing in the
+/// workflow was forked or extended to accept a machine reviewer, which is the point — a reviewer that
+/// is not a person still cannot invent a merge path.
+/// <para>
+/// <strong>The head commit is the epoch, and that is what stops the loop.</strong> A human reviewer
+/// stops talking when they are satisfied; CI fails a commit forever. Delivering on "CI is red" would
+/// therefore re-fire every minute for as long as the gate stays parked, and re-firing means a fresh
+/// remediation round each time. So a failure is reported once per head commit per job, and the record
+/// of what has been reported is deliberately <em>not</em> dropped when the gate briefly leaves
+/// <c>PendingInput</c> during remediation — dropping it there is precisely what would turn one broken
+/// build into a round every five minutes. A new report requires a new commit, which gives the loop the
+/// same property a human review has: the author has to do something before the reviewer can say
+/// anything. Reporting is also bounded in time (<see cref="PrReviewPollingOptions.CiFailureLookback"/>)
+/// so a failure that predates the current park by hours is not resurrected by an operator merging
+/// through it deliberately.
+/// </para>
+/// <para>
+/// <strong>A green build approves nothing.</strong> CI passing is not the second pair of eyes the
+/// merge gate exists to obtain, and delivering it as an approval would let a machine authorise its own
+/// author's code and merge it. Green CI therefore produces no signal at all: it stops being an obstacle
+/// and leaves the decision exactly where it was. Red CI only ever pushes the job backwards, which is
+/// the one direction an automated reviewer is safe to move a job in.
+/// </para>
+/// <para>
 /// <strong>A PR merged by hand counts.</strong> If a human merges the pull request directly on
 /// GitHub, that is a strictly stronger act than approving it: the code they reviewed is in the base
 /// branch. The poller delivers an approval for the merged head; the merge activity reads the PR,
@@ -114,6 +164,15 @@ public class PrReviewPollingService(
     /// parked gate, so a later round's fresh review is deliverable again.
     /// </summary>
     private readonly ConcurrentDictionary<Guid, string> _deliveredKeys = new();
+
+    /// <summary>
+    /// Job id → the head commit whose CI failure was last reported. Kept when a gate momentarily stops
+    /// showing as parked (that is what remediation looks like from out here) and dropped only when the
+    /// job reaches a terminal status, because this map is what makes "the author has to push before CI
+    /// can complain again" true. See the class remarks for why a CI failure cannot use the same
+    /// lifecycle as <see cref="_deliveredKeys"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<Guid, string> _ciReportedHeads = new();
 
     /// <summary>
     /// Job id → the last verdict key whose non-delivery we logged. Delivery stays retryable (a
@@ -242,12 +301,37 @@ public class PrReviewPollingService(
             }
 
             var verdict = DecideVerdict(jobId, snapshot, card.UpdatedAt, logger);
+
+            // CI is asked only when nothing a person said has already decided this gate. Not out of
+            // politeness: a reviewer that fires first can consume the park, and a human's
+            // request-changes carries detail no build log has.
+            if (verdict is null &&
+                options.Value.CheckCi &&
+                string.Equals(snapshot.PrState, "open", StringComparison.OrdinalIgnoreCase))
+            {
+                verdict = await ReadCiVerdictAsync(
+                    jobId, github, prRef, snapshot.HeadSha, authorToken,
+                    card.UpdatedAt, options.Value, ct);
+            }
+
             if (verdict is null)
             {
                 continue;
             }
 
-            if (_deliveredKeys.TryGetValue(jobId, out var already) && already == verdict.Key)
+            if (verdict.CiHeadSha is { } verdictHead)
+            {
+                // One report per commit. Deliberately not the same map as review keys: those are
+                // dropped the moment a gate stops being parked, and a CI failure delivered from a
+                // dropped key would start a fresh remediation round every few minutes against a build
+                // that is merely still broken.
+                if (string.Equals(_ciReportedHeads.GetValueOrDefault(jobId), verdictHead,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+            }
+            else if (_deliveredKeys.TryGetValue(jobId, out var already) && already == verdict.Key)
             {
                 continue;
             }
@@ -269,11 +353,23 @@ public class PrReviewPollingService(
                     // retryable, or a workflow that was mid-restart when the review landed never
                     // hears about it and the gate sits out its seven days.
                     _deliveredKeys[jobId] = verdict.Key;
-                    logger.LogInformation(
-                        "Delivered {Decision} review for job {JobId} from {Reviewer} " +
-                        "(PR {Pr}, review {ReviewId}) into workflow {WorkflowId}",
-                        verdict.IsApproved ? "approving" : "changes-requested",
-                        jobId, verdict.ReviewerId, prRef, verdict.ReviewId, delivery.WorkflowId);
+
+                    if (verdict.CiHeadSha is { } reportedHead)
+                    {
+                        _ciReportedHeads[jobId] = reportedHead;
+                        logger.LogInformation(
+                            "Delivered CI failure for job {JobId} on {Head} (PR {Pr}) into workflow " +
+                            "{WorkflowId}; the gate is taking its request-changes round: {Checks}",
+                            jobId, reportedHead, prRef, delivery.WorkflowId, verdict.Comments);
+                    }
+                    else
+                    {
+                        logger.LogInformation(
+                            "Delivered {Decision} review for job {JobId} from {Reviewer} " +
+                            "(PR {Pr}, review {ReviewId}) into workflow {WorkflowId}",
+                            verdict.IsApproved ? "approving" : "changes-requested",
+                            jobId, verdict.ReviewerId, prRef, verdict.ReviewId, delivery.WorkflowId);
+                    }
                     break;
 
                 case SignalDeliveryStatus.NoRunningWorkflow:
@@ -300,6 +396,16 @@ public class PrReviewPollingService(
             if (!parkedJobs.Contains(jobId))
             {
                 _deliveredKeys.TryRemove(jobId, out _);
+            }
+        }
+
+        foreach (var jobId in _ciReportedHeads.Keys)
+        {
+            // Terminal only, on purpose — see _ciReportedHeads. A job that finished can never park a
+            // gate again, so its entry has nothing left to suppress; an unfinished one still has.
+            if (terminalJobs.Contains(jobId))
+            {
+                _ciReportedHeads.TryRemove(jobId, out _);
             }
         }
     }
@@ -471,6 +577,266 @@ public class PrReviewPollingService(
         return null;
     }
 
+    /// <summary>
+    /// The reviewer identity a CI failure is delivered under. Namespaced like a person's
+    /// <c>github:&lt;login&gt;</c> tag so the timeline card and the remediation prompt say where the
+    /// request came from, and so an operator can tell a machine's round from a human's at a glance.
+    /// </summary>
+    internal const string CiReviewerId = "github:ci";
+
+    /// <summary>
+    /// Reads the head commit's CI and reports it if it is red, or null for "say nothing".
+    /// </summary>
+    /// <remarks>
+    /// Reads with the same persona credential the reviews were read with — the author of the PR can see
+    /// its checks — and reuses the head SHA the review read already returned rather than fetching the
+    /// pull request a second time, so a tick costs the same three GETs per parked gate it did before.
+    /// A CI read that fails never escalates to the reviews' verdict: an unreachable check API is not
+    /// evidence that a build broke, and halting a healthy job over a network blip is a worse bug than
+    /// waiting one more tick.
+    /// </remarks>
+    private async Task<PrGateVerdict?> ReadCiVerdictAsync(
+        Guid jobId,
+        IGitHubPullRequestService github,
+        string prRef,
+        string? headSha,
+        string? authorToken,
+        DateTimeOffset parkedAtUtc,
+        PrReviewPollingOptions pollingOptions,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(headSha))
+        {
+            // No head to read a build result for. An empty pull request has no CI verdict, and
+            // inventing one is how a job gets sent into a remediation round for a commit that does
+            // not exist.
+            return null;
+        }
+
+        var ci = await github.ReadPullRequestCiStateAsync(
+            prRef,
+            tokenOverride: authorToken,
+            headShaOverride: headSha.Trim(),
+            ct: ct);
+
+        if (!ci.Success)
+        {
+            if (string.Equals(ci.FailureReason, "no_credentials", StringComparison.Ordinal) ||
+                string.Equals(ci.FailureReason, "not_supported", StringComparison.Ordinal))
+            {
+                logger.LogDebug("CI poll for job {JobId} skipped: {Message}", jobId, ci.Message);
+            }
+            else
+            {
+                logger.LogWarning(
+                    "Could not read CI state for job {JobId} ({Pr}): {Message} ({Reason})",
+                    jobId, prRef, ci.Message, ci.FailureReason);
+            }
+
+            return null;
+        }
+
+        var verdict = EvaluateCiFailures(
+            ci, prRef, parkedAtUtc, DateTimeOffset.UtcNow,
+            pollingOptions.CiFailureLookback, ParkSkewTolerance);
+
+        if (verdict is null && CiIsRed(ci))
+        {
+            logger.LogDebug(
+                "Job {JobId}'s pull request {Pr} reports failing checks on {Head} that predate this " +
+                "park and outlive the CI lookback; leaving the gate to its reviewers.",
+                jobId, prRef, Short(headSha));
+        }
+
+        return verdict;
+    }
+
+    /// <summary>
+    /// Turns a CI snapshot into the verdict to deliver, or null for "say nothing yet".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The rules, and what each one is protecting:
+    /// <list type="number">
+    /// <item><strong>Only an explicit <c>failure</c> counts.</strong> A check run's other
+    /// non-green endings — <c>cancelled</c>, <c>timed_out</c>, <c>action_required</c>, <c>stale</c>,
+    /// <c>neutral</c>, <c>skipped</c> — say more about the runner, or about a human who stopped the
+    /// run, than about the code, and acting on them sends a persona to rewrite files that are
+    /// probably fine. The same reasoning excludes a commit status of <c>error</c>, which in the
+    /// integrations that still post one usually means the publisher itself broke.</item>
+    /// <item><strong>Nothing that is still running is a failure.</strong> Checks are almost always
+    /// mid-flight when a gate parks, and firing on <c>queued</c> would report a red build for a
+    /// commit nobody has finished testing. Only a finished check's conclusion is read, which is also
+    /// what makes a long-running suite harmless.</item>
+    /// <item><strong>The failure must belong to this park.</strong> Either it completed after the
+    /// gate parked (modulo the review skew tolerance, which this shares so both halves of the poller
+    /// agree on what GitHub's clock is worth), or it completed inside
+    /// <see cref="PrReviewPollingOptions.CiFailureLookback"/> — the common case of CI going red while
+    /// the persona was still summarising its own work. Anything older is a failure a human has been
+    /// looking at for hours, possibly one they chose to merge through, and an operator's own decision
+    /// is not this poller's to overrule.</item>
+    /// <item><strong>Green says nothing at all.</strong> Returning no verdict for a passing build is
+    /// what keeps CI out of the approving business; see the class remarks.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Failures are reported newest-first and undated ones last: a persona reading "the build is red"
+    /// benefits from seeing the check that most recently spoke first, and one GitHub could not date is
+    /// still a failure and must not be dropped for want of a timestamp.
+    /// </para>
+    /// </remarks>
+    internal static PrGateVerdict? EvaluateCiFailures(
+        GitHubCiSnapshot ci,
+        string? prUrl,
+        DateTimeOffset parkedAtUtc,
+        DateTimeOffset nowUtc,
+        TimeSpan lookback,
+        TimeSpan skew)
+    {
+        if (!ci.Success || string.IsNullOrWhiteSpace(ci.HeadSha))
+        {
+            return null;
+        }
+
+        var failures = FindCiFailures(ci.Checks);
+        if (failures.Count == 0)
+        {
+            return null;
+        }
+
+        var reportable = failures
+            .Where(f => f.CompletedAt is null ||
+                        f.CompletedAt > parkedAtUtc - skew ||
+                        f.CompletedAt > nowUtc - lookback)
+            .OrderByDescending(NewnessKey)
+            .ToList();
+
+        if (reportable.Count == 0)
+        {
+            return null;
+        }
+
+        var head = ci.HeadSha!.Trim().ToLowerInvariant();
+        var names = reportable
+            .Select(CheckLabel)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return new PrGateVerdict(
+            IsApproved: false,
+            ReviewerId: CiReviewerId,
+            Comments: BuildCiFailureNotes(head, prUrl, reportable, ci.Checks),
+            At: reportable
+                .Select(f => f.CompletedAt)
+                .FirstOrDefault(t => t is not null)
+                .GetValueOrDefault(nowUtc),
+            // No GitHub review id exists for a build result; 0 is the honest absence rather than a
+            // borrowed number that would collide with a real review's key.
+            ReviewId: 0,
+            ApprovedHeadSha: null,
+            Key: $"ci:{head}:{string.Join(",", names.OrderBy(n => n, StringComparer.Ordinal))}",
+            CiHeadSha: head);
+    }
+
+    /// <summary>Whether a snapshot reports anything worth a remediation round.</summary>
+    /// <remarks>
+    /// Ignores the freshness rules on purpose: the caller uses this to tell "the build is red and this
+    /// poller chose not to say so again" from "the build is green", which are different things to log
+    /// and different things for an operator troubleshooting a parked gate to be told.
+    /// </remarks>
+    internal static bool CiIsRed(GitHubCiSnapshot ci) => FindCiFailures(ci.Checks).Count > 0;
+
+    /// <summary>
+    /// The checks on this list that reported a code failure, in the order GitHub gave them.
+    /// </summary>
+    private static List<GitHubCiCheck> FindCiFailures(IReadOnlyList<GitHubCiCheck> checks) =>
+        checks
+            .Where(c => string.Equals(c.State, "failure", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(c.Conclusion, "failure", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+    private static DateTimeOffset NewnessKey(GitHubCiCheck check) => check.CompletedAt ?? DateTimeOffset.MinValue;
+
+    private static string CheckLabel(GitHubCiCheck check) =>
+        string.IsNullOrWhiteSpace(check.Name)
+            ? (check.Kind == GitHubCiCheckKind.CommitStatus ? "a commit status" : "an unnamed check run")
+            : check.Name!.Trim();
+
+    /// <summary>How many failing checks are itemised before the rest are summarised.</summary>
+    private const int CiFailuresListed = 15;
+
+    /// <summary>
+    /// The feedback text a CI failure delivers as a review's comments.
+    /// </summary>
+    /// <remarks>
+    /// Shaped for the reader that will actually get it. <c>BuildReviewRemediationTasks</c> turns each
+    /// bullet into one checklist item and ignores prose, so every failing check gets its own task with
+    /// its own URL, while the framing lines that tell the persona what to do when it is done land in
+    /// the round prompt without becoming tasks of their own. The trailing instruction matters: with
+    /// "the gate re-parks on the new commit" the author knows the loop it is in, and a fix that is
+    /// committed but never pushed would leave everyone waiting on a build of code that no longer exists
+    /// on GitHub.
+    /// </remarks>
+    internal static string BuildCiFailureNotes(
+        string headSha,
+        string? prUrl,
+        IReadOnlyList<GitHubCiCheck> failures,
+        IReadOnlyList<GitHubCiCheck> allChecks)
+    {
+        var listed = failures.Take(CiFailuresListed).ToList();
+        var lines = new List<string>(listed.Count + 4);
+
+        var where = string.IsNullOrWhiteSpace(prUrl) ? "the job pull request" : prUrl;
+        lines.Add($"CI is failing on the current head ({Short(headSha)}) of {where}:");
+        lines.Add(string.Empty);
+
+        foreach (var failure in listed)
+        {
+            var url = string.IsNullOrWhiteSpace(failure.HtmlUrl) ? null : failure.HtmlUrl!.Trim();
+            lines.Add(url is null
+                ? $"- {CheckLabel(failure)} — failure"
+                : $"- {CheckLabel(failure)} — failure — {url}");
+        }
+
+        if (failures.Count > listed.Count)
+        {
+            var rest = failures.Skip(CiFailuresListed).Select(CheckLabel);
+            lines.Add(string.Empty);
+            lines.Add($"Also failing, not listed individually: {string.Join(", ", rest)}.");
+        }
+
+        var running = allChecks
+            .Where(c => !string.Equals(c.State, "failure", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(c.Conclusion, "failure", StringComparison.OrdinalIgnoreCase) &&
+                        !IsSettled(c))
+            .Select(CheckLabel)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(CiFailuresListed)
+            .ToList();
+
+        if (running.Count > 0)
+        {
+            // Named rather than left out, so a persona fixing one red check does not conclude the whole
+            // suite is finished and re-request review on a commit that has not been tested yet.
+            lines.Add(string.Empty);
+            lines.Add($"Still running on this commit: {string.Join(", ", running)}.");
+        }
+
+        lines.Add(string.Empty);
+        lines.Add("Fix the failing checks, run the same verification locally, commit to the job branch " +
+                  "and push — the review gate re-parks on the new commit once CI has re-run.");
+
+        return string.Join("\n", lines);
+    }
+
+    /// <summary>Whether a check has finished, by either API's vocabulary.</summary>
+    private static bool IsSettled(GitHubCiCheck check) =>
+        string.Equals(check.Status, "completed", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(check.Status, "success", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(check.State, "success", StringComparison.OrdinalIgnoreCase);
+
+    private static string Short(string value) => value.Length > 8 ? value[..8] : value;
+
     private static string ReviewerTag(string? login) =>
         "github:" + (string.IsNullOrWhiteSpace(login) ? "unknown" : login.Trim().TrimStart('@').ToLowerInvariant());
 
@@ -586,6 +952,11 @@ public class PrReviewPollingService(
 /// approvals — the head it binds to, because an approval of a superseded commit must become
 /// deliverable again only when it is re-issued, not when the poller re-reads it.
 /// </param>
+/// <param name="CiHeadSha">
+/// Set only by a CI verdict: the commit the failure was read from, which is the epoch duplicate
+/// suppression is keyed on for a reviewer that would otherwise repeat itself forever. Null for every
+/// verdict that came from a person.
+/// </param>
 public sealed record PrGateVerdict(
     bool IsApproved,
     string ReviewerId,
@@ -593,4 +964,5 @@ public sealed record PrGateVerdict(
     DateTimeOffset? At,
     long ReviewId,
     string? ApprovedHeadSha,
-    string Key);
+    string Key,
+    string? CiHeadSha = null);
