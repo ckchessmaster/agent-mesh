@@ -50,6 +50,18 @@ api:
       scrapeTimeout: 10s
       # Merged onto the PodMonitor, for operators that restrict selection by label.
       labels: {}
+      # A Prometheus that scrapes by pod IP has to be able to *find* the pods, which means
+      # listing them. See templates/podmonitor-rbac.yaml for why this is not covered by the
+      # operator's own cluster roles in this fleet.
+      rbac:
+        create: true
+        # Who gets pod-read access in this namespace. Default is this fleet's Prometheus
+        # service account; kube-prometheus-stack installs name theirs after the release
+        # (e.g. <release>-kube-prometheus-stack-operator), so set this to match.
+        subjects:
+          - kind: ServiceAccount
+            name: prometheus-k8s
+            namespace: monitoring
 
 worker:
   image:
