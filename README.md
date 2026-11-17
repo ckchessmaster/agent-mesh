@@ -91,6 +91,70 @@ Open the Aspire dashboard link output in your console to monitor container statu
 
 ---
 
+## Observability & Metrics
+
+The .NET services publish OpenTelemetry metrics through `src/AgentMesh.ServiceDefaults`. The Aspire
+dashboard receives them over OTLP (as above); a Prometheus scraper can pull the same `MeterProvider`
+from a `/metrics` endpoint, which is opt-in through configuration and wired up for the API by the
+Helm chart:
+
+```bash
+# Local run: served on the port the app already listens on.
+Metrics__Prometheus__Enabled=true dotnet run --project src/AgentMesh.Api
+
+# Serve it on a dedicated listener instead. The port must also be in the app's listen URLs -
+# ASPNETCORE_URLS="http://+:5000;http://+:9464" - because binding it from code makes Kestrel
+# discard the configured list and the application's own port stops listening.
+```
+
+In Kubernetes, `api.metrics` in `deploy/helm/agent-mesh/values.yaml` enables the endpoint on
+container port 9464 and creates a PodMonitor when the cluster has the prometheus-operator CRDs.
+Three details are deliberate:
+
+* **The metrics port is not part of the `agent-mesh-api` Service.** The scrape endpoint cannot be
+  authenticated without handing Prometheus a bearer token, so it stays reachable only from the pod
+  network and can never be hit through the Ingress. The listener answers nothing but `/metrics`.
+* **`AddPrometheusExporter` is additive to the OTLP exporter**, so the Aspire dashboard keeps
+  working with metrics enabled.
+* **The chart grants Prometheus pod-read access in this namespace** (`api.metrics.podMonitor.rbac`).
+  Discovery is the part people forget: a PodMonitor that syncs happily and shows up in
+  `prometheus.yaml` can still scrape nothing, because listing pods is a permission the operator's
+  own cluster roles may not cover. The symptom is an empty target list plus
+  `pods is forbidden: User "system:serviceaccount:monitoring:prometheus-k8s"` in the Prometheus
+  log. Set `api.metrics.podMonitor.rbac.subjects` if your Prometheus runs under a different
+  service account, or `rbac.create=false` if the namespace is already authorised.
+
+### Triaging memory and restarts
+
+The API's `OOMKilled` restarts (exit `137`) were invisible from the outside: container metrics show
+total memory but cannot distinguish "the GC is holding committed heap it means to return" from
+"something is leaking". These series answer that:
+
+```promql
+# Am I about to be OOM-killed? Committed GC heap against the container ceiling.
+dotnet_gc_last_collection_memory_committed_size_bytes{namespace="agent-mesh"}
+container_spec_memory_limit_bytes{namespace="agent-mesh",container="api"}
+
+# Where the heap actually is - gen2 vs LOH vs POH is the whole diagnosis.
+dotnet_gc_last_collection_heap_size_bytes{namespace="agent-mesh",container="api"}
+
+# Allocation pressure and how much of the interval is spent collecting.
+rate(dotnet_gc_heap_total_allocated_bytes_total{namespace="agent-mesh"}[5m])
+rate(dotnet_gc_pause_time_seconds_total{namespace="agent-mesh"}[5m])
+
+# The kernel's side of the story, from cAdvisor.
+increase(container_oom_events_total{namespace="agent-mesh",container="api"}[1h])
+```
+
+The same exporter carries the operational context around the heap, all of it worth reading next to
+the memory curve: `aspnetcore_memory_pool_pooled_bytes` and
+`aspnetcore_memory_pool_allocated_bytes_total` (the buffer pools that actually account for an
+allocation spike), `dotnet_process_memory_working_set_bytes` (the process's own view of what the
+cgroup sees), `dotnet_thread_pool_queue_length_total` and `kestrel_active_connections` for back-pressure,
+and `http_server_active_requests` for what was in flight when it happened.
+
+---
+
 ## Repository Structure
 
 ```text

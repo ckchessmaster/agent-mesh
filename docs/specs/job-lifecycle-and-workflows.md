@@ -117,6 +117,25 @@ sequenceDiagram
 ### Turn Timeout & Output Spillover Protection
 * **Command Timeouts**: Shell executions inside runner environments are bounded by a strict 180-second timeout. Runaway processes are terminated via process-group `SIGTERM` followed by `SIGKILL`.
 * **Spillover Redirection**: Any stdout or stderr output exceeding 60 lines or 4 KB is automatically redirected to `/tmp/agentmesh/runs/last_run.log`, preventing context window bloat while preserving full logs on disk for debugging.
+* **The clamp does not cover subprocess drivers**: the 180-second bound applies to commands the *platform* executes. A driver such as `agy` or `copilot` runs its own tools inside its own process, so nothing above it can bound what it runs. When one of those drivers wedges, the failure is silence, not a timeout.
+
+### Stalled Turns: Detection, Settlement & Recovery
+
+A turn is *stalled* when its session is still reporting `thinking` or `busy` and nothing is advancing it. This is strictly worse than a failure: the transcript's last row is an unanswered `tool_call`, no terminal status is ever written, and the cockpit renders a lie until a human notices.
+
+`TurnStallPolicy` is the single definition, and the **ordering of its three thresholds is load-bearing** — the worker, the API sweeper and the CLI ship as separate images, and a sweeper tuned tighter than the worker's ceiling would settle live turns mid-command:
+
+| Threshold | Value | Owner |
+| --- | --- | --- |
+| Driver stream idle bound | 20 min (`AGENTMESH_DRIVER_IDLE_TIMEOUT_MINUTES`) | CLI adapter, per subprocess driver |
+| Observation ceiling | 110 min (`MaxTurnDuration`) | `HttpAgentTurnRunner` |
+| Orphan sweep floor | 130 min (ceiling + 20 min grace) | `OrphanedTurnSweeperService` |
+
+* **Settlement writes two things, always**: the session moves to `stopped`, *and* a `[turn-stalled]` transcript row records why and at what instant. A bare status flip is indistinguishable from an operator pressing Stop, and leaves the next investigation starting from zero.
+* **Only live statuses are ever rewritten.** A completed turn, a session parked `waiting_for_input` for a human, and an operator-stopped session are facts about what happened; settlement is a repair, not an override. A wrong settle is survivable because the next real event overwrites the status.
+* **The sweeper is the backstop for turns no workflow observes** — cockpit chat, a handoff, a worker pod deleted mid-poll. It runs in the API because the API owns `AgentMeshHub`: settling without broadcasting `SessionUpdated` is correct in the database and wrong on the screen. `TurnReconciler:OrphanMinutes` may only be raised above the floor, never lowered.
+* **The job carries the same truth**: its `ProgressHeartbeat` is prefixed `Stalled:`, which is what the dashboard's lifecycle derivation checks *before* the `"Executing task"` text it was writing when the turn died. Stalled is a heartbeat marker, not a new `ProjectJobStatus`.
+* **Recovery is an endpoint, not a procedure.** `POST /api/project-jobs/{id}/recover` settles the abandoned turns, rewinds the workspace checkpoint they left parked at `in_progress`, then either aborts the turn of a still-open run (never starting a second run onto the same workspace lease) or starts one run resuming at the first incomplete task — the same rule the workflow applies to its own continue-as-new. `resume: false` erases the phantom turns without starting anything. No Temporal cluster access is required, and nothing is lost by retrying: the settle is idempotent.
 
 ---
 

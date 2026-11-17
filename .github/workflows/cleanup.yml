@@ -2,6 +2,12 @@ name: Weekly Cleanup
 
 # Keeps only the most recent N releases (plus their CI artifacts and GHCR images/chart versions).
 # The git tags of the pruned releases are deleted too; tags without a release are left alone.
+#
+# Stale branches are pruned in the same pass. `delete_branch_on_merge` is enabled on this repo, but
+# it only acts at merge time: it never fires for a PR that is closed instead of merged, it is
+# skipped when the head branch keeps receiving commits, and it cannot retroactively clean anything
+# merged before it was turned on. Without this job those leftovers accumulate for good, which is
+# how 33 branches ended up piled on 2026-11-17.
 
 on:
   schedule:
@@ -12,6 +18,10 @@ on:
         description: 'Number of most recent releases to keep'
         required: false
         default: '3'
+      branch_age_days:
+        description: 'Only consider branches whose tip is older than this many days'
+        required: false
+        default: '14'
       dry_run:
         description: 'Only report what would be deleted'
         type: boolean
@@ -22,6 +32,9 @@ permissions:
   contents: write   # delete releases
   actions: write    # delete workflow artifacts
   packages: write   # delete GHCR package versions
+  pull-requests: read  # the stale-branch job asks which branches have an open PR; an explicit
+                       # `permissions:` block above sets every other scope to none, so omitting
+                       # this makes `gh pr list` fail with 403 rather than return an empty list
 
 concurrency:
   group: cleanup
@@ -29,6 +42,7 @@ concurrency:
 
 env:
   KEEP: ${{ github.event.inputs.keep || '3' }}
+  BRANCH_DAYS: ${{ github.event.inputs.branch_age_days || '14' }}
   # Scheduled runs are always live; manual runs default to dry-run.
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run || 'false' }}
   GH_TOKEN: ${{ github.token }}
@@ -101,3 +115,86 @@ jobs:
           delete-untagged: true
           exclude-tags: latest
           dry-run: ${{ env.DRY_RUN }}
+
+  stale-branches:
+    name: Prune Stale Git Branches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          # Containment is decided by comparing each branch against main, which needs the whole
+          # commit graph. A default checkout fetches a single commit, which would make every branch
+          # look like it carries unique work and quietly turn this job into a no-op.
+          fetch-depth: 0
+
+      - name: Delete branches that carry nothing main does not already have
+        run: |
+          set -euo pipefail
+          DEFAULT=$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq '.defaultBranchRef.name')
+          now=$(date +%s)
+
+          # A branch with an open PR is live work however old its tip is, so it is never a candidate.
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 1000 \
+            --json headRefName --jq '.[].headRefName' | sort -u > open.txt
+
+          # Never pruned regardless of content: release lines and bot branches stay checked out
+          # for long stretches by design.
+          PROTECTED=("release/*" "hotfix/*" "dependabot/*" "renovate/*")
+
+          deleted=0; open_skipped=0; unique_kept=0; too_young=0
+          while read -r full ts sha; do
+            name=${full#refs/remotes/origin/}
+            case "$name" in ""|"HEAD"|"$DEFAULT") continue ;; esac
+
+            skip=0
+            for pat in "${PROTECTED[@]}"; do
+              if [[ $name == $pat ]]; then skip=1; break; fi
+            done
+            if [ "$skip" = "1" ]; then echo "keeping $name (protected pattern)"; continue; fi
+
+            if grep -qxF "$name" open.txt; then
+              open_skipped=$((open_skipped + 1)); echo "keeping $name (open PR)"; continue
+            fi
+
+            age_days=$(( (now - ts) / 86400 ))
+            if [ "$age_days" -lt "$BRANCH_DAYS" ]; then
+              too_young=$((too_young + 1)); echo "keeping $name (${age_days}d old, under ${BRANCH_DAYS}d)"; continue
+            fi
+
+            # The actual safety test, and the reason this can run unattended. `git cherry` prints one
+            # line per commit the branch has that upstream lacks, with '+' meaning "not
+            # patch-equivalent to anything on main". A squash-merged branch reads all '-', and a
+            # branch that was merged outright prints nothing at all - both mean the branch holds no
+            # content main is missing. A single '+' leaves it alone, which is what protects parked
+            # work and branches whose PR was closed rather than merged.
+            unique=$(git cherry "origin/$DEFAULT" "$sha" | grep -c '^+' || true)
+            if [ "$unique" != "0" ]; then
+              unique_kept=$((unique_kept + 1))
+              echo "keeping $name (${unique} commit(s) main does not have, ${age_days}d old)"
+              continue
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would delete $name (${age_days}d old, ${sha:0:10})"
+              deleted=$((deleted + 1))
+            elif git push origin --delete "$name" >/dev/null 2>&1; then
+              echo "deleted $name (${age_days}d old, ${sha:0:10})"
+              deleted=$((deleted + 1))
+            else
+              echo "FAILED to delete $name (${sha:0:10})"
+            fi
+          done < <(git for-each-ref --format='%(refname) %(committerdate:unix) %(objectname)' refs/remotes/origin)
+
+          {
+            echo "## Stale branch cleanup"
+            echo ""
+            echo "DRY_RUN=$DRY_RUN, branch age cutoff ${BRANCH_DAYS}d, default branch $DEFAULT"
+            echo ""
+            echo "| outcome | count |"
+            echo "| --- | --- |"
+            echo "| deleted (or would delete) | $deleted |"
+            echo "| kept: open PR | $open_skipped |"
+            echo "| kept: has unique commits | $unique_kept |"
+            echo "| kept: younger than cutoff | $too_young |"
+          } >> "$GITHUB_STEP_SUMMARY"

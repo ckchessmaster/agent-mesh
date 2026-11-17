@@ -47,6 +47,14 @@ builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespa
 // Pinned by ApiServiceRegistrationTests so it cannot regress quietly.
 builder.Services.AddScoped<IWorkflowSignalRouter, WorkflowSignalRouter>();
 
+// Operator recovery for a job whose turn stopped advancing: settles the phantom sessions and asks the
+// orchestrator for one resumed run, so the repair does not require anyone to reset workflow history by
+// hand. The gateway wraps the three Temporal calls the recovery makes, and is registered unconditionally
+// because the Temporal client above is too; recovery keeps the parameter optional so a test, or a
+// deployment with no orchestrator, gets an honest "settled, cannot resume" instead of a null reference.
+builder.Services.AddScoped<IJobExecutionWorkflowGateway, TemporalJobExecutionWorkflowGateway>();
+builder.Services.AddScoped<IJobTurnRecovery, JobTurnRecovery>();
+
 // Configure Authentication & Authorization
 builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();
 builder.Services.AddSingleton<ICredentialEncryptionService, AesCredentialEncryptionService>();
@@ -192,6 +200,8 @@ builder.Services.AddScoped<JobChangesService>();
 // Dedicated Persona Container Environments & Idle Reaper
 builder.Services.AddPersonaContainerManager(builder.Configuration);
 builder.Services.AddHostedService<PersonaIdleReaperService>();
+// Settles turn sessions whose owner stopped advancing them (see the service remarks).
+builder.Services.AddHostedService<OrphanedTurnSweeperService>();
 
 // Configure CORS
 builder.Services.AddCors(options =>

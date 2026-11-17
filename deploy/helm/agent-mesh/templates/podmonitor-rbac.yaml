@@ -1,0 +1,41 @@
+{{- $metrics := .Values.api.metrics | default dict }}
+{{- $monitor := $metrics.podMonitor | default dict }}
+{{- $rbac := $monitor.rbac | default dict }}
+{{- if and $metrics.enabled $monitor.enabled $rbac.create }}
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor" }}
+# Prometheus discovers PodMonitor targets by listing pods in the scraped namespace, and this
+# fleet deliberately does not give the monitoring ServiceAccount cluster-wide read access: each
+# scraped namespace grants it a Role of its own (that is how cnpg-services scrapes postgres).
+# Without this binding the PodMonitor still syncs and the job still lands in prometheus.yaml, so
+# the config looks correct while the target list stays empty and the only symptom is
+#   pods is forbidden: User "system:serviceaccount:monitoring:prometheus-k8s" cannot list
+#   resource "pods" in the namespace "agent-mesh"
+# buried in the Prometheus log. Measured in prod on 2026-11-17 against the v2.6.3 chart.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-metrics-scrape
+  labels:
+    app: {{ .Release.Name }}-api
+rules:
+  # Discovery only. The scrape itself goes to the pod IP over HTTP and needs nothing here.
+  # Services and endpoints are intentionally absent: nothing in this chart uses a
+  # ServiceMonitor, so a target list is all the scraper is ever allowed to read.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-metrics-scrape-binding
+  labels:
+    app: {{ .Release.Name }}-api
+subjects:
+  {{- toYaml $rbac.subjects | nindent 2 }}
+roleRef:
+  kind: Role
+  name: {{ .Release.Name }}-metrics-scrape
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

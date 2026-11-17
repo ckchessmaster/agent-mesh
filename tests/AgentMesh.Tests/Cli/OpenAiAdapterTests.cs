@@ -125,6 +125,83 @@ public class OpenAiAdapterTests
     }
 
     [Fact]
+    public async Task ExecuteToolLocallyAsync_AlreadyCancelled_DoesNotCreateRunCommandWorkingDirectory()
+    {
+        // A cancelled prompt must not leave a workspace behind. `run_command` mkdirs its working
+        // directory before the sandbox is even reached, so the old ordering created the directory
+        // and then abandoned it, which reads as real output to whatever resumes the session.
+        var root = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        var nested = Path.Combine(root, "deep", "deeper");
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { command = "echo should-not-run", workingDirectory = nested });
+            Func<Task> act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, root, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
+            Directory.Exists(nested).Should().BeFalse("a cancelled prompt must not create working directories");
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_AlreadyCancelled_DoesNotWriteFileOrItsParentDirectory()
+    {
+        // The second mutating door: `write_file` mkdirs the target's parent and then writes it.
+        var root = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(root);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { path = "sub/out.txt", content = "must never be written" });
+            Func<Task> act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("write_file", args, root, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
+            File.Exists(Path.Combine(root, "sub", "out.txt")).Should().BeFalse("a cancelled prompt must not write files");
+            Directory.Exists(Path.Combine(root, "sub")).Should().BeFalse("a cancelled prompt must not create the target's parent directory");
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_AlreadyCancelled_UncreatableWorkingDirectory_StillReportsCancellation()
+    {
+        // The masking case, and the reason checking the token is not merely tidy. A regular file
+        // standing where a directory would have to be makes the mkdir throw an IOException, while a
+        // cancelled token produces no exception of its own, so the generic catch converted the
+        // cancellation into a "Tool execution error: ..." string. The caller then saw a tool that
+        // had run and failed when in truth the turn had been cancelled before anything ran.
+        var root = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(root);
+        var blocker = Path.Combine(root, "blocker");
+        File.WriteAllText(blocker, "not a directory");
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { command = "echo should-not-run", workingDirectory = Path.Combine(blocker, "deeper") });
+            Func<Task> act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, root, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
     public async Task ExecuteToolLocallyAsync_WriteAndReadFile_Succeeds()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_tool_test_" + Guid.NewGuid().ToString("N")[..8]);

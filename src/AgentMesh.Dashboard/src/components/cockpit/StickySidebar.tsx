@@ -17,7 +17,9 @@ import {
   PlayCircle,
   Circle,
   Clock,
-  X
+  X,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 
 export interface StickySidebarProps {
@@ -57,6 +59,7 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
   const [abortSuccess, setAbortSuccess] = useState(false);
   const [assignError, setAssignError] = useState<string | null>(null);
   const [assigningTaskId, setAssigningTaskId] = useState<string | null>(null);
+  const [mobileExpanded, setMobileExpanded] = useState(false);
 
   const teamMembers = useMemo(() => {
     const map = new Map<string, { id: string; name: string; role: string }>();
@@ -228,29 +231,58 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
   return (
     <aside
       data-testid="sticky-sidebar"
-      className="w-[320px] flex-shrink-0 bg-slate-900 border-r border-slate-800 flex flex-col h-full overflow-y-auto p-4 select-none"
+      className="w-full md:w-[320px] flex-shrink-0 bg-slate-900 border-b md:border-b-0 md:border-r border-slate-800 flex flex-col max-h-[60vh] md:max-h-none md:h-full overflow-y-auto p-3 sm:p-4 select-none"
     >
       {/* Top Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
-        <div className="flex items-center space-x-2">
-          <SquareTerminal className="w-5 h-5 text-indigo-400" />
-          <h2 className="text-sm font-semibold text-slate-100 tracking-wide uppercase">
+      <div
+        className={`flex items-center justify-between gap-2 ${
+          mobileExpanded
+            ? 'pb-3 border-b border-slate-800 mb-3 sm:mb-4'
+            : 'md:pb-3 md:border-b md:border-slate-800 md:mb-4'
+        }`}
+      >
+        <div className="flex items-center space-x-2 min-w-0">
+          <SquareTerminal className="w-5 h-5 text-indigo-400 shrink-0" />
+          <h2 className="text-sm font-semibold text-slate-100 tracking-wide uppercase truncate">
             Execution Cockpit
           </h2>
         </div>
-        <span
-          className={`px-2 py-0.5 text-xs font-mono rounded ${
-            status === 'Running'
-              ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 animate-pulse'
-              : 'bg-slate-800 text-slate-400 border border-slate-700'
-          }`}
-        >
-          {status}
-        </span>
+        <div className="flex items-center gap-2 shrink-0">
+          <span
+            data-testid="mobile-cockpit-progress"
+            className="md:hidden text-xs text-slate-400 font-mono"
+          >
+            {completedCount}/{items.length} steps
+          </span>
+          <span
+            className={`px-2 py-0.5 text-xs font-mono rounded ${
+              status === 'Running'
+                ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 animate-pulse'
+                : 'bg-slate-800 text-slate-400 border border-slate-700'
+            }`}
+          >
+            {status}
+          </span>
+          <button
+            type="button"
+            data-testid="mobile-cockpit-toggle"
+            onClick={() => setMobileExpanded((prev) => !prev)}
+            aria-expanded={mobileExpanded}
+            aria-label={mobileExpanded ? 'Collapse Execution Cockpit' : 'Expand Execution Cockpit'}
+            className="md:hidden p-1 rounded border border-slate-700 bg-slate-800/80 text-slate-300 hover:text-white"
+          >
+            {mobileExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </button>
+        </div>
       </div>
 
+      {/* Collapsible Body on Mobile, Always Visible on md+ */}
+      <div
+        data-testid="sticky-sidebar-body"
+        className={`${mobileExpanded ? 'flex' : 'hidden'} md:flex flex-col flex-1 min-h-0`}
+      >
       {/* Living Checklist */}
-      <div className="flex-1 mb-6">
+      <div className="flex-1 mb-4 sm:mb-6">
         <div className="flex items-center justify-between mb-2">
           <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">
             Plan Checklist
@@ -451,20 +483,20 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
             Temporal Health
           </span>
         </div>
-        <div className="flex justify-between text-slate-400 pt-1">
-          <span className="text-slate-500">Workflow:</span>
-          <span className="text-slate-300 truncate max-w-[170px]" title={workflowId}>
+        <div className="flex justify-between gap-2 text-slate-400 pt-1">
+          <span className="text-slate-500 shrink-0">Workflow:</span>
+          <span className="text-slate-300 truncate min-w-0" title={workflowId}>
             {workflowId}
           </span>
         </div>
-        <div className="flex justify-between text-slate-400">
-          <span className="text-slate-500">Run ID:</span>
-          <span className="text-slate-300 truncate max-w-[170px]" title={runId}>
+        <div className="flex justify-between gap-2 text-slate-400">
+          <span className="text-slate-500 shrink-0">Run ID:</span>
+          <span className="text-slate-300 truncate min-w-0" title={runId}>
             {runId}
           </span>
         </div>
-        <div className="flex justify-between text-slate-400">
-          <span className="text-slate-500">Attempt:</span>
+        <div className="flex justify-between gap-2 text-slate-400">
+          <span className="text-slate-500 shrink-0">Attempt:</span>
           <span className="text-slate-300 font-semibold">{attempt}</span>
         </div>
       </div>
@@ -491,6 +523,7 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
               : '🛑 Stop Active Turn'}
           </span>
         </button>
+      </div>
       </div>
     </aside>
   );

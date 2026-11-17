@@ -1257,6 +1257,87 @@ public class ProjectJobsController(
         return Ok(dto);
     }
 
+    /// <summary>
+    /// Recovers a job whose turn stopped advancing: settles the phantom sessions, then resumes the job from
+    /// its own recorded progress.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Why this is an endpoint and not an operator procedure.</strong> The alternative, demonstrated
+    /// by the incident that produced it, was a human opening Temporal, finding the run id for a job, and
+    /// resetting or terminating it. That path needs cluster credentials, it needs to know the workflow-id
+    /// shape, and its failure modes are invisible: reset to the wrong event and completed stages replay,
+    /// terminate and start fresh and the job loses the checklist its persona built over six turns. Every
+    /// fact a correct resume needs is already in the job's own rows, so the repair belongs next to them.
+    /// </para>
+    /// <para>
+    /// <c>resume: false</c> exists for the operator who wants the lie erased but intends to drive the
+    /// persona by hand: it settles the abandoned turns without starting a workflow underneath them.
+    /// </para>
+    /// <para>
+    /// Failures are mapped rather than left to throw. A job that does not exist, a job that is archived, and
+    /// an orchestrator that will not answer are three different operator conversations, and collapsing them
+    /// into one 500 is how a recovery tool ends up distrusted.
+    /// </para>
+    /// </remarks>
+    [HttpPost("api/project-jobs/{id}/recover")]
+    public async Task<IActionResult> RecoverJob(
+        Guid id,
+        [FromBody] JobRecoveryRequest? req = null,
+        [FromServices] IJobTurnRecovery? recovery = null,
+        CancellationToken ct = default)
+    {
+        if (recovery is null)
+        {
+            return StatusCode(503, new { error = "Job recovery is not available on this deployment." });
+        }
+
+        var caller = !string.IsNullOrWhiteSpace(req?.Caller)
+            ? req!.Caller!.Trim()
+            : User?.Identity?.IsAuthenticated == true && !string.IsNullOrWhiteSpace(User.Identity.Name)
+                ? User.Identity.Name!
+                : "operator";
+
+        try
+        {
+            var result = await recovery.RecoverAsync(id, req ?? new JobRecoveryRequest(), caller, ct);
+
+            // The job is returned with the recovery so the cockpit can repaint the card from the same
+            // response that explains what happened. Returning only the recovery text would leave the card
+            // showing "Stalled" until the next poll, which is the same lie in a new costume.
+            var fresh = await db.ProjectJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == id, ct);
+            var freshProject = fresh is null
+                ? null
+                : await db.Projects.AsNoTracking().FirstOrDefaultAsync(pr => pr.Id == fresh.ProjectId, ct);
+            var cardCount = fresh is null
+                ? 0
+                : await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString(), ct);
+
+            return Ok(new
+            {
+                recovery = result,
+                job = fresh is null ? null : ToDto(fresh, freshProject?.Name, cardCount)
+            });
+        }
+        catch (AgentMesh.Api.Services.JobRecoveryNotFoundException ex)
+        {
+            return NotFound(new { error = ex.Message });
+        }
+        catch (AgentMesh.Api.Services.JobRecoveryBlockedException ex)
+        {
+            return Conflict(new { error = ex.Message });
+        }
+        catch (AgentMesh.Api.Services.JobRecoveryOrchestrationException ex)
+        {
+            logger?.LogWarning(ex, "Job recovery could not reach the orchestrator for {JobId}", id);
+            return StatusCode(502, new
+            {
+                error = $"Turns may have been settled, but the orchestrator could not be reached: {ex.Message}",
+                hint = "Nothing was lost. Retry once the orchestrator answers; the settle is idempotent."
+            });
+        }
+    }
+
     [HttpPost("api/project-jobs/{id}/complete")]
     public async Task<IActionResult> CompleteJob(
         Guid id,
@@ -1782,6 +1863,11 @@ public class ProjectJobsController(
         if (j.Status == ProjectJobStatus.Pending) return null;
         if (!string.IsNullOrEmpty(j.ProgressHeartbeat))
         {
+            // Checked first on purpose. A stalled job also carries the "Executing task" text it was
+            // writing when its turn was settled, and reporting it as in progress is the exact lie that
+            // made an abandoned turn look like a running one for thirteen hours.
+            if (AgentMesh.Infrastructure.Services.TurnStallSettler.IsStalledHeartbeat(j.ProgressHeartbeat))
+                return "Stalled";
             if (j.ProgressHeartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase))
                 return "AwaitingApproval";
             if (j.ProgressHeartbeat.Contains("Awaiting pull request review", StringComparison.OrdinalIgnoreCase))

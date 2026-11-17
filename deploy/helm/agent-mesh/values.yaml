@@ -18,10 +18,50 @@ api:
   resources:
     limits:
       cpu: 1000m
-      memory: 512Mi
+      # Measured in prod (2026-11-17): the API's working-set floor is ~230Mi and
+      # GC-driven spikes reach 470-510Mi, so the old 512Mi ceiling was hit several
+      # times a day and the container was OOMKilled (exit 137). The extra headroom
+      # also has to cover ~150Mi of mapped-image + shared memory the process carries
+      # alongside the managed heap.
+      memory: 1Gi
     requests:
       cpu: 100m
-      memory: 128Mi
+      memory: 512Mi
+  # Runtime knobs injected into the API container. DOTNET_GCHeapHardLimit caps the
+  # managed heap so the GC collects *before* the container limit instead of growing
+  # into it - without a cap, server GC scales its target to whatever the cgroup
+  # allows and simply OOMs later at a bigger ceiling.
+  # Value is hexadecimal bytes: 0x28000000 = 640Mi. Keep it comfortably below
+  # api.resources.limits.memory.
+  env:
+    DOTNET_GCHeapHardLimit: "0x28000000"
+  # Prometheus scrape endpoint, implemented in src/AgentMesh.ServiceDefaults/Extensions.cs.
+  # It is served on its own container port which the Service deliberately does not publish, so
+  # the unauthenticated endpoint stays inside the pod network where the scraper lives and can
+  # never be reached through the Ingress.
+  metrics:
+    enabled: true
+    port: 9464
+    # A PodMonitor is only created when the cluster actually has the prometheus-operator CRDs,
+    # so leaving this on is harmless on a bare cluster.
+    podMonitor:
+      enabled: true
+      interval: 30s
+      scrapeTimeout: 10s
+      # Merged onto the PodMonitor, for operators that restrict selection by label.
+      labels: {}
+      # A Prometheus that scrapes by pod IP has to be able to *find* the pods, which means
+      # listing them. See templates/podmonitor-rbac.yaml for why this is not covered by the
+      # operator's own cluster roles in this fleet.
+      rbac:
+        create: true
+        # Who gets pod-read access in this namespace. Default is this fleet's Prometheus
+        # service account; kube-prometheus-stack installs name theirs after the release
+        # (e.g. <release>-kube-prometheus-stack-operator), so set this to match.
+        subjects:
+          - kind: ServiceAccount
+            name: prometheus-k8s
+            namespace: monitoring
 
 worker:
   image:
