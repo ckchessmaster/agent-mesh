@@ -149,8 +149,16 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var personaPrompt = GetJsonPropString(elem, "personaPrompt");
                 var jobId = GetJsonPropString(elem, "jobId");
                 var projectId = GetJsonPropString(elem, "projectId");
+                var projectName = GetJsonPropString(elem, "projectName");
+                var projectDescription = GetJsonPropString(elem, "projectDescription");
+                var repositoryName = GetJsonPropString(elem, "repositoryName");
                 var gitBranch = GetJsonPropString(elem, "gitBranch");
+                var gitUrl = GetJsonPropString(elem, "gitUrl");
+                var gitBaseBranch = GetJsonPropString(elem, "gitBaseBranch");
+                var gitAuthorName = GetJsonPropString(elem, "gitAuthorName");
+                var gitAuthorEmail = GetJsonPropString(elem, "gitAuthorEmail");
                 var workspaceType = GetJsonPropString(elem, "workspaceType");
+                var workspaceGitRemote = GetJsonPropString(elem, "workspaceGitRemote");
                 var conversationId = GetJsonPropString(elem, "conversationId") ?? GetJsonPropString(elem, "conversation_id");
                 var attachments = ExtractJsonAttachments(elem);
 
@@ -177,8 +185,16 @@ public class AgentRunnerInstance : IAsyncDisposable
                     ContextSize = contextSize,
                     JobId = jobId,
                     ProjectId = projectId,
+                    ProjectName = projectName,
+                    ProjectDescription = projectDescription,
+                    RepositoryName = repositoryName,
                     GitBranch = gitBranch,
+                    GitUrl = gitUrl ?? workspaceGitRemote,
+                    GitBaseBranch = gitBaseBranch,
+                    GitAuthorName = gitAuthorName,
+                    GitAuthorEmail = gitAuthorEmail,
                     WorkspaceType = workspaceType,
+                    WorkspaceGitRemote = workspaceGitRemote ?? gitUrl,
                     Attachments = attachments,
                     ConversationId = conversationId,
                     // v1.2.15 lineage: honour the server's timestamp instead of stamping "now" at
