@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useLayoutEffect, useRef } from 'react';
 import { ProjectJobStatus, type ProjectJob } from '../../types';
 import type { JobTimelineCard } from '../../types/timeline';
 import { JobInitializedCard } from './cards/JobInitializedCard';
@@ -45,6 +45,16 @@ export interface TimelineFeedProps {
   onAddComment?: (cardId: string, content: string) => Promise<void> | void;
 }
 
+/**
+ * How far above the bottom still counts as "following the feed". Cards are tall (a plan gate or a PR
+ * review fills a screen), so a strict one-pixel test would treat an operator reading the newest card as
+ * scrolled away, and then refuse to move them for the next one.
+ */
+const FOLLOW_SLACK_PX = 160;
+
+const isFeedAtBottom = (el: HTMLElement) =>
+  el.scrollHeight - (el.scrollTop + el.clientHeight) <= FOLLOW_SLACK_PX;
+
 export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   cards,
   loading = false,
@@ -58,6 +68,60 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   onSubmitIntervention,
   onAddComment
 }) => {
+  // --- Feed "stick to bottom" -----------------------------------------------------------
+  // The feed is a transcript that grows at the bottom, so it used to open at the top: an
+  // operator arriving at a job had to scroll past the entire run to see what it was doing
+  // right now, on every single visit.
+  //
+  // Two pieces of state make that call, because the rule that actually matters is that a
+  // live update must never yank down someone who scrolled up to read history:
+  //   * followedJobId — which job this container is positioned for. A mismatch means the
+  //     feed just mounted or the cockpit swapped jobs, and in both cases the operator came
+  //     for the newest card, so we pin unconditionally.
+  //   * atBottom — kept current by the scroll handler, and the only thing allowed to let a
+  //     newly arrived card move the view.
+  //
+  // The loading/empty branches above leave `feedRef` null, which is what makes the first
+  // render that has cards count as a fresh job rather than an already-positioned one.
+  //
+  // No dependency array on purpose: the effect must see the DOM after every render, and it
+  // decides for itself whether anything changed. A scrollHeight read forces layout, so it
+  // happens only when we are about to write scrollTop — never on an ordinary render.
+  const feedRef = useRef<HTMLElement | null>(null);
+  const followedJobIdRef = useRef<string | null>(null);
+  const positionedKeyRef = useRef<string | null>(null);
+  const atBottomRef = useRef(true);
+
+  const handleFeedScroll = useCallback(() => {
+    const el = feedRef.current;
+    if (el) atBottomRef.current = isFeedAtBottom(el);
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = feedRef.current;
+    if (!el) {
+      // Unmounted feed: drop the key so remounting the same card list still counts as new.
+      positionedKeyRef.current = null;
+      return;
+    }
+
+    const jobId = job?.id ?? '';
+    const key = `${jobId}|${cards.length}|${cards[cards.length - 1]?.id ?? ''}`;
+
+    if (followedJobIdRef.current !== jobId) {
+      el.scrollTop = el.scrollHeight;
+      followedJobIdRef.current = jobId;
+      positionedKeyRef.current = key;
+      atBottomRef.current = true;
+      return;
+    }
+
+    if (positionedKeyRef.current !== key) {
+      if (atBottomRef.current) el.scrollTop = el.scrollHeight;
+      positionedKeyRef.current = key;
+    }
+  });
+
   if (loading && cards.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-6 sm:p-12 text-slate-400">
@@ -107,6 +171,8 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
 
   return (
     <main
+      ref={feedRef}
+      onScroll={handleFeedScroll}
       data-testid="timeline-feed"
       className="flex-1 overflow-y-auto p-3 sm:p-6 max-w-4xl mx-auto w-full space-y-3 sm:space-y-4"
     >
