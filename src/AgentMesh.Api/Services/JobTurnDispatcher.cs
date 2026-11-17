@@ -234,14 +234,54 @@ public class JobTurnDispatcher(
             await workspaces.AcquireLeaseAsync(job.Id, driverId, persona.Id, ct);
         }
 
+        var jobIdStr = job.Id.ToString();
+        var waitingSessions = await db.AgentSessions
+            .Where(s => s.Status == "waiting_for_input" && s.Id != turnSessionId)
+            .ToListAsync(ct);
+
+        var unparkedSessions = waitingSessions
+            .Where(s => MetadataMatchesJob(s.MetadataJson, jobIdStr))
+            .ToList();
+
+        var unparkedAt = DateTimeOffset.UtcNow;
+        foreach (var staleSession in unparkedSessions)
+        {
+            staleSession.Status = "active";
+            staleSession.UpdatedAt = unparkedAt;
+        }
+
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
+
+        if (hubContext != null)
+        {
+            foreach (var staleSession in unparkedSessions)
+            {
+                await hubContext.Clients.All.SendAsync("SessionUpdated", staleSession, ct);
+            }
+        }
 
         await BroadcastAsync(
             turnSession, promptMsg, driver, persona, job, project, promptWithContext, attachments,
             hydration, ct, req.PromptStack);
 
         return new DispatchedJobTurn(turnSession, promptMsg, driver);
+    }
+
+    internal static bool MetadataMatchesJob(string? metadataJson, string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(metadataJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+            if (!doc.RootElement.TryGetProperty("jobId", out var jobIdEl)) return false;
+            return string.Equals(jobIdEl.GetString(), jobId, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task BroadcastAsync(

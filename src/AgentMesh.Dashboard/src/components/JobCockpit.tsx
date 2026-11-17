@@ -295,8 +295,8 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         {/* Assigned Personas & Actions */}
         <div className="flex items-center flex-wrap gap-1.5 sm:gap-2.5 shrink-0 w-full md:w-auto">
           {/* Job Assignee Dropdown */}
-          <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl text-xs">
-            <span className="text-[11px] font-semibold text-slate-400">Assignee:</span>
+          <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl text-xs min-w-0 max-w-full">
+            <span className="text-[11px] font-semibold text-slate-400 shrink-0">Assignee:</span>
             <select
               value={job.assignedAgentId || project.defaultLeadPersonaId || ''}
               onChange={async (e) => {
@@ -307,7 +307,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               title="Assign this job to a team member"
               aria-label="Assigned Team Member"
               data-testid="cockpit-assigned-agent-select"
-              className="bg-slate-900 border border-slate-700/70 rounded-md px-2 py-0.5 text-xs text-sky-300 font-medium focus:outline-none focus:border-sky-500 cursor-pointer"
+              className="bg-slate-900 border border-slate-700/70 rounded-md px-2 py-0.5 text-xs text-sky-300 font-medium focus:outline-none focus:border-sky-500 cursor-pointer min-w-0 max-w-full truncate"
             >
               <option value="">Default (@{project.defaultLeadPersonaId || 'implementer'})</option>
               {teamMembers.map((m) => (
@@ -427,7 +427,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               </button>
             )
           ) : (
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
               <div>
                 {showCompleteConfirm ? (
                   <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl flex-wrap">

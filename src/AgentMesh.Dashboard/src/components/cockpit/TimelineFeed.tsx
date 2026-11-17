@@ -60,7 +60,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
 }) => {
   if (loading && cards.length === 0) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400">
+      <div className="flex-1 flex flex-col items-center justify-center p-6 sm:p-12 text-slate-400">
         <Loader2 className="w-8 h-8 animate-spin text-indigo-400 mb-2" />
         <p className="text-sm">Loading timeline stream...</p>
       </div>
@@ -72,7 +72,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
       return (
         <div
           data-testid="timeline-pending-start-state"
-          className="flex-1 flex flex-col items-center justify-center p-12 text-slate-400"
+          className="flex-1 flex flex-col items-center justify-center p-6 sm:p-12 text-slate-400"
         >
           <Layers className="w-10 h-10 mb-3 text-amber-400/80" />
           <h3 className="text-sm font-semibold text-slate-200">Job Pending Start</h3>
@@ -95,10 +95,10 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
     }
 
     return (
-      <div className="flex-1 flex flex-col items-center justify-center p-12 text-slate-500">
+      <div className="flex-1 flex flex-col items-center justify-center p-6 sm:p-12 text-slate-500">
         <Layers className="w-10 h-10 mb-3 text-slate-600" />
         <h3 className="text-sm font-semibold text-slate-300">Timeline stream empty</h3>
-        <p className="text-xs text-slate-500 mt-1">
+        <p className="text-xs text-slate-500 mt-1 text-center">
           Cards will appear here as the Temporal orchestrator executes turns.
         </p>
       </div>
@@ -108,7 +108,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   return (
     <main
       data-testid="timeline-feed"
-      className="flex-1 overflow-y-auto p-6 max-w-4xl mx-auto w-full space-y-4"
+      className="flex-1 overflow-y-auto p-3 sm:p-6 max-w-4xl mx-auto w-full space-y-3 sm:space-y-4"
     >
       {cards.map((card) => {
         switch (card.cardType) {
@@ -187,11 +187,11 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
             return (
               <div
                 key={card.id}
-                className="p-4 rounded-lg bg-slate-900/80 border border-slate-800 text-slate-200 mb-4"
+                className="p-3 sm:p-4 rounded-lg bg-slate-900/80 border border-slate-800 text-slate-200 mb-3 sm:mb-4"
               >
-                <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <h4 className="text-sm font-semibold text-slate-100 truncate">{card.title}</h4>
+                <div className="flex items-start sm:items-center justify-between gap-2 pb-2 border-b border-slate-800">
+                  <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0">
+                    <h4 className="text-sm font-semibold text-slate-100 truncate max-w-full">{card.title}</h4>
                     {authorPersona && (
                       <span className="px-2 py-0.5 text-[11px] font-mono rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
                         @{authorPersona}
@@ -208,11 +208,11 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
                   </span>
                 </div>
                 {textContent ? (
-                  <div className="mt-2 text-xs text-slate-200 whitespace-pre-wrap">
+                  <div className="mt-2 text-xs text-slate-200 whitespace-pre-wrap break-words">
                     {textContent}
                   </div>
                 ) : (
-                  <div className="mt-2 text-xs font-mono text-slate-400 max-h-36 overflow-y-auto whitespace-pre-wrap">
+                  <div className="mt-2 text-xs font-mono text-slate-400 max-h-36 overflow-y-auto whitespace-pre-wrap break-words">
                     {card.structuredPayloadJson}
                   </div>
                 )}
@@ -222,7 +222,7 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
                       href={prUrl}
                       target="_blank"
                       rel="noreferrer"
-                      className="text-xs font-mono text-sky-400 hover:underline"
+                      className="text-xs font-mono text-sky-400 hover:underline break-all"
                     >
                       {prUrl}
                     </a>

@@ -164,5 +164,34 @@ describe('StickySidebar', () => {
     expect(screen.getByText('✓')).toBeInTheDocument();
     expect(screen.getByText('○')).toBeInTheDocument();
   });
+
+  it('renders full-width on mobile with collapsible body toggle and 320px width on desktop', () => {
+    render(<StickySidebar jobId="test-job-123" checklist={sampleChecklist} />);
+
+    const aside = screen.getByTestId('sticky-sidebar');
+    expect(aside.className).toContain('w-full');
+    expect(aside.className).toContain('md:w-[320px]');
+    expect(aside.className).toContain('max-h-[60vh]');
+    expect(aside.className).toContain('md:h-full');
+
+    const toggle = screen.getByTestId('mobile-cockpit-toggle');
+    const body = screen.getByTestId('sticky-sidebar-body');
+
+    // Starts collapsed on mobile (< md) while remaining always visible on md+
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(body.className).toContain('hidden');
+    expect(body.className).toContain('md:flex');
+
+    // Expand on mobile
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(body.className).not.toContain('hidden');
+    expect(body.className).toContain('flex');
+
+    // Collapse again
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(body.className).toContain('hidden');
+  });
 });
 
