@@ -72,31 +72,9 @@ public static class GitWorkspaceManager
                 return;
             }
 
-            var authorName = !string.IsNullOrWhiteSpace(customAuthorName)
-                ? customAuthorName.Trim()
-                : (!string.IsNullOrWhiteSpace(personaName) ? personaName.Trim() : personaId.Trim());
-            if (string.IsNullOrWhiteSpace(authorName))
-            {
-                authorName = "AgentMesh";
-            }
-
-            var authorEmail = !string.IsNullOrWhiteSpace(customAuthorEmail)
-                ? customAuthorEmail.Trim()
-                : $"{personaId.Trim().ToLowerInvariant().Replace(' ', '-')}-bot@agentmesh.local";
-            if (string.IsNullOrWhiteSpace(authorEmail) || authorEmail.StartsWith('-') || !authorEmail.Contains('@'))
-            {
-                authorEmail = "agentmesh-bot@agentmesh.local";
-            }
-
-            var summary = prompt.Trim().Split('\n')[0];
-            if (summary.Length > 60) summary = summary[..60] + "...";
-            var commitMsg = $"feat(job): turn by @{personaId} - {summary}";
-
-            var escapedAuthorName = EscapeForCommandLine(authorName);
-            var escapedAuthorEmail = EscapeForCommandLine(authorEmail);
             var (commitCode, _, commitErr) = await RunGitAsync(
                 directory,
-                $"-c user.name=\"{escapedAuthorName}\" -c user.email=\"{escapedAuthorEmail}\" commit -m \"{EscapeForCommandLine(commitMsg)}\" --author=\"{escapedAuthorName} <{escapedAuthorEmail}>\"");
+                BuildCommitArguments(personaId, personaName, prompt, customAuthorName, customAuthorEmail, out var authorName, out var authorEmail));
 
             if (commitCode == 0)
             {
@@ -111,6 +89,44 @@ public static class GitWorkspaceManager
         {
             log?.Invoke($"Warning: Failed to commit turn changes: {ex.Message}");
         }
+    }
+
+    internal static string BuildCommitArguments(
+        string? personaId,
+        string? personaName,
+        string? prompt,
+        string? customAuthorName,
+        string? customAuthorEmail,
+        out string authorName,
+        out string authorEmail)
+    {
+        var normalizedPersonaId = (personaId ?? string.Empty).Trim();
+
+        authorName = !string.IsNullOrWhiteSpace(customAuthorName)
+            ? customAuthorName.Trim()
+            : (!string.IsNullOrWhiteSpace(personaName) ? personaName.Trim() : normalizedPersonaId);
+        if (string.IsNullOrWhiteSpace(authorName))
+        {
+            authorName = "AgentMesh";
+        }
+
+        authorEmail = !string.IsNullOrWhiteSpace(customAuthorEmail)
+            ? customAuthorEmail.Trim()
+            : $"{normalizedPersonaId.ToLowerInvariant().Replace(' ', '-')}-bot@agentmesh.local";
+        if (string.IsNullOrWhiteSpace(authorEmail) || authorEmail.StartsWith('-') || !authorEmail.Contains('@'))
+        {
+            authorEmail = "agentmesh-bot@agentmesh.local";
+        }
+
+        var normalizedPrompt = (prompt ?? string.Empty).Trim();
+        var summary = normalizedPrompt.Split('\n')[0];
+        if (summary.Length > 60) summary = summary[..60] + "...";
+        var actorLabel = string.IsNullOrWhiteSpace(normalizedPersonaId) ? "agentmesh" : normalizedPersonaId;
+        var commitMsg = $"feat(job): turn by @{actorLabel} - {summary}";
+
+        var escapedAuthorName = EscapeForCommandLine(authorName);
+        var escapedAuthorEmail = EscapeForCommandLine(authorEmail);
+        return $"-c user.name=\"{escapedAuthorName}\" -c user.email=\"{escapedAuthorEmail}\" commit -m \"{EscapeForCommandLine(commitMsg)}\" --author=\"{escapedAuthorName} <{escapedAuthorEmail}>\"";
     }
 
     private static string EscapeForCommandLine(string str) =>

@@ -424,6 +424,40 @@ public class AgentMeshCliTests
     }
 
     [Fact]
+    public void GitWorkspaceManager_BuildCommitArguments_IncludesCommitterConfigAndFallsBackForBlankPersona()
+    {
+        var args = GitWorkspaceManager.BuildCommitArguments(
+            personaId: "astra",
+            personaName: "Astra",
+            prompt: "Verify commit identity",
+            customAuthorName: null,
+            customAuthorEmail: null,
+            out var authorName,
+            out var authorEmail);
+
+        authorName.Should().Be("Astra");
+        authorEmail.Should().Be("astra-bot@agentmesh.local");
+        args.Should().Contain("-c user.name=\"Astra\"");
+        args.Should().Contain("-c user.email=\"astra-bot@agentmesh.local\"");
+        args.Should().Contain("--author=\"Astra <astra-bot@agentmesh.local>\"");
+
+        var fallbackArgs = GitWorkspaceManager.BuildCommitArguments(
+            personaId: "   ",
+            personaName: null,
+            prompt: "Fallback identity",
+            customAuthorName: null,
+            customAuthorEmail: null,
+            out var fallbackName,
+            out var fallbackEmail);
+
+        fallbackName.Should().Be("AgentMesh");
+        fallbackEmail.Should().Be("agentmesh-bot@agentmesh.local");
+        fallbackArgs.Should().Contain("-c user.name=\"AgentMesh\"");
+        fallbackArgs.Should().Contain("-c user.email=\"agentmesh-bot@agentmesh.local\"");
+        fallbackArgs.Should().Contain("feat(job): turn by @agentmesh - Fallback identity");
+    }
+
+    [Fact]
     public void AgyAdapter_PersistsAndRestores_SessionConversationMapping()
     {
         var sessionId = Guid.NewGuid();
