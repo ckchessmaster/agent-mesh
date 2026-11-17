@@ -2566,6 +2566,22 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string? agentId = null,
         bool isDiscoveryPhase = false)
     {
+        // Honour cancellation before the tool loop touches the filesystem. Every mutating case
+        // below is reached through this one door, and all of them create a directory as their
+        // first side effect: `run_command` mkdirs the requested working directory, `write_file`
+        // mkdirs the target's parent, `edit_file` rewrites a file in place. Doing that for an
+        // already-cancelled prompt leaves stray workspace directories and half-written files
+        // behind, which then look like real output to whatever resumes the session.
+        //
+        // It also closes a masking hole. The catch below rethrows OperationCanceledException, but
+        // a *cancelled* token never produces one on its own - the mkdir is what throws, and when
+        // the directory is uncreatable (read-only mount, denied parent) it throws
+        // UnauthorizedAccessException instead, which the generic catch turns into a "Tool
+        // execution error" string. Cancellation then arrives at the caller dressed up as a tool
+        // failure, and the turn is reported as having tried and failed rather than never having
+        // run. Checking first makes that combination impossible.
+        ct.ThrowIfCancellationRequested();
+
         cwd = ResolveDefaultToolWorkingDirectory(cwd);
 
         try
