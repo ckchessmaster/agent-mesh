@@ -1,0 +1,28 @@
+{{- $metrics := .Values.api.metrics | default dict }}
+{{- $monitor := $metrics.podMonitor | default dict }}
+{{- if and $metrics.enabled $monitor.enabled }}
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor" }}
+# Scraped from the pod IP on the metrics port, so no Service is involved and nothing about the
+# published API surface changes. The operator in this fleet selects every PodMonitor in every
+# namespace, so no discovery labels are needed here; $monitor.labels is the escape hatch for
+# stricter operators that require one.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    app: {{ .Release.Name }}-api
+    {{- with $monitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-api
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $monitor.interval | default "30s" }}
+      scrapeTimeout: {{ $monitor.scrapeTimeout | default "10s" }}
+{{- end }}
+{{- end }}
