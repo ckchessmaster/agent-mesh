@@ -1422,6 +1422,12 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string? agyLastActionSummary = null;
         string? agyLatestThought = null;
 
+        // Resolved once per turn: reading the environment inside the loop would re-parse it on every
+        // line, and a mid-turn change to the bound must not silently extend a turn that is already
+        // being wound down.
+        var agyStreamIdleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+            Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
+
         try
         {
             while (true)
@@ -1432,7 +1438,33 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     throw new OperationCanceledException(ct);
                 }
 
-                var line = await proc.StandardOutput.ReadLineAsync(ct);
+                // Bounded on purpose. `agy` executes its own tools inside its own process, so the
+                // platform's command clamp never applies to what it runs: when its shell wedged on a
+                // `dotnet test`, this read waited on a pipe that would never deliver again, and nothing
+                // above it could tell a quiet driver from a dead one. The turn therefore held its
+                // session open for two hours, and the cockpit reported an agent that was "running a
+                // command" long after the only process able to run one had stopped producing.
+                //
+                // A stall is reported as an error event rather than thrown. The event is what settles the
+                // session status; an exception here would leave the transcript ending on an unanswered
+                // tool call, which is the exact state that made this undebuggable.
+                var agyRead = await StreamStallWatchdog.ReadLineAsync(proc.StandardOutput, agyStreamIdleLimit, ct);
+                if (agyRead.Stalled)
+                {
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "error",
+                        Content = $"Driver `agy` produced no output for {(int)agyStreamIdleLimit.TotalMinutes} minutes" +
+                            $" while {(string.IsNullOrWhiteSpace(agyLastActionSummary) ? "no step had been reported yet" : $"on `{agyLastActionSummary}`")}. " +
+                            "Its process was terminated so this turn stops claiming to be running. " +
+                            "Check the workspace for uncommitted work before re-running the task, and raise " +
+                            $"{TurnStallPolicy.DriverStreamIdleLimitEnvVar} if this driver legitimately runs longer than that."
+                    });
+                    AgentAdapterFactory.KillProcessTree(proc);
+                    return;
+                }
+
+                var line = agyRead.Line;
                 if (line == null) break;
 
                 if (ct.IsCancellationRequested)
@@ -2444,6 +2476,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var lastActivity = Stopwatch.GetTimestamp();
         var lastHeartbeatTime = Stopwatch.GetTimestamp();
         var sw = Stopwatch.StartNew();
+        var copilotIdleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+            Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
         string? copilotSessionId = null;
         string? terminalUsageJson = null;
         string? taskCompleteSummary = null;
@@ -2587,6 +2621,23 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         EventType = "thought",
                         Content = $"[GitHub Copilot CLI @{preset.Id}] Still working... ({sw.Elapsed.TotalSeconds:F0}s elapsed)"
                     });
+                }
+
+                // The heartbeats above make a wedged copilot look alive, which is worse than silence: the
+                // transcript keeps growing while nothing is happening, and this loop then waits on a
+                // process that will never exit. Same bound as the other subprocess drivers, so the three
+                // of them agree on how long "still working" is allowed to mean.
+                if (silentDuration >= copilotIdleLimit)
+                {
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "error",
+                        Content = $"[GitHub Copilot CLI @{preset.Id}] No output for " +
+                            $"{(int)copilotIdleLimit.TotalMinutes} minutes ({sw.Elapsed.TotalSeconds:F0}s into the turn); " +
+                            "terminating the driver so this turn stops claiming to be running."
+                    });
+                    AgentAdapterFactory.KillProcessTree(proc);
+                    break;
                 }
             }
 
@@ -3105,12 +3156,35 @@ public class GenericCommandAdapter : IAgentAdapter
             var plainTextBuffer = new StringBuilder();
             var emittedFinalResponse = false;
 
+            // Resolved once, not per line: the bound must not move mid-turn.
+            var genericIdleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+                Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
+
             try
             {
                 while (true)
                 {
                     ct.ThrowIfCancellationRequested();
-                    var line = await proc.StandardOutput.ReadLineAsync(ct);
+
+                    // Same bound as the agy path, for the same reason: this adapter pipes an arbitrary
+                    // driver's stdout, and a driver that stops writing is indistinguishable from one
+                    // that is thinking, from here. Without a bound the turn outlives its watcher.
+                    var genericRead = await StreamStallWatchdog.ReadLineAsync(proc.StandardOutput, genericIdleLimit, ct);
+                    if (genericRead.Stalled)
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "error",
+                            Content = $"Driver `{AdapterType}` produced no output for " +
+                                $"{(int)genericIdleLimit.TotalMinutes} minutes; its process was terminated so this " +
+                                "turn stops claiming to be running. Raise " +
+                                $"{TurnStallPolicy.DriverStreamIdleLimitEnvVar} if this driver legitimately runs longer."
+                        });
+                        AgentAdapterFactory.KillProcessTree(proc);
+                        return;
+                    }
+
+                    var line = genericRead.Line;
                     if (line == null) break;
                     ct.ThrowIfCancellationRequested();
 

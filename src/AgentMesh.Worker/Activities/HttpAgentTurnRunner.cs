@@ -9,6 +9,7 @@ using AgentMesh.Core.Repositories;
 using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
+using AgentMesh.Infrastructure.Services;
 using Temporalio.Activities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -630,16 +631,152 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
 
             if (DateTimeOffset.UtcNow - startedAt >= MaxTurnDuration)
             {
+                // Give up *and* say so on the session. Until this write existed, the ceiling produced a
+                // clean workflow outcome while the session row stayed in the last status the agent wrote
+                // for itself, and the cockpit derives its "running a command" indicator from that status
+                // alone. The turn had ended hours earlier as far as every orchestrator was concerned; only
+                // the transcript disagreed, and the transcript is what the operator looks at.
+                var settled = await AbandonTurnAsync(sessionId, snapshot, input, ct);
+
                 return new TurnOutcome(
                     TurnOutcomeStatus.StuckLoopDetected,
                     $"Turn session {sessionId} for task {input.TaskId} did not conclude within " +
                     $"{MaxTurnDuration.TotalMinutes.ToString(CultureInfo.InvariantCulture)} minutes " +
                     $"(last observed status: '{snapshot.SessionStatus}'). Inspect the transcript before " +
-                    "resuming; the runner may be wedged on a hung command.");
+                    "resuming; the runner may be wedged on a hung command. " +
+                    (settled
+                        ? "The session has been marked stopped; recover the job with " +
+                          "`POST /api/project-jobs/{jobId}/recover` to retry the halted task."
+                        : "The session was left as-is because it changed status during this window."));
             }
 
             await Task.Delay(PollInterval, ct);
         }
+    }
+
+    /// <summary>The identity that appears as the author of a platform-written settle notice.</summary>
+    /// <remarks>
+    /// Matches the <c>sender</c> the dispatch payload already uses, so a transcript reads consistently:
+    /// the same principal that handed the prompt to the persona is the one that reports the turn abandoned.
+    /// </remarks>
+    internal const string ObserverAgentId = "temporal-worker";
+
+    /// <summary>
+    /// Marks an abandoned turn terminal on the session and leaves a transcript row explaining it.
+    /// </summary>
+    /// <returns><see langword="true"/> when the session was settled by this call.</returns>
+    /// <remarks>
+    /// <para>
+    /// Best effort on purpose. A repair that cannot write must not change what the workflow is told: the
+    /// stall is the headline either way, and the API sweeper retries the same settle once the session is
+    /// old enough to be unambiguously orphaned. Swallowing the exception here is the difference between
+    /// a turn that reports one problem and one that reports none because the cleanup threw.
+    /// </para>
+    /// <para>
+    /// Cancellation is not swallowed. A cancelled activity means the workflow stopped asking, which is a
+    /// different story from a wedged agent, and writing "the runner stopped observing it" in that case
+    /// would leave a false fact in a durable transcript.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> AbandonTurnAsync(
+        Guid sessionId,
+        TurnState snapshot,
+        TaskExecutionInput input,
+        CancellationToken ct)
+    {
+        try
+        {
+            var settled = await TurnStallSettler.SettleOneAsync(
+                db, sessionId, BuildAbandonNotice(snapshot), ObserverAgentId, ct);
+
+            if (settled is null)
+            {
+                logger.LogInformation(
+                    "Turn for task {TaskId} reached the observation ceiling but session {SessionId} was " +
+                    "no longer live; leaving its status to whoever changed it",
+                    input.TaskId, sessionId);
+                return false;
+            }
+
+            // The session is now honest. The job has to be too, or the cockpit shows a job that looks
+            // like it is still executing while its transcript says the turn was abandoned, and the
+            // operator has to open Temporal to find out which one is lying.
+            if (Guid.TryParse(input.JobId, out var stalledJobId))
+            {
+                await TurnStallSettler.MarkJobStalledAsync(db, stalledJobId, BuildAbandonNotice(snapshot), ct);
+            }
+
+            logger.LogWarning(
+                "Session {SessionId} for task {TaskId} abandoned after {Minutes} minutes and marked {Status}",
+                sessionId, input.TaskId,
+                MaxTurnDuration.TotalMinutes.ToString(CultureInfo.InvariantCulture),
+                TurnStallPolicy.SettledStatus);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex,
+                "Could not settle abandoned turn session {SessionId} for task {TaskId}; the sweeper will " +
+                "retry once the session is old enough to be unambiguously orphaned",
+                sessionId, input.TaskId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Turns the last thing observed into the notice the operator reads in the transcript.
+    /// </summary>
+    /// <remarks>
+    /// The distinction that matters is between "the agent stopped mid-tool" and "the agent went quiet
+    /// between steps", and the last row's event type is what makes it: a trailing <c>tool_call</c> with no
+    /// result after it is a command that never returned, which names the thing to go kill. A trailing
+    /// <c>thought</c> means something else entirely. Guessing at the cause is not useful here; quoting
+    /// the last row is, and it is a measurement rather than a claim.
+    /// </remarks>
+    internal static string BuildAbandonNotice(TurnState snapshot)
+    {
+        var silence = snapshot.LastActivityAt is { } last
+            ? $" Silent for {FormatElapsed(DateTimeOffset.UtcNow - last)}."
+            : string.Empty;
+
+        var lastRow = snapshot.LastSessionMessageType is { Length: > 0 } type
+            ? $"Last recorded transcript row was a `{type}`{(string.IsNullOrWhiteSpace(snapshot.LastSessionMessageContent) ? "." : $": {Abbreviate(snapshot.LastSessionMessageContent, 180)}.")}"
+            : "No transcript row was recorded for this turn.";
+
+        return $"{lastRow}{silence} The turn runner stopped observing it after " +
+            $"{MaxTurnDuration.TotalMinutes.ToString(CultureInfo.InvariantCulture)} minutes, so nothing is " +
+            $"advancing this session any more. Recover with `POST /api/project-jobs/<jobId>/recover`.";
+    }
+
+    /// <summary>
+    /// Renders an elapsed span as <c>2h 14m 05s</c>, dropping leading units that are zero.
+    /// </summary>
+    /// <remarks>
+    /// Hand-rolled rather than <c>TimeSpan.ToString</c> with a custom pattern: that pattern needs quoted
+    /// literal sections, which do not survive the trip through an interpolated-string legibly, and this
+    /// reads better in a transcript than <c>02:14:05</c> anyway.
+    /// </remarks>
+    internal static string FormatElapsed(TimeSpan elapsed)
+    {
+        if (elapsed < TimeSpan.Zero) elapsed = TimeSpan.Zero;
+
+        return elapsed.TotalHours >= 1
+            ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes:00}m {elapsed.Seconds:00}s"
+            : elapsed.TotalMinutes >= 1
+                ? $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:00}s"
+                : $"{elapsed.Seconds}s";
+    }
+
+
+    /// <summary>Collapses whitespace and clips to a transcript-safe length.</summary>
+    private static string Abbreviate(string value, int limit)
+    {
+        var flat = System.Text.RegularExpressions.Regex.Replace(value, "\\s+", " ").Trim();
+        return flat.Length <= limit ? flat : flat[..limit].TrimEnd() + "…";
     }
 
     /// <summary>
