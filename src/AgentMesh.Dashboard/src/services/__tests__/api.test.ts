@@ -161,4 +161,166 @@ describe('API Service & Auth Interceptor', () => {
       await expect(api.getAgentSessionsPage('agy')).rejects.toThrow(/agent sessions/i);
     });
   });
+
+  describe('project workspace fields & setup endpoint', () => {
+    it('sends repositoryName and workingDirectory in createProject and updateProject', async () => {
+      const mockFetch = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: 'billing-api',
+              name: 'Billing API',
+              repositoryName: 'billing-api',
+              workingDirectory: '/workspace/repos/billing-api',
+              resolvedWorkingDirectory: '/workspace/repos/billing-api'
+            }),
+            { status: 201 }
+          )
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: 'billing-api',
+              name: 'Billing API',
+              repositoryName: 'billing-svc',
+              workingDirectory: '/workspace/custom/billing',
+              resolvedWorkingDirectory: '/workspace/custom/billing'
+            }),
+            { status: 200 }
+          )
+        );
+
+      const created = await api.createProject({
+        name: 'Billing API',
+        repositoryName: 'billing-api',
+        workingDirectory: '/workspace/repos/billing-api'
+      });
+      expect(created.repositoryName).toBe('billing-api');
+      expect(created.resolvedWorkingDirectory).toBe('/workspace/repos/billing-api');
+      expect(mockFetch).toHaveBeenNthCalledWith(
+        1,
+        '/api/projects',
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.stringContaining('"repositoryName":"billing-api"')
+        })
+      );
+
+      const updated = await api.updateProject('billing-api', {
+        repositoryName: 'billing-svc',
+        workingDirectory: '/workspace/custom/billing'
+      });
+      expect(updated.workingDirectory).toBe('/workspace/custom/billing');
+      expect(mockFetch).toHaveBeenNthCalledWith(
+        2,
+        '/api/projects/billing-api',
+        expect.objectContaining({
+          method: 'PUT',
+          body: expect.stringContaining('"workingDirectory":"/workspace/custom/billing"')
+        })
+      );
+    });
+
+    it('surfaces API validation error messages from createProject and updateProject', async () => {
+      vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ error: 'WorkingDirectory must be an absolute path.' }),
+            { status: 400, statusText: 'Bad Request' }
+          )
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ error: 'RepositoryName cannot be empty.' }),
+            { status: 400, statusText: 'Bad Request' }
+          )
+        );
+
+      await expect(
+        api.createProject({ name: 'Bad', workingDirectory: 'relative/dir' })
+      ).rejects.toThrow('Failed to create project: WorkingDirectory must be an absolute path.');
+
+      await expect(
+        api.updateProject('bad', { repositoryName: '' })
+      ).rejects.toThrow('Failed to update project: RepositoryName cannot be empty.');
+    });
+
+    it('calls POST /api/projects/{id}/setup and normalizes camelCase or PascalCase responses', async () => {
+      const mockFetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            ProjectId: 'my service',
+            Success: true,
+            TargetDirectory: '/workspace/repos/my-service',
+            EffectiveDirectory: '/workspace/repos/my-service',
+            Outcome: 'Initialized',
+            UsedFallback: false,
+            CreatedFiles: true,
+            Message: 'Initialized repository.',
+            Warnings: ['git user fallback']
+          }),
+          { status: 200 }
+        )
+      );
+
+      const result = await api.setupProjectWorkspace('my service', {
+        fallbackDirectory: '/tmp/fallback'
+      });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/projects/my%20service/setup?fallbackDirectory=%2Ftmp%2Ffallback',
+        expect.objectContaining({ method: 'POST' })
+      );
+      expect(result).toEqual({
+        projectId: 'my service',
+        success: true,
+        targetDirectory: '/workspace/repos/my-service',
+        effectiveDirectory: '/workspace/repos/my-service',
+        outcome: 'Initialized',
+        usedFallback: false,
+        createdFiles: true,
+        message: 'Initialized repository.',
+        warnings: ['git user fallback'],
+        error: null
+      });
+    });
+
+    it('returns structured setup diagnostics on HTTP 422 and throws on 404', async () => {
+      vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              projectId: 'failing-proj',
+              success: false,
+              targetDirectory: '/workspace/repos/failing-proj',
+              effectiveDirectory: '',
+              outcome: 'Failed',
+              usedFallback: false,
+              createdFiles: false,
+              message: 'Remote clone failed.',
+              warnings: ['auth required'],
+              error: 'Remote clone failed.'
+            }),
+            { status: 422, statusText: 'Unprocessable Entity' }
+          )
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ error: "Project 'missing' not found." }),
+            { status: 404, statusText: 'Not Found' }
+          )
+        );
+
+      const failedResult = await api.setupProjectWorkspace('failing-proj');
+      expect(failedResult.success).toBe(false);
+      expect(failedResult.outcome).toBe('Failed');
+      expect(failedResult.warnings).toEqual(['auth required']);
+      expect(failedResult.error).toBe('Remote clone failed.');
+
+      await expect(api.setupProjectWorkspace('missing')).rejects.toThrow(
+        "Failed to setup project workspace: Project 'missing' not found."
+      );
+    });
+  });
 });
