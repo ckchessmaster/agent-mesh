@@ -105,12 +105,12 @@ export const CardComments: React.FC<CardCommentsProps> = ({
                 value={newComment}
                 onChange={(e) => setNewComment(e.target.value)}
                 disabled={submitting}
-                className="flex-1 bg-slate-900 border border-slate-700/80 rounded px-2.5 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                className="flex-1 min-w-0 bg-slate-900 border border-slate-700/80 rounded px-2.5 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
               />
               <button
                 type="submit"
                 disabled={!newComment.trim() || submitting}
-                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-medium flex items-center space-x-1 disabled:opacity-40 transition"
+                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-medium flex items-center space-x-1 disabled:opacity-40 transition shrink-0"
               >
                 <Send className="w-3 h-3" />
                 <span>Send</span>

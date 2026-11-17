@@ -417,4 +417,128 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     const mentionPalette = screen.getByTestId('team-mention-palette');
     expect(mentionPalette.className).toContain('max-w-[calc(100vw-2rem)]');
   });
+
+  it('stacks CockpitLayout vertically on mobile and side-by-side on desktop with responsive feed spacing', async () => {
+    window.innerWidth = 375;
+
+    render(
+      <JobCockpit
+        project={mockProject}
+        job={mockJob}
+        tasks={[]}
+        personas={[mockPersona]}
+        sessions={[]}
+        onAddTask={vi.fn()}
+        onToggleTask={vi.fn()}
+        onDeleteTask={vi.fn()}
+        onCompleteJob={vi.fn()}
+      />
+    );
+
+    const layout = screen.getByTestId('cockpit-layout');
+    expect(layout.className).toContain('flex-col');
+    expect(layout.className).toContain('md:flex-row');
+
+    const sidebar = screen.getByTestId('sticky-sidebar');
+    expect(sidebar.className).toContain('w-full');
+    expect(sidebar.className).toContain('md:w-[320px]');
+
+    // Verify JobCockpit action button container wraps on narrow mobile viewports
+    const completeBtn = screen.getByTestId('cockpit-complete-job-btn');
+    const actionGroup = completeBtn.parentElement?.parentElement;
+    expect(actionGroup?.className).toContain('flex-wrap');
+  });
+
+  it('renders TimelineFeed and timeline cards with responsive mobile padding and wrapping controls', async () => {
+    const { TimelineFeed } = await import('../components/cockpit/TimelineFeed');
+    const sampleCards = [
+      {
+        id: 'c-init',
+        jobId: 'job-1',
+        stage: 0,
+        cardType: 'JobInitialized' as const,
+        status: 'Resolved' as const,
+        title: 'Job Initialized',
+        summaryMarkdown: '',
+        structuredPayloadJson: JSON.stringify({
+          jobId: 'job-1',
+          targetBranch: 'mesh/very-long-branch-name-for-mobile-truncation',
+          assignedAgentId: 'astra'
+        }),
+        comments: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      },
+      {
+        id: 'c-plan',
+        jobId: 'job-1',
+        stage: 1,
+        cardType: 'PlanApproval' as const,
+        status: 'PendingInput' as const,
+        title: 'Plan Approval',
+        summaryMarkdown: '',
+        structuredPayloadJson: JSON.stringify({
+          reasoning: 'Verify mobile stacking',
+          tasks: [
+            {
+              taskId: 't-1',
+              title: 'Fix mobile cockpit layout',
+              targetFile: 'src/components/cockpit/CockpitLayout.tsx',
+              verificationMethod: 'vitest run'
+            }
+          ]
+        }),
+        comments: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      },
+      {
+        id: 'c-step',
+        jobId: 'job-1',
+        stage: 2,
+        cardType: 'TaskStep' as const,
+        status: 'Active' as const,
+        title: 'Step 1: Implement responsive layout',
+        summaryMarkdown: '',
+        structuredPayloadJson: JSON.stringify({
+          taskIndex: 0,
+          taskTitle: 'Implement responsive layout'
+        }),
+        comments: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    ];
+
+    render(
+      <TimelineFeed
+        cards={sampleCards}
+        onSubmitPlanDecision={vi.fn()}
+        onSendPlanGuidance={vi.fn()}
+        onAddComment={vi.fn()}
+      />
+    );
+
+    const feed = screen.getByTestId('timeline-feed');
+    expect(feed.className).toContain('p-3');
+    expect(feed.className).toContain('sm:p-6');
+
+    const initCard = screen.getByTestId('job-initialized-card');
+    expect(initCard.className).toContain('p-3');
+    expect(initCard.className).toContain('sm:p-4');
+
+    const planCard = screen.getByTestId('plan-approval-card');
+    expect(planCard.className).toContain('p-3');
+    expect(planCard.className).toContain('sm:p-4');
+
+    const guidanceBtn = screen.getByTestId('plan-send-guidance');
+    const decisionRow = guidanceBtn.parentElement?.parentElement;
+    expect(decisionRow?.className).toContain('flex-col');
+    expect(decisionRow?.className).toContain('sm:flex-row');
+
+    const stepCard = screen.getByTestId('task-step-card');
+    expect(stepCard.className).toContain('p-3');
+    expect(stepCard.className).toContain('sm:p-4');
+  });
 });
+

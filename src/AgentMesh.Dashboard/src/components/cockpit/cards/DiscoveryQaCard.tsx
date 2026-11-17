@@ -94,27 +94,27 @@ export const DiscoveryQaCard: React.FC<DiscoveryQaCardProps> = ({
   return (
     <div
       data-testid="discovery-qa-card"
-      className="p-4 rounded-lg bg-slate-900/90 border border-indigo-500/30 shadow-md text-slate-200 mb-4 transition"
+      className="p-3 sm:p-4 rounded-lg bg-slate-900/90 border border-indigo-500/30 shadow-md text-slate-200 mb-3 sm:mb-4 transition"
     >
       {/* Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-        <div className="flex items-center space-x-2">
-          <div className="p-1.5 rounded bg-indigo-500/20 text-indigo-400">
+      <div className="flex items-start sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+        <div className="flex items-start sm:items-center space-x-2 min-w-0">
+          <div className="p-1.5 rounded bg-indigo-500/20 text-indigo-400 shrink-0">
             <HelpCircle className="w-4 h-4" />
           </div>
-          <div>
+          <div className="min-w-0">
             <h3 className="text-sm font-semibold text-slate-100 flex items-center space-x-2">
-              <span>{card.title || 'Discovery Q&A'}</span>
-              <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="truncate">{card.title || 'Discovery Q&A'}</span>
+              <Sparkles className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
             </h3>
-            <p className="text-xs text-slate-400">
+            <p className="text-xs text-slate-400 break-words">
               {payload.summary ||
                 (isSubmitted ? 'Answered in the session transcript' : 'Clarification required before decomposition')}
             </p>
           </div>
         </div>
         <span
-          className={`px-2 py-0.5 text-xs font-mono rounded ${
+          className={`px-2 py-0.5 text-xs font-mono rounded shrink-0 ${
             isPending
               ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30 animate-pulse'
               : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'

@@ -138,11 +138,11 @@ export const PrReviewCard: React.FC<PrReviewCardProps> = ({
   return (
     <div
       data-testid="pr-review-card"
-      className="p-4 rounded-lg bg-slate-900/90 border border-slate-700 shadow-md text-slate-200 mb-4 transition"
+      className="p-3 sm:p-4 rounded-lg bg-slate-900/90 border border-slate-700 shadow-md text-slate-200 mb-3 sm:mb-4 transition"
     >
       {/* Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800 gap-2">
-        <div className="flex items-center gap-2 min-w-0">
+      <div className="flex items-start sm:items-center justify-between pb-3 border-b border-slate-800 gap-2">
+        <div className="flex items-start sm:items-center gap-2 min-w-0">
           <div className="p-1.5 rounded bg-indigo-500/20 text-indigo-300 shrink-0">
             <GitPullRequest className="w-4 h-4" />
           </div>
@@ -176,7 +176,7 @@ export const PrReviewCard: React.FC<PrReviewCardProps> = ({
             </div>
           </div>
         </div>
-        {statusBadge()}
+        <div className="shrink-0">{statusBadge()}</div>
       </div>
 
       {/* PR deep link */}
@@ -187,9 +187,9 @@ export const PrReviewCard: React.FC<PrReviewCardProps> = ({
             href={prUrl}
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center gap-1.5 text-xs font-mono text-sky-400 hover:text-sky-300 hover:underline"
+            className="inline-flex items-center gap-1.5 text-xs font-mono text-sky-400 hover:text-sky-300 hover:underline break-all"
           >
-            <ExternalLink className="w-3.5 h-3.5" />
+            <ExternalLink className="w-3.5 h-3.5 shrink-0" />
             {prUrl.replace(/^https?:\/\//, '')}
           </a>
         </div>
@@ -246,12 +246,12 @@ export const PrReviewCard: React.FC<PrReviewCardProps> = ({
             </div>
           )}
 
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <span className="text-[10px] text-slate-500">
               Signs as <span className="font-mono text-slate-400">operator</span>; two-man rule and the
               approved-commit freeze are enforced server-side.
             </span>
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 data-testid="reject-pr-btn"
                 type="button"

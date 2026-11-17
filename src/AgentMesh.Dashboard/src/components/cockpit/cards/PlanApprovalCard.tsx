@@ -97,17 +97,17 @@ export const PlanApprovalCard: React.FC<PlanApprovalCardProps> = ({
   return (
     <div
       data-testid="plan-approval-card"
-      className="p-4 rounded-lg bg-slate-900/90 border border-slate-700 shadow-md text-slate-200 mb-4 transition"
+      className="p-3 sm:p-4 rounded-lg bg-slate-900/90 border border-slate-700 shadow-md text-slate-200 mb-3 sm:mb-4 transition"
     >
       {/* Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-        <div className="flex items-center space-x-2">
-          <div className="p-1.5 rounded bg-emerald-500/20 text-emerald-400">
+      <div className="flex items-start sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+        <div className="flex items-start sm:items-center space-x-2 min-w-0">
+          <div className="p-1.5 rounded bg-emerald-500/20 text-emerald-400 shrink-0">
             <ShieldCheck className="w-4 h-4" />
           </div>
-          <div>
+          <div className="min-w-0">
             <h3 className="text-sm font-semibold text-slate-100">{card.title || 'Plan Approval'}</h3>
-            <p className="text-xs text-slate-400">
+            <p className="text-xs text-slate-400 break-words">
               {payload.reasoning || 'Review the proposed decomposition and verification steps'}
             </p>
           </div>
@@ -137,22 +137,22 @@ export const PlanApprovalCard: React.FC<PlanApprovalCardProps> = ({
           {payload.tasks?.map((task, idx) => (
             <div
               key={task.taskId || idx}
-              className="p-2.5 rounded bg-slate-950/40 border border-slate-800 text-xs flex items-start justify-between"
+              className="p-2.5 rounded bg-slate-950/40 border border-slate-800 text-xs flex flex-col sm:flex-row sm:items-start justify-between gap-2"
             >
-              <div className="space-y-1">
-                <div className="flex items-center space-x-2">
-                  <span className="font-mono text-indigo-400 font-semibold">{idx + 1}.</span>
-                  <span className="font-medium text-slate-200">{task.title}</span>
+              <div className="space-y-1 min-w-0 flex-1">
+                <div className="flex items-start space-x-2">
+                  <span className="font-mono text-indigo-400 font-semibold shrink-0">{idx + 1}.</span>
+                  <span className="font-medium text-slate-200 break-words">{task.title}</span>
                 </div>
                 {task.targetFile && (
-                  <div className="flex items-center space-x-1 text-[11px] text-slate-400 font-mono">
-                    <FileText className="w-3 h-3 text-slate-500" />
-                    <span>{task.targetFile}</span>
+                  <div className="flex items-center space-x-1 text-[11px] text-slate-400 font-mono min-w-0">
+                    <FileText className="w-3 h-3 text-slate-500 shrink-0" />
+                    <span className="truncate">{task.targetFile}</span>
                   </div>
                 )}
               </div>
               {task.verificationMethod && (
-                <div className="text-[11px] text-slate-400 font-mono bg-slate-900 px-2 py-1 rounded border border-slate-800">
+                <div className="text-[11px] text-slate-400 font-mono bg-slate-900 px-2 py-1 rounded border border-slate-800 self-start shrink-0 max-w-full break-words">
                   Verify: {task.verificationMethod}
                 </div>
               )}
@@ -202,7 +202,7 @@ export const PlanApprovalCard: React.FC<PlanApprovalCardProps> = ({
             />
           </div>
 
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             {onSendGuidance ? (
               <div className="flex items-center space-x-2 min-w-0">
                 <button
@@ -232,7 +232,7 @@ export const PlanApprovalCard: React.FC<PlanApprovalCardProps> = ({
               <span />
             )}
 
-            <div className="flex items-center space-x-2 flex-shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
                 disabled={busy}

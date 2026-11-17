@@ -52,25 +52,25 @@ export const TurnInterruptedCard: React.FC<TurnInterruptedCardProps> = ({
   return (
     <div
       data-testid="turn-interrupted-card"
-      className="p-4 rounded-lg bg-rose-950/20 border-2 border-rose-600/70 shadow-lg text-slate-200 mb-4 transition"
+      className="p-3 sm:p-4 rounded-lg bg-rose-950/20 border-2 border-rose-600/70 shadow-lg text-slate-200 mb-3 sm:mb-4 transition"
     >
       {/* Alert Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-rose-900/60">
-        <div className="flex items-center space-x-2.5">
-          <div className="p-2 rounded bg-rose-600/30 text-rose-400">
+      <div className="flex items-start sm:items-center justify-between gap-2 pb-3 border-b border-rose-900/60">
+        <div className="flex items-start sm:items-center space-x-2.5 min-w-0">
+          <div className="p-2 rounded bg-rose-600/30 text-rose-400 shrink-0">
             <AlertOctagon className="w-5 h-5 animate-pulse" />
           </div>
-          <div>
-            <h3 className="text-sm font-bold text-rose-200 tracking-wide">
+          <div className="min-w-0">
+            <h3 className="text-sm font-bold text-rose-200 tracking-wide break-words">
               {card.title || 'Turn Interrupted: Process Group Terminated'}
             </h3>
-            <p className="text-xs text-rose-300/80">
+            <p className="text-xs text-rose-300/80 break-words">
               Triggered by <span className="font-semibold text-rose-200">{payload.requestedBy || 'operator'}</span>: {payload.reason}
             </p>
           </div>
         </div>
 
-        <span className="px-2.5 py-1 text-xs font-mono font-bold rounded bg-rose-600/30 text-rose-300 border border-rose-500/50 uppercase">
+        <span className="px-2.5 py-1 text-xs font-mono font-bold rounded bg-rose-600/30 text-rose-300 border border-rose-500/50 uppercase shrink-0">
           {resolvedAction ? 'Intervened' : 'Turn Interrupted'}
         </span>
       </div>

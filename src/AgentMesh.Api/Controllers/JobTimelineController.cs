@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
@@ -217,6 +218,8 @@ public class JobTimelineController(
         await handle.SignalAsync(w => w.SubmitDiscoveryAnswersAsync(
             new DiscoveryAnswersSignal(cardId, answers, payload.Feedback)));
 
+        await UnparkJobWaitingSessionsAsync(jobId, HttpContext?.RequestAborted ?? CancellationToken.None);
+
         return Accepted();
     }
 
@@ -289,6 +292,8 @@ public class JobTimelineController(
                 });
             }
         }
+
+        await UnparkJobWaitingSessionsAsync(jobId, ct);
 
         return Accepted();
     }
@@ -395,7 +400,39 @@ public class JobTimelineController(
             });
         }
 
+        await UnparkJobWaitingSessionsAsync(jobId, ct);
+
         return Accepted(new { commentId = comment.Id, delivered = true, workflowId = delivery.WorkflowId });
+    }
+
+    private async Task UnparkJobWaitingSessionsAsync(string jobId, CancellationToken ct)
+    {
+        var waitingSessions = await db.AgentSessions
+            .Where(s => s.Status == "waiting_for_input")
+            .ToListAsync(ct);
+
+        var matching = waitingSessions
+            .Where(s => JobTurnDispatcher.MetadataMatchesJob(s.MetadataJson, jobId))
+            .ToList();
+
+        if (matching.Count == 0) return;
+
+        var now = DateTimeOffset.UtcNow;
+        foreach (var session in matching)
+        {
+            session.Status = "active";
+            session.UpdatedAt = now;
+        }
+
+        await db.SaveChangesAsync(ct);
+
+        if (hubContext != null)
+        {
+            foreach (var session in matching)
+            {
+                await hubContext.Clients.All.SendAsync("SessionUpdated", session, ct);
+            }
+        }
     }
 
     [HttpPost("abort-turn")]
