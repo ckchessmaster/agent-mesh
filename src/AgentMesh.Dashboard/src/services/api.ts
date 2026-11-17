@@ -39,7 +39,8 @@ import type {
   PlanDecisionPayload,
   PrReviewDecisionPayload,
   AbortTurnRequest,
-  InterventionRequest
+  InterventionRequest,
+  JobRecoveryResponse
 } from '../types';
 import { JobFileChangeStatus } from '../types';
 
@@ -1575,6 +1576,34 @@ export const api = {
       headers: getHeaders()
     });
     if (!res.ok) throw new Error(`Failed to reset job: ${res.statusText}`);
+    return res.json();
+  },
+
+  /**
+   * Recovers a stalled job: settles turns that stopped reporting, then asks the orchestrator to resume
+   * from the job's own recorded task progress.
+   *
+   * `resume: false` erases the phantom turns without starting a run, for the operator who intends to
+   * drive the persona by hand. Unlike `resetJob`, nothing is terminated and no progress is discarded:
+   * recovery is the surgical repair, reset is the blunt one.
+   */
+  async recoverJob(
+    id: string,
+    req?: { resume?: boolean; note?: string; quietSeconds?: number; caller?: string }
+  ): Promise<JobRecoveryResponse> {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}/recover`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req || {})
+    });
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const b = await res.json();
+        detail = b?.error || b?.message || '';
+      } catch {}
+      throw new Error(detail || `Failed to recover job (${res.status})`);
+    }
     return res.json();
   },
 
