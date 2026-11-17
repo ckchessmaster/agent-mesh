@@ -169,19 +169,6 @@ const mapProjectWorkspaceSetupResult = (item: any): ProjectWorkspaceSetupResult 
   error: item?.error ?? item?.Error ?? null
 });
 
-const readApiErrorMessage = async (res: Response): Promise<string> => {
-  try {
-    const body = await res.json();
-    const msg = body?.error ?? body?.Error ?? body?.message ?? body?.Message;
-    if (typeof msg === 'string' && msg.trim()) {
-      return msg.trim();
-    }
-  } catch {
-    // Fall back to statusText when response is not JSON.
-  }
-  return res.statusText || `HTTP ${res.status}`;
-};
-
 const mapProjectDocument = (item: any): ProjectDocument => {
   const id = item?.id || item?.Id || '';
   const projectId = item?.projectId || item?.ProjectId || '';
@@ -1094,7 +1081,7 @@ export const api = {
       headers: getHeaders(),
       body: JSON.stringify(req)
     });
-    if (!res.ok) throw new Error(`Failed to create project: ${await readApiErrorMessage(res)}`);
+    if (!res.ok) throw new Error(await readApiErrorMessage(res, 'Failed to create project'));
     return res.json();
   },
 
@@ -1104,7 +1091,7 @@ export const api = {
       headers: getHeaders(),
       body: JSON.stringify(req)
     });
-    if (!res.ok) throw new Error(`Failed to update project: ${await readApiErrorMessage(res)}`);
+    if (!res.ok) throw new Error(await readApiErrorMessage(res, 'Failed to update project'));
     return res.json();
   },
 
