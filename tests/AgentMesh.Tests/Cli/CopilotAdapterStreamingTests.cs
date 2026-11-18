@@ -492,6 +492,124 @@ public class CopilotAdapterStreamingTests
     }
 
     [Fact]
+    public void FormatToolCallSummary_RichToolSummaries_FormatAllSupportedTools()
+    {
+        CopilotAdapter.FormatToolCallSummary("bash", """{"command":"dotnet test","description":"Run unit tests"}""")
+            .Should().Be("Run unit tests — dotnet test");
+
+        CopilotAdapter.FormatToolCallSummary("bash", """{"command":"git status"}""")
+            .Should().Be("Running bash: git status");
+
+        CopilotAdapter.FormatToolCallSummary("view", """{"path":"/workspace/repos/agent-mesh/src/App.tsx","view_range":[1,250]}""")
+            .Should().Be("Viewing App.tsx (lines 1-250)");
+
+        CopilotAdapter.FormatToolCallSummary("view", """{"path":"/workspace/repos/agent-mesh/package.json"}""")
+            .Should().Be("Viewing package.json");
+
+        CopilotAdapter.FormatToolCallSummary("glob", """{"paths":"/workspace/repos/agent-mesh/src/Dashboard","pattern":"**/*.tsx"}""")
+            .Should().Be("Finding files: **/*.tsx in Dashboard");
+
+        CopilotAdapter.FormatToolCallSummary("grep", """{"paths":"/workspace/repos/agent-mesh/src","pattern":"TryParseCopilotJsonLine"}""")
+            .Should().Be("Searching for 'TryParseCopilotJsonLine' in src");
+
+        CopilotAdapter.FormatToolCallSummary("sql", """{"query":"SELECT id FROM sessions","description":"List sessions"}""")
+            .Should().Be("Querying (List sessions): SELECT id FROM sessions");
+
+        CopilotAdapter.InferCopilotToolName("tool", """{"command":"ls -la"}""").Should().Be("bash");
+        CopilotAdapter.FormatToolCallSummary("tool", """{"command":"ls -la"}""")
+            .Should().Be("Running bash: ls -la");
+    }
+
+    [Fact]
+    public void FormatCopilotToolResultSummary_UnwrapsJsonAndHandlesEmptyOutput()
+    {
+        CopilotAdapter.FormatCopilotToolResultSummary("bash", """{"content":"All 42 tests passed"}""")
+            .Should().Be("All 42 tests passed");
+
+        CopilotAdapter.FormatCopilotToolResultSummary("bash", "")
+            .Should().Be("Completed bash (no output)");
+
+        CopilotAdapter.FormatCopilotToolResultSummary("bash", null)
+            .Should().Be("Completed bash (no output)");
+
+        CopilotAdapter.FormatCopilotToolResultSummary("bash", """{"content":""}""")
+            .Should().Be("Completed bash (no output)");
+    }
+
+    [Fact]
+    public async Task RunCopilotSubprocessAsync_CoalescesArglessPreludeAndSurvivesEmptyToolOutput()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "copilot-coalesce-test-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        var fakeScript = Path.Combine(tempDir, "fake-copilot-coalesce.sh");
+
+        const string scriptContent = """
+            #!/usr/bin/env bash
+            echo '{"type":"session.start","data":{"sessionId":"cop-sess-coalesce"}}'
+            echo '{"type":"tool.call","data":{"toolName":"bash"}}'
+            echo '{"type":"assistant.reasoning","data":{"content":"Inspecting repository status first."}}'
+            echo '{"type":"tool.execution_start","data":{"toolName":"bash","arguments":{"command":"git status","description":"Check git status"}}}'
+            echo '{"type":"tool.execution_complete","data":{"toolName":"bash","result":{"content":""}}}'
+            echo '{"type":"assistant.message","data":{"content":"Repository is clean."}}'
+            """;
+        await File.WriteAllTextAsync(fakeScript, scriptContent);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(fakeScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            var preset = new AgentPresetConfig { Id = "copilot-cli", AdapterType = "copilot" };
+            var promptEvent = new PromptReceivedEvent { SessionId = Guid.NewGuid(), Prompt = "Check status" };
+
+            var (exitCode, _, _, succeeded) = await CopilotAdapter.RunCopilotSubprocessAsync(
+                fakeScript,
+                isViaGh: false,
+                cwd: tempDir,
+                preset,
+                promptEvent,
+                promptEnvelope: "Check status",
+                useJsonFormat: true,
+                ev =>
+                {
+                    if (string.IsNullOrWhiteSpace(ev.Content))
+                    {
+                        throw new InvalidOperationException("Message content is required.");
+                    }
+                    events.Add(ev);
+                    return Task.CompletedTask;
+                },
+                CancellationToken.None);
+
+            exitCode.Should().Be(0);
+            succeeded.Should().BeTrue();
+
+            var thoughts = events.Where(e => e.EventType == "thought").ToList();
+            thoughts.Should().ContainSingle(t => t.Content == "Inspecting repository status first.");
+
+            var toolCalls = events.Where(e => e.EventType == "tool_call").ToList();
+            toolCalls.Should().HaveCount(1);
+            toolCalls[0].ToolName.Should().Be("bash");
+            toolCalls[0].Content.Should().Be("Check git status — git status");
+            toolCalls[0].ToolArgsJson.Should().Contain("git status");
+
+            var toolResults = events.Where(e => e.EventType == "tool_result").ToList();
+            toolResults.Should().HaveCount(1);
+            toolResults[0].ToolName.Should().Be("bash");
+            toolResults[0].Content.Should().Be("Completed bash (no output)");
+
+            var responseEvent = events.Single(e => e.EventType == "response");
+            responseEvent.Content.Should().Be("Repository is clean.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void BuildCopilotProcessStartInfo_WhenExtraMcpArgumentsProvided_AppendsConfigAndDenyFlags()
     {
         var promptEvent = new PromptReceivedEvent

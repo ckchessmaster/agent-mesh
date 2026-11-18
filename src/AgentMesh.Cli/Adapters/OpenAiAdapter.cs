@@ -1539,6 +1539,18 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             }
             streamRetryAttempt = 0;
 
+            var rawFinalContent = contentBuilder.ToString();
+            var (inlineThought, cleanedFinalContent) = ExtractInlineThinkBlocks(rawFinalContent);
+            if (!string.IsNullOrWhiteSpace(inlineThought))
+            {
+                if (reasoningBuilder.Length == 0)
+                {
+                    reasoningBuilder.Append(inlineThought);
+                }
+                rawFinalContent = cleanedFinalContent;
+            }
+            var finalContent = rawFinalContent;
+
             // If reasoning occurred, emit thought event
             if (reasoningBuilder.Length > 0)
             {
@@ -1552,8 +1564,20 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     });
                 }
             }
-
-            var finalContent = contentBuilder.ToString();
+            else if (toolCallsByIndex.Count > 0 &&
+                     !string.IsNullOrWhiteSpace(finalContent) &&
+                     !toolCallsByIndex.Values.Any(v => string.Equals(v.Name.ToString().Trim(), "ask_question", StringComparison.OrdinalIgnoreCase)))
+            {
+                var narrationText = StripRawToolCallTags(finalContent);
+                if (!string.IsNullOrWhiteSpace(narrationText))
+                {
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = narrationText
+                    });
+                }
+            }
 
             // Native tool calls execution
             if (toolCallsByIndex.Count > 0)
@@ -3118,6 +3142,37 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
         catch { }
         return false;
+    }
+
+    internal static (string? ExtractedThought, string CleanedContent) ExtractInlineThinkBlocks(string? content)
+    {
+        if (string.IsNullOrEmpty(content)) return (null, string.Empty);
+
+        var matches = Regex.Matches(content, @"<think>([\s\S]*?)</think>", RegexOptions.IgnoreCase);
+        if (matches.Count == 0) return (null, content);
+
+        var thoughts = new List<string>();
+        foreach (Match m in matches)
+        {
+            var inner = m.Groups[1].Value.Trim();
+            if (!string.IsNullOrWhiteSpace(inner))
+            {
+                thoughts.Add(inner);
+            }
+        }
+
+        var cleaned = Regex.Replace(content, @"<think>[\s\S]*?</think>", string.Empty, RegexOptions.IgnoreCase).Trim();
+        var extracted = thoughts.Count > 0 ? string.Join("\n\n", thoughts) : null;
+        return (extracted, cleaned);
+    }
+
+    private static string StripRawToolCallTags(string content)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return string.Empty;
+        var stripped = Regex.Replace(content, @"<tool_call>\s*[\s\S]*?\s*</tool_call>", string.Empty, RegexOptions.IgnoreCase);
+        stripped = Regex.Replace(stripped, @"```(?:json:)?tool_call\s*[\s\S]*?```", string.Empty, RegexOptions.IgnoreCase);
+        stripped = Regex.Replace(stripped, @"<function=[\w.\-]+>[\s\S]*?</function>", string.Empty, RegexOptions.IgnoreCase);
+        return stripped.Trim();
     }
 
     internal static (bool HasTool, string? Name, string? Args) TryParseFallbackToolCall(string content)

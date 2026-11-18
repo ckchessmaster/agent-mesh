@@ -201,6 +201,75 @@ public class AgyAdapterArgumentTests
     }
 
     [Fact]
+    public void ReadNewThoughtsFromTranscript_ReadsIncrementalThoughtsAndResolvesTruncatedFields()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agy-thoughts-test-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        var transcriptPath = Path.Combine(tempDir, "transcript.jsonl");
+        var fullPath = Path.Combine(tempDir, "transcript_full.jsonl");
+
+        try
+        {
+            File.WriteAllLines(transcriptPath, new[]
+            {
+                """{"step_index":1,"type":"USER_INPUT","content":"hello"}""",
+                """{"step_index":2,"type":"PLANNER_RESPONSE","thinking":"First thought"}""",
+                """{"step_index":3,"type":"PLANNER_RESPONSE","thinking":"Truncated...","truncated_fields":["thinking"]}""",
+                """{"step_index":4,"type":"PLANNER_RESPONSE","thinking":null}"""
+            });
+            File.WriteAllLines(fullPath, new[]
+            {
+                """{"step_index":3,"type":"PLANNER_RESPONSE","thinking":"Full untruncated reasoning from transcript_full"}"""
+            });
+
+            var lastThoughtStep = 1;
+            var batch1 = AgyAdapter.ReadNewThoughtsFromTranscript(transcriptPath, ref lastThoughtStep);
+
+            batch1.Should().HaveCount(2);
+            batch1[0].Should().Be((2, "First thought"));
+            batch1[1].Should().Be((3, "Full untruncated reasoning from transcript_full"));
+            lastThoughtStep.Should().Be(3);
+
+            File.AppendAllLines(transcriptPath, new[]
+            {
+                """{"step_index":5,"type":"PLANNER_RESPONSE","thinking":"Next step thought"}"""
+            });
+
+            var batch2 = AgyAdapter.ReadNewThoughtsFromTranscript(transcriptPath, ref lastThoughtStep);
+            batch2.Should().ContainSingle().Which.Should().Be((5, "Next step thought"));
+            lastThoughtStep.Should().Be(5);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FormatAgyToolSummary_FormatsCommandsFilesTasksAndSubagents()
+    {
+        using var cmdDoc = System.Text.Json.JsonDocument.Parse("""{"CommandLine":"git status -sb","toolSummary":"Check git status"}""");
+        AgyAdapter.FormatAgyToolSummary("run_command", cmdDoc.RootElement)
+            .Should().Be("Running command (Check git status): git status -sb");
+
+        using var readDoc = System.Text.Json.JsonDocument.Parse("""{"AbsolutePath":"/workspace/src/App.tsx","StartLine":10,"EndLine":50}""");
+        AgyAdapter.FormatAgyToolSummary("read_file", readDoc.RootElement)
+            .Should().Be("Inspecting file: App.tsx (lines 10-50)");
+
+        using var editDoc = System.Text.Json.JsonDocument.Parse("""{"TargetFile":"/workspace/src/AgentAdapters.cs"}""");
+        AgyAdapter.FormatAgyToolSummary("edit_file", editDoc.RootElement)
+            .Should().Be("Modifying file: AgentAdapters.cs");
+
+        using var taskDoc = System.Text.Json.JsonDocument.Parse("""{"Action":"update_status","TaskId":"task-1"}""");
+        AgyAdapter.FormatAgyToolSummary("manage_task", taskDoc.RootElement)
+            .Should().Be("Managing task: update_status (task-1)");
+
+        using var subDoc = System.Text.Json.JsonDocument.Parse("""{"Role":"Codebase Researcher","TypeName":"research"}""");
+        AgyAdapter.FormatAgyToolSummary("invoke_subagent", subDoc.RootElement)
+            .Should().Be("Invoking subagent: Codebase Researcher");
+    }
+
+    [Fact]
     public async Task ExecutePromptAsync_WithMcpServers_StagesAndRestoresAgyMcpConfigWithoutLeakingSecrets()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), $"agy-mcp-e2e-{Guid.NewGuid():N}");
