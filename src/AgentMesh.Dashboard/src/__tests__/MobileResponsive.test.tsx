@@ -134,6 +134,7 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     window.innerWidth = 375;
     window.dispatchEvent(new Event('resize'));
 
@@ -171,12 +172,14 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
   it('renders mobile bottom nav when at master list and allows drilling into job detail with mobile back button', async () => {
     render(<App />);
 
-    // Wait for project to appear in ProjectList
-    expect(await screen.findByText('Mobile Core')).toBeInTheDocument();
-
-    // Verify Mobile Bottom Navigation Bar is present
+    // Default mobile landing tab is Dashboard with bottom navigation bar visible
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
     const bottomNav = await screen.findByTestId('mobile-bottom-nav');
     expect(bottomNav).toBeInTheDocument();
+
+    // Switch to Projects tab via mobile bottom nav and wait for project to appear in ProjectList
+    fireEvent.click(within(bottomNav).getByRole('button', { name: /projects/i }));
+    expect((await screen.findAllByText('Mobile Core')).length).toBeGreaterThan(0);
 
     // Find the job item in the list and click it to drill into Detail view
     const jobItems = await screen.findAllByText('Mobile Navigation Polish');
@@ -200,10 +203,15 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
   it('switches between primary sections via the Mobile Bottom Navigation Bar', async () => {
     render(<App />);
 
-    expect(await screen.findByText('Mobile Core')).toBeInTheDocument();
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
 
     const bottomNav = await screen.findByTestId('mobile-bottom-nav');
     expect(bottomNav).toBeInTheDocument();
+
+    // Switch to Projects tab
+    const projectsBtn = within(bottomNav).getByRole('button', { name: /projects/i });
+    fireEvent.click(projectsBtn);
+    expect((await screen.findAllByText('Mobile Core')).length).toBeGreaterThan(0);
 
     // Switch to Personas tab
     const personasBtn = within(bottomNav).getByRole('button', { name: /personas/i });
@@ -222,12 +230,14 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     // Danger Zone should be visible in Drivers tab
     const dangerZoneBtn = await screen.findByTestId('danger-zone-clear-mesh-btn');
     expect(dangerZoneBtn).toBeInTheDocument();
+
+    // Switch back to Dashboard tab
+    fireEvent.click(within(bottomNav).getByTestId('mobile-nav-dashboard'));
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
   });
 
   it('triggers reset mesh from Danger Zone button in Drivers tab', async () => {
     render(<App />);
-
-    expect(await screen.findByText('Mobile Core')).toBeInTheDocument();
 
     const bottomNav = await screen.findByTestId('mobile-bottom-nav');
     const driversBtn = within(bottomNav).getByRole('button', { name: /drivers/i });

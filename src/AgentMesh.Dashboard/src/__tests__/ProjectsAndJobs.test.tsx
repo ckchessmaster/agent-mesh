@@ -146,6 +146,8 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    localStorage.setItem('agentmesh_active_tab', 'projects');
     vi.mocked(api.getStatus).mockResolvedValue({
       status: 'Healthy',
       timestamp: new Date().toISOString(),

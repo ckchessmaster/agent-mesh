@@ -165,6 +165,7 @@ describe('Session trajectory auto-scroll to bottom', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    localStorage.setItem('agentmesh_active_tab', 'drivers');
     for (const key of Object.keys(signalRHandlers)) delete signalRHandlers[key];
 
     vi.mocked(api.getStatus).mockResolvedValue({

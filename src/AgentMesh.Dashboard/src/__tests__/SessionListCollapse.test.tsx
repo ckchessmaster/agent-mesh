@@ -133,6 +133,8 @@ const rowText = (text: string) => sidebar().queryAllByText(text).length;
 describe('Persona & Driver session lists are bounded', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    localStorage.setItem('agentmesh_active_tab', 'personas');
     vi.mocked(api.getStatus).mockResolvedValue(mockStatus);
     vi.mocked(api.getCapabilities).mockResolvedValue({ agentRuntimes: {} } as never);
     vi.mocked(api.getAgents).mockResolvedValue([]);

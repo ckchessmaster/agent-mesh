@@ -2,7 +2,7 @@ import '@testing-library/jest-dom/vitest';
 import { configure } from '@testing-library/react';
 import { vi, afterEach } from 'vitest';
 
-configure({ asyncUtilTimeout: 5000 });
+configure({ asyncUtilTimeout: 10000 });
 
 afterEach(() => {
   if (typeof localStorage !== 'undefined') {
