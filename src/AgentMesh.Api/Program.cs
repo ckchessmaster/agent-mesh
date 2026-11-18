@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using AgentMesh.Api.Auth;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -180,6 +180,12 @@ builder.Services.AddSingleton<IJobWorkspaceLocator>(sp =>
 
 builder.Services.AddScoped<JobChangesGitSource>();
 builder.Services.AddScoped<JobChangesService>();
+
+// The cross-project "waiting on a human" rollup behind GET /api/attention and the desktop
+// notification bell. Scoped because it reads the database; the three sources it folds (heartbeat,
+// pending timeline cards, the job ledger) are all already written by the paths above, so this adds
+// no state of its own — see AttentionQueryService for why the fold lives here and not in the client.
+builder.Services.AddScoped<IAttentionQueryService, AttentionQueryService>();
 
 // Dedicated Persona Container Environments & Idle Reaper
 builder.Services.AddPersonaContainerManager(builder.Configuration);
