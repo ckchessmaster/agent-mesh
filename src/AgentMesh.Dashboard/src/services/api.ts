@@ -12,6 +12,9 @@ import type {
   PersonaAuthStartResult,
   PersonaAuthSubmitResult,
   Project,
+  CreateProjectRequest,
+  UpdateProjectRequest,
+  ProjectWorkspaceSetupResult,
   ProjectJob,
   ProjectDocument,
   ProjectPersonaSummary,
@@ -148,7 +151,27 @@ const mapJobArtifact = (item: any): JobArtifact => {
   };
 };
 
-const mapProjectDocument = (item: any): ProjectDocument => {  const id = item?.id || item?.Id || '';  const projectId = item?.projectId || item?.ProjectId || '';
+/**
+ * Normalizes `ProjectWorkspaceSetupResponseDto` payloads across camelCase and PascalCase serializers.
+ */
+const mapProjectWorkspaceSetupResult = (item: any): ProjectWorkspaceSetupResult => ({
+  projectId: item?.projectId ?? item?.ProjectId ?? '',
+  success: Boolean(item?.success ?? item?.Success),
+  targetDirectory: item?.targetDirectory ?? item?.TargetDirectory ?? '',
+  effectiveDirectory: item?.effectiveDirectory ?? item?.EffectiveDirectory ?? '',
+  outcome: item?.outcome ?? item?.Outcome ?? 'Failed',
+  usedFallback: Boolean(item?.usedFallback ?? item?.UsedFallback),
+  createdFiles: Boolean(item?.createdFiles ?? item?.CreatedFiles),
+  message: item?.message ?? item?.Message ?? '',
+  warnings: Array.isArray(item?.warnings)
+    ? item.warnings
+    : (Array.isArray(item?.Warnings) ? item.Warnings : []),
+  error: item?.error ?? item?.Error ?? null
+});
+
+const mapProjectDocument = (item: any): ProjectDocument => {
+  const id = item?.id || item?.Id || '';
+  const projectId = item?.projectId || item?.ProjectId || '';
   const fileName = item?.fileName || item?.FileName || null;
   const downloadUrl = item?.downloadUrl || item?.DownloadUrl
     || (id && projectId
@@ -1052,47 +1075,47 @@ export const api = {
     return res.json();
   },
 
-  async createProject(req: {
-    name: string;
-    id?: string;
-    description?: string;
-    workspaceType?: number;
-    gitRepositoryUrl?: string;
-    gitBaseBranch?: string;
-    s3BucketName?: string;
-    s3PrefixKey?: string;
-    projectInstructions?: string;
-    defaultLeadPersonaId?: string;
-    allowedPersonaIds?: string[];
-  }): Promise<Project> {
+  async createProject(req: CreateProjectRequest): Promise<Project> {
     const res = await apiFetch('/api/projects', {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
     });
-    if (!res.ok) throw new Error(`Failed to create project: ${res.statusText}`);
+    if (!res.ok) throw new Error(await readApiErrorMessage(res, 'Failed to create project'));
     return res.json();
   },
 
-  async updateProject(id: string, req: {
-    name?: string;
-    description?: string;
-    workspaceType?: number;
-    gitRepositoryUrl?: string;
-    gitBaseBranch?: string;
-    s3BucketName?: string;
-    s3PrefixKey?: string;
-    projectInstructions?: string;
-    defaultLeadPersonaId?: string;
-    allowedPersonaIds?: string[];
-  }): Promise<Project> {
+  async updateProject(id: string, req: UpdateProjectRequest): Promise<Project> {
     const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(req)
     });
-    if (!res.ok) throw new Error(`Failed to update project: ${res.statusText}`);
+    if (!res.ok) throw new Error(await readApiErrorMessage(res, 'Failed to update project'));
     return res.json();
+  },
+
+  async setupProjectWorkspace(
+    id: string,
+    options?: { fallbackDirectory?: string }
+  ): Promise<ProjectWorkspaceSetupResult> {
+    const fallback = options?.fallbackDirectory?.trim();
+    const query = fallback ? `?fallbackDirectory=${encodeURIComponent(fallback)}` : '';
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/setup${query}`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    const raw = await res.json().catch(() => null);
+    if (!res.ok) {
+      // 422 UnprocessableEntity carries a structured ProjectWorkspaceSetupResponseDto with warnings
+      // and targetDirectory; return it so the modal can render full diagnostics rather than losing fields.
+      if (raw && typeof raw === 'object' && ('outcome' in raw || 'Outcome' in raw) && ('projectId' in raw || 'ProjectId' in raw)) {
+        return mapProjectWorkspaceSetupResult(raw);
+      }
+      const detail = raw?.error ?? raw?.Error ?? raw?.message ?? raw?.Message ?? res.statusText;
+      throw new Error(`Failed to setup project workspace: ${detail}`);
+    }
+    return mapProjectWorkspaceSetupResult(raw);
   },
 
   async deleteProject(id: string): Promise<{ status: string; id: string; deletedJobsCount: number }> {

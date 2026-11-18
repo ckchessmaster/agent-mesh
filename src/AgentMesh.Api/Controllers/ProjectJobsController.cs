@@ -2035,34 +2035,8 @@ public class ProjectJobsController(
                 db, project.Id, turnSessionId, combinedAttachments, project.ProjectInstructions);
             combinedAttachments = library.Attachments.ToList();
 
-            var resolvedWorkingDir = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
-                ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
-                : project.GetResolvedWorkingDirectory();
-
-            var turnMetadata = new Dictionary<string, object?>
-            {
-                ["jobId"] = job.Id.ToString(),
-                ["projectId"] = project.Id,
-                ["projectName"] = project.Name,
-                ["repositoryName"] = project.RepositoryName,
-                ["workingDirectory"] = resolvedWorkingDir,
-                ["workspaceType"] = project.WorkspaceType.ToString(),
-                ["gitBranch"] = job.GitBranchName,
-                ["gitUrl"] = project.GitRepositoryUrl,
-                ["gitBaseBranch"] = project.GitBaseBranch,
-                ["s3ArchiveKey"] = job.S3ArchiveKey,
-                ["projectInstructions"] = project.ProjectInstructions,
-                ["personaId"] = persona.Id,
-                ["personaName"] = persona.Name,
-                ["personaRole"] = persona.Role,
-                ["personaPrompt"] = persona.PersonaPrompt,
-                ["model"] = persona.DefaultModel,
-                ["effort"] = persona.DefaultEffort,
-                ["mode"] = persona.DefaultMode,
-                ["tier"] = persona.DefaultTier,
-                ["contextSize"] = persona.DefaultContextSize,
-                ["attachments"] = combinedAttachments
-            };
+            var turnMetadata = JobTurnDispatcher.BuildTurnMetadata(
+                job, project, persona, combinedAttachments);
 
             var turnSession = new AgentSession
             {
@@ -2137,31 +2111,8 @@ public class ProjectJobsController(
 
             if (hubContext != null)
             {
-                var promptPayload = new
-                {
-                    sessionId = turnSession.Id,
-                    messageId = promptMsg.Id,
-                    agentId = driverId,
-                    driverId = driverId,
-                    personaId = persona.Id,
-                    personaName = persona.Name,
-                    personaRole = persona.Role,
-                    personaPrompt = persona.PersonaPrompt,
-                    prompt = promptMsg.Content,
-                    sender = promptMsg.SenderAgentId,
-                    model = persona.DefaultModel,
-                    effort = persona.DefaultEffort,
-                    mode = persona.DefaultMode,
-                    tier = persona.DefaultTier,
-                    contextSize = persona.DefaultContextSize,
-                    jobId = job.Id,
-                    projectId = project.Id,
-                    repositoryName = project.RepositoryName,
-                    workingDirectory = resolvedWorkingDir,
-                    gitBranch = job.GitBranchName,
-                    createdAt = promptMsg.CreatedAt,
-                    attachments = combinedAttachments
-                };
+                var promptPayload = JobTurnDispatcher.BuildPromptReceivedPayload(
+                    turnSession, promptMsg, driverId, persona, job, project, promptMsg.Content, combinedAttachments);
 
                 var group = hubContext.Clients?.Group($"agent-{driverId}");
                 if (group != null)

@@ -1371,4 +1371,99 @@ public class ProjectJobsControllerTests
         var updatedJob = await db.ProjectJobs.FindAsync(job.Id);
         updatedJob!.AssignedAgentId.Should().Be("rook");
     }
+
+    [Fact]
+    public async Task CheckAndDispatchQueuedJobTurnsAsync_PropagatesWorkingDirectoryAndRepoMetadata()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project
+        {
+            Id = "checkout-svc",
+            Name = "Checkout Service",
+            Description = "Order checkout flow",
+            WorkspaceType = WorkspaceType.Git,
+            GitRepositoryUrl = "https://github.com/org/checkout-svc.git",
+            GitBaseBranch = "main",
+            RepositoryName = "checkout-svc",
+            WorkingDirectory = "/workspace/repos/monorepo/services/checkout/"
+        };
+        var persona = new Persona
+        {
+            Id = "astra",
+            Name = "Astra",
+            Role = "Senior Engineer",
+            DriverId = "agy",
+            MaxConcurrentJobs = 1,
+            GitAuthorName = "Astra",
+            GitAuthorEmail = "astra@agent-mesh"
+        };
+        var targetJobId = Guid.NewGuid();
+        var queuedTurn = new QueuedJobTurnDto(
+            Id: Guid.NewGuid(),
+            JobId: targetJobId,
+            ProjectId: project.Id,
+            TargetPersonaId: persona.Id,
+            SenderType: "user",
+            SenderId: "operator",
+            SenderName: "Operator",
+            Content: "@astra fix queued cart issue",
+            Mentions: [persona.Id],
+            Attachments: null,
+            Priority: 0,
+            CreatedAt: DateTimeOffset.UtcNow);
+        var targetJob = new ProjectJob
+        {
+            Id = targetJobId,
+            ProjectId = project.Id,
+            Title = "Fix cart totals",
+            Status = ProjectJobStatus.Active,
+            GitBranchName = "mesh/job-cart",
+            QueuedTurnsJson = System.Text.Json.JsonSerializer.Serialize(new[] { queuedTurn })
+        };
+        db.Projects.Add(project);
+        db.Personas.Add(persona);
+        db.ProjectPersonas.Add(new ProjectPersona { ProjectId = project.Id, PersonaId = persona.Id });
+        db.ProjectJobs.Add(targetJob);
+        await db.SaveChangesAsync();
+
+        var capturedPayloads = new List<object>();
+        var mockClientProxy = new Mock<IClientProxy>();
+        mockClientProxy
+            .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object?[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "PromptReceived" && args.Length > 0 && args[0] is not null)
+                {
+                    capturedPayloads.Add(args[0]!);
+                }
+            })
+            .Returns(Task.CompletedTask);
+        var mockClients = new Mock<IHubClients>();
+        mockClients.Setup(c => c.All).Returns(mockClientProxy.Object);
+        mockClients.Setup(c => c.Group(It.IsAny<string>())).Returns(mockClientProxy.Object);
+        var mockHub = new Mock<IHubContext<AgentMeshHub>>();
+        mockHub.Setup(h => h.Clients).Returns(mockClients.Object);
+
+        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, mockHub.Object, "astra");
+
+        var drainedSession = await db.AgentSessions.AsNoTracking().SingleAsync();
+        using (var doc = System.Text.Json.JsonDocument.Parse(drainedSession.MetadataJson!))
+        {
+            doc.RootElement.GetProperty("workingDirectory").GetString().Should().Be("/workspace/repos/monorepo/services/checkout");
+            doc.RootElement.GetProperty("repositoryName").GetString().Should().Be("checkout-svc");
+            doc.RootElement.GetProperty("projectDescription").GetString().Should().Be("Order checkout flow");
+            doc.RootElement.GetProperty("gitUrl").GetString().Should().Be("https://github.com/org/checkout-svc.git");
+        }
+
+        capturedPayloads.Should().NotBeEmpty();
+        var drainedWireJson = System.Text.Json.JsonSerializer.Serialize(capturedPayloads[0]);
+        using (var wireDoc = System.Text.Json.JsonDocument.Parse(drainedWireJson))
+        {
+            wireDoc.RootElement.GetProperty("workingDirectory").GetString().Should().Be("/workspace/repos/monorepo/services/checkout");
+            wireDoc.RootElement.GetProperty("repositoryName").GetString().Should().Be("checkout-svc");
+            wireDoc.RootElement.GetProperty("workspaceType").GetString().Should().Be("Git");
+            wireDoc.RootElement.GetProperty("gitUrl").GetString().Should().Be("https://github.com/org/checkout-svc.git");
+        }
+    }
 }

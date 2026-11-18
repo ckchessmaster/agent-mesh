@@ -519,4 +519,77 @@ public class ApiServiceRegistrationTests : IClassFixture<WebApplicationFactory<A
         public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
             Task.FromResult(WorkflowDriving);
     }
+
+    [Fact]
+    public void ProjectWorkspaceSetup_IsRegisteredInServiceCollection()
+    {
+        var descriptor = Descriptors.FirstOrDefault(d => d.ServiceType == typeof(IProjectWorkspaceSetup));
+
+        descriptor.Should().NotBeNull("Program.cs must register IProjectWorkspaceSetup for ProjectsController.");
+        descriptor!.ImplementationType.Should().Be<ProjectWorkspaceSetup>();
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+    }
+
+    [Fact]
+    public async Task ProjectsController_ActivatedByTheRealContainer_UsesRegisteredWorkspaceSetup()
+    {
+        var recorder = new RecordingWorkspaceSetup();
+
+        using var factory = BuildWith(services =>
+        {
+            var production = services.SingleOrDefault(d => d.ServiceType == typeof(IProjectWorkspaceSetup));
+            if (production is not null) services.Remove(production);
+            services.AddSingleton<IProjectWorkspaceSetup>(recorder);
+        });
+
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+
+        var projectId = "proj-" + Guid.NewGuid().ToString("N")[..8];
+        db.Projects.Add(new ProjectModel
+        {
+            Id = projectId,
+            Name = "Setup Test",
+            RepositoryName = projectId
+        });
+        await db.SaveChangesAsync();
+
+        var controller = ActivatorUtilities.CreateInstance<ProjectsController>(scope.ServiceProvider);
+        var result = await controller.SetupProjectWorkspace(projectId);
+
+        result.Should().BeOfType<Microsoft.AspNetCore.Mvc.OkObjectResult>();
+        recorder.Projects.Should().ContainSingle(p => p.Id == projectId);
+    }
+
+    private sealed class RecordingWorkspaceSetup : IProjectWorkspaceSetup
+    {
+        public List<ProjectModel> Projects { get; } = [];
+
+        public Task<ProjectWorkspaceSetupResult> EnsureWorkspaceAsync(
+            ProjectWorkspaceSetupRequest request,
+            Action<string>? log = null,
+            CancellationToken ct = default) =>
+            Task.FromResult(ProjectWorkspaceSetupResult.Succeeded(
+                request.WorkingDirectory ?? $"/workspace/repos/{request.RepositoryName}",
+                request.WorkingDirectory ?? $"/workspace/repos/{request.RepositoryName}",
+                ProjectWorkspaceSetupOutcome.Initialized,
+                createdFiles: true,
+                message: "Initialized"));
+
+        public Task<ProjectWorkspaceSetupResult> EnsureWorkspaceAsync(
+            ProjectModel project,
+            string? fallbackDirectory = null,
+            Action<string>? log = null,
+            CancellationToken ct = default)
+        {
+            Projects.Add(project);
+            var target = project.GetResolvedWorkingDirectory();
+            return Task.FromResult(ProjectWorkspaceSetupResult.Succeeded(
+                target,
+                target,
+                ProjectWorkspaceSetupOutcome.Initialized,
+                createdFiles: true,
+                message: "Initialized"));
+        }
+    }
 }

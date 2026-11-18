@@ -532,6 +532,9 @@ export interface Project {
   workspaceType: WorkspaceType | number;
   gitRepositoryUrl?: string | null;
   gitBaseBranch: string;
+  repositoryName?: string;
+  workingDirectory?: string;
+  resolvedWorkingDirectory?: string;
   s3BucketName?: string | null;
   s3PrefixKey?: string | null;
   projectInstructions: string;
@@ -542,6 +545,59 @@ export interface Project {
   activeJobCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CreateProjectRequest {
+  name: string;
+  id?: string;
+  description?: string;
+  workspaceType?: WorkspaceType | number;
+  gitRepositoryUrl?: string;
+  gitBaseBranch?: string;
+  repositoryName?: string;
+  workingDirectory?: string;
+  s3BucketName?: string;
+  s3PrefixKey?: string;
+  projectInstructions?: string;
+  defaultLeadPersonaId?: string;
+  allowedPersonaIds?: string[];
+}
+
+export interface UpdateProjectRequest {
+  name?: string;
+  description?: string;
+  workspaceType?: WorkspaceType | number;
+  gitRepositoryUrl?: string;
+  gitBaseBranch?: string;
+  repositoryName?: string;
+  workingDirectory?: string;
+  s3BucketName?: string;
+  s3PrefixKey?: string;
+  projectInstructions?: string;
+  defaultLeadPersonaId?: string;
+  allowedPersonaIds?: string[];
+}
+
+export type ProjectWorkspaceSetupOutcome =
+  | 'AlreadyInitialized'
+  | 'Cloned'
+  | 'Initialized'
+  | 'DirectoryPrepared'
+  | 'FallbackUsed'
+  | 'Failed'
+  | string;
+
+export interface ProjectWorkspaceSetupResult {
+  projectId: string;
+  success: boolean;
+  targetDirectory: string;
+  effectiveDirectory: string;
+  outcome: ProjectWorkspaceSetupOutcome;
+  usedFallback: boolean;
+  createdFiles: boolean;
+  message: string;
+  warnings: string[];
+  error?: string | null;
 }
 
 export interface JobTask {

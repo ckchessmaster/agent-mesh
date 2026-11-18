@@ -23,6 +23,7 @@ vi.mock('../services/api', () => ({
     createProject: vi.fn(),
     updateProject: vi.fn(),
     deleteProject: vi.fn(),
+    setupProjectWorkspace: vi.fn(),
     getProjectJobs: vi.fn(),
     getProjectJob: vi.fn(),
     createProjectJob: vi.fn(),

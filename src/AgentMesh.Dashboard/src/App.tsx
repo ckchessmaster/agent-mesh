@@ -67,6 +67,7 @@ import type {
   AgentUsageResponse,
   AskQuestionItem,
   JobTask,
+  CreateProjectRequest,
   Persona,
   Project,
   ProjectJob,
@@ -1090,7 +1091,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, [selectedJobId, selectedProjectId, projects, jobsByProject]);
 
-  const handleSaveProject = async (req: any) => {
+  const handleSaveProject = async (req: CreateProjectRequest) => {
     if (editingProject) {
       const updated = await api.updateProject(editingProject.id, req);
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));

@@ -1,33 +1,71 @@
 import React, { useState, useEffect } from 'react';
-import { X, FolderGit2, Check, AlertCircle } from 'lucide-react';
-import type { Persona, Project } from '../types';
+import { X, FolderGit2, Check, AlertCircle, FolderCheck, Loader2, FolderCog } from 'lucide-react';
+import type {
+  CreateProjectRequest,
+  Persona,
+  Project,
+  ProjectWorkspaceSetupResult
+} from '../types';
 import { WorkspaceType } from '../types';
+import { api } from '../services/api';
 import { ProjectDocumentsSection } from './ProjectDocumentsSection';
 
 interface ProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (req: {
-    name: string;
-    id?: string;
-    description?: string;
-    workspaceType: number;
-    gitRepositoryUrl?: string;
-    gitBaseBranch?: string;
-    s3BucketName?: string;
-    s3PrefixKey?: string;
-    projectInstructions?: string;
-    defaultLeadPersonaId?: string;
-    allowedPersonaIds?: string[];
-  }) => Promise<void>;
+  onSave: (req: CreateProjectRequest) => Promise<void>;
+  onSetupWorkspace?: (projectId: string) => Promise<ProjectWorkspaceSetupResult>;
   editingProject?: Project | null;
   availablePersonas: Persona[];
 }
+
+const MAX_REPOSITORY_NAME_LENGTH = 128;
+const MAX_WORKING_DIRECTORY_LENGTH = 256;
+
+const normalizeSlug = (input: string): string =>
+  input
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\-_]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+const isSafeRepositoryName = (value: string): boolean => {
+  if (!value || value.length > MAX_REPOSITORY_NAME_LENGTH) return false;
+  if (value === '.' || value === '..') return false;
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) return false;
+  return value.replace(/\./g, '') !== '';
+};
+
+const isSafeWorkingDirectory = (value: string): boolean => {
+  if (!value) return true;
+  if (value.length > MAX_WORKING_DIRECTORY_LENGTH) return false;
+  const hasPosixRoot = value.startsWith('/');
+  const hasWindowsRoot = /^[A-Za-z]:[/\\]/.test(value);
+  if (!hasPosixRoot && !hasWindowsRoot) return false;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 32 || code === 127) return false;
+  }
+  return true;
+};
+
+const normalizeWorkspacePath = (path: string): string => {
+  let normalized = path.trim();
+  if (!normalized) return normalized;
+  if (normalized.startsWith('/')) {
+    normalized = normalized.replace(/\\/g, '/');
+  }
+  while (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+};
 
 export const ProjectModal: React.FC<ProjectModalProps> = ({
   isOpen,
   onClose,
   onSave,
+  onSetupWorkspace,
   editingProject,
   availablePersonas
 }) => {
@@ -37,6 +75,8 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
   const [workspaceType, setWorkspaceType] = useState<number>(WorkspaceType.Git);
   const [gitRepoUrl, setGitRepoUrl] = useState('');
   const [gitBaseBranch, setGitBaseBranch] = useState('main');
+  const [repositoryName, setRepositoryName] = useState('');
+  const [workingDirectory, setWorkingDirectory] = useState('');
   const [s3Bucket, setS3Bucket] = useState('agent-mesh-artifacts');
   const [s3Prefix, setS3Prefix] = useState('');
   const [instructions, setInstructions] = useState('');
@@ -44,6 +84,9 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
   const [selectedPersonaIds, setSelectedPersonaIds] = useState<string[]>([]);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isSettingUpWorkspace, setIsSettingUpWorkspace] = useState(false);
+  const [setupResult, setSetupResult] = useState<ProjectWorkspaceSetupResult | null>(null);
+  const [setupError, setSetupError] = useState<string | null>(null);
 
   useEffect(() => {
     if (editingProject) {
@@ -53,6 +96,8 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
       setWorkspaceType(typeof editingProject.workspaceType === 'number' ? editingProject.workspaceType : WorkspaceType.Git);
       setGitRepoUrl(editingProject.gitRepositoryUrl || '');
       setGitBaseBranch(editingProject.gitBaseBranch || 'main');
+      setRepositoryName(editingProject.repositoryName || '');
+      setWorkingDirectory(editingProject.workingDirectory || '');
       setS3Bucket(editingProject.s3BucketName || 'agent-mesh-artifacts');
       setS3Prefix(editingProject.s3PrefixKey || '');
       setInstructions(editingProject.projectInstructions || '');
@@ -65,6 +110,8 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
       setWorkspaceType(WorkspaceType.Git);
       setGitRepoUrl('');
       setGitBaseBranch('main');
+      setRepositoryName('');
+      setWorkingDirectory('');
       setS3Bucket('agent-mesh-artifacts');
       setS3Prefix('');
       setInstructions('');
@@ -72,9 +119,39 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
       setSelectedPersonaIds(availablePersonas.map((p) => p.id));
     }
     setError(null);
+    setSetupResult(null);
+    setSetupError(null);
   }, [editingProject, isOpen, availablePersonas]);
 
   if (!isOpen) return null;
+
+  const trimmedRepoName = repositoryName.trim();
+  const trimmedWorkingDirectory = workingDirectory.trim();
+  const effectiveRepoName =
+    trimmedRepoName ||
+    editingProject?.repositoryName ||
+    normalizeSlug(id) ||
+    normalizeSlug(name) ||
+    'agent-mesh';
+  const resolvedWorkingDirectoryPreview = trimmedWorkingDirectory
+    ? normalizeWorkspacePath(trimmedWorkingDirectory)
+    : editingProject?.resolvedWorkingDirectory &&
+        trimmedRepoName === (editingProject.repositoryName || '') &&
+        !(editingProject.workingDirectory || '')
+      ? editingProject.resolvedWorkingDirectory
+      : `/workspace/repos/${effectiveRepoName}`;
+
+  const hasUnsavedWorkspaceChanges = Boolean(
+    editingProject &&
+      (trimmedRepoName !== (editingProject.repositoryName || '') ||
+        trimmedWorkingDirectory !== (editingProject.workingDirectory || '') ||
+        workspaceType !==
+          (typeof editingProject.workspaceType === 'number'
+            ? editingProject.workspaceType
+            : WorkspaceType.Git) ||
+        gitRepoUrl.trim() !== (editingProject.gitRepositoryUrl || '') ||
+        (gitBaseBranch.trim() || 'main') !== (editingProject.gitBaseBranch || 'main'))
+  );
 
   const togglePersona = (pId: string) => {
     setSelectedPersonaIds((prev) => {
@@ -86,10 +163,35 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
     });
   };
 
+  const handleSetupWorkspace = async () => {
+    if (!editingProject || isSettingUpWorkspace || isSaving) return;
+    setIsSettingUpWorkspace(true);
+    setSetupError(null);
+    setSetupResult(null);
+    try {
+      const runSetup = onSetupWorkspace ?? ((projectId: string) => api.setupProjectWorkspace(projectId));
+      const result = await runSetup(editingProject.id);
+      setSetupResult(result);
+    } catch (err: any) {
+      setSetupError(err?.message || 'Failed to setup project workspace.');
+    } finally {
+      setIsSettingUpWorkspace(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || isSaving) {
-      if (!name.trim()) setError('Project Name is required.');
+    if (isSaving) return;
+    if (!name.trim()) {
+      setError('Project Name is required.');
+      return;
+    }
+    if (trimmedRepoName && !isSafeRepositoryName(trimmedRepoName)) {
+      setError('Repository Name must be 1-128 characters using only ASCII letters, digits, ".", "-", or "_".');
+      return;
+    }
+    if (trimmedWorkingDirectory && !isSafeWorkingDirectory(trimmedWorkingDirectory)) {
+      setError('Working Directory must be an absolute path up to 256 characters with no control characters.');
       return;
     }
     setIsSaving(true);
@@ -102,6 +204,8 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
         workspaceType,
         gitRepositoryUrl: workspaceType === WorkspaceType.Git ? gitRepoUrl.trim() || undefined : undefined,
         gitBaseBranch: workspaceType === WorkspaceType.Git ? gitBaseBranch.trim() || 'main' : undefined,
+        repositoryName: trimmedRepoName || undefined,
+        workingDirectory: editingProject ? trimmedWorkingDirectory : trimmedWorkingDirectory || undefined,
         s3BucketName: workspaceType === WorkspaceType.S3Archive ? s3Bucket.trim() || undefined : undefined,
         s3PrefixKey: workspaceType === WorkspaceType.S3Archive ? s3Prefix.trim() || undefined : undefined,
         projectInstructions: instructions.trim() || undefined,
@@ -295,6 +399,146 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
               </div>
             </div>
           )}
+
+          <div className="p-3.5 bg-slate-950/60 border border-slate-800/80 rounded-xl space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <FolderCog className="w-3.5 h-3.5 text-sky-400" />
+                <span className="text-xs font-semibold text-slate-300">
+                  Workspace Directory & Setup
+                </span>
+              </div>
+              {editingProject ? (
+                <button
+                  type="button"
+                  onClick={handleSetupWorkspace}
+                  disabled={isSettingUpWorkspace || isSaving}
+                  data-testid="setup-project-workspace-btn"
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 disabled:opacity-50 transition flex items-center gap-1.5 cursor-pointer"
+                >
+                  {isSettingUpWorkspace ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Setting up...</span>
+                    </>
+                  ) : (
+                    <>
+                      <FolderCheck className="w-3.5 h-3.5" />
+                      <span>Setup Workspace</span>
+                    </>
+                  )}
+                </button>
+              ) : (
+                <span className="text-[11px] text-slate-500">
+                  Save this project first to run workspace setup on disk.
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label
+                  htmlFor="project-repository-name"
+                  className="block text-[11px] font-semibold text-slate-400 mb-1"
+                >
+                  Repository Name <span className="text-slate-500 font-normal">(optional)</span>
+                </label>
+                <input
+                  id="project-repository-name"
+                  type="text"
+                  value={repositoryName}
+                  onChange={(e) => setRepositoryName(e.target.value)}
+                  placeholder="e.g. agent-mesh (defaults to slug)"
+                  data-testid="project-repository-name-input"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="project-working-directory"
+                  className="block text-[11px] font-semibold text-slate-400 mb-1"
+                >
+                  Working Directory <span className="text-slate-500 font-normal">(optional override)</span>
+                </label>
+                <input
+                  id="project-working-directory"
+                  type="text"
+                  value={workingDirectory}
+                  onChange={(e) => setWorkingDirectory(e.target.value)}
+                  placeholder="/workspace/repos/..."
+                  data-testid="project-working-directory-input"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-sky-500 font-mono"
+                />
+              </div>
+            </div>
+
+            <div
+              className="text-[11px] text-slate-400 flex flex-wrap items-center gap-1.5"
+              data-testid="project-resolved-working-directory"
+            >
+              <span>Effective working directory:</span>
+              <code className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-200 font-mono">
+                {resolvedWorkingDirectoryPreview}
+              </code>
+            </div>
+
+            {hasUnsavedWorkspaceChanges && (
+              <div
+                className="text-[11px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-2.5 py-1.5"
+                data-testid="project-workspace-dirty-hint"
+              >
+                Workspace settings have unsaved changes. Click Update Project before running setup to use the updated values.
+              </div>
+            )}
+
+            {setupError && (
+              <div
+                className="p-2.5 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2 text-xs text-red-300"
+                data-testid="project-workspace-setup-result"
+              >
+                <AlertCircle className="w-4 h-4 shrink-0 text-red-400 mt-0.5" />
+                <span>{setupError}</span>
+              </div>
+            )}
+
+            {setupResult && (
+              <div
+                className={`p-2.5 rounded-lg border text-xs space-y-1 ${
+                  !setupResult.success
+                    ? 'bg-red-500/10 border-red-500/30 text-red-200'
+                    : setupResult.usedFallback
+                      ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+                      : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                }`}
+                data-testid="project-workspace-setup-result"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-semibold">{setupResult.outcome}</span>
+                  <span className="text-[11px] opacity-90">{setupResult.message}</span>
+                </div>
+                {setupResult.effectiveDirectory && (
+                  <div className="text-[11px] opacity-90">
+                    Effective directory:{' '}
+                    <code className="font-mono">{setupResult.effectiveDirectory}</code>
+                  </div>
+                )}
+                {!setupResult.success && setupResult.targetDirectory && (
+                  <div className="text-[11px] opacity-90">
+                    Target directory:{' '}
+                    <code className="font-mono">{setupResult.targetDirectory}</code>
+                  </div>
+                )}
+                {setupResult.warnings.length > 0 && (
+                  <ul className="list-disc list-inside text-[11px] opacity-90 space-y-0.5">
+                    {setupResult.warnings.map((w, idx) => (
+                      <li key={idx}>{w}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
 
           <div>
             <label className="block text-xs font-semibold text-slate-300 mb-2">
