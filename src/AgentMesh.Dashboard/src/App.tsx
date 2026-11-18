@@ -69,7 +69,6 @@ import type {
   AgentSession,
   AgentUsageResponse,
   AskQuestionItem,
-  AskQuestionOption,
   DashboardOverviewResponse,
   JobTask,
   CreateProjectRequest,

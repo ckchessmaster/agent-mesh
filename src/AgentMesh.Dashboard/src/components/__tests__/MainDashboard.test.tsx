@@ -209,6 +209,7 @@ const sampleJobs: ProjectJob[] = [
       { id: 't3', title: 'Build MainDashboard', isCompleted: false, status: 'in_progress' },
       { id: 't4', title: 'Wire App tabs', isCompleted: false, status: 'todo' },
     ],
+    messageCount: 4,
     createdAt: '2026-11-18T15:00:00Z',
     updatedAt: '2026-11-18T16:08:00Z',
   },
@@ -225,6 +226,7 @@ const sampleJobs: ProjectJob[] = [
     tasks: [
       { id: 't5', title: 'Update adapter', isCompleted: true, status: 'completed' },
     ],
+    messageCount: 2,
     createdAt: '2026-11-17T10:00:00Z',
     updatedAt: '2026-11-17T12:00:00Z',
   },
@@ -237,6 +239,7 @@ const sampleJobs: ProjectJob[] = [
     status: ProjectJobStatus.Archived,
     gitBranchName: 'mesh/job-spike',
     tasks: [],
+    messageCount: 0,
     createdAt: '2026-11-10T10:00:00Z',
     updatedAt: '2026-11-10T12:00:00Z',
   },
