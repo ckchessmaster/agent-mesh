@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -734,7 +735,9 @@ public class PersonasController(
             {
                 var (workDir, model, effort, mode, tier) = SessionsController.ExtractSessionSettings(session.MetadataJson);
                 var contextSize = SessionsController.ExtractSessionContextSize(session.MetadataJson);
-                var payload = new
+                var mcpServers = await PersonaMcpResolver.ResolveForPersonaAsync(db, persona.Id, encryptionService);
+
+                object BuildPayload(List<ResolvedMcpServerConfig>? servers) => new
                 {
                     sessionId = session.Id,
                     messageId = promptMsg.Id,
@@ -755,11 +758,16 @@ public class PersonasController(
                     tier = tier,
                     contextSize = contextSize,
                     attachments = req.Attachments,
+                    mcpServers = servers,
                     createdAt = promptMsg.CreatedAt
                 };
-                await hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", payload);
-                await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", payload);
-                await hubContext.Clients.All.SendAsync("PromptReceived", payload);
+
+                var targetedPayload = BuildPayload(mcpServers);
+                var broadcastPayload = BuildPayload(null);
+
+                await hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", targetedPayload);
+                await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", targetedPayload);
+                await hubContext.Clients.All.SendAsync("PromptReceived", broadcastPayload);
             }
         }
 
@@ -789,6 +797,39 @@ public class PersonasController(
             .ToList();
 
         return Ok(dtos);
+    }
+
+    /// <summary>
+    /// Returns decrypted, merged MCP server configurations assigned and enabled for this persona.
+    /// Authenticated runners/drivers call this when polling pending prompts or backfilling turn context.
+    /// </summary>
+    [HttpGet("{id}/mcp-servers/resolved")]
+    public async Task<IActionResult> GetResolvedPersonaMcpServers(string id, CancellationToken ct)
+    {
+        var normalizedId = McpControllerHelpers.NormalizeId(id);
+        var persona = await db.Personas
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (User?.Identity?.IsAuthenticated == true &&
+            User.IsInRole("Driver") &&
+            !User.IsInRole("Admin") &&
+            !User.HasClaim("IsMasterKey", "true"))
+        {
+            var callerAgentId = User.FindFirst("AgentId")?.Value;
+            if (!string.Equals(callerAgentId, persona.DriverId, StringComparison.OrdinalIgnoreCase))
+            {
+                return Forbid();
+            }
+        }
+
+        var resolved = await PersonaMcpResolver.ResolveForPersonaAsync(db, normalizedId, encryptionService, ct);
+        return Ok(resolved);
     }
 
     [HttpGet("{id}/mcp-servers/{serverId}")]

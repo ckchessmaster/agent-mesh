@@ -29,7 +29,8 @@ public class AgentsController(
     IDriverQuotaProbe? quotaProbe = null,
     IPersonaContainerManager? containerManager = null,
     IDriverCapabilityProbe? capabilityProbe = null,
-    ILogger<AgentsController>? logger = null) : ControllerBase
+    ILogger<AgentsController>? logger = null,
+    ICredentialEncryptionService? encryptionService = null) : ControllerBase
 {
     private IDriverQuotaProbe QuotaProbe => quotaProbe ?? NullDriverQuotaProbe.Instance;
     private IDriverCapabilityProbe CapabilityProbe => capabilityProbe ?? NullDriverCapabilityProbe.Instance;
@@ -2335,6 +2336,9 @@ public class AgentsController(
             {
                 var (workDir, model, effort, mode, tier) = SessionsController.ExtractSessionSettings(session.MetadataJson);
                 var contextSize = SessionsController.ExtractSessionContextSize(session.MetadataJson);
+                var mcpServers = persona != null
+                    ? await PersonaMcpResolver.ResolveForPersonaAsync(db, persona.Id, encryptionService)
+                    : null;
                 await hubContext.Clients.Group($"agent-{normalizedId}").SendAsync("PromptReceived", new
                 {
                     sessionId = session.Id,
@@ -2354,6 +2358,7 @@ public class AgentsController(
                     tier = tier,
                     contextSize = contextSize,
                     attachments = req.Attachments,
+                    mcpServers = mcpServers,
                     createdAt = promptMsg.CreatedAt
                 });
             }

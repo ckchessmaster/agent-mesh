@@ -165,6 +165,9 @@ public class PromptReceivedEvent
     [JsonPropertyName("attachments")]
     public List<AttachmentItem>? Attachments { get; set; }
 
+    [JsonPropertyName("mcpServers")]
+    public List<ResolvedMcpServerConfig>? McpServers { get; set; }
+
     // NOTE: `ConversationId` is declared once above (next to `SessionId`). Both the main and the
     // v1.2.13-v1.2.15 lineages independently added this same property during the divergence; the
     // reconciliation keeps a single declaration.

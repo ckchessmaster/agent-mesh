@@ -265,6 +265,141 @@ public class MeshClientPendingPromptsTests : IDisposable
         missing.Should().BeNull();
     }
 
+    [Fact]
+    public async Task GetResolvedPersonaMcpServersAsync_And_GetPendingPromptsForPersonaAsync_DeliverAndCacheMcpConfigs()
+    {
+        var session1 = Guid.NewGuid();
+        var session2 = Guid.NewGuid();
+        var msg1 = Guid.NewGuid();
+        var msg2 = Guid.NewGuid();
+        var metadataJson = JsonSerializer.Serialize(new
+        {
+            jobId = Guid.NewGuid().ToString(),
+            projectId = "payments",
+            workingDirectory = "/workspace/repos/payments"
+        });
+
+        var mcpRequests = 0;
+        string? capturedAuth = null;
+        string? capturedAgentId = null;
+
+        var client = CreateClient(req =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            if (path.EndsWith("/api/personas/astra/sessions", StringComparison.Ordinal))
+            {
+                return JsonResponse(new[]
+                {
+                    new { id = session1, status = "thinking", driverId = "agy", personaId = "astra", personaName = "Astra", metadataJson },
+                    new { id = session2, status = "thinking", driverId = "agy", personaId = "astra", personaName = "Astra", metadataJson }
+                });
+            }
+            if (path.EndsWith($"/api/sessions/{session1}/events", StringComparison.Ordinal))
+            {
+                return JsonResponse(new[]
+                {
+                    new { id = msg1, eventType = "prompt", content = "Turn 1", senderAgentId = "operator", createdAt = DateTimeOffset.UtcNow }
+                });
+            }
+            if (path.EndsWith($"/api/sessions/{session2}/events", StringComparison.Ordinal))
+            {
+                return JsonResponse(new[]
+                {
+                    new { id = msg2, eventType = "prompt", content = "Turn 2", senderAgentId = "operator", createdAt = DateTimeOffset.UtcNow }
+                });
+            }
+            if (path.EndsWith("/api/personas/astra/mcp-servers/resolved", StringComparison.Ordinal))
+            {
+                mcpRequests++;
+                capturedAuth = req.Headers.Authorization?.ToString();
+                capturedAgentId = req.Headers.TryGetValues("X-Agent-Id", out var vals) ? vals.FirstOrDefault() : null;
+                return JsonResponse(new object[]
+                {
+                    new
+                    {
+                        id = "github",
+                        name = "GitHub",
+                        transport = "Stdio",
+                        command = "npx",
+                        args = new[] { "-y", "@modelcontextprotocol/server-github" },
+                        env = new Dictionary<string, string> { ["GITHUB_TOKEN"] = "ghp_resolved_1234" },
+                        headers = new Dictionary<string, string>(),
+                        timeoutSeconds = 45,
+                        allowedTools = new[] { "get_issue" },
+                        blockedTools = new[] { "delete_repo" }
+                    },
+                    new
+                    {
+                        id = "context7",
+                        name = "Context7",
+                        transport = "Http",
+                        url = "https://mcp.context7.com/mcp",
+                        env = new Dictionary<string, string>(),
+                        headers = new Dictionary<string, string> { ["Authorization"] = "Bearer ctx7_secret" },
+                        timeoutSeconds = 30
+                    }
+                });
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        var prompts = await client.GetPendingPromptsForPersonaAsync("astra", "mesh_tok_runner");
+
+        prompts.Should().HaveCount(2);
+        mcpRequests.Should().Be(1, "resolved MCP config should be fetched once per persona per poll cycle");
+        capturedAuth.Should().Be("Bearer mesh_tok_runner");
+        capturedAgentId.Should().Be("agy");
+
+        foreach (var p in prompts)
+        {
+            p.McpServers.Should().HaveCount(2);
+            p.McpServers![0].Id.Should().Be("github");
+            p.McpServers[0].Transport.Should().Be(McpTransportType.Stdio);
+            p.McpServers[0].Env["GITHUB_TOKEN"].Should().Be("ghp_resolved_1234");
+            p.McpServers[0].AllowedTools.Should().Equal("get_issue");
+            p.McpServers[0].BlockedTools.Should().Equal("delete_repo");
+
+            p.McpServers[1].Id.Should().Be("context7");
+            p.McpServers[1].Transport.Should().Be(McpTransportType.Http);
+            p.McpServers[1].Headers["Authorization"].Should().Be("Bearer ctx7_secret");
+        }
+
+        // Direct fetch returns null on error/404 and does not throw
+        var missing = await client.GetResolvedPersonaMcpServersAsync("unknown-persona", "mesh_tok_runner");
+        missing.Should().BeNull();
+    }
+
+    [Fact]
+    public void AgentRunnerInstance_ExtractJsonMcpServers_ParsesArrayAndDistinguishesNullVsEmpty()
+    {
+        using var absentDoc = JsonDocument.Parse("""{"sessionId":"00000000-0000-0000-0000-000000000001"}""");
+        AgentRunnerInstance.ExtractJsonMcpServers(absentDoc.RootElement).Should().BeNull();
+
+        using var emptyDoc = JsonDocument.Parse("""{"mcpServers":[]}""");
+        AgentRunnerInstance.ExtractJsonMcpServers(emptyDoc.RootElement).Should().NotBeNull().And.BeEmpty();
+
+        using var populatedDoc = JsonDocument.Parse("""
+        {
+          "mcpServers": [
+            {
+              "id": "context7",
+              "name": "Context7",
+              "transport": "Http",
+              "url": "https://mcp.context7.com/mcp",
+              "headers": { "X-Api-Key": "secret-val" },
+              "timeoutSeconds": 25
+            }
+          ]
+        }
+        """);
+        var parsed = AgentRunnerInstance.ExtractJsonMcpServers(populatedDoc.RootElement);
+        parsed.Should().ContainSingle();
+        parsed![0].Id.Should().Be("context7");
+        parsed[0].Transport.Should().Be(McpTransportType.Http);
+        parsed[0].Headers["X-Api-Key"].Should().Be("secret-val");
+        parsed[0].TimeoutSeconds.Should().Be(25);
+    }
+
     private MeshClient CreateClient(Func<HttpRequestMessage, HttpResponseMessage> handler)
     {
         var store = new ConfigStore(_configPath);

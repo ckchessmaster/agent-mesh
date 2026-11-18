@@ -147,6 +147,7 @@ builder.Services.AddSeaweedS3Storage(builder.Configuration);
 builder.Services.Configure<JobHandoffOptions>(builder.Configuration.GetSection(JobHandoffOptions.SectionName));
 builder.Services.AddSingleton<IProjectWorkspaceSetup, ProjectWorkspaceSetup>();
 builder.Services.AddScoped<IJobWorkspaceService, JobWorkspaceService>();
+builder.Services.AddScoped<IPersonaMcpResolver, PersonaMcpResolver>();
 builder.Services.AddScoped<JobTurnDispatcher>();
 builder.Services.AddScoped<IJobHandoffService, JobHandoffService>();
 builder.Services.AddHostedService<JobHandoffReaper>();

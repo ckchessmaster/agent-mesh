@@ -56,12 +56,38 @@ public record DispatchedJobTurn(AgentSession Session, SessionMessage PromptMessa
 /// where the work should live. Per-job workspaces are only safe if every dispatch path points the
 /// runner at the same directory, so the paths have to be one path.
 /// </summary>
-public class JobTurnDispatcher(
-    AgentMeshDbContext db,
-    IHubContext<AgentMeshHub>? hubContext = null,
-    IJobWorkspaceService? workspaces = null,
-    IPersonaContainerManager? containerManager = null)
+public class JobTurnDispatcher
 {
+    private readonly AgentMeshDbContext db;
+    private readonly IHubContext<AgentMeshHub>? hubContext;
+    private readonly IJobWorkspaceService? workspaces;
+    private readonly IPersonaContainerManager? containerManager;
+    private readonly ICredentialEncryptionService? encryptionService;
+
+    public JobTurnDispatcher(
+        AgentMeshDbContext db,
+        IHubContext<AgentMeshHub>? hubContext = null,
+        IJobWorkspaceService? workspaces = null,
+        IPersonaContainerManager? containerManager = null)
+        : this(db, hubContext, workspaces, containerManager, encryptionService: null)
+    {
+    }
+
+    [ActivatorUtilitiesConstructor]
+    public JobTurnDispatcher(
+        AgentMeshDbContext db,
+        IHubContext<AgentMeshHub>? hubContext,
+        IJobWorkspaceService? workspaces,
+        IPersonaContainerManager? containerManager,
+        ICredentialEncryptionService? encryptionService)
+    {
+        this.db = db;
+        this.hubContext = hubContext;
+        this.workspaces = workspaces;
+        this.containerManager = containerManager;
+        this.encryptionService = encryptionService;
+    }
+
     internal static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -225,9 +251,12 @@ public class JobTurnDispatcher(
             }
         }
 
+        var mcpServers = await PersonaMcpResolver.ResolveForPersonaAsync(
+            db, persona.Id, encryptionService, ct);
+
         await BroadcastAsync(
             turnSession, promptMsg, driver, persona, job, project, promptWithContext, attachments,
-            hydration, ct, req.PromptStack);
+            hydration, ct, req.PromptStack, mcpServers);
 
         return new DispatchedJobTurn(turnSession, promptMsg, driver);
     }
@@ -259,26 +288,30 @@ public class JobTurnDispatcher(
         List<JobAttachmentDto> attachments,
         JobWorkspaceHydration? hydration,
         CancellationToken ct,
-        PromptStackWirePayload? promptStack = null)
+        PromptStackWirePayload? promptStack = null,
+        List<ResolvedMcpServerConfig>? mcpServers = null)
     {
         if (hubContext == null) return;
 
         var driverId = driver.Id;
-        var payload = BuildPromptReceivedPayload(
-            session, promptMsg, driverId, persona, job, project, prompt, attachments, hydration, promptStack);
+        var targetedPayload = BuildPromptReceivedPayload(
+            session, promptMsg, driverId, persona, job, project, prompt, attachments, hydration, promptStack, mcpServers);
+        // Never broadcast decrypted MCP secrets over Clients.All (browser dashboard clients listen there).
+        var broadcastPayload = BuildPromptReceivedPayload(
+            session, promptMsg, driverId, persona, job, project, prompt, attachments, hydration, promptStack, mcpServers: null);
 
         var personaGroup = hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}");
         if (personaGroup != null)
         {
-            await personaGroup.SendAsync("PromptReceived", payload, ct);
+            await personaGroup.SendAsync("PromptReceived", targetedPayload, ct);
         }
 
         var group = hubContext.Clients.Group($"agent-{driverId}");
         if (group != null)
         {
-            await group.SendAsync("PromptReceived", payload, ct);
+            await group.SendAsync("PromptReceived", targetedPayload, ct);
         }
-        await hubContext.Clients.All.SendAsync("PromptReceived", payload, ct);
+        await hubContext.Clients.All.SendAsync("PromptReceived", broadcastPayload, ct);
 
         // Broadcast session lifecycle so dashboards reflect active turns in real-time
         var summary = new Controllers.SessionSummaryDto(
@@ -400,7 +433,8 @@ public class JobTurnDispatcher(
         string prompt,
         List<JobAttachmentDto> attachments,
         JobWorkspaceHydration? hydration = null,
-        PromptStackWirePayload? promptStack = null)
+        PromptStackWirePayload? promptStack = null,
+        List<ResolvedMcpServerConfig>? mcpServers = null)
     {
         var workingDirectory = ResolveTurnWorkingDirectory(job, project);
         return new
@@ -418,6 +452,7 @@ public class JobTurnDispatcher(
             // messages[1] from it; one that does not (older binary, or a dispatch path that has no
             // composer) falls back to `prompt` plus its own locally built system prompt.
             promptStack,
+            mcpServers,
             sender = promptMsg.SenderAgentId,
             workingDirectory,
             model = persona.DefaultModel,
