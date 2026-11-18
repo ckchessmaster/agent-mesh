@@ -25,8 +25,114 @@ export interface Persona {
   gitHubTokenPreview?: string | null;
   gitAuthorName?: string | null;
   gitAuthorEmail?: string | null;
+  mcpServerCount?: number;
   createdAt: string;
   updatedAt?: string;
+}
+
+export const McpTransportType = {
+  Stdio: 'Stdio',
+  Http: 'Http',
+  Sse: 'Sse'
+} as const;
+export type McpTransportType = (typeof McpTransportType)[keyof typeof McpTransportType] | string;
+
+export interface McpServer {
+  id: string;
+  name: string;
+  description: string;
+  transport: McpTransportType;
+  command?: string | null;
+  args: string[];
+  url?: string | null;
+  envMasked: Record<string, string>;
+  headersMasked: Record<string, string>;
+  hasEnv: boolean;
+  hasHeaders: boolean;
+  enabled: boolean;
+  timeoutSeconds: number;
+  assignedPersonaCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateMcpServerRequest {
+  name: string;
+  id?: string;
+  description?: string;
+  transport?: McpTransportType;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+  timeoutSeconds?: number;
+}
+
+export interface UpdateMcpServerRequest {
+  name?: string;
+  description?: string;
+  transport?: McpTransportType;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  mergeEnv?: boolean;
+  mergeHeaders?: boolean;
+  removeEnvKeys?: string[];
+  removeHeaderKeys?: string[];
+  enabled?: boolean;
+  timeoutSeconds?: number;
+}
+
+export interface PersonaMcpServer {
+  personaId: string;
+  mcpServerId: string;
+  mcpServerName: string;
+  mcpServerDescription: string;
+  transport: McpTransportType;
+  command?: string | null;
+  args: string[];
+  url?: string | null;
+  serverEnabled: boolean;
+  enabled: boolean;
+  effectiveEnabled: boolean;
+  timeoutSeconds: number;
+  serverEnvMasked: Record<string, string>;
+  serverHeadersMasked: Record<string, string>;
+  envOverridesMasked: Record<string, string>;
+  headersOverridesMasked: Record<string, string>;
+  hasEnvOverrides: boolean;
+  hasHeadersOverrides: boolean;
+  allowedTools?: string[] | null;
+  blockedTools?: string[] | null;
+  assignedAt: string;
+  updatedAt: string;
+}
+
+export interface AssignPersonaMcpServerRequest {
+  mcpServerId: string;
+  enabled?: boolean;
+  envOverrides?: Record<string, string>;
+  headersOverrides?: Record<string, string>;
+  allowedTools?: string[];
+  blockedTools?: string[];
+}
+
+export interface UpsertPersonaMcpServerRequest {
+  enabled?: boolean;
+  envOverrides?: Record<string, string>;
+  headersOverrides?: Record<string, string>;
+  mergeEnvOverrides?: boolean;
+  mergeHeadersOverrides?: boolean;
+  removeEnvOverrideKeys?: string[];
+  removeHeaderOverrideKeys?: string[];
+  allowedTools?: string[];
+  blockedTools?: string[];
+  clearAllowedTools?: boolean;
+  clearBlockedTools?: boolean;
 }
 
 export interface PersonaEnvironmentStatus {
