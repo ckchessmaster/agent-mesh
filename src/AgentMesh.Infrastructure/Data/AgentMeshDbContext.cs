@@ -21,6 +21,8 @@ public class AgentMeshDbContext(DbContextOptions<AgentMeshDbContext> options) : 
     public DbSet<ProjectDocument> ProjectDocuments => Set<ProjectDocument>();
     public DbSet<JobTimelineCard> JobTimelineCards => Set<JobTimelineCard>();
     public DbSet<JobCardComment> JobCardComments => Set<JobCardComment>();
+    public DbSet<McpServer> McpServers => Set<McpServer>();
+    public DbSet<PersonaMcpServer> PersonaMcpServers => Set<PersonaMcpServer>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
