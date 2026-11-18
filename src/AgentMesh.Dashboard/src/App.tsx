@@ -37,6 +37,7 @@ import {
   Download,
   ZoomIn,
   FolderGit2,
+  LayoutDashboard,
   Maximize2,
   Box,
   GitBranch,
@@ -68,6 +69,8 @@ import type {
   AgentSession,
   AgentUsageResponse,
   AskQuestionItem,
+  AskQuestionOption,
+  DashboardOverviewResponse,
   JobTask,
   CreateProjectRequest,
   Persona,
@@ -83,7 +86,7 @@ import type {
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from './types';
-import { ProjectJobStatus } from './types';
+import { JobLifecycleStatus, ProjectJobStatus } from './types';
 import type { JobPanelTab } from './types';
 import { SlashCommandPalette, SLASH_COMMANDS, type SlashCommandItem } from './components/SlashCommandPalette';
 import { ArtifactViewer } from './components/ArtifactViewer';
@@ -93,6 +96,7 @@ import { ProjectModal } from './components/ProjectModal';
 import { NewJobModal } from './components/NewJobModal';
 import { JobCockpit } from './components/JobCockpit';
 import { ProjectList } from './components/ProjectList';
+import { MainDashboard } from './components/MainDashboard';
 import { MermaidViewer } from './components/MermaidViewer';
 import { getOptionLabel, getOptionDescription } from './components/QuestionCard';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -262,14 +266,15 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [sessions, setSessions] = useState<AgentSession[]>([]);
-  const [activeTab, setActiveTab] = useState<'projects' | 'personas' | 'drivers'>(() => {
+  const [dashboardOverview, setDashboardOverview] = useState<DashboardOverviewResponse | null>(null);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'projects' | 'personas' | 'drivers'>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('agentmesh_active_tab');
-      if (saved === 'projects' || saved === 'personas' || saved === 'drivers') {
+      if (saved === 'dashboard' || saved === 'projects' || saved === 'personas' || saved === 'drivers') {
         return saved;
       }
     }
-    return 'personas';
+    return 'dashboard';
   });
   const hasUserSwitchedTabRef = useRef(
     typeof window !== 'undefined' && !!localStorage.getItem('agentmesh_active_tab')
@@ -756,6 +761,49 @@ export default function App() {
     }
   };
 
+  const fetchDashboardOverview = useCallback(async () => {
+    if (typeof api.getDashboardOverview !== 'function') return;
+    try {
+      const res = await api.getDashboardOverview();
+      if (res) {
+        setDashboardOverview(res);
+      }
+    } catch {
+      // MainDashboard gracefully derives fallback stats when the overview endpoint is unavailable
+    }
+  }, []);
+
+  const dashboardAttentionCount = useMemo(() => {
+    if (dashboardOverview) {
+      return Math.max(
+        dashboardOverview.jobStats?.attentionCount ?? 0,
+        dashboardOverview.attentionItems?.length ?? 0
+      );
+    }
+    const waitingSessions = sessions.filter(
+      (s) => (s.status || '').toLowerCase() === 'waiting_for_input'
+    ).length;
+    const seenJobIds = new Set<string>();
+    let blockedOrAwaitingJobs = 0;
+    for (const list of Object.values(jobsByProject)) {
+      if (!Array.isArray(list)) continue;
+      for (const job of list) {
+        if (!job?.id || seenJobIds.has(job.id)) continue;
+        seenJobIds.add(job.id);
+        if (
+          job.status === ProjectJobStatus.Active &&
+          (job.lifecycleStatus === JobLifecycleStatus.Blocked ||
+            job.lifecycleStatus === JobLifecycleStatus.Failed ||
+            job.lifecycleStatus === JobLifecycleStatus.AwaitingApproval ||
+            job.lifecycleStatus === JobLifecycleStatus.AwaitingReview)
+        ) {
+          blockedOrAwaitingJobs++;
+        }
+      }
+    }
+    return waitingSessions + blockedOrAwaitingJobs;
+  }, [dashboardOverview, sessions, jobsByProject]);
+
   const fetchAllData = useCallback(async () => {
     try {
       if (api.verifyAuth) {
@@ -764,14 +812,17 @@ export default function App() {
         });
       }
 
-      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes, mcpServersRes] = await Promise.all([
+      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes, mcpServersRes, overviewRes] = await Promise.all([
         api.getStatus(),
         api.getAgents(),
         api.getPersonas ? api.getPersonas().catch(() => []) : Promise.resolve([]),
         api.getSessions('all'),
         api.getCapabilities().catch(() => null),
         api.getProjects ? api.getProjects().catch(() => []) : Promise.resolve([]),
-        api.getMcpServers ? api.getMcpServers().catch(() => []) : Promise.resolve([])
+        api.getMcpServers ? api.getMcpServers().catch(() => []) : Promise.resolve([]),
+        typeof api.getDashboardOverview === 'function'
+          ? Promise.resolve(api.getDashboardOverview()).catch(() => null)
+          : Promise.resolve(null)
       ]);
       setStatusData(statusRes);
       setAgents(agentsRes);
@@ -789,25 +840,17 @@ export default function App() {
         return result;
       });
       setProjects(projectsRes || []);
+      if (overviewRes) {
+        setDashboardOverview(overviewRes);
+      }
       if (capsRes) {
         setCapabilities(capsRes);
       }
       setApiError(null);
 
-      // Reconcile tab: prefer user's selected tab if it has items, otherwise select first populated section
-      const isCurrentTabPopulated =
-        (activeTab === 'projects' && projectsRes && projectsRes.length > 0) ||
-        (activeTab === 'personas' && personasRes && personasRes.length > 0) ||
-        (activeTab === 'drivers' && agentsRes && agentsRes.length > 0);
-
-      if (!hasUserSwitchedTabRef.current || !isCurrentTabPopulated) {
-        if (projectsRes && projectsRes.length > 0) {
-          setActiveTab('projects');
-        } else if (personasRes.length > 0) {
-          setActiveTab('personas');
-        } else if (agentsRes.length > 0) {
-          setActiveTab('drivers');
-        }
+      // Keep Dashboard as the default landing page unless the operator explicitly chose another tab.
+      if (!hasUserSwitchedTabRef.current) {
+        setActiveTab((cur) => (cur === 'dashboard' ? cur : 'dashboard'));
       }
 
       // Auto-select first project if none selected
@@ -1112,6 +1155,7 @@ export default function App() {
       setSelectedProjectId(created.id);
       fetchJobsForProject(created.id);
     }
+    void fetchDashboardOverview();
   };
 
   const handleDeleteProject = async (projectId: string) => {
@@ -1121,6 +1165,7 @@ export default function App() {
       setSelectedProjectId(null);
       setSelectedJobId(null);
     }
+    void fetchDashboardOverview();
   };
 
   const handleCreateJob = async (req: any) => {
@@ -1133,7 +1178,10 @@ export default function App() {
         ...(prev[jobModalProject.id] || []).filter((j) => j.id !== created.id)
       ]
     }));
+    hasUserSwitchedTabRef.current = true;
+    setActiveTab('projects');
     handleSelectJob(jobModalProject.id, created.id);
+    void fetchDashboardOverview();
   };
 
   const handleDeleteJob = async (jobId: string) => {
@@ -1149,6 +1197,7 @@ export default function App() {
       setSelectedJobId(null);
       setJobTasks([]);
     }
+    void fetchDashboardOverview();
   };
 
   const handleUpdateJob = async (updates: {
@@ -1166,6 +1215,7 @@ export default function App() {
       ...prev,
       [updated.projectId]: (prev[updated.projectId] || []).map((j) => (j.id === updated.id ? updated : j))
     }));
+    void fetchDashboardOverview();
   };
 
   const handleDeleteAgent = async (agentId: string) => {
@@ -1298,6 +1348,7 @@ export default function App() {
       }
       return next;
     });
+    void fetchDashboardOverview();
   };
 
   const handleArchiveJob = async (jobId?: string) => {
@@ -1312,6 +1363,7 @@ export default function App() {
         }
         return next;
       });
+      void fetchDashboardOverview();
     } catch (err) {
       console.error('Failed to archive job:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to archive job');
@@ -1330,6 +1382,7 @@ export default function App() {
         }
         return next;
       });
+      void fetchDashboardOverview();
     } catch (err) {
       console.error('Failed to reopen job:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to reopen job');
@@ -1348,6 +1401,7 @@ export default function App() {
         }
         return next;
       });
+      void fetchDashboardOverview();
     } catch (err) {
       console.error('Failed to reset job:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to reset job');
@@ -1460,6 +1514,44 @@ export default function App() {
     }
   }, [selectedSessionId, fetchSessionEvents, fetchSessionArtifacts, connection, signalRConnected]);
 
+  const joinedDashboardJobsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!connection || !signalRConnected) {
+      joinedDashboardJobsRef.current.clear();
+      return;
+    }
+
+    const desiredJobIds = new Set<string>();
+    for (const job of dashboardOverview?.recentJobs ?? []) {
+      if (job?.id && (job.status === ProjectJobStatus.Active || job.status === ProjectJobStatus.Pending)) {
+        desiredJobIds.add(job.id);
+      }
+    }
+    for (const list of Object.values(jobsByProject)) {
+      if (!Array.isArray(list)) continue;
+      for (const job of list) {
+        if (job?.id && (job.status === ProjectJobStatus.Active || job.status === ProjectJobStatus.Pending)) {
+          desiredJobIds.add(job.id);
+        }
+      }
+    }
+
+    const current = joinedDashboardJobsRef.current;
+    for (const jobId of desiredJobIds) {
+      if (!current.has(jobId)) {
+        current.add(jobId);
+        connection.invoke('JoinJob', jobId).catch(() => {});
+      }
+    }
+    for (const jobId of Array.from(current)) {
+      if (!desiredJobIds.has(jobId)) {
+        current.delete(jobId);
+        connection.invoke('LeaveJob', jobId).catch(() => {});
+      }
+    }
+  }, [connection, signalRConnected, dashboardOverview?.recentJobs, jobsByProject]);
+
   // Handle panel resizing
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -1495,6 +1587,9 @@ export default function App() {
           return [...prev, msg];
         });
       }
+      const asksForHumanInput =
+        msg.eventType === 'tool_call' &&
+        (msg.toolName === 'ask_question' || msg.toolName === 'ask_user');
       setSessions((prev) =>
         prev.map((s) =>
           s.id === msg.sessionId
@@ -1502,7 +1597,7 @@ export default function App() {
                 ...s,
                 messageCount: (s.messageCount || 0) + 1,
                 status:
-                  msg.eventType === 'tool_call' && (msg.toolName === 'ask_question' || msg.toolName === 'ask_user')
+                  asksForHumanInput
                     ? 'waiting_for_input'
                     : (msg.eventType === 'prompt' || msg.eventType === 'thought' || msg.eventType === 'tool_call')
                     ? 'thinking'
@@ -1514,6 +1609,9 @@ export default function App() {
             : s
         )
       );
+      if (asksForHumanInput || msg.eventType === 'prompt') {
+        void fetchDashboardOverview();
+      }
     };
 
     const handleSessionCreated = (session: AgentSession) => {
@@ -1532,6 +1630,7 @@ export default function App() {
           setSelectedAgentId(session.driverId || session.creatorAgentId || null);
         }
       }
+      void fetchDashboardOverview();
     };
 
     const handleSessionDeleted = (data: { id?: string; sessionId?: string; personaId?: string; driverId?: string }) => {
@@ -1552,6 +1651,7 @@ export default function App() {
         }
         return cur;
       });
+      void fetchDashboardOverview();
     };
 
     const handleSessionUpdated = (updatedSession?: AgentSession) => {
@@ -1570,6 +1670,9 @@ export default function App() {
       setAgents([]);
       setPersonas([]);
       setSessions([]);
+      setProjects([]);
+      setJobsByProject({});
+      setDashboardOverview(null);
       setEvents([]);
       setArtifacts([]);
       setSelectedPersonaId(null);
@@ -1662,6 +1765,16 @@ export default function App() {
         }
         return next;
       });
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.map((j) =>
+                j.id === data.jobId ? { ...j, tasks: data.tasks } : j
+              )
+            }
+          : prev
+      );
     };
 
     const handleProgressHeartbeatUpdated = (data: {
@@ -1688,6 +1801,26 @@ export default function App() {
         }
         return next;
       });
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.map((j) =>
+                j.id === data.jobId
+                  ? {
+                      ...j,
+                      progressHeartbeat:
+                        data.progressHeartbeat !== undefined ? data.progressHeartbeat : j.progressHeartbeat,
+                      currentTaskId:
+                        data.currentTaskId !== undefined ? data.currentTaskId : j.currentTaskId,
+                      lifecycleStatus:
+                        data.lifecycleStatus !== undefined ? (data.lifecycleStatus as any) : j.lifecycleStatus
+                    }
+                  : j
+              )
+            }
+          : prev
+      );
     };
 
     const handleJobCreated = (job: ProjectJob) => {
@@ -1695,6 +1828,15 @@ export default function App() {
         ...prev,
         [job.projectId]: [job, ...(prev[job.projectId] || []).filter((j) => j.id !== job.id)]
       }));
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: [job, ...prev.recentJobs.filter((j) => j.id !== job.id)]
+            }
+          : prev
+      );
+      void fetchDashboardOverview();
     };
 
     const handleJobUpdated = (job: ProjectJob) => {
@@ -1702,6 +1844,17 @@ export default function App() {
         ...prev,
         [job.projectId]: (prev[job.projectId] || []).map((j) => (j.id === job.id ? job : j))
       }));
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.some((j) => j.id === job.id)
+                ? prev.recentJobs.map((j) => (j.id === job.id ? { ...j, ...job } : j))
+                : [job, ...prev.recentJobs]
+            }
+          : prev
+      );
+      void fetchDashboardOverview();
     };
 
     const handleJobDeleted = (data: { id: string; projectId: string }) => {
@@ -1710,19 +1863,60 @@ export default function App() {
         [data.projectId]: (prev[data.projectId] || []).filter((j) => j.id !== data.id)
       }));
       setSelectedJobId((cur) => (cur === data.id ? null : cur));
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.filter((j) => j.id !== data.id),
+              attentionItems: prev.attentionItems.filter((item) => item.jobId !== data.id)
+            }
+          : prev
+      );
+      void fetchDashboardOverview();
     };
 
     const handleProjectCreated = (proj: Project) => {
       setProjects((prev) => [proj, ...prev.filter((p) => p.id !== proj.id)]);
+      void fetchDashboardOverview();
     };
 
     const handleProjectUpdated = (proj: Project) => {
       setProjects((prev) => prev.map((p) => (p.id === proj.id ? proj : p)));
+      void fetchDashboardOverview();
     };
 
     const handleProjectDeleted = (data: { id: string }) => {
       setProjects((prev) => prev.filter((p) => p.id !== data.id));
       setSelectedProjectId((cur) => (cur === data.id ? null : cur));
+      void fetchDashboardOverview();
+    };
+
+    const handleTimelineCardUpdated = () => {
+      void fetchDashboardOverview();
+    };
+
+    const handlePersonaRunnerStatusChanged = (data: {
+      personaId?: string;
+      driverId?: string;
+      status?: string;
+    }) => {
+      if (data?.personaId && data.status) {
+        const targetId = data.personaId.toLowerCase();
+        setPersonas((prev) =>
+          prev.map((p) =>
+            p.id.toLowerCase() === targetId ? { ...p, driverStatus: data.status } : p
+          )
+        );
+      }
+      if (data?.driverId && data.status) {
+        const targetDriverId = data.driverId.toLowerCase();
+        setAgents((prev) =>
+          prev.map((a) =>
+            a.id.toLowerCase() === targetDriverId ? { ...a, status: data.status } : a
+          )
+        );
+      }
+      void fetchAllData();
     };
 
     const handleCommandOutput = (data: { sessionId?: string; commandId?: string; output?: string }) => {
@@ -1772,13 +1966,21 @@ export default function App() {
     connection.on('PersonaMcpServerRemoved', handleMcpUpdated);
     connection.on('MeshReset', handleMeshReset);
     connection.on('JobTaskUpdated', handleJobTaskUpdated);
+    connection.on('ChecklistUpdated', handleJobTaskUpdated);
     connection.on('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
     connection.on('JobCreated', handleJobCreated);
     connection.on('JobUpdated', handleJobUpdated);
     connection.on('JobDeleted', handleJobDeleted);
+    connection.on('JobStaged', handleTimelineCardUpdated);
     connection.on('ProjectCreated', handleProjectCreated);
     connection.on('ProjectUpdated', handleProjectUpdated);
     connection.on('ProjectDeleted', handleProjectDeleted);
+    connection.on('ProjectPersonaAssigned', handleTimelineCardUpdated);
+    connection.on('ProjectPersonaRemoved', handleTimelineCardUpdated);
+    connection.on('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
+    connection.on('JobApprovalUpdated', handleTimelineCardUpdated);
+    connection.on('JobHandoffUpdated', handleTimelineCardUpdated);
+    connection.on('PersonaRunnerStatusChanged', handlePersonaRunnerStatusChanged);
 
     return () => {
       connection.off('ReceiveMessage', handleReceiveMessage);
@@ -1805,15 +2007,23 @@ export default function App() {
       connection.off('PersonaMcpServerRemoved', handleMcpUpdated);
       connection.off('MeshReset', handleMeshReset);
       connection.off('JobTaskUpdated', handleJobTaskUpdated);
+      connection.off('ChecklistUpdated', handleJobTaskUpdated);
       connection.off('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
       connection.off('JobCreated', handleJobCreated);
       connection.off('JobUpdated', handleJobUpdated);
       connection.off('JobDeleted', handleJobDeleted);
+      connection.off('JobStaged', handleTimelineCardUpdated);
       connection.off('ProjectCreated', handleProjectCreated);
       connection.off('ProjectUpdated', handleProjectUpdated);
       connection.off('ProjectDeleted', handleProjectDeleted);
+      connection.off('ProjectPersonaAssigned', handleTimelineCardUpdated);
+      connection.off('ProjectPersonaRemoved', handleTimelineCardUpdated);
+      connection.off('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
+      connection.off('JobApprovalUpdated', handleTimelineCardUpdated);
+      connection.off('JobHandoffUpdated', handleTimelineCardUpdated);
+      connection.off('PersonaRunnerStatusChanged', handlePersonaRunnerStatusChanged);
     };
-  }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents, fetchSessionArtifacts]);
+  }, [connection, selectedSessionId, fetchAllData, fetchDashboardOverview, fetchSessionEvents, fetchSessionArtifacts]);
 
   const handleResetMesh = async () => {
     setIsActionPending(true);
@@ -1822,6 +2032,9 @@ export default function App() {
       setAgents([]);
       setPersonas([]);
       setSessions([]);
+      setProjects([]);
+      setJobsByProject({});
+      setDashboardOverview(null);
       setEvents([]);
       setSelectedPersonaId(null);
       setSelectedAgentId(null);
@@ -3057,8 +3270,8 @@ export default function App() {
       {/* Top Bar */}
       <header className="h-14 border-b border-slate-800/80 bg-slate-900/70 backdrop-blur px-3 sm:px-5 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2 sm:gap-3 min-w-0">
-          {/* Mobile Back Button (only shown in mobile detail view) */}
-          {isMobile && isMobileDetailView && (
+          {/* Mobile Back Button (only shown in mobile detail view on split-pane tabs) */}
+          {isMobile && isMobileDetailView && activeTab !== 'dashboard' && (
             <button
               type="button"
               onClick={handleMobileBack}
@@ -3109,6 +3322,33 @@ export default function App() {
             <div className="flex items-center gap-1 ml-4 bg-slate-950/80 border border-slate-800 rounded-xl p-1">
               <button
                 type="button"
+                data-testid="desktop-nav-dashboard"
+                onClick={() => {
+                  hasUserSwitchedTabRef.current = true;
+                  setActiveTab('dashboard');
+                  setIsMobileDetailView(false);
+                }}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                  activeTab === 'dashboard'
+                    ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                }`}
+              >
+                <LayoutDashboard className="w-3.5 h-3.5" />
+                <span>Dashboard</span>
+                {dashboardAttentionCount > 0 && (
+                  <span
+                    data-testid="header-dashboard-attention-badge"
+                    className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/35"
+                  >
+                    {dashboardAttentionCount}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                data-testid="desktop-nav-projects"
                 onClick={() => {
                   hasUserSwitchedTabRef.current = true;
                   setActiveTab('projects');
@@ -3218,8 +3458,105 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Split View */}
+      {/* Main View */}
       <div className="flex-1 flex overflow-hidden">
+        {activeTab === 'dashboard' ? (
+          <ErrorBoundary fallbackTitle="Dashboard Error">
+            <MainDashboard
+              statusData={statusData}
+              apiError={apiError}
+              signalRConnected={signalRConnected}
+              isLoading={isLoading}
+              overview={dashboardOverview}
+              projects={projects}
+              jobsByProject={jobsByProject}
+              personas={personas}
+              agents={agents}
+              sessions={sessions}
+              agentUsages={agentUsages}
+              onRefresh={fetchAllData}
+              onNavigateTab={(tab) => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab(tab);
+                setIsMobileDetailView(false);
+              }}
+              onSelectJob={(projectId, jobId) => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab('projects');
+                handleSelectJob(projectId, jobId);
+              }}
+              onSelectProject={(projectId) => {
+                hasUserSwitchedTabRef.current = true;
+                setSelectedProjectId(projectId);
+                setActiveTab('projects');
+                setIsMobileDetailView(false);
+              }}
+              onSelectSession={(session) => {
+                hasUserSwitchedTabRef.current = true;
+                if (session.personaId) {
+                  setSelectedPersonaId(session.personaId);
+                  setSelectedAgentId(session.driverId || session.creatorAgentId || null);
+                  setActiveTab('personas');
+                } else {
+                  if (session.driverId || session.creatorAgentId) {
+                    setSelectedAgentId(session.driverId || session.creatorAgentId || null);
+                  }
+                  setActiveTab('drivers');
+                }
+                setSelectedSessionId(session.id);
+                setIsCreatingSession(false);
+                setIsMobileDetailView(true);
+              }}
+              onSelectPersona={(persona) => {
+                hasUserSwitchedTabRef.current = true;
+                setSelectedPersonaId(persona.id);
+                setSelectedAgentId(persona.driverId);
+                const pSessions = personaSessionsMap.get(persona.id) || [];
+                if (pSessions.length > 0 && !pSessions.some((s) => s.id === selectedSessionId)) {
+                  setSelectedSessionId(pSessions[0].id);
+                }
+                setIsCreatingSession(false);
+                setActiveTab('personas');
+                setIsMobileDetailView(false);
+              }}
+              onStartPersonaSession={(persona) => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab('personas');
+                startNewSessionWithPersona(persona);
+              }}
+              onSelectDriver={(agent) => {
+                hasUserSwitchedTabRef.current = true;
+                setSelectedAgentId(agent.id);
+                const aSessions = agentSessionsMap.get(agent.id) || [];
+                if (aSessions.length > 0 && !aSessions.some((s) => s.id === selectedSessionId)) {
+                  setSelectedSessionId(aSessions[0].id);
+                }
+                setIsCreatingSession(false);
+                setActiveTab('drivers');
+                setIsMobileDetailView(false);
+              }}
+              onOpenDriverUsage={(agent) => {
+                void handleOpenUsageModal(agent);
+              }}
+              onOpenNewProjectModal={() => {
+                setEditingProject(null);
+                setShowProjectModal(true);
+              }}
+              onOpenNewJobModal={(proj) => {
+                setJobModalProject(proj);
+                setShowJobModal(true);
+              }}
+              onOpenCreatePersonaModal={() => openCreatePersonaModal()}
+              onOpenRegisterDriverModal={() => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab('drivers');
+                setIsMobileDetailView(false);
+                setShowRegisterModal(true);
+              }}
+            />
+          </ErrorBoundary>
+        ) : (
+          <>
         {/* Left Sidebar: Projects, Personas or Drivers & Their Sessions */}
         <aside
           className={`${
@@ -5967,6 +6304,8 @@ export default function App() {
             </div>
           )}
         </main>
+          </>
+        )}
       </div>
 
       {/* Agent Quota & Usage Details Modal */}
@@ -6786,12 +7125,38 @@ export default function App() {
         />
       )}
 
-      {/* Mobile Bottom Navigation Bar: fixed to bottom on mobile when at list/master level */}
-      {isMobile && !isMobileDetailView && (
+      {/* Mobile Bottom Navigation Bar: fixed to bottom on mobile when at list/master level or Dashboard */}
+      {isMobile && (!isMobileDetailView || activeTab === 'dashboard') && (
         <nav
-          className="fixed bottom-0 inset-x-0 border-t border-slate-800/80 bg-slate-900/95 backdrop-blur-md px-4 py-2 flex items-center justify-around shrink-0 z-40 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-lg"
+          className="fixed bottom-0 inset-x-0 border-t border-slate-800/80 bg-slate-900/95 backdrop-blur-md px-2 py-2 flex items-center justify-around shrink-0 z-40 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-lg"
           data-testid="mobile-bottom-nav"
         >
+          <button
+            type="button"
+            data-testid="mobile-nav-dashboard"
+            onClick={() => {
+              hasUserSwitchedTabRef.current = true;
+              setActiveTab('dashboard');
+              setIsMobileDetailView(false);
+            }}
+            className={`relative flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
+              activeTab === 'dashboard'
+                ? 'text-sky-400 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <LayoutDashboard className="w-5 h-5" />
+            <span className="text-[10px]">Dashboard</span>
+            {dashboardAttentionCount > 0 && (
+              <span
+                data-testid="mobile-dashboard-attention-badge"
+                className="absolute -top-0.5 right-1 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-slate-950 text-[9px] font-bold font-mono flex items-center justify-center"
+              >
+                {dashboardAttentionCount > 99 ? '99+' : dashboardAttentionCount}
+              </span>
+            )}
+          </button>
+
           <button
             type="button"
             onClick={() => {
@@ -6799,7 +7164,7 @@ export default function App() {
               setActiveTab('projects');
               setIsMobileDetailView(false);
             }}
-            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+            className={`flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
               activeTab === 'projects'
                 ? 'text-sky-400 font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
@@ -6816,7 +7181,7 @@ export default function App() {
               setActiveTab('personas');
               setIsMobileDetailView(false);
             }}
-            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+            className={`flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
               activeTab === 'personas'
                 ? 'text-sky-400 font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
@@ -6833,7 +7198,7 @@ export default function App() {
               setActiveTab('drivers');
               setIsMobileDetailView(false);
             }}
-            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+            className={`flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
               activeTab === 'drivers'
                 ? 'text-sky-400 font-semibold'
                 : 'text-slate-400 hover:text-slate-200'

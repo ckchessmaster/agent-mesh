@@ -1,15 +1,26 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, waitFor, fireEvent, act, within } from '@testing-library/react';
 import App from '../App';
 import { api } from '../services/api';
 import type {
   Agent,
   AgentSession,
+  DashboardOverviewResponse,
   DriverCapabilities,
   Persona,
+  Project,
+  ProjectJob,
   SessionMessage,
   SystemCapabilitiesResponse,
   SystemStatusResponse
+} from '../types';
+import {
+  DashboardAttentionKind,
+  DashboardAttentionSeverity,
+  JobLifecycleStatus,
+  ProjectJobPriority,
+  ProjectJobStatus,
+  WorkspaceType
 } from '../types';
 
 vi.mock('../services/api', () => ({
@@ -105,8 +116,32 @@ vi.mock('../services/api', () => ({
     submitQuestionAnswer: vi.fn().mockResolvedValue({ toolResult: {}, prompt: {}, session: {} }),
     getSessionArtifacts: vi.fn().mockResolvedValue([]),
     getSessionArtifact: vi.fn().mockResolvedValue({ id: 'art-1', name: 'plan.md', content: '# Plan' }),
-    syncSessionArtifact: vi.fn()
+    syncSessionArtifact: vi.fn(),
+    getDashboardOverview: vi.fn().mockResolvedValue(null),
+    getProjects: vi.fn().mockResolvedValue([]),
+    getProjectJobs: vi.fn().mockResolvedValue([]),
+    getJobTasks: vi.fn().mockResolvedValue([]),
+    getJobArtifacts: vi.fn().mockResolvedValue([]),
+    getTimelineCards: vi.fn().mockResolvedValue([])
   }
+}));
+
+const signalRHandlers: Record<string, (...args: any[]) => void> = {};
+const mockSignalRConnection = {
+  on: vi.fn((event: string, cb: (...args: any[]) => void) => {
+    signalRHandlers[event] = cb;
+  }),
+  off: vi.fn((event: string) => {
+    delete signalRHandlers[event];
+  }),
+  invoke: vi.fn().mockResolvedValue(undefined)
+};
+
+vi.mock('../hooks/useSignalR', () => ({
+  useSignalR: () => ({
+    connection: mockSignalRConnection,
+    connected: true
+  })
 }));
 
 vi.mock('../auth/AuthProvider', () => ({
@@ -180,12 +215,17 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    localStorage.setItem('agentmesh_active_tab', 'drivers');
+    Object.keys(signalRHandlers).forEach((k) => delete signalRHandlers[k]);
     vi.mocked(api.getStatus).mockResolvedValue(mockHealthyStatus);
     vi.mocked(api.getCapabilities).mockResolvedValue(mockCaps);
     vi.mocked(api.getAgents).mockResolvedValue([]);
     vi.mocked(api.getPersonas).mockResolvedValue([]);
     vi.mocked(api.getSessions).mockResolvedValue([]);
     vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+    vi.mocked(api.getProjects).mockResolvedValue([]);
+    vi.mocked(api.getDashboardOverview).mockResolvedValue(null as any);
   });
 
   it('renders clean empty state when no agents are connected', async () => {
@@ -841,6 +881,7 @@ describe('App - Agent-Centric Session Cockpit MVP', () => {
       updatedAt: new Date().toISOString()
     } as any);
 
+    localStorage.setItem('agentmesh_active_tab', 'personas');
     render(<App />);
 
     await waitFor(() => {
@@ -1621,6 +1662,7 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
       updatedAt: new Date().toISOString()
     });
 
+    localStorage.setItem('agentmesh_active_tab', 'personas');
     render(<App />);
 
     // 1. Verify Personas & Sessions tab renders Persona card and its session
@@ -1808,6 +1850,7 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     vi.mocked(api.getSessionMessages).mockResolvedValue([]);
     vi.mocked(api.deleteSession).mockResolvedValue({ status: 'deleted', id: 'session-del-1' });
 
+    localStorage.setItem('agentmesh_active_tab', 'personas');
     render(<App />);
 
     await waitFor(() => {
@@ -2150,6 +2193,7 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
       defaultContextSize: '200k'
     });
 
+    localStorage.setItem('agentmesh_active_tab', 'personas');
     render(<App />);
 
     await waitFor(() => {
@@ -2219,6 +2263,7 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
       maxConcurrentJobs: 3
     });
 
+    localStorage.setItem('agentmesh_active_tab', 'personas');
     render(<App />);
 
     await waitFor(() => {
@@ -2333,4 +2378,298 @@ Let me know what sounds good, or I can suggest a few quick ideas right now!
     expect(screen.queryByLabelText(/^API Key$/i)).not.toBeInTheDocument();
   });
 });
+
+describe('App - Default Dashboard Landing, Navigation & Live SignalR Updates', () => {
+  const originalInnerWidth = window.innerWidth;
+  const nowIso = '2026-11-18T17:00:00.000Z';
+
+  const mockHealthyStatus: SystemStatusResponse = {
+    status: 'Healthy',
+    timestamp: nowIso,
+    environment: 'Development',
+    services: {
+      api: { status: 'Healthy', latencyMs: 2, description: 'ASP.NET Core 10 Web API' },
+      postgres: { status: 'Healthy', latencyMs: 3, description: 'PostgreSQL 17' }
+    }
+  };
+
+  const mockDriver: Agent = {
+    id: 'copilot-driver',
+    name: 'GitHub Copilot CLI',
+    status: 'online',
+    runtimeType: 'CliCopilot',
+    trustTier: 3,
+    createdAt: nowIso
+  };
+
+  const mockPersona: Persona = {
+    id: 'bee',
+    name: 'Bee',
+    role: 'Principal Software Engineer',
+    personaPrompt: 'Ship carefully verified features.',
+    driverId: 'copilot-driver',
+    driverName: 'GitHub Copilot CLI',
+    driverStatus: 'online',
+    trustTier: 3,
+    maxConcurrentJobs: 2,
+    createdAt: nowIso
+  };
+
+  const mockProject: Project = {
+    id: 'proj-mesh',
+    name: 'Agent Mesh',
+    description: 'Distributed agent control plane',
+    workspaceType: WorkspaceType.Git,
+    gitBaseBranch: 'main',
+    projectInstructions: '',
+    jobCount: 1,
+    activeJobCount: 1,
+    assignedPersonas: [mockPersona],
+    createdAt: nowIso,
+    updatedAt: nowIso
+  };
+
+  const mockJob: ProjectJob = {
+    id: 'job-dash-1',
+    projectId: 'proj-mesh',
+    projectName: 'Agent Mesh',
+    title: 'Ship Main Dashboard',
+    description: 'Add default landing dashboard',
+    gitBranchName: 'mesh/job-dash-1',
+    priority: ProjectJobPriority.High,
+    status: ProjectJobStatus.Active,
+    lifecycleStatus: JobLifecycleStatus.AwaitingApproval,
+    progressHeartbeat: 'Plan ready for operator approval',
+    assignedAgentId: 'bee',
+    tasks: [],
+    messageCount: 1,
+    createdAt: nowIso,
+    updatedAt: nowIso
+  };
+
+  const mockOverview: DashboardOverviewResponse = {
+    generatedAt: nowIso,
+    jobStats: {
+      totalProjects: 1,
+      activeProjects: 1,
+      totalJobs: 1,
+      activeJobs: 1,
+      pendingJobs: 0,
+      completedJobs: 0,
+      archivedJobs: 0,
+      attentionCount: 2,
+      activeSessions: 1,
+      thinkingSessions: 0,
+      waitingForInputSessions: 1
+    },
+    recentJobs: [mockJob],
+    attentionItems: [
+      {
+        id: 'card:plan-1',
+        kind: DashboardAttentionKind.PlanApproval,
+        severity: DashboardAttentionSeverity.Warning,
+        title: 'Approve Execution Plan',
+        summary: '5 tasks proposed for Ship Main Dashboard',
+        projectId: 'proj-mesh',
+        projectName: 'Agent Mesh',
+        jobId: 'job-dash-1',
+        jobTitle: 'Ship Main Dashboard',
+        personaId: 'bee',
+        personaName: 'Bee',
+        createdAt: nowIso,
+        updatedAt: nowIso
+      },
+      {
+        id: 'session:sess-wait-1',
+        kind: DashboardAttentionKind.SessionWaitingInput,
+        severity: DashboardAttentionSeverity.Critical,
+        title: 'Architecture Q&A',
+        summary: 'Session is waiting for human input',
+        sessionId: 'sess-wait-1',
+        personaId: 'bee',
+        personaName: 'Bee',
+        driverId: 'copilot-driver',
+        createdAt: nowIso,
+        updatedAt: nowIso
+      }
+    ]
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    Object.keys(signalRHandlers).forEach((k) => delete signalRHandlers[k]);
+    window.innerWidth = 1280;
+    window.dispatchEvent(new Event('resize'));
+
+    vi.mocked(api.getStatus).mockResolvedValue(mockHealthyStatus);
+    vi.mocked(api.getCapabilities).mockResolvedValue({ agentRuntimes: {}, drivers: [], schemaVersion: 2 });
+    vi.mocked(api.getAgents).mockResolvedValue([mockDriver]);
+    vi.mocked(api.getPersonas).mockResolvedValue([mockPersona]);
+    vi.mocked(api.getProjects).mockResolvedValue([mockProject]);
+    vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob]);
+    vi.mocked(api.getJobTasks).mockResolvedValue([]);
+    vi.mocked(api.getJobArtifacts).mockResolvedValue([]);
+    vi.mocked(api.getTimelineCards).mockResolvedValue([]);
+    vi.mocked(api.getSessions).mockResolvedValue([
+      {
+        id: 'sess-wait-1',
+        title: 'Architecture Q&A',
+        status: 'waiting_for_input',
+        personaId: 'bee',
+        personaName: 'Bee',
+        driverId: 'copilot-driver',
+        creatorAgentId: 'copilot-driver',
+        metadataJson: '{}',
+        createdAt: nowIso,
+        updatedAt: nowIso
+      }
+    ]);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+    vi.mocked(api.getDashboardOverview).mockResolvedValue(mockOverview);
+  });
+
+  afterEach(() => {
+    window.innerWidth = originalInnerWidth;
+    window.dispatchEvent(new Event('resize'));
+  });
+
+  it('lands on Dashboard by default with empty localStorage, renders desktop header attention badge, and drills down into jobs and sessions', async () => {
+    render(<App />);
+
+    // Lands on MainDashboard even when projects, personas, and drivers are all populated
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
+    expect(localStorage.getItem('agentmesh_active_tab')).toBe('dashboard');
+
+    // Desktop header shows Dashboard tab and attention badge = 2
+    const desktopDashboardTab = screen.getByTestId('desktop-nav-dashboard');
+    expect(desktopDashboardTab).toBeInTheDocument();
+    const headerBadge = await screen.findByTestId('header-dashboard-attention-badge');
+    expect(headerBadge).toHaveTextContent('2');
+
+    // Clicking a job row on Dashboard switches to Projects & Jobs tab and opens JobCockpit
+    fireEvent.click(screen.getByTestId('dashboard-job-job-dash-1'));
+    await waitFor(() => {
+      expect(localStorage.getItem('agentmesh_active_tab')).toBe('projects');
+      expect(screen.queryByTestId('main-dashboard')).not.toBeInTheDocument();
+    });
+
+    // Clicking Dashboard tab in desktop header returns to MainDashboard
+    fireEvent.click(screen.getByTestId('desktop-nav-dashboard'));
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
+
+    // Clicking a session attention item drills directly into Personas & Sessions for that session
+    fireEvent.click(screen.getByTestId('attention-item-session:sess-wait-1'));
+    await waitFor(() => {
+      expect(localStorage.getItem('agentmesh_active_tab')).toBe('personas');
+      expect(screen.getAllByText('Architecture Q&A').length).toBeGreaterThan(0);
+    });
+  });
+
+  it('renders 4-tab mobile bottom nav with Dashboard active by default, attention badge, and mobile detail drill-down', async () => {
+    window.innerWidth = 375;
+    window.dispatchEvent(new Event('resize'));
+
+    render(<App />);
+
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
+    const bottomNav = await screen.findByTestId('mobile-bottom-nav');
+    expect(within(bottomNav).getByTestId('mobile-nav-dashboard')).toBeInTheDocument();
+    expect(within(bottomNav).getByText('Projects')).toBeInTheDocument();
+    expect(within(bottomNav).getByText('Personas')).toBeInTheDocument();
+    expect(within(bottomNav).getByText('Drivers')).toBeInTheDocument();
+
+    const mobileBadge = await screen.findByTestId('mobile-dashboard-attention-badge');
+    expect(mobileBadge).toHaveTextContent('2');
+
+    // Drilling down into a job enters mobile detail view (hiding bottom nav and showing mobile back button)
+    fireEvent.click(screen.getByTestId('dashboard-job-job-dash-1'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('mobile-bottom-nav')).not.toBeInTheDocument();
+      expect(screen.getByTestId('mobile-back-button')).toBeInTheDocument();
+    });
+  });
+
+  it('updates Dashboard jobs, heartbeats, and attention badges live on SignalR events', async () => {
+    render(<App />);
+
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
+    expect(await screen.findByTestId('header-dashboard-attention-badge')).toHaveTextContent('2');
+    await waitFor(() => {
+      expect(mockSignalRConnection.invoke).toHaveBeenCalledWith('JoinJob', 'job-dash-1');
+    });
+
+    // 1. Live ProgressHeartbeatUpdated updates the visible job heartbeat immediately
+    await act(async () => {
+      signalRHandlers['ProgressHeartbeatUpdated']?.({
+        jobId: 'job-dash-1',
+        progressHeartbeat: 'Executing Task 4: Wiring live SignalR updates',
+        lifecycleStatus: JobLifecycleStatus.InProgress
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Executing Task 4: Wiring live SignalR updates')).toBeInTheDocument();
+    });
+
+    // 2. Live JobCreated & ReceiveTimelineCardUpdated re-fetch overview and update attention badge
+    const newJob: ProjectJob = {
+      id: 'job-dash-2',
+      projectId: 'proj-mesh',
+      projectName: 'Agent Mesh',
+      title: 'Harden OIDC Refresh',
+      description: 'Add token rotation check',
+      gitBranchName: 'mesh/job-dash-2',
+      priority: ProjectJobPriority.Normal,
+      status: ProjectJobStatus.Active,
+      lifecycleStatus: JobLifecycleStatus.Blocked,
+      progressHeartbeat: 'Blocked on Dex config secret',
+      assignedAgentId: 'bee',
+      tasks: [],
+      messageCount: 0,
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+
+    vi.mocked(api.getDashboardOverview).mockResolvedValue({
+      ...mockOverview,
+      jobStats: {
+        ...mockOverview.jobStats,
+        totalJobs: 2,
+        activeJobs: 2,
+        attentionCount: 3
+      },
+      recentJobs: [newJob, mockJob],
+      attentionItems: [
+        ...mockOverview.attentionItems,
+        {
+          id: 'job:job-dash-2',
+          kind: DashboardAttentionKind.JobBlocked,
+          severity: DashboardAttentionSeverity.Critical,
+          title: 'Harden OIDC Refresh',
+          summary: 'Blocked on Dex config secret',
+          projectId: 'proj-mesh',
+          projectName: 'Agent Mesh',
+          jobId: 'job-dash-2',
+          jobTitle: 'Harden OIDC Refresh',
+          personaId: 'bee',
+          personaName: 'Bee',
+          createdAt: nowIso,
+          updatedAt: nowIso
+        }
+      ]
+    });
+
+    await act(async () => {
+      signalRHandlers['JobCreated']?.(newJob);
+      signalRHandlers['ReceiveTimelineCardUpdated']?.({ id: 'card-99', jobId: 'job-dash-2' });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('dashboard-job-job-dash-2')).toBeInTheDocument();
+      expect(screen.getByTestId('header-dashboard-attention-badge')).toHaveTextContent('3');
+    });
+  });
+});
+
 
