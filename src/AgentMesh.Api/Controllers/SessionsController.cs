@@ -25,7 +25,8 @@ public class SessionsController(
     IHubContext<AgentMeshHub> hubContext,
     IStorageService? storageService = null,
     IWorkflowSignalRouter? workflows = null,
-    ILogger<SessionsController>? logger = null) : ControllerBase
+    ILogger<SessionsController>? logger = null,
+    ICredentialEncryptionService? encryptionService = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -417,6 +418,60 @@ public class SessionsController(
             }
         }
         return (pid, metaName, metaRole, metaPrompt);
+    }
+
+    private async Task BroadcastSessionPromptReceivedAsync(
+        AgentSession session,
+        SessionMessage message,
+        string targetAgentId,
+        string? workingDirectory,
+        string? model,
+        string? effort,
+        string? mode,
+        string? tier,
+        string? contextSize,
+        object? attachments)
+    {
+        var normalizedDriver = targetAgentId.Trim().ToLowerInvariant();
+        var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
+        var mcpServers = !string.IsNullOrWhiteSpace(personaId)
+            ? await PersonaMcpResolver.ResolveForPersonaAsync(db, personaId, encryptionService)
+            : null;
+        var conversationId = ExtractSessionConversationId(session.MetadataJson);
+
+        object BuildPayload(List<ResolvedMcpServerConfig>? servers) => new
+        {
+            sessionId = session.Id,
+            messageId = message.Id,
+            agentId = normalizedDriver,
+            driverId = normalizedDriver,
+            personaId,
+            personaName,
+            personaRole,
+            personaPrompt,
+            prompt = message.Content,
+            sender = message.SenderAgentId,
+            workingDirectory,
+            model,
+            effort,
+            mode,
+            tier,
+            contextSize,
+            attachments,
+            mcpServers = servers,
+            conversationId,
+            createdAt = message.CreatedAt
+        };
+
+        var targetedPayload = BuildPayload(mcpServers);
+        var broadcastPayload = BuildPayload(null);
+
+        await hubContext.Clients.Group($"agent-{normalizedDriver}").SendAsync("PromptReceived", targetedPayload);
+        if (!string.IsNullOrWhiteSpace(personaId))
+        {
+            await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", targetedPayload);
+        }
+        await hubContext.Clients.All.SendAsync("PromptReceived", broadcastPayload);
     }
 
     public static (string? workingDirectory, string? model, string? effort, string? mode, string? tier) ExtractSessionSettings(string? metadataJson)
@@ -1023,36 +1078,8 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{callerAgentId}";
-            var promptPayload = new
-            {
-                sessionId = session.Id,
-                messageId = initialMsg.Id,
-                agentId = callerAgentId,
-                driverId = callerAgentId,
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = initialMsg.Content,
-                sender = initialMsg.SenderAgentId,
-                workingDirectory = workDir,
-                model = model,
-                effort = effort,
-                mode = mode,
-                tier = tier,
-                contextSize = contextSize,
-                attachments = req.Attachments,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = initialMsg.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session, initialMsg, callerAgentId, workDir, model, effort, mode, tier, contextSize, req.Attachments);
         }
 
         return CreatedAtAction(nameof(GetSession), new { id = session.Id }, session);
@@ -1380,36 +1407,9 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
-            var promptPayload = new
-            {
-                sessionId = id,
-                messageId = message.Id,
-                agentId = message.TargetAgentId.Trim().ToLowerInvariant(),
-                driverId = message.TargetAgentId.Trim().ToLowerInvariant(),
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = message.Content,
-                sender = message.SenderAgentId,
-                workingDirectory = workDir,
-                model = model,
-                effort = effort,
-                mode = mode,
-                tier = tier,
-                contextSize = contextSize,
-                attachments = messageAttachments.Count > 0 ? messageAttachments : null,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = message.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session, message, message.TargetAgentId, workDir, model, effort, mode, tier, contextSize,
+                messageAttachments.Count > 0 ? messageAttachments : null);
         }
         else if (eventType == "response")
         {
@@ -1462,38 +1462,19 @@ public class SessionsController(
 
                     var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
                     var contextSize = ExtractSessionContextSize(session.MetadataJson);
-                    var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
                     if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
                     {
-                        var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                        var promptPayload = new
-                        {
-                            sessionId = id,
-                            messageId = nextMsg.Id,
-                            agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                            driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                            personaId = personaId,
-                            personaName = personaName,
-                            personaRole = personaRole,
-                            personaPrompt = personaPrompt,
-                            prompt = nextMsg.Content,
-                            sender = nextMsg.SenderAgentId,
-                            workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
-                            model = nextPrompt.Model ?? model,
-                            effort = nextPrompt.Effort ?? effort,
-                            mode = nextPrompt.Mode ?? mode,
-                            tier = nextPrompt.Tier ?? tier,
-                            contextSize = nextPrompt.ContextSize ?? contextSize,
-                            attachments = nextPrompt.Attachments,
-                            conversationId = ExtractSessionConversationId(session.MetadataJson),
-                            createdAt = nextMsg.CreatedAt
-                        };
-                        await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                        if (!string.IsNullOrWhiteSpace(personaId))
-                        {
-                            await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-                        }
-                        await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                        await BroadcastSessionPromptReceivedAsync(
+                            session,
+                            nextMsg,
+                            session.CreatorAgentId,
+                            nextPrompt.WorkingDirectory ?? workDir,
+                            nextPrompt.Model ?? model,
+                            nextPrompt.Effort ?? effort,
+                            nextPrompt.Mode ?? mode,
+                            nextPrompt.Tier ?? tier,
+                            nextPrompt.ContextSize ?? contextSize,
+                            nextPrompt.Attachments);
                     }
                 }
                 else
@@ -1504,7 +1485,7 @@ public class SessionsController(
 
                     if (!string.IsNullOrWhiteSpace(session.PersonaId))
                     {
-                        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+                        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId, encryptionService);
                     }
                 }
             }
@@ -1634,7 +1615,7 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(session.PersonaId))
         {
-            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId, encryptionService);
         }
 
         var auditDto = ToMessageDto(auditMsg);
@@ -1696,7 +1677,7 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(session.PersonaId))
         {
-            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId, encryptionService);
         }
 
         var auditDto = ToMessageDto(auditMsg);
@@ -1816,36 +1797,17 @@ public class SessionsController(
 
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
-                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-                var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                var promptPayload = new
-                {
-                    sessionId = id,
-                    messageId = msg.Id,
-                    agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    personaId = personaId,
-                    personaName = personaName,
-                    personaRole = personaRole,
-                    personaPrompt = personaPrompt,
-                    prompt = msg.Content,
-                    sender = msg.SenderAgentId,
-                    workingDirectory = req.WorkingDirectory ?? workDir,
-                    model = req.Model ?? model,
-                    effort = req.Effort ?? effort,
-                    mode = req.Mode ?? mode,
-                    tier = req.Tier ?? tier,
-                    contextSize = req.ContextSize ?? contextSize,
-                    attachments = req.Attachments,
-                    conversationId = ExtractSessionConversationId(session.MetadataJson),
-                    createdAt = msg.CreatedAt
-                };
-                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                if (!string.IsNullOrWhiteSpace(personaId))
-                {
-                    await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-                }
-                await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                await BroadcastSessionPromptReceivedAsync(
+                    session,
+                    msg,
+                    session.CreatorAgentId,
+                    req.WorkingDirectory ?? workDir,
+                    req.Model ?? model,
+                    req.Effort ?? effort,
+                    req.Mode ?? mode,
+                    req.Tier ?? tier,
+                    req.ContextSize ?? contextSize,
+                    req.Attachments);
             }
 
             return Ok(new { session, queue, dispatched = true });
@@ -1880,36 +1842,17 @@ public class SessionsController(
 
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
-                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-                var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                var promptPayload = new
-                {
-                    sessionId = id,
-                    messageId = msg.Id,
-                    agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    personaId = personaId,
-                    personaName = personaName,
-                    personaRole = personaRole,
-                    personaPrompt = personaPrompt,
-                    prompt = msg.Content,
-                    sender = msg.SenderAgentId,
-                    workingDirectory = req.WorkingDirectory ?? workDir,
-                    model = req.Model ?? model,
-                    effort = req.Effort ?? effort,
-                    mode = req.Mode ?? mode,
-                    tier = req.Tier ?? tier,
-                    contextSize = req.ContextSize ?? contextSize,
-                    attachments = req.Attachments,
-                    conversationId = ExtractSessionConversationId(session.MetadataJson),
-                    createdAt = msg.CreatedAt
-                };
-                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                if (!string.IsNullOrWhiteSpace(personaId))
-                {
-                    await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-                }
-                await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                await BroadcastSessionPromptReceivedAsync(
+                    session,
+                    msg,
+                    session.CreatorAgentId,
+                    req.WorkingDirectory ?? workDir,
+                    req.Model ?? model,
+                    req.Effort ?? effort,
+                    req.Mode ?? mode,
+                    req.Tier ?? tier,
+                    req.ContextSize ?? contextSize,
+                    req.Attachments);
             }
 
             return Ok(new { session, queue, dispatched = true });
@@ -2019,36 +1962,17 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            var promptPayload = new
-            {
-                sessionId = id,
-                messageId = msg.Id,
-                agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = msg.Content,
-                sender = msg.SenderAgentId,
-                workingDirectory = item.WorkingDirectory ?? workDir,
-                model = item.Model ?? model,
-                effort = item.Effort ?? effort,
-                mode = item.Mode ?? mode,
-                tier = item.Tier ?? tier,
-                contextSize = item.ContextSize ?? contextSize,
-                attachments = item.Attachments,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = msg.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session,
+                msg,
+                session.CreatorAgentId,
+                item.WorkingDirectory ?? workDir,
+                item.Model ?? model,
+                item.Effort ?? effort,
+                item.Mode ?? mode,
+                item.Tier ?? tier,
+                item.ContextSize ?? contextSize,
+                item.Attachments);
         }
 
         return Ok(new { session, queue, dispatched = true });
@@ -2250,35 +2174,17 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            var promptPayload = new
-            {
-                sessionId = id,
-                messageId = promptMsg.Id,
-                agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = promptMsg.Content,
-                sender = promptMsg.SenderAgentId,
-                workingDirectory = workDir,
-                model = model,
-                effort = effort,
-                mode = mode,
-                tier = tier,
-                contextSize = contextSize,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = promptMsg.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session,
+                promptMsg,
+                session.CreatorAgentId,
+                workDir,
+                model,
+                effort,
+                mode,
+                tier,
+                contextSize,
+                attachments: null);
         }
 
         return Ok(new { toolResult = toolResultDto, prompt = promptDto, session });

@@ -172,6 +172,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var workspaceGitRemote = GetJsonPropString(elem, "workspaceGitRemote");
                 var conversationId = GetJsonPropString(elem, "conversationId") ?? GetJsonPropString(elem, "conversation_id");
                 var attachments = ExtractJsonAttachments(elem);
+                var mcpServers = ExtractJsonMcpServers(elem);
 
                 var createdStr = GetJsonPropString(elem, "createdAt");
                 var createdAt = createdStr != null && DateTimeOffset.TryParse(createdStr, out var cdt) ? cdt : DateTimeOffset.UtcNow;
@@ -207,6 +208,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                     WorkspaceType = workspaceType,
                     WorkspaceGitRemote = workspaceGitRemote ?? gitUrl,
                     Attachments = attachments,
+                    McpServers = mcpServers,
                     ConversationId = conversationId,
                     // v1.2.15 lineage: honour the server's timestamp instead of stamping "now" at
                     // the runner, which reorders replayed/queued prompts against the ledger.
@@ -612,6 +614,27 @@ public class AgentRunnerInstance : IAsyncDisposable
                 await StagePromptAttachmentsAsync(ev, effectiveWorkDir, _meshClient, (msg) => _onLog(_preset.Id, msg), turnToken);
             }
 
+            if (ev.McpServers == null)
+            {
+                var effectivePersonaId = !string.IsNullOrWhiteSpace(ev.PersonaId)
+                    ? ev.PersonaId
+                    : _preset.PersonaId;
+                if (!string.IsNullOrWhiteSpace(effectivePersonaId))
+                {
+                    ev.McpServers = await _meshClient.GetResolvedPersonaMcpServersAsync(
+                        effectivePersonaId,
+                        _agentToken,
+                        _preset.Id,
+                        turnToken);
+                }
+            }
+
+            if (ev.McpServers is { Count: > 0 })
+            {
+                var serverIds = string.Join(", ", ev.McpServers.Select(m => m.Id));
+                _onLog(_preset.Id, $"Resolved {ev.McpServers.Count} MCP server(s) for turn [{ev.SessionId.ToString()[..8]}]: {serverIds}");
+            }
+
             _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender} (model: {ev.Model ?? "default"}, effort: {ev.Effort ?? "default"}): {ev.Prompt} (cwd: {effectiveWorkDir})");
 
             if (!string.IsNullOrWhiteSpace(ev.GitBranch) && !workspace.UsedFallback)
@@ -839,16 +862,23 @@ public class AgentRunnerInstance : IAsyncDisposable
         _cts.Dispose();
     }
 
-    public static List<AttachmentItem>? ExtractJsonAttachments(JsonElement elem)
+    public static List<AttachmentItem>? ExtractJsonAttachments(JsonElement elem) =>
+        ExtractJsonListProperty<AttachmentItem>(elem, "attachments");
+
+    public static List<ResolvedMcpServerConfig>? ExtractJsonMcpServers(JsonElement elem) =>
+        ExtractJsonListProperty<ResolvedMcpServerConfig>(elem, "mcpServers");
+
+    private static List<T>? ExtractJsonListProperty<T>(JsonElement elem, string propertyName)
     {
+        if (elem.ValueKind != JsonValueKind.Object) return null;
         foreach (var prop in elem.EnumerateObject())
         {
-            if (string.Equals(prop.Name, "attachments", StringComparison.OrdinalIgnoreCase) &&
+            if (string.Equals(prop.Name, propertyName, StringComparison.OrdinalIgnoreCase) &&
                 prop.Value.ValueKind == JsonValueKind.Array)
             {
                 try
                 {
-                    return JsonSerializer.Deserialize<List<AttachmentItem>>(prop.Value.GetRawText(), new JsonSerializerOptions
+                    return JsonSerializer.Deserialize<List<T>>(prop.Value.GetRawText(), new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true
                     });

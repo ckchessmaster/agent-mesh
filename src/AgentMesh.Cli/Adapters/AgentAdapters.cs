@@ -343,6 +343,31 @@ public static class AgentAdapterFactory
     private static string? FirstNonBlank(params string?[] values) =>
         values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim();
 
+    internal static async Task EmitSubprocessMcpEventsAsync(
+        string presetId,
+        string driverName,
+        SubprocessMcpProvisionResult provisioning,
+        Func<TrajectoryEventPayload, Task> onEvent)
+    {
+        foreach (var warning in provisioning.Warnings)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[@{presetId}] Warning: {warning}"
+            });
+        }
+
+        if (provisioning.ProvisionedServerCount > 0)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[@{presetId}] Provisioned {provisioning.ProvisionedServerCount} MCP server(s) for {driverName}."
+            });
+        }
+    }
+
     /// <summary>
     /// Runs a shell command and returns the hardened result: clamped timeout, process-group teardown on
     /// kill, and non-destructive log spillover.
@@ -797,6 +822,12 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 {
     private static readonly ConcurrentDictionary<Guid, string> SessionConversations = new();
     private static readonly object MappingLock = new();
+    private static readonly AsyncLocal<string?> HomeDirectoryOverride = new();
+    internal static string? HomeDirectoryForTest
+    {
+        get => HomeDirectoryOverride.Value;
+        set => HomeDirectoryOverride.Value = value;
+    }
 
     public static string? GetSessionConversationId(Guid sessionId)
     {
@@ -1384,6 +1415,12 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "antigravity-cli", "brain", activeConvId, ".system_generated", "logs", "transcript.jsonl")
             : null;
         var lastTranscriptStep = transcriptFile != null ? GetMaxTranscriptStep(transcriptFile) : -1;
+
+        using var mcpProvisioning = SubprocessMcpProvisioner.ProvisionForAgy(
+            promptEvent.McpServers,
+            promptEvent.Mode,
+            HomeDirectoryForTest);
+        await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "agy", mcpProvisioning, onEvent);
 
         using var proc = new Process { StartInfo = psi };
         using var agyReg = ActiveAgyProcessRegistry.Register(promptEvent.SessionId, proc);
@@ -1992,27 +2029,21 @@ public class ClaudeAdapter : IAgentAdapter
                 promptEvent.PersonaPrompt,
                 promptEvent.SessionId,
                 promptEvent.Attachments);
-            var escapedPrompt = promptEnvelope.Replace("\"", "\\\"");
-            var autocompactArg = !string.IsNullOrWhiteSpace(promptEvent.ContextSize)
-                ? $" --autocompact \"{promptEvent.ContextSize.Trim()}\""
-                : "";
-            var isPastDiscovery = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true);
 
-            var isDiscovery = !isPastDiscovery && (
-                (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
-            var maxSteps = OpenAiAdapter.ResolveMaxSteps(preset, isDiscovery);
-            var maxStepsArg = $" --max-steps {maxSteps}";
-            // Claude is launched as a command line, not a ProcessStartInfo, so the turn context travels as
-            // an env prefix — otherwise `claude -p` has no route to the control plane either.
-            var turnContext = AgentAdapterFactory.BuildMeshTurnContextPrefix(promptEvent, preset.Id);
-            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"{turnContext} \"{claudePath}\"{autocompactArg}{maxStepsArg} -p \"{escapedPrompt}\"", cwd, ct);
+            using var mcpProvisioning = SubprocessMcpProvisioner.ProvisionForClaude(
+                promptEvent.McpServers,
+                promptEvent.Mode);
+            await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "claude", mcpProvisioning, onEvent);
+
+            var psi = BuildClaudeProcessStartInfo(
+                claudePath,
+                cwd,
+                preset,
+                promptEvent,
+                promptEnvelope,
+                mcpProvisioning.ExtraArguments);
+
+            var (exitCode, stdOut, stdErr) = await RunClaudeProcessAsync(psi, preset, onEvent, ct);
             ct.ThrowIfCancellationRequested();
             var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut : stdErr;
 
@@ -2077,6 +2108,107 @@ public class ClaudeAdapter : IAgentAdapter
 
         var fallback = new AgyAdapter();
         await fallback.ExecutePromptAsync(preset, promptEvent, onEvent, ct);
+    }
+
+    internal static ProcessStartInfo BuildClaudeProcessStartInfo(
+        string claudePath,
+        string cwd,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        string promptEnvelope,
+        IReadOnlyList<string>? extraMcpArguments = null)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = claudePath,
+            WorkingDirectory = cwd,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, preset.Id);
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.ContextSize))
+        {
+            psi.ArgumentList.Add("--autocompact");
+            psi.ArgumentList.Add(promptEvent.ContextSize.Trim());
+        }
+
+        var isPastDiscovery = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true);
+
+        var isDiscovery = !isPastDiscovery && (
+            (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
+
+        var maxSteps = OpenAiAdapter.ResolveMaxSteps(preset, isDiscovery);
+        psi.ArgumentList.Add("--max-steps");
+        psi.ArgumentList.Add(maxSteps.ToString());
+
+        if (extraMcpArguments != null)
+        {
+            foreach (var arg in extraMcpArguments)
+            {
+                psi.ArgumentList.Add(arg);
+            }
+        }
+
+        psi.ArgumentList.Add("-p");
+        psi.ArgumentList.Add(promptEnvelope);
+
+        return psi;
+    }
+
+    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunClaudeProcessAsync(
+        ProcessStartInfo psi,
+        AgentPresetConfig preset,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        using var proc = new Process { StartInfo = psi };
+        using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
+        proc.Start();
+        proc.StandardInput.Close();
+
+        var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
+        var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
+
+        var idleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+            Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
+
+        try
+        {
+            var exitTask = proc.WaitForExitAsync(ct);
+            await Task.WhenAny(exitTask, Task.Delay(idleLimit, ct));
+            if (!exitTask.IsCompleted)
+            {
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "error",
+                    Content = $"[Claude Code @{preset.Id}] No exit after {(int)idleLimit.TotalMinutes} minutes; terminating the driver so this turn stops claiming to be running."
+                });
+                AgentAdapterFactory.KillProcessTree(proc);
+                await Task.WhenAny(Task.WhenAll(stdOutTask, stdErrTask), Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None));
+                return (-1, string.Empty, "Timed out waiting for Claude CLI.");
+            }
+
+            await exitTask;
+            var stdOut = await stdOutTask;
+            var stdErr = await stdErrTask;
+            return (proc.ExitCode, stdOut, stdErr);
+        }
+        catch (OperationCanceledException)
+        {
+            AgentAdapterFactory.KillProcessTree(proc);
+            throw;
+        }
     }
 }
 
@@ -2160,6 +2292,11 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             promptEvent.SessionId,
             promptEvent.Attachments);
 
+        using var mcpProvisioning = SubprocessMcpProvisioner.ProvisionForCopilot(
+            promptEvent.McpServers,
+            promptEvent.Mode);
+        await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "copilot", mcpProvisioning, onEvent);
+
         var (exitCode, stdout, stderr, runSucceeded) = await RunCopilotSubprocessAsync(
             executablePath,
             isViaGh,
@@ -2169,7 +2306,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             promptEnvelope,
             useJsonFormat: true,
             onEvent,
-            ct);
+            ct,
+            mcpProvisioning.ExtraArguments);
 
         if (!runSucceeded && (stderr.Contains("unexpected argument '--output-format'") || stderr.Contains("unknown option '--output-format'")))
         {
@@ -2182,7 +2320,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 promptEnvelope,
                 useJsonFormat: false,
                 onEvent,
-                ct);
+                ct,
+                mcpProvisioning.ExtraArguments);
         }
     }
 
@@ -2193,7 +2332,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         PromptReceivedEvent promptEvent,
         string promptEnvelope,
         bool useJsonFormat,
-        string? driverId = null)
+        string? driverId = null,
+        IReadOnlyList<string>? extraMcpArguments = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -2261,6 +2401,14 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             psi.ArgumentList.Add("json");
             psi.ArgumentList.Add("--stream");
             psi.ArgumentList.Add("on");
+        }
+
+        if (extraMcpArguments != null)
+        {
+            foreach (var arg in extraMcpArguments)
+            {
+                psi.ArgumentList.Add(arg);
+            }
         }
 
         IsolateCopilotEnvironment(psi.Environment, driverId: driverId ?? promptEvent.DriverId);
@@ -2458,9 +2606,27 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string promptEnvelope,
         bool useJsonFormat,
         Func<TrajectoryEventPayload, Task> onEvent,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<string>? extraMcpArguments = null)
     {
-        var psi = BuildCopilotProcessStartInfo(executablePath, isViaGh, cwd, promptEvent, promptEnvelope, useJsonFormat, preset.Id);
+        using var localProvisioning = extraMcpArguments == null
+            ? SubprocessMcpProvisioner.ProvisionForCopilot(promptEvent.McpServers, promptEvent.Mode)
+            : null;
+        if (localProvisioning != null)
+        {
+            await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "copilot", localProvisioning, onEvent);
+        }
+
+        var effectiveMcpArgs = extraMcpArguments ?? localProvisioning?.ExtraArguments;
+        var psi = BuildCopilotProcessStartInfo(
+            executablePath,
+            isViaGh,
+            cwd,
+            promptEvent,
+            promptEnvelope,
+            useJsonFormat,
+            preset.Id,
+            effectiveMcpArgs);
         SelfHealContainerCopilotConfig(psi.Environment);
         // Re-evaluate COPILOT_GITHUB_TOKEN / COPILOT_HOME after self-heal so env matches healed config.json
         IsolateCopilotEnvironment(psi.Environment, driverId: preset.Id ?? promptEvent.DriverId);

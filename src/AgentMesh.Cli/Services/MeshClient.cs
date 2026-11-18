@@ -111,6 +111,46 @@ public class MeshClient
         }
     }
 
+    public virtual async Task<List<ResolvedMcpServerConfig>?> GetResolvedPersonaMcpServersAsync(
+        string personaId,
+        string? agentToken = null,
+        string? agentId = null,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(personaId))
+        {
+            return null;
+        }
+
+        try
+        {
+            var token = !string.IsNullOrWhiteSpace(agentToken) ? agentToken : _config.MasterToken;
+            var normalizedId = personaId.Trim().ToLowerInvariant();
+            using var req = CreateRequest(
+                HttpMethod.Get,
+                $"api/personas/{Uri.EscapeDataString(normalizedId)}/mcp-servers/resolved",
+                token,
+                agentId);
+            using var res = await _http.SendAsync(req, ct);
+            if (!res.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            return await res.Content.ReadFromJsonAsync<List<ResolvedMcpServerConfig>>(
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true },
+                cancellationToken: ct) ?? new List<ResolvedMcpServerConfig>();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public async Task<RemoteProjectDto?> GetProjectAsync(string projectId, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(projectId))
@@ -466,6 +506,7 @@ public class MeshClient
     {
         var pending = new List<PromptReceivedEvent>();
         var projectCache = new Dictionary<string, RemoteProjectDto?>(StringComparer.OrdinalIgnoreCase);
+        var mcpCache = new Dictionary<string, List<ResolvedMcpServerConfig>?>(StringComparer.OrdinalIgnoreCase);
 
         try
         {
@@ -626,6 +667,20 @@ public class MeshClient
                         catch { }
                     }
 
+                    List<ResolvedMcpServerConfig>? mcpServers = null;
+                    if (!string.IsNullOrWhiteSpace(personaId))
+                    {
+                        if (!mcpCache.TryGetValue(personaId, out mcpServers))
+                        {
+                            mcpServers = await GetResolvedPersonaMcpServersAsync(
+                                personaId,
+                                token,
+                                headerAgentId ?? driverId,
+                                ct);
+                            mcpCache[personaId] = mcpServers;
+                        }
+                    }
+
                     pending.Add(new PromptReceivedEvent
                     {
                         SessionId = sessionId,
@@ -657,6 +712,7 @@ public class MeshClient
                         WorkspaceType = workspaceType,
                         WorkspaceGitRemote = workspaceGitRemote,
                         Attachments = attachments,
+                        McpServers = mcpServers,
                         CreatedAt = createdAt
                     });
                 }

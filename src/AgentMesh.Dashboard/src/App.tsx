@@ -40,7 +40,9 @@ import {
   Maximize2,
   Box,
   GitBranch,
-  Copy
+  Copy,
+  Plug,
+  Server
 } from 'lucide-react';
 import { api } from './services/api';
 import { useSignalR } from './hooks/useSignalR';
@@ -77,6 +79,7 @@ import type {
   SessionMessage,
   SessionArtifact,
   JobArtifact,
+  McpServer,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from './types';
@@ -95,6 +98,8 @@ import { getOptionLabel, getOptionDescription } from './components/QuestionCard'
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { DriverConfigModal } from './components/DriverConfigModal';
 import { PersonaEnvironmentModal } from './components/PersonaEnvironmentModal';
+import { McpCatalogModal } from './components/McpCatalogModal';
+import { PersonaMcpModal } from './components/PersonaMcpModal';
 import { SessionListSection } from './components/SessionListSection';
 import { isJobTurnSession, sortSessionsByRecency } from './utils/sessionDisplay';
 
@@ -409,6 +414,10 @@ export default function App() {
   const [personaGitAuthorEmail, setPersonaGitAuthorEmail] = useState('');
   const [clearPersonaGitHubToken, setClearPersonaGitHubToken] = useState(false);
   const [inspectingPersonaEnv, setInspectingPersonaEnv] = useState<Persona | null>(null);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [showMcpCatalogModal, setShowMcpCatalogModal] = useState(false);
+  const [managingPersonaMcp, setManagingPersonaMcp] = useState<Persona | null>(null);
+  const [mcpCatalogRefreshTick, setMcpCatalogRefreshTick] = useState(0);
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
 
@@ -755,17 +764,19 @@ export default function App() {
         });
       }
 
-      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes] = await Promise.all([
+      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes, mcpServersRes] = await Promise.all([
         api.getStatus(),
         api.getAgents(),
         api.getPersonas ? api.getPersonas().catch(() => []) : Promise.resolve([]),
         api.getSessions('all'),
         api.getCapabilities().catch(() => null),
-        api.getProjects ? api.getProjects().catch(() => []) : Promise.resolve([])
+        api.getProjects ? api.getProjects().catch(() => []) : Promise.resolve([]),
+        api.getMcpServers ? api.getMcpServers().catch(() => []) : Promise.resolve([])
       ]);
       setStatusData(statusRes);
       setAgents(agentsRes);
       setPersonas(personasRes);
+      setMcpServers(mcpServersRes);
       setSessions((prev) => {
         if (!sessionsRes || sessionsRes.length === 0) return prev;
         const fetchedMap = new Map(sessionsRes.map((s) => [s.id, s]));
@@ -1727,6 +1738,16 @@ export default function App() {
       });
     };
 
+    const handleMcpUpdated = () => {
+      setMcpCatalogRefreshTick((t) => t + 1);
+      if (api.getMcpServers) {
+        void api.getMcpServers().then(setMcpServers).catch(() => {});
+      }
+      if (api.getPersonas) {
+        void api.getPersonas().then(setPersonas).catch(() => {});
+      }
+    };
+
     connection.on('ReceiveMessage', handleReceiveMessage);
     connection.on('CommandOutput', handleCommandOutput);
     connection.on('SessionCreated', handleSessionCreated);
@@ -1743,6 +1764,12 @@ export default function App() {
     connection.on('PersonaCreated', handleSessionUpdated);
     connection.on('PersonaUpdated', handleSessionUpdated);
     connection.on('PersonaDeleted', handleSessionUpdated);
+    connection.on('McpServerCreated', handleMcpUpdated);
+    connection.on('McpServerUpdated', handleMcpUpdated);
+    connection.on('McpServerDeleted', handleMcpUpdated);
+    connection.on('PersonaMcpServerAssigned', handleMcpUpdated);
+    connection.on('PersonaMcpServerUpdated', handleMcpUpdated);
+    connection.on('PersonaMcpServerRemoved', handleMcpUpdated);
     connection.on('MeshReset', handleMeshReset);
     connection.on('JobTaskUpdated', handleJobTaskUpdated);
     connection.on('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
@@ -1770,6 +1797,12 @@ export default function App() {
       connection.off('PersonaCreated', handleSessionUpdated);
       connection.off('PersonaUpdated', handleSessionUpdated);
       connection.off('PersonaDeleted', handleSessionUpdated);
+      connection.off('McpServerCreated', handleMcpUpdated);
+      connection.off('McpServerUpdated', handleMcpUpdated);
+      connection.off('McpServerDeleted', handleMcpUpdated);
+      connection.off('PersonaMcpServerAssigned', handleMcpUpdated);
+      connection.off('PersonaMcpServerUpdated', handleMcpUpdated);
+      connection.off('PersonaMcpServerRemoved', handleMcpUpdated);
       connection.off('MeshReset', handleMeshReset);
       connection.off('JobTaskUpdated', handleJobTaskUpdated);
       connection.off('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
@@ -3219,21 +3252,33 @@ export default function App() {
             />
           ) : activeTab === 'personas' ? (
             <>
-              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Users className="w-4 h-4 text-sky-400" />
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Users className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400 truncate">
                     Personas ({personas.length})
                   </span>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => openCreatePersonaModal()}
-                  className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>New Persona</span>
-                </button>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowMcpCatalogModal(true)}
+                    data-testid="open-mcp-catalog-btn"
+                    title="Manage shared MCP server catalog"
+                    className="text-xs flex items-center gap-1 text-slate-300 hover:text-sky-300 font-medium px-2 py-1 rounded bg-slate-800/60 hover:bg-slate-800 border border-slate-700/70 transition cursor-pointer"
+                  >
+                    <Server className="w-3 h-3 text-sky-400" />
+                    <span>MCP ({mcpServers.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openCreatePersonaModal()}
+                    className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>New Persona</span>
+                  </button>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-3 space-y-4 pb-24 sm:pb-4">
@@ -3342,11 +3387,33 @@ export default function App() {
                                     <span>GitHub</span>
                                   </span>
                                 )}
+                                {(persona.mcpServerCount ?? 0) > 0 && (
+                                  <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-950/50 border border-sky-500/30 text-[10px] font-mono text-sky-300"
+                                    title={`${persona.mcpServerCount} MCP server(s) assigned`}
+                                  >
+                                    <Plug className="w-2.5 h-2.5 text-sky-400" />
+                                    <span>{persona.mcpServerCount} MCP</span>
+                                  </span>
+                                )}
                               </div>
                             </div>
                           </div>
 
                           <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setManagingPersonaMcp(persona);
+                              }}
+                              className="p-1 rounded-md text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition cursor-pointer"
+                              title={`Configure MCP servers for ${persona.name}`}
+                              aria-label={`Configure MCP servers for ${persona.name}`}
+                              data-testid={`persona-mcp-btn-${persona.id}`}
+                            >
+                              <Plug className="w-3 h-3 text-sky-400" />
+                            </button>
                             <button
                               type="button"
                               onClick={(e) => {
@@ -3447,20 +3514,31 @@ export default function App() {
             </>
           ) : (
             <>
-              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Bot className="w-4 h-4 text-sky-400" />
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Bot className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400 truncate">
                     Connected Drivers ({agents.length})
                   </span>
                 </div>
-                <button
-                  onClick={() => setShowRegisterModal((v) => !v)}
-                  className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Add Driver</span>
-                </button>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowMcpCatalogModal(true)}
+                    title="Manage shared MCP server catalog"
+                    className="text-xs flex items-center gap-1 text-slate-300 hover:text-sky-300 font-medium px-2 py-1 rounded bg-slate-800/60 hover:bg-slate-800 border border-slate-700/70 transition cursor-pointer"
+                  >
+                    <Server className="w-3 h-3 text-sky-400" />
+                    <span>MCP ({mcpServers.length})</span>
+                  </button>
+                  <button
+                    onClick={() => setShowRegisterModal((v) => !v)}
+                    className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add Driver</span>
+                  </button>
+                </div>
               </div>
 
               {/* Inline Register Driver Drawer */}
@@ -6521,6 +6599,33 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+
+                {editingPersona && (
+                  <div className="pt-2 border-t border-slate-800 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="font-semibold text-slate-300 flex items-center gap-1.5">
+                        <Plug className="w-3.5 h-3.5 text-sky-400" />
+                        <span>MCP Tool Servers ({editingPersona.mcpServerCount ?? 0} assigned)</span>
+                      </div>
+                      <p className="text-[10px] text-slate-500 mt-0.5">
+                        Assign shared MCP servers and configure per-persona tool filters or secret overrides.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const target = editingPersona;
+                        setShowPersonaModal(false);
+                        setManagingPersonaMcp(target);
+                      }}
+                      data-testid="edit-persona-configure-mcp-btn"
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 text-[11px] font-semibold flex items-center gap-1.5 transition cursor-pointer shrink-0"
+                    >
+                      <Plug className="w-3 h-3" />
+                      <span>Configure MCP</span>
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Footer */}
@@ -6644,6 +6749,40 @@ export default function App() {
         <PersonaEnvironmentModal
           persona={inspectingPersonaEnv}
           onClose={() => setInspectingPersonaEnv(null)}
+        />
+      )}
+
+      {managingPersonaMcp && (
+        <PersonaMcpModal
+          persona={managingPersonaMcp}
+          onClose={() => setManagingPersonaMcp(null)}
+          onOpenCatalog={() => setShowMcpCatalogModal(true)}
+          catalogRefreshTick={mcpCatalogRefreshTick}
+          onAssignmentsChanged={async () => {
+            if (api.getPersonas) {
+              const updatedPersonas = await api.getPersonas().catch(() => null);
+              if (updatedPersonas) setPersonas(updatedPersonas);
+            }
+            if (api.getMcpServers) {
+              const updatedServers = await api.getMcpServers().catch(() => null);
+              if (updatedServers) setMcpServers(updatedServers);
+            }
+          }}
+        />
+      )}
+
+      {showMcpCatalogModal && (
+        <McpCatalogModal
+          isOpen={showMcpCatalogModal}
+          onClose={() => setShowMcpCatalogModal(false)}
+          initialServers={mcpServers}
+          onCatalogChanged={(nextServers) => {
+            setMcpServers(nextServers);
+            setMcpCatalogRefreshTick((t) => t + 1);
+            if (api.getPersonas) {
+              void api.getPersonas().then(setPersonas).catch(() => {});
+            }
+          }}
         />
       )}
 

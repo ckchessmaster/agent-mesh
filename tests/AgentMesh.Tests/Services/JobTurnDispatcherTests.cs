@@ -1,10 +1,14 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Cli.Models;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
+using AgentMesh.Infrastructure.Services;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
 using Microsoft.AspNetCore.SignalR;
@@ -196,6 +200,163 @@ public class JobTurnDispatcherTests
         var wireJson = JsonSerializer.Serialize(capturedPayloads[0], JsonOpts);
         var ev = JsonSerializer.Deserialize<PromptReceivedEvent>(wireJson, JsonOpts);
         ev!.WorkingDirectory.Should().Be("/workspace/repos/worktrees/job-wt");
+    }
+
+    [Fact]
+    public async Task DispatchAsync_DeliversDecryptedPersonaMcpConfigsToTargetedGroups_WithoutLeakingSecretsToAllOrMetadata()
+    {
+        using var db = TestDbContextFactory.Create();
+        var encryption = new AesCredentialEncryptionService(
+            SHA256.HashData(Encoding.UTF8.GetBytes("dispatcher-mcp-test-key-32-bytes")));
+
+        var allPayloads = new List<object>();
+        var groupPayloads = new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
+
+        var allProxy = new Mock<IClientProxy>();
+        allProxy
+            .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object?[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "PromptReceived" && args.Length > 0 && args[0] is not null)
+                {
+                    allPayloads.Add(args[0]!);
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        var clients = new Mock<IHubClients>();
+        clients.Setup(c => c.All).Returns(allProxy.Object);
+        clients.Setup(c => c.Group(It.IsAny<string>())).Returns((string groupName) =>
+        {
+            var groupProxy = new Mock<IClientProxy>();
+            groupProxy
+                .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+                .Callback<string, object?[], CancellationToken>((method, args, _) =>
+                {
+                    if (method == "PromptReceived" && args.Length > 0 && args[0] is not null)
+                    {
+                        if (!groupPayloads.TryGetValue(groupName, out var list))
+                        {
+                            list = new List<object>();
+                            groupPayloads[groupName] = list;
+                        }
+                        list.Add(args[0]!);
+                    }
+                })
+                .Returns(Task.CompletedTask);
+            return groupProxy.Object;
+        });
+
+        var hub = new Mock<IHubContext<AgentMeshHub>>();
+        hub.Setup(h => h.Clients).Returns(clients.Object);
+
+        var project = new Project
+        {
+            Id = "billing",
+            Name = "Billing",
+            WorkspaceType = WorkspaceType.Git,
+            RepositoryName = "billing"
+        };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Wire MCP",
+            GitBranchName = "mesh/job-mcp"
+        };
+        var persona = new Persona
+        {
+            Id = "astra",
+            Name = "Astra",
+            Role = "Senior Engineer",
+            DriverId = "agy"
+        };
+        var githubServer = new McpServer
+        {
+            Id = "github",
+            Name = "GitHub",
+            Transport = McpTransportType.Stdio,
+            Command = "npx",
+            ArgsJson = "[\"-y\",\"@modelcontextprotocol/server-github\"]",
+            EnvEncrypted = McpSecretProtector.EncryptDictionary(encryption, new Dictionary<string, string>
+            {
+                ["GITHUB_TOKEN"] = "ghp_catalog_secret_0001",
+                ["GITHUB_HOST"] = "github.com"
+            }),
+            Enabled = true
+        };
+        var disabledServer = new McpServer
+        {
+            Id = "disabled-srv",
+            Name = "Disabled",
+            Transport = McpTransportType.Http,
+            Url = "https://disabled.example.com/mcp",
+            Enabled = false
+        };
+
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.Personas.Add(persona);
+        db.McpServers.AddRange(githubServer, disabledServer);
+        db.PersonaMcpServers.AddRange(
+            new PersonaMcpServer
+            {
+                PersonaId = "astra",
+                McpServerId = "github",
+                Enabled = true,
+                EnvOverridesEncrypted = McpSecretProtector.EncryptDictionary(encryption, new Dictionary<string, string>
+                {
+                    ["GITHUB_TOKEN"] = "ghp_astra_secret_9999"
+                }),
+                AllowedToolsJson = "[\"get_issue\"]",
+                BlockedToolsJson = "[\"delete_repo\"]"
+            },
+            new PersonaMcpServer
+            {
+                PersonaId = "astra",
+                McpServerId = "disabled-srv",
+                Enabled = true
+            });
+        await db.SaveChangesAsync();
+
+        var dispatcher = new JobTurnDispatcher(db, hub.Object, workspaces: null, containerManager: null, encryptionService: encryption);
+        var result = await dispatcher.DispatchAsync(new JobTurnRequest(job, project, persona, "Run task", "operator"));
+
+        // 1. MetadataJson persisted in DB must never contain decrypted secrets
+        result.Session.MetadataJson.Should().NotContain("ghp_astra_secret_9999");
+        result.Session.MetadataJson.Should().NotContain("ghp_catalog_secret_0001");
+
+        // 2. Targeted runner groups receive decrypted, merged MCP server configs
+        groupPayloads.Should().ContainKey("persona-astra");
+        groupPayloads.Should().ContainKey("agent-agy");
+
+        foreach (var targetGroup in new[] { "persona-astra", "agent-agy" })
+        {
+            var wireJson = JsonSerializer.Serialize(groupPayloads[targetGroup][0], JsonOpts);
+            var ev = JsonSerializer.Deserialize<PromptReceivedEvent>(wireJson, JsonOpts);
+            ev.Should().NotBeNull();
+            ev!.McpServers.Should().ContainSingle();
+            var srv = ev.McpServers![0];
+            srv.Id.Should().Be("github");
+            srv.Transport.Should().Be(McpTransportType.Stdio);
+            srv.Command.Should().Be("npx");
+            srv.Args.Should().Equal("-y", "@modelcontextprotocol/server-github");
+            srv.Env.Should().Equal(new Dictionary<string, string>
+            {
+                ["GITHUB_TOKEN"] = "ghp_astra_secret_9999",
+                ["GITHUB_HOST"] = "github.com"
+            });
+            srv.AllowedTools.Should().Equal("get_issue");
+            srv.BlockedTools.Should().Equal("delete_repo");
+        }
+
+        // 3. Clients.All must not receive decrypted MCP secrets
+        allPayloads.Should().ContainSingle();
+        var broadcastJson = JsonSerializer.Serialize(allPayloads[0], JsonOpts);
+        broadcastJson.Should().NotContain("ghp_astra_secret_9999");
+        broadcastJson.Should().NotContain("ghp_catalog_secret_0001");
+        var broadcastEv = JsonSerializer.Deserialize<PromptReceivedEvent>(broadcastJson, JsonOpts);
+        broadcastEv!.McpServers.Should().BeNull();
     }
 
     private static (IHubContext<AgentMeshHub> Hub, List<object> CapturedPayloads) CreateCapturingHub()
