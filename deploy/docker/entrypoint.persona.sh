@@ -211,35 +211,55 @@ fi
 sync_persona_state() {
     mkdir -p /workspace/.agentmesh/state/.config
     if [ -d /root/.config ]; then
-        cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
+        cp -au /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
     fi
     if [ -d /root/.aip ]; then
         mkdir -p /workspace/.agentmesh/state/.aip
-        cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
+        cp -au /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
     fi
     if [ -d /root/.gemini ]; then
         mkdir -p /workspace/.agentmesh/state/.gemini
-        cp -a /root/.gemini/. /workspace/.agentmesh/state/.gemini/ 2>/dev/null || true
+        (
+            shopt -s dotglob nullglob
+            for gitem in /root/.gemini/*; do
+                gname=$(basename "$gitem")
+                if [ "$gname" = "antigravity-cli" ] && [ -d "$gitem" ]; then
+                    mkdir -p /workspace/.agentmesh/state/.gemini/antigravity-cli
+                    for aitem in "$gitem"/*; do
+                        aname=$(basename "$aitem")
+                        case "$aname" in
+                            log|crashes|cache) continue ;;
+                        esac
+                        cp -au "$aitem" /workspace/.agentmesh/state/.gemini/antigravity-cli/ 2>/dev/null || true
+                    done
+                else
+                    cp -au "$gitem" /workspace/.agentmesh/state/.gemini/ 2>/dev/null || true
+                fi
+            done
+        )
     fi
     if [ -d /root/.claude ]; then
         mkdir -p /workspace/.agentmesh/state/.claude
-        cp -a /root/.claude/. /workspace/.agentmesh/state/.claude/ 2>/dev/null || true
+        cp -au /root/.claude/. /workspace/.agentmesh/state/.claude/ 2>/dev/null || true
     fi
     if [ -d /root/.copilot ]; then
         mkdir -p /workspace/.agentmesh/state/.copilot
-        cp -a /root/.copilot/. /workspace/.agentmesh/state/.copilot/ 2>/dev/null || true
+        cp -au /root/.copilot/. /workspace/.agentmesh/state/.copilot/ 2>/dev/null || true
     fi
     if [ -d /root/.local/bin ]; then
         mkdir -p /workspace/.agentmesh/state/.local/bin
-        cp -a /root/.local/bin/. /workspace/.agentmesh/state/.local/bin/ 2>/dev/null || true
+        cp -au /root/.local/bin/. /workspace/.agentmesh/state/.local/bin/ 2>/dev/null || true
         chmod 700 /workspace/.agentmesh/state/.local 2>/dev/null || true
     fi
-    # Also synchronize all existing state directories in /workspace/.agentmesh/state
+    # Also synchronize any additional custom state directories in /workspace/.agentmesh/state
     if [ -d /workspace/.agentmesh/state ]; then
         for sdir in /workspace/.agentmesh/state/.*; do
             bname=$(basename "$sdir")
-            if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ] && [ -d "/root/$bname" ]; then
-                cp -a "/root/$bname/." "$sdir/" 2>/dev/null || true
+            case "$bname" in
+                .|..|.config|.aip|.gemini|.claude|.copilot|.local) continue ;;
+            esac
+            if [ -d "$sdir" ] && [ -d "/root/$bname" ]; then
+                cp -au "/root/$bname/." "$sdir/" 2>/dev/null || true
                 chmod 700 "$sdir" 2>/dev/null || true
             fi
         done
@@ -292,7 +312,7 @@ fi
 # Start background periodic state synchronization worker
 (
     while true; do
-        sleep 10
+        sleep 60
         sync_persona_state 2>/dev/null || true
     done
 ) &
