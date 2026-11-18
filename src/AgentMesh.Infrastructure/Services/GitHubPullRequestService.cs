@@ -84,6 +84,46 @@ public interface IGitHubPullRequestService
         string? repositoryOverride = null,
         string? tokenOverride = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Reads what CI has decided about a pull request's head commit.
+    /// </summary>
+    /// <remarks>
+    /// The other half of the loop the review read opened. A gate parked on a red build used to be a
+    /// persona that had stopped working and a human who had to notice; this lets the poller report the
+    /// failure as the request-changes review it functionally is, so the author is sent back to fix it.
+    /// <para>
+    /// Like the review read, this returns evidence and never a verdict. Deciding that a
+    /// <c>queued</c> run is not a failure, that a re-run that passed supersedes the attempt that failed,
+    /// and that a failure the current park already acted on must not fire again is policy, and it lives
+    /// with the rest of the gate's policy so it can be tested without HTTP.
+    /// </para>
+    /// <para>
+    /// <paramref name="headShaOverride"/> asks about a specific commit for a caller that already read
+    /// the pull request this tick. It exists to save a second GET, not to skip the head binding: passing
+    /// a stale SHA is how a fixed build gets reported broken again.
+    /// </para>
+    /// <para>
+    /// A failed read must never be presented as a green commit. Callers act on this only when
+    /// <c>Success</c> is true, and a <c>Success</c> result with no checks means the repository reported
+    /// no CI for this commit, which is a real answer and not a licence to halt.
+    /// </para>
+    /// <para>
+    /// The default reports "this implementation does not read CI" rather than an empty successful
+    /// snapshot, and that distinction is the whole point: a caller that treats an unread result as
+    /// green would halt nothing, and one that treats it as red would halt a build nobody looked at. The
+    /// poller only acts on <c>Success</c>, so a stub or a future non-GitHub implementation stays inert
+    /// by default instead of having to remember to say so.
+    /// </para>
+    /// </remarks>
+    Task<GitHubCiSnapshot> ReadPullRequestCiStateAsync(
+        string prUrlOrNumber,
+        string? repositoryOverride = null,
+        string? tokenOverride = null,
+        string? headShaOverride = null,
+        CancellationToken ct = default) =>
+        Task.FromResult(GitHubCiSnapshot.Failure("not_supported",
+            "This pull request service does not read CI state."));
 }
 
 /// <summary>Which merge strategy GitHub should apply.</summary>

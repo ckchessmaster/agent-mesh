@@ -91,6 +91,12 @@ flowchart LR
 * **Docker Container Manager**: [`DockerPersonaContainerManager`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Infrastructure/Containers/DockerPersonaContainerManager.cs) orchestrates ephemeral Docker containers for local developer runs in .NET Aspire.
 * **Kubernetes Container Manager**: [`KubernetesPersonaContainerManager`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Infrastructure/Containers/KubernetesPersonaContainerManager.cs) manages StatefulSets or on-demand Pods in production Kubernetes clusters.
 
+### Persona Workspace Storage
+* **One claim per persona.** In Kubernetes each persona gets a `ReadWriteOnce` claim named `agentmesh-persona-<persona>-workspace`, requested from `config.personaRunner.storage.size` (default `10Gi`) and its storage class from `config.personaRunner.storage.storageClassName`, which leaves the cluster default in place when unset. The claim outlives the pod, which is what lets a persona keep its checked-out repositories between jobs.
+* **The size is a ceiling that may only rise.** Kubernetes cannot shrink a bound claim, so a configured value *below* what a persona already holds is ignored and warned about once rather than sent to the API server, where it would fail on every turn. Raising the value is the supported direction and the only one.
+* **Raising it reaches existing workspaces.** The configured size is compared against each claim's actual request whenever that persona's workspace is reconciled, and a smaller claim is patched up to the configured size — so growing an established deployment is a chart change, not an operator task. Comparison is numeric, because `10Gi` and `10240Mi` are the same size written two ways and a text comparison would write to every claim on every turn.
+* **A refused resize is not a failed persona.** Resizing needs a storage class with `allowVolumeExpansion: true`; a class that refuses, or a statically provisioned claim, leaves the workspace at the size it already has and logs a warning. Longhorn's default class does support it, and expands the filesystem online.
+
 ### Companion Supervisor & Auto-Updating
 * **Process Supervisor**: Inside runner containers, a companion supervisor monitors process health, handles SIGTERM graceful drains, and exposes health probes.
 * **Idle Auto-Updater**: When runner binaries or driver configurations are updated, idle runner pods automatically pull the latest binary release and restart cleanly without dropping active job sessions.

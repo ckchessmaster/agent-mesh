@@ -72,6 +72,26 @@ public class TimelineActivities(
     [Activity]
     public async Task<JobTimelineCard> CreateCardAsync(CreateTimelineCardInput input)
     {
+        // One card per pull request, whichever writer arrives first.
+        //
+        // The review gate and the `pr open` path both post a PrReview card, and each one deduplicated
+        // against a different notion of "the card for this PR" — the gate against workflow state that a
+        // new run starts empty, the CLI path against the pull-request number in the payload. A job that
+        // reached the pull-request stage therefore got two cards sitting side by side in the cockpit
+        // saying the same thing, and the poller had to guess which one's timestamp is the real park.
+        //
+        // Doing it here, inside the activity, rather than in the workflow, is deliberate: the workflow's
+        // command sequence is unchanged, so a run parked mid-review across a deploy replays exactly as
+        // it did before. Only the effect on the table changes.
+        if (input.CardType == TimelineCardType.PrReview)
+        {
+            var adopted = await AdoptExistingPullRequestCardAsync(input);
+            if (adopted is not null)
+            {
+                return adopted;
+            }
+        }
+
         var card = new JobTimelineCard
         {
             Id = Guid.NewGuid(),
@@ -107,6 +127,74 @@ public class TimelineActivities(
         return card;
     }
 
+    /// <summary>
+    /// Updates the job's existing pull-request review card instead of inserting a second one, or returns
+    /// null when this job has no card for this pull request yet.
+    /// </summary>
+    private async Task<JobTimelineCard?> AdoptExistingPullRequestCardAsync(
+        CreateTimelineCardInput input,
+        CancellationToken ct = default)
+    {
+        var reference = PrReviewCardPayload.ReadReference(input.StructuredPayloadJson);
+        if (reference.Number is null && reference.Url is null)
+        {
+            // The gate can park before a pull request is registered; with nothing to match on, creating
+            // a card is the only honest option. See PrReviewCardPayload for why guessing is worse.
+            return null;
+        }
+
+        // Filtered in memory on purpose. StructuredPayloadJson is jsonb and PostgreSQL defines no LIKE
+        // for jsonb, so a payload predicate translates to SQL the server rejects — the same constraint
+        // the session-transcript scan in this class documents. One job has a handful of review cards.
+        var candidates = await dbContext.JobTimelineCards
+            .Where(c => c.JobId == input.JobId && c.CardType == TimelineCardType.PrReview)
+            .ToListAsync(ct);
+
+        var existing = candidates
+            .Where(c => PrReviewCardPayload.IsSamePullRequest(
+                PrReviewCardPayload.ReadReference(c.StructuredPayloadJson), reference))
+            .OrderByDescending(c => c.UpdatedAt)
+            .FirstOrDefault();
+
+        if (existing is null)
+        {
+            return null;
+        }
+
+        var wasMissingTask = string.IsNullOrWhiteSpace(existing.TaskId);
+        existing.Status = input.Status;
+        existing.Title = input.Title ?? existing.Title;
+        existing.StructuredPayloadJson =
+            PrReviewCardPayload.Merge(existing.StructuredPayloadJson, input.StructuredPayloadJson);
+        existing.UpdatedAt = DateTimeOffset.UtcNow;
+
+        // The gate parks with no task and the CLI writes with one, so whichever lands second should fill
+        // the gap rather than erase the other's context: task id drives which checklist row the card
+        // renders under.
+        if (wasMissingTask && !string.IsNullOrWhiteSpace(input.TaskId))
+        {
+            existing.TaskId = input.TaskId;
+        }
+
+        var job = await TryLoadJobAsync(input.JobId, ct);
+        if (job != null)
+        {
+            job.ProgressHeartbeat = input.Title;
+            job.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+
+        await dbContext.SaveChangesAsync(ct);
+        await NotifyCardUpdatedAsync(existing);
+
+        logger.LogInformation(
+            "Adopted existing pull-request review card {CardId} for job {JobId} (PR {PrNumber} {PrUrl}) " +
+            "instead of posting a duplicate",
+            existing.Id, existing.JobId,
+            reference.Number?.ToString() ?? "-", reference.Url ?? "-");
+
+        return existing;
+    }
+
     [Activity]
     public async Task UpdateCardStatusAsync(UpdateTimelineCardStatusInput input)
     {
@@ -117,7 +205,13 @@ public class TimelineActivities(
             card.UpdatedAt = DateTimeOffset.UtcNow;
             if (!string.IsNullOrEmpty(input.StructuredPayloadJson))
             {
-                card.StructuredPayloadJson = input.StructuredPayloadJson;
+                // The review card has two writers, and a status write from the gate carries no linkage
+                // fields. Replacing the payload would delete the pull-request summary the CLI recorded
+                // from a card that was just displaying it, so this card type merges and every other one
+                // keeps the replace semantics its callers already depend on.
+                card.StructuredPayloadJson = card.CardType == TimelineCardType.PrReview
+                    ? PrReviewCardPayload.Merge(card.StructuredPayloadJson, input.StructuredPayloadJson)
+                    : input.StructuredPayloadJson;
             }
             if (!string.IsNullOrEmpty(input.Title))
             {
