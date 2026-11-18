@@ -187,6 +187,13 @@ builder.Services.AddScoped<JobChangesService>();
 // no state of its own — see AttentionQueryService for why the fold lives here and not in the client.
 builder.Services.AddScoped<IAttentionQueryService, AttentionQueryService>();
 
+// The push side of that same read model. The three sources the rollup folds are written from a dozen
+// places (the MCP tool surface, the job controllers, the worker's timeline-card callback), and each of
+// them calls IAttentionNotifier after its commit so an operator's desktop banner fires on the
+// transition instead of on the next poll. See AttentionNotifier for why it recomputes rather than
+// classifies the write, and why that makes this safe to call from anywhere.
+builder.Services.AddScoped<IAttentionNotifier, AttentionNotifier>();
+
 // Dedicated Persona Container Environments & Idle Reaper
 builder.Services.AddPersonaContainerManager(builder.Configuration);
 builder.Services.AddHostedService<PersonaIdleReaperService>();

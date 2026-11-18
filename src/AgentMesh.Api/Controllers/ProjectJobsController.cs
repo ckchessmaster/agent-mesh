@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -145,7 +145,11 @@ public class ProjectJobsController(
     IStorageService? storageService = null,
     IWorkflowSignalRouter? workflows = null,
     ILogger<ProjectJobsController>? logger = null,
-    JobTurnDispatcher? turns = null) : ControllerBase
+    JobTurnDispatcher? turns = null,
+    // Optional like the rest: 46 tests construct this controller to exercise job and task CRUD. The
+    // production container registers it and ApiServiceRegistrationTests pins that, so the null default
+    // can only ever mean "a unit test", never "notifications are off in production".
+    IAttentionNotifier? attention = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -1542,6 +1546,14 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // The ledger write site, and the busiest one: this route is how the Cockpit posts chat, how an
+        // operator answers an agent, and how the worker's own escalation path lands a
+        // requires-reply message (HttpAgentTurnRunner POSTs here before it falls back to writing the row
+        // itself). Both directions therefore run through here — an agent's ask opens a wait, a human's
+        // reply closes one — and the worker's fallback write only happens when the API is unreachable,
+        // where there would be no hub to broadcast on either.
+        await attention.RefreshAttentionAsync(id);
+
         var msgDto = ToMessageDto(jobMsg);
 
         if (hubContext != null)
@@ -1960,6 +1972,11 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // Completing or archiving a job removes it from OpenJobsPredicate, which is how a wait that
+        // ended by the job simply finishing raises AttentionResolved: the same call that used to return
+        // an item now returns null. No write site has to know which kind it was clearing.
+        await attention.RefreshAttentionAsync(id);
+
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
         var dto = ToDto(job, project?.Name, msgCount);
@@ -1985,6 +2002,9 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // Same reason as CompleteJob above: archived jobs leave the rollup, so their waits are over.
+        await attention.RefreshAttentionAsync(id);
+
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
         var dto = ToDto(job, project?.Name, msgCount);
@@ -2009,6 +2029,11 @@ public class ProjectJobsController(
         job.Status = ProjectJobStatus.Active;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        // Reopening puts the job back inside OpenJobsPredicate. If its last heartbeat still reads
+        // "Awaiting plan approval" because the plan was never approved, that wait is real again and the
+        // bell should say so; if it does not, this is the no-op the client cannot tell apart.
+        await attention.RefreshAttentionAsync(id);
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);
@@ -2066,6 +2091,10 @@ public class ProjectJobsController(
         job.ProgressHeartbeat = null;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        // A reset clears the heartbeat, which is the source that was holding the wait. The job is still
+        // open (Pending is in the rollup), so only the cleared heartbeat makes this a resolution.
+        await attention.RefreshAttentionAsync(id);
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var msgCount = await db.JobMessages.CountAsync(m => m.JobId == id);

@@ -78,6 +78,13 @@ public sealed record AttentionRollupDto(
 public interface IAttentionQueryService
 {
     Task<AttentionRollupDto> QueryAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The one item <paramref name="jobId"/> is contributing to the rollup, or null when it is waiting
+    /// on nobody. Same fold, same precedence, same prose as <see cref="QueryAsync"/> — see
+    /// <see cref="AttentionQueryService.QueryJobAsync"/>.
+    /// </summary>
+    Task<AttentionItemDto?> QueryJobAsync(Guid jobId, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -291,6 +298,64 @@ public sealed class AttentionQueryService(
             ordered.Count, jobs.Count);
 
         return new AttentionRollupDto(ordered, ordered.Count, generatedAt);
+    }
+
+    /// <summary>
+    /// The single-job form of <see cref="QueryAsync"/>, for the write sites that have to announce or
+    /// clear one job's wait without re-reading every other open job in the system.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It shares everything that decides an answer with the rollup — <see cref="OpenJobsPredicate"/>,
+    /// <see cref="CardPredicate"/>, <see cref="LedgerPredicate"/>, <see cref="HumanReplyPredicate"/>,
+    /// <see cref="ClassifyHeartbeat"/> and <c>BuildItem</c> — and differs only in the driving set: one
+    /// job id instead of all open ones. That is deliberate. The push events carry the same
+    /// <see cref="AttentionItemDto"/> a client later gets from <c>GET /api/attention</c>, including
+    /// <see cref="AttentionItemDto.Id"/>, which is the client's dedupe key: if the two paths classified
+    /// independently, the same wait would arrive under two ids and a notification would fire twice for
+    /// it, or a banner would never clear.
+    /// </para>
+    /// <para>
+    /// <strong>Why a completed job answers null.</strong> The status filter is applied before anything
+    /// else, so approving a plan or finishing a job produces null from the same call that produced an
+    /// item a moment earlier — which is how <see cref="AttentionEvents.Resolved"/> gets raised without
+    /// any code path having to write a "resolved" fact.
+    /// </para>
+    /// <para>
+    /// Cost is four indexed reads (job by primary key, its cards, its structured ledger rows, its last
+    /// human reply) plus the project name, all of them the queries above narrowed to one id.
+    /// </para>
+    /// </remarks>
+    public async Task<AttentionItemDto?> QueryJobAsync(
+        Guid jobId,
+        CancellationToken cancellationToken = default)
+    {
+        var job = await db.ProjectJobs.AsNoTracking()
+            .Where(OpenJobsPredicate)
+            .Where(j => j.Id == jobId)
+            .Select(j => new JobRow(j.Id, j.ProjectId, j.Title, j.ProgressHeartbeat, j.UpdatedAt))
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (job is null)
+        {
+            return null;
+        }
+
+        var key = job.Id.ToString();
+        var jobIds = new List<string> { key };
+        var jobGuids = new List<Guid> { job.Id };
+
+        var cards = (await LoadCardsAsync(jobIds, cancellationToken)).TryGetValue(key, out var rows)
+            ? rows
+            : [];
+        var (prByJob, escalationByJob) = await LoadLedgerAsync(jobGuids, cancellationToken);
+        prByJob.TryGetValue(job.Id, out var pr);
+        escalationByJob.TryGetValue(job.Id, out var escalation);
+
+        var projectNames = await LoadProjectNamesAsync([job.ProjectId], cancellationToken);
+        projectNames.TryGetValue(job.ProjectId, out var projectName);
+
+        return BuildItem(job, key, cards, escalation, pr, projectName);
     }
 
     private async Task<Dictionary<string, List<CardRow>>> LoadCardsAsync(
