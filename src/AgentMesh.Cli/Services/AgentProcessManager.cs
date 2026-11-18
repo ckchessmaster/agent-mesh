@@ -2,9 +2,14 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Enums;
+using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using Microsoft.AspNetCore.SignalR.Client;
 
 namespace AgentMesh.Cli.Services;
+
+internal sealed record TurnWorkspaceResolution(string WorkingDirectory, bool UsedFallback);
 
 public class InfiniteRetryPolicy : IRetryPolicy
 {
@@ -27,6 +32,8 @@ public class AgentRunnerInstance : IAsyncDisposable
     private readonly string _meshUrl;
     private readonly Action<string, string> _onLog;
     private readonly Action _onStateChanged;
+    private readonly IProjectWorkspaceSetup _workspaceSetup;
+    private readonly string? _fallbackDirectoryOverride;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<Guid, byte> _processedMessages = new();
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _stoppedSessions = new();
@@ -44,13 +51,17 @@ public class AgentRunnerInstance : IAsyncDisposable
         MeshClient meshClient,
         string meshUrl,
         Action<string, string> onLog,
-        Action onStateChanged)
+        Action onStateChanged,
+        IProjectWorkspaceSetup? workspaceSetup = null,
+        string? fallbackDirectoryOverride = null)
     {
         _preset = preset;
         _meshClient = meshClient;
         _meshUrl = meshUrl.TrimEnd('/');
         _onLog = onLog;
         _onStateChanged = onStateChanged;
+        _workspaceSetup = workspaceSetup ?? new ProjectWorkspaceSetup();
+        _fallbackDirectoryOverride = fallbackDirectoryOverride;
 
         State = new AgentRuntimeState
         {
@@ -149,10 +160,19 @@ public class AgentRunnerInstance : IAsyncDisposable
                 var personaPrompt = GetJsonPropString(elem, "personaPrompt");
                 var jobId = GetJsonPropString(elem, "jobId");
                 var projectId = GetJsonPropString(elem, "projectId");
+                var projectName = GetJsonPropString(elem, "projectName");
+                var projectDescription = GetJsonPropString(elem, "projectDescription");
+                var repositoryName = GetJsonPropString(elem, "repositoryName");
                 var gitBranch = GetJsonPropString(elem, "gitBranch");
+                var gitUrl = GetJsonPropString(elem, "gitUrl");
+                var gitBaseBranch = GetJsonPropString(elem, "gitBaseBranch");
+                var gitAuthorName = GetJsonPropString(elem, "gitAuthorName");
+                var gitAuthorEmail = GetJsonPropString(elem, "gitAuthorEmail");
                 var workspaceType = GetJsonPropString(elem, "workspaceType");
+                var workspaceGitRemote = GetJsonPropString(elem, "workspaceGitRemote");
                 var conversationId = GetJsonPropString(elem, "conversationId") ?? GetJsonPropString(elem, "conversation_id");
                 var attachments = ExtractJsonAttachments(elem);
+                var mcpServers = ExtractJsonMcpServers(elem);
 
                 var createdStr = GetJsonPropString(elem, "createdAt");
                 var createdAt = createdStr != null && DateTimeOffset.TryParse(createdStr, out var cdt) ? cdt : DateTimeOffset.UtcNow;
@@ -177,9 +197,18 @@ public class AgentRunnerInstance : IAsyncDisposable
                     ContextSize = contextSize,
                     JobId = jobId,
                     ProjectId = projectId,
+                    ProjectName = projectName,
+                    ProjectDescription = projectDescription,
+                    RepositoryName = repositoryName,
                     GitBranch = gitBranch,
+                    GitUrl = gitUrl ?? workspaceGitRemote,
+                    GitBaseBranch = gitBaseBranch,
+                    GitAuthorName = gitAuthorName,
+                    GitAuthorEmail = gitAuthorEmail,
                     WorkspaceType = workspaceType,
+                    WorkspaceGitRemote = workspaceGitRemote ?? gitUrl,
                     Attachments = attachments,
+                    McpServers = mcpServers,
                     ConversationId = conversationId,
                     // v1.2.15 lineage: honour the server's timestamp instead of stamping "now" at
                     // the runner, which reorders replayed/queued prompts against the ledger.
@@ -517,7 +546,7 @@ public class AgentRunnerInstance : IAsyncDisposable
         catch { }
     }
 
-    private async Task HandlePromptAsync(PromptReceivedEvent ev, CancellationToken ct)
+    internal async Task HandlePromptAsync(PromptReceivedEvent ev, CancellationToken ct)
     {
         if (ev.MessageId != Guid.Empty && !_processedMessages.TryAdd(ev.MessageId, 1))
         {
@@ -575,18 +604,9 @@ public class AgentRunnerInstance : IAsyncDisposable
                 AgyAdapter.SetSessionConversationId(ev.SessionId, ev.ConversationId);
             }
 
-            // Resolve working directory: explicit working directory or active project's /workspace/repos/<project> checkout
-            var effectiveWorkDir = AgentProcessManager.ResolveEffectiveWorkingDirectory(ev);
-
-            try
-            {
-                Directory.CreateDirectory(effectiveWorkDir);
-            }
-            catch (Exception ex)
-            {
-                _onLog(_preset.Id, $"Warning: Could not create workspace directory '{effectiveWorkDir}': {ex.Message}");
-            }
-
+            // Ensure project workspace structure is initialized (idempotently) or fall back safely.
+            var workspace = await PrepareTurnWorkspaceAsync(ev, turnToken);
+            var effectiveWorkDir = workspace.WorkingDirectory;
             ev.WorkingDirectory = effectiveWorkDir;
 
             if (ev.Attachments is { Count: > 0 })
@@ -594,9 +614,30 @@ public class AgentRunnerInstance : IAsyncDisposable
                 await StagePromptAttachmentsAsync(ev, effectiveWorkDir, _meshClient, (msg) => _onLog(_preset.Id, msg), turnToken);
             }
 
+            if (ev.McpServers == null)
+            {
+                var effectivePersonaId = !string.IsNullOrWhiteSpace(ev.PersonaId)
+                    ? ev.PersonaId
+                    : _preset.PersonaId;
+                if (!string.IsNullOrWhiteSpace(effectivePersonaId))
+                {
+                    ev.McpServers = await _meshClient.GetResolvedPersonaMcpServersAsync(
+                        effectivePersonaId,
+                        _agentToken,
+                        _preset.Id,
+                        turnToken);
+                }
+            }
+
+            if (ev.McpServers is { Count: > 0 })
+            {
+                var serverIds = string.Join(", ", ev.McpServers.Select(m => m.Id));
+                _onLog(_preset.Id, $"Resolved {ev.McpServers.Count} MCP server(s) for turn [{ev.SessionId.ToString()[..8]}]: {serverIds}");
+            }
+
             _onLog(_preset.Id, $"Prompt [{ev.SessionId.ToString()[..8]}] from {ev.Sender} (model: {ev.Model ?? "default"}, effort: {ev.Effort ?? "default"}): {ev.Prompt} (cwd: {effectiveWorkDir})");
 
-            if (!string.IsNullOrWhiteSpace(ev.GitBranch))
+            if (!string.IsNullOrWhiteSpace(ev.GitBranch) && !workspace.UsedFallback)
             {
                 await GitWorkspaceManager.PrepareJobBranchAsync(
                     effectiveWorkDir,
@@ -692,7 +733,7 @@ public class AgentRunnerInstance : IAsyncDisposable
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(ev.GitBranch))
+            if (!string.IsNullOrWhiteSpace(ev.GitBranch) && !workspace.UsedFallback)
             {
                 await GitWorkspaceManager.CommitTurnChangesAsync(
                     effectiveWorkDir,
@@ -821,16 +862,23 @@ public class AgentRunnerInstance : IAsyncDisposable
         _cts.Dispose();
     }
 
-    public static List<AttachmentItem>? ExtractJsonAttachments(JsonElement elem)
+    public static List<AttachmentItem>? ExtractJsonAttachments(JsonElement elem) =>
+        ExtractJsonListProperty<AttachmentItem>(elem, "attachments");
+
+    public static List<ResolvedMcpServerConfig>? ExtractJsonMcpServers(JsonElement elem) =>
+        ExtractJsonListProperty<ResolvedMcpServerConfig>(elem, "mcpServers");
+
+    private static List<T>? ExtractJsonListProperty<T>(JsonElement elem, string propertyName)
     {
+        if (elem.ValueKind != JsonValueKind.Object) return null;
         foreach (var prop in elem.EnumerateObject())
         {
-            if (string.Equals(prop.Name, "attachments", StringComparison.OrdinalIgnoreCase) &&
+            if (string.Equals(prop.Name, propertyName, StringComparison.OrdinalIgnoreCase) &&
                 prop.Value.ValueKind == JsonValueKind.Array)
             {
                 try
                 {
-                    return JsonSerializer.Deserialize<List<AttachmentItem>>(prop.Value.GetRawText(), new JsonSerializerOptions
+                    return JsonSerializer.Deserialize<List<T>>(prop.Value.GetRawText(), new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true
                     });
@@ -930,6 +978,247 @@ public class AgentRunnerInstance : IAsyncDisposable
         return stagedPaths;
     }
 
+    internal async Task<TurnWorkspaceResolution> PrepareTurnWorkspaceAsync(
+        PromptReceivedEvent ev,
+        CancellationToken ct)
+    {
+        var fallbackDir = ResolveFallbackDirectory(ev.SessionId);
+        await BackfillProjectMetadataIfNeededAsync(ev, ct);
+
+        var hasProjectContext =
+            !string.IsNullOrWhiteSpace(ev.ProjectId) ||
+            !string.IsNullOrWhiteSpace(ev.RepositoryName);
+
+        if (!hasProjectContext)
+        {
+            return ResolveNonProjectWorkspace(ev, fallbackDir);
+        }
+
+        var workspaceType = WorkspaceType.Git;
+        if (!string.IsNullOrWhiteSpace(ev.WorkspaceType) &&
+            Enum.TryParse<WorkspaceType>(ev.WorkspaceType.Trim(), ignoreCase: true, out var parsedWorkspaceType))
+        {
+            workspaceType = parsedWorkspaceType;
+        }
+
+        var gitRemote = !string.IsNullOrWhiteSpace(ev.GitUrl) ? ev.GitUrl : ev.WorkspaceGitRemote;
+        var setupRequest = new ProjectWorkspaceSetupRequest(
+            ProjectId: ev.ProjectId,
+            ProjectName: ev.ProjectName,
+            ProjectDescription: ev.ProjectDescription,
+            RepositoryName: ev.RepositoryName,
+            WorkingDirectory: ev.WorkingDirectory,
+            WorkspaceType: workspaceType,
+            GitRepositoryUrl: gitRemote,
+            GitBaseBranch: ev.GitBaseBranch,
+            FallbackDirectory: fallbackDir);
+
+        ProjectWorkspaceSetupResult setupResult;
+        try
+        {
+            setupResult = await _workspaceSetup.EnsureWorkspaceAsync(
+                setupRequest,
+                msg => _onLog(_preset.Id, $"[setup] {msg}"),
+                ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var target = !string.IsNullOrWhiteSpace(ev.WorkingDirectory)
+                ? ev.WorkingDirectory.Trim()
+                : WorkspacePathResolver.FromRepositoryName(ev.RepositoryName ?? ev.ProjectId);
+            setupResult = ProjectWorkspaceSetupResult.Failure(
+                target,
+                $"Project workspace setup failed unexpectedly: {ex.Message}");
+        }
+
+        if (setupResult.Success &&
+            !string.IsNullOrWhiteSpace(setupResult.EffectiveDirectory) &&
+            Directory.Exists(setupResult.EffectiveDirectory))
+        {
+            var normalizedEffective = WorkspacePathResolver.Normalize(setupResult.EffectiveDirectory);
+            if (setupResult.UsedFallback)
+            {
+                _onLog(_preset.Id,
+                    $"Warning: Project workspace '{setupResult.TargetDirectory}' is unavailable ({setupResult.Message}); falling back to '{normalizedEffective}'.");
+            }
+            else if (setupResult.CreatedFiles)
+            {
+                _onLog(_preset.Id,
+                    $"Initialized project workspace at '{normalizedEffective}' ({setupResult.Outcome}).");
+            }
+
+            return new TurnWorkspaceResolution(normalizedEffective, setupResult.UsedFallback);
+        }
+
+        var safeFallback = EnsureExistingFallbackDirectory(fallbackDir, ev.SessionId);
+        _onLog(_preset.Id,
+            $"Warning: Project workspace '{setupResult.TargetDirectory}' could not be prepared ({setupResult.Message}); falling back to '{safeFallback}'.");
+        return new TurnWorkspaceResolution(safeFallback, UsedFallback: true);
+    }
+
+    private TurnWorkspaceResolution ResolveNonProjectWorkspace(PromptReceivedEvent ev, string fallbackDir)
+    {
+        if (string.IsNullOrWhiteSpace(ev.WorkingDirectory))
+        {
+            var defaultDir = EnsureExistingFallbackDirectory(fallbackDir, ev.SessionId);
+            return new TurnWorkspaceResolution(defaultDir, UsedFallback: false);
+        }
+
+        var requested = WorkspacePathResolver.Normalize(ev.WorkingDirectory.Trim());
+        string? reason;
+        if (!WorkspacePathResolver.IsSafeWorkingDirectory(requested))
+        {
+            reason = "unsafe working directory path";
+        }
+        else if (TryEnsureDirectory(requested, out var error))
+        {
+            return new TurnWorkspaceResolution(requested, UsedFallback: false);
+        }
+        else
+        {
+            reason = error ?? "directory does not exist";
+        }
+
+        var safeFallback = EnsureExistingFallbackDirectory(fallbackDir, ev.SessionId);
+        _onLog(_preset.Id,
+            $"Warning: Workspace directory '{requested}' could not be prepared ({reason}); falling back to '{safeFallback}'.");
+        return new TurnWorkspaceResolution(safeFallback, UsedFallback: true);
+    }
+
+    private async Task BackfillProjectMetadataIfNeededAsync(PromptReceivedEvent ev, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(ev.ProjectId))
+        {
+            return;
+        }
+
+        var needsBackfill =
+            string.IsNullOrWhiteSpace(ev.WorkingDirectory) ||
+            string.IsNullOrWhiteSpace(ev.RepositoryName) ||
+            string.IsNullOrWhiteSpace(ev.ProjectName) ||
+            string.IsNullOrWhiteSpace(ev.WorkspaceType);
+
+        if (!needsBackfill)
+        {
+            return;
+        }
+
+        RemoteProjectDto? project = null;
+        try
+        {
+            project = await _meshClient.GetProjectAsync(ev.ProjectId, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // Best-effort backfill; proceed with what the prompt already carries.
+        }
+
+        if (project == null)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(ev.WorkingDirectory))
+        {
+            var resolved = !string.IsNullOrWhiteSpace(project.ResolvedWorkingDirectory)
+                ? project.ResolvedWorkingDirectory
+                : WorkspacePathResolver.Resolve(project.RepositoryName, project.WorkingDirectory);
+            ev.WorkingDirectory = WorkspacePathResolver.Normalize(resolved);
+        }
+
+        if (string.IsNullOrWhiteSpace(ev.ProjectName)) ev.ProjectName = project.Name;
+        if (string.IsNullOrWhiteSpace(ev.ProjectDescription) && !string.IsNullOrWhiteSpace(project.Description))
+        {
+            ev.ProjectDescription = project.Description;
+        }
+        if (string.IsNullOrWhiteSpace(ev.RepositoryName)) ev.RepositoryName = project.RepositoryName;
+        if (string.IsNullOrWhiteSpace(ev.GitUrl)) ev.GitUrl = project.GitRepositoryUrl;
+        if (string.IsNullOrWhiteSpace(ev.WorkspaceGitRemote)) ev.WorkspaceGitRemote = project.GitRepositoryUrl;
+        if (string.IsNullOrWhiteSpace(ev.GitBaseBranch)) ev.GitBaseBranch = project.GitBaseBranch;
+        if (string.IsNullOrWhiteSpace(ev.WorkspaceType) && project.WorkspaceType.HasValue)
+        {
+            ev.WorkspaceType = project.WorkspaceType.Value.ToString();
+        }
+    }
+
+    private string ResolveFallbackDirectory(Guid sessionId)
+    {
+        if (!string.IsNullOrWhiteSpace(_fallbackDirectoryOverride))
+        {
+            return WorkspacePathResolver.Normalize(_fallbackDirectoryOverride.Trim());
+        }
+
+        if (Directory.Exists("/workspace"))
+        {
+            return "/workspace";
+        }
+
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".agentmesh",
+            "workspaces",
+            sessionId.ToString());
+    }
+
+    private static string EnsureExistingFallbackDirectory(string primaryFallback, Guid sessionId)
+    {
+        var sessionWorkspace = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".agentmesh",
+            "workspaces",
+            sessionId.ToString());
+
+        var candidates = new[]
+        {
+            primaryFallback,
+            sessionWorkspace,
+            Directory.GetCurrentDirectory(),
+            Path.GetTempPath()
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) continue;
+            var normalized = WorkspacePathResolver.Normalize(candidate.Trim());
+            if (!WorkspacePathResolver.IsSafeWorkingDirectory(normalized)) continue;
+            if (TryEnsureDirectory(normalized, out _))
+            {
+                return normalized;
+            }
+        }
+
+        return Path.GetTempPath();
+    }
+
+    private static bool TryEnsureDirectory(string path, out string? error)
+    {
+        try
+        {
+            Directory.CreateDirectory(path);
+            if (Directory.Exists(path))
+            {
+                error = null;
+                return true;
+            }
+
+            error = "directory does not exist after creation";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
     private static string Truncate(string input, int maxLen)
     {
         var singleLine = input.Replace("\r", " ").Replace("\n", " ").Trim();
@@ -942,17 +1231,23 @@ public class AgentProcessManager : IAsyncDisposable
     private readonly CliConfig _config;
     private readonly ConfigStore _configStore;
     private readonly MeshClient _meshClient;
+    private readonly IProjectWorkspaceSetup _workspaceSetup;
     private readonly ConcurrentDictionary<string, AgentRunnerInstance> _runners = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<(DateTimeOffset Timestamp, string AgentId, string Message)> _activityLogs = new();
 
     public event Action<string, string>? OnActivityLog;
     public event Action? OnStateChanged;
 
-    public AgentProcessManager(CliConfig config, ConfigStore configStore, MeshClient meshClient)
+    public AgentProcessManager(
+        CliConfig config,
+        ConfigStore configStore,
+        MeshClient meshClient,
+        IProjectWorkspaceSetup? workspaceSetup = null)
     {
         _config = config;
         _configStore = configStore;
         _meshClient = meshClient;
+        _workspaceSetup = workspaceSetup ?? new ProjectWorkspaceSetup();
     }
 
     public IReadOnlyList<(DateTimeOffset Timestamp, string AgentId, string Message)> GetRecentLogs(int count = 10) =>
@@ -1096,7 +1391,13 @@ public class AgentProcessManager : IAsyncDisposable
             preset.MaxSteps = _config.DefaultMaxSteps;
         }
 
-        var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog, () => OnStateChanged?.Invoke());
+        var runner = new AgentRunnerInstance(
+            preset,
+            _meshClient,
+            _config.MeshUrl,
+            RecordLog,
+            () => OnStateChanged?.Invoke(),
+            _workspaceSetup);
         _runners[normalizedId] = runner;
 
         try
@@ -1183,7 +1484,13 @@ public class AgentProcessManager : IAsyncDisposable
             preset.MaxSteps = _config.DefaultMaxSteps;
         }
 
-        var runner = new AgentRunnerInstance(preset, _meshClient, _config.MeshUrl, RecordLog, () => OnStateChanged?.Invoke());
+        var runner = new AgentRunnerInstance(
+            preset,
+            _meshClient,
+            _config.MeshUrl,
+            RecordLog,
+            () => OnStateChanged?.Invoke(),
+            _workspaceSetup);
         _runners[normalizedPersonaId] = runner;
 
         try

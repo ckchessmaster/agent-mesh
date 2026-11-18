@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
+using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -48,10 +49,21 @@ public class PersonasController(
             .Select(g => new { PersonaId = g.Key, Count = g.Count() })
             .ToDictionaryAsync(x => x.PersonaId, x => x.Count, StringComparer.OrdinalIgnoreCase);
 
+        var mcpCounts = await db.PersonaMcpServers
+            .AsNoTracking()
+            .GroupBy(pm => pm.PersonaId)
+            .Select(g => new { PersonaId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.PersonaId, x => x.Count, StringComparer.OrdinalIgnoreCase);
+
         var dtos = personas.Select(p =>
         {
             drivers.TryGetValue(p.DriverId, out var driver);
-            return ToDto(p, driver, sessionCounts.GetValueOrDefault(p.Id, 0), encryptionService);
+            return ToDto(
+                p,
+                driver,
+                sessionCounts.GetValueOrDefault(p.Id, 0),
+                encryptionService,
+                mcpCounts.GetValueOrDefault(p.Id, 0));
         }).ToList();
 
         return Ok(dtos);
@@ -76,7 +88,8 @@ public class PersonasController(
             .FirstOrDefaultAsync(d => d.Id == persona.DriverId);
 
         var sessionCount = await db.AgentSessions.CountAsync(s => s.PersonaId == normalizedId);
-        return Ok(ToDto(persona, driver, sessionCount, encryptionService));
+        var mcpCount = await db.PersonaMcpServers.CountAsync(pm => pm.PersonaId == normalizedId);
+        return Ok(ToDto(persona, driver, sessionCount, encryptionService, mcpCount));
     }
 
     [HttpPost]
@@ -264,7 +277,8 @@ public class PersonasController(
 
         var driver = await db.Agents.AsNoTracking().FirstOrDefaultAsync(d => d.Id == persona.DriverId);
         var sessionCount = await db.AgentSessions.CountAsync(s => s.PersonaId == normalizedId);
-        var dto = ToDto(persona, driver, sessionCount, encryptionService);
+        var mcpCount = await db.PersonaMcpServers.CountAsync(pm => pm.PersonaId == normalizedId);
+        var dto = ToDto(persona, driver, sessionCount, encryptionService, mcpCount);
 
         if (hubContext != null)
         {
@@ -282,6 +296,14 @@ public class PersonasController(
         if (persona == null)
         {
             return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        var mcpAssignments = await db.PersonaMcpServers
+            .Where(pm => pm.PersonaId == normalizedId)
+            .ToListAsync();
+        if (mcpAssignments.Count > 0)
+        {
+            db.PersonaMcpServers.RemoveRange(mcpAssignments);
         }
 
         var personaSessions = await db.AgentSessions
@@ -713,7 +735,9 @@ public class PersonasController(
             {
                 var (workDir, model, effort, mode, tier) = SessionsController.ExtractSessionSettings(session.MetadataJson);
                 var contextSize = SessionsController.ExtractSessionContextSize(session.MetadataJson);
-                var payload = new
+                var mcpServers = await PersonaMcpResolver.ResolveForPersonaAsync(db, persona.Id, encryptionService);
+
+                object BuildPayload(List<ResolvedMcpServerConfig>? servers) => new
                 {
                     sessionId = session.Id,
                     messageId = promptMsg.Id,
@@ -734,15 +758,408 @@ public class PersonasController(
                     tier = tier,
                     contextSize = contextSize,
                     attachments = req.Attachments,
+                    mcpServers = servers,
                     createdAt = promptMsg.CreatedAt
                 };
-                await hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", payload);
-                await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", payload);
-                await hubContext.Clients.All.SendAsync("PromptReceived", payload);
+
+                var targetedPayload = BuildPayload(mcpServers);
+                var broadcastPayload = BuildPayload(null);
+
+                await hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", targetedPayload);
+                await hubContext.Clients.Group($"agent-{driverId}").SendAsync("PromptReceived", targetedPayload);
+                await hubContext.Clients.All.SendAsync("PromptReceived", broadcastPayload);
             }
         }
 
         return CreatedAtAction("GetSession", "Sessions", new { id = session.Id }, session);
+    }
+
+    [HttpGet("{id}/mcp-servers")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetPersonaMcpServers(string id)
+    {
+        var normalizedId = McpControllerHelpers.NormalizeId(id);
+        var personaExists = await db.Personas.AsNoTracking().AnyAsync(p => p.Id == normalizedId);
+        if (!personaExists)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        var assignments = await db.PersonaMcpServers
+            .AsNoTracking()
+            .Include(pm => pm.McpServer)
+            .Where(pm => pm.PersonaId == normalizedId && pm.McpServer != null)
+            .OrderBy(pm => pm.McpServer!.Name)
+            .ToListAsync();
+
+        var dtos = assignments
+            .Select(pm => ToMcpDto(pm, pm.McpServer!, encryptionService))
+            .ToList();
+
+        return Ok(dtos);
+    }
+
+    /// <summary>
+    /// Returns decrypted, merged MCP server configurations assigned and enabled for this persona.
+    /// Authenticated runners/drivers call this when polling pending prompts or backfilling turn context.
+    /// </summary>
+    [HttpGet("{id}/mcp-servers/resolved")]
+    public async Task<IActionResult> GetResolvedPersonaMcpServers(string id, CancellationToken ct)
+    {
+        var normalizedId = McpControllerHelpers.NormalizeId(id);
+        var persona = await db.Personas
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.Id == normalizedId, ct);
+
+        if (persona == null)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        if (User?.Identity?.IsAuthenticated == true &&
+            User.IsInRole("Driver") &&
+            !User.IsInRole("Admin") &&
+            !User.HasClaim("IsMasterKey", "true"))
+        {
+            var callerAgentId = User.FindFirst("AgentId")?.Value;
+            if (!string.Equals(callerAgentId, persona.DriverId, StringComparison.OrdinalIgnoreCase))
+            {
+                return Forbid();
+            }
+        }
+
+        var resolved = await PersonaMcpResolver.ResolveForPersonaAsync(db, normalizedId, encryptionService, ct);
+        return Ok(resolved);
+    }
+
+    [HttpGet("{id}/mcp-servers/{serverId}")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetPersonaMcpServer(string id, string serverId)
+    {
+        var normalizedPersonaId = McpControllerHelpers.NormalizeId(id);
+        var personaExists = await db.Personas.AsNoTracking().AnyAsync(p => p.Id == normalizedPersonaId);
+        if (!personaExists)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        var normalizedServerId = McpControllerHelpers.NormalizeId(serverId);
+        var assignment = await db.PersonaMcpServers
+            .AsNoTracking()
+            .Include(pm => pm.McpServer)
+            .FirstOrDefaultAsync(pm => pm.PersonaId == normalizedPersonaId && pm.McpServerId == normalizedServerId);
+
+        if (assignment?.McpServer == null)
+        {
+            return NotFound(new { error = $"MCP server '{serverId}' is not assigned to persona '{id}'." });
+        }
+
+        return Ok(ToMcpDto(assignment, assignment.McpServer, encryptionService));
+    }
+
+    [HttpPost("{id}/mcp-servers")]
+    public async Task<IActionResult> AssignPersonaMcpServer(string id, [FromBody] AssignPersonaMcpServerRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.McpServerId))
+        {
+            return BadRequest(new { error = "McpServerId is required." });
+        }
+
+        var normalizedPersonaId = McpControllerHelpers.NormalizeId(id);
+        var personaExists = await db.Personas.AsNoTracking().AnyAsync(p => p.Id == normalizedPersonaId);
+        if (!personaExists)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        var normalizedServerId = McpControllerHelpers.NormalizeId(req.McpServerId);
+        var server = await db.McpServers.AsNoTracking().FirstOrDefaultAsync(m => m.Id == normalizedServerId);
+        if (server == null)
+        {
+            return NotFound(new { error = $"MCP server '{req.McpServerId}' not found." });
+        }
+
+        var existing = await db.PersonaMcpServers
+            .AsNoTracking()
+            .AnyAsync(pm => pm.PersonaId == normalizedPersonaId && pm.McpServerId == normalizedServerId);
+        if (existing)
+        {
+            return Conflict(new { error = $"MCP server '{normalizedServerId}' is already assigned to persona '{normalizedPersonaId}'." });
+        }
+
+        if (!McpControllerHelpers.TryEncryptSecretMap(encryptionService, req.EnvOverrides, out var envOverridesEncrypted, out var envError))
+        {
+            return envError!;
+        }
+
+        if (!McpControllerHelpers.TryEncryptSecretMap(encryptionService, req.HeadersOverrides, out var headersOverridesEncrypted, out var headersError))
+        {
+            return headersError!;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var assignment = new PersonaMcpServer
+        {
+            PersonaId = normalizedPersonaId,
+            McpServerId = normalizedServerId,
+            Enabled = req.Enabled,
+            EnvOverridesEncrypted = envOverridesEncrypted,
+            HeadersOverridesEncrypted = headersOverridesEncrypted,
+            AllowedToolsJson = req.AllowedTools != null
+                ? JsonSerializer.Serialize(McpControllerHelpers.NormalizeToolList(req.AllowedTools))
+                : null,
+            BlockedToolsJson = req.BlockedTools != null
+                ? JsonSerializer.Serialize(McpControllerHelpers.NormalizeToolList(req.BlockedTools))
+                : null,
+            AssignedAt = now,
+            UpdatedAt = now
+        };
+
+        db.PersonaMcpServers.Add(assignment);
+        await db.SaveChangesAsync();
+
+        var dto = ToMcpDto(assignment, server, encryptionService);
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("PersonaMcpServerAssigned", dto);
+        }
+
+        return CreatedAtAction(
+            nameof(GetPersonaMcpServer),
+            new { id = normalizedPersonaId, serverId = normalizedServerId },
+            dto);
+    }
+
+    [HttpPut("{id}/mcp-servers/{serverId}")]
+    public async Task<IActionResult> UpsertPersonaMcpServer(
+        string id,
+        string serverId,
+        [FromBody] UpsertPersonaMcpServerRequest req)
+    {
+        var normalizedPersonaId = McpControllerHelpers.NormalizeId(id);
+        var personaExists = await db.Personas.AsNoTracking().AnyAsync(p => p.Id == normalizedPersonaId);
+        if (!personaExists)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        var normalizedServerId = McpControllerHelpers.NormalizeId(serverId);
+        var server = await db.McpServers.AsNoTracking().FirstOrDefaultAsync(m => m.Id == normalizedServerId);
+        if (server == null)
+        {
+            return NotFound(new { error = $"MCP server '{serverId}' not found." });
+        }
+
+        var assignment = await db.PersonaMcpServers
+            .FirstOrDefaultAsync(pm => pm.PersonaId == normalizedPersonaId && pm.McpServerId == normalizedServerId);
+
+        var isNew = assignment == null;
+        if (assignment == null)
+        {
+            var now = DateTimeOffset.UtcNow;
+            assignment = new PersonaMcpServer
+            {
+                PersonaId = normalizedPersonaId,
+                McpServerId = normalizedServerId,
+                Enabled = req.Enabled ?? true,
+                AssignedAt = now,
+                UpdatedAt = now
+            };
+        }
+
+        if (!TryApplyAssignmentUpdates(assignment, req, encryptionService, out var updateError))
+        {
+            return updateError!;
+        }
+
+        if (isNew)
+        {
+            db.PersonaMcpServers.Add(assignment);
+        }
+
+        await db.SaveChangesAsync();
+
+        var dto = ToMcpDto(assignment, server, encryptionService);
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync(
+                isNew ? "PersonaMcpServerAssigned" : "PersonaMcpServerUpdated",
+                dto);
+        }
+
+        return Ok(dto);
+    }
+
+    [HttpPatch("{id}/mcp-servers/{serverId}")]
+    public async Task<IActionResult> UpdatePersonaMcpServer(
+        string id,
+        string serverId,
+        [FromBody] UpsertPersonaMcpServerRequest req)
+    {
+        var normalizedPersonaId = McpControllerHelpers.NormalizeId(id);
+        var personaExists = await db.Personas.AsNoTracking().AnyAsync(p => p.Id == normalizedPersonaId);
+        if (!personaExists)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        var normalizedServerId = McpControllerHelpers.NormalizeId(serverId);
+        var assignment = await db.PersonaMcpServers
+            .Include(pm => pm.McpServer)
+            .FirstOrDefaultAsync(pm => pm.PersonaId == normalizedPersonaId && pm.McpServerId == normalizedServerId);
+
+        if (assignment?.McpServer == null)
+        {
+            return NotFound(new { error = $"MCP server '{serverId}' is not assigned to persona '{id}'." });
+        }
+
+        if (!TryApplyAssignmentUpdates(assignment, req, encryptionService, out var updateError))
+        {
+            return updateError!;
+        }
+
+        await db.SaveChangesAsync();
+
+        var dto = ToMcpDto(assignment, assignment.McpServer, encryptionService);
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("PersonaMcpServerUpdated", dto);
+        }
+
+        return Ok(dto);
+    }
+
+    [HttpDelete("{id}/mcp-servers/{serverId}")]
+    public async Task<IActionResult> RemovePersonaMcpServer(string id, string serverId)
+    {
+        var normalizedPersonaId = McpControllerHelpers.NormalizeId(id);
+        var personaExists = await db.Personas.AsNoTracking().AnyAsync(p => p.Id == normalizedPersonaId);
+        if (!personaExists)
+        {
+            return NotFound(new { error = $"Persona '{id}' not found." });
+        }
+
+        var normalizedServerId = McpControllerHelpers.NormalizeId(serverId);
+        var assignment = await db.PersonaMcpServers
+            .FirstOrDefaultAsync(pm => pm.PersonaId == normalizedPersonaId && pm.McpServerId == normalizedServerId);
+
+        if (assignment == null)
+        {
+            return NotFound(new { error = $"MCP server '{serverId}' is not assigned to persona '{id}'." });
+        }
+
+        db.PersonaMcpServers.Remove(assignment);
+        await db.SaveChangesAsync();
+
+        if (hubContext != null)
+        {
+            await hubContext.Clients.All.SendAsync("PersonaMcpServerRemoved", new
+            {
+                personaId = normalizedPersonaId,
+                mcpServerId = normalizedServerId
+            });
+        }
+
+        return Ok(new
+        {
+            status = "deleted",
+            personaId = normalizedPersonaId,
+            mcpServerId = normalizedServerId
+        });
+    }
+
+    private static bool TryApplyAssignmentUpdates(
+        PersonaMcpServer assignment,
+        UpsertPersonaMcpServerRequest req,
+        ICredentialEncryptionService? encryptionService,
+        out IActionResult? errorResult)
+    {
+        if (!McpControllerHelpers.TryUpdateSecretMap(
+                encryptionService,
+                assignment.EnvOverridesEncrypted,
+                req.EnvOverrides,
+                req.MergeEnvOverrides,
+                req.RemoveEnvOverrideKeys,
+                out var nextEnvOverrides,
+                out var envError))
+        {
+            errorResult = envError;
+            return false;
+        }
+
+        if (!McpControllerHelpers.TryUpdateSecretMap(
+                encryptionService,
+                assignment.HeadersOverridesEncrypted,
+                req.HeadersOverrides,
+                req.MergeHeadersOverrides,
+                req.RemoveHeaderOverrideKeys,
+                out var nextHeadersOverrides,
+                out var headersError))
+        {
+            errorResult = headersError;
+            return false;
+        }
+
+        if (req.Enabled.HasValue)
+        {
+            assignment.Enabled = req.Enabled.Value;
+        }
+
+        assignment.EnvOverridesEncrypted = nextEnvOverrides;
+        assignment.HeadersOverridesEncrypted = nextHeadersOverrides;
+
+        if (req.ClearAllowedTools)
+        {
+            assignment.AllowedToolsJson = null;
+        }
+        else if (req.AllowedTools != null)
+        {
+            assignment.AllowedToolsJson = JsonSerializer.Serialize(McpControllerHelpers.NormalizeToolList(req.AllowedTools));
+        }
+
+        if (req.ClearBlockedTools)
+        {
+            assignment.BlockedToolsJson = null;
+        }
+        else if (req.BlockedTools != null)
+        {
+            assignment.BlockedToolsJson = JsonSerializer.Serialize(McpControllerHelpers.NormalizeToolList(req.BlockedTools));
+        }
+
+        assignment.UpdatedAt = DateTimeOffset.UtcNow;
+        errorResult = null;
+        return true;
+    }
+
+    public static PersonaMcpServerDto ToMcpDto(
+        PersonaMcpServer assignment,
+        McpServer server,
+        ICredentialEncryptionService? encryption = null)
+    {
+        return new PersonaMcpServerDto(
+            PersonaId: assignment.PersonaId,
+            McpServerId: assignment.McpServerId,
+            McpServerName: server.Name,
+            McpServerDescription: server.Description,
+            Transport: server.Transport,
+            Command: server.Command,
+            Args: McpControllerHelpers.ParseStringList(server.ArgsJson),
+            Url: server.Url,
+            ServerEnabled: server.Enabled,
+            Enabled: assignment.Enabled,
+            EffectiveEnabled: server.Enabled && assignment.Enabled,
+            TimeoutSeconds: server.TimeoutSeconds,
+            ServerEnvMasked: McpControllerHelpers.MaskOrEmpty(encryption, server.EnvEncrypted),
+            ServerHeadersMasked: McpControllerHelpers.MaskOrEmpty(encryption, server.HeadersEncrypted),
+            EnvOverridesMasked: McpControllerHelpers.MaskOrEmpty(encryption, assignment.EnvOverridesEncrypted),
+            HeadersOverridesMasked: McpControllerHelpers.MaskOrEmpty(encryption, assignment.HeadersOverridesEncrypted),
+            HasEnvOverrides: !string.IsNullOrWhiteSpace(assignment.EnvOverridesEncrypted),
+            HasHeadersOverrides: !string.IsNullOrWhiteSpace(assignment.HeadersOverridesEncrypted),
+            AllowedTools: McpControllerHelpers.ParseNullableStringList(assignment.AllowedToolsJson),
+            BlockedTools: McpControllerHelpers.ParseNullableStringList(assignment.BlockedToolsJson),
+            AssignedAt: assignment.AssignedAt,
+            UpdatedAt: assignment.UpdatedAt
+        );
     }
 
     private async Task<Agent> EnsureDriverExistsAsync(string driverId)
@@ -792,7 +1209,12 @@ public class PersonasController(
     private static string? NormalizeOptional(string? val) =>
         string.IsNullOrWhiteSpace(val) ? null : val.Trim();
 
-    public static PersonaDto ToDto(Persona p, Agent? driver, int sessionCount, ICredentialEncryptionService? encryption = null)
+    public static PersonaDto ToDto(
+        Persona p,
+        Agent? driver,
+        int sessionCount,
+        ICredentialEncryptionService? encryption = null,
+        int mcpServerCount = 0)
     {
         var hasToken = !string.IsNullOrWhiteSpace(p.GitHubTokenEncrypted);
         string? preview = null;
@@ -826,7 +1248,8 @@ public class PersonasController(
             HasGitHubToken: hasToken,
             GitHubTokenPreview: preview,
             GitAuthorName: p.GitAuthorName,
-            GitAuthorEmail: p.GitAuthorEmail
+            GitAuthorEmail: p.GitAuthorEmail,
+            McpServerCount: mcpServerCount
         );
     }
 }
@@ -887,5 +1310,54 @@ public record PersonaDto(
     bool HasGitHubToken = false,
     string? GitHubTokenPreview = null,
     string? GitAuthorName = null,
-    string? GitAuthorEmail = null
+    string? GitAuthorEmail = null,
+    int McpServerCount = 0
+);
+
+public record AssignPersonaMcpServerRequest(
+    string McpServerId,
+    bool Enabled = true,
+    Dictionary<string, string>? EnvOverrides = null,
+    Dictionary<string, string>? HeadersOverrides = null,
+    List<string>? AllowedTools = null,
+    List<string>? BlockedTools = null
+);
+
+public record UpsertPersonaMcpServerRequest(
+    bool? Enabled = null,
+    Dictionary<string, string>? EnvOverrides = null,
+    Dictionary<string, string>? HeadersOverrides = null,
+    bool MergeEnvOverrides = false,
+    bool MergeHeadersOverrides = false,
+    List<string>? RemoveEnvOverrideKeys = null,
+    List<string>? RemoveHeaderOverrideKeys = null,
+    List<string>? AllowedTools = null,
+    List<string>? BlockedTools = null,
+    bool ClearAllowedTools = false,
+    bool ClearBlockedTools = false
+);
+
+public record PersonaMcpServerDto(
+    string PersonaId,
+    string McpServerId,
+    string McpServerName,
+    string McpServerDescription,
+    McpTransportType Transport,
+    string? Command,
+    List<string> Args,
+    string? Url,
+    bool ServerEnabled,
+    bool Enabled,
+    bool EffectiveEnabled,
+    int TimeoutSeconds,
+    Dictionary<string, string> ServerEnvMasked,
+    Dictionary<string, string> ServerHeadersMasked,
+    Dictionary<string, string> EnvOverridesMasked,
+    Dictionary<string, string> HeadersOverridesMasked,
+    bool HasEnvOverrides,
+    bool HasHeadersOverrides,
+    List<string>? AllowedTools,
+    List<string>? BlockedTools,
+    DateTimeOffset AssignedAt,
+    DateTimeOffset UpdatedAt
 );

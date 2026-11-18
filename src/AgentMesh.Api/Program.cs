@@ -145,7 +145,9 @@ builder.Services.AddSeaweedS3Storage(builder.Configuration);
 // The durable workspace state is what makes handoff work across machines: a runner's local
 // directory is a cache, so anything not saved here is treated as lost when the next persona starts.
 builder.Services.Configure<JobHandoffOptions>(builder.Configuration.GetSection(JobHandoffOptions.SectionName));
+builder.Services.AddSingleton<IProjectWorkspaceSetup, ProjectWorkspaceSetup>();
 builder.Services.AddScoped<IJobWorkspaceService, JobWorkspaceService>();
+builder.Services.AddScoped<IPersonaMcpResolver, PersonaMcpResolver>();
 builder.Services.AddScoped<JobTurnDispatcher>();
 builder.Services.AddScoped<IJobHandoffService, JobHandoffService>();
 builder.Services.AddHostedService<JobHandoffReaper>();

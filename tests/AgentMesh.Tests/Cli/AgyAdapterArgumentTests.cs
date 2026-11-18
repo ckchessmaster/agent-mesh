@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Enums;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 using FluentAssertions;
 
@@ -264,5 +267,79 @@ public class AgyAdapterArgumentTests
         using var subDoc = System.Text.Json.JsonDocument.Parse("""{"Role":"Codebase Researcher","TypeName":"research"}""");
         AgyAdapter.FormatAgyToolSummary("invoke_subagent", subDoc.RootElement)
             .Should().Be("Invoking subagent: Codebase Researcher");
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WithMcpServers_StagesAndRestoresAgyMcpConfigWithoutLeakingSecrets()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"agy-mcp-e2e-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var fakeHome = Path.Combine(tempRoot, "home");
+        Directory.CreateDirectory(fakeHome);
+        var capturedConfigPath = Path.Combine(tempRoot, "captured-mcp-config.json");
+        var fakeAgy = Path.Combine(tempRoot, "fake-agy.sh");
+
+        var mcpConfigPath = Path.Combine(fakeHome, ".gemini", "config", "mcp_config.json");
+        var script = $$$"""
+            #!/usr/bin/env bash
+            cp "{{{mcpConfigPath}}}" "{{{capturedConfigPath}}}"
+            echo '{"event":"init","conversation_id":"conv-mcp-1"}'
+            echo '{"event":"result","result":{"response":"Agy saw MCP config."}}'
+            """;
+        await File.WriteAllTextAsync(fakeAgy, script);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(fakeAgy, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        try
+        {
+            AgyAdapter.HomeDirectoryForTest = fakeHome;
+            var adapter = new AgyAdapter();
+            var preset = new AgentPresetConfig { Id = "agy-mcp", AdapterType = "agy", Command = fakeAgy };
+            var promptEvent = new PromptReceivedEvent
+            {
+                SessionId = Guid.NewGuid(),
+                WorkingDirectory = tempRoot,
+                Prompt = "Check docs",
+                McpServers =
+                [
+                    new ResolvedMcpServerConfig
+                    {
+                        Id = "context7",
+                        Name = "Context7",
+                        Transport = McpTransportType.Http,
+                        Url = "https://mcp.context7.com/mcp",
+                        Headers = new Dictionary<string, string> { ["Authorization"] = "Bearer agy_e2e_secret" },
+                        AllowedTools = ["query-docs"]
+                    }
+                ]
+            };
+
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEvent, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            File.Exists(capturedConfigPath).Should().BeTrue();
+            File.Exists(mcpConfigPath).Should().BeFalse("ephemeral mcp_config.json must be cleaned up after agy exits");
+
+            using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(capturedConfigPath));
+            var ctx = doc.RootElement.GetProperty("mcpServers").GetProperty("context7");
+            ctx.GetProperty("serverUrl").GetString().Should().Be("https://mcp.context7.com/mcp");
+            ctx.GetProperty("headers").GetProperty("Authorization").GetString().Should().Be("Bearer agy_e2e_secret");
+            ctx.GetProperty("enabledTools").EnumerateArray().Select(e => e.GetString()).Should().Equal("query-docs");
+
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Provisioned 1 MCP server(s) for agy"));
+            events.Should().Contain(e => e.EventType == "response" && e.Content == "Agy saw MCP config.");
+            string.Join("\n", events.Select(e => e.Content)).Should().NotContain("agy_e2e_secret");
+        }
+        finally
+        {
+            AgyAdapter.HomeDirectoryForTest = null;
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
     }
 }

@@ -9,7 +9,9 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using ModelContextProtocol.Client;
 
 namespace AgentMesh.Cli.Adapters;
 
@@ -45,6 +47,13 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     /// Args: (toolName, argsJson, sessionId, personaId, agentId, ct).
     /// </summary>
     public static Func<string, string, Guid?, string?, string?, CancellationToken, Task<string>>? PlatformToolExecutor { get; set; }
+
+    internal static Func<ResolvedMcpServerConfig, string?, IClientTransport?>? McpTransportFactoryForTest { get; set; }
+
+    internal static void ResetMcpTransportFactoryForTest()
+    {
+        McpTransportFactoryForTest = null;
+    }
 
     public static string HistoryDirectoryPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -1057,6 +1066,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
+
+        await using var mcpManager = (!isDirectMode && promptEvent.McpServers is { Count: > 0 })
+            ? await ConnectMcpServersAsync(promptEvent.McpServers, preset, cwd, onEvent, ct)
+            : null;
+
         // Tool schema is FROZEN across phases: the definition array sits inside the cached
         // system prefix, so swapping it at every stage transition busts the very prefix the
         // layers-1-5 prompt stack exists to keep warm — and mid-session tool-set churn also
@@ -1064,7 +1078,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         // executor (ExecuteToolLocallyRawAsync blocks write/edit/git-mutation/PR during
         // discovery with instructive errors), which is both cache-stable and teaches the model
         // why a call was refused instead of silently hiding the capability.
-        var toolsDefinition = isDirectMode ? null : GetToolDefinitions();
+        var toolsDefinition = isDirectMode
+            ? null
+            : GetToolDefinitions(mcpManager?.GetOpenAiToolDefinitions());
 
         // Compaction: summarize older turns with the model (lossy fallback to truncation), then persist.
         async Task<(bool Changed, bool Summarized)> CompactAsync(int target, bool aggressive)
@@ -1608,7 +1624,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
 
                     // Normal tool execution
-                    var summary = FormatToolSummary(toolName, toolArgs);
+                    var summary = FormatToolSummary(toolName, toolArgs, mcpManager);
                     lastActionSummary = summary;
                     TrackToolActivity(toolName, toolArgs, filesInspected, filesModified, commandsRun);
                     await onEvent(new TrajectoryEventPayload
@@ -1619,28 +1635,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         ToolArgsJson = toolArgs
                     });
 
-                    // Command budget, not the HTTP handshake budget: ResolveTimeoutSeconds falls back to
-                    // 600s, which would mean a wedged test runner holds a worker for ten minutes and the
-                    // 180s sandbox default never applies.
-                    var toolTimeout = ResolveCommandTimeoutSeconds(preset);
-                    var toolResult = await ExecuteToolLocallyAsync(
+                    var toolResult = await ExecuteBridgedOrLocalToolAsync(
                         toolName,
                         toolArgs,
                         cwd,
-                        ct,
-                        toolTimeout,
-                        promptEvent.SessionId,
+                        mcpManager,
+                        preset,
+                        promptEvent,
                         callId,
-                        onOutputChunk: async (chunk) =>
-                        {
-                            if (CommandOutputBroadcaster != null)
-                            {
-                                try { await CommandOutputBroadcaster(promptEvent.SessionId, callId, chunk); } catch { }
-                            }
-                        },
-                        personaId: promptEvent.PersonaId,
-                        agentId: promptEvent.AgentId,
-                        isDiscoveryPhase: isDiscoveryPhase);
+                        isDiscoveryPhase,
+                        ct);
                     ct.ThrowIfCancellationRequested();
 
                     await onEvent(new TrajectoryEventPayload
@@ -1752,7 +1756,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                 // Differentiated step budget: pure read-only turns increment step budget every 2 turns,
                 // while mutating commands increment every turn.
-                bool isPureReadOnlyTurn = executedToolCalls.All(c => IsReadOnlyTool(c.Function.Name, c.Function.Arguments));
+                bool isPureReadOnlyTurn = executedToolCalls.All(c => IsReadOnlyTool(c.Function.Name, c.Function.Arguments, mcpManager));
                 if (isPureReadOnlyTurn)
                 {
                     readOnlyStreak++;
@@ -1799,7 +1803,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     return;
                 }
 
-                var summary = FormatToolSummary(fbName, fbArgs ?? "{}");
+                var summary = FormatToolSummary(fbName, fbArgs ?? "{}", mcpManager);
                 lastActionSummary = summary;
                 TrackToolActivity(fbName, fbArgs ?? "{}", filesInspected, filesModified, commandsRun);
                 await onEvent(new TrajectoryEventPayload
@@ -1810,25 +1814,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     ToolArgsJson = fbArgs
                 });
 
-                // Command budget, not the HTTP handshake budget: ResolveTimeoutSeconds falls back to 600s,
-                // which would mean a wedged test runner holds a worker for ten minutes and the 180s sandbox
-                // default never applies.
-                var toolTimeout = ResolveCommandTimeoutSeconds(preset);
-                var toolResult = await ExecuteToolLocallyAsync(
+                var toolResult = await ExecuteBridgedOrLocalToolAsync(
                     fbName,
                     fbArgs ?? "{}",
                     cwd,
-                    ct,
-                    toolTimeout,
-                    promptEvent.SessionId,
+                    mcpManager,
+                    preset,
+                    promptEvent,
                     "fallback-command",
-                    onOutputChunk: async (chunk) =>
-                    {
-                        if (CommandOutputBroadcaster != null)
-                        {
-                            try { await CommandOutputBroadcaster(promptEvent.SessionId, "fallback-command", chunk); } catch { }
-                        }
-                    });
+                    isDiscoveryPhase,
+                    ct);
 
                 await onEvent(new TrajectoryEventPayload
                 {
@@ -2175,6 +2170,76 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
     }
 
+    private static async Task<McpClientManager> ConnectMcpServersAsync(
+        IReadOnlyList<ResolvedMcpServerConfig> servers,
+        AgentPresetConfig preset,
+        string cwd,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        var manager = await McpClientManager.CreateAsync(servers, cwd, McpTransportFactoryForTest, ct);
+        foreach (var diag in manager.Diagnostics.Where(d => !d.Connected))
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[@{preset.Id}] Warning: MCP server '{diag.ServerName}' ({diag.ServerId}) failed to connect: {diag.ErrorMessage}"
+            });
+        }
+
+        var connectedCount = manager.Diagnostics.Count(d => d.Connected);
+        if (connectedCount > 0 || manager.Tools.Count > 0)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[@{preset.Id}] Connected {connectedCount}/{manager.Diagnostics.Count} MCP server(s); bridged {manager.Tools.Count} MCP tool(s)."
+            });
+        }
+
+        return manager;
+    }
+
+    private static async Task<string> ExecuteBridgedOrLocalToolAsync(
+        string toolName,
+        string argsJson,
+        string cwd,
+        McpClientManager? mcpManager,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        string commandId,
+        bool isDiscoveryPhase,
+        CancellationToken ct)
+    {
+        if (mcpManager != null && mcpManager.HasTool(toolName))
+        {
+            return await mcpManager.CallToolAsync(toolName, argsJson, ct);
+        }
+
+        // Command budget, not the HTTP handshake budget: ResolveTimeoutSeconds falls back to
+        // 600s, which would mean a wedged test runner holds a worker for ten minutes and the
+        // 180s sandbox default never applies.
+        var toolTimeout = ResolveCommandTimeoutSeconds(preset);
+        return await ExecuteToolLocallyAsync(
+            toolName,
+            argsJson,
+            cwd,
+            ct,
+            toolTimeout,
+            promptEvent.SessionId,
+            commandId,
+            onOutputChunk: async (chunk) =>
+            {
+                if (CommandOutputBroadcaster != null)
+                {
+                    try { await CommandOutputBroadcaster(promptEvent.SessionId, commandId, chunk); } catch { }
+                }
+            },
+            personaId: promptEvent.PersonaId,
+            agentId: promptEvent.AgentId,
+            isDiscoveryPhase: isDiscoveryPhase);
+    }
+
     private static string BuildSystemPrompt(AgentPresetConfig preset, PromptReceivedEvent promptEvent, string cwd)
     {
         var sb = new StringBuilder();
@@ -2222,7 +2287,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return sb.ToString();
     }
 
-    public static List<object> GetToolDefinitions()
+    public static List<object> GetToolDefinitions() => GetToolDefinitions(extraTools: null);
+
+    public static List<object> GetToolDefinitions(IEnumerable<object>? extraTools)
     {
         var tools = new List<object>
         {
@@ -2498,6 +2565,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                 }
             });
+        }
+
+        if (extraTools != null)
+        {
+            tools.AddRange(extraTools);
         }
 
         return tools;
@@ -2866,8 +2938,13 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
     }
 
-    private static string FormatToolSummary(string toolName, string argsJson)
+    private static string FormatToolSummary(string toolName, string argsJson, McpClientManager? mcpManager = null)
     {
+        if (mcpManager != null && mcpManager.TryGetTool(toolName, out var bridgedTool))
+        {
+            return $"MCP ({bridgedTool!.ServerName}): {bridgedTool.OriginalName}";
+        }
+
         try
         {
             using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
@@ -2952,9 +3029,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return Regex.IsMatch(trimmed, @"\b(?:git\s+(?:commit|push|merge|rebase|cherry-pick)|gh\s+pr\s+create)\b", RegexOptions.IgnoreCase);
     }
 
-    internal static bool IsReadOnlyTool(string? toolName, string? argsJson)
+    internal static bool IsReadOnlyTool(string? toolName, string? argsJson, McpClientManager? mcpManager = null)
     {
         if (string.IsNullOrWhiteSpace(toolName)) return true;
+        if (mcpManager != null && mcpManager.TryGetTool(toolName, out var bridgedTool))
+        {
+            return bridgedTool!.IsReadOnly;
+        }
+
         var name = toolName.Trim().ToLowerInvariant();
         if (name is "read_file" or "view_file" or "ask_question" or "save_memory" or "list_memories" or "search_memory") return true;
         if (name is "manage_task")

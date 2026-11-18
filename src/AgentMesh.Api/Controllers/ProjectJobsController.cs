@@ -122,7 +122,8 @@ public class ProjectJobsController(
     IStorageService? storageService = null,
     IWorkflowSignalRouter? workflows = null,
     ILogger<ProjectJobsController>? logger = null,
-    JobTurnDispatcher? turns = null) : ControllerBase
+    JobTurnDispatcher? turns = null,
+    ICredentialEncryptionService? encryptionService = null) : ControllerBase
 {
     private readonly IWorkflowSignalRouter? _workflows = workflows;
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -554,7 +555,7 @@ public class ProjectJobsController(
         var dispatched = false;
         if (movedTurnCount > 0 && toPersonaId != null)
         {
-            await CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, toPersonaId);
+            await CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, toPersonaId, encryptionService);
             var stillParked = ParseQueuedTurns(job.QueuedTurnsJson);
             dispatched = movedTurnIds.All(turnId => stillParked.All(t => t.Id != turnId));
         }
@@ -1897,7 +1898,8 @@ public class ProjectJobsController(
     public static async Task CheckAndDispatchQueuedJobTurnsAsync(
         AgentMeshDbContext db,
         IHubContext<AgentMeshHub>? hubContext,
-        string personaId)
+        string personaId,
+        ICredentialEncryptionService? encryptionService = null)
     {
         if (string.IsNullOrWhiteSpace(personaId)) return;
         var normPersonaId = personaId.Trim().ToLowerInvariant();
@@ -1956,6 +1958,8 @@ public class ProjectJobsController(
         }
 
         if (availableSlots <= 0) return;
+
+        var mcpServers = await PersonaMcpResolver.ResolveForPersonaAsync(db, persona.Id, encryptionService);
 
         foreach (var (job, turnToDispatch) in orderedTurns)
         {
@@ -2035,34 +2039,8 @@ public class ProjectJobsController(
                 db, project.Id, turnSessionId, combinedAttachments, project.ProjectInstructions);
             combinedAttachments = library.Attachments.ToList();
 
-            var resolvedWorkingDir = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
-                ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
-                : project.GetResolvedWorkingDirectory();
-
-            var turnMetadata = new Dictionary<string, object?>
-            {
-                ["jobId"] = job.Id.ToString(),
-                ["projectId"] = project.Id,
-                ["projectName"] = project.Name,
-                ["repositoryName"] = project.RepositoryName,
-                ["workingDirectory"] = resolvedWorkingDir,
-                ["workspaceType"] = project.WorkspaceType.ToString(),
-                ["gitBranch"] = job.GitBranchName,
-                ["gitUrl"] = project.GitRepositoryUrl,
-                ["gitBaseBranch"] = project.GitBaseBranch,
-                ["s3ArchiveKey"] = job.S3ArchiveKey,
-                ["projectInstructions"] = project.ProjectInstructions,
-                ["personaId"] = persona.Id,
-                ["personaName"] = persona.Name,
-                ["personaRole"] = persona.Role,
-                ["personaPrompt"] = persona.PersonaPrompt,
-                ["model"] = persona.DefaultModel,
-                ["effort"] = persona.DefaultEffort,
-                ["mode"] = persona.DefaultMode,
-                ["tier"] = persona.DefaultTier,
-                ["contextSize"] = persona.DefaultContextSize,
-                ["attachments"] = combinedAttachments
-            };
+            var turnMetadata = JobTurnDispatcher.BuildTurnMetadata(
+                job, project, persona, combinedAttachments);
 
             var turnSession = new AgentSession
             {
@@ -2137,36 +2115,22 @@ public class ProjectJobsController(
 
             if (hubContext != null)
             {
-                var promptPayload = new
-                {
-                    sessionId = turnSession.Id,
-                    messageId = promptMsg.Id,
-                    agentId = driverId,
-                    driverId = driverId,
-                    personaId = persona.Id,
-                    personaName = persona.Name,
-                    personaRole = persona.Role,
-                    personaPrompt = persona.PersonaPrompt,
-                    prompt = promptMsg.Content,
-                    sender = promptMsg.SenderAgentId,
-                    model = persona.DefaultModel,
-                    effort = persona.DefaultEffort,
-                    mode = persona.DefaultMode,
-                    tier = persona.DefaultTier,
-                    contextSize = persona.DefaultContextSize,
-                    jobId = job.Id,
-                    projectId = project.Id,
-                    repositoryName = project.RepositoryName,
-                    workingDirectory = resolvedWorkingDir,
-                    gitBranch = job.GitBranchName,
-                    createdAt = promptMsg.CreatedAt,
-                    attachments = combinedAttachments
-                };
+                var targetedPayload = JobTurnDispatcher.BuildPromptReceivedPayload(
+                    turnSession, promptMsg, driverId, persona, job, project, promptMsg.Content, combinedAttachments,
+                    mcpServers: mcpServers);
+                var broadcastPayload = JobTurnDispatcher.BuildPromptReceivedPayload(
+                    turnSession, promptMsg, driverId, persona, job, project, promptMsg.Content, combinedAttachments,
+                    mcpServers: null);
 
+                var personaGroup = hubContext.Clients?.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}");
+                if (personaGroup != null)
+                {
+                    await personaGroup.SendAsync("PromptReceived", targetedPayload);
+                }
                 var group = hubContext.Clients?.Group($"agent-{driverId}");
                 if (group != null)
                 {
-                    await group.SendAsync("PromptReceived", promptPayload);
+                    await group.SendAsync("PromptReceived", targetedPayload);
                 }
                 var jobGroup = hubContext.Clients?.Group($"job-{job.Id}");
                 if (jobGroup != null)
@@ -2175,7 +2139,7 @@ public class ProjectJobsController(
                 }
                 if (hubContext.Clients?.All != null)
                 {
-                    await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                    await hubContext.Clients.All.SendAsync("PromptReceived", broadcastPayload);
                     var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == job.Id.ToString());
                     var jobDto = ToDto(job, project.Name, cardCount);
                     await hubContext.Clients.All.SendAsync("JobUpdated", jobDto);

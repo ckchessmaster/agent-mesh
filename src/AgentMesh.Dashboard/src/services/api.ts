@@ -12,6 +12,9 @@ import type {
   PersonaAuthStartResult,
   PersonaAuthSubmitResult,
   Project,
+  CreateProjectRequest,
+  UpdateProjectRequest,
+  ProjectWorkspaceSetupResult,
   ProjectJob,
   ProjectDocument,
   ProjectPersonaSummary,
@@ -40,9 +43,16 @@ import type {
   PrReviewDecisionPayload,
   AbortTurnRequest,
   InterventionRequest,
-  JobRecoveryResponse
+  JobRecoveryResponse,
+  McpServer,
+  McpTransportType,
+  CreateMcpServerRequest,
+  UpdateMcpServerRequest,
+  PersonaMcpServer,
+  AssignPersonaMcpServerRequest,
+  UpsertPersonaMcpServerRequest
 } from '../types';
-import { JobFileChangeStatus } from '../types';
+import { JobFileChangeStatus, McpTransportType as McpTransportValues } from '../types';
 
 let tokenProvider: (() => string | null) | null = null;
 let unauthorizedHandler: (() => void | Promise<void>) | null = null;
@@ -148,7 +158,27 @@ const mapJobArtifact = (item: any): JobArtifact => {
   };
 };
 
-const mapProjectDocument = (item: any): ProjectDocument => {  const id = item?.id || item?.Id || '';  const projectId = item?.projectId || item?.ProjectId || '';
+/**
+ * Normalizes `ProjectWorkspaceSetupResponseDto` payloads across camelCase and PascalCase serializers.
+ */
+const mapProjectWorkspaceSetupResult = (item: any): ProjectWorkspaceSetupResult => ({
+  projectId: item?.projectId ?? item?.ProjectId ?? '',
+  success: Boolean(item?.success ?? item?.Success),
+  targetDirectory: item?.targetDirectory ?? item?.TargetDirectory ?? '',
+  effectiveDirectory: item?.effectiveDirectory ?? item?.EffectiveDirectory ?? '',
+  outcome: item?.outcome ?? item?.Outcome ?? 'Failed',
+  usedFallback: Boolean(item?.usedFallback ?? item?.UsedFallback),
+  createdFiles: Boolean(item?.createdFiles ?? item?.CreatedFiles),
+  message: item?.message ?? item?.Message ?? '',
+  warnings: Array.isArray(item?.warnings)
+    ? item.warnings
+    : (Array.isArray(item?.Warnings) ? item.Warnings : []),
+  error: item?.error ?? item?.Error ?? null
+});
+
+const mapProjectDocument = (item: any): ProjectDocument => {
+  const id = item?.id || item?.Id || '';
+  const projectId = item?.projectId || item?.ProjectId || '';
   const fileName = item?.fileName || item?.FileName || null;
   const downloadUrl = item?.downloadUrl || item?.DownloadUrl
     || (id && projectId
@@ -309,6 +339,84 @@ const mapJobChangePatch = (item: any): JobChangePatch => ({
   deletions: readInt(item, 'deletions', 'Deletions'),
   contextLines: readInt(item, 'contextLines', 'ContextLines') ?? 3,
   source: item?.source || item?.Source ? mapJobChangeSource(item?.source ?? item?.Source) : null,
+});
+
+const normalizeMcpTransport = (raw: unknown): McpTransportType => {
+  if (typeof raw === 'number') {
+    if (raw === 1) return McpTransportValues.Http;
+    if (raw === 2) return McpTransportValues.Sse;
+    return McpTransportValues.Stdio;
+  }
+  if (typeof raw === 'string') {
+    const lower = raw.trim().toLowerCase();
+    if (lower === 'http') return McpTransportValues.Http;
+    if (lower === 'sse') return McpTransportValues.Sse;
+    if (lower === 'stdio') return McpTransportValues.Stdio;
+    if (raw.trim().length > 0) return raw.trim();
+  }
+  return McpTransportValues.Stdio;
+};
+
+const readStringRecord = (item: any, camel: string, pascal: string): Record<string, string> => {
+  const value = item?.[camel] ?? item?.[pascal];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const result: Record<string, string> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (typeof v === 'string') {
+      result[k] = v;
+    } else if (v !== null && v !== undefined) {
+      result[k] = String(v);
+    }
+  }
+  return result;
+};
+
+export const mapMcpServer = (item: any): McpServer => ({
+  id: readStr(item, 'id', 'Id') ?? '',
+  name: readStr(item, 'name', 'Name') ?? '',
+  description: typeof item?.description === 'string'
+    ? item.description
+    : (typeof item?.Description === 'string' ? item.Description : ''),
+  transport: normalizeMcpTransport(item?.transport ?? item?.Transport),
+  command: readStr(item, 'command', 'Command'),
+  args: readStrList(item, 'args', 'Args') ?? [],
+  url: readStr(item, 'url', 'Url'),
+  envMasked: readStringRecord(item, 'envMasked', 'EnvMasked'),
+  headersMasked: readStringRecord(item, 'headersMasked', 'HeadersMasked'),
+  hasEnv: readBool(item, 'hasEnv', 'HasEnv'),
+  hasHeaders: readBool(item, 'hasHeaders', 'HasHeaders'),
+  enabled: item?.enabled ?? item?.Enabled ?? true,
+  timeoutSeconds: readInt(item, 'timeoutSeconds', 'TimeoutSeconds') ?? 30,
+  assignedPersonaCount: readInt(item, 'assignedPersonaCount', 'AssignedPersonaCount') ?? 0,
+  createdAt: readStr(item, 'createdAt', 'CreatedAt') ?? new Date().toISOString(),
+  updatedAt: readStr(item, 'updatedAt', 'UpdatedAt') ?? new Date().toISOString()
+});
+
+export const mapPersonaMcpServer = (item: any): PersonaMcpServer => ({
+  personaId: readStr(item, 'personaId', 'PersonaId') ?? '',
+  mcpServerId: readStr(item, 'mcpServerId', 'McpServerId') ?? '',
+  mcpServerName: readStr(item, 'mcpServerName', 'McpServerName') ?? '',
+  mcpServerDescription: typeof item?.mcpServerDescription === 'string'
+    ? item.mcpServerDescription
+    : (typeof item?.McpServerDescription === 'string' ? item.McpServerDescription : ''),
+  transport: normalizeMcpTransport(item?.transport ?? item?.Transport),
+  command: readStr(item, 'command', 'Command'),
+  args: readStrList(item, 'args', 'Args') ?? [],
+  url: readStr(item, 'url', 'Url'),
+  serverEnabled: item?.serverEnabled ?? item?.ServerEnabled ?? true,
+  enabled: item?.enabled ?? item?.Enabled ?? true,
+  effectiveEnabled: item?.effectiveEnabled ?? item?.EffectiveEnabled ?? false,
+  timeoutSeconds: readInt(item, 'timeoutSeconds', 'TimeoutSeconds') ?? 30,
+  serverEnvMasked: readStringRecord(item, 'serverEnvMasked', 'ServerEnvMasked'),
+  serverHeadersMasked: readStringRecord(item, 'serverHeadersMasked', 'ServerHeadersMasked'),
+  envOverridesMasked: readStringRecord(item, 'envOverridesMasked', 'EnvOverridesMasked'),
+  headersOverridesMasked: readStringRecord(item, 'headersOverridesMasked', 'HeadersOverridesMasked'),
+  hasEnvOverrides: readBool(item, 'hasEnvOverrides', 'HasEnvOverrides'),
+  hasHeadersOverrides: readBool(item, 'hasHeadersOverrides', 'HasHeadersOverrides'),
+  allowedTools: readStrList(item, 'allowedTools', 'AllowedTools'),
+  blockedTools: readStrList(item, 'blockedTools', 'BlockedTools'),
+  assignedAt: readStr(item, 'assignedAt', 'AssignedAt') ?? new Date().toISOString(),
+  updatedAt: readStr(item, 'updatedAt', 'UpdatedAt') ?? new Date().toISOString()
 });
 
 const getAuthHeadersOnly = (): Record<string, string> => {
@@ -1052,47 +1160,47 @@ export const api = {
     return res.json();
   },
 
-  async createProject(req: {
-    name: string;
-    id?: string;
-    description?: string;
-    workspaceType?: number;
-    gitRepositoryUrl?: string;
-    gitBaseBranch?: string;
-    s3BucketName?: string;
-    s3PrefixKey?: string;
-    projectInstructions?: string;
-    defaultLeadPersonaId?: string;
-    allowedPersonaIds?: string[];
-  }): Promise<Project> {
+  async createProject(req: CreateProjectRequest): Promise<Project> {
     const res = await apiFetch('/api/projects', {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify(req)
     });
-    if (!res.ok) throw new Error(`Failed to create project: ${res.statusText}`);
+    if (!res.ok) throw new Error(await readApiErrorMessage(res, 'Failed to create project'));
     return res.json();
   },
 
-  async updateProject(id: string, req: {
-    name?: string;
-    description?: string;
-    workspaceType?: number;
-    gitRepositoryUrl?: string;
-    gitBaseBranch?: string;
-    s3BucketName?: string;
-    s3PrefixKey?: string;
-    projectInstructions?: string;
-    defaultLeadPersonaId?: string;
-    allowedPersonaIds?: string[];
-  }): Promise<Project> {
+  async updateProject(id: string, req: UpdateProjectRequest): Promise<Project> {
     const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(req)
     });
-    if (!res.ok) throw new Error(`Failed to update project: ${res.statusText}`);
+    if (!res.ok) throw new Error(await readApiErrorMessage(res, 'Failed to update project'));
     return res.json();
+  },
+
+  async setupProjectWorkspace(
+    id: string,
+    options?: { fallbackDirectory?: string }
+  ): Promise<ProjectWorkspaceSetupResult> {
+    const fallback = options?.fallbackDirectory?.trim();
+    const query = fallback ? `?fallbackDirectory=${encodeURIComponent(fallback)}` : '';
+    const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/setup${query}`, {
+      method: 'POST',
+      headers: getHeaders()
+    });
+    const raw = await res.json().catch(() => null);
+    if (!res.ok) {
+      // 422 UnprocessableEntity carries a structured ProjectWorkspaceSetupResponseDto with warnings
+      // and targetDirectory; return it so the modal can render full diagnostics rather than losing fields.
+      if (raw && typeof raw === 'object' && ('outcome' in raw || 'Outcome' in raw) && ('projectId' in raw || 'ProjectId' in raw)) {
+        return mapProjectWorkspaceSetupResult(raw);
+      }
+      const detail = raw?.error ?? raw?.Error ?? raw?.message ?? raw?.Message ?? res.statusText;
+      throw new Error(`Failed to setup project workspace: ${detail}`);
+    }
+    return mapProjectWorkspaceSetupResult(raw);
   },
 
   async deleteProject(id: string): Promise<{ status: string; id: string; deletedJobsCount: number }> {
@@ -1746,6 +1854,140 @@ export const api = {
     if (!res.ok) {
       throw new Error(await readApiErrorMessage(res, 'Failed to submit intervention'));
     }
+  },
+
+  async getMcpServers(options?: { enabled?: boolean; transport?: McpTransportType }): Promise<McpServer[]> {
+    const params = new URLSearchParams();
+    if (typeof options?.enabled === 'boolean') params.append('enabled', String(options.enabled));
+    if (options?.transport) params.append('transport', String(options.transport));
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await apiFetch(`/api/mcp-servers${query}`, { headers: getHeaders() });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load MCP servers'));
+    }
+    const items = await res.json();
+    return Array.isArray(items) ? items.map(mapMcpServer) : [];
+  },
+
+  async getMcpServer(id: string): Promise<McpServer> {
+    const res = await apiFetch(`/api/mcp-servers/${encodeURIComponent(id)}`, { headers: getHeaders() });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load MCP server'));
+    }
+    return mapMcpServer(await res.json());
+  },
+
+  async createMcpServer(req: CreateMcpServerRequest): Promise<McpServer> {
+    const res = await apiFetch('/api/mcp-servers', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to create MCP server'));
+    }
+    return mapMcpServer(await res.json());
+  },
+
+  async updateMcpServer(id: string, req: UpdateMcpServerRequest): Promise<McpServer> {
+    const res = await apiFetch(`/api/mcp-servers/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to update MCP server'));
+    }
+    return mapMcpServer(await res.json());
+  },
+
+  async deleteMcpServer(id: string): Promise<{ status: string; id: string; unassignedPersonaCount: number }> {
+    const res = await apiFetch(`/api/mcp-servers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to delete MCP server'));
+    }
+    return res.json();
+  },
+
+  async getPersonaMcpServers(personaId: string): Promise<PersonaMcpServer[]> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/mcp-servers`, {
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load persona MCP servers'));
+    }
+    const items = await res.json();
+    return Array.isArray(items) ? items.map(mapPersonaMcpServer) : [];
+  },
+
+  async assignPersonaMcpServer(personaId: string, req: AssignPersonaMcpServerRequest): Promise<PersonaMcpServer> {
+    const res = await apiFetch(`/api/personas/${encodeURIComponent(personaId)}/mcp-servers`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to assign MCP server to persona'));
+    }
+    return mapPersonaMcpServer(await res.json());
+  },
+
+  async upsertPersonaMcpServer(
+    personaId: string,
+    serverId: string,
+    req: UpsertPersonaMcpServerRequest
+  ): Promise<PersonaMcpServer> {
+    const res = await apiFetch(
+      `/api/personas/${encodeURIComponent(personaId)}/mcp-servers/${encodeURIComponent(serverId)}`,
+      {
+        method: 'PUT',
+        headers: getHeaders(),
+        body: JSON.stringify(req)
+      }
+    );
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to save persona MCP server assignment'));
+    }
+    return mapPersonaMcpServer(await res.json());
+  },
+
+  async updatePersonaMcpServer(
+    personaId: string,
+    serverId: string,
+    req: UpsertPersonaMcpServerRequest
+  ): Promise<PersonaMcpServer> {
+    const res = await apiFetch(
+      `/api/personas/${encodeURIComponent(personaId)}/mcp-servers/${encodeURIComponent(serverId)}`,
+      {
+        method: 'PATCH',
+        headers: getHeaders(),
+        body: JSON.stringify(req)
+      }
+    );
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to update persona MCP server assignment'));
+    }
+    return mapPersonaMcpServer(await res.json());
+  },
+
+  async removePersonaMcpServer(
+    personaId: string,
+    serverId: string
+  ): Promise<{ status: string; personaId: string; mcpServerId: string }> {
+    const res = await apiFetch(
+      `/api/personas/${encodeURIComponent(personaId)}/mcp-servers/${encodeURIComponent(serverId)}`,
+      {
+        method: 'DELETE',
+        headers: getHeaders()
+      }
+    );
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to remove MCP server from persona'));
+    }
+    return res.json();
   }
 };
 

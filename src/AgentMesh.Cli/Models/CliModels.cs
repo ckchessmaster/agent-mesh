@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using AgentMesh.Cli.Adapters;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 
@@ -131,11 +132,23 @@ public class PromptReceivedEvent
     [JsonPropertyName("projectId")]
     public string? ProjectId { get; set; }
 
+    [JsonPropertyName("projectName")]
+    public string? ProjectName { get; set; }
+
+    [JsonPropertyName("projectDescription")]
+    public string? ProjectDescription { get; set; }
+
     [JsonPropertyName("repositoryName")]
     public string? RepositoryName { get; set; }
 
     [JsonPropertyName("gitBranch")]
     public string? GitBranch { get; set; }
+
+    [JsonPropertyName("gitUrl")]
+    public string? GitUrl { get; set; }
+
+    [JsonPropertyName("gitBaseBranch")]
+    public string? GitBaseBranch { get; set; }
 
     [JsonPropertyName("gitAuthorName")]
     public string? GitAuthorName { get; set; }
@@ -146,8 +159,14 @@ public class PromptReceivedEvent
     [JsonPropertyName("workspaceType")]
     public string? WorkspaceType { get; set; }
 
+    [JsonPropertyName("workspaceGitRemote")]
+    public string? WorkspaceGitRemote { get; set; }
+
     [JsonPropertyName("attachments")]
     public List<AttachmentItem>? Attachments { get; set; }
+
+    [JsonPropertyName("mcpServers")]
+    public List<ResolvedMcpServerConfig>? McpServers { get; set; }
 
     // NOTE: `ConversationId` is declared once above (next to `SessionId`). Both the main and the
     // v1.2.13-v1.2.15 lineages independently added this same property during the divergence; the
@@ -281,4 +300,16 @@ public record RemotePersonaDto(
     [property: JsonPropertyName("sessionCount")] int SessionCount = 0,
     [property: JsonPropertyName("defaultContextSize")] string? DefaultContextSize = null,
     [property: JsonPropertyName("maxConcurrentJobs")] int? MaxConcurrentJobs = null
+);
+
+public record RemoteProjectDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("description")] string Description = "",
+    [property: JsonPropertyName("workspaceType"), JsonConverter(typeof(JsonStringEnumConverter))] WorkspaceType? WorkspaceType = null,
+    [property: JsonPropertyName("gitRepositoryUrl")] string? GitRepositoryUrl = null,
+    [property: JsonPropertyName("gitBaseBranch")] string? GitBaseBranch = null,
+    [property: JsonPropertyName("repositoryName")] string? RepositoryName = null,
+    [property: JsonPropertyName("workingDirectory")] string? WorkingDirectory = null,
+    [property: JsonPropertyName("resolvedWorkingDirectory")] string? ResolvedWorkingDirectory = null
 );

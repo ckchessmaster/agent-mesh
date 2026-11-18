@@ -56,12 +56,38 @@ public record DispatchedJobTurn(AgentSession Session, SessionMessage PromptMessa
 /// where the work should live. Per-job workspaces are only safe if every dispatch path points the
 /// runner at the same directory, so the paths have to be one path.
 /// </summary>
-public class JobTurnDispatcher(
-    AgentMeshDbContext db,
-    IHubContext<AgentMeshHub>? hubContext = null,
-    IJobWorkspaceService? workspaces = null,
-    IPersonaContainerManager? containerManager = null)
+public class JobTurnDispatcher
 {
+    private readonly AgentMeshDbContext db;
+    private readonly IHubContext<AgentMeshHub>? hubContext;
+    private readonly IJobWorkspaceService? workspaces;
+    private readonly IPersonaContainerManager? containerManager;
+    private readonly ICredentialEncryptionService? encryptionService;
+
+    public JobTurnDispatcher(
+        AgentMeshDbContext db,
+        IHubContext<AgentMeshHub>? hubContext = null,
+        IJobWorkspaceService? workspaces = null,
+        IPersonaContainerManager? containerManager = null)
+        : this(db, hubContext, workspaces, containerManager, encryptionService: null)
+    {
+    }
+
+    [ActivatorUtilitiesConstructor]
+    public JobTurnDispatcher(
+        AgentMeshDbContext db,
+        IHubContext<AgentMeshHub>? hubContext,
+        IJobWorkspaceService? workspaces,
+        IPersonaContainerManager? containerManager,
+        ICredentialEncryptionService? encryptionService)
+    {
+        this.db = db;
+        this.hubContext = hubContext;
+        this.workspaces = workspaces;
+        this.containerManager = containerManager;
+        this.encryptionService = encryptionService;
+    }
+
     internal static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -143,44 +169,8 @@ public class JobTurnDispatcher(
             }
         }
 
-        var resolvedWorkingDirectory = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
-            ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
-            : project.GetResolvedWorkingDirectory();
-
-        var turnMetadata = new Dictionary<string, object?>
-        {
-            ["jobId"] = job.Id.ToString(),
-            ["taskId"] = req.TaskId,
-            ["projectId"] = project.Id,
-            ["projectName"] = project.Name,
-            ["repositoryName"] = project.RepositoryName,
-            ["workingDirectory"] = resolvedWorkingDirectory,
-            ["workspaceType"] = project.WorkspaceType.ToString(),
-            ["gitBranch"] = job.GitBranchName,
-            ["gitUrl"] = project.GitRepositoryUrl,
-            ["gitBaseBranch"] = project.GitBaseBranch,
-            ["s3ArchiveKey"] = job.S3ArchiveKey,
-            ["projectInstructions"] = project.ProjectInstructions,
-            ["personaId"] = persona.Id,
-            ["personaName"] = persona.Name,
-            ["personaRole"] = persona.Role,
-            ["personaPrompt"] = persona.PersonaPrompt,
-            ["gitAuthorName"] = persona.GitAuthorName,
-            ["gitAuthorEmail"] = persona.GitAuthorEmail,
-            ["model"] = persona.DefaultModel,
-            ["effort"] = persona.DefaultEffort,
-            ["mode"] = persona.DefaultMode,
-            ["tier"] = persona.DefaultTier,
-            ["contextSize"] = persona.DefaultContextSize,
-            ["attachments"] = attachments,
-            // Per-job workspace: the runner keys its checkout off jobId, not sessionId, so every
-            // persona on every machine converges on one durable tree for this job.
-            ["workspaceScope"] = "job",
-            ["workspaceGitRemote"] = hydration?.GitRemoteUrl ?? project.GitRepositoryUrl,
-            ["workspaceGitRef"] = hydration?.GitRef ?? job.GitBranchName,
-            ["workspaceHeadCommit"] = hydration?.HeadCommit,
-            ["workspaceBundleKey"] = hydration?.BundleS3Key
-        };
+        var turnMetadata = BuildTurnMetadata(
+            job, project, persona, attachments, hydration, req.TaskId);
 
         var turnSession = new AgentSession
         {
@@ -261,9 +251,12 @@ public class JobTurnDispatcher(
             }
         }
 
+        var mcpServers = await PersonaMcpResolver.ResolveForPersonaAsync(
+            db, persona.Id, encryptionService, ct);
+
         await BroadcastAsync(
             turnSession, promptMsg, driver, persona, job, project, promptWithContext, attachments,
-            hydration, ct, req.PromptStack);
+            hydration, ct, req.PromptStack, mcpServers);
 
         return new DispatchedJobTurn(turnSession, promptMsg, driver);
     }
@@ -295,62 +288,30 @@ public class JobTurnDispatcher(
         List<JobAttachmentDto> attachments,
         JobWorkspaceHydration? hydration,
         CancellationToken ct,
-        PromptStackWirePayload? promptStack = null)
+        PromptStackWirePayload? promptStack = null,
+        List<ResolvedMcpServerConfig>? mcpServers = null)
     {
         if (hubContext == null) return;
 
         var driverId = driver.Id;
-        var payload = new
-        {
-            sessionId = session.Id,
-            messageId = promptMsg.Id,
-            agentId = driverId,
-            driverId = driverId,
-            personaId = persona.Id,
-            personaName = persona.Name,
-            personaRole = persona.Role,
-            personaPrompt = persona.PersonaPrompt,
-            prompt,
-            // The layered stack, forwarded verbatim. A runner that receives it splits messages[0] and
-            // messages[1] from it; one that does not (older binary, or a dispatch path that has no
-            // composer) falls back to `prompt` plus its own locally built system prompt.
-            promptStack,
-            sender = promptMsg.SenderAgentId,
-            model = persona.DefaultModel,
-            effort = persona.DefaultEffort,
-            mode = persona.DefaultMode,
-            tier = persona.DefaultTier,
-            contextSize = persona.DefaultContextSize,
-            jobId = job.Id,
-            projectId = project.Id,
-            repositoryName = project.RepositoryName,
-            workingDirectory = !string.IsNullOrWhiteSpace(job.WorkingDirectory)
-                ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
-                : project.GetResolvedWorkingDirectory(),
-            gitBranch = job.GitBranchName,
-            gitAuthorName = persona.GitAuthorName,
-            gitAuthorEmail = persona.GitAuthorEmail,
-            createdAt = promptMsg.CreatedAt,
-            attachments,
-            workspaceScope = "job",
-            workspaceGitRemote = hydration?.GitRemoteUrl ?? project.GitRepositoryUrl,
-            workspaceGitRef = hydration?.GitRef ?? job.GitBranchName,
-            workspaceHeadCommit = hydration?.HeadCommit,
-            workspaceBundleKey = hydration?.BundleS3Key
-        };
+        var targetedPayload = BuildPromptReceivedPayload(
+            session, promptMsg, driverId, persona, job, project, prompt, attachments, hydration, promptStack, mcpServers);
+        // Never broadcast decrypted MCP secrets over Clients.All (browser dashboard clients listen there).
+        var broadcastPayload = BuildPromptReceivedPayload(
+            session, promptMsg, driverId, persona, job, project, prompt, attachments, hydration, promptStack, mcpServers: null);
 
         var personaGroup = hubContext.Clients.Group($"persona-{persona.Id.Trim().ToLowerInvariant()}");
         if (personaGroup != null)
         {
-            await personaGroup.SendAsync("PromptReceived", payload, ct);
+            await personaGroup.SendAsync("PromptReceived", targetedPayload, ct);
         }
 
         var group = hubContext.Clients.Group($"agent-{driverId}");
         if (group != null)
         {
-            await group.SendAsync("PromptReceived", payload, ct);
+            await group.SendAsync("PromptReceived", targetedPayload, ct);
         }
-        await hubContext.Clients.All.SendAsync("PromptReceived", payload, ct);
+        await hubContext.Clients.All.SendAsync("PromptReceived", broadcastPayload, ct);
 
         // Broadcast session lifecycle so dashboards reflect active turns in real-time
         var summary = new Controllers.SessionSummaryDto(
@@ -406,6 +367,118 @@ public class JobTurnDispatcher(
             db.Agents.Add(driver);
         }
         return driver;
+    }
+
+    internal static string ResolveTurnWorkingDirectory(ProjectJob job, Project project) =>
+        !string.IsNullOrWhiteSpace(job.WorkingDirectory)
+            ? WorkspacePathResolver.Normalize(job.WorkingDirectory.Trim())
+            : project.GetResolvedWorkingDirectory();
+
+    internal static Dictionary<string, object?> BuildTurnMetadata(
+        ProjectJob job,
+        Project project,
+        Persona persona,
+        List<JobAttachmentDto> attachments,
+        JobWorkspaceHydration? hydration = null,
+        string? taskId = null)
+    {
+        var workingDirectory = ResolveTurnWorkingDirectory(job, project);
+        var gitRemote = hydration?.GitRemoteUrl ?? project.GitRepositoryUrl;
+        var gitRef = hydration?.GitRef ?? job.GitBranchName;
+
+        return new Dictionary<string, object?>
+        {
+            ["jobId"] = job.Id.ToString(),
+            ["taskId"] = taskId,
+            ["projectId"] = project.Id,
+            ["projectName"] = project.Name,
+            ["projectDescription"] = project.Description,
+            ["repositoryName"] = project.RepositoryName,
+            ["workingDirectory"] = workingDirectory,
+            ["workspaceType"] = project.WorkspaceType.ToString(),
+            ["gitBranch"] = job.GitBranchName,
+            ["gitUrl"] = project.GitRepositoryUrl,
+            ["gitBaseBranch"] = project.GitBaseBranch,
+            ["s3ArchiveKey"] = job.S3ArchiveKey,
+            ["projectInstructions"] = project.ProjectInstructions,
+            ["personaId"] = persona.Id,
+            ["personaName"] = persona.Name,
+            ["personaRole"] = persona.Role,
+            ["personaPrompt"] = persona.PersonaPrompt,
+            ["gitAuthorName"] = persona.GitAuthorName,
+            ["gitAuthorEmail"] = persona.GitAuthorEmail,
+            ["model"] = persona.DefaultModel,
+            ["effort"] = persona.DefaultEffort,
+            ["mode"] = persona.DefaultMode,
+            ["tier"] = persona.DefaultTier,
+            ["contextSize"] = persona.DefaultContextSize,
+            ["attachments"] = attachments,
+            // Per-job workspace: the runner keys its checkout off jobId, not sessionId, so every
+            // persona on every machine converges on one durable tree for this job.
+            ["workspaceScope"] = "job",
+            ["workspaceGitRemote"] = gitRemote,
+            ["workspaceGitRef"] = gitRef,
+            ["workspaceHeadCommit"] = hydration?.HeadCommit,
+            ["workspaceBundleKey"] = hydration?.BundleS3Key
+        };
+    }
+
+    internal static object BuildPromptReceivedPayload(
+        AgentSession session,
+        SessionMessage promptMsg,
+        string driverId,
+        Persona persona,
+        ProjectJob job,
+        Project project,
+        string prompt,
+        List<JobAttachmentDto> attachments,
+        JobWorkspaceHydration? hydration = null,
+        PromptStackWirePayload? promptStack = null,
+        List<ResolvedMcpServerConfig>? mcpServers = null)
+    {
+        var workingDirectory = ResolveTurnWorkingDirectory(job, project);
+        return new
+        {
+            sessionId = session.Id,
+            messageId = promptMsg.Id,
+            agentId = driverId,
+            driverId = driverId,
+            personaId = persona.Id,
+            personaName = persona.Name,
+            personaRole = persona.Role,
+            personaPrompt = persona.PersonaPrompt,
+            prompt,
+            // The layered stack, forwarded verbatim. A runner that receives it splits messages[0] and
+            // messages[1] from it; one that does not (older binary, or a dispatch path that has no
+            // composer) falls back to `prompt` plus its own locally built system prompt.
+            promptStack,
+            mcpServers,
+            sender = promptMsg.SenderAgentId,
+            workingDirectory,
+            model = persona.DefaultModel,
+            effort = persona.DefaultEffort,
+            mode = persona.DefaultMode,
+            tier = persona.DefaultTier,
+            contextSize = persona.DefaultContextSize,
+            jobId = job.Id,
+            projectId = project.Id,
+            projectName = project.Name,
+            projectDescription = project.Description,
+            repositoryName = project.RepositoryName,
+            workspaceType = project.WorkspaceType.ToString(),
+            gitBranch = job.GitBranchName,
+            gitUrl = project.GitRepositoryUrl,
+            gitBaseBranch = project.GitBaseBranch,
+            gitAuthorName = persona.GitAuthorName,
+            gitAuthorEmail = persona.GitAuthorEmail,
+            createdAt = promptMsg.CreatedAt,
+            attachments,
+            workspaceScope = "job",
+            workspaceGitRemote = hydration?.GitRemoteUrl ?? project.GitRepositoryUrl,
+            workspaceGitRef = hydration?.GitRef ?? job.GitBranchName,
+            workspaceHeadCommit = hydration?.HeadCommit,
+            workspaceBundleKey = hydration?.BundleS3Key
+        };
     }
 
     private static void StageAttachments(Guid jobId, Guid turnSessionId, List<JobAttachmentDto> attachments)

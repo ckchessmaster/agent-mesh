@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.13" />
+    <PackageReference Include="ModelContextProtocol.Core" Version="2.2.0" />
     <PackageReference Include="Spectre.Console" Version="0.50.0" />
   </ItemGroup>
 

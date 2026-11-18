@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Enums;
+using AgentMesh.Core.Models;
 using FluentAssertions;
 using Xunit;
 
@@ -599,6 +602,119 @@ public class CopilotAdapterStreamingTests
 
             var responseEvent = events.Single(e => e.EventType == "response");
             responseEvent.Content.Should().Be("Repository is clean.");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void BuildCopilotProcessStartInfo_WhenExtraMcpArgumentsProvided_AppendsConfigAndDenyFlags()
+    {
+        var promptEvent = new PromptReceivedEvent
+        {
+            SessionId = Guid.NewGuid(),
+            Prompt = "Hello Copilot"
+        };
+
+        var psi = CopilotAdapter.BuildCopilotProcessStartInfo(
+            "/usr/bin/copilot",
+            isViaGh: false,
+            cwd: "/workspace",
+            promptEvent,
+            promptEnvelope: "Enveloped Prompt",
+            useJsonFormat: true,
+            driverId: "copilot-cli",
+            extraMcpArguments: ["--additional-mcp-config", "@/tmp/copilot-mcp.json", "--deny-tool", "github(delete_repo)"]);
+
+        var args = psi.ArgumentList.ToList();
+        args.Should().ContainInOrder("--additional-mcp-config", "@/tmp/copilot-mcp.json");
+        args.Should().ContainInOrder("--deny-tool", "github(delete_repo)");
+    }
+
+    [Fact]
+    public async Task RunCopilotSubprocessAsync_WithMcpServers_ProvisionsTempConfigDuringRunAndCleansUpAfterExit()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "copilot-mcp-run-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        var fakeScript = Path.Combine(tempDir, "fake-copilot-mcp.sh");
+        var capturedArgsPath = Path.Combine(tempDir, "args.txt");
+        var capturedConfigPath = Path.Combine(tempDir, "config.json");
+
+        var script = $$$"""
+            #!/usr/bin/env bash
+            printf '%s\n' "$@" > "{{{capturedArgsPath}}}"
+            while [[ $# -gt 0 ]]; do
+              if [[ "$1" == "--additional-mcp-config" && $# -ge 2 ]]; then
+                cfg="${2#@}"
+                cp "$cfg" "{{{capturedConfigPath}}}"
+                shift 2
+              else
+                shift
+              fi
+            done
+            echo '{"type":"assistant.message","data":{"content":"Copilot used MCP."}}'
+            """;
+        await File.WriteAllTextAsync(fakeScript, script);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(fakeScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            var preset = new AgentPresetConfig { Id = "copilot-cli", AdapterType = "copilot" };
+            var promptEvent = new PromptReceivedEvent
+            {
+                SessionId = Guid.NewGuid(),
+                Prompt = "Inspect PRs",
+                McpServers =
+                [
+                    new ResolvedMcpServerConfig
+                    {
+                        Id = "github",
+                        Name = "GitHub",
+                        Transport = McpTransportType.Http,
+                        Url = "https://api.githubcopilot.com/mcp/",
+                        Headers = new Dictionary<string, string> { ["Authorization"] = "Bearer copilot_mcp_secret" },
+                        AllowedTools = ["list_prs", "delete_repo"],
+                        BlockedTools = ["delete_repo"]
+                    }
+                ]
+            };
+
+            var (exitCode, _, _, succeeded) = await CopilotAdapter.RunCopilotSubprocessAsync(
+                fakeScript,
+                isViaGh: false,
+                cwd: tempDir,
+                preset,
+                promptEvent,
+                promptEnvelope: "Inspect PRs",
+                useJsonFormat: true,
+                ev => { events.Add(ev); return Task.CompletedTask; },
+                CancellationToken.None);
+
+            exitCode.Should().Be(0);
+            succeeded.Should().BeTrue();
+            File.Exists(capturedConfigPath).Should().BeTrue();
+
+            var args = await File.ReadAllLinesAsync(capturedArgsPath);
+            args.Should().Contain("--additional-mcp-config");
+            args.Should().ContainInOrder("--deny-tool", "github(delete_repo)");
+
+            var atPath = args[Array.IndexOf(args, "--additional-mcp-config") + 1];
+            atPath.Should().StartWith("@");
+            File.Exists(atPath[1..]).Should().BeFalse("temp Copilot MCP config must be deleted after exit");
+
+            using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(capturedConfigPath));
+            var gh = doc.RootElement.GetProperty("mcpServers").GetProperty("github");
+            gh.GetProperty("headers").GetProperty("Authorization").GetString().Should().Be("Bearer copilot_mcp_secret");
+            gh.GetProperty("tools").EnumerateArray().Select(e => e.GetString()).Should().Equal("list_prs");
+
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Provisioned 1 MCP server(s) for copilot"));
+            string.Join("\n", events.Select(e => e.Content)).Should().NotContain("copilot_mcp_secret");
         }
         finally
         {
