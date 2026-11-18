@@ -335,6 +335,80 @@ export interface SystemStatusResponse {
   };
 }
 
+export const DashboardAttentionKind = {
+  Escalation: 'escalation',
+  TurnInterrupted: 'turn_interrupted',
+  PlanApproval: 'plan_approval',
+  DiscoveryQa: 'discovery_qa',
+  PrReview: 'pr_review',
+  PendingCard: 'pending_card',
+  SessionWaitingInput: 'session_waiting_input',
+  JobAwaitingApproval: 'job_awaiting_approval',
+  JobAwaitingReview: 'job_awaiting_review',
+  JobBlocked: 'job_blocked',
+} as const;
+export type DashboardAttentionKind =
+  | (typeof DashboardAttentionKind)[keyof typeof DashboardAttentionKind]
+  | string;
+
+export const DashboardAttentionSeverity = {
+  Critical: 'critical',
+  Warning: 'warning',
+  Info: 'info',
+} as const;
+export type DashboardAttentionSeverity =
+  | (typeof DashboardAttentionSeverity)[keyof typeof DashboardAttentionSeverity]
+  | string;
+
+export interface DashboardJobStats {
+  totalProjects: number;
+  activeProjects: number;
+  totalJobs: number;
+  activeJobs: number;
+  pendingJobs: number;
+  completedJobs: number;
+  archivedJobs: number;
+  attentionCount: number;
+  activeSessions: number;
+  thinkingSessions: number;
+  waitingForInputSessions: number;
+}
+
+export interface DashboardAttentionItem {
+  id: string;
+  kind: DashboardAttentionKind;
+  severity: DashboardAttentionSeverity;
+  title: string;
+  summary?: string | null;
+  projectId?: string | null;
+  projectName?: string | null;
+  jobId?: string | null;
+  jobTitle?: string | null;
+  cardId?: string | null;
+  cardType?: string | null;
+  sessionId?: string | null;
+  personaId?: string | null;
+  personaName?: string | null;
+  driverId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DashboardOverviewOptions {
+  recentJobsLimit?: number;
+  attentionLimit?: number;
+  includeArchived?: boolean;
+}
+
+export interface DashboardOverviewResponse {
+  generatedAt: string;
+  jobStats: DashboardJobStats;
+  recentJobs: ProjectJob[];
+  attentionItems: DashboardAttentionItem[];
+}
+
+export type DashboardOverview = DashboardOverviewResponse;
+
 export interface ModeOption {
   id: string;
   label: string;

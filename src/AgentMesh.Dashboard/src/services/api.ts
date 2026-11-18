@@ -2,6 +2,10 @@ import type {
   Agent,
   AgentSession,
   AgentUsageResponse,
+  DashboardAttentionItem,
+  DashboardJobStats,
+  DashboardOverviewOptions,
+  DashboardOverviewResponse,
   DriverConfig,
   DriverSidecarConfig,
   JobTask,
@@ -52,7 +56,14 @@ import type {
   AssignPersonaMcpServerRequest,
   UpsertPersonaMcpServerRequest
 } from '../types';
-import { JobFileChangeStatus, McpTransportType as McpTransportValues } from '../types';
+import {
+  DashboardAttentionKind,
+  DashboardAttentionSeverity,
+  JobFileChangeStatus,
+  McpTransportType as McpTransportValues,
+  ProjectJobPriority,
+  ProjectJobStatus,
+} from '../types';
 
 let tokenProvider: (() => string | null) | null = null;
 let unauthorizedHandler: (() => void | Promise<void>) | null = null;
@@ -419,6 +430,135 @@ export const mapPersonaMcpServer = (item: any): PersonaMcpServer => ({
   updatedAt: readStr(item, 'updatedAt', 'UpdatedAt') ?? new Date().toISOString()
 });
 
+const mapDashboardJobTask = (raw: any): JobTask => {
+  const item = raw ?? {};
+  const rawAttachments = item.attachments ?? item.Attachments;
+  return {
+    id: readStr(item, 'id', 'Id') ?? '',
+    title: readStr(item, 'title', 'Title') ?? '',
+    isCompleted: readBool(item, 'isCompleted', 'IsCompleted'),
+    status: readStr(item, 'status', 'Status') ?? undefined,
+    statusNotes: readStr(item, 'statusNotes', 'StatusNotes'),
+    targetFile: readStr(item, 'targetFile', 'TargetFile'),
+    verificationMethod: readStr(item, 'verificationMethod', 'VerificationMethod'),
+    requiresDiscussion:
+      typeof (item.requiresDiscussion ?? item.RequiresDiscussion) === 'boolean'
+        ? Boolean(item.requiresDiscussion ?? item.RequiresDiscussion)
+        : undefined,
+    assignedPersonaId: readStr(item, 'assignedPersonaId', 'AssignedPersonaId'),
+    completedAt: readStr(item, 'completedAt', 'CompletedAt'),
+    attachments: Array.isArray(rawAttachments) ? rawAttachments : null,
+  };
+};
+
+const mapDashboardProjectJob = (raw: any): ProjectJob => {
+  const item = raw ?? {};
+  const rawTasks = item.tasks ?? item.Tasks;
+  const rawQueuedTurns = item.queuedTurns ?? item.QueuedTurns;
+  const tasks: any[] = Array.isArray(rawTasks) ? rawTasks : [];
+  const createdAt = readStr(item, 'createdAt', 'CreatedAt') ?? new Date().toISOString();
+
+  return {
+    id: readStr(item, 'id', 'Id') ?? '',
+    projectId: readStr(item, 'projectId', 'ProjectId') ?? '',
+    projectName: readStr(item, 'projectName', 'ProjectName'),
+    title: readStr(item, 'title', 'Title') ?? '',
+    description:
+      typeof item.description === 'string'
+        ? item.description
+        : typeof item.Description === 'string'
+          ? item.Description
+          : '',
+    status: readInt(item, 'status', 'Status') ?? ProjectJobStatus.Active,
+    gitBranchName:
+      typeof item.gitBranchName === 'string'
+        ? item.gitBranchName
+        : typeof item.GitBranchName === 'string'
+          ? item.GitBranchName
+          : '',
+    s3ArchiveKey: readStr(item, 's3ArchiveKey', 'S3ArchiveKey'),
+    tasks: tasks.map(mapDashboardJobTask),
+    resultSummary: readStr(item, 'resultSummary', 'ResultSummary'),
+    priority: readInt(item, 'priority', 'Priority') ?? ProjectJobPriority.Normal,
+    approvalPolicy: readInt(item, 'approvalPolicy', 'ApprovalPolicy') ?? undefined,
+    currentTaskId: readStr(item, 'currentTaskId', 'CurrentTaskId'),
+    progressHeartbeat: readStr(item, 'progressHeartbeat', 'ProgressHeartbeat'),
+    lifecycleStatus: readStr(item, 'lifecycleStatus', 'LifecycleStatus'),
+    assignedAgentId: readStr(item, 'assignedAgentId', 'AssignedAgentId'),
+    queuedTurns: Array.isArray(rawQueuedTurns) ? rawQueuedTurns : undefined,
+    messageCount: readInt(item, 'messageCount', 'MessageCount') ?? 0,
+    createdAt,
+    updatedAt: readStr(item, 'updatedAt', 'UpdatedAt') ?? createdAt,
+  };
+};
+
+const mapDashboardJobStats = (raw: any): DashboardJobStats => {
+  const item = raw ?? {};
+  return {
+    totalProjects: readInt(item, 'totalProjects', 'TotalProjects') ?? 0,
+    activeProjects: readInt(item, 'activeProjects', 'ActiveProjects') ?? 0,
+    totalJobs: readInt(item, 'totalJobs', 'TotalJobs') ?? 0,
+    activeJobs: readInt(item, 'activeJobs', 'ActiveJobs') ?? 0,
+    pendingJobs: readInt(item, 'pendingJobs', 'PendingJobs') ?? 0,
+    completedJobs: readInt(item, 'completedJobs', 'CompletedJobs') ?? 0,
+    archivedJobs: readInt(item, 'archivedJobs', 'ArchivedJobs') ?? 0,
+    attentionCount: readInt(item, 'attentionCount', 'AttentionCount') ?? 0,
+    activeSessions: readInt(item, 'activeSessions', 'ActiveSessions') ?? 0,
+    thinkingSessions: readInt(item, 'thinkingSessions', 'ThinkingSessions') ?? 0,
+    waitingForInputSessions: readInt(item, 'waitingForInputSessions', 'WaitingForInputSessions') ?? 0,
+  };
+};
+
+const mapDashboardAttentionItem = (raw: any): DashboardAttentionItem => {
+  const item = raw ?? {};
+  const createdAt = readStr(item, 'createdAt', 'CreatedAt') ?? new Date().toISOString();
+  return {
+    id: readStr(item, 'id', 'Id') ?? '',
+    kind: readStr(item, 'kind', 'Kind') ?? DashboardAttentionKind.PendingCard,
+    severity: readStr(item, 'severity', 'Severity') ?? DashboardAttentionSeverity.Warning,
+    title: readStr(item, 'title', 'Title') ?? 'Attention required',
+    summary: readStr(item, 'summary', 'Summary'),
+    projectId: readStr(item, 'projectId', 'ProjectId'),
+    projectName: readStr(item, 'projectName', 'ProjectName'),
+    jobId: readStr(item, 'jobId', 'JobId'),
+    jobTitle: readStr(item, 'jobTitle', 'JobTitle'),
+    cardId: readStr(item, 'cardId', 'CardId'),
+    cardType: readStr(item, 'cardType', 'CardType'),
+    sessionId: readStr(item, 'sessionId', 'SessionId'),
+    personaId: readStr(item, 'personaId', 'PersonaId'),
+    personaName: readStr(item, 'personaName', 'PersonaName'),
+    driverId: readStr(item, 'driverId', 'DriverId'),
+    createdAt,
+    updatedAt: readStr(item, 'updatedAt', 'UpdatedAt') ?? createdAt,
+  };
+};
+
+const mapDashboardOverview = (raw: any): DashboardOverviewResponse => {
+  const item = raw ?? {};
+  const rawRecentJobs = item.recentJobs ?? item.RecentJobs;
+  const rawAttentionItems = item.attentionItems ?? item.AttentionItems;
+  const recentJobsRaw: any[] = Array.isArray(rawRecentJobs) ? rawRecentJobs : [];
+  const attentionItemsRaw: any[] = Array.isArray(rawAttentionItems) ? rawAttentionItems : [];
+  const rawStats = item.jobStats ?? item.JobStats;
+  const recentJobs = recentJobsRaw.map(mapDashboardProjectJob);
+  const attentionItems = attentionItemsRaw.map(mapDashboardAttentionItem);
+  const stats = mapDashboardJobStats(rawStats);
+
+  return {
+    generatedAt: readStr(item, 'generatedAt', 'GeneratedAt') ?? new Date().toISOString(),
+    jobStats:
+      rawStats == null
+        ? {
+            ...stats,
+            totalJobs: recentJobs.length,
+            attentionCount: attentionItems.length,
+          }
+        : stats,
+    recentJobs,
+    attentionItems,
+  };
+};
+
 const getAuthHeadersOnly = (): Record<string, string> => {
   const token = tokenProvider?.();
   if (token) {
@@ -458,6 +598,25 @@ export const api = {
     const res = await apiFetch('/api/status', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load system status: ${res.statusText}`);
     return res.json();
+  },
+
+  async getDashboardOverview(opts?: DashboardOverviewOptions): Promise<DashboardOverviewResponse> {
+    const params = new URLSearchParams();
+    if (typeof opts?.recentJobsLimit === 'number' && opts.recentJobsLimit > 0) {
+      params.append('recentJobsLimit', String(opts.recentJobsLimit));
+    }
+    if (typeof opts?.attentionLimit === 'number' && opts.attentionLimit > 0) {
+      params.append('attentionLimit', String(opts.attentionLimit));
+    }
+    if (typeof opts?.includeArchived === 'boolean') {
+      params.append('includeArchived', String(opts.includeArchived));
+    }
+    const query = params.toString() ? `?${params.toString()}` : '';
+    const res = await apiFetch(`/api/dashboard/overview${query}`, { headers: getHeaders() });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load dashboard overview'));
+    }
+    return mapDashboardOverview(await res.json());
   },
 
   async getCapabilities(): Promise<SystemCapabilitiesResponse> {
