@@ -97,7 +97,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
         status,
         approvalPolicy,
         resultSummary: resultSummary.trim() || undefined,
-        assignedAgentId: assignedAgentId.trim() || null
+        assignedAgentId: assignedAgentId.trim()
       });
       onClose();
     } catch (err: any) {

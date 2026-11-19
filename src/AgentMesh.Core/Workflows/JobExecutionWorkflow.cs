@@ -63,6 +63,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     private PrReviewSignal? _prReview;
     private AbortActiveTurnSignal? _pendingAbort;
     private TurnInterventionSignal? _pendingIntervention;
+    private JobAssigneeUpdatedSignal? _pendingAssigneeUpdate;
     private ChildWorkflowHandle<ITaskExecutionWorkflow, TaskExecutionResult>? _activeChildHandle;
     private string? _activeChildWorkflowId;
     private List<ChecklistTaskItem> _tasks = new();
@@ -199,6 +200,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
                     _pendingAbort = null;
                     _pendingIntervention = null;
+                    _pendingAssigneeUpdate = null;
 
                     var taskSpecificContext = BuildChildRemediationContext(task, currentRemediationContext);
                     var childInput = new ChildTaskExecutionInput(
@@ -206,7 +208,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                         task.TaskId,
                         globalIdx,
                         task.Title,
-                        input.AssignedAgentId,
+                        CurrentAssignedAgentId(input),
                         input.WorkspacePath,
                         input.TargetBranch,
                         input.ProjectId,
@@ -230,6 +232,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
                     _activeChildHandle = childHandle;
 
+                    if (_pendingAssigneeUpdate != null)
+                    {
+                        await TrySignalChildAssigneeAsync(childHandle, _pendingAssigneeUpdate);
+                        _pendingAssigneeUpdate = null;
+                    }
                     if (_pendingAbort != null)
                     {
                         await childHandle.SignalAsync(wf => wf.AbortTurnAsync(_pendingAbort));
@@ -246,6 +253,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                     _activeChildWorkflowId = null;
                     _pendingAbort = null;
                     _pendingIntervention = null;
+                    _pendingAssigneeUpdate = null;
 
                     if (!result.Success)
                     {
@@ -599,14 +607,15 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                   $"(`agentmesh pr sync --base {input.TargetBranch}`), push your commits, and update/re-register PR " +
                   $"{_activePrUrl} via `agentmesh pr open` so the latest HEAD SHA is recorded for re-review.";
 
+            var stageAssignee = CurrentAssignedAgentId(input);
             var stageInput = new TaskExecutionInput(
                 JobId: input.JobId,
                 TaskId: $"stage-4-pr-open-{_reviewRound}",
-                AgentId: input.AssignedAgentId,
+                AgentId: stageAssignee,
                 ProjectId: input.ProjectId,
                 WorkspacePath: input.WorkspacePath,
                 TargetBranch: input.TargetBranch,
-                PersonaId: input.AssignedAgentId,
+                PersonaId: stageAssignee,
                 TaskTitle: string.IsNullOrWhiteSpace(_activePrUrl)
                     ? "Stage 4: Open Job Pull Request"
                     : $"Stage 4: Update Job Pull Request (Round {_reviewRound})",
@@ -710,13 +719,14 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             _ => prLabel
         };
 
+        var effectiveAssignee = CurrentAssignedAgentId(input);
         var payloadJson = JsonSerializer.Serialize(new
         {
             prUrl = _activePrUrl,
             prNumber = _activePrNumber,
             headSha = _candidateHeadSha,
-            authorPersonaId = input.AssignedAgentId,
-            senderPersona = input.AssignedAgentId,
+            authorPersonaId = effectiveAssignee,
+            senderPersona = effectiveAssignee,
             targetBranch = input.TargetBranch,
             round = _reviewRound + 1,
             reviewerId,
@@ -792,7 +802,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             PendingTasks: nextTasks,
             RemediationContext: remediationContext);
 
-        var nextInput = input with { Continuation = continuation };
+        var nextInput = input with
+        {
+            AssignedAgentId = CurrentAssignedAgentId(input),
+            Continuation = continuation
+        };
         throw Workflow.CreateContinueAsNewException((JobExecutionWorkflow wf) => wf.ExecuteJobAsync(nextInput));
     }
 
@@ -1131,6 +1145,57 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
         return Task.CompletedTask;
     }
 
+    private string CurrentAssignedAgentId(JobExecutionInput input) =>
+        !string.IsNullOrWhiteSpace(_assignedAgentId) ? _assignedAgentId! : input.AssignedAgentId;
+
+    private static async Task TrySignalChildAssigneeAsync(
+        ChildWorkflowHandle<ITaskExecutionWorkflow, TaskExecutionResult> childHandle,
+        JobAssigneeUpdatedSignal signal)
+    {
+        try
+        {
+            await childHandle.SignalAsync(wf => wf.UpdateAssigneeAsync(signal));
+        }
+        catch (Exception)
+        {
+            // Child workflow may have just completed before the parent observed its result;
+            // the parent already updated _assignedAgentId so the next item will use it.
+        }
+    }
+
+    [WorkflowSignal]
+    public async Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal)
+    {
+        if (signal is null || string.IsNullOrWhiteSpace(signal.AssignedAgentId))
+        {
+            return;
+        }
+
+        var normalized = signal.AssignedAgentId.Trim().TrimStart('@').ToLowerInvariant();
+        if (normalized.Length == 0)
+        {
+            return;
+        }
+
+        _assignedAgentId = normalized;
+        Workflow.UpsertMemo(MemoUpdate.ValueSet("personaId", normalized));
+
+        var forwarded = new JobAssigneeUpdatedSignal(normalized);
+        if (_activeChildHandle != null)
+        {
+            await TrySignalChildAssigneeAsync(_activeChildHandle, forwarded);
+            _pendingAssigneeUpdate = null;
+        }
+        else if (_activeChildWorkflowId != null)
+        {
+            _pendingAssigneeUpdate = forwarded;
+        }
+        else
+        {
+            _pendingAssigneeUpdate = null;
+        }
+    }
+
     [WorkflowSignal]
     public Task UpdateHeartbeatAsync(string heartbeat)
     {
@@ -1146,5 +1211,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             _currentHeartbeat,
             _reviewRound,
             _activePrUrl,
-            _ignoredSelfReviewCount);
+            _ignoredSelfReviewCount,
+            _assignedAgentId);
 }

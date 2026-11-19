@@ -726,6 +726,43 @@ public class TaskExecutionWorkflowTests
         turns.PendingReplyAt(1)!.SenderId.Should().Be("astra");
     }
 
+    [Fact]
+    public async Task UpdateAssignee_UpdatesPersonaForNextTurnAndSignalRouting()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        turns.Enqueue(TurnOutcome.Awaiting("operator", "Which approach?"));
+        turns.Enqueue(TurnOutcome.Completed("Done by new assignee"));
+
+        var handle = await StartWorkflowAsync(env);
+        await WaitUntilAsync(handle, s => s.Status.StartsWith("Waiting on input"));
+
+        await handle.SignalAsync(w => w.UpdateAssigneeAsync(new JobAssigneeUpdatedSignal("sorren")));
+        await WaitUntilAsync(handle, s => s.PersonaId == "sorren");
+
+        // Self-signal from new assignee is dropped
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(
+            new ChatMessageSignal("sorren", "Self message", DateTimeOffset.UtcNow, "self-sorren")));
+        await WaitUntilAsync(handle, s => s.IgnoredSelfSignalCount == 1);
+
+        // Message addressed to new assignee unblocks and executes turn 2 for sorren
+        var reply = new ChatMessageSignal(
+            "operator",
+            "Proceed with option B",
+            DateTimeOffset.UtcNow,
+            "op-1",
+            TargetPersonaIds: ["sorren"]);
+        await handle.SignalAsync(w => w.ReceiveChatMessageAsync(reply));
+
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+        result.Success.Should().BeTrue();
+        turns.InputAt(0)!.PersonaId.Should().Be("rook");
+        turns.InputAt(1)!.PersonaId.Should().Be("sorren");
+        turns.InputAt(1)!.AgentId.Should().Be("sorren");
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // Harness
     // ──────────────────────────────────────────────────────────────────────────
@@ -897,9 +934,13 @@ public class TaskExecutionWorkflowTests
     {
         private readonly List<Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>> script = [];
         private readonly List<ChatMessageSignal?> delivered = [];
+        private readonly List<TaskExecutionInput> inputs = [];
         private int cursor;
 
         public int Calls { get; private set; }
+
+        public TaskExecutionInput? InputAt(int turnIndex) =>
+            turnIndex < inputs.Count ? inputs[turnIndex] : null;
 
         public void Enqueue(TurnOutcome outcome) =>
             script.Add((_, reply) =>
@@ -980,6 +1021,7 @@ public class TaskExecutionWorkflowTests
             }
 
             var attempt = script[cursor];
+            inputs.Add(input);
 
             return attempt(input, pendingReply).ContinueWith(t =>
             {

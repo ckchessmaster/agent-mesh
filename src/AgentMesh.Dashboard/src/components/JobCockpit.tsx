@@ -342,7 +342,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               value={job.assignedAgentId || project.defaultLeadPersonaId || ''}
               onChange={async (e) => {
                 if (onUpdateJob) {
-                  await onUpdateJob({ assignedAgentId: e.target.value || null });
+                  await onUpdateJob({ assignedAgentId: e.target.value });
                 }
               }}
               title="Assign this job to a team member"
