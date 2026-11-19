@@ -478,4 +478,87 @@ describe('DriverConfigModal', () => {
     expect(submitSpy).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('device-user-code')).not.toBeInTheDocument();
   });
+
+  it('renders OpenRouter form, tests OpenRouter key, and saves Routing & Headers patch', async () => {
+    const openRouterAgent: Agent = {
+      id: 'openrouter',
+      name: 'OpenRouter',
+      role: 'Autonomous AI Engineer',
+      status: 'online',
+      runtimeType: 'OpenRouter',
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({
+        adapter: 'openrouter',
+        endpoint: 'https://openrouter.ai/api/v1',
+        defaultModel: 'openrouter/auto'
+      }),
+      config: {
+        adapter: 'openrouter',
+        endpoint: 'https://openrouter.ai/api/v1',
+        defaultModel: 'openrouter/auto',
+        hasApiKey: true,
+        openRouter: null
+      }
+    };
+
+    const testSpy = vi.spyOn(api, 'testOpenRouterServer').mockResolvedValueOnce({
+      success: true,
+      models: [{ id: 'openrouter/auto', name: 'Auto Router', efforts: [] }],
+      keyLabel: 'Mesh Prod',
+      limitRemaining: 12.5
+    });
+
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <DriverConfigModal
+        agent={openRouterAgent}
+        initialConfig={openRouterAgent.config}
+        onClose={vi.fn()}
+        onSave={onSave}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Test Connection/i }));
+    await waitFor(() => expect(testSpy).toHaveBeenCalledWith({
+      endpoint: 'https://openrouter.ai/api/v1',
+      apiKey: undefined,
+      agentId: 'openrouter'
+    }));
+    expect(await screen.findByText(/Verified OpenRouter key! Found 1 tool-capable model/i)).toBeInTheDocument();
+
+    // Open collapsible Routing & Headers section (collapsed by default when unconfigured)
+    fireEvent.click(screen.getByRole('button', { name: /OpenRouter Routing & Headers/i }));
+
+    fireEvent.change(screen.getByLabelText(/Fallback Models/i), {
+      target: { value: 'anthropic/claude-sonnet-4, openai/gpt-4.1' }
+    });
+    fireEvent.change(screen.getByLabelText(/Provider Sort/i), { target: { value: 'throughput' } });
+    fireEvent.change(screen.getByLabelText(/Provider Order/i), { target: { value: 'anthropic, bedrock' } });
+    fireEvent.click(screen.getByLabelText(/Zero Data Retention \(ZDR\)/i));
+    fireEvent.change(screen.getByLabelText(/HTTP-Referer Header/i), {
+      target: { value: 'https://mesh.example' }
+    });
+
+    fireEvent.submit(screen.getByRole('button', { name: /Save/i }).closest('form')!);
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledWith({
+      openRouter: {
+        httpReferer: 'https://mesh.example',
+        appTitle: '',
+        fallbackModels: ['anthropic/claude-sonnet-4', 'openai/gpt-4.1'],
+        provider: {
+          sort: 'throughput',
+          order: ['anthropic', 'bedrock'],
+          only: [],
+          ignore: [],
+          allowFallbacks: true,
+          dataCollection: '',
+          zdr: true,
+          requireParameters: false
+        }
+      }
+    });
+  });
 });

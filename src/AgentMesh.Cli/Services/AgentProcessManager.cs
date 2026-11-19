@@ -347,7 +347,7 @@ public class AgentRunnerInstance : IAsyncDisposable
         _onStateChanged();
         _onLog(_preset.Id, $"ONLINE & listening for prompts (adapter: {_preset.AdapterType})");
 
-        OpenAiAdapter.CommandOutputBroadcaster = async (sessionId, commandId, chunk) =>
+        AgentToolExecutor.CommandOutputBroadcaster = async (sessionId, commandId, chunk) =>
         {
             if (_hubConnection != null && _hubConnection.State == HubConnectionState.Connected)
             {
@@ -362,7 +362,10 @@ public class AgentRunnerInstance : IAsyncDisposable
         OpenAiAdapter.LearnedContextLimitReporter = (driverId, model, maxContextTokens) =>
             _meshClient.ReportLearnedContextLimitAsync(driverId, _agentToken, model, maxContextTokens, _cts.Token);
 
-        OpenAiAdapter.PlatformToolExecutor = async (toolName, argsJson, sessionId, personaId, agentId, ct) =>
+        OpenRouterAdapter.LearnedContextLimitReporter = (driverId, model, maxContextTokens) =>
+            _meshClient.ReportLearnedContextLimitAsync(driverId, _agentToken, model, maxContextTokens, _cts.Token);
+
+        AgentToolExecutor.PlatformToolExecutor = async (toolName, argsJson, sessionId, personaId, agentId, ct) =>
             await _meshClient.CallPlatformMcpToolAsync(toolName, argsJson, sessionId, personaId, agentId, ct);
 
         // Process any prompts that were queued while this agent was offline

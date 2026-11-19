@@ -1,5 +1,7 @@
 using System.Text.Json;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Services;
 
@@ -197,6 +199,16 @@ public class ConfigStore
                         }
                         catch { }
                     }
+                    if (root.TryGetProperty("openRouter", out var orProp) && orProp.ValueKind == JsonValueKind.Object)
+                    {
+                        try
+                        {
+                            preset.OpenRouter = JsonSerializer.Deserialize<OpenRouterConfig>(
+                                orProp.GetRawText(),
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        }
+                        catch { }
+                    }
                     if (root.TryGetProperty("sidecar", out var sc) && sc.ValueKind == JsonValueKind.Object)
                     {
                         try
@@ -210,12 +222,13 @@ public class ConfigStore
             catch { }
         }
 
-        if (string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(preset.AdapterType, DriverAdapters.OpenAi, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(preset.AdapterType, DriverAdapters.OpenRouter, StringComparison.OrdinalIgnoreCase))
         {
             if (preset.Capabilities == null || preset.Capabilities.Count == 0 ||
                 preset.Capabilities.SequenceEqual(new[] { "shell", "inspect_workspace" }))
             {
-                preset.Capabilities = GetDefaultCapabilities("openai");
+                preset.Capabilities = GetDefaultCapabilities(preset.AdapterType);
             }
             preset.Command = null;
         }
@@ -263,6 +276,20 @@ public class ConfigStore
                 Capabilities = new List<string> { "explain", "suggest", "git_ops" }
             };
         }
+
+        if (!config.Agents.ContainsKey("openrouter"))
+        {
+            config.Agents["openrouter"] = new AgentPresetConfig
+            {
+                Id = "openrouter",
+                Name = "OpenRouter",
+                Role = "Autonomous AI Engineer",
+                AdapterType = DriverAdapters.OpenRouter,
+                Endpoint = OpenRouterConfig.DefaultEndpoint,
+                DefaultModel = "openrouter/auto",
+                Capabilities = GetDefaultCapabilities(DriverAdapters.OpenRouter)
+            };
+        }
     }
 
     public static string InferAdapterType(string id)
@@ -270,6 +297,8 @@ public class ConfigStore
         if (id.StartsWith("agy", StringComparison.OrdinalIgnoreCase)) return "agy";
         if (id.StartsWith("claude", StringComparison.OrdinalIgnoreCase)) return "claude";
         if (id.StartsWith("copilot", StringComparison.OrdinalIgnoreCase)) return "copilot";
+        if (id.StartsWith("openrouter", StringComparison.OrdinalIgnoreCase) ||
+            id.Contains("openrouter", StringComparison.OrdinalIgnoreCase)) return DriverAdapters.OpenRouter;
         if (id.StartsWith("openai", StringComparison.OrdinalIgnoreCase) ||
             id.StartsWith("ollama", StringComparison.OrdinalIgnoreCase) ||
             id.StartsWith("vllm", StringComparison.OrdinalIgnoreCase) ||
@@ -282,6 +311,7 @@ public class ConfigStore
         "agy" => $"Antigravity ({id})",
         "claude" => $"Claude Code ({id})",
         "copilot" => $"GitHub Copilot ({id})",
+        "openrouter" => $"OpenRouter ({id})",
         "openai" => $"OpenAI Compatible ({id})",
         _ => $"Agent {id}"
     };
@@ -291,6 +321,7 @@ public class ConfigStore
         "agy" => "Autonomous Codebase Engineer",
         "claude" => "Anthropic Terminal Architect",
         "copilot" => "Shell & Git Specialist",
+        "openrouter" => "Autonomous AI Engineer",
         "openai" => "Autonomous AI Engineer",
         _ => "Codebase Engineer"
     };
@@ -300,15 +331,17 @@ public class ConfigStore
         "agy" => "agy",
         "claude" => "claude",
         "copilot" => "copilot",
+        "openrouter" => null,
         "openai" => null,
         _ => null
     };
 
-    private static List<string> GetDefaultCapabilities(string adapterType) => adapterType switch
+    internal static List<string> GetDefaultCapabilities(string adapterType) => adapterType switch
     {
         "agy" => new List<string> { "run_command", "view_file", "replace_file_content" },
         "claude" => new List<string> { "bash", "edit_file", "read_file" },
         "copilot" => new List<string> { "explain", "suggest" },
+        "openrouter" => new List<string> { "run_command", "read_file", "write_file", "edit_file", "ask_question" },
         "openai" => new List<string> { "run_command", "read_file", "write_file", "edit_file", "ask_question" },
         _ => new List<string> { "shell", "inspect_workspace" }
     };

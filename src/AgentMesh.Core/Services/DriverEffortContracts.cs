@@ -42,6 +42,13 @@ public static class DriverEffortContracts
     /// </summary>
     public static readonly IReadOnlyList<string> OpenAi = Array.Empty<string>();
 
+    /// <summary>
+    /// OpenRouter's unified <c>reasoning.effort</c> levels, forwarded verbatim for models that
+    /// advertise <c>"reasoning"</c> in <c>/api/v1/models</c> <c>supported_parameters</c>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> OpenRouter =
+        new[] { "none", "minimal", "low", "medium", "high", "xhigh", "max" };
+
     /// <summary>The effort ladder for a canonical adapter, empty when it has none.</summary>
     public static IReadOnlyList<string> For(string? adapter) => DriverAdapters.Canonicalize(adapter) switch
     {
@@ -49,6 +56,7 @@ public static class DriverEffortContracts
         DriverAdapters.Claude => Claude,
         DriverAdapters.Copilot => Copilot,
         DriverAdapters.OpenAi => OpenAi,
+        DriverAdapters.OpenRouter => OpenRouter,
         _ => Array.Empty<string>()
     };
 

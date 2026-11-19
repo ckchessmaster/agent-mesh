@@ -31,6 +31,7 @@ public static class AgentAdapterFactory
             "claude" => new ClaudeAdapter(),
             "copilot" => new CopilotAdapter(),
             "agy" => new AgyAdapter(),
+            "openrouter" or "open-router" => new OpenRouterAdapter(),
             "openai" or "openai-compatible" or "ollama" or "vllm" => new OpenAiAdapter(),
             _ => new GenericCommandAdapter()
         };

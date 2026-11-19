@@ -640,3 +640,77 @@ describe('capabilityUnavailableMessage', () => {
     expect(capabilityUnavailableMessage(resolved)).toBe('The agy CLI is not installed on the API host.');
   });
 });
+
+describe('OpenRouter capabilities & effort scoping', () => {
+  it('resolves openrouter adapter from explicit key, openrouter.ai endpoint, enum string, runtime 5, and id', () => {
+    expect(
+      resolveAdapterKey(agent({ id: 'gw', capabilitiesJson: JSON.stringify({ adapter: 'openrouter' }) }))
+    ).toBe('openrouter');
+    expect(
+      resolveAdapterKey(agent({ id: 'gw', capabilitiesJson: JSON.stringify({ adapter: 'open-router' }) }))
+    ).toBe('openrouter');
+    expect(
+      resolveAdapterKey(
+        agent({ id: 'gw', capabilitiesJson: JSON.stringify({ endpoint: 'https://openrouter.ai/api/v1' }) })
+      )
+    ).toBe('openrouter');
+    expect(
+      resolveAdapterKey(agent({ id: 'gw', runtimeType: 'OpenRouter', capabilitiesJson: '{}' }))
+    ).toBe('openrouter');
+    expect(
+      resolveAdapterKey(agent({ id: 'gw', runtimeType: 5, capabilitiesJson: '{}' }))
+    ).toBe('openrouter');
+    expect(
+      resolveAdapterKey(agent({ id: 'openrouter', name: 'OpenRouter Gateway', runtimeType: 0, capabilitiesJson: '{}' }))
+    ).toBe('openrouter');
+    // Existing legacy numeric mapping runtimeType 4 stays 'openai' when capabilitiesJson gives no openrouter hint
+    expect(resolveAdapterKey(agent({ id: 'oai', runtimeType: 4, capabilitiesJson: '{}' }))).toBe('openai');
+  });
+
+  it('returns empty efforts for a non-reasoning OpenRouter model even when sibling models support reasoning', () => {
+    const orAgent = agent({
+      id: 'openrouter',
+      runtimeType: 'OpenRouter',
+      capabilitiesJson: JSON.stringify({ adapter: 'openrouter', endpoint: 'https://openrouter.ai/api/v1' })
+    });
+
+    const resolved = resolveDriverCapabilities(
+      response([
+        {
+          driverId: 'openrouter',
+          name: 'OpenRouter',
+          adapter: 'openrouter',
+          endpoint: 'https://openrouter.ai/api/v1',
+          modelSource: 'probed',
+          observedAt: '2026-06-01T00:00:00Z',
+          supportsContextSelection: true,
+          modes: [],
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4',
+              name: 'Claude Sonnet 4',
+              efforts: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+            },
+            {
+              id: 'meta-llama/llama-3.3-70b-instruct:free',
+              name: 'Llama 3.3 70B Free',
+              efforts: []
+            }
+          ]
+        }
+      ]),
+      orAgent
+    );
+
+    expect(effortsFor(resolved, 'meta-llama/llama-3.3-70b-instruct:free')).toEqual([]);
+    expect(effortsFor(resolved, 'anthropic/claude-sonnet-4')).toEqual([
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max'
+    ]);
+  });
+});

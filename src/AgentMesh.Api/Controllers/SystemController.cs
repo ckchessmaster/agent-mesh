@@ -258,6 +258,221 @@ public class SystemController(
         }
     }
 
+    /// <summary>
+    /// Validates an OpenRouter API key against <c>GET /api/v1/key</c> and fetches tool-capable
+    /// models from <c>GET /api/v1/models</c>, optionally persisting the declaration when an
+    /// <c>agentId</c> is provided.
+    /// </summary>
+    [HttpPost("drivers/test-openrouter")]
+    public async Task<IActionResult> TestOpenRouterServer(
+        [FromBody] TestOpenRouterServerRequest req,
+        [FromServices] AgentMeshDbContext? db = null,
+        CancellationToken ct = default)
+    {
+        var baseUrl = OpenRouterDriverQuotaProbe.NormalizeBaseUrl(req.Endpoint);
+
+        var effectiveApiKey = req.ApiKey;
+        if (db != null && !string.IsNullOrWhiteSpace(req.AgentId) && string.IsNullOrWhiteSpace(effectiveApiKey))
+        {
+            try
+            {
+                var normalizedId = req.AgentId.Trim().TrimStart('@').ToLowerInvariant();
+                var agent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+                if (agent != null && !string.IsNullOrWhiteSpace(agent.CapabilitiesJson))
+                {
+                    effectiveApiKey = DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, null).ApiKey;
+                }
+            }
+            catch
+            {
+                // Ignore malformed stored blob and fall back to host env var
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(effectiveApiKey))
+        {
+            effectiveApiKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY");
+        }
+
+        if (string.IsNullOrWhiteSpace(effectiveApiKey))
+        {
+            return Ok(new TestOpenRouterServerResponse(
+                false,
+                "OpenRouter API key is required (enter an API key or set OPENROUTER_API_KEY on the host).",
+                new()));
+        }
+
+        effectiveApiKey = effectiveApiKey.Trim();
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+
+            string? keyLabel = null;
+            bool? isFreeTier = null;
+            double? limitRemaining = null;
+
+            using (var keyReq = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/key"))
+            {
+                keyReq.Headers.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", effectiveApiKey);
+                keyReq.Headers.TryAddWithoutValidation("X-Title", OpenRouterConfig.DefaultAppTitle);
+
+                using var keyRes = await client.SendAsync(keyReq, ct);
+                if (keyRes.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+                {
+                    return Ok(new TestOpenRouterServerResponse(
+                        false,
+                        $"OpenRouter rejected the API key (HTTP {(int)keyRes.StatusCode}).",
+                        new()));
+                }
+
+                if (keyRes.IsSuccessStatusCode)
+                {
+                    var keyBody = await keyRes.Content.ReadAsStringAsync(ct);
+                    TryExtractOpenRouterKeyInfo(keyBody, out keyLabel, out isFreeTier, out limitRemaining);
+                }
+            }
+
+            using var modelsReq = new HttpRequestMessage(HttpMethod.Get, DriverModelDiscovery.ToModelsUrl(baseUrl));
+            modelsReq.Headers.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", effectiveApiKey);
+            modelsReq.Headers.TryAddWithoutValidation("X-Title", OpenRouterConfig.DefaultAppTitle);
+
+            using var modelsRes = await client.SendAsync(modelsReq, ct);
+            if (!modelsRes.IsSuccessStatusCode)
+            {
+                return Ok(new TestOpenRouterServerResponse(
+                    false,
+                    $"OpenRouter /models returned HTTP {(int)modelsRes.StatusCode} ({modelsRes.ReasonPhrase}).",
+                    new()));
+            }
+
+            var modelsJson = await modelsRes.Content.ReadAsStringAsync(ct);
+            var discovered = DriverModelDiscovery.ParseOpenRouterModels(modelsJson);
+            if (discovered.Count == 0)
+            {
+                return Ok(new TestOpenRouterServerResponse(
+                    false,
+                    "OpenRouter responded successfully but returned no tool-capable text models.",
+                    new()));
+            }
+
+            var modelDtos = discovered
+                .Select(m => new ModelCapabilityDto(
+                    Id: m.Id,
+                    Name: m.Name,
+                    Efforts: m.Efforts,
+                    ContextSizes: DriverCapabilityProbe.ContextSizesForModel(m.Id, m.MaxContextTokens),
+                    MaxContextTokens: m.MaxContextTokens,
+                    PromptPricePerMillion: m.PromptPricePerMillion,
+                    CompletionPricePerMillion: m.CompletionPricePerMillion))
+                .ToList();
+
+            await TryPersistDiscoveredOpenRouterModelsAsync(db, req.AgentId, baseUrl, discovered, ct);
+
+            return Ok(new TestOpenRouterServerResponse(
+                true,
+                null,
+                modelDtos,
+                keyLabel,
+                isFreeTier,
+                limitRemaining));
+        }
+        catch (Exception ex)
+        {
+            return Ok(new TestOpenRouterServerResponse(false, $"Connection failed: {ex.Message}", new()));
+        }
+    }
+
+    private static void TryExtractOpenRouterKeyInfo(
+        string? json,
+        out string? keyLabel,
+        out bool? isFreeTier,
+        out double? limitRemaining)
+    {
+        keyLabel = null;
+        isFreeTier = null;
+        limitRemaining = null;
+        if (string.IsNullOrWhiteSpace(json)) return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var payload = doc.RootElement.TryGetProperty("data", out var dataProp) && dataProp.ValueKind == JsonValueKind.Object
+                ? dataProp
+                : doc.RootElement;
+
+            if (payload.ValueKind != JsonValueKind.Object) return;
+            if (payload.TryGetProperty("label", out var lbl) && lbl.ValueKind == JsonValueKind.String)
+                keyLabel = lbl.GetString();
+            if (payload.TryGetProperty("is_free_tier", out var free) &&
+                (free.ValueKind == JsonValueKind.True || free.ValueKind == JsonValueKind.False))
+                isFreeTier = free.GetBoolean();
+            if (payload.TryGetProperty("limit_remaining", out var rem) && rem.ValueKind == JsonValueKind.Number && rem.TryGetDouble(out var remVal))
+                limitRemaining = remVal;
+        }
+        catch
+        {
+            // Key metadata is optional informational telemetry
+        }
+    }
+
+    private async Task TryPersistDiscoveredOpenRouterModelsAsync(
+        AgentMeshDbContext? db,
+        string? agentId,
+        string endpoint,
+        IReadOnlyList<DiscoveredOpenRouterModel> discovered,
+        CancellationToken ct)
+    {
+        if (db == null || string.IsNullOrWhiteSpace(agentId) || discovered.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var normalizedId = agentId.Trim().TrimStart('@').ToLowerInvariant();
+            var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == normalizedId, ct);
+            if (agent == null) return;
+
+            var declaration = new DriverCapabilityDeclaration
+            {
+                Adapter = DriverAdapters.OpenRouter,
+                Endpoint = DriverModelDiscovery.NormalizeEndpoint(endpoint),
+                ObservedAt = DateTimeOffset.UtcNow,
+                SupportsContextSelection = true,
+                Source = "openrouter-models-api",
+                Models = discovered
+                    .Select(m => new DriverCapabilityDeclaration.DeclaredModel
+                    {
+                        Id = m.Id,
+                        Name = m.Name,
+                        Efforts = m.Efforts,
+                        MaxContextTokens = m.MaxContextTokens,
+                        PromptPricePerMillion = m.PromptPricePerMillion,
+                        CompletionPricePerMillion = m.CompletionPricePerMillion
+                    })
+                    .ToList()
+            };
+
+            var patch = new System.Text.Json.Nodes.JsonObject
+            {
+                ["declared"] = JsonSerializer.SerializeToNode(declaration)
+            };
+
+            agent.CapabilitiesJson = DriverCapabilities.Merge(agent.CapabilitiesJson, patch.ToJsonString())
+                ?? agent.CapabilitiesJson;
+            agent.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+            _probe.InvalidateCache();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not persist discovered OpenRouter models for driver {DriverId}", agentId);
+        }
+    }
+
     private async Task TryPersistDiscoveredOpenAiModelsAsync(
         AgentMeshDbContext? db,
         string? agentId,
@@ -434,7 +649,14 @@ public class SystemController(
     }
 
     private static ModelCapabilityDto ToModelDto(DriverModelCapability model) =>
-        new(model.Id, model.Name, model.Efforts, model.ContextSizes);
+        new(
+            model.Id,
+            model.Name,
+            model.Efforts,
+            model.ContextSizes,
+            model.MaxContextTokens,
+            model.PromptPricePerMillion,
+            model.CompletionPricePerMillion);
 
     /// <summary>
     /// The adapter-level interaction surface: modes and tiers.
@@ -458,7 +680,10 @@ public record ModelCapabilityDto(
     string Id,
     string Name,
     IReadOnlyCollection<string> Efforts,
-    IReadOnlyCollection<string>? ContextSizes = null
+    IReadOnlyCollection<string>? ContextSizes = null,
+    int? MaxContextTokens = null,
+    double? PromptPricePerMillion = null,
+    double? CompletionPricePerMillion = null
 );
 
 /// <param name="SupportsContextSelection">
@@ -536,3 +761,13 @@ public record TestOpenAiServerRequest(string Endpoint, string? ApiKey = null, Dr
 public record OpenAiModelItemDto(string Id, string Name);
 
 public record TestOpenAiServerResponse(bool Success, string? Error, List<OpenAiModelItemDto> Models);
+
+public record TestOpenRouterServerRequest(string? Endpoint = null, string? ApiKey = null, string? AgentId = null);
+
+public record TestOpenRouterServerResponse(
+    bool Success,
+    string? Error,
+    List<ModelCapabilityDto> Models,
+    string? KeyLabel = null,
+    bool? IsFreeTier = null,
+    double? LimitRemaining = null);

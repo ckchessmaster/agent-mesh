@@ -85,6 +85,14 @@ function formatTokenCount(total: number | undefined | null): string {
   return `${(value / 1_000_000).toFixed(2)}M`;
 }
 
+/** Compact USD cost formatter. Returns null when cost is missing or zero. */
+export function formatUsdCost(cost?: number | null): string | null {
+  if (typeof cost !== 'number' || !Number.isFinite(cost) || cost <= 0) return null;
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  if (cost < 1) return `$${cost.toFixed(3)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
 /**
  * The chip on a driver card. Lifetime tokens are always real (aggregated from session metadata),
  * so they render even when quota is unavailable.
@@ -96,12 +104,14 @@ export function describeUsageChip(usage: AgentUsageResponse): {
 } {
   const quota = summarizeQuota(usage.providerQuota);
   const tokens = formatTokenCount(usage.lifetimeTokens?.totalTokens);
+  const costLabel = formatUsdCost(usage.lifetimeTokens?.costUsd);
+  const costSuffix = costLabel ? ` · ${costLabel}` : '';
   return {
-    text: `${quota.label} · ${tokens} tokens`,
+    text: `${quota.label} · ${tokens} tokens${costSuffix}`,
     tone: quota.tone,
     title: quota.available
-      ? `${quota.detail} · ${tokens} tokens tracked by this mesh. Click for details.`
-      : `${quota.detail} Click for lifetime token usage.`
+      ? `${quota.detail} · ${tokens} tokens${costSuffix} tracked by this mesh. Click for details.`
+      : `${quota.detail}${costLabel ? ` Total cost: ${costLabel}.` : ''} Click for lifetime token usage.`
   };
 }
 

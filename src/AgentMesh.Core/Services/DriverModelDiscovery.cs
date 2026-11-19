@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -16,7 +17,10 @@ public sealed record DriverModelCapability(
     string Id,
     string Name,
     IReadOnlyList<string> Efforts,
-    IReadOnlyList<string>? ContextSizes = null);
+    IReadOnlyList<string>? ContextSizes = null,
+    int? MaxContextTokens = null,
+    double? PromptPricePerMillion = null,
+    double? CompletionPricePerMillion = null);
 
 /// <summary>
 /// A model entry extracted from an OpenAI-compatible <c>/models</c> response, including its
@@ -25,6 +29,18 @@ public sealed record DriverModelCapability(
 public sealed record DiscoveredOpenAiModel(
     string Id,
     int? MaxContextTokens = null);
+
+/// <summary>
+/// A tool-capable text model extracted from OpenRouter's <c>/api/v1/models</c> response,
+/// including display name, context window, reasoning support, and per-million USD pricing.
+/// </summary>
+public sealed record DiscoveredOpenRouterModel(
+    string Id,
+    string Name,
+    int? MaxContextTokens,
+    IReadOnlyList<string> Efforts,
+    double? PromptPricePerMillion = null,
+    double? CompletionPricePerMillion = null);
 
 /// <summary>
 /// Parsing primitives for driver capability discovery, shared by the API's background probe and
@@ -353,6 +369,201 @@ public static class DriverModelDiscovery
         {
             return Array.Empty<DriverModelCapability>();
         }
+    }
+
+    /// <summary>
+    /// Extracts tool-capable text models from OpenRouter's <c>GET /api/v1/models</c> payload,
+    /// preserving per-model context length, USD/1M pricing, and <c>reasoning</c> effort support.
+    /// Prepends <c>openrouter/auto</c> when at least one model is discovered and auto is absent.
+    /// </summary>
+    public static IReadOnlyList<DiscoveredOpenRouterModel> ParseOpenRouterModels(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+
+            if (!TryGetPropertyCaseInsensitive(doc.RootElement, "data", out var data) ||
+                data.ValueKind != JsonValueKind.Array)
+            {
+                return Array.Empty<DiscoveredOpenRouterModel>();
+            }
+
+            var result = new List<DiscoveredOpenRouterModel>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var hasAuto = false;
+
+            foreach (var item in data.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+
+                if (!TryGetPropertyCaseInsensitive(item, "id", out var idProp) ||
+                    idProp.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var modelId = idProp.GetString()?.Trim();
+                if (string.IsNullOrWhiteSpace(modelId)) continue;
+
+                var isAuto = string.Equals(modelId, "openrouter/auto", StringComparison.OrdinalIgnoreCase);
+                if (!isAuto && !IsTextOutputOpenRouterModel(item)) continue;
+
+                var supportedParams = ReadSupportedParameters(item);
+                if (!isAuto && !supportedParams.Contains("tools")) continue;
+
+                if (!seen.Add(modelId)) continue;
+                if (isAuto) hasAuto = true;
+
+                var displayName = modelId;
+                if (TryGetPropertyCaseInsensitive(item, "name", out var nameProp) &&
+                    nameProp.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(nameProp.GetString()))
+                {
+                    displayName = nameProp.GetString()!.Trim();
+                }
+
+                var maxContext = ExtractModelContextLimit(item);
+                if (maxContext is > 0)
+                {
+                    ModelContextLimits.RecordLearnedLimit(modelId, maxContext.Value);
+                }
+
+                var efforts = supportedParams.Contains("reasoning")
+                    ? DriverEffortContracts.OpenRouter
+                    : Array.Empty<string>();
+
+                var (promptPrice, completionPrice) = ExtractOpenRouterPricing(item);
+
+                result.Add(new DiscoveredOpenRouterModel(
+                    Id: modelId,
+                    Name: displayName,
+                    MaxContextTokens: maxContext,
+                    Efforts: efforts,
+                    PromptPricePerMillion: promptPrice,
+                    CompletionPricePerMillion: completionPrice));
+            }
+
+            if (!hasAuto && result.Count > 0)
+            {
+                result.Insert(0, new DiscoveredOpenRouterModel(
+                    Id: "openrouter/auto",
+                    Name: "Auto Router (OpenRouter)",
+                    MaxContextTokens: null,
+                    Efforts: Array.Empty<string>(),
+                    PromptPricePerMillion: null,
+                    CompletionPricePerMillion: null));
+            }
+
+            return result;
+        }
+        catch (JsonException)
+        {
+            return Array.Empty<DiscoveredOpenRouterModel>();
+        }
+    }
+
+    private static bool IsTextOutputOpenRouterModel(JsonElement item)
+    {
+        if (!TryGetPropertyCaseInsensitive(item, "architecture", out var arch) ||
+            arch.ValueKind != JsonValueKind.Object)
+        {
+            return true;
+        }
+
+        if (TryGetPropertyCaseInsensitive(arch, "output_modalities", out var outputs) &&
+            outputs.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in outputs.EnumerateArray())
+            {
+                if (entry.ValueKind == JsonValueKind.String &&
+                    string.Equals(entry.GetString()?.Trim(), "text", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (TryGetPropertyCaseInsensitive(arch, "modality", out var modality) &&
+            modality.ValueKind == JsonValueKind.String)
+        {
+            var raw = modality.GetString();
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                var arrowIdx = raw.IndexOf("->", StringComparison.Ordinal);
+                var outputSide = arrowIdx >= 0 ? raw[(arrowIdx + 2)..] : raw;
+                return outputSide.Contains("text", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        return true;
+    }
+
+    private static HashSet<string> ReadSupportedParameters(JsonElement item)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!TryGetPropertyCaseInsensitive(item, "supported_parameters", out var paramsProp) ||
+            paramsProp.ValueKind != JsonValueKind.Array)
+        {
+            return set;
+        }
+
+        foreach (var entry in paramsProp.EnumerateArray())
+        {
+            if (entry.ValueKind == JsonValueKind.String)
+            {
+                var s = entry.GetString()?.Trim();
+                if (!string.IsNullOrWhiteSpace(s)) set.Add(s);
+            }
+        }
+
+        return set;
+    }
+
+    private static (double? PromptPerMillion, double? CompletionPerMillion) ExtractOpenRouterPricing(JsonElement item)
+    {
+        if (!TryGetPropertyCaseInsensitive(item, "pricing", out var pricing) ||
+            pricing.ValueKind != JsonValueKind.Object)
+        {
+            return (null, null);
+        }
+
+        return (
+            TryExtractPricePerMillion(pricing, "prompt"),
+            TryExtractPricePerMillion(pricing, "completion"));
+    }
+
+    private static double? TryExtractPricePerMillion(JsonElement pricing, string field)
+    {
+        if (!TryGetPropertyCaseInsensitive(pricing, field, out var prop)) return null;
+
+        double perToken;
+        if (prop.ValueKind == JsonValueKind.Number)
+        {
+            if (!prop.TryGetDouble(out perToken)) return null;
+        }
+        else if (prop.ValueKind == JsonValueKind.String)
+        {
+            var raw = prop.GetString()?.Trim();
+            if (string.IsNullOrWhiteSpace(raw) ||
+                !double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out perToken))
+            {
+                return null;
+            }
+        }
+        else
+        {
+            return null;
+        }
+
+        // OpenRouter encodes dynamic/variable pricing as negative values (e.g. "-1").
+        if (double.IsNaN(perToken) || double.IsInfinity(perToken) || perToken < 0)
+        {
+            return null;
+        }
+
+        return Math.Round(perToken * 1_000_000.0, 4);
     }
 
     private static readonly string[] ContextLimitFieldNames =

@@ -1,4 +1,5 @@
-﻿using AgentMesh.Api.Controllers;
+﻿using System.Text.Json;
+using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
@@ -193,6 +194,75 @@ public class AgentUsageQuotaEndpointTests
         usage.LifetimeTokens.OutputTokens.Should().Be(0);
         usage.LifetimeTokens.ThinkingTokens.Should().Be(0);
         usage.ProviderQuota.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetAgentUsage_AggregatesCachedTokensAndCostUsd_AndForwardsApiKeyToQuotaProbe()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Agents.Add(new Agent
+        {
+            Id = "openrouter",
+            Name = "OpenRouter",
+            TrustTier = TrustTier.SeniorManager,
+            RuntimeType = RuntimeType.OpenRouter,
+            CapabilitiesJson = """{"adapter":"openrouter","apiKey":"sk-or-quota-key"}"""
+        });
+
+        var meta1 = SessionsController.AccumulateUsageMetadata("{}", JsonSerializer.Serialize(new
+        {
+            usage = new
+            {
+                inputTokens = 1000,
+                outputTokens = 200,
+                thinkingTokens = 50,
+                cachedTokens = 400,
+                totalTokens = 1200,
+                durationSeconds = 1.5,
+                costUsd = 0.0025
+            }
+        }));
+        var meta2 = SessionsController.AccumulateUsageMetadata(meta1, JsonSerializer.Serialize(new
+        {
+            usage = new
+            {
+                inputTokens = 500,
+                outputTokens = 100,
+                thinkingTokens = 25,
+                cachedTokens = 200,
+                totalTokens = 600,
+                durationSeconds = 0.5,
+                costUsd = 0.00125
+            }
+        }));
+
+        db.AgentSessions.Add(new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            DriverId = "openrouter",
+            CreatorAgentId = "openrouter",
+            Title = "OpenRouter Session",
+            MetadataJson = meta2,
+            Status = "idle"
+        });
+        await db.SaveChangesAsync();
+
+        var probe = new RecordingProbe(reading: null);
+        var controller = new AgentsController(db, new ApiKeyService(), null, probe);
+
+        var usage = await AssertUsageAsync(controller, "openrouter");
+
+        usage.LifetimeTokens.InputTokens.Should().Be(1500);
+        usage.LifetimeTokens.OutputTokens.Should().Be(300);
+        usage.LifetimeTokens.ThinkingTokens.Should().Be(75);
+        usage.LifetimeTokens.CachedTokens.Should().Be(600);
+        usage.LifetimeTokens.TotalTokens.Should().Be(1800);
+        usage.LifetimeTokens.CostUsd.Should().BeApproximately(0.00375, 0.000001);
+
+        var req = probe.Requests.Single();
+        req.RuntimeType.Should().Be(RuntimeType.OpenRouter);
+        req.Adapter.Should().Be("openrouter");
+        req.ApiKey.Should().Be("sk-or-quota-key");
     }
 
     private static async Task<AgentUsageResponse> AssertUsageAsync(AgentsController controller, string id)

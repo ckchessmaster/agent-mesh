@@ -201,6 +201,24 @@ export interface DriverSidecarConfig {
   authCheckCommand?: string | null;
 }
 
+export interface OpenRouterProviderRouting {
+  sort?: string | null;
+  order?: string[] | null;
+  only?: string[] | null;
+  ignore?: string[] | null;
+  allowFallbacks?: boolean | null;
+  dataCollection?: string | null;
+  zdr?: boolean | null;
+  requireParameters?: boolean | null;
+}
+
+export interface OpenRouterConfig {
+  httpReferer?: string | null;
+  appTitle?: string | null;
+  fallbackModels?: string[] | null;
+  provider?: OpenRouterProviderRouting | null;
+}
+
 /**
  * Parsed driver runtime config, as returned by GET /api/agents/{id}/config and mirrored on
  * Agent.config. The API never sends the API key itself — only whether one is stored.
@@ -226,6 +244,7 @@ export interface DriverConfig {
   hasSidecarAuthKey?: boolean;
   loginCommand?: string | null;
   authCheckCommand?: string | null;
+  openRouter?: OpenRouterConfig | null;
 }
 
 export interface Agent {
@@ -366,6 +385,9 @@ export interface ModelCapability {
    * Absent on a baseline entry, which carries no models at all.
    */
   contextSizes?: string[] | null;
+  maxContextTokens?: number | null;
+  promptPricePerMillion?: number | null;
+  completionPricePerMillion?: number | null;
 }
 
 /**
@@ -474,6 +496,8 @@ export interface LifetimeTokens {
   thinkingTokens: number;
   totalTokens: number;
   totalDurationSeconds: number;
+  cachedTokens?: number;
+  costUsd?: number;
 }
 
 export interface AgentUsageResponse {

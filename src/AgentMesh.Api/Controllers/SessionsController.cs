@@ -566,22 +566,26 @@ public class SessionsController(
 
             if (hasUsage)
             {
-                var input = usageElem.TryGetProperty("inputTokens", out var ip) ? ip.GetInt64() : 0;
-                var output = usageElem.TryGetProperty("outputTokens", out var op) ? op.GetInt64() : 0;
-                var thinking = usageElem.TryGetProperty("thinkingTokens", out var tp) ? tp.GetInt64() : 0;
-                var total = usageElem.TryGetProperty("totalTokens", out var totp) ? totp.GetInt64() : (input + output);
-                var duration = usageElem.TryGetProperty("durationSeconds", out var dp) ? dp.GetDouble() : 0.0;
+                var input = usageElem.TryGetProperty("inputTokens", out var ip) && ip.TryGetInt64(out var iv) ? iv : 0;
+                var output = usageElem.TryGetProperty("outputTokens", out var op) && op.TryGetInt64(out var ov) ? ov : 0;
+                var thinking = usageElem.TryGetProperty("thinkingTokens", out var tp) && tp.TryGetInt64(out var tv) ? tv : 0;
+                var cached = usageElem.TryGetProperty("cachedTokens", out var cp) && cp.TryGetInt64(out var cv) ? cv : 0;
+                var total = usageElem.TryGetProperty("totalTokens", out var totp) && totp.TryGetInt64(out var totv) ? totv : (input + output);
+                var duration = usageElem.TryGetProperty("durationSeconds", out var dp) && dp.TryGetDouble(out var dv) ? dv : 0.0;
+                var cost = usageElem.TryGetProperty("costUsd", out var costp) && costp.TryGetDouble(out var costv) ? costv : 0.0;
 
-                long existingInput = 0, existingOutput = 0, existingThinking = 0, existingTotal = 0;
-                double existingDuration = 0.0;
+                long existingInput = 0, existingOutput = 0, existingThinking = 0, existingCached = 0, existingTotal = 0;
+                double existingDuration = 0.0, existingCost = 0.0;
 
                 if (dict.TryGetValue("cumulativeUsage", out var existingUsageObj) && existingUsageObj is System.Text.Json.JsonElement existingElem)
                 {
-                    if (existingElem.TryGetProperty("inputTokens", out var ei)) existingInput = ei.GetInt64();
-                    if (existingElem.TryGetProperty("outputTokens", out var eo)) existingOutput = eo.GetInt64();
-                    if (existingElem.TryGetProperty("thinkingTokens", out var et)) existingThinking = et.GetInt64();
-                    if (existingElem.TryGetProperty("totalTokens", out var etot)) existingTotal = etot.GetInt64();
-                    if (existingElem.TryGetProperty("totalDurationSeconds", out var ed)) existingDuration = ed.GetDouble();
+                    if (existingElem.TryGetProperty("inputTokens", out var ei) && ei.TryGetInt64(out var eiv)) existingInput = eiv;
+                    if (existingElem.TryGetProperty("outputTokens", out var eo) && eo.TryGetInt64(out var eov)) existingOutput = eov;
+                    if (existingElem.TryGetProperty("thinkingTokens", out var et) && et.TryGetInt64(out var etv)) existingThinking = etv;
+                    if (existingElem.TryGetProperty("cachedTokens", out var ec) && ec.TryGetInt64(out var ecv)) existingCached = ecv;
+                    if (existingElem.TryGetProperty("totalTokens", out var etot) && etot.TryGetInt64(out var etotv)) existingTotal = etotv;
+                    if (existingElem.TryGetProperty("totalDurationSeconds", out var ed) && ed.TryGetDouble(out var edv)) existingDuration = edv;
+                    if (existingElem.TryGetProperty("costUsd", out var ecost) && ecost.TryGetDouble(out var ecostv)) existingCost = ecostv;
                 }
 
                 dict["cumulativeUsage"] = new
@@ -589,8 +593,10 @@ public class SessionsController(
                     inputTokens = existingInput + input,
                     outputTokens = existingOutput + output,
                     thinkingTokens = existingThinking + thinking,
+                    cachedTokens = existingCached + cached,
                     totalTokens = existingTotal + total,
-                    totalDurationSeconds = existingDuration + duration
+                    totalDurationSeconds = existingDuration + duration,
+                    costUsd = Math.Round(existingCost + cost, 8)
                 };
             }
 

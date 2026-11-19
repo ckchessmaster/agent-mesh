@@ -1139,6 +1139,10 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             checkCmd = "command -v copilot >/dev/null 2>&1 && copilot --version";
         }
+        else if (adapterType == "openrouter")
+        {
+            checkCmd = "echo 'OpenRouter API Adapter'";
+        }
         else if (adapterType == "openai")
         {
             checkCmd = !string.IsNullOrWhiteSpace(companionBin)
@@ -1262,6 +1266,24 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "No GitHub Copilot CLI credentials found. Click 'Authenticate Driver' in the UI or run /login in terminal to log in."));
             }
         }
+        else if (adapterType == "openrouter")
+        {
+            var (keyExit, keyOut, _) = await ExecInContainerAsync(normPersonaId, "printenv OPENROUTER_API_KEY", ct);
+            var hasEnvKey = (keyExit == 0 && !string.IsNullOrWhiteSpace(keyOut));
+
+            if (hasApiKey || hasEnvKey)
+            {
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "success", "OpenRouter API key configured"));
+            }
+            else if (!string.IsNullOrWhiteSpace(loginCmd))
+            {
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "Driver requires authentication. Click 'Authenticate Driver' in the UI to log in."));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep("Authentication Check", "warning", "No OpenRouter API key configured (OPENROUTER_API_KEY). Enter an API key in the UI."));
+            }
+        }
         else if (adapterType == "openai")
         {
             var (keyExit, keyOut, _) = await ExecInContainerAsync(normPersonaId, "printenv OPENAI_API_KEY", ct);
@@ -1307,12 +1329,14 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
 
         // 7. Driver Endpoint Reachability Check (for HTTP endpoints)
-        if (!string.IsNullOrWhiteSpace(endpoint))
+        var effectiveHttpEndpoint = !string.IsNullOrWhiteSpace(endpoint)
+            ? endpoint
+            : (adapterType == "openrouter" ? OpenRouterConfig.DefaultEndpoint : null);
+
+        if (!string.IsNullOrWhiteSpace(effectiveHttpEndpoint))
         {
-            var baseEndpoint = endpoint.TrimEnd('/');
-            var modelsUrl = baseEndpoint.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)
-                ? $"{baseEndpoint}/models"
-                : $"{baseEndpoint}/v1/models";
+            var baseEndpoint = effectiveHttpEndpoint.TrimEnd('/');
+            var modelsUrl = DriverModelDiscovery.ToModelsUrl(baseEndpoint);
 
             var (epExit, epOut, epErr) = await ExecInContainerAsync(
                 normPersonaId,
@@ -1325,28 +1349,28 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 steps.Add(new PersonaDriverVerificationStep(
                     "Driver Endpoint Reachability",
                     "success",
-                    $"Endpoint responded successfully at {endpoint} (HTTP 200)"));
+                    $"Endpoint responded successfully at {effectiveHttpEndpoint} (HTTP 200)"));
             }
             else if (epCombined.Contains("HTTP_CODE:401") || epCombined.Contains("HTTP_CODE:403"))
             {
                 steps.Add(new PersonaDriverVerificationStep(
                     "Driver Endpoint Reachability",
                     "warning",
-                    $"Endpoint reached at {endpoint} but rejected authentication (HTTP 401/403)"));
+                    $"Endpoint reached at {effectiveHttpEndpoint} but rejected authentication (HTTP 401/403)"));
             }
             else if (epCombined.Contains("Connection refused", StringComparison.OrdinalIgnoreCase))
             {
                 steps.Add(new PersonaDriverVerificationStep(
                     "Driver Endpoint Reachability",
                     "failed",
-                    $"Connection refused: Failed to connect to {endpoint}"));
+                    $"Connection refused: Failed to connect to {effectiveHttpEndpoint}"));
             }
             else
             {
                 steps.Add(new PersonaDriverVerificationStep(
                     "Driver Endpoint Reachability",
                     "failed",
-                    $"Unable to reach endpoint at {endpoint}: {epCombined}"));
+                    $"Unable to reach endpoint at {effectiveHttpEndpoint}: {epCombined}"));
             }
         }
 
@@ -1434,6 +1458,36 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         "Dry-Run Prompt Test",
                         "warning",
                         $"Dry-run prompt exited with code {dryExit}: {(!string.IsNullOrWhiteSpace(dryErr) ? dryErr : dryOut)}"));
+                }
+            }
+            else if (adapterType == "openrouter")
+            {
+                var baseEndpoint = !string.IsNullOrWhiteSpace(endpoint)
+                    ? endpoint.TrimEnd('/')
+                    : OpenRouterConfig.DefaultEndpoint;
+                var modelsUrl = DriverModelDiscovery.ToModelsUrl(baseEndpoint);
+
+                var (mExit, mOut, mErr) = await ExecInContainerAsync(
+                    normPersonaId,
+                    $"curl -s -m 10 -H \"Authorization: Bearer $OPENROUTER_API_KEY\" -H \"X-Title: AgentMesh\" \"{modelsUrl}\"",
+                    ct);
+                if (mExit == 0 && !string.IsNullOrWhiteSpace(mOut) && mOut.Contains("\"data\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    var modelList = ParseModelsFromBody(mOut);
+                    var modelNames = modelList != null && modelList.Count > 0 ? string.Join(", ", modelList.Take(5)) : "active";
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "success",
+                        !string.IsNullOrWhiteSpace(defaultModel) && modelList != null && modelList.Contains(defaultModel)
+                            ? $"OpenRouter active with configured model '{defaultModel}' ({modelList.Count} models available)"
+                            : $"OpenRouter endpoint active. Models available: {modelNames}"));
+                }
+                else
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Dry-Run Prompt Test",
+                        "warning",
+                        $"OpenRouter models check returned code {mExit}: {(!string.IsNullOrWhiteSpace(mErr) ? mErr : mOut)}"));
                 }
             }
             else if (adapterType == "openai" && !string.IsNullOrWhiteSpace(endpoint))
@@ -1545,6 +1599,24 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         {
             // Always allow starting an isolated `copilot login --device-code` flow when the operator
             // explicitly clicks Authenticate Driver, stripped of GH_TOKEN/GITHUB_TOKEN.
+        }
+        else if (adapterType == "openrouter" && string.IsNullOrWhiteSpace(loginCmd))
+        {
+            var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -n \"$OPENROUTER_API_KEY\"", ct);
+            if (chkExit == 0 || info.HasApiKey)
+            {
+                return new PersonaAuthStartResult(normPersonaId, driverId, "already_authenticated", Instructions: "OpenRouter API key is configured.");
+            }
+            return new PersonaAuthStartResult(normPersonaId, driverId, "apikey_required", Instructions: "OpenRouter authenticates via API key (sk-or-v1-...). Enter your OpenRouter API key below.");
+        }
+        else if (adapterType == "openai" && string.IsNullOrWhiteSpace(loginCmd))
+        {
+            var (chkExit, _, _) = await ExecInContainerAsync(normPersonaId, "test -n \"$OPENAI_API_KEY\"", ct);
+            if (chkExit == 0 || info.HasApiKey)
+            {
+                return new PersonaAuthStartResult(normPersonaId, driverId, "already_authenticated", Instructions: "OpenAI API key is configured.");
+            }
+            return new PersonaAuthStartResult(normPersonaId, driverId, "apikey_required", Instructions: "OpenAI-compatible driver authenticates via API Key or direct endpoint. Enter your API key below or configure a Login Command in driver settings.");
         }
 
         if (_activeK8sAuthSessions.TryGetValue(normPersonaId, out var existing) && !existing.HasProcessExited)
@@ -2195,6 +2267,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             ? "ANTHROPIC_API_KEY"
             : providerNorm.Contains("gemini")
             ? "GEMINI_API_KEY"
+            : providerNorm.Contains("openrouter")
+            ? "OPENROUTER_API_KEY"
             : "OPENAI_API_KEY";
 
         await UpsertPersonaSecretAsync(normPersonaId, new Dictionary<string, byte[]>
@@ -2546,7 +2620,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         string? authorName,
         string? authorEmail,
         string? driverAdapter,
-        string? driverOAuthToken)
+        string? driverOAuthToken,
+        string? driverApiKey = null,
+        string? driverEndpoint = null)
     {
         var upserts = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         // Always scrub legacy COPILOT_GITHUB_TOKEN from the Kubernetes secret so a Persona's
@@ -2573,6 +2649,18 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             var cpBytes = Encoding.UTF8.GetBytes(driverOAuthToken!.Trim());
             upserts["copilot-oauth-token"] = cpBytes;
             upserts[CopilotCredentialHelper.CopilotOAuthTokenEnvVar] = cpBytes;
+        }
+
+        if (string.Equals(driverAdapter, DriverAdapters.OpenRouter, StringComparison.OrdinalIgnoreCase))
+        {
+            if (!string.IsNullOrWhiteSpace(driverApiKey))
+            {
+                upserts["OPENROUTER_API_KEY"] = Encoding.UTF8.GetBytes(driverApiKey.Trim());
+            }
+            if (!string.IsNullOrWhiteSpace(driverEndpoint))
+            {
+                upserts["OPENROUTER_BASE_URL"] = Encoding.UTF8.GetBytes(driverEndpoint.Trim());
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(authorName))
@@ -2771,6 +2859,8 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
 
             string? driverAdapter = null;
             string? driverOAuthToken = null;
+            string? driverApiKey = null;
+            string? driverEndpoint = null;
             if (!string.IsNullOrWhiteSpace(persona.DriverId))
             {
                 var driverId = persona.DriverId.Trim().TrimStart('@').ToLowerInvariant();
@@ -2788,6 +2878,12 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                 explicitAdapter = adProp.GetString();
                             if (doc.RootElement.TryGetProperty("endpoint", out var epProp) && epProp.ValueKind == JsonValueKind.String)
                                 endpoint = epProp.GetString();
+                            if (doc.RootElement.TryGetProperty("apiKey", out var keyProp) &&
+                                keyProp.ValueKind == JsonValueKind.String &&
+                                !string.IsNullOrWhiteSpace(keyProp.GetString()))
+                            {
+                                driverApiKey = keyProp.GetString()!.Trim();
+                            }
                             if (doc.RootElement.TryGetProperty("oauthToken", out var tokProp) &&
                                 tokProp.ValueKind == JsonValueKind.String &&
                                 !string.IsNullOrWhiteSpace(tokProp.GetString()))
@@ -2799,7 +2895,16 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     catch { }
                 }
 
+                driverEndpoint = !string.IsNullOrWhiteSpace(endpoint)
+                    ? endpoint.Trim()
+                    : (_config["OPENROUTER_BASE_URL"] ?? Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL"));
                 driverAdapter = DriverAdapters.ResolveAdapter(explicitAdapter, driverId, endpoint, driver?.RuntimeType);
+
+                if (string.IsNullOrWhiteSpace(driverApiKey) &&
+                    string.Equals(driverAdapter, DriverAdapters.OpenRouter, StringComparison.OrdinalIgnoreCase))
+                {
+                    driverApiKey = _config["OPENROUTER_API_KEY"] ?? Environment.GetEnvironmentVariable("OPENROUTER_API_KEY");
+                }
 
                 if (string.IsNullOrWhiteSpace(driverOAuthToken))
                 {
@@ -2820,7 +2925,9 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 authorName,
                 authorEmail,
                 driverAdapter,
-                driverOAuthToken);
+                driverOAuthToken,
+                driverApiKey,
+                driverEndpoint);
 
             if (upserts.Count > 0 || removals.Count > 0)
             {
@@ -3359,17 +3466,14 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                         {
                             using var doc = JsonDocument.Parse(agent.CapabilitiesJson);
                             var root = doc.RootElement;
+                            string? explicitAdapter = null;
                             if (root.TryGetProperty("adapter", out var aProp) && aProp.ValueKind == JsonValueKind.String)
                             {
-                                var aStr = aProp.GetString();
-                                if (!string.IsNullOrWhiteSpace(aStr)) adapterType = aStr.Trim().ToLowerInvariant();
+                                explicitAdapter = aProp.GetString();
                             }
-                            else if (driverId.StartsWith("claude")) adapterType = "claude";
-                            else if (driverId.StartsWith("copilot")) adapterType = "copilot";
-                            else if (driverId.StartsWith("openai")) adapterType = "openai";
-
                             if (root.TryGetProperty("endpoint", out var eProp) && eProp.ValueKind == JsonValueKind.String)
                                 endpoint = eProp.GetString()?.Trim();
+                            adapterType = DriverAdapters.ResolveAdapter(explicitAdapter, driverId, endpoint, agent.RuntimeType, fallback: "agy");
                             if (root.TryGetProperty("defaultModel", out var mProp) && mProp.ValueKind == JsonValueKind.String)
                                 defaultModel = mProp.GetString()?.Trim();
                             if (root.TryGetProperty("apiKey", out var kProp) && kProp.ValueKind == JsonValueKind.String)

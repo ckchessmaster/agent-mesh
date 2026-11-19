@@ -63,7 +63,10 @@ builder.Services.AddSingleton<ICredentialEncryptionService, AesCredentialEncrypt
 // the dashboard fans these out over every driver on load, and each probe shells out to a
 // provider CLI that takes seconds to answer.
 builder.Services.AddSingleton<AgyDriverQuotaProbe>();
-builder.Services.AddSingleton<IDriverQuotaProbe>(sp => sp.GetRequiredService<AgyDriverQuotaProbe>());
+builder.Services.AddSingleton<OpenRouterDriverQuotaProbe>();
+builder.Services.AddSingleton<IDriverQuotaProbe>(sp => new CompositeDriverQuotaProbe(
+    sp.GetRequiredService<AgyDriverQuotaProbe>(),
+    sp.GetRequiredService<OpenRouterDriverQuotaProbe>()));
 
 // Driver capability introspection (models, efforts, context windows) resolved per driver from
 // the driver itself. Same singleton rationale as the quota probe, plus a concurrency gate: this
