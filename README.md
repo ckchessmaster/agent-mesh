@@ -1,4 +1,4 @@
-# AgentMesh
+﻿# AgentMesh
 
 > **Heterogeneous Agent Control Plane & Communication Bus**
 
@@ -67,6 +67,84 @@ AgentMesh is a centralized control plane, identity fabric, and durable execution
 | 🤖 [**Personas, Drivers & Runners**](docs/specs/personas-drivers-and-runners.md) | Persona vs. Driver decoupling, runner pods, companion supervisors, sidecars, and container managers. |
 | 🛠️ [**Platform MCP Tools & Contracts**](docs/specs/platform-mcp-tools-and-contracts.md) | Platform MCP tools (`manage_task`, `post_job_message`, `save_memory`, `open_pull_request`), schemas, and SignalR events. |
 | 📦 [**Archived Development Phases**](docs/archive/phases/) | Historical documentation covering initial bootstrap phases 1 through 7. |
+
+---
+
+## Operator Attention & Desktop Notifications
+
+The cockpit answers one question continuously: **what needs a human right now, across every project?**
+
+### What counts as "waiting on you"
+
+The rules live server-side (`src/AgentMesh.Api/Services/AttentionQueryService.cs`) so the desktop
+banner and the bell inbox can never disagree about what is blocked. A job contributes **at most one**
+item, and only `Active` / `Pending` jobs are considered — a job that finishes, is archived, or gets a
+human reply resolves itself.
+
+| Kind (`type`) | Raised when you are needed |
+| :--- | :--- |
+| `planApproval` | A plan is parked at the approval gate. |
+| `discoveryQuestions` | An agent posted discovery/trade-off questions and is waiting for answers. |
+| `interruptedTurn` | A turn was interrupted mid-flight and needs an operator to recover it. |
+| `prReview` | A pull request is open and awaiting your review. |
+| `escalation` | An agent posted a message with `requiresReply` addressed to you (3-R escalation). |
+
+### Contract
+
+| Surface | Shape |
+| :--- | :--- |
+| `GET /api/attention` (authorized) | `{ items: [{ id, type, title, detail, jobId, jobTitle, projectId, projectName, cardId, prUrl, prNumber, since }], count, generatedAt }` — oldest first, empty rather than 404 when nothing is blocked. `id` is `"{jobId}:{type}"`. |
+| SignalR `AttentionNeeded` (broadcast to all clients) | One `AttentionItem`, emitted when a job starts waiting. |
+| SignalR `AttentionResolved` (broadcast to all clients) | `{ jobId }`, emitted when that job stops waiting. |
+
+Both events fire from the three state-transition write sites (job ledger message, progress heartbeat,
+timeline card), so a wait is announced when it actually opens rather than on the next poll.
+
+### In the cockpit
+
+The header **bell** badges the number of waits you have not looked at, lists them with the job, the
+project, the reason and how long each has been waiting, and click-throughs: a PR review opens the pull
+request, everything else selects that project and job in the cockpit. Dismissing hides a wait from the
+list without answering the agent — it returns if the job clears and parks again. The switch beside the
+bell is the master mute for desktop alerts.
+
+State is deliberately operator-local (there is no "ack" endpoint; the server's answer to "is this still
+waiting?" is "ask me again"):
+
+| `localStorage` key | Holds | Lifetime |
+| :--- | :--- | :--- |
+| `agentmesh_attention_seen_v1` | Which waits were already announced (banner + chime), shared by the push path and the poll. | 24h — a wait still open tomorrow nudges again. |
+| `agentmesh_attention_read_v1` | Which rows you have opened in the bell (clears the badge). | 24h |
+| `agentmesh_attention_dismissed_v1` | Rows you hid from the list. | 24h, or until the wait resolves |
+| `agentmesh_notifications_muted_v1` | The master mute flag. | until toggled back |
+
+### Secure context — read this if no banner ever appears
+
+Browsers only expose the `Notification` API and an audible `AudioContext` in a **secure context**:
+`https://…`, or `http://localhost` / `http://127.0.0.1`. Serving the cockpit on a bare LAN address or an
+http tunnel — `http://192.168.0.20:5173`, `http://agents.internal` — means the OS banner is never raised
+and the chime is silent, **with no error thrown**, because the API is simply not exposed to insecure
+origins. The bell states this in its footer instead of failing silently:
+
+> Desktop alerts need HTTPS or localhost
+
+The in-app bell, badge and inbox keep working either way; only the operating-system alert is lost.
+
+* **Deployment:** terminate TLS at the ingress. The Helm chart ships `ingress.className`, `ingress.host`,
+  `ingress.clusterIssuer` (Let's Encrypt) and `ingress.tlsSecretName`, so a normal install is already a
+  secure context.
+* **Remote machine, no certificate:** port-forward and open it as localhost —
+  `kubectl port-forward svc/<release>-dashboard 8080:80` then browse `http://localhost:8080`.
+* **Local development:** `npm run dev` serves `http://localhost:5173`, which *is* a secure context, so
+  notifications work in development. Opening the dev server through a machine name or LAN IP instead
+  turns them off.
+* **Permission is asked, never assumed:** the browser prompt fires only from the bell's
+  *Enable desktop alerts* button, never on page load (browsers auto-deny unprompted requests, and an
+  immediate prompt trains you to dismiss it unread). A prior "block" is a terminal state — the footer
+  then tells you to allow alerts in site settings.
+* **Sound needs a gesture too:** autoplay policy creates `AudioContext` suspended until the page sees
+  input, so the cockpit registers a one-shot `pointerdown`/`keydown` listener. A tab that is never
+  touched will banner silently, by design.
 
 ---
 
