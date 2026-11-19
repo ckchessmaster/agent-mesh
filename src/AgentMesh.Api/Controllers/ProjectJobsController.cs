@@ -287,6 +287,46 @@ public class ProjectJobsController(
         await db.SaveChangesAsync();
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+
+        if (req.AssignedAgentId != null && _workflows != null)
+        {
+            var effectiveAssignee = job.AssignedAgentId;
+            if (string.IsNullOrWhiteSpace(effectiveAssignee))
+            {
+                effectiveAssignee = project?.DefaultLeadPersonaId;
+                if (string.IsNullOrWhiteSpace(effectiveAssignee))
+                {
+                    effectiveAssignee = await db.ProjectPersonas
+                        .AsNoTracking()
+                        .Where(pp => pp.ProjectId == job.ProjectId)
+                        .Select(pp => pp.PersonaId)
+                        .FirstOrDefaultAsync();
+                }
+                if (string.IsNullOrWhiteSpace(effectiveAssignee))
+                {
+                    effectiveAssignee = await db.Personas
+                        .AsNoTracking()
+                        .Select(p => p.Id)
+                        .FirstOrDefaultAsync();
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(effectiveAssignee))
+            {
+                try
+                {
+                    await _workflows.SendAssigneeUpdateAsync(
+                        id,
+                        new JobAssigneeUpdatedSignal(effectiveAssignee.Trim().ToLowerInvariant()),
+                        HttpContext?.RequestAborted ?? CancellationToken.None);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    logger?.LogWarning(ex, "Failed to signal workflow assignee update for job {JobId}", id);
+                }
+            }
+        }
+
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
         var dto = ToDto(job, project?.Name, cardCount);
 

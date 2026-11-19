@@ -34,6 +34,8 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     private string? _awaitingFrom;
     private string? _personaId;
     private string? _agentId;
+    private string? _rawPersonaId;
+    private string? _rawAgentId;
     private DateTimeOffset? _awaitingSince;
     private int _turnCount;
     private TurnOutcomeStatus? _lastOutcome;
@@ -52,6 +54,8 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         _currentStatus = "Running";
         _turnSessionId = input.TurnSessionId;
 
+        _rawPersonaId = input.PersonaId;
+        _rawAgentId = input.AgentId;
         _personaId = NormalizeIdentity(input.PersonaId);
         _agentId = NormalizeIdentity(input.AgentId);
 
@@ -102,7 +106,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
 
             try
             {
-                outcome = await ExecuteTurnActivityAsync(input, pendingReply, turnCancellation.Token);
+                outcome = await ExecuteTurnActivityAsync(CurrentInput(input), pendingReply, turnCancellation.Token);
                 _activeTurnCts = null;
             }
             catch (Exception ex) when (_abortSignal != null && IsActivityCancellation(ex))
@@ -279,6 +283,35 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         _intervention = signal;
         return Task.CompletedTask;
     }
+
+    [WorkflowSignal]
+    public Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal)
+    {
+        if (signal is null || string.IsNullOrWhiteSpace(signal.AssignedAgentId))
+        {
+            return Task.CompletedTask;
+        }
+
+        var normalized = signal.AssignedAgentId.Trim().TrimStart('@').ToLowerInvariant();
+        if (normalized.Length == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        _rawPersonaId = normalized;
+        _rawAgentId = normalized;
+        _personaId = NormalizeIdentity(normalized);
+        _agentId = NormalizeIdentity(normalized);
+        Workflow.UpsertMemo(MemoUpdate.ValueSet("personaId", normalized));
+        return Task.CompletedTask;
+    }
+
+    private TaskExecutionInput CurrentInput(TaskExecutionInput input) =>
+        input with
+        {
+            AgentId = !string.IsNullOrWhiteSpace(_rawAgentId) ? _rawAgentId! : input.AgentId,
+            PersonaId = !string.IsNullOrWhiteSpace(_rawPersonaId) ? _rawPersonaId : input.PersonaId
+        };
 
     [WorkflowSignal]
     public Task ReceiveChatMessageAsync(ChatMessageSignal signal)

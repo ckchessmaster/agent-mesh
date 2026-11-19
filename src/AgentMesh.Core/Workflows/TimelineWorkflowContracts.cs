@@ -78,6 +78,10 @@ public record TurnInterventionSignal(
     string? AdditionalContext = null
 );
 
+public record JobAssigneeUpdatedSignal(
+    string? AssignedAgentId
+);
+
 public record JobExecutionContinuationState(
     int ReviewRound,
     Guid? InitCardId,
@@ -196,7 +200,8 @@ public record JobWorkflowState(
     string CurrentHeartbeat,
     int ReviewRound = 0,
     string? ActivePrUrl = null,
-    int IgnoredSelfReviewCount = 0
+    int IgnoredSelfReviewCount = 0,
+    string? AssignedAgentId = null
 );
 
 [Workflow("JobExecutionWorkflow")]
@@ -219,6 +224,9 @@ public interface IJobExecutionWorkflow
 
     [WorkflowSignal]
     Task InterveneTurnAsync(TurnInterventionSignal signal);
+
+    [WorkflowSignal]
+    Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal);
 
     [WorkflowSignal]
     Task ReceiveChatMessageAsync(ChatMessageSignal signal);
@@ -252,6 +260,9 @@ public interface ITaskExecutionWorkflow
 
     [WorkflowSignal]
     Task InterveneTurnAsync(TurnInterventionSignal signal);
+
+    [WorkflowSignal]
+    Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal);
 
     [WorkflowSignal]
     Task ReceiveChatMessageAsync(ChatMessageSignal signal);

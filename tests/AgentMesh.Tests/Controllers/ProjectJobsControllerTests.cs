@@ -136,6 +136,49 @@ public class ProjectJobsControllerTests
     }
 
     [Fact]
+    public async Task UpdateJob_ChangingAssignedAgentId_SignalsWorkflowRouter()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "app", Name = "App", DefaultLeadPersonaId = "lead-persona" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "app",
+            Title = "Job 1",
+            AssignedAgentId = "rook",
+            TasksJson = "[]"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new Mock<IWorkflowSignalRouter>();
+        router.Setup(r => r.SendAssigneeUpdateAsync(
+                job.Id,
+                It.IsAny<JobAssigneeUpdatedSignal>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SignalDelivery($"job-{job.Id:D}", SignalDeliveryStatus.Delivered));
+
+        var controller = new ProjectJobsController(db, workflows: router.Object);
+
+        await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(AssignedAgentId: "sorren"));
+
+        router.Verify(r => r.SendAssigneeUpdateAsync(
+            job.Id,
+            It.Is<JobAssigneeUpdatedSignal>(s => s.AssignedAgentId == "sorren"),
+            It.IsAny<CancellationToken>()), Times.Once);
+
+        // Clearing back to Default signals the project's default lead persona
+        await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(AssignedAgentId: ""));
+
+        router.Verify(r => r.SendAssigneeUpdateAsync(
+            job.Id,
+            It.Is<JobAssigneeUpdatedSignal>(s => s.AssignedAgentId == "lead-persona"),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
     public async Task TaskManagement_CanAddToggleAndDeleteTasks()
     {
         using var db = TestDbContextFactory.Create();
