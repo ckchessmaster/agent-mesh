@@ -287,7 +287,7 @@ public static class Program
             {
                 if (subArgs.Count == 0)
                 {
-                    AnsiConsole.MarkupLine("[red]Usage:[/] agentmesh add <agent-id> [[--name <name>]] [[--role <role>]] [[--adapter <agy|claude|copilot|openai|generic>]] [[--command <cmd>]] [[--endpoint <url>]] [[--api-key <key>]] [[--model <model>]]");
+                    AnsiConsole.MarkupLine("[red]Usage:[/] agentmesh add <agent-id> [[--name <name>]] [[--role <role>]] [[--adapter <agy|claude|copilot|openai|openrouter|generic>]] [[--command <cmd>]] [[--endpoint <url>]] [[--api-key <key>]] [[--model <model>]]");
                     return 1;
                 }
 
@@ -298,6 +298,19 @@ public static class Program
                 if (!string.IsNullOrWhiteSpace(customEndpoint)) preset.Endpoint = customEndpoint;
                 if (!string.IsNullOrWhiteSpace(customApiKey)) preset.ApiKey = customApiKey;
                 if (!string.IsNullOrWhiteSpace(customDefaultModel)) preset.DefaultModel = customDefaultModel;
+                if (string.Equals(preset.AdapterType, "openrouter", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrWhiteSpace(preset.Endpoint))
+                        preset.Endpoint = AgentMesh.Core.Models.OpenRouterConfig.DefaultEndpoint;
+                    if (string.IsNullOrWhiteSpace(preset.DefaultModel))
+                        preset.DefaultModel = "openrouter/auto";
+                    if (preset.Capabilities == null || preset.Capabilities.Count == 0 ||
+                        preset.Capabilities.SequenceEqual(new[] { "shell", "inspect_workspace" }))
+                    {
+                        preset.Capabilities = ConfigStore.GetDefaultCapabilities("openrouter");
+                    }
+                    preset.Command = null;
+                }
                 configStore.Save(config);
 
                 try
@@ -420,7 +433,7 @@ public static class Program
         AnsiConsole.MarkupLine("  [cyan]agentmesh config [[--url <url>]][/]        View or update Mesh URL and operator token\n");
         AnsiConsole.MarkupLine("[bold]Options:[/]");
         AnsiConsole.MarkupLine("  [grey]--persona, -p <id>[/]  Dedicated persona ID (auto-binds to persona in Mesh)");
-        AnsiConsole.MarkupLine("  [grey]--driver, -d <drv>[/]  Driver/harness to use for persona (e.g. openai, agy, claude)");
+        AnsiConsole.MarkupLine("  [grey]--driver, -d <drv>[/]  Driver/harness to use for persona (e.g. openrouter, openai, agy, claude)");
         AnsiConsole.MarkupLine("  [grey]--headless[/]          Run headless without interactive TUI");
         AnsiConsole.MarkupLine("  [grey]--url <url>[/]         AgentMesh API URL (default: http://localhost:5000)");
         AnsiConsole.MarkupLine("  [grey]--token <token>[/]     Operator/master token for auto-registration");

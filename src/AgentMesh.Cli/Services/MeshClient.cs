@@ -5,6 +5,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 
@@ -205,6 +206,38 @@ public class MeshClient
         AgentPresetConfig preset,
         DriverCapabilityDeclaration? declared)
     {
+        var isOpenRouter =
+            string.Equals(preset.AdapterType, DriverAdapters.OpenRouter, StringComparison.OrdinalIgnoreCase) ||
+            (string.Equals(preset.AdapterType, DriverAdapters.Generic, StringComparison.OrdinalIgnoreCase) &&
+             !string.IsNullOrWhiteSpace(preset.Endpoint) &&
+             preset.Endpoint.Contains("openrouter.ai", StringComparison.OrdinalIgnoreCase));
+
+        if (isOpenRouter)
+        {
+            var caps = new Dictionary<string, object?>
+            {
+                ["adapter"] = DriverAdapters.OpenRouter,
+                ["endpoint"] = !string.IsNullOrWhiteSpace(preset.Endpoint) ? preset.Endpoint : OpenRouterConfig.DefaultEndpoint,
+                ["apiKey"] = preset.ApiKey,
+                ["defaultModel"] = preset.DefaultModel,
+                ["timeoutSeconds"] = preset.TimeoutSeconds,
+                ["maxRetries"] = preset.MaxRetries,
+                ["retryDelayMilliseconds"] = preset.RetryDelayMilliseconds,
+                ["maxSteps"] = preset.MaxSteps,
+                ["contextWindowTokens"] = preset.ContextWindowTokens,
+                ["defaultContextSize"] = preset.DefaultContextSize,
+                ["compactionThresholdPercent"] = preset.CompactionThresholdPercent,
+                ["streamChunkIdleTimeoutSeconds"] = preset.StreamChunkIdleTimeoutSeconds,
+                ["openRouter"] = preset.OpenRouter,
+                ["sidecar"] = preset.Sidecar,
+                ["capabilities"] = preset.Capabilities
+            };
+
+            if (declared != null) caps["declared"] = declared;
+
+            return JsonSerializer.Serialize(caps);
+        }
+
         var isOpenAiCompatible =
             string.Equals(preset.AdapterType, "openai", StringComparison.OrdinalIgnoreCase) ||
             !string.IsNullOrWhiteSpace(preset.Endpoint);
@@ -336,12 +369,19 @@ public class MeshClient
         var declared = await DescribeCapabilitiesAsync(preset, ct);
         RememberRegistration(preset.Id, declared);
         var capabilitiesJson = SerializePresetCapabilities(preset, declared);
+        var runtimeType = string.Equals(preset.AdapterType, DriverAdapters.OpenRouter, StringComparison.OrdinalIgnoreCase)
+            ? RuntimeType.OpenRouter
+            : (string.Equals(preset.AdapterType, DriverAdapters.OpenAi, StringComparison.OrdinalIgnoreCase) ||
+               !string.IsNullOrWhiteSpace(preset.Endpoint))
+                ? RuntimeType.OpenAiCompatible
+                : RuntimeType.CliAgy;
 
         var registerPayload = new
         {
             id = preset.Id,
             name = preset.Name,
             role = preset.Role,
+            runtimeType,
             status = "online",
             capabilitiesJson
         };

@@ -34,10 +34,11 @@ public record DriverCapabilitiesView(
     // self-report about the binary next to it.
     DriverCapabilityDeclaration? Declared = null,
     bool HasOAuthToken = false,
-    IReadOnlyDictionary<string, int>? LearnedContextLimits = null)
+    IReadOnlyDictionary<string, int>? LearnedContextLimits = null,
+    OpenRouterConfig? OpenRouter = null)
 {
     public static readonly DriverCapabilitiesView Empty =
-        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null, null, null, false, null);
+        new(null, null, null, null, null, null, null, Array.Empty<string>(), false, null, false, null, null, null, null, false, null, null);
 
     /// <summary>
     /// Models an operator wrote into the blob. Merged over whatever the capability probe finds and
@@ -174,6 +175,49 @@ public static class DriverCapabilities
                 continue;
             }
 
+            if (key.Equals("openRouter", StringComparison.OrdinalIgnoreCase) &&
+                value is JsonObject incomingOpenRouter)
+            {
+                var existingOr = existingObj[key] as JsonObject ?? new JsonObject();
+                var mergedOr = existingOr.DeepClone().AsObject();
+                foreach (var (orKey, orVal) in incomingOpenRouter)
+                {
+                    if (orVal is null) continue;
+                    if (orKey.Equals("provider", StringComparison.OrdinalIgnoreCase) &&
+                        orVal is JsonObject incomingProvider)
+                    {
+                        var existingProv = mergedOr[orKey] as JsonObject ?? new JsonObject();
+                        var mergedProv = existingProv.DeepClone().AsObject();
+                        foreach (var (pKey, pVal) in incomingProvider)
+                        {
+                            if (pVal is null) continue;
+                            if (pVal is JsonValue pjVal && pjVal.TryGetValue<string>(out var pStrVal) && string.IsNullOrWhiteSpace(pStrVal))
+                            {
+                                mergedProv.Remove(pKey);
+                                continue;
+                            }
+                            mergedProv[pKey] = pVal.DeepClone();
+                        }
+                        mergedOr[orKey] = mergedProv;
+                        continue;
+                    }
+                    if (orKey.Equals("fallbackModels", StringComparison.OrdinalIgnoreCase) &&
+                        orVal is JsonArray incomingFallbacks)
+                    {
+                        mergedOr[orKey] = incomingFallbacks.DeepClone();
+                        continue;
+                    }
+                    if (orVal is JsonValue ojVal && ojVal.TryGetValue<string>(out var orStrVal) && string.IsNullOrWhiteSpace(orStrVal))
+                    {
+                        mergedOr.Remove(orKey);
+                        continue;
+                    }
+                    mergedOr[orKey] = orVal.DeepClone();
+                }
+                existingObj[key] = mergedOr;
+                continue;
+            }
+
             if (key.Equals("learnedContextLimits", StringComparison.OrdinalIgnoreCase) &&
                 value is JsonObject incomingLimits &&
                 existingObj[key] is JsonObject existingLimits)
@@ -263,6 +307,16 @@ public static class DriverCapabilities
             catch { }
         }
 
+        OpenRouterConfig? openRouter = null;
+        if (obj.TryGetPropertyValue("openRouter", out var openRouterNode) && openRouterNode is JsonObject openRouterObj)
+        {
+            try
+            {
+                openRouter = JsonSerializer.Deserialize<OpenRouterConfig>(openRouterObj.ToJsonString());
+            }
+            catch { }
+        }
+
         var learnedLimits = ReadLearnedContextLimits(obj);
         if (learnedLimits != null)
         {
@@ -294,7 +348,8 @@ public static class DriverCapabilities
             // every driver on every capability request.
             Declared: DriverCapabilityDeclaration.TryRead(obj),
             HasOAuthToken: !string.IsNullOrWhiteSpace(ReadString(obj, "oauthToken")),
-            LearnedContextLimits: learnedLimits);
+            LearnedContextLimits: learnedLimits,
+            OpenRouter: openRouter);
     }
 
     internal static (string? ApiKey, DriverSidecarConfig? Sidecar, string? OAuthToken) ExtractProbeSecrets(

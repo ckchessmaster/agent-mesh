@@ -4,6 +4,8 @@ import type {
   AgentUsageResponse,
   DriverConfig,
   DriverSidecarConfig,
+  ModelCapability,
+  OpenRouterConfig,
   JobTask,
   AssignJobTaskResult,
   Persona,
@@ -476,6 +478,27 @@ export const api = {
     return res.json();
   },
 
+  async testOpenRouterServer(req: {
+    endpoint?: string;
+    apiKey?: string;
+    agentId?: string;
+  }): Promise<{
+    success: boolean;
+    error?: string;
+    models: ModelCapability[];
+    keyLabel?: string | null;
+    isFreeTier?: boolean | null;
+    limitRemaining?: number | null;
+  }> {
+    const res = await apiFetch('/api/system/drivers/test-openrouter', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to test OpenRouter connection: ${res.statusText}`);
+    return res.json();
+  },
+
   async getAgents(): Promise<Agent[]> {
     const res = await apiFetch('/api/agents', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load agents: ${res.statusText}`);
@@ -752,6 +775,7 @@ export const api = {
   async upsertAgent(req: {
     id: string;
     name: string;
+    runtimeType?: number | string;
     role?: string;
     status?: string;
     capabilitiesJson?: string;
@@ -805,6 +829,7 @@ export const api = {
       sidecar?: DriverSidecarConfig;
       loginCommand?: string;
       authCheckCommand?: string;
+      openRouter?: OpenRouterConfig;
     }
   ): Promise<DriverConfig> {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/config`, {
