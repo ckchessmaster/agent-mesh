@@ -171,6 +171,14 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(32)")
                         .HasColumnName("execution_status");
 
+                    b.Property<string>("InitialPrompt")
+                        .HasColumnType("text")
+                        .HasColumnName("initial_prompt");
+
+                    b.Property<string>("MessageText")
+                        .HasColumnType("text")
+                        .HasColumnName("message_text");
+
                     b.Property<string>("PayloadJson")
                         .IsRequired()
                         .HasColumnType("jsonb")
@@ -544,73 +552,6 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.ToTable("job_handoffs", (string)null);
                 });
 
-            modelBuilder.Entity("AgentMesh.Core.Models.JobMessage", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid")
-                        .HasColumnName("id");
-
-                    b.Property<string>("Content")
-                        .IsRequired()
-                        .HasColumnType("text")
-                        .HasColumnName("content");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("timestamp with time zone")
-                        .HasColumnName("created_at")
-                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
-
-                    b.Property<Guid>("JobId")
-                        .HasColumnType("uuid")
-                        .HasColumnName("job_id");
-
-                    b.Property<string>("MentionsJson")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("jsonb")
-                        .HasDefaultValue("[]")
-                        .HasColumnName("mentions");
-
-                    b.Property<string>("SenderId")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)")
-                        .HasColumnName("sender_id");
-
-                    b.Property<string>("SenderName")
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)")
-                        .HasColumnName("sender_name");
-
-                    b.Property<string>("SenderType")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasMaxLength(32)
-                        .HasColumnType("character varying(32)")
-                        .HasDefaultValue("user")
-                        .HasColumnName("sender_type");
-
-                    b.Property<string>("StructuredPayloadJson")
-                        .HasColumnType("jsonb")
-                        .HasColumnName("structured_payload");
-
-                    b.Property<Guid?>("TurnSessionId")
-                        .HasColumnType("uuid")
-                        .HasColumnName("turn_session_id");
-
-                    b.HasKey("Id")
-                        .HasName("pk_job_messages");
-
-                    b.HasIndex("JobId")
-                        .HasDatabaseName("ix_job_messages_job_id");
-
-                    b.HasIndex("TurnSessionId")
-                        .HasDatabaseName("ix_job_messages_turn_session_id");
-
-                    b.ToTable("job_messages", (string)null);
-                });
-
             modelBuilder.Entity("AgentMesh.Core.Models.JobTimelineCard", b =>
                 {
                     b.Property<Guid>("Id")
@@ -813,6 +754,91 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.ToTable("job_workspace_states", (string)null);
                 });
 
+            modelBuilder.Entity("AgentMesh.Core.Models.McpServer", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("id");
+
+                    b.Property<string>("ArgsJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("[]")
+                        .HasColumnName("args");
+
+                    b.Property<string>("Command")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)")
+                        .HasColumnName("command");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("Description")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasDefaultValue("")
+                        .HasColumnName("description");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("boolean")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("EnvEncrypted")
+                        .HasColumnType("text")
+                        .HasColumnName("env_encrypted");
+
+                    b.Property<string>("HeadersEncrypted")
+                        .HasColumnType("text")
+                        .HasColumnName("headers_encrypted");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("name");
+
+                    b.Property<int>("TimeoutSeconds")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(30)
+                        .HasColumnName("timeout_seconds");
+
+                    b.Property<string>("Transport")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasDefaultValue("Stdio")
+                        .HasColumnName("transport");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("Url")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasColumnName("url");
+
+                    b.HasKey("Id")
+                        .HasName("pk_mcp_servers");
+
+                    b.HasIndex("Name")
+                        .HasDatabaseName("ix_mcp_servers_name");
+
+                    b.ToTable("mcp_servers", (string)null);
+                });
+
             modelBuilder.Entity("AgentMesh.Core.Models.Persona", b =>
                 {
                     b.Property<string>("Id")
@@ -914,6 +940,62 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasDatabaseName("ix_personas_driver_id");
 
                     b.ToTable("personas", (string)null);
+                });
+
+            modelBuilder.Entity("AgentMesh.Core.Models.PersonaMcpServer", b =>
+                {
+                    b.Property<string>("PersonaId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("persona_id");
+
+                    b.Property<string>("McpServerId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("mcp_server_id");
+
+                    b.Property<string>("AllowedToolsJson")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("allowed_tools");
+
+                    b.Property<DateTimeOffset>("AssignedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("assigned_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.Property<string>("BlockedToolsJson")
+                        .HasColumnType("jsonb")
+                        .HasColumnName("blocked_tools");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("boolean")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("EnvOverridesEncrypted")
+                        .HasColumnType("text")
+                        .HasColumnName("env_overrides_encrypted");
+
+                    b.Property<string>("HeadersOverridesEncrypted")
+                        .HasColumnType("text")
+                        .HasColumnName("headers_overrides_encrypted");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+                    b.HasKey("PersonaId", "McpServerId")
+                        .HasName("pk_persona_mcp_servers");
+
+                    b.HasIndex("McpServerId")
+                        .HasDatabaseName("ix_persona_mcp_servers_mcp_server_id");
+
+                    b.HasIndex("PersonaId")
+                        .HasDatabaseName("ix_persona_mcp_servers_persona_id");
+
+                    b.ToTable("persona_mcp_servers", (string)null);
                 });
 
             modelBuilder.Entity("AgentMesh.Core.Models.Project", b =>
@@ -1130,8 +1212,7 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Property<string>("Description")
                         .IsRequired()
                         .ValueGeneratedOnAdd()
-                        .HasMaxLength(1024)
-                        .HasColumnType("character varying(1024)")
+                        .HasColumnType("text")
                         .HasDefaultValue("")
                         .HasColumnName("description");
 
@@ -1349,6 +1430,27 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Navigation("Card");
                 });
 
+            modelBuilder.Entity("AgentMesh.Core.Models.PersonaMcpServer", b =>
+                {
+                    b.HasOne("AgentMesh.Core.Models.McpServer", "McpServer")
+                        .WithMany("PersonaMcpServers")
+                        .HasForeignKey("McpServerId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_persona_mcp_servers_mcp_servers_mcp_server_id");
+
+                    b.HasOne("AgentMesh.Core.Models.Persona", "Persona")
+                        .WithMany("PersonaMcpServers")
+                        .HasForeignKey("PersonaId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired()
+                        .HasConstraintName("fk_persona_mcp_servers_personas_persona_id");
+
+                    b.Navigation("McpServer");
+
+                    b.Navigation("Persona");
+                });
+
             modelBuilder.Entity("AgentMesh.Core.Models.ProjectPersona", b =>
                 {
                     b.HasOne("AgentMesh.Core.Models.Persona", null)
@@ -1388,8 +1490,15 @@ namespace AgentMesh.Infrastructure.Migrations
                     b.Navigation("Comments");
                 });
 
+            modelBuilder.Entity("AgentMesh.Core.Models.McpServer", b =>
+                {
+                    b.Navigation("PersonaMcpServers");
+                });
+
             modelBuilder.Entity("AgentMesh.Core.Models.Persona", b =>
                 {
+                    b.Navigation("PersonaMcpServers");
+
                     b.Navigation("ProjectPersonas");
                 });
 #pragma warning restore 612, 618

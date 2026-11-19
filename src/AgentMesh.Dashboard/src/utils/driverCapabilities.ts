@@ -29,7 +29,7 @@ export type CapabilitySource =
   | 'user_override'
   | 'unavailable';
 
-const CANONICAL_KEYS = ['agy', 'copilot', 'claude', 'openai', 'generic'] as const;
+const CANONICAL_KEYS = ['agy', 'copilot', 'claude', 'openai', 'openrouter', 'generic'] as const;
 
 /** Adapter aliases the API canonicalizes; mirrored here so both sides agree. */
 const ADAPTER_ALIASES: Record<string, string> = {
@@ -44,6 +44,8 @@ const ADAPTER_ALIASES: Record<string, string> = {
   vllm: 'openai',
   lmstudio: 'openai',
   'lm-studio': 'openai',
+  openrouter: 'openrouter',
+  'open-router': 'openrouter',
   generic: 'generic',
   custom: 'generic',
   command: 'generic'
@@ -51,13 +53,23 @@ const ADAPTER_ALIASES: Record<string, string> = {
 
 /**
  * The runtimeType enum values that imply a transport, matching AgentMesh.Core's RuntimeType.
- * Numeric because the API serializes the enum as an int.
+ * Numeric because older API builds serialize the enum as an int, while AgentsController strings
+ * arrive as enum names (`OpenRouter`, `OpenAiCompatible`, etc.).
  */
 const RUNTIME_TYPE_NAMES: Record<number, string> = {
   1: 'generic', // McpCloud
   2: 'openai', // LocalOllama
   3: 'agy', // CliAgy
-  4: 'openai' // OpenAiCompatible
+  4: 'openai', // OpenAiCompatible
+  5: 'openrouter'
+};
+
+const RUNTIME_TYPE_STRINGS: Record<string, string> = {
+  mcpcloud: 'generic',
+  localollama: 'openai',
+  cliagy: 'agy',
+  openaicompatible: 'openai',
+  openrouter: 'openrouter'
 };
 
 function readAdapterField(source: unknown): string | undefined {
@@ -93,12 +105,16 @@ export function resolveAdapterKey(
     if (runtimes && runtimes[explicit.toLowerCase()]) return explicit.toLowerCase();
   }
 
-  // An endpoint means the driver speaks OpenAI-compatible HTTP whatever its enum says. This is the
-  // case the substring guess got wrong most often.
+  // An endpoint means the driver speaks OpenAI-compatible HTTP (or OpenRouter) whatever its enum says.
   const endpoint = readEndpoint(fromCapabilities, agent.config);
-  if (endpoint) return 'openai';
+  if (endpoint) {
+    if (endpoint.toLowerCase().includes('openrouter.ai')) return 'openrouter';
+    return 'openai';
+  }
 
-  const runtimeKey = RUNTIME_TYPE_NAMES[Number(agent.runtimeType)];
+  const runtimeKey =
+    RUNTIME_TYPE_STRINGS[String(agent.runtimeType ?? '').trim().toLowerCase()] ??
+    RUNTIME_TYPE_NAMES[Number(agent.runtimeType)];
   if (runtimeKey && (!runtimes || runtimes[runtimeKey])) return runtimeKey;
 
   // Last resort: name heuristics, kept so drivers written before `adapter` was recorded still get
@@ -361,8 +377,17 @@ export function resolveCapabilitiesFor(
       return resolveDriverCapabilities(capabilities, {
         id: directDriver.driverId,
         name: directDriver.name,
-        runtimeType: directDriver.adapter === 'openai' ? 4 : 3,
+        runtimeType:
+          directDriver.adapter === 'openrouter'
+            ? 'OpenRouter'
+            : directDriver.adapter === 'openai'
+            ? 4
+            : 3,
         trustTier: 1,
+        capabilitiesJson: JSON.stringify({
+          adapter: directDriver.adapter,
+          endpoint: directDriver.endpoint
+        }),
         createdAt: directDriver.observedAt
       });
     }
@@ -560,7 +585,7 @@ export function effortsFor(
     ? resolved.models.find((m) => m.id?.toLowerCase() === modelId.toLowerCase())
     : undefined;
 
-  if (model?.efforts && model.efforts.length > 0) return model.efforts;
+  if (model) return model.efforts ?? [];
 
   // Union across the driver's models: efforts are per-model on agy (the CLI lists one id per
   // effort variant), so a driver-wide union is the widest honest set.

@@ -117,6 +117,36 @@ sequenceDiagram
 ### Turn Timeout & Output Spillover Protection
 * **Command Timeouts**: Shell executions inside runner environments are bounded by a strict 180-second timeout. Runaway processes are terminated via process-group `SIGTERM` followed by `SIGKILL`.
 * **Spillover Redirection**: Any stdout or stderr output exceeding 60 lines or 4 KB is automatically redirected to `/tmp/agentmesh/runs/last_run.log`, preventing context window bloat while preserving full logs on disk for debugging.
+* **The clamp does not cover subprocess drivers**: the 180-second bound applies to commands the *platform* executes. A driver such as `agy` or `copilot` runs its own tools inside its own process, so nothing above it can bound what it runs. When one of those drivers wedges, the failure is silence, not a timeout.
+
+### Stalled Turns: Detection, Settlement & Recovery
+
+A turn is *stalled* when its session is still reporting `thinking` or `busy` and nothing is advancing it. This is strictly worse than a failure: the transcript's last row is an unanswered `tool_call`, no terminal status is ever written, and the cockpit renders a lie until a human notices.
+
+`TurnStallPolicy` is the single definition, and the **ordering of its three thresholds is load-bearing** — the worker, the API sweeper and the CLI ship as separate images, and a sweeper tuned tighter than the worker's ceiling would settle live turns mid-command:
+
+| Threshold | Value | Owner |
+| --- | --- | --- |
+| Driver stream idle bound | 20 min (`AGENTMESH_DRIVER_IDLE_TIMEOUT_MINUTES`) | CLI adapter, per subprocess driver |
+| Observation ceiling | 110 min (`MaxTurnDuration`) | `HttpAgentTurnRunner` |
+| Orphan sweep floor | 130 min (ceiling + 20 min grace) | `OrphanedTurnSweeperService` |
+
+* **Settlement writes two things, always**: the session moves to `stopped`, *and* a `[turn-stalled]` transcript row records why and at what instant. A bare status flip is indistinguishable from an operator pressing Stop, and leaves the next investigation starting from zero.
+* **Only live statuses are ever rewritten.** A completed turn, a session parked `waiting_for_input` for a human, and an operator-stopped session are facts about what happened; settlement is a repair, not an override. A wrong settle is survivable because the next real event overwrites the status.
+* **The sweeper is the backstop for turns no workflow observes** — cockpit chat, a handoff, a worker pod deleted mid-poll. It runs in the API because the API owns `AgentMeshHub`: settling without broadcasting `SessionUpdated` is correct in the database and wrong on the screen. `TurnReconciler:OrphanMinutes` may only be raised above the floor, never lowered.
+* **The job carries the same truth**: its `ProgressHeartbeat` is prefixed `Stalled:`, which is what the dashboard's lifecycle derivation checks *before* the `"Executing task"` text it was writing when the turn died. Stalled is a heartbeat marker, not a new `ProjectJobStatus`.
+* **Recovery is an endpoint, not a procedure.** `POST /api/project-jobs/{id}/recover` settles the abandoned turns, rewinds the workspace checkpoint they left parked at `in_progress`, then either aborts the turn of a still-open run (never starting a second run onto the same workspace lease) or starts one run resuming at the first incomplete task — the same rule the workflow applies to its own continue-as-new. `resume: false` erases the phantom turns without starting anything. No Temporal cluster access is required, and nothing is lost by retrying: the settle is idempotent.
+
+### The Pull-Request Gate: Reviews, CI, and One Card Per PR
+
+Stage 4 parks on a review gate, and everything it waits for arrives as the same `PrReviewSignal`. Three producers feed it — the two review endpoints, the GitHub-side review poller, and CI — and the gate's merge, two-man and approved-SHA semantics do not know which one spoke.
+
+* **Reviewers work on GitHub, so the platform watches GitHub.** `PrReviewPollingService` finds `PrReview` cards the workflow parked in `PendingInput`, reads the pull request's reviews, and delivers a decision as the signal the REST endpoints already send. An approval counts only for the commit it saw; a review older than the current park is treated as one this park already acted on.
+* **Failed CI is a request-changes review, and only that.** A red build used to sit on the pull request informing nobody: the author had stopped working and a human had to notice and type into a review box what GitHub had already said. The poller reads the head commit's check runs and statuses and delivers a failure with `IsApproved: false`, which takes the workflow's existing changes-requested branch — round incremented, one remediation task per failing check, author sent back, gate re-parked on the new head. Nothing in the workflow was forked to admit a machine reviewer.
+* **Green CI approves nothing.** A passing build is not the second pair of eyes the gate exists to obtain, and delivering it as an approval would let a machine authorise its own author's code and merge it. CI moves a job backwards or not at all.
+* **The head commit is the epoch, which is what stops the loop.** A human stops talking when satisfied; CI fails a commit forever. A failure is therefore reported once per head commit per job, and that record survives the gate momentarily leaving `PendingInput` during remediation — dropping it there would turn one broken build into a remediation round every few minutes. A new complaint requires a new commit, giving automated review the same property a human has: the author must do something first.
+* **Only an explicit `failure` is a failure.** `cancelled`, `timed_out`, `action_required`, `stale`, `neutral` and `skipped` describe the runner or a human who stopped a run more often than they describe the code, and a commit status of `error` usually means the publisher broke. Checks that are still `queued` or `in_progress` are never a verdict: CI is almost always mid-flight when a gate parks.
+* **One card per pull request.** The workflow's gate and the CLI's `pr open` both write the review card, each deduplicating against its own idea of "the card for this PR", so every job that reached Stage 4 posted two cards that looked identical in the cockpit and left the poller guessing which timestamp was the real park. Identity is now shared (`PrReviewCardPayload`: pull-request number, else URL) and the second writer adopts and merges instead of appending, so each writer keeps its own fields — a gate status write no longer deletes the summary the CLI recorded. Adoption lives inside `CreateCardAsync`, which keeps the workflow's Temporal command sequence untouched and so stays safe for runs parked mid-review across a deploy.
 
 ---
 

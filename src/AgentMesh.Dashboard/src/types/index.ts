@@ -33,8 +33,114 @@ export interface Persona {
   gitHubTokenPreview?: string | null;
   gitAuthorName?: string | null;
   gitAuthorEmail?: string | null;
+  mcpServerCount?: number;
   createdAt: string;
   updatedAt?: string;
+}
+
+export const McpTransportType = {
+  Stdio: 'Stdio',
+  Http: 'Http',
+  Sse: 'Sse'
+} as const;
+export type McpTransportType = (typeof McpTransportType)[keyof typeof McpTransportType] | string;
+
+export interface McpServer {
+  id: string;
+  name: string;
+  description: string;
+  transport: McpTransportType;
+  command?: string | null;
+  args: string[];
+  url?: string | null;
+  envMasked: Record<string, string>;
+  headersMasked: Record<string, string>;
+  hasEnv: boolean;
+  hasHeaders: boolean;
+  enabled: boolean;
+  timeoutSeconds: number;
+  assignedPersonaCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateMcpServerRequest {
+  name: string;
+  id?: string;
+  description?: string;
+  transport?: McpTransportType;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+  timeoutSeconds?: number;
+}
+
+export interface UpdateMcpServerRequest {
+  name?: string;
+  description?: string;
+  transport?: McpTransportType;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  mergeEnv?: boolean;
+  mergeHeaders?: boolean;
+  removeEnvKeys?: string[];
+  removeHeaderKeys?: string[];
+  enabled?: boolean;
+  timeoutSeconds?: number;
+}
+
+export interface PersonaMcpServer {
+  personaId: string;
+  mcpServerId: string;
+  mcpServerName: string;
+  mcpServerDescription: string;
+  transport: McpTransportType;
+  command?: string | null;
+  args: string[];
+  url?: string | null;
+  serverEnabled: boolean;
+  enabled: boolean;
+  effectiveEnabled: boolean;
+  timeoutSeconds: number;
+  serverEnvMasked: Record<string, string>;
+  serverHeadersMasked: Record<string, string>;
+  envOverridesMasked: Record<string, string>;
+  headersOverridesMasked: Record<string, string>;
+  hasEnvOverrides: boolean;
+  hasHeadersOverrides: boolean;
+  allowedTools?: string[] | null;
+  blockedTools?: string[] | null;
+  assignedAt: string;
+  updatedAt: string;
+}
+
+export interface AssignPersonaMcpServerRequest {
+  mcpServerId: string;
+  enabled?: boolean;
+  envOverrides?: Record<string, string>;
+  headersOverrides?: Record<string, string>;
+  allowedTools?: string[];
+  blockedTools?: string[];
+}
+
+export interface UpsertPersonaMcpServerRequest {
+  enabled?: boolean;
+  envOverrides?: Record<string, string>;
+  headersOverrides?: Record<string, string>;
+  mergeEnvOverrides?: boolean;
+  mergeHeadersOverrides?: boolean;
+  removeEnvOverrideKeys?: string[];
+  removeHeaderOverrideKeys?: string[];
+  allowedTools?: string[];
+  blockedTools?: string[];
+  clearAllowedTools?: boolean;
+  clearBlockedTools?: boolean;
 }
 
 export interface PersonaEnvironmentStatus {
@@ -103,6 +209,24 @@ export interface DriverSidecarConfig {
   authCheckCommand?: string | null;
 }
 
+export interface OpenRouterProviderRouting {
+  sort?: string | null;
+  order?: string[] | null;
+  only?: string[] | null;
+  ignore?: string[] | null;
+  allowFallbacks?: boolean | null;
+  dataCollection?: string | null;
+  zdr?: boolean | null;
+  requireParameters?: boolean | null;
+}
+
+export interface OpenRouterConfig {
+  httpReferer?: string | null;
+  appTitle?: string | null;
+  fallbackModels?: string[] | null;
+  provider?: OpenRouterProviderRouting | null;
+}
+
 /**
  * Parsed driver runtime config, as returned by GET /api/agents/{id}/config and mirrored on
  * Agent.config. The API never sends the API key itself — only whether one is stored.
@@ -128,6 +252,7 @@ export interface DriverConfig {
   hasSidecarAuthKey?: boolean;
   loginCommand?: string | null;
   authCheckCommand?: string | null;
+  openRouter?: OpenRouterConfig | null;
 }
 
 export interface Agent {
@@ -237,6 +362,80 @@ export interface SystemStatusResponse {
   };
 }
 
+export const DashboardAttentionKind = {
+  Escalation: 'escalation',
+  TurnInterrupted: 'turn_interrupted',
+  PlanApproval: 'plan_approval',
+  DiscoveryQa: 'discovery_qa',
+  PrReview: 'pr_review',
+  PendingCard: 'pending_card',
+  SessionWaitingInput: 'session_waiting_input',
+  JobAwaitingApproval: 'job_awaiting_approval',
+  JobAwaitingReview: 'job_awaiting_review',
+  JobBlocked: 'job_blocked',
+} as const;
+export type DashboardAttentionKind =
+  | (typeof DashboardAttentionKind)[keyof typeof DashboardAttentionKind]
+  | string;
+
+export const DashboardAttentionSeverity = {
+  Critical: 'critical',
+  Warning: 'warning',
+  Info: 'info',
+} as const;
+export type DashboardAttentionSeverity =
+  | (typeof DashboardAttentionSeverity)[keyof typeof DashboardAttentionSeverity]
+  | string;
+
+export interface DashboardJobStats {
+  totalProjects: number;
+  activeProjects: number;
+  totalJobs: number;
+  activeJobs: number;
+  pendingJobs: number;
+  completedJobs: number;
+  archivedJobs: number;
+  attentionCount: number;
+  activeSessions: number;
+  thinkingSessions: number;
+  waitingForInputSessions: number;
+}
+
+export interface DashboardAttentionItem {
+  id: string;
+  kind: DashboardAttentionKind;
+  severity: DashboardAttentionSeverity;
+  title: string;
+  summary?: string | null;
+  projectId?: string | null;
+  projectName?: string | null;
+  jobId?: string | null;
+  jobTitle?: string | null;
+  cardId?: string | null;
+  cardType?: string | null;
+  sessionId?: string | null;
+  personaId?: string | null;
+  personaName?: string | null;
+  driverId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DashboardOverviewOptions {
+  recentJobsLimit?: number;
+  attentionLimit?: number;
+  includeArchived?: boolean;
+}
+
+export interface DashboardOverviewResponse {
+  generatedAt: string;
+  jobStats: DashboardJobStats;
+  recentJobs: ProjectJob[];
+  attentionItems: DashboardAttentionItem[];
+}
+
+export type DashboardOverview = DashboardOverviewResponse;
+
 export interface ModeOption {
   id: string;
   label: string;
@@ -268,6 +467,9 @@ export interface ModelCapability {
    * Absent on a baseline entry, which carries no models at all.
    */
   contextSizes?: string[] | null;
+  maxContextTokens?: number | null;
+  promptPricePerMillion?: number | null;
+  completionPricePerMillion?: number | null;
 }
 
 /**
@@ -376,6 +578,8 @@ export interface LifetimeTokens {
   thinkingTokens: number;
   totalTokens: number;
   totalDurationSeconds: number;
+  cachedTokens?: number;
+  costUsd?: number;
 }
 
 export interface AgentUsageResponse {
@@ -473,9 +677,41 @@ export const JobLifecycleStatus = {
   AwaitingReview: 'AwaitingReview',
   Completed: 'Completed',
   Blocked: 'Blocked',
-  Failed: 'Failed'
+  Failed: 'Failed',
+  /**
+   * The job's turn was settled by the platform because nothing was advancing it. Distinct from
+   * `Blocked`, which means a gate is waiting on a human: a stalled job has nobody waiting on anyone,
+   * and the cockpit offers a recovery for it rather than an approval.
+   */
+  Stalled: 'Stalled'
 } as const;
 export type JobLifecycleStatus = (typeof JobLifecycleStatus)[keyof typeof JobLifecycleStatus];
+
+/** What a job recovery did, mirrored from the API's `JobRecoveryResult`. */
+export interface JobRecoveryResult {
+  jobId: string;
+  workflowId?: string | null;
+  action:
+    | 'NothingToDo'
+    | 'SettledOnly'
+    | 'AbortedLiveTurn'
+    | 'Resumed'
+    | 'RestartedFromDiscovery'
+    | 'OrchestratorUnavailable'
+    | string;
+  settledSessions: string[];
+  resumedAtTask?: string | null;
+  resumedAtNumber: number;
+  totalTasks: number;
+  prUrl?: string | null;
+  message: string;
+}
+
+/** Response of `POST /api/project-jobs/{id}/recover`: the recovery plus the job as it now stands. */
+export interface JobRecoveryResponse {
+  recovery: JobRecoveryResult;
+  job?: ProjectJob;
+}
 
 export interface QueuedJobTurnDto {
   id: string;
@@ -508,6 +744,9 @@ export interface Project {
   workspaceType: WorkspaceType | number;
   gitRepositoryUrl?: string | null;
   gitBaseBranch: string;
+  repositoryName?: string;
+  workingDirectory?: string;
+  resolvedWorkingDirectory?: string;
   s3BucketName?: string | null;
   s3PrefixKey?: string | null;
   projectInstructions: string;
@@ -518,6 +757,59 @@ export interface Project {
   activeJobCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CreateProjectRequest {
+  name: string;
+  id?: string;
+  description?: string;
+  workspaceType?: WorkspaceType | number;
+  gitRepositoryUrl?: string;
+  gitBaseBranch?: string;
+  repositoryName?: string;
+  workingDirectory?: string;
+  s3BucketName?: string;
+  s3PrefixKey?: string;
+  projectInstructions?: string;
+  defaultLeadPersonaId?: string;
+  allowedPersonaIds?: string[];
+}
+
+export interface UpdateProjectRequest {
+  name?: string;
+  description?: string;
+  workspaceType?: WorkspaceType | number;
+  gitRepositoryUrl?: string;
+  gitBaseBranch?: string;
+  repositoryName?: string;
+  workingDirectory?: string;
+  s3BucketName?: string;
+  s3PrefixKey?: string;
+  projectInstructions?: string;
+  defaultLeadPersonaId?: string;
+  allowedPersonaIds?: string[];
+}
+
+export type ProjectWorkspaceSetupOutcome =
+  | 'AlreadyInitialized'
+  | 'Cloned'
+  | 'Initialized'
+  | 'DirectoryPrepared'
+  | 'FallbackUsed'
+  | 'Failed'
+  | string;
+
+export interface ProjectWorkspaceSetupResult {
+  projectId: string;
+  success: boolean;
+  targetDirectory: string;
+  effectiveDirectory: string;
+  outcome: ProjectWorkspaceSetupOutcome;
+  usedFallback: boolean;
+  createdFiles: boolean;
+  message: string;
+  warnings: string[];
+  error?: string | null;
 }
 
 export interface JobTask {
@@ -567,20 +859,6 @@ export interface ProjectJob {
   messageCount: number;
   createdAt: string;
   updatedAt: string;
-}
-
-export interface JobMessage {
-  id: string;
-  jobId: string;
-  senderType: 'user' | 'persona' | string;
-  senderId?: string | null;
-  senderName?: string | null;
-  content: string;
-  mentions: string[];
-  turnSessionId?: string | null;
-  structuredPayloadJson?: string | null;
-  attachments?: SessionAttachment[] | null;
-  createdAt: string;
 }
 
 export interface QueuedPromptItem {

@@ -8,8 +8,8 @@
  *
  * ### Why the client keeps read/dismiss state at all
  *
- * `GET /api/attention` is derived from live job state (heartbeats, pending cards, unanswered ledger
- * messages — see `src/AgentMesh.Api/Services/AttentionQueryService.cs`). There is deliberately no
+ * `GET /api/attention` is derived from live job state (the job's heartbeat and its pending timeline
+ * cards — see `src/AgentMesh.Api/Services/AttentionQueryService.cs`). There is deliberately no
  * `POST /api/attention/dismiss`: the server's answer to "is this still waiting?" is "ask me again",
  * and an ack column would create a second, stale source of truth for a wait that has already moved on.
  * So "I have seen this" and "hide this one" are operator-local facts, persisted under our own keys.

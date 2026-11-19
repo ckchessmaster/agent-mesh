@@ -50,7 +50,6 @@ vi.mock('../services/api', () => ({
     updateJobTask: vi.fn(),
     assignJobTask: vi.fn(),
     deleteJobTask: vi.fn(),
-    getJobMessages: vi.fn(),
     getJobArtifacts: vi.fn(),
     getJobArtifact: vi.fn(),
     getJobChanges: vi.fn(),
@@ -204,7 +203,6 @@ beforeEach(() => {
   vi.mocked(api.getProjectJobs).mockResolvedValue([jobAlpha, jobBeta]);
   vi.mocked(api.getProjectJob).mockResolvedValue(jobAlpha);
   vi.mocked(api.getJobTasks).mockResolvedValue([]);
-  vi.mocked(api.getJobMessages).mockResolvedValue([]);
   vi.mocked(api.getJobArtifacts).mockResolvedValue([]);
   vi.mocked(api.getJobChanges).mockResolvedValue({ files: [] } as never);
   vi.mocked(api.getAttention).mockResolvedValue(rollupOf());
@@ -285,9 +283,11 @@ describe('Attention wiring in App', () => {
     render(<App />);
 
     await screen.findByTestId('attention-badge');
-    // The cockpit auto-selected the first job of the project; the wait belongs to the other one.
-    await waitFor(() => expect(screen.getAllByText('Wire the ingest retry loop').length).toBeGreaterThan(0));
-    expect(screen.queryByText('mesh/job-beta-branch')).toBeNull();
+    // The wait belongs to job-beta while the cockpit is looking at some other job. Asserted on the
+    // selection key, not on the branch string being absent from the DOM: the landing overview lists every
+    // open job across projects, so job-beta's branch has been on screen the whole time and was always the
+    // wrong thing to test.
+    expect(window.localStorage.getItem('agentmesh_selected_job_id')).not.toBe('job-beta');
 
     openBell();
     fireEvent.click(await screen.findByTestId('attention-open-job-beta:planApproval'));
@@ -297,6 +297,7 @@ describe('Attention wiring in App', () => {
     // of what is being asserted (the click closes it).
     expect(screen.queryByTestId('attention-panel')).toBeNull();
     expect(await screen.findByText('mesh/job-beta-branch', {}, { timeout: 4000 })).toBeInTheDocument();
+    expect(window.localStorage.getItem('agentmesh_selected_job_id')).toBe('job-beta');
     expect(window.localStorage.getItem('agentmesh_active_tab')).toBe('projects');
   });
 
@@ -334,6 +335,8 @@ describe('Attention wiring in App', () => {
     // The bell degrades to its own error dot; the rest of the cockpit must be unaffected.
     expect(await screen.findByTestId('attention-error-dot')).toBeInTheDocument();
     expect(screen.getByText('Projects & Jobs')).toBeInTheDocument();
-    expect(screen.getByText('Mesh Healthy')).toBeInTheDocument();
+    // More than one status pill renders now (header and landing overview), so this is a "the app is
+    // still standing" check rather than a unique-element one.
+    expect(screen.getAllByText('Mesh Healthy').length).toBeGreaterThan(0);
   });
 });

@@ -22,42 +22,42 @@ export const JobInitializedCard: React.FC<JobInitializedCardProps> = ({
   return (
     <div
       data-testid="job-initialized-card"
-      className="p-4 rounded-lg bg-slate-900/80 border border-slate-800 shadow-sm text-slate-200 mb-4 transition"
+      className="p-3 sm:p-4 rounded-lg bg-slate-900/80 border border-slate-800 shadow-sm text-slate-200 mb-3 sm:mb-4 transition"
     >
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-        <div className="flex items-center space-x-2">
-          <div className="p-1.5 rounded bg-sky-500/20 text-sky-400">
+      <div className="flex items-start sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+        <div className="flex items-start sm:items-center space-x-2 min-w-0">
+          <div className="p-1.5 rounded bg-sky-500/20 text-sky-400 shrink-0">
             <Rocket className="w-4 h-4" />
           </div>
-          <div>
-            <h3 className="text-sm font-semibold text-slate-100">{card.title || 'Job Initialized'}</h3>
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-slate-100 truncate">{card.title || 'Job Initialized'}</h3>
             <p className="text-xs text-slate-400">Workflow orchestration initialized</p>
           </div>
         </div>
-        <span className="px-2 py-0.5 text-xs font-mono rounded bg-slate-800 text-slate-400 border border-slate-700">
+        <span className="px-2 py-0.5 text-xs font-mono rounded bg-slate-800 text-slate-400 border border-slate-700 shrink-0">
           Initialized
         </span>
       </div>
 
       <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono">
         {payload.targetBranch && (
-          <div className="flex items-center space-x-2 p-2 rounded bg-slate-950/40 border border-slate-800">
-            <GitBranch className="w-3.5 h-3.5 text-slate-500" />
-            <span className="text-slate-400">Branch:</span>
-            <span className="text-indigo-300 font-semibold">{payload.targetBranch}</span>
+          <div className="flex items-center space-x-2 p-2 rounded bg-slate-950/40 border border-slate-800 min-w-0">
+            <GitBranch className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+            <span className="text-slate-400 shrink-0">Branch:</span>
+            <span className="text-indigo-300 font-semibold truncate">{payload.targetBranch}</span>
           </div>
         )}
         {payload.assignedAgentId && (
-          <div className="flex items-center space-x-2 p-2 rounded bg-slate-950/40 border border-slate-800">
-            <User className="w-3.5 h-3.5 text-slate-500" />
-            <span className="text-slate-400">Assigned Agent:</span>
-            <span className="text-purple-300 font-semibold">{payload.assignedAgentId}</span>
+          <div className="flex items-center space-x-2 p-2 rounded bg-slate-950/40 border border-slate-800 min-w-0">
+            <User className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+            <span className="text-slate-400 shrink-0">Assigned Agent:</span>
+            <span className="text-purple-300 font-semibold truncate">{payload.assignedAgentId}</span>
           </div>
         )}
         {payload.workspacePath && (
-          <div className="flex items-center space-x-2 p-2 rounded bg-slate-950/40 border border-slate-800 col-span-full">
-            <FolderGit2 className="w-3.5 h-3.5 text-slate-500" />
-            <span className="text-slate-400">Workspace:</span>
+          <div className="flex items-center space-x-2 p-2 rounded bg-slate-950/40 border border-slate-800 col-span-full min-w-0">
+            <FolderGit2 className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+            <span className="text-slate-400 shrink-0">Workspace:</span>
             <span className="text-slate-300 truncate">{payload.workspacePath}</span>
           </div>
         )}

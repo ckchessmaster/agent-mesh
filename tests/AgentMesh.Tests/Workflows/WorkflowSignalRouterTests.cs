@@ -91,7 +91,7 @@ public class WorkflowSignalRouterTests
     }
 
     /// <summary>
-    /// A review decision routed through the router releases the PR-review pause and triggers the merge.
+    /// A review decision routed through the router releases the job-level PR-review pause and triggers the merge.
     /// </summary>
     [Fact]
     public async Task SendPrReview_ResumesTheWorkflow_AndTheMergeActivityRuns()
@@ -102,22 +102,165 @@ public class WorkflowSignalRouterTests
         await using var worker = TestWorker.Start(env, turns, git);
 
         var jobId = Guid.NewGuid();
-        turns.Enqueue(TurnOutcome.AwaitingReview("https://github.com/o/r/pull/77", 77, "PR up."));
-        turns.Enqueue(TurnOutcome.Completed("Merged."));
+        turns.Enqueue(TurnOutcome.Completed("Task 1 committed cleanly."));
+        turns.Enqueue(TurnOutcome.AwaitingReview("https://github.com/o/r/pull/77", 77, "PR up.", "sha-77"));
 
-        var handle = await StartAsync(env, jobId);
-        await WaitUntilAsync(handle, s => s.Status == "Awaiting PR Review");
+        var jobInput = new JobExecutionInput(
+            JobId: jobId.ToString("D"),
+            AssignedAgentId: "rook",
+            ProjectId: "agent-mesh",
+            WorkspacePath: "/workspace/repos/agent-mesh",
+            InitialPrompt: "Implement job-level PR gate",
+            TargetBranch: "main",
+            ApprovalPolicy: AgentMesh.Core.Models.PlanApprovalPolicy.LeadOrHuman);
+
+        var handle = await env.Client.StartWorkflowAsync(
+            (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(jobInput),
+            new Temporalio.Client.WorkflowOptions($"job-{jobId:D}", WorkflowSignalRouter.TaskQueue));
 
         var router = new WorkflowSignalRouter(env.Client);
+
+        // Wait for plan approval gate and approve via router
+        var planDeadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < planDeadline)
+        {
+            try
+            {
+                var st = await handle.QueryAsync(w => w.GetCurrentState());
+                if (st.CurrentHeartbeat.Contains("Awaiting plan approval")) break;
+            }
+            catch { }
+            await Task.Delay(100);
+        }
+
+        var planDelivery = await router.SendPlanApprovalAsync(
+            jobId,
+            new PlanApprovedSignal("astra", "tech_lead", "Go", DateTimeOffset.UtcNow));
+        planDelivery.Status.Should().Be(SignalDeliveryStatus.Delivered);
+
+        // Wait for job-level PR review gate
+        var prDeadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < prDeadline)
+        {
+            var st = await handle.QueryAsync(w => w.GetCurrentState());
+            if (st.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase)) break;
+            await Task.Delay(100);
+        }
+
         var delivery = await router.SendPrReviewAsync(
             jobId,
-            new PrReviewSignal("sorren", IsApproved: true, null, DateTimeOffset.UtcNow, 77));
+            new PrReviewSignal("sorren", IsApproved: true, null, DateTimeOffset.UtcNow, 77, ApprovedHeadSha: "sha-77"));
 
         delivery.Status.Should().Be(SignalDeliveryStatus.Delivered);
+        delivery.WorkflowId.Should().Be($"job-{jobId:D}");
 
-        var result = await handle.GetResultAsync();
+        var result = await handle.GetResultAsync<JobExecutionResult>();
         result.Success.Should().BeTrue();
         git.Calls.Should().ContainSingle().Which.Should().Be("https://github.com/o/r/pull/77");
+    }
+
+    [Fact]
+    public async Task SendAssigneeUpdate_SignalsRunningJobWorkflow_UpdatesMemoAndNextChecklistItem()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var turns = new FakeTurnActivity();
+        var git = new FakeGitActivity();
+        await using var worker = TestWorker.Start(env, turns, git,
+            [
+                new ProposedChecklistItem("task-1", "Task 1", "src/A.cs", "dotnet test"),
+                new ProposedChecklistItem("task-2", "Task 2", "src/B.cs", "dotnet test")
+            ]);
+
+        var jobId = Guid.NewGuid();
+        var task1Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        turns.EnqueueGatedBy(task1Gate, TurnOutcome.Completed("Task 1 done."));
+        turns.Enqueue(TurnOutcome.Completed("Task 2 done."));
+        turns.Enqueue(TurnOutcome.AwaitingReview("https://github.com/o/r/pull/88", 88, "PR up.", "sha-88"));
+
+        var jobInput = new JobExecutionInput(
+            JobId: jobId.ToString("D"),
+            AssignedAgentId: "rook",
+            ProjectId: "agent-mesh",
+            WorkspacePath: "/workspace/repos/agent-mesh",
+            InitialPrompt: "Reassign mid-job",
+            TargetBranch: "main",
+            ApprovalPolicy: AgentMesh.Core.Models.PlanApprovalPolicy.LeadOrHuman);
+
+        var handle = await env.Client.StartWorkflowAsync(
+            (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(jobInput),
+            new Temporalio.Client.WorkflowOptions($"job-{jobId:D}", WorkflowSignalRouter.TaskQueue)
+            {
+                Memo = new Dictionary<string, object> { ["personaId"] = "rook" }
+            });
+
+        try
+        {
+            var router = new WorkflowSignalRouter(env.Client);
+
+            var planDeadline = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < planDeadline)
+            {
+                try
+                {
+                    var st = await handle.QueryAsync(w => w.GetCurrentState());
+                    if (st.CurrentHeartbeat.Contains("Awaiting plan approval")) break;
+                }
+                catch { }
+                await Task.Delay(100);
+            }
+
+            await router.SendPlanApprovalAsync(
+                jobId,
+                new PlanApprovedSignal("astra", "tech_lead", "Go", DateTimeOffset.UtcNow));
+
+            // Wait until task-1 is inside RunAgentCodingTurnAsync
+            var turnDeadline = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < turnDeadline && turns.Calls < 1)
+            {
+                await Task.Delay(50);
+            }
+            turns.Calls.Should().Be(1);
+
+            var updateDelivery = await router.SendAssigneeUpdateAsync(jobId, new JobAssigneeUpdatedSignal("sorren"));
+            updateDelivery.Status.Should().Be(SignalDeliveryStatus.Delivered);
+
+            // Wait for workflow state & memo to reflect the new assignee
+            var memoDeadline = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < memoDeadline)
+            {
+                var st = await handle.QueryAsync(w => w.GetCurrentState());
+                if (st.AssignedAgentId == "sorren") break;
+                await Task.Delay(50);
+            }
+
+            (await router.IsWorkflowDrivingAsync(jobId, "sorren")).Should().BeTrue();
+            (await router.IsWorkflowDrivingAsync(jobId, "rook")).Should().BeFalse();
+
+            task1Gate.SetResult();
+
+            var prDeadline = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < prDeadline)
+            {
+                var st = await handle.QueryAsync(w => w.GetCurrentState());
+                if (st.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase)) break;
+                await Task.Delay(100);
+            }
+
+            turns.InputAt(0)!.PersonaId.Should().Be("rook");
+            turns.InputAt(1)!.PersonaId.Should().Be("sorren");
+            turns.InputAt(2)!.PersonaId.Should().Be("sorren");
+
+            await router.SendPrReviewAsync(
+                jobId,
+                new PrReviewSignal("astra", IsApproved: true, null, DateTimeOffset.UtcNow, 88, ApprovedHeadSha: "sha-88"));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+        }
+        finally
+        {
+            task1Gate.TrySetResult();
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -939,11 +1082,25 @@ public class WorkflowSignalRouterTests
             this.running = running;
         }
 
-        public static TestWorker Start(WorkflowEnvironment env, FakeTurnActivity turns, FakeGitActivity git)
+        public static TestWorker Start(
+            WorkflowEnvironment env,
+            FakeTurnActivity turns,
+            FakeGitActivity git,
+            List<ProposedChecklistItem>? customTasks = null)
         {
+            var timeline = new FakeRouterTimelineActivities(customTasks);
             var options = new TemporalWorkerOptions(WorkflowSignalRouter.TaskQueue)
                 .AddActivity(turns.RunAgentCodingTurnAsync)
                 .AddActivity(git.MergePullRequestAsync)
+                .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
+                .AddActivity((Func<CreateTimelineCardInput, Task<AgentMesh.Core.Models.JobTimelineCard>>)timeline.CreateCardAsync)
+                .AddActivity((Func<UpdateTimelineCardStatusInput, Task>)timeline.UpdateCardStatusAsync)
+                .AddActivity((Func<DiscoveryQaActivityInput, Task<DiscoveryQaActivityResult>>)timeline.ExecuteDiscoveryQaActivityAsync)
+                .AddActivity((Func<DecompositionActivityInput, Task<DecompositionActivityResult>>)timeline.ExecuteDecompositionActivityAsync)
+                .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
+                .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
+                .AddActivity((Func<AppendRemediationTasksInput, Task<IReadOnlyList<ProposedChecklistItem>>>)timeline.AppendRemediationTasksAsync)
+                .AddWorkflow<JobExecutionWorkflow>()
                 .AddWorkflow<TaskExecutionWorkflow>();
 
             options.StickyQueueScheduleToStartTimeout = TimeSpan.FromSeconds(1);
@@ -976,9 +1133,13 @@ public class WorkflowSignalRouterTests
     {
         private readonly List<Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>> script = [];
         private readonly List<ChatMessageSignal?> delivered = [];
+        private readonly List<TaskExecutionInput> inputs = [];
         private int cursor;
 
         public int Calls { get; private set; }
+
+        public TaskExecutionInput? InputAt(int turnIndex) =>
+            turnIndex < inputs.Count ? inputs[turnIndex] : null;
 
         public void Enqueue(TurnOutcome outcome) =>
             script.Add((_, reply) =>
@@ -1022,6 +1183,7 @@ public class WorkflowSignalRouterTests
             }
 
             var attempt = script[cursor];
+            inputs.Add(input);
 
             return attempt(input, pendingReply).ContinueWith(t =>
             {
@@ -1042,5 +1204,56 @@ public class WorkflowSignalRouterTests
             Calls.Add(prUrl);
             return Task.FromResult($"merged {prUrl}");
         }
+
+        [Activity("MergeJobPullRequest")]
+        public Task<string> MergeJobPullRequestAsync(MergePullRequestInput input)
+        {
+            if (!string.IsNullOrWhiteSpace(input.PrUrl))
+            {
+                Calls.Add(input.PrUrl);
+            }
+            return Task.FromResult($"merged {input.PrUrl}");
+        }
+    }
+
+    private sealed class FakeRouterTimelineActivities(List<ProposedChecklistItem>? customTasks = null) : ITimelineActivities
+    {
+        [Activity]
+        public Task<AgentMesh.Core.Models.JobTimelineCard> CreateCardAsync(CreateTimelineCardInput input) =>
+            Task.FromResult(new AgentMesh.Core.Models.JobTimelineCard
+            {
+                Id = Guid.NewGuid(),
+                JobId = input.JobId,
+                TaskId = input.TaskId,
+                CardType = input.CardType,
+                Status = input.Status,
+                Title = input.Title,
+                StructuredPayloadJson = input.StructuredPayloadJson
+            });
+
+        [Activity]
+        public Task UpdateCardStatusAsync(UpdateTimelineCardStatusInput input) => Task.CompletedTask;
+
+        [Activity]
+        public Task<DiscoveryQaActivityResult> ExecuteDiscoveryQaActivityAsync(DiscoveryQaActivityInput input) =>
+            Task.FromResult(new DiscoveryQaActivityResult(Guid.Empty, new DiscoveryPayload([], "No questions")));
+
+        [Activity]
+        public Task<DecompositionActivityResult> ExecuteDecompositionActivityAsync(DecompositionActivityInput input) =>
+            Task.FromResult(new DecompositionActivityResult(
+                Guid.NewGuid(),
+                new PlanApprovalPayload(
+                    customTasks ?? [new ProposedChecklistItem("task-1", "Task 1", "src/A.cs", "dotnet test")],
+                    "Plan")));
+
+        [Activity]
+        public Task<Guid> RecordTurnInterruptedAsync(TurnInterruptedCardInput input) => Task.FromResult(Guid.NewGuid());
+
+        [Activity]
+        public Task<Guid> UpdateTaskStepCardAsync(TaskStepCardInput input) => Task.FromResult(Guid.NewGuid());
+
+        [Activity]
+        public Task<IReadOnlyList<ProposedChecklistItem>> AppendRemediationTasksAsync(AppendRemediationTasksInput input) =>
+            Task.FromResult(input.Tasks);
     }
 }

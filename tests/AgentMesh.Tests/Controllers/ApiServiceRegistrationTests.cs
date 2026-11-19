@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Moq;
 using StackExchange.Redis;
 using Temporalio.Client;
@@ -247,6 +248,86 @@ public class ApiServiceRegistrationTests : IClassFixture<WebApplicationFactory<A
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // Stall detection and operator recovery
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The recovery service pair is registered, scoped, and resolvable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Same shape of failure <see cref="IWorkflowSignalRouter"/> was pinned for, and for the same
+    /// reason: the recover endpoint declares <c>IJobTurnRecovery</c> as an <em>optional</em>
+    /// <c>[FromServices]</c> parameter — ~40 controller tests construct that type directly and must not
+    /// be forced to know about Temporal. A missing registration therefore does not throw at activation;
+    /// it makes every recovery request answer 503 "not available on this deployment" while all the
+    /// constructor-injected tests stay green.
+    /// </para>
+    /// <para>
+    /// That matters more here than anywhere else in this feature: recovery is the only way an operator
+    /// gets a stalled job moving without cluster access to Temporal. A silently unregistered recovery
+    /// service is the difference between a two-minute repair and an after-hours incident.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(typeof(IJobTurnRecovery), typeof(JobTurnRecovery))]
+    [InlineData(typeof(IJobExecutionWorkflowGateway), typeof(TemporalJobExecutionWorkflowGateway))]
+    public void RecoveryServices_AreRegisteredAgainstTheirImplementations(Type service, Type implementation)
+    {
+        var descriptor = Descriptors.FirstOrDefault(d => d.ServiceType == service);
+
+        descriptor.Should().NotBeNull(
+            $"Program.cs must register {service.Name}. Without it POST " +
+            $"/api/project-jobs/{{id}}/recover answers 503 and the only way to recover a stalled turn " +
+            "is to reset Temporal history by hand.");
+        descriptor!.ImplementationType.Should().Be(implementation);
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Scoped,
+            "the implementation holds a scoped AgentMeshDbContext; a singleton would capture one " +
+            "context across requests, which has bitten this project before");
+    }
+
+    /// <summary>
+    /// The graph actually builds in a request scope, not merely as a descriptor.
+    /// </summary>
+    /// <remarks>
+    /// This is the check that the gateway's own dependency (<c>ITemporalClient</c>, registered by
+    /// <c>AddTemporalClient</c>) sits above it in <c>Program.cs</c>. A type can be registered and still
+    /// be unresolvable, and the endpoint's optional parameter hides exactly that as a 503.
+    /// </remarks>
+    [Fact]
+    public void RecoveryServices_ResolveFromARequestScope()
+    {
+        using var scope = _factory.Services.CreateScope();
+
+        scope.ServiceProvider.GetService<IJobExecutionWorkflowGateway>()
+            .Should().BeOfType<TemporalJobExecutionWorkflowGateway>();
+        scope.ServiceProvider.GetService<IJobTurnRecovery>()
+            .Should().BeOfType<JobTurnRecovery>();
+    }
+
+    /// <summary>
+    /// The orphan sweeper runs as a hosted service.
+    /// </summary>
+    /// <remarks>
+    /// The sweeper is the backstop for turns that no workflow is watching — a cockpit chat, a handoff, a
+    /// turn whose worker pod was deleted mid-poll. Class correctness is covered elsewhere; nothing but
+    /// this assertion proves anything ever <em>calls</em> it. Unregistered, the platform keeps the exact
+    /// symptom the feature was built to remove, and reports no error doing so.
+    /// </remarks>
+    [Fact]
+    public void OrphanedTurnSweeper_IsRegisteredAsAHostedService()
+    {
+        var descriptor = Descriptors.SingleOrDefault(d =>
+            d.ServiceType == typeof(IHostedService) &&
+            d.ImplementationType == typeof(OrphanedTurnSweeperService));
+
+        descriptor.Should().NotBeNull(
+            "Program.cs must call AddHostedService<OrphanedTurnSweeperService>(). The sweeper is the " +
+            "only thing that settles sessions no workflow is observing.");
+        descriptor!.Lifetime.Should().Be(ServiceLifetime.Singleton);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // Controller activation
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -350,13 +431,26 @@ public class ApiServiceRegistrationTests : IClassFixture<WebApplicationFactory<A
             Title = "Orchestrated task",
             TasksJson = "[]",
         });
+        var cardId = Guid.NewGuid();
+        db.JobTimelineCards.Add(new AgentMesh.Core.Models.JobTimelineCard
+        {
+            Id = cardId,
+            JobId = jobId.ToString(),
+            CardType = AgentMesh.Core.Models.TimelineCardType.Escalation3R,
+            Status = AgentMesh.Core.Models.TimelineCardStatus.PendingInput,
+            Title = "Escalation",
+            StructuredPayloadJson = "{\"requiresReply\":true,\"targetPersona\":\"operator\"}",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
         await db.SaveChangesAsync();
 
-        var controller = ActivatorUtilities.CreateInstance<ProjectJobsController>(scope.ServiceProvider);
+        var controller = ActivatorUtilities.CreateInstance<JobTimelineController>(scope.ServiceProvider);
 
-        var result = await controller.PostJobMessage(
-            jobId,
-            new PostJobMessageRequest(Content: "Use OIDC, not passwords.", SenderType: "user"),
+        var result = await controller.AddComment(
+            jobId.ToString(),
+            cardId,
+            new AddCommentRequest("operator", "operator", "Use OIDC, not passwords."),
             CancellationToken.None);
 
         result.Should().BeOfType<Microsoft.AspNetCore.Mvc.OkObjectResult>(
@@ -424,5 +518,137 @@ public class ApiServiceRegistrationTests : IClassFixture<WebApplicationFactory<A
 
         public Task<bool> IsWorkflowDrivingAsync(Guid jobId, string? targetPersonaId, CancellationToken ct = default) =>
             Task.FromResult(WorkflowDriving);
+    }
+
+    [Fact]
+    public void ProjectWorkspaceSetup_IsRegisteredInServiceCollection()
+    {
+        var descriptor = Descriptors.FirstOrDefault(d => d.ServiceType == typeof(IProjectWorkspaceSetup));
+
+        descriptor.Should().NotBeNull("Program.cs must register IProjectWorkspaceSetup for ProjectsController.");
+        descriptor!.ImplementationType.Should().Be<ProjectWorkspaceSetup>();
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+    }
+
+    [Fact]
+    public async Task ProjectsController_ActivatedByTheRealContainer_UsesRegisteredWorkspaceSetup()
+    {
+        var recorder = new RecordingWorkspaceSetup();
+
+        using var factory = BuildWith(services =>
+        {
+            var production = services.SingleOrDefault(d => d.ServiceType == typeof(IProjectWorkspaceSetup));
+            if (production is not null) services.Remove(production);
+            services.AddSingleton<IProjectWorkspaceSetup>(recorder);
+        });
+
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+
+        var projectId = "proj-" + Guid.NewGuid().ToString("N")[..8];
+        db.Projects.Add(new ProjectModel
+        {
+            Id = projectId,
+            Name = "Setup Test",
+            RepositoryName = projectId
+        });
+        await db.SaveChangesAsync();
+
+        var controller = ActivatorUtilities.CreateInstance<ProjectsController>(scope.ServiceProvider);
+        var result = await controller.SetupProjectWorkspace(projectId);
+
+        result.Should().BeOfType<Microsoft.AspNetCore.Mvc.OkObjectResult>();
+        recorder.Projects.Should().ContainSingle(p => p.Id == projectId);
+    }
+
+    [Fact]
+    public async Task JobTurnDispatcher_ActivatedByTheRealContainer_ReceivesEncryptionServiceAndResolvesMcpSecrets()
+    {
+        var descriptor = Descriptors.FirstOrDefault(d => d.ServiceType == typeof(IPersonaMcpResolver));
+        descriptor.Should().NotBeNull("Program.cs must register IPersonaMcpResolver.");
+
+        using var scope = _factory.Services.CreateScope();
+        var resolver = scope.ServiceProvider.GetRequiredService<IPersonaMcpResolver>();
+        resolver.Should().NotBeNull();
+
+        var db = scope.ServiceProvider.GetRequiredService<AgentMeshDbContext>();
+        var encryption = scope.ServiceProvider.GetRequiredService<ICredentialEncryptionService>();
+
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var personaId = $"astra-{suffix}";
+        var serverId = $"gh-{suffix}";
+        var projectId = $"proj-{suffix}";
+
+        db.Projects.Add(new ProjectModel
+        {
+            Id = projectId,
+            Name = "DI MCP Test",
+            RepositoryName = projectId
+        });
+        db.Personas.Add(new AgentMesh.Core.Models.Persona
+        {
+            Id = personaId,
+            Name = "Astra",
+            DriverId = "agy",
+            PersonaPrompt = "Prompt"
+        });
+        db.McpServers.Add(new AgentMesh.Core.Models.McpServer
+        {
+            Id = serverId,
+            Name = "GitHub",
+            Transport = AgentMesh.Core.Enums.McpTransportType.Stdio,
+            Command = "npx",
+            EnvEncrypted = McpSecretProtector.EncryptDictionary(encryption, new Dictionary<string, string>
+            {
+                ["TOKEN"] = "secret-from-di-container"
+            }),
+            Enabled = true
+        });
+        db.PersonaMcpServers.Add(new AgentMesh.Core.Models.PersonaMcpServer
+        {
+            PersonaId = personaId,
+            McpServerId = serverId,
+            Enabled = true
+        });
+        await db.SaveChangesAsync();
+
+        var resolved = await resolver.ResolveForPersonaAsync(personaId);
+        resolved.Should().ContainSingle();
+        resolved[0].Env["TOKEN"].Should().Be("secret-from-di-container");
+
+        var dispatcher = scope.ServiceProvider.GetRequiredService<JobTurnDispatcher>();
+        dispatcher.Should().NotBeNull();
+    }
+
+    private sealed class RecordingWorkspaceSetup : IProjectWorkspaceSetup
+    {
+        public List<ProjectModel> Projects { get; } = [];
+
+        public Task<ProjectWorkspaceSetupResult> EnsureWorkspaceAsync(
+            ProjectWorkspaceSetupRequest request,
+            Action<string>? log = null,
+            CancellationToken ct = default) =>
+            Task.FromResult(ProjectWorkspaceSetupResult.Succeeded(
+                request.WorkingDirectory ?? $"/workspace/repos/{request.RepositoryName}",
+                request.WorkingDirectory ?? $"/workspace/repos/{request.RepositoryName}",
+                ProjectWorkspaceSetupOutcome.Initialized,
+                createdFiles: true,
+                message: "Initialized"));
+
+        public Task<ProjectWorkspaceSetupResult> EnsureWorkspaceAsync(
+            ProjectModel project,
+            string? fallbackDirectory = null,
+            Action<string>? log = null,
+            CancellationToken ct = default)
+        {
+            Projects.Add(project);
+            var target = project.GetResolvedWorkingDirectory();
+            return Task.FromResult(ProjectWorkspaceSetupResult.Succeeded(
+                target,
+                target,
+                ProjectWorkspaceSetupOutcome.Initialized,
+                createdFiles: true,
+                message: "Initialized"));
+        }
     }
 }

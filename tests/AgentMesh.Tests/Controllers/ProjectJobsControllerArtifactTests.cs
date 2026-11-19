@@ -142,6 +142,18 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
     /// parameters are optional by design so the artifact endpoints stay testable without a cluster;
     /// the storage-dependent assertions inject via <c>[FromServices]</c> instead.
     /// </summary>
+    private static JobTimelineCard LinkCard(Guid jobId, Guid sessionId, string content = "x") => new()
+    {
+        Id = Guid.NewGuid(),
+        JobId = jobId.ToString(),
+        CardType = TimelineCardType.TaskStep,
+        Status = TimelineCardStatus.Active,
+        Title = "Turn",
+        StructuredPayloadJson = JsonSerializer.Serialize(new { turnSessionId = sessionId, content }),
+        CreatedAt = DateTimeOffset.UtcNow,
+        UpdatedAt = DateTimeOffset.UtcNow
+    };
+
     private static ProjectJobsController Controller(
         AgentMesh.Infrastructure.Data.AgentMeshDbContext db) => new(db);
 
@@ -192,8 +204,8 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
                     JobArtifactManifest.BuildContentUrl(jobId, "a1"))
             })
         });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = firstTurnSession, Content = "turn 1" });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = secondTurnSession, Content = "turn 2" });
+        db.JobTimelineCards.Add(LinkCard(jobId, firstTurnSession, "turn 1"));
+        db.JobTimelineCards.Add(LinkCard(jobId, secondTurnSession, "turn 2"));
         await db.SaveChangesAsync();
 
         var artifacts = await JobArtifactMirror.RefreshAsync(db, jobId);
@@ -263,7 +275,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
             MetadataJson = SessionMetadataWithArtifacts(jobId, ("a1", "recovered.md", "text/markdown", 7))
         });
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId));
         await db.SaveChangesAsync();
         WriteJobFile(jobId, "recovered.md", "# recovered through the backfill");
 
@@ -347,13 +359,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
         };
         db.AgentSessions.Add(session);
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage
-        {
-            JobId = jobId,
-            TurnSessionId = sessionId,
-            Content = "turn reply",
-            SenderType = "persona"
-        });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId, "turn reply"));
         await db.SaveChangesAsync();
 
         // Act
@@ -384,7 +390,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
             MetadataJson = SessionMetadataWithArtifacts(jobId, ("a1", "plan.md", "text/markdown", 120))
         });
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId));
         await db.SaveChangesAsync();
 
         var controller = Controller(db);
@@ -490,7 +496,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
             MetadataJson = SessionMetadataWithArtifacts(jobId, ("a1", "plan.md", "text/markdown", 5))
         });
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId));
         await db.SaveChangesAsync();
         WriteJobFile(jobId, "plan.md", "# by id or name");
 
@@ -552,7 +558,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
             MetadataJson = SessionMetadataWithArtifacts(jobId, ("a1", "plan.md", "text/markdown", 9))
         });
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId));
         await db.SaveChangesAsync();
 
         var dir = SessionDir(sessionId);
@@ -582,7 +588,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
             MetadataJson = SessionMetadataWithArtifacts(jobId, ("a1", "gone.md", "text/markdown", 9))
         });
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId));
         await db.SaveChangesAsync();
 
         (await Controller(db).GetJobArtifactContent(jobId, "a1"))
@@ -721,13 +727,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
         var sessionId = Guid.NewGuid();
         db.AgentSessions.Add(new AgentSession { Id = sessionId, MetadataJson = "{}" });
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage
-        {
-            JobId = jobId,
-            TurnSessionId = sessionId,
-            Content = "turn reply",
-            SenderType = "persona"
-        });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId, "turn reply"));
         await db.SaveChangesAsync();
 
         var controller = new SessionsController(db, _mockHubContext.Object)
@@ -765,19 +765,10 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
     [Fact]
     public void ResolveJobId_FallsBackToTheJobMessageLink()
     {
-        // The mirror's own resolution path, asserted directly: a session whose envelope lacks jobId is
-        // still a job's turn if a job message names it, and without this fallback a re-sync of that
-        // turn's artifacts would silently stop updating the job.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         var sessionId = Guid.NewGuid();
-        db.JobMessages.Add(new JobMessage
-        {
-            JobId = jobId,
-            TurnSessionId = sessionId,
-            Content = "turn reply",
-            SenderType = "persona"
-        });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId, "turn reply"));
         db.SaveChanges();
 
         JobArtifactMirror.ResolveJobId(
@@ -791,13 +782,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
         var envelopeJob = Guid.NewGuid();
         var messageJob = Guid.NewGuid();
         var sessionId = Guid.NewGuid();
-        db.JobMessages.Add(new JobMessage
-        {
-            JobId = messageJob,
-            TurnSessionId = sessionId,
-            Content = "x",
-            SenderType = "persona"
-        });
+        db.JobTimelineCards.Add(LinkCard(messageJob, sessionId, "x"));
         db.SaveChanges();
 
         JobArtifactMirror.ResolveJobId(
@@ -834,7 +819,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
                     JobArtifactManifest.BuildContentUrl(jobId, "a1"))
             })
         });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId));
         await db.SaveChangesAsync();
 
         var artifacts = await JobArtifactMirror.RefreshAsync(db, jobId);
@@ -875,7 +860,7 @@ public sealed class ProjectJobsControllerArtifactTests : IDisposable
                 jobId, ("a1", "plan.md", "text/markdown", 5), ("a2", "diagram.mmd", "text/plain", 7))
         });
         db.ProjectJobs.Add(new ProjectJob { Id = jobId, ProjectId = "core-app", Title = "Build it" });
-        db.JobMessages.Add(new JobMessage { JobId = jobId, TurnSessionId = sessionId, Content = "x" });
+        db.JobTimelineCards.Add(LinkCard(jobId, sessionId));
         await db.SaveChangesAsync();
 
         WriteJobFile(jobId, "loose-notes.md", "# written straight to the job directory");

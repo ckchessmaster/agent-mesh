@@ -47,8 +47,22 @@ export interface DiscoveryQuestion {
 export interface DiscoveryPayload {
   questions: DiscoveryQuestion[];
   summary: string;
-  answers?: Record<string, string>;
+  /**
+   * Answers keyed by question id. Cards written before November 2026 — and any card written straight from
+   * an answered session question rather than from the Discovery Q&A activity — carry the answer array the
+   * operator submitted instead, which `DiscoveryQaCard` still renders.
+   */
+  answers?: Record<string, string> | DiscoveryAnswerRow[];
   feedback?: string;
+  /** The human-readable Q/A digest, present on cards written when a session question was answered. */
+  content?: string;
+}
+
+export interface DiscoveryAnswerRow {
+  question?: string;
+  questionIndex?: number;
+  selectedOptions?: string[];
+  customText?: string;
 }
 
 export interface ProposedChecklistItem {
@@ -76,6 +90,21 @@ export interface TaskStepPayload {
     response: string;
   }>;
   updatedAt?: string;
+}
+
+export interface PrReviewPayload {
+  prUrl?: string | null;
+  prNumber?: number | null;
+  headSha?: string | null;
+  authorPersonaId?: string | null;
+  senderPersona?: string | null;
+  targetBranch?: string | null;
+  round?: number | null;
+  reviewerId?: string | null;
+  note?: string | null;
+  /** The `open_pull_request` ledger variant puts its message here ("PR #1 opened: …"). */
+  content?: string | null;
+  source?: string | null;
 }
 
 export interface TurnInterruptedPayload {
@@ -111,6 +140,19 @@ export interface PlanDecisionPayload {
   approved: boolean;
   feedback?: string;
   approverId?: string;
+}
+
+/**
+ * Body of `POST /api/jobs/{id}/reviews`. `approvedHeadSha` is deliberately not sent by the Cockpit:
+ * the server binds the decision to the head SHA recorded on the gate's own card, which is the
+ * durable value — a UI could only send a rendering that may already be stale.
+ */
+export interface PrReviewDecisionPayload {
+  isApproved: boolean;
+  reviewComments?: string;
+  reviewerId?: string;
+  prNumber?: number;
+  approvedHeadSha?: string;
 }
 
 export interface AbortTurnRequest {

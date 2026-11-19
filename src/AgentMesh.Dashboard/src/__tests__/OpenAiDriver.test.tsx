@@ -73,8 +73,6 @@ vi.mock('../services/api', () => ({
     updateProject: vi.fn(),
     deleteProject: vi.fn(),
     createProjectJob: vi.fn(),
-    getProjectJobMessages: vi.fn().mockResolvedValue([]),
-    postProjectJobMessage: vi.fn(),
     getProjectJobTasks: vi.fn().mockResolvedValue([]),
     createProjectJobTask: vi.fn(),
     updateProjectJobTask: vi.fn(),
@@ -86,6 +84,30 @@ vi.mock('../services/api', () => ({
     uploadTaskAttachment: vi.fn(),
     deleteTaskAttachment: vi.fn()
   }
+}));
+
+const mockSignalRConnection = {
+  on: vi.fn(),
+  off: vi.fn(),
+  invoke: vi.fn().mockResolvedValue(undefined)
+};
+
+vi.mock('../hooks/useSignalR', () => ({
+  useSignalR: () => ({
+    connection: mockSignalRConnection,
+    connected: true
+  })
+}));
+
+vi.mock('../auth/AuthProvider', () => ({
+  useAuth: vi.fn(() => ({
+    isAuthenticated: true,
+    isLoading: false,
+    user: { profile: { email: 'admin', name: 'admin' }, access_token: 'mock-jwt-token' },
+    signinRedirect: vi.fn(),
+    signoutRedirect: vi.fn()
+  })),
+  AppAuthProvider: ({ children }: { children: React.ReactNode }) => children
 }));
 
 describe('OpenAI-Compatible Driver Integration', () => {
@@ -166,7 +188,7 @@ describe('OpenAI-Compatible Driver Integration', () => {
         })
       );
     });
-  }, 15000);
+  });
 
   it('renders custom model override input when creating a session with an OpenAI driver', async () => {
     vi.mocked(api.getAgents).mockResolvedValueOnce([

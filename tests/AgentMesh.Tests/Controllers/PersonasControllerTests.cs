@@ -484,4 +484,139 @@ public class PersonasControllerTests
         var entity = await db.Personas.FindAsync("deployer");
         entity!.GitHubTokenEncrypted.Should().BeNull();
     }
+
+    [Fact]
+    public async Task PersonaMcpServers_AssignUpsertPatchAndDelete_ManagesOverridesAndToolFilters()
+    {
+        // Arrange
+        using var db = TestDbContextFactory.Create();
+        var encService = new AgentMesh.Infrastructure.Services.AesCredentialEncryptionService(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("test-key-32-bytes-long-seed-1234")));
+
+        var personasController = new PersonasController(db, _mockHubContext.Object, encryptionService: encService);
+        var mcpController = new McpServersController(db, encService, _mockHubContext.Object);
+
+        await personasController.CreatePersona(new CreatePersonaRequest("Astra", "agy", "astra"));
+        await mcpController.CreateMcpServer(new CreateMcpServerRequest(
+            Name: "GitHub",
+            Id: "github",
+            Transport: McpTransportType.Stdio,
+            Command: "npx",
+            Args: new List<string> { "-y", "@modelcontextprotocol/server-github" },
+            Env: new Dictionary<string, string>
+            {
+                ["GITHUB_PERSONAL_ACCESS_TOKEN"] = "ghp_CatalogToken0000",
+                ["GITHUB_API_URL"] = "https://api.github.com"
+            }
+        ));
+
+        // Act 1: Assign via POST
+        var assignRes = await personasController.AssignPersonaMcpServer("astra", new AssignPersonaMcpServerRequest(
+            McpServerId: "github",
+            Enabled: true,
+            EnvOverrides: new Dictionary<string, string>
+            {
+                ["GITHUB_PERSONAL_ACCESS_TOKEN"] = "ghp_AstraOverride9999"
+            },
+            AllowedTools: new List<string> { "get_issue", "create_pull_request", "get_issue" },
+            BlockedTools: new List<string> { "delete_repository" }
+        ));
+
+        var created = assignRes.Should().BeOfType<CreatedAtActionResult>().Subject;
+        var assignedDto = created.Value.Should().BeOfType<PersonaMcpServerDto>().Subject;
+        assignedDto.PersonaId.Should().Be("astra");
+        assignedDto.McpServerId.Should().Be("github");
+        assignedDto.Enabled.Should().BeTrue();
+        assignedDto.EffectiveEnabled.Should().BeTrue();
+        assignedDto.ServerEnvMasked["GITHUB_PERSONAL_ACCESS_TOKEN"].Should().Be("ghp_...0000");
+        assignedDto.EnvOverridesMasked["GITHUB_PERSONAL_ACCESS_TOKEN"].Should().Be("ghp_...9999");
+        assignedDto.AllowedTools.Should().Equal("get_issue", "create_pull_request");
+        assignedDto.BlockedTools.Should().Equal("delete_repository");
+
+        // Duplicate POST -> 409 Conflict
+        var dupRes = await personasController.AssignPersonaMcpServer("astra", new AssignPersonaMcpServerRequest("github"));
+        dupRes.Should().BeOfType<ConflictObjectResult>();
+
+        // Verify PersonaDto reports McpServerCount
+        var personaRes = await personasController.GetPersona("astra");
+        var personaDto = personaRes.Should().BeOfType<OkObjectResult>().Subject.Value.Should().BeOfType<PersonaDto>().Subject;
+        personaDto.McpServerCount.Should().Be(1);
+
+        // Act 2: PATCH to merge an override, toggle enabled=false, and clear AllowedTools back to null
+        var patchRes = await personasController.UpdatePersonaMcpServer("astra", "github", new UpsertPersonaMcpServerRequest(
+            Enabled: false,
+            EnvOverrides: new Dictionary<string, string> { ["CUSTOM_FLAG"] = "enabled" },
+            MergeEnvOverrides: true,
+            ClearAllowedTools: true
+        ));
+
+        var patchedDto = patchRes.Should().BeOfType<OkObjectResult>().Subject.Value.Should().BeOfType<PersonaMcpServerDto>().Subject;
+        patchedDto.Enabled.Should().BeFalse();
+        patchedDto.EffectiveEnabled.Should().BeFalse();
+        patchedDto.EnvOverridesMasked.Should().ContainKeys("GITHUB_PERSONAL_ACCESS_TOKEN", "CUSTOM_FLAG");
+        patchedDto.AllowedTools.Should().BeNull();
+        patchedDto.BlockedTools.Should().Equal("delete_repository");
+
+        // Verify merged decryption via McpSecretProtector
+        var entity = await db.PersonaMcpServers.FindAsync("astra", "github");
+        var serverEntity = await db.McpServers.FindAsync("github");
+        var mergedEnv = McpSecretProtector.MergeAndDecrypt(encService, serverEntity!.EnvEncrypted, entity!.EnvOverridesEncrypted);
+        mergedEnv.Should().Equal(new Dictionary<string, string>
+        {
+            ["GITHUB_PERSONAL_ACCESS_TOKEN"] = "ghp_AstraOverride9999",
+            ["GITHUB_API_URL"] = "https://api.github.com",
+            ["CUSTOM_FLAG"] = "enabled"
+        });
+
+        // Act 3: PUT upsert on a second server creates it idempotently
+        await mcpController.CreateMcpServer(new CreateMcpServerRequest(
+            Name: "Context7",
+            Id: "context7",
+            Transport: McpTransportType.Http,
+            Url: "https://mcp.context7.com/mcp",
+            Enabled: false
+        ));
+
+        var putRes = await personasController.UpsertPersonaMcpServer("astra", "context7", new UpsertPersonaMcpServerRequest(
+            Enabled: true,
+            HeadersOverrides: new Dictionary<string, string> { ["X-Api-Key"] = "ctx7_key_4321" },
+            AllowedTools: new List<string>() // explicit empty allowlist != null
+        ));
+        var putDto = putRes.Should().BeOfType<OkObjectResult>().Subject.Value.Should().BeOfType<PersonaMcpServerDto>().Subject;
+        putDto.Enabled.Should().BeTrue();
+        putDto.ServerEnabled.Should().BeFalse();
+        putDto.EffectiveEnabled.Should().BeFalse();
+        putDto.AllowedTools.Should().NotBeNull().And.BeEmpty();
+        putDto.HeadersOverridesMasked["X-Api-Key"].Should().Be("ctx7...4321");
+
+        // List assignments
+        var listRes = await personasController.GetPersonaMcpServers("astra");
+        var list = listRes.Should().BeOfType<OkObjectResult>().Subject
+            .Value.Should().BeAssignableTo<IEnumerable<PersonaMcpServerDto>>().Subject.ToList();
+        list.Should().HaveCount(2);
+
+        // Act 4: DELETE one assignment, then DeletePersona cleans up remaining assignment
+        var delRes = await personasController.RemovePersonaMcpServer("astra", "github");
+        delRes.Should().BeOfType<OkObjectResult>();
+        (await db.PersonaMcpServers.FindAsync("astra", "github")).Should().BeNull();
+
+        await personasController.DeletePersona("astra");
+        db.PersonaMcpServers.Where(pm => pm.PersonaId == "astra").Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task PersonaMcpServers_MissingPersonaOrServer_ReturnsNotFound()
+    {
+        using var db = TestDbContextFactory.Create();
+        var personasController = new PersonasController(db);
+        await personasController.CreatePersona(new CreatePersonaRequest("Astra", "agy", "astra"));
+
+        (await personasController.GetPersonaMcpServers("unknown")).Should().BeOfType<NotFoundObjectResult>();
+        (await personasController.GetPersonaMcpServer("astra", "missing")).Should().BeOfType<NotFoundObjectResult>();
+        (await personasController.AssignPersonaMcpServer("astra", new AssignPersonaMcpServerRequest("missing")))
+            .Should().BeOfType<NotFoundObjectResult>();
+        (await personasController.UpdatePersonaMcpServer("astra", "missing", new UpsertPersonaMcpServerRequest(Enabled: false)))
+            .Should().BeOfType<NotFoundObjectResult>();
+        (await personasController.RemovePersonaMcpServer("astra", "missing")).Should().BeOfType<NotFoundObjectResult>();
+    }
 }

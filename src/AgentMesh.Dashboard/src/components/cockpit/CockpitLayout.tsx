@@ -39,6 +39,8 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
     addComment,
     submitAnswers,
     submitPlanDecision,
+    sendPlanGuidance,
+    submitPrReview,
     abortActiveTurn,
     submitIntervention
   } = useJobTimeline(jobId);
@@ -46,9 +48,9 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
   return (
     <div
       data-testid="cockpit-layout"
-      className={`flex h-full w-full bg-slate-950 text-slate-100 overflow-hidden ${className}`}
+      className={`flex flex-col md:flex-row h-full w-full bg-slate-950 text-slate-100 overflow-hidden ${className}`}
     >
-      {/* Sticky Left Sidebar (320px) */}
+      {/* Sticky Left Sidebar (320px on md+, collapsible top bar on mobile) */}
       <StickySidebar
         jobId={jobId}
         job={job}
@@ -63,7 +65,7 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
       />
 
       {/* Main Timeline Feed */}
-      <div className="flex-1 flex flex-col h-full overflow-hidden">
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col md:h-full overflow-hidden">
         {error && (
           <div className="p-3 bg-rose-950/40 border-b border-rose-800 text-xs text-rose-300 flex justify-between items-center">
             <span>Error connecting to timeline: {error}</span>
@@ -77,6 +79,11 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
           isStarting={isStarting}
           onSubmitAnswers={submitAnswers}
           onSubmitPlanDecision={submitPlanDecision}
+          // Passed straight through rather than fired-and-forgotten: the card renders a rejection as the
+          // reason the gate is still open. `void` here would turn "nobody was told" back into silence,
+          // which is the bug this whole path exists to remove.
+          onSendPlanGuidance={sendPlanGuidance}
+          onSubmitPrReview={submitPrReview}
           onSubmitIntervention={submitIntervention}
           onAddComment={(cardId, content) => { void addComment(cardId, content); }}
         />

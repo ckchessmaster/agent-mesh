@@ -34,6 +34,8 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     private string? _awaitingFrom;
     private string? _personaId;
     private string? _agentId;
+    private string? _rawPersonaId;
+    private string? _rawAgentId;
     private DateTimeOffset? _awaitingSince;
     private int _turnCount;
     private TurnOutcomeStatus? _lastOutcome;
@@ -52,6 +54,8 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         _currentStatus = "Running";
         _turnSessionId = input.TurnSessionId;
 
+        _rawPersonaId = input.PersonaId;
+        _rawAgentId = input.AgentId;
         _personaId = NormalizeIdentity(input.PersonaId);
         _agentId = NormalizeIdentity(input.AgentId);
 
@@ -102,7 +106,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
 
             try
             {
-                outcome = await ExecuteTurnActivityAsync(input, pendingReply, turnCancellation.Token);
+                outcome = await ExecuteTurnActivityAsync(CurrentInput(input), pendingReply, turnCancellation.Token);
                 _activeTurnCts = null;
             }
             catch (Exception ex) when (_abortSignal != null && IsActivityCancellation(ex))
@@ -183,77 +187,10 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                     break;
 
                 case TurnOutcomeStatus.PrOpenedAwaitingReview:
+                case TurnOutcomeStatus.TaskCompleted:
                     _activePrUrl = outcome.PrUrl ?? _activePrUrl;
                     _activePrNumber = outcome.PrNumber ?? _activePrNumber;
-                    _currentStatus = "Awaiting PR Review";
-                    _awaitingSince = Workflow.UtcNow;
 
-                    var gotReview = await Workflow.WaitConditionAsync(
-                        () => _prReview != null, MaxWait);
-
-                    _awaitingSince = null;
-
-                    if (!gotReview)
-                    {
-                        var reviewTimeout =
-                            $"No review on {_activePrUrl ?? "the open pull request"} within " +
-                            $"{MaxWait.TotalDays} days; halting.";
-                        _currentStatus = $"Halted: {reviewTimeout}";
-                        _lastOutcome = TurnOutcomeStatus.Failed;
-                        return new TaskExecutionResult(false, input.TaskId, _activePrUrl, reviewTimeout);
-                    }
-
-                    var review = _prReview!;
-                    _prReview = null;
-
-                    if (review.IsApproved)
-                    {
-                        _currentStatus = "Merging PR";
-
-                        string? mergeResult;
-                        try
-                        {
-                            mergeResult = await Workflow.ExecuteActivityAsync(
-                                (IGitActivities act) => act.MergePullRequestAsync(_activePrUrl!),
-                                new ActivityOptions
-                                {
-                                    StartToCloseTimeout = TimeSpan.FromMinutes(5),
-                                    RetryPolicy = new()
-                                    {
-                                        InitialInterval = TimeSpan.FromSeconds(5),
-                                        MaximumInterval = TimeSpan.FromMinutes(1),
-                                        MaximumAttempts = 3,
-                                    },
-                                });
-                        }
-                        catch (Exception ex) when (IsTurnHalt(ex))
-                        {
-                            var reason = $"Approved merge could not complete: {HaltReasonOf(ex)}";
-                            _currentStatus = $"Halted: {reason}";
-                            _lastOutcome = TurnOutcomeStatus.Failed;
-                            _isTerminated = true;
-
-                            return new TaskExecutionResult(false, input.TaskId, _activePrUrl, reason);
-                        }
-
-                        _currentStatus = "Completed";
-                        _isTerminated = true;
-
-                        return new TaskExecutionResult(
-                            true, input.TaskId, _activePrUrl,
-                            mergeResult ?? "Pull request merged; task completed.");
-                    }
-
-                    _currentStatus = "Changes requested on PR; resuming coding turn";
-
-                    _chatInbox.Enqueue(new ChatMessageSignal(
-                        SenderId: string.IsNullOrWhiteSpace(review.ReviewerId) ? "reviewer" : review.ReviewerId,
-                        Content: $"Review feedback on PR {_activePrUrl}:\n{review.ReviewComments ?? "(no comments provided)"}",
-                        Timestamp: review.Timestamp,
-                        MessageId: null));
-                    break;
-
-                case TurnOutcomeStatus.TaskCompleted:
                     if (isTimelineTask)
                     {
                         await Workflow.ExecuteActivityAsync(
@@ -272,9 +209,15 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                     _currentStatus = "Completed";
                     _isTerminated = true;
 
+                    var completionSummary = outcome.Message ?? "Task completed and committed to job branch.";
                     return new TaskExecutionResult(
-                        true, input.TaskId, outcome.PrUrl ?? _activePrUrl,
-                        outcome.Message ?? "Task completed and verified successfully.");
+                        Success: true,
+                        ErrorMessage: completionSummary,
+                        TaskId: input.TaskId,
+                        FinalPrUrl: _activePrUrl,
+                        Summary: completionSummary,
+                        PrNumber: _activePrNumber,
+                        HeadSha: outcome.HeadSha);
 
                 case TurnOutcomeStatus.StuckLoopDetected:
                 case TurnOutcomeStatus.Failed:
@@ -340,6 +283,35 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         _intervention = signal;
         return Task.CompletedTask;
     }
+
+    [WorkflowSignal]
+    public Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal)
+    {
+        if (signal is null || string.IsNullOrWhiteSpace(signal.AssignedAgentId))
+        {
+            return Task.CompletedTask;
+        }
+
+        var normalized = signal.AssignedAgentId.Trim().TrimStart('@').ToLowerInvariant();
+        if (normalized.Length == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        _rawPersonaId = normalized;
+        _rawAgentId = normalized;
+        _personaId = NormalizeIdentity(normalized);
+        _agentId = NormalizeIdentity(normalized);
+        Workflow.UpsertMemo(MemoUpdate.ValueSet("personaId", normalized));
+        return Task.CompletedTask;
+    }
+
+    private TaskExecutionInput CurrentInput(TaskExecutionInput input) =>
+        input with
+        {
+            AgentId = !string.IsNullOrWhiteSpace(_rawAgentId) ? _rawAgentId! : input.AgentId,
+            PersonaId = !string.IsNullOrWhiteSpace(_rawPersonaId) ? _rawPersonaId : input.PersonaId
+        };
 
     [WorkflowSignal]
     public Task ReceiveChatMessageAsync(ChatMessageSignal signal)

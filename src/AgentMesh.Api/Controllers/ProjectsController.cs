@@ -49,7 +49,23 @@ public record ProjectSummaryDto(
     int JobCount,
     int ActiveJobCount,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt
+    DateTimeOffset UpdatedAt,
+    string RepositoryName = Project.DefaultRepositoryName,
+    string WorkingDirectory = "",
+    string ResolvedWorkingDirectory = ""
+);
+
+public record ProjectWorkspaceSetupResponseDto(
+    string ProjectId,
+    bool Success,
+    string TargetDirectory,
+    string EffectiveDirectory,
+    string Outcome,
+    bool UsedFallback,
+    bool CreatedFiles,
+    string Message,
+    IReadOnlyList<string> Warnings,
+    string? Error = null
 );
 
 public record CreateProjectRequest(
@@ -63,7 +79,9 @@ public record CreateProjectRequest(
     string? S3PrefixKey = null,
     string? ProjectInstructions = null,
     string? DefaultLeadPersonaId = null,
-    List<string>? AllowedPersonaIds = null
+    List<string>? AllowedPersonaIds = null,
+    string? RepositoryName = null,
+    string? WorkingDirectory = null
 );
 
 public record UpdateProjectRequest(
@@ -76,7 +94,9 @@ public record UpdateProjectRequest(
     string? S3PrefixKey = null,
     string? ProjectInstructions = null,
     string? DefaultLeadPersonaId = null,
-    List<string>? AllowedPersonaIds = null
+    List<string>? AllowedPersonaIds = null,
+    string? RepositoryName = null,
+    string? WorkingDirectory = null
 );
 
 public record AssignPersonaRequest(
@@ -89,7 +109,8 @@ public record AssignPersonaRequest(
 public class ProjectsController(
     AgentMeshDbContext db,
     IHubContext<AgentMeshHub>? hubContext = null,
-    IStorageService? storageService = null) : ControllerBase
+    IStorageService? storageService = null,
+    IProjectWorkspaceSetup? workspaceSetup = null) : ControllerBase
 {
     [HttpGet]
     [AllowAnonymous]
@@ -204,6 +225,18 @@ public class ProjectsController(
             return BadRequest(new { error = "A valid Project Id or Name is required." });
         }
 
+        var (repoOk, repositoryName, repoError) = ResolveRepositoryNameForCreate(req.RepositoryName, normalizedId);
+        if (!repoOk)
+        {
+            return BadRequest(new { error = repoError });
+        }
+
+        var (workDirOk, workingDirectory, workDirError) = ResolveWorkingDirectory(req.WorkingDirectory);
+        if (!workDirOk)
+        {
+            return BadRequest(new { error = workDirError });
+        }
+
         var existing = await db.Projects.FirstOrDefaultAsync(p => p.Id == normalizedId);
         if (existing != null)
         {
@@ -218,6 +251,8 @@ public class ProjectsController(
             WorkspaceType = req.WorkspaceType,
             GitRepositoryUrl = req.GitRepositoryUrl?.Trim(),
             GitBaseBranch = !string.IsNullOrWhiteSpace(req.GitBaseBranch) ? req.GitBaseBranch.Trim() : "main",
+            RepositoryName = repositoryName,
+            WorkingDirectory = workingDirectory,
             S3BucketName = req.S3BucketName?.Trim(),
             S3PrefixKey = req.S3PrefixKey?.Trim(),
             ProjectInstructions = req.ProjectInstructions?.Trim() ?? string.Empty,
@@ -285,6 +320,24 @@ public class ProjectsController(
         if (req.WorkspaceType.HasValue) project.WorkspaceType = req.WorkspaceType.Value;
         if (req.GitRepositoryUrl != null) project.GitRepositoryUrl = req.GitRepositoryUrl.Trim();
         if (!string.IsNullOrWhiteSpace(req.GitBaseBranch)) project.GitBaseBranch = req.GitBaseBranch.Trim();
+        if (req.RepositoryName != null)
+        {
+            var (repoOk, repositoryName, repoError) = ValidateExplicitRepositoryName(req.RepositoryName);
+            if (!repoOk)
+            {
+                return BadRequest(new { error = repoError });
+            }
+            project.RepositoryName = repositoryName;
+        }
+        if (req.WorkingDirectory != null)
+        {
+            var (workDirOk, workingDirectory, workDirError) = ResolveWorkingDirectory(req.WorkingDirectory);
+            if (!workDirOk)
+            {
+                return BadRequest(new { error = workDirError });
+            }
+            project.WorkingDirectory = workingDirectory;
+        }
         if (req.S3BucketName != null) project.S3BucketName = req.S3BucketName.Trim();
         if (req.S3PrefixKey != null) project.S3PrefixKey = req.S3PrefixKey.Trim();
         if (req.ProjectInstructions != null) project.ProjectInstructions = req.ProjectInstructions.Trim();
@@ -372,8 +425,9 @@ public class ProjectsController(
 
         if (jobIds.Count > 0)
         {
-            var messages = await db.JobMessages.Where(m => jobIds.Contains(m.JobId)).ToListAsync();
-            db.JobMessages.RemoveRange(messages);
+            var jobIdStrings = jobIds.Select(id => id.ToString()).ToList();
+            var cards = await db.JobTimelineCards.Where(c => jobIdStrings.Contains(c.JobId)).ToListAsync();
+            db.JobTimelineCards.RemoveRange(cards);
             db.ProjectJobs.RemoveRange(jobs);
         }
 
@@ -503,6 +557,99 @@ public class ProjectsController(
         return Ok(new { status = "removed", projectId = normId, personaId = normPersonaId });
     }
 
+    [HttpPost("{id}/setup")]
+    public async Task<IActionResult> SetupProjectWorkspace(
+        string id,
+        [FromQuery] string? fallbackDirectory = null,
+        CancellationToken ct = default)
+    {
+        var normId = id.Trim().ToLowerInvariant();
+        var project = await db.Projects
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.Id == normId, ct);
+
+        if (project == null)
+        {
+            return NotFound(new { error = $"Project '{id}' not found." });
+        }
+
+        var setup = workspaceSetup ?? new ProjectWorkspaceSetup();
+        var result = await setup.EnsureWorkspaceAsync(project, fallbackDirectory: fallbackDirectory, ct: ct);
+
+        var response = new ProjectWorkspaceSetupResponseDto(
+            ProjectId: project.Id,
+            Success: result.Success,
+            TargetDirectory: result.TargetDirectory,
+            EffectiveDirectory: result.EffectiveDirectory,
+            Outcome: result.Outcome.ToString(),
+            UsedFallback: result.UsedFallback,
+            CreatedFiles: result.CreatedFiles,
+            Message: result.Message,
+            Warnings: result.Warnings,
+            Error: result.Success ? null : result.Message
+        );
+
+        if (!result.Success)
+        {
+            return UnprocessableEntity(response);
+        }
+
+        return Ok(response);
+    }
+
+    private static (bool Valid, string Value, string? Error) ResolveRepositoryNameForCreate(
+        string? rawRepositoryName,
+        string normalizedProjectId)
+    {
+        if (string.IsNullOrWhiteSpace(rawRepositoryName))
+        {
+            var fallback = WorkspacePathResolver.IsSafeRepositoryName(normalizedProjectId)
+                ? normalizedProjectId
+                : Project.DefaultRepositoryName;
+            return (true, fallback, null);
+        }
+
+        return ValidateExplicitRepositoryName(rawRepositoryName);
+    }
+
+    private static (bool Valid, string Value, string? Error) ValidateExplicitRepositoryName(string rawRepositoryName)
+    {
+        if (string.IsNullOrWhiteSpace(rawRepositoryName))
+        {
+            return (false, string.Empty, "RepositoryName cannot be empty.");
+        }
+
+        var trimmed = rawRepositoryName.Trim();
+        if (!WorkspacePathResolver.IsSafeRepositoryName(trimmed))
+        {
+            return (
+                false,
+                string.Empty,
+                "RepositoryName must be 1-128 characters using only ASCII letters, digits, '.', '-', or '_'.");
+        }
+
+        return (true, trimmed, null);
+    }
+
+    private static (bool Valid, string Value, string? Error) ResolveWorkingDirectory(string? rawWorkingDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(rawWorkingDirectory))
+        {
+            return (true, string.Empty, null);
+        }
+
+        var trimmed = rawWorkingDirectory.Trim();
+        if (!WorkspacePathResolver.IsSafeWorkingDirectory(trimmed))
+        {
+            return (
+                false,
+                string.Empty,
+                "WorkingDirectory must be an absolute path up to 256 characters with no control characters.");
+        }
+
+        return (true, WorkspacePathResolver.Normalize(trimmed), null);
+    }
+
     private static ProjectSummaryDto ToDto(
         Project p,
         string? defaultLeadPersonaName,
@@ -526,7 +673,10 @@ public class ProjectsController(
             totalJobs,
             activeJobs,
             p.CreatedAt,
-            p.UpdatedAt
+            p.UpdatedAt,
+            p.RepositoryName,
+            p.WorkingDirectory,
+            p.GetResolvedWorkingDirectory()
         );
     }
 

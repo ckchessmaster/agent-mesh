@@ -55,7 +55,7 @@ public class OpenAiAdapterTests
     public void OpenAiAdapter_GetToolDefinitions_ContainsAllRequiredAutonomousTools()
     {
         var tools = OpenAiAdapter.GetToolDefinitions();
-        tools.Should().HaveCount(9);
+        tools.Should().HaveCount(10);
 
         var toolNames = new List<string>();
         foreach (var t in tools)
@@ -78,6 +78,31 @@ public class OpenAiAdapterTests
         toolNames.Should().Contain("post_job_message");
         toolNames.Should().Contain("open_pull_request");
         toolNames.Should().Contain("save_memory");
+        toolNames.Should().Contain("list_memories");
+    }
+
+    [Fact]
+    public void ResolveEffectiveWorkingDirectory_DefaultsContainerSessionsToProjectRepoUnderWorkspaceRepos()
+    {
+        var ev = new PromptReceivedEvent
+        {
+            SessionId = Guid.NewGuid(),
+            ProjectId = "payments-api",
+            RepositoryName = "payments-api",
+            WorkingDirectory = null
+        };
+
+        var resolved = AgentProcessManager.ResolveEffectiveWorkingDirectory(
+            ev,
+            directoryExists: path => path == "/workspace" || path == "/workspace/repos");
+
+        resolved.Should().Be("/workspace/repos/payments-api");
+
+        // Even if a legacy caller passed "/workspace", an active project resolves to /workspace/repos/<repo>
+        ev.WorkingDirectory = "/workspace";
+        AgentProcessManager.ResolveEffectiveWorkingDirectory(
+            ev,
+            directoryExists: path => path == "/workspace").Should().Be("/workspace/repos/payments-api");
     }
 
     [Fact]
@@ -96,6 +121,83 @@ public class OpenAiAdapterTests
         finally
         {
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_AlreadyCancelled_DoesNotCreateRunCommandWorkingDirectory()
+    {
+        // A cancelled prompt must not leave a workspace behind. `run_command` mkdirs its working
+        // directory before the sandbox is even reached, so the old ordering created the directory
+        // and then abandoned it, which reads as real output to whatever resumes the session.
+        var root = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        var nested = Path.Combine(root, "deep", "deeper");
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { command = "echo should-not-run", workingDirectory = nested });
+            Func<Task> act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, root, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
+            Directory.Exists(nested).Should().BeFalse("a cancelled prompt must not create working directories");
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_AlreadyCancelled_DoesNotWriteFileOrItsParentDirectory()
+    {
+        // The second mutating door: `write_file` mkdirs the target's parent and then writes it.
+        var root = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(root);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { path = "sub/out.txt", content = "must never be written" });
+            Func<Task> act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("write_file", args, root, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
+            File.Exists(Path.Combine(root, "sub", "out.txt")).Should().BeFalse("a cancelled prompt must not write files");
+            Directory.Exists(Path.Combine(root, "sub")).Should().BeFalse("a cancelled prompt must not create the target's parent directory");
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_AlreadyCancelled_UncreatableWorkingDirectory_StillReportsCancellation()
+    {
+        // The masking case, and the reason checking the token is not merely tidy. A regular file
+        // standing where a directory would have to be makes the mkdir throw an IOException, while a
+        // cancelled token produces no exception of its own, so the generic catch converted the
+        // cancellation into a "Tool execution error: ..." string. The caller then saw a tool that
+        // had run and failed when in truth the turn had been cancelled before anything ran.
+        var root = Path.Combine(Path.GetTempPath(), "agentmesh_cancel_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(root);
+        var blocker = Path.Combine(root, "blocker");
+        File.WriteAllText(blocker, "not a directory");
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+
+            var args = JsonSerializer.Serialize(new { command = "echo should-not-run", workingDirectory = Path.Combine(blocker, "deeper") });
+            Func<Task> act = async () => await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, root, cts.Token);
+
+            await act.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
         }
     }
 
@@ -170,6 +272,409 @@ public class OpenAiAdapterTests
         {
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
         }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_EditFile_RefusesAmbiguousTarget_Unmodified()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_tool_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var filePath = Path.Combine(tempDir, "dup.txt");
+            await File.WriteAllTextAsync(filePath, "alpha beta alpha gamma alpha");
+
+            var ambiguousArgs = JsonSerializer.Serialize(new
+            {
+                path = "dup.txt",
+                target = "alpha",
+                replacement = "ALPHA"
+            });
+            var ambiguousRes = await OpenAiAdapter.ExecuteToolLocallyAsync("edit_file", ambiguousArgs, tempDir, CancellationToken.None);
+            ambiguousRes.Should().Contain("appears 3 times");
+            ambiguousRes.Should().Contain("replace_all");
+
+            // The refusal must not touch the file — a partial or global clobber on an ambiguous
+            // target is the exact silent-corruption failure this guard exists to stop.
+            (await File.ReadAllTextAsync(filePath)).Should().Be("alpha beta alpha gamma alpha");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_EditFile_ScopedTargetAnd_ReplaceAll_BothSucceed()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_tool_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var filePath = Path.Combine(tempDir, "dup.txt");
+            await File.WriteAllTextAsync(filePath, "alpha beta alpha gamma alpha");
+
+            // Unique via surrounding context: replaces exactly one occurrence.
+            var scopedArgs = JsonSerializer.Serialize(new
+            {
+                path = "dup.txt",
+                target = "alpha beta",
+                replacement = "ALPHA beta"
+            });
+            var scopedRes = await OpenAiAdapter.ExecuteToolLocallyAsync("edit_file", scopedArgs, tempDir, CancellationToken.None);
+            scopedRes.Should().Contain("Successfully replaced target");
+            (await File.ReadAllTextAsync(filePath)).Should().Be("ALPHA beta alpha gamma alpha");
+
+            // Explicit replace_all is the only path that may touch multiple sites.
+            var allArgs = JsonSerializer.Serialize(new
+            {
+                path = "dup.txt",
+                target = "alpha",
+                replacement = "ALPHA",
+                replace_all = true
+            });
+            var allRes = await OpenAiAdapter.ExecuteToolLocallyAsync("edit_file", allArgs, tempDir, CancellationToken.None);
+            allRes.Should().Contain("replaced all 2 occurrences");
+            (await File.ReadAllTextAsync(filePath)).Should().Be("ALPHA beta ALPHA gamma ALPHA");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public void GetToolDefinitions_EditFile_ExposesReplaceAllParameter()
+    {
+        var tools = OpenAiAdapter.GetToolDefinitions();
+        var json = JsonSerializer.Serialize(tools);
+        json.Should().Contain("replace_all");
+    }
+
+    // ---------- numbered-view paste normalization ----------
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_EditFile_AcceptsTargetPastedFromNumberedView()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_tool_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var filePath = Path.Combine(tempDir, "src.txt");
+            await File.WriteAllTextAsync(filePath, "alpha one\nbeta two\ngamma three\n");
+
+            // The model pasted straight out of read_file's "N: " display format.
+            var editArgs = JsonSerializer.Serialize(new
+            {
+                path = "src.txt",
+                target = "1: alpha one\n2: beta two",
+                replacement = "ALPHA one\nBETA two"
+            });
+            var res = await OpenAiAdapter.ExecuteToolLocallyAsync("edit_file", editArgs, tempDir, CancellationToken.None);
+            res.Should().Contain("Successfully replaced target");
+            res.Should().Contain("line-number prefixes");
+            (await File.ReadAllTextAsync(filePath)).Should().Be("ALPHA one\nBETA two\ngamma three\n");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_EditFile_NeverNormalizesIntoMidLineMatches()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_tool_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var filePath = Path.Combine(tempDir, "notes.txt");
+            await File.WriteAllTextAsync(filePath, "42: meaning of config\nother line\n");
+
+            // Stripping this target's prefix yields "meaning of config", which occurs only
+            // MID-line (after "42: "). Line-boundary semantics must refuse rather than rewrite
+            // a substring of a legitimately-numbered line.
+            var editArgs = JsonSerializer.Serialize(new
+            {
+                path = "notes.txt",
+                target = "1: meaning of config",
+                replacement = "HACKED"
+            });
+            var res = await OpenAiAdapter.ExecuteToolLocallyAsync("edit_file", editArgs, tempDir, CancellationToken.None);
+            res.Should().Contain("Error: Target string not found");
+            res.Should().Contain("0 matches");
+            (await File.ReadAllTextAsync(filePath)).Should().Be("42: meaning of config\nother line\n");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    // ---------- fallback tool-call parsing: leak execution paths ----------
+
+    [Fact]
+    public void TryParseFallbackToolCall_ParsesQwenXmlFunctionBlocks()
+    {
+        var content = "Sure. <tool_call>\n<function=run_command>\n<parameter=command>ls -la /tmp</parameter>\n<parameter=timeout_seconds>45</parameter>\n</function>\n</tool_call>";
+        var (hasTool, name, args) = OpenAiAdapter.TryParseFallbackToolCall(content);
+        hasTool.Should().BeTrue();
+        name.Should().Be("run_command");
+        using var doc = JsonDocument.Parse(args!);
+        doc.RootElement.GetProperty("command").GetString().Should().Be("ls -la /tmp");
+        doc.RootElement.GetProperty("timeout_seconds").ValueKind.Should().Be(JsonValueKind.Number);
+        doc.RootElement.GetProperty("timeout_seconds").GetInt32().Should().Be(45);
+    }
+
+    [Fact]
+    public void TryParseFallbackToolCall_HermesJsonStillWorks()
+    {
+        var content = "Working... <tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.cs\"}}</tool_call>";
+        var (hasTool, name, args) = OpenAiAdapter.TryParseFallbackToolCall(content);
+        hasTool.Should().BeTrue();
+        name.Should().Be("read_file");
+        args.Should().Contain("a.cs");
+    }
+
+    [Theory]
+    [InlineData("42", typeof(long))]
+    [InlineData("3.5", typeof(double))]
+    [InlineData("true", typeof(bool))]
+    [InlineData("hello world", typeof(string))]
+    public void CoerceXmlParamValue_TypesArePreserved(string raw, Type expected)
+    {
+        OpenAiAdapter.CoerceXmlParamValue(raw)!.GetType().Should().Be(expected);
+    }
+
+    // ---------- benign exit-code classification ----------
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_RunCommand_AnnotatesBenignGrepMiss()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_tool_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var filePath = Path.Combine(tempDir, "empty.txt");
+            await File.WriteAllTextAsync(filePath, "nothing relevant here\n");
+            var args = JsonSerializer.Serialize(new { command = $"grep zzz_no_match {filePath}" });
+            var res = await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, tempDir, CancellationToken.None);
+            res.Should().Contain("Exit Code: 1");
+            res.Should().Contain("NORMAL RESULT");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteToolLocallyAsync_RunCommand_DoesNotAnnotateRealFailures()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agentmesh_tool_test_" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var args = JsonSerializer.Serialize(new { command = "exit 1" });
+            var res = await OpenAiAdapter.ExecuteToolLocallyAsync("run_command", args, tempDir, CancellationToken.None);
+            res.Should().Contain("Exit Code: 1");
+            res.Should().NotContain("NORMAL RESULT");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        }
+    }
+
+    [Theory]
+    [InlineData("grep foo x.txt", true)]
+    [InlineData("/usr/bin/rg pattern .", true)]
+    [InlineData("git grep pattern", true)]
+    [InlineData("diff a b", true)]
+    [InlineData("dotnet test", false)]
+    [InlineData("echo done", false)]
+    public void IsBenignExitOneCommand_Classification(string cmd, bool benign)
+    {
+        OpenAiAdapter.IsBenignExitOneCommand(cmd).Should().Be(benign);
+    }
+
+    // ---------- behavior profile application ----------
+
+    [Fact]
+    public void ApplyProfileSampling_QwenLoopback_SendsQwenNumbers_AndUnknownModelSendsNothing()
+    {
+        var qwen = AgentMesh.Core.Services.ModelBehaviorProfiles.Resolve("qwen3.8-flash-next", endpointIsLoopback: true);
+        var body = new Dictionary<string, object?>();
+        var sent = OpenAiAdapter.ApplyProfileSampling(body, qwen, "qwen3.8-flash-next");
+        sent.Should().Contain(new[] { "temperature", "top_p", "top_k", "min_p" });
+        body["top_k"].Should().Be(20L);           // integers stay integers on the wire
+        body["temperature"].Should().Be(0.6);
+
+        var unknown = AgentMesh.Core.Services.ModelBehaviorProfiles.Resolve("mystery-9000", endpointIsLoopback: true);
+        var emptyBody = new Dictionary<string, object?>();
+        OpenAiAdapter.ApplyProfileSampling(emptyBody, unknown, "mystery-9000").Should().BeEmpty();
+        emptyBody.Should().BeEmpty();              // byte-for-byte the pre-registry request shape
+    }
+
+    [Fact]
+    public void ParseRejectedRequestParameters_NeedsRejectionPhrase_AndOnlyOwnKeys()
+    {
+        var candidates = new List<string> { "top_k", "temperature" };
+        OpenAiAdapter.ParseRejectedRequestParameters(
+                "{\"error\":\"top_k: Extra inputs are not permitted\"}", candidates)
+            .Should().BeEquivalentTo(new[] { "top_k" });
+        // Same key named without a parameter-rejection phrase -> learn nothing (e.g. a context
+        // error that happens to mention the word in prose).
+        OpenAiAdapter.ParseRejectedRequestParameters(
+                "context length exceeded near top_k", candidates)
+            .Should().BeEmpty();
+    }
+
+    [Fact]
+    public void MaybeAttachReasoning_EchoesField_WhenServerSeparated()
+    {
+        var profile = AgentMesh.Core.Services.ModelBehaviorProfiles.Resolve("qwen3.8-flash-next", endpointIsLoopback: true);
+        var shape = new OpenAiAdapter.ReasoningShapeTracker();
+        shape.NoteField();
+        var msg = new OpenAiMessage { Role = "assistant", Content = "answer" };
+        OpenAiAdapter.MaybeAttachReasoningToHistory(msg, "  because reasons  ", shape, profile, "qwen3.8-flash-next");
+        msg.ReasoningContent.Should().Be("because reasons");
+        msg.Content.Should().Be("answer");
+    }
+
+    [Fact]
+    public void MaybeAttachReasoning_FallsBackToBalancedInline_WhenFieldRejected()
+    {
+        AgentMesh.Core.Services.ModelBehaviorProfiles.ClearLearnedState();
+        try
+        {
+            AgentMesh.Core.Services.ModelBehaviorProfiles.RecordReasoningFieldRejected("m-inline");
+            var profile = AgentMesh.Core.Services.ModelBehaviorProfiles.Resolve("m-inline", endpointIsLoopback: true);
+            var shape = new OpenAiAdapter.ReasoningShapeTracker();
+            shape.NoteField();
+            var msg = new OpenAiMessage { Role = "assistant", Content = "answer" };
+            OpenAiAdapter.MaybeAttachReasoningToHistory(msg, "deep thought", shape, profile, "m-inline");
+            msg.ReasoningContent.Should().BeNull();
+            msg.Content.Should().StartWith("<think>\ndeep thought\n</think>\n\n");
+            msg.Content.Should().EndWith("answer");
+        }
+        finally
+        {
+            AgentMesh.Core.Services.ModelBehaviorProfiles.ClearLearnedState();
+        }
+    }
+
+    [Fact]
+    public void MaybeAttachReasoning_SkipsUnbalancedTruncatedReasoning()
+    {
+        var profile = AgentMesh.Core.Services.ModelBehaviorProfiles.Resolve("qwen3.8-flash-next", endpointIsLoopback: true);
+        var shape = new OpenAiAdapter.ReasoningShapeTracker();
+        shape.NoteField();
+        AgentMesh.Core.Services.ModelBehaviorProfiles.ClearLearnedState();
+        AgentMesh.Core.Services.ModelBehaviorProfiles.RecordReasoningFieldRejected("qwen3.8-flash-next"); // force inline path
+        try
+        {
+            var msg = new OpenAiMessage { Role = "assistant", Content = "answer" };
+            OpenAiAdapter.MaybeAttachReasoningToHistory(msg, "<think>truncated by stream death", shape, profile, "qwen3.8-flash-next");
+            msg.ReasoningContent.Should().BeNull();
+            msg.Content.Should().Be("answer"); // an unclosed think block would poison history
+        }
+        finally
+        {
+            AgentMesh.Core.Services.ModelBehaviorProfiles.ClearLearnedState();
+        }
+    }
+
+    [Fact]
+    public void Reasoning_SerializesOnlyWhenSet_AndCountsInEstimator()
+    {
+        var plain = new OpenAiMessage { Role = "assistant", Content = "x" };
+        var plainDict = (IDictionary<string, object?>)plain.ToSerializableObject();
+        plainDict.ContainsKey("reasoning_content").Should().BeFalse();
+
+        var withReasoning = new OpenAiMessage { Role = "assistant", Content = "x", ReasoningContent = new string('y', 3600) };
+        var dict = (IDictionary<string, object?>)withReasoning.ToSerializableObject();
+        dict["reasoning_content"].Should().Be(new string('y', 3600));
+
+        OpenAiAdapter.EstimateMessageTokens(withReasoning)
+            .Should().BeGreaterThan(OpenAiAdapter.EstimateMessageTokens(plain) + 900);
+    }
+
+    // ---------- swap + intent guards ----------
+
+    [Theory]
+    [InlineData(503, "The model server (titanium) is offline right now", true)]
+    [InlineData(500, "model loading, try again", true)]
+    [InlineData(502, "Bad Gateway", false)]
+    [InlineData(500, null, false)]
+    public void IsModelServerSwapSignal_Detection(int status, string? body, bool expected)
+    {
+        OpenAiAdapter.IsModelServerSwapSignal(status, body).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("Let me check the file again.", true)]
+    [InlineData("I'll run the tests now and verify the fix.", true)]
+    [InlineData("I ran the tests and all 214 passed. The PR is ready.", false)]
+    [InlineData("Done. Should I merge it?", false)]
+    [InlineData("", false)]
+    public void LooksLikeUnexecutedIntent_Detection(string content, bool expected)
+    {
+        OpenAiAdapter.LooksLikeUnexecutedIntent(content).Should().Be(expected);
+    }
+
+    [Fact]
+    public void ResolveSwapWaitBudget_PresetZeroDisables_DefaultIsTenMinutes()
+    {
+        OpenAiAdapter.ResolveSwapWaitBudgetSeconds(new AgentPresetConfig { SwapWaitSeconds = 0 }).Should().Be(0);
+        OpenAiAdapter.ResolveSwapWaitBudgetSeconds(new AgentPresetConfig { SwapWaitSeconds = 120 }).Should().Be(120);
+        OpenAiAdapter.ResolveSwapWaitBudgetSeconds(new AgentPresetConfig()).Should().BeGreaterThanOrEqualTo(0);
+    }
+
+    [Theory]
+    [InlineData("http://localhost:11434/v1", true)]
+    [InlineData("http://127.0.0.1:9999/v1", true)]
+    [InlineData("https://api.example.com/v1", false)]
+    public async Task EnsureCompanionReady_NonSidecarProfiles_AlwaysReady(string endpoint, bool _)
+    {
+        // No sidecar configured => the pre-flight must be a no-op, for loopback AND remote endpoints.
+        var preset = new AgentPresetConfig { Id = "test", Endpoint = endpoint };
+        var (ready, guidance) = await OpenAiAdapter.EnsureCompanionReadyAsync(preset, endpoint, _ => Task.CompletedTask, CancellationToken.None);
+        ready.Should().BeTrue();
+        guidance.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task EnsureCompanionReady_LoopbackDeadPortWithoutCompanionCommand_NotReady()
+    {
+        var preset = new AgentPresetConfig
+        {
+            Id = "test",
+            Sidecar = new AgentMesh.Core.Models.DriverSidecarConfig { Enabled = true, CompanionPort = 1, CompanionCommand = null, LoginCommand = "foo login" }
+        };
+        var (ready, guidance) = await OpenAiAdapter.EnsureCompanionReadyAsync(preset, "http://localhost:1/v1", _ => Task.CompletedTask, CancellationToken.None);
+        ready.Should().BeFalse();
+        guidance.Should().NotBeNull().And.Contain("foo login");
+    }
+
+    [Fact]
+    public void BuildCompanionAuthHint_IsDerivedFromConfigNotHardcodedBinaries()
+    {
+        var withSidecar = new AgentPresetConfig
+        {
+            Sidecar = new AgentMesh.Core.Models.DriverSidecarConfig
+            {
+                Enabled = true,
+                LoginCommand = "vendor-cli login",
+                AuthCheckCommand = "vendor-cli status"
+            }
+        };
+        var hint = OpenAiAdapter.BuildCompanionAuthHint(withSidecar);
+        hint.Should().NotBeNull();
+        hint.Should().Contain("vendor-cli login").And.Contain("vendor-cli status");
+        hint.Should().NotContain("aip");
+
+        OpenAiAdapter.BuildCompanionAuthHint(new AgentPresetConfig()).Should().BeNull();
     }
 
     [Fact]
@@ -956,32 +1461,27 @@ public class OpenAiAdapterTests
     }
 
     [Fact]
-    public void GetToolDefinitions_MasksMutatingTools_DuringDiscovery()
+    public void GetToolDefinitions_IsFrozen_SchemaStableAcrossPhases()
     {
-        var discoveryTools = OpenAiAdapter.GetToolDefinitions(isDiscoveryPhase: true);
-        var discoveryNames = discoveryTools
+        // The tool array sits inside the cached system prefix; swapping it at stage
+        // transitions busts the prefix cache and confuses models mid-session. The schema is
+        // therefore a single fixed list, and stage enforcement moved to the executor
+        // (see ExecuteToolLocallyAsync_RejectsMutations_DuringDiscovery).
+        var tools = OpenAiAdapter.GetToolDefinitions();
+        var names = tools
             .Select(t => ((dynamic)t).function.name as string)
             .ToList();
 
-        discoveryNames.Should().Contain("run_command");
-        discoveryNames.Should().Contain("read_file");
-        discoveryNames.Should().Contain("ask_question");
-        discoveryNames.Should().Contain("manage_task");
-        discoveryNames.Should().Contain("post_job_message");
-        discoveryNames.Should().Contain("save_memory");
+        names.Should().Contain("run_command");
+        names.Should().Contain("read_file");
+        names.Should().Contain("ask_question");
+        names.Should().Contain("manage_task");
+        names.Should().Contain("post_job_message");
+        names.Should().Contain("save_memory");
 
-        discoveryNames.Should().NotContain("write_file", "write_file must be hidden during discovery");
-        discoveryNames.Should().NotContain("edit_file", "edit_file must be hidden during discovery");
-        discoveryNames.Should().NotContain("open_pull_request", "open_pull_request must be hidden during discovery");
-
-        var executionTools = OpenAiAdapter.GetToolDefinitions(isDiscoveryPhase: false);
-        var executionNames = executionTools
-            .Select(t => ((dynamic)t).function.name as string)
-            .ToList();
-
-        executionNames.Should().Contain("write_file");
-        executionNames.Should().Contain("edit_file");
-        executionNames.Should().Contain("open_pull_request");
+        names.Should().Contain("write_file", "mutating tools stay in the frozen schema; the executor refuses them during discovery");
+        names.Should().Contain("edit_file", "mutating tools stay in the frozen schema; the executor refuses them during discovery");
+        names.Should().Contain("open_pull_request", "mutating tools stay in the frozen schema; the executor refuses them during discovery");
     }
 
     [Theory]
@@ -1506,6 +2006,226 @@ public class OpenAiAdapterTests
             OpenAiAdapter.ResetHttpClientForTest();
             OpenAiAdapter.PlatformToolExecutor = null;
         }
+    }
+
+    [Fact]
+    public void ResolveModelContextLimit_RespectsConfigured512kProfileWithoutClampingTo128k()
+    {
+        var presetWithTokens = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            AdapterType = "openai",
+            DefaultModel = "llama3.3",
+            ContextWindowTokens = 524_288
+        };
+
+        var presetWithSettings = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            AdapterType = "openai",
+            DefaultModel = "deepseek-r1",
+            OpenAi = new OpenAISettings { DefaultContextSize = "512k" }
+        };
+
+        OpenAiAdapter.ResolveModelContextLimit("llama3.3", null, presetWithTokens).Should().Be(524_288);
+        OpenAiAdapter.ResolveModelContextLimit("deepseek-r1", "default", presetWithSettings).Should().Be(524_288);
+        OpenAiAdapter.ResolveModelContextLimit("qwen2.5-coder", "524288", presetWithTokens).Should().Be(524_288);
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_TriggersCompactionAt75PercentOfContextWindow_WithoutCappingThinkingTokens()
+    {
+        var sessionId = Guid.NewGuid();
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "qwen3.8-flash-next",
+            ContextWindowTokens = 4_000,
+            CompactionThresholdPercent = 75
+        };
+
+        OpenAiAdapter.ResolveCompactionThresholdPercent(preset).Should().Be(75);
+
+        // Pre-seed >3,000 estimated tokens (>75% of 4,000, <80% of 4,000 = 3,200) so 75% triggers compaction
+        // whereas the old 80% threshold would NOT have triggered!
+        var seeded = new List<OpenAiMessage>
+        {
+            new() { Role = "system", Content = "You are Rook." },
+            new() { Role = "user", Content = "[TASK ENVELOPE & WORKING ENVIRONMENT]\nTask: implement compaction" },
+            new() { Role = "assistant", Content = "Reading file", ToolCalls = [new OpenAiToolCall { Id = "c1", Function = new OpenAiFunctionCall { Name = "read_file", Arguments = "{}" } }] },
+            new() { Role = "tool", ToolCallId = "c1", Content = new string('x', 10_900) },
+            new() { Role = "user", Content = "Continue1" },
+            new() { Role = "assistant", Content = "Ack1" },
+            new() { Role = "user", Content = "Continue2" },
+            new() { Role = "assistant", Content = "Ack2" }
+        };
+        OpenAiAdapter.SaveHistoryToDisk(sessionId, seeded);
+
+        string? mainRequestBody = null;
+        var mockClient = new HttpClient(new MockHttpMessageHandler(req =>
+        {
+            var body = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (body.Contains("\"stream\":false"))
+            {
+                // Summarizer request fails gracefully -> CompactHistory truncates tool output
+                return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
+            }
+
+            mainRequestBody = body;
+            var sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Deep unbounded reasoning...\",\"content\":\"Done.\"}}]}\n\ndata: [DONE]\n\n";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(
+                preset,
+                new PromptReceivedEvent { SessionId = sessionId, Prompt = "Proceed", Model = "qwen3.8-flash-next" },
+                ev => { events.Add(ev); return Task.CompletedTask; },
+                CancellationToken.None);
+
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("threshold 75%"));
+            mainRequestBody.Should().NotBeNull();
+            mainRequestBody.Should().NotContain("\"max_tokens\"", "main agent turn must never cap reasoning/thinking tokens");
+            mainRequestBody.Should().NotContain("\"max_completion_tokens\"");
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+        }
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_EnforcesPostFirstByteChunkIdleWatchdog_AndRetriesStalledStream()
+    {
+        var sessionId = Guid.NewGuid();
+        var adapter = new OpenAiAdapter();
+        var preset = new AgentPresetConfig
+        {
+            Id = "spence-ai",
+            Name = "Spence AI",
+            AdapterType = "openai",
+            Endpoint = "http://127.0.0.1:11434/v1",
+            DefaultModel = "qwen3.8-flash-next",
+            TimeoutSeconds = 30,
+            StreamChunkIdleTimeoutSeconds = 1,
+            MaxRetries = 1,
+            RetryDelayMilliseconds = 10
+        };
+
+        var attempt = 0;
+        var mockClient = new HttpClient(new AsyncStreamingHttpMessageHandler(async (_, ct) =>
+        {
+            var currentAttempt = Interlocked.Increment(ref attempt);
+            if (currentAttempt == 1)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new StallingSseContent("data: {\"choices\":[{\"delta\":{\"content\":\"First chunk\"}}]}\n\n", TimeSpan.FromSeconds(5))
+                };
+            }
+
+            await Task.Yield();
+            var sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered response after retry.\"}}]}\n\ndata: [DONE]\n\n";
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream")
+            };
+        }));
+
+        OpenAiAdapter.SetHttpClientForTest(mockClient);
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(
+                preset,
+                new PromptReceivedEvent { SessionId = sessionId, Prompt = "Test watchdog", Model = "qwen3.8-flash-next" },
+                ev => { events.Add(ev); return Task.CompletedTask; },
+                CancellationToken.None);
+
+            attempt.Should().Be(2, "stalled stream after first SSE chunk must cancel and retry");
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("SSE stream stalled"));
+            events.Should().Contain(e => e.EventType == "response" && e.Content.Contains("Recovered response after retry."));
+        }
+        finally
+        {
+            OpenAiAdapter.ResetHttpClientForTest();
+            OpenAiAdapter.ClearSessionHistory(sessionId);
+        }
+    }
+
+    private sealed class AsyncStreamingHttpMessageHandler(
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> handler) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            handler(request, cancellationToken);
+    }
+
+    private sealed class StallingSseContent(string firstChunk, TimeSpan stallDuration) : HttpContent
+    {
+        protected override async Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(firstChunk);
+            await stream.WriteAsync(bytes);
+            await stream.FlushAsync();
+            await Task.Delay(stallDuration);
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken)
+        {
+            return Task.FromResult<Stream>(new StallingReadStream(firstChunk, stallDuration));
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = -1;
+            return false;
+        }
+    }
+
+    private sealed class StallingReadStream(string firstChunk, TimeSpan stallDuration) : Stream
+    {
+        private readonly byte[] _firstBytes = System.Text.Encoding.UTF8.GetBytes(firstChunk);
+        private int _offset;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => _offset; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => ReadAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_offset < _firstBytes.Length)
+            {
+                var toCopy = Math.Min(buffer.Length, _firstBytes.Length - _offset);
+                _firstBytes.AsMemory(_offset, toCopy).CopyTo(buffer);
+                _offset += toCopy;
+                return toCopy;
+            }
+
+            await Task.Delay(stallDuration, cancellationToken);
+            return 0;
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            await ReadAsync(buffer.AsMemory(offset, count), cancellationToken);
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private class MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler

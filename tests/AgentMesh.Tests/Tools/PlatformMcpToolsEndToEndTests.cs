@@ -182,7 +182,7 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         var properties = root.RootElement.GetProperty("properties");
 
         properties.EnumerateObject().Select(p => p.Name)
-            .Should().BeEquivalentTo("title", "summary_3r", "branch_name", "job_id");
+            .Should().BeEquivalentTo("title", "summary_3r", "branch_name", "job_id", "pr_url", "pr_number", "head_sha");
 
         root.RootElement.GetProperty("required").EnumerateArray().Select(e => e.GetString())
             .Should().BeEquivalentTo("title", "summary_3r");
@@ -229,13 +229,14 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         payload.GetProperty("success").GetBoolean().Should().BeTrue(payload.ToString());
         payload.GetProperty("requiresReply").GetBoolean().Should().BeTrue();
 
-        // Read back through a fresh scope: the point is that the row is in the store the Cockpit's
-        // HTTP endpoints will query, not merely in the object the tool mutated.
-        var stored = await ReadBackAsync(db => db.JobMessages.Where(m => m.JobId == jobId).ToListAsync());
-        var message = stored.Should().ContainSingle().Subject;
-        message.Content.Should().Be("@e2e-lead Blocked on the migration order. Need a decision.");
-        message.SenderId.Should().Be("e2e-lead");
-        message.TurnSessionId.Should().Be(sessionId);
+        var stored = await ReadBackAsync(db => db.JobTimelineCards.Where(c => c.JobId == jobId.ToString()).ToListAsync());
+        var card = stored.Should().ContainSingle().Subject;
+        card.CardType.Should().Be(TimelineCardType.Escalation3R);
+        card.Status.Should().Be(TimelineCardStatus.PendingInput);
+        using var cardDoc = JsonDocument.Parse(card.StructuredPayloadJson);
+        cardDoc.RootElement.GetProperty("content").GetString().Should().Be("@e2e-lead Blocked on the migration order. Need a decision.");
+        cardDoc.RootElement.GetProperty("authorPersonaId").GetString().Should().Be("e2e-lead");
+        cardDoc.RootElement.GetProperty("turnSessionId").GetGuid().Should().Be(sessionId);
 
         var session = await ReadBackAsync(db => db.AgentSessions.SingleAsync(s => s.Id == sessionId));
         session.Status.Should().Be("waiting_for_input");
@@ -379,7 +380,7 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
         payload.GetProperty("success").GetBoolean().Should().BeFalse();
         payload.GetProperty("error").GetString().Should().Be("no_working_directory");
 
-        (await ReadBackAsync(db => db.JobMessages.CountAsync(m => m.JobId == jobId))).Should().Be(0);
+        (await ReadBackAsync(db => db.JobTimelineCards.CountAsync(c => c.JobId == jobId.ToString()))).Should().Be(0);
     }
 
     [Fact]
@@ -657,6 +658,20 @@ public class PlatformMcpToolsEndToEndTests : IClassFixture<WebApplicationFactory
             CancellationToken ct = default) =>
             Task.FromResult(GitHubPullRequestService.JobChangeRemoteRead.Fail(
                 "stubbed", "The end-to-end stub performs no remote reads."));
+
+        /// <summary>
+        /// Review-state reading belongs to the poller and the workflow's merge guard, neither of
+        /// which the MCP tool surface touches; the stub answers "nothing was read" for the same
+        /// reason <see cref="ReadBranchComparisonAsync"/> does — no test here asserts on it, and a
+        /// throw would fail the fixture for a reason unrelated to what is under test.
+        /// </summary>
+        public Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
+            string prUrlOrNumber,
+            string? repositoryOverride = null,
+            string? tokenOverride = null,
+            CancellationToken ct = default) =>
+            Task.FromResult(GitHubPrReviewSnapshot.Failure(
+                "stubbed", "The end-to-end stub reads no review state from GitHub."));
 
         public Task<GitHubMergeResult> MergePullRequestAsync(
             GitHubMergeRequest request,

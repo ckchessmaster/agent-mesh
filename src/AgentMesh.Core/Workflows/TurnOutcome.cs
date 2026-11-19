@@ -66,7 +66,8 @@ public record TurnOutcome(
     string? Message = null,
     string? TargetPersona = null,
     string? PrUrl = null,
-    int? PrNumber = null)
+    int? PrNumber = null,
+    string? HeadSha = null)
 {
     public string? Summary => Message;
 
@@ -79,12 +80,12 @@ public record TurnOutcome(
         new(TurnOutcomeStatus.AwaitingInput, message, targetPersona);
 
     /// <summary>Convenience for the "review my PR" case.</summary>
-    public static TurnOutcome AwaitingReview(string? prUrl, int? prNumber, string? message = null) =>
-        new(TurnOutcomeStatus.PrOpenedAwaitingReview, message, PrUrl: prUrl, PrNumber: prNumber);
+    public static TurnOutcome AwaitingReview(string? prUrl, int? prNumber, string? message = null, string? headSha = null) =>
+        new(TurnOutcomeStatus.PrOpenedAwaitingReview, message, PrUrl: prUrl, PrNumber: prNumber, HeadSha: headSha);
 
     /// <summary>Convenience for the terminal success case.</summary>
-    public static TurnOutcome Completed(string? message = null, string? prUrl = null, int? prNumber = null) =>
-        new(TurnOutcomeStatus.TaskCompleted, message, PrUrl: prUrl, PrNumber: prNumber);
+    public static TurnOutcome Completed(string? message = null, string? prUrl = null, int? prNumber = null, string? headSha = null) =>
+        new(TurnOutcomeStatus.TaskCompleted, message, PrUrl: prUrl, PrNumber: prNumber, HeadSha: headSha);
 
     /// <summary>Convenience for the two halt cases, which differ only in why they stopped.</summary>
     public static TurnOutcome Halt(TurnOutcomeStatus status, string reason) =>

@@ -44,8 +44,6 @@ vi.mock('../services/api', () => ({
     updateJobTask: vi.fn(),
     assignJobTask: vi.fn(),
     deleteJobTask: vi.fn(),
-    getJobMessages: vi.fn(),
-    postJobMessage: vi.fn(),
     uploadJobAttachments: vi.fn(),
     completeJob: vi.fn(),
     createAgentSession: vi.fn(),
@@ -72,6 +70,19 @@ vi.mock('../auth/AuthProvider', () => ({
   }))
 }));
 
+const mockSignalRConnection = {
+  on: vi.fn(),
+  off: vi.fn(),
+  invoke: vi.fn().mockResolvedValue(undefined)
+};
+
+vi.mock('../hooks/useSignalR', () => ({
+  useSignalR: () => ({
+    connection: mockSignalRConnection,
+    connected: true
+  })
+}));
+
 const healthyStatus: SystemStatusResponse = {
   status: 'Healthy',
   timestamp: new Date().toISOString(),
@@ -92,8 +103,7 @@ const mockAgent: Agent = {
   createdAt: new Date().toISOString()
 };
 
-// creatorAgentId matches mockAgent.id so the session renders under the Drivers tab,
-// which is the tab App auto-selects when there are no projects and no personas.
+// creatorAgentId matches mockAgent.id so the session renders under the Drivers tab.
 const mockSession: AgentSession = {
   id: 'session-nl-1',
   title: 'Newline Session',
@@ -138,13 +148,15 @@ describe('Session chat composer: shift+Enter inserts a newline', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    // App defaults to the Dashboard landing tab; open Drivers where mockSession is listed.
+    localStorage.setItem('agentmesh_active_tab', 'drivers');
     vi.mocked(api.getStatus).mockResolvedValue(healthyStatus);
     vi.mocked(api.getCapabilities).mockResolvedValue(caps);
     vi.mocked(api.getAgents).mockResolvedValue([mockAgent]);
     vi.mocked(api.getPersonas).mockResolvedValue([]);
-    // No projects: App auto-selects the Drivers tab, where the session is listed.
     vi.mocked(api.getProjects).mockResolvedValue([]);
     vi.mocked(api.getSessions).mockResolvedValue([mockSession]);
+    vi.mocked(api.getSession).mockResolvedValue(mockSession);
     vi.mocked(api.getSessionMessages).mockResolvedValue([]);
     vi.mocked(api.getSessionArtifacts).mockResolvedValue([]);
     vi.mocked(api.postSessionMessage).mockResolvedValue(createdMessage);

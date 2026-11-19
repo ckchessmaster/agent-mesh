@@ -1,7 +1,10 @@
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Core.Workflows;
+using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Temporalio.Activities;
 using Temporalio.Exceptions;
@@ -14,10 +17,10 @@ namespace AgentMesh.Worker.Activities;
 /// <remarks>
 /// <para>
 /// The worker performs the merge rather than the agent because the merge is the one action in the
-/// task lifecycle that must not be attributable to the model: the persona container deliberately holds
-/// no push credentials (see <see cref="GitHubPullRequestService"/>'s remarks), and a merge is only
-/// legitimate as the platform acting on a decision a human recorded through a workflow signal. If the
-/// agent could merge, the review gate would be advisory.
+/// task lifecycle that must not be attributable to the model: a merge is only legitimate as the
+/// platform acting on a decision a human recorded through a workflow signal. If the agent could
+/// merge, the review gate would be advisory. The <em>credential</em> signing the merge is a separate
+/// question from <em>who decided</em> to merge — see <see cref="ResolveAuthorGithubTokenAsync"/>.
 /// </para>
 /// <para>
 /// Registered as its own activity type rather than as another method on
@@ -30,7 +33,12 @@ namespace AgentMesh.Worker.Activities;
 public class GitActivities(
     ILogger<GitActivities> logger,
     IGitHubPullRequestService pullRequests,
-    IConfiguration config) : IGitActivities
+    IConfiguration config,
+    // Both optional-additive: absent (older three-arg construction, test hosts without the persona
+    // store wired) the merge falls back to deployment-configured credentials, which is exactly the
+    // behaviour before persona-identity merges existed. The worker host supplies both.
+    AgentMeshDbContext? db = null,
+    ICredentialEncryptionService? encryption = null) : IGitActivities
 {
     /// <summary>
     /// Merges an approved pull request.
@@ -61,8 +69,8 @@ public class GitActivities(
             : default;
 
         logger.LogInformation(
-            "Merging PR for job {JobId} into target branch {Branch}",
-            input.JobId, input.TargetBranch);
+            "Merging PR for job {JobId} into target branch {Branch} (approvedSha={ApprovedSha})",
+            input.JobId, input.TargetBranch, input.ApprovedHeadSha ?? "(none)");
 
         var prUrl = input.PrUrl;
         if (string.IsNullOrWhiteSpace(prUrl))
@@ -71,7 +79,10 @@ public class GitActivities(
                 "Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
         }
 
-        return await MergePullRequestAsync(prUrl);
+        var authorToken = await ResolveAuthorGithubTokenAsync(input.JobId, cancellationToken);
+
+        return await MergePullRequestInternalAsync(
+            prUrl, input.ApprovedHeadSha, cancellationToken, authorToken);
     }
 
     [Activity]
@@ -81,31 +92,111 @@ public class GitActivities(
             ? ActivityExecutionContext.Current.CancellationToken
             : default;
 
+        return await MergePullRequestInternalAsync(prUrl, approvedHeadSha: null, cancellationToken);
+    }
+
+    /// <summary>
+    /// The job's author persona GitHub PAT — the credential that opened the PR — or null.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Why the author's identity signs a platform decision.</strong> The merge is a human's
+    /// decision (recorded through the review gate) and a machine's execution; nothing says the
+    /// execution must be billed to a GitHub account the human owns. This deployment's GitHub
+    /// identities <em>are</em> the personas' — the PR was opened by the persona's credential, the
+    /// PR's head branch belongs to that account, and GitHub allows an author to merge its own pull
+    /// request. Falling back to the configured control-plane token keeps every existing deployment
+    /// working unchanged; when neither exists the service refuses loudly, as it always has.
+    /// </para>
+    /// <para>
+    /// <strong>The credential is read fresh, never replayed.</strong> Temporal activities run real IO
+    /// and are allowed to observe the present; the approved SHA comes from the workflow's recorded
+    /// signal (immutable history), but <em>which persona</em> authored the job is a lookup, and if it
+    /// changed mid-activity (it cannot — the job is parked), re-reading it could only converge to the
+    /// current assignee, which is the safer identity, not a less safe one.
+    /// </para>
+    /// <para>
+    /// Resolution order: project job row first (the job-level workflow's id space), then the agent-job
+    /// table (the older runner path). A missing job row, missing assignee, or a persona with no stored
+    /// token all yield null — the silent-but-correct answer is to fall through to configured
+    /// credentials, and the no_credentials failure the service then reports names both halves of the
+    /// gap so an operator can tell "persona has no PAT" from "cluster has no token".
+    /// </para>
+    /// </remarks>
+    private async Task<string?> ResolveAuthorGithubTokenAsync(string jobId, CancellationToken ct)
+    {
+        if (db is null || encryption is null) return null;
+        if (!Guid.TryParse(jobId, out var parsed)) return null;
+
+        try
+        {
+            var authorId =
+                (await db.ProjectJobs.AsNoTracking()
+                    .Where(j => j.Id == parsed)
+                    .Select(j => j.AssignedAgentId)
+                    .FirstOrDefaultAsync(ct))
+                ?? (await db.AgentJobs.AsNoTracking()
+                    .Where(j => j.Id == parsed)
+                    .Select(j => j.AssignedAgentId)
+                    .FirstOrDefaultAsync(ct));
+
+            if (string.IsNullOrWhiteSpace(authorId)) return null;
+
+            var normalized = authorId.Trim().TrimStart('@').ToLowerInvariant();
+            var encrypted = await db.Personas.AsNoTracking()
+                .Where(p => p.Id == normalized)
+                .Select(p => p.GitHubTokenEncrypted)
+                .FirstOrDefaultAsync(ct);
+
+            if (string.IsNullOrWhiteSpace(encrypted))
+            {
+                logger.LogInformation(
+                    "Job {JobId} author persona '{Persona}' has no stored GitHub token; " +
+                    "falling back to configured GitHub credentials.", jobId, normalized);
+                return null;
+            }
+
+            var decrypted = encryption.Decrypt(encrypted);
+            return string.IsNullOrWhiteSpace(decrypted) ? null : decrypted.Trim();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A credential-store blip must not mask the merge into a hard failure here: the
+            // service's own no_credentials refusal (or configured-token success) is the honest
+            // next step, and it carries the operator-facing message.
+            logger.LogWarning(ex,
+                "Resolving the author persona GitHub token for job {JobId} failed; " +
+                "falling back to configured GitHub credentials.", jobId);
+            return null;
+        }
+    }
+
+    private async Task<string> MergePullRequestInternalAsync(
+        string prUrl,
+        string? approvedHeadSha,
+        CancellationToken cancellationToken,
+        string? authorToken = null)
+    {
         if (string.IsNullOrWhiteSpace(prUrl))
         {
-            // Nothing to merge and nothing to retry: the workflow asked to merge a null URL, which
-            // means it reached this branch without recording a PR. That is a workflow bug, and
-            // reporting it as a halt is more honest than reporting it as a merge failure the operator
-            // would then try to fix by re-reviewing a PR that does not exist.
             throw new ApplicationFailureException(
                 "Merge requested without a pull request URL.", nonRetryable: true, errorType: "no_pr_url");
         }
 
-        var (repository, sha) = await ResolveMergeContextAsync(cancellationToken);
+        var (repository, contextSha) = await ResolveMergeContextAsync(cancellationToken);
+        var effectiveSha = !string.IsNullOrWhiteSpace(approvedHeadSha) ? approvedHeadSha.Trim() : contextSha;
 
         logger.LogInformation(
             "Merging approved pull request {PrUrl} (repository {Repository}, approvedSha {Sha})",
-            prUrl, repository ?? "(resolved from config/url)", sha ?? "(not recorded)");
+            prUrl, repository ?? "(resolved from config/url)", effectiveSha ?? "(not recorded)");
 
         var result = await pullRequests.MergePullRequestAsync(
             new GitHubMergeRequest(
                 PrUrlOrNumber: prUrl.Trim(),
                 Repository: repository,
-                // Squash matches this repository's own history (feature commits squashed onto main) and
-                // keeps the base branch linear, which is what makes a reverted task easy to find and
-                // back out.
                 Method: ReadMergeMethod(),
-                Sha: sha),
+                Sha: effectiveSha,
+                Token: authorToken),
             cancellationToken);
 
         if (!result.Success)

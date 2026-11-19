@@ -222,16 +222,15 @@ public class MacroTurnsReviewGateTests
         using var db = TestDbContextFactory.Create();
         var jobId = await SeedJobAsync(db, withPrLedgerRow: true);
 
-        // The author posts something with a structured payload that is not a PR linkage, 5 minutes
-        // after opening the PR. Shape matches SessionsController.MergeAttachmentsIntoStructuredPayload.
-        db.JobMessages.Add(new JobMessage
+        db.JobTimelineCards.Add(new JobTimelineCard
         {
-            JobId = jobId,
-            SenderType = "persona",
-            SenderId = AuthorPersona,
-            Content = "Attaching the trace",
-            StructuredPayloadJson = """{"attachments":[{"name":"trace.txt"}]}""",
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.TaskStep,
+            Status = TimelineCardStatus.Active,
+            Title = "Attaching the trace",
+            StructuredPayloadJson = $$"""{"authorPersonaId":"{{AuthorPersona}}","attachments":[{"name":"trace.txt"}]}""",
             CreatedAt = DateTimeOffset.UtcNow + TimeSpan.FromMinutes(5),
+            UpdatedAt = DateTimeOffset.UtcNow + TimeSpan.FromMinutes(5),
         });
         await db.SaveChangesAsync();
 
@@ -337,10 +336,9 @@ public class MacroTurnsReviewGateTests
         using var db = TestDbContextFactory.Create();
         var jobId = await SeedJobAsync(db, withPrLedgerRow: false);
 
-        // PR 41 was opened by the author; PR 42 by somebody else, and it is the more recent row.
-        db.JobMessages.AddRange(
-            PrMessage(jobId, AuthorPersona, prNumber: 41, age: TimeSpan.FromMinutes(30)),
-            PrMessage(jobId, "other-agent", prNumber: 42, age: TimeSpan.FromMinutes(5)));
+        db.JobTimelineCards.AddRange(
+            PrCard(jobId, AuthorPersona, prNumber: 41, age: TimeSpan.FromMinutes(30)),
+            PrCard(jobId, "other-agent", prNumber: 42, age: TimeSpan.FromMinutes(5)));
         await db.SaveChangesAsync();
 
         var router = RouteDelivered(jobId);
@@ -422,26 +420,23 @@ public class MacroTurnsReviewGateTests
 
         if (withPrLedgerRow)
         {
-            db.JobMessages.Add(PrMessage(jobId, AuthorPersona, prNumber: 41, age: TimeSpan.FromMinutes(10)));
+            db.JobTimelineCards.Add(PrCard(jobId, AuthorPersona, prNumber: 41, age: TimeSpan.FromMinutes(10)));
         }
 
         await db.SaveChangesAsync();
         return jobId;
     }
 
-    /// <summary>
-    /// A ledger row shaped the way <c>open_pull_request</c> writes one: a persona message whose
-    /// structured payload carries <c>prUrl</c> and <c>prNumber</c>.
-    /// </summary>
-    private static JobMessage PrMessage(Guid jobId, string senderId, int prNumber, TimeSpan age) => new()
+    private static JobTimelineCard PrCard(Guid jobId, string senderId, int prNumber, TimeSpan age) => new()
     {
-        JobId = jobId,
-        SenderType = "persona",
-        SenderId = senderId,
-        Content = $"Opened PR #{prNumber}",
+        JobId = jobId.ToString(),
+        CardType = TimelineCardType.PrReview,
+        Status = TimelineCardStatus.PendingInput,
+        Title = $"PR #{prNumber}",
         StructuredPayloadJson =
-            $$"""{"prUrl":"https://github.com/o/r/pull/{{prNumber}}","prNumber":{{prNumber}}}""",
+            $$"""{"prUrl":"https://github.com/o/r/pull/{{prNumber}}","prNumber":{{prNumber}},"authorPersonaId":"{{senderId}}","senderPersona":"{{senderId}}"}""",
         CreatedAt = DateTimeOffset.UtcNow - age,
+        UpdatedAt = DateTimeOffset.UtcNow - age,
     };
 
     /// <summary>

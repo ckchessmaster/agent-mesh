@@ -391,4 +391,174 @@ describe('DriverConfigModal', () => {
       expect(screen.getByText(/Successfully authenticated driver and refreshed models!/i)).toBeInTheDocument();
     });
   });
+
+  it('warns and disables Save Key when a classic ghp_ PAT is pasted into Copilot driver Direct API Key', async () => {
+    const copilotAgent: Agent = {
+      id: 'beeline-gh-copilot',
+      name: 'GitHub Copilot CLI',
+      runtimeType: 0,
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({ adapter: 'copilot' }),
+      config: { adapter: 'copilot', capabilities: ['bash'], hasApiKey: false }
+    };
+
+    vi.spyOn(api, 'startDriverAuth').mockResolvedValueOnce({
+      personaId: 'beeline-gh-copilot',
+      driverId: 'beeline-gh-copilot',
+      status: 'waiting_code',
+      authUrl: 'https://github.com/login/device',
+      userCode: 'ABCD-1234'
+    });
+
+    render(
+      <DriverConfigModal
+        agent={copilotAgent}
+        initialConfig={copilotAgent.config}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Authenticate Driver/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Direct API Key/i })).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /Direct API Key/i }));
+
+    const keyInput = screen.getByPlaceholderText(/Fine-grained Copilot PAT/i);
+    fireEvent.change(keyInput, { target: { value: 'ghp_classicPatShouldNotBeUsedForCopilot' } });
+
+    expect(screen.getByText(/not supported by GitHub Copilot CLI/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Save Key/i })).toBeDisabled();
+  });
+
+  it('stops polling and shows error when submitDriverAuthCode returns failed', async () => {
+    const copilotAgent: Agent = {
+      id: 'beeline-gh-copilot',
+      name: 'GitHub Copilot CLI',
+      runtimeType: 0,
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({ adapter: 'copilot' }),
+      config: { adapter: 'copilot', capabilities: ['bash'], hasApiKey: false }
+    };
+
+    vi.spyOn(api, 'startDriverAuth').mockResolvedValueOnce({
+      personaId: 'beeline-gh-copilot',
+      driverId: 'beeline-gh-copilot',
+      status: 'waiting_code',
+      authUrl: 'https://github.com/login/device',
+      userCode: 'FAIL-1234'
+    });
+
+    const submitSpy = vi.spyOn(api, 'submitDriverAuthCode').mockResolvedValueOnce({
+      personaId: 'beeline-gh-copilot',
+      status: 'failed',
+      errorMessage: 'GitHub Copilot login exited without storing an authentication token.'
+    });
+
+    render(
+      <DriverConfigModal
+        agent={copilotAgent}
+        initialConfig={copilotAgent.config}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Authenticate Driver/i }));
+    await waitFor(() => expect(screen.getByTestId('device-user-code')).toHaveTextContent('FAIL-1234'));
+
+    fireEvent.click(screen.getByRole('button', { name: /I Have Authorized in Browser/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/GitHub Copilot login exited without storing an authentication token/i)).toBeInTheDocument();
+    });
+
+    expect(submitSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('device-user-code')).not.toBeInTheDocument();
+  });
+
+  it('renders OpenRouter form, tests OpenRouter key, and saves Routing & Headers patch', async () => {
+    const openRouterAgent: Agent = {
+      id: 'openrouter',
+      name: 'OpenRouter',
+      role: 'Autonomous AI Engineer',
+      status: 'online',
+      runtimeType: 'OpenRouter',
+      trustTier: 2,
+      createdAt: new Date().toISOString(),
+      capabilitiesJson: JSON.stringify({
+        adapter: 'openrouter',
+        endpoint: 'https://openrouter.ai/api/v1',
+        defaultModel: 'openrouter/auto'
+      }),
+      config: {
+        adapter: 'openrouter',
+        endpoint: 'https://openrouter.ai/api/v1',
+        defaultModel: 'openrouter/auto',
+        hasApiKey: true,
+        openRouter: null
+      }
+    };
+
+    const testSpy = vi.spyOn(api, 'testOpenRouterServer').mockResolvedValueOnce({
+      success: true,
+      models: [{ id: 'openrouter/auto', name: 'Auto Router', efforts: [] }],
+      keyLabel: 'Mesh Prod',
+      limitRemaining: 12.5
+    });
+
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <DriverConfigModal
+        agent={openRouterAgent}
+        initialConfig={openRouterAgent.config}
+        onClose={vi.fn()}
+        onSave={onSave}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Test Connection/i }));
+    await waitFor(() => expect(testSpy).toHaveBeenCalledWith({
+      endpoint: 'https://openrouter.ai/api/v1',
+      apiKey: undefined,
+      agentId: 'openrouter'
+    }));
+    expect(await screen.findByText(/Verified OpenRouter key! Found 1 tool-capable model/i)).toBeInTheDocument();
+
+    // Open collapsible Routing & Headers section (collapsed by default when unconfigured)
+    fireEvent.click(screen.getByRole('button', { name: /OpenRouter Routing & Headers/i }));
+
+    fireEvent.change(screen.getByLabelText(/Fallback Models/i), {
+      target: { value: 'anthropic/claude-sonnet-4, openai/gpt-4.1' }
+    });
+    fireEvent.change(screen.getByLabelText(/Provider Sort/i), { target: { value: 'throughput' } });
+    fireEvent.change(screen.getByLabelText(/Provider Order/i), { target: { value: 'anthropic, bedrock' } });
+    fireEvent.click(screen.getByLabelText(/Zero Data Retention \(ZDR\)/i));
+    fireEvent.change(screen.getByLabelText(/HTTP-Referer Header/i), {
+      target: { value: 'https://mesh.example' }
+    });
+
+    fireEvent.submit(screen.getByRole('button', { name: /Save/i }).closest('form')!);
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledWith({
+      openRouter: {
+        httpReferer: 'https://mesh.example',
+        appTitle: '',
+        fallbackModels: ['anthropic/claude-sonnet-4', 'openai/gpt-4.1'],
+        provider: {
+          sort: 'throughput',
+          order: ['anthropic', 'bedrock'],
+          only: [],
+          ignore: [],
+          allowFallbacks: true,
+          dataCollection: '',
+          zdr: true,
+          requireParameters: false
+        }
+      }
+    });
+  });
 });

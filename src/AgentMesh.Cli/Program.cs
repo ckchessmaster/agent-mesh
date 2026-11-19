@@ -1,3 +1,4 @@
+using AgentMesh.Cli.Commands;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
 using AgentMesh.Cli.UI;
@@ -18,6 +19,37 @@ public static class Program
 
         var configStore = new ConfigStore();
         var config = configStore.Load();
+
+        // Dispatch `agentmesh pr <sync|open|merge>` directly before generic runner flags consume short switches
+        if (args.Length > 0 && string.Equals(args[0], "pr", StringComparison.OrdinalIgnoreCase))
+        {
+            return await PrCommand.ExecuteAsync(
+                args.Skip(1).ToList(),
+                config,
+                configStore,
+                ct: cts.Token);
+        }
+
+        // `agentmesh task …` and `agentmesh message …` are the control-plane verbs a driver reaches from
+        // its own shell, so they get the same early dispatch as `pr`: no runner flag may swallow their
+        // options, and `--help` must print the verb usage rather than launch a TUI.
+        if (args.Length > 0 && string.Equals(args[0], "task", StringComparison.OrdinalIgnoreCase))
+        {
+            return await PlatformToolCommand.ExecuteTaskAsync(
+                args.Skip(1).ToList(),
+                config,
+                configStore,
+                ct: cts.Token);
+        }
+
+        if (args.Length > 0 && string.Equals(args[0], "message", StringComparison.OrdinalIgnoreCase))
+        {
+            return await PlatformToolCommand.ExecuteMessageAsync(
+                args.Skip(1).ToList(),
+                config,
+                configStore,
+                ct: cts.Token);
+        }
 
         // Parse global options (--url, --token, --command, --role, --adapter, --name, --once, --persona, --driver, --headless)
         var positional = new List<string>();
@@ -255,7 +287,7 @@ public static class Program
             {
                 if (subArgs.Count == 0)
                 {
-                    AnsiConsole.MarkupLine("[red]Usage:[/] agentmesh add <agent-id> [[--name <name>]] [[--role <role>]] [[--adapter <agy|claude|copilot|openai|generic>]] [[--command <cmd>]] [[--endpoint <url>]] [[--api-key <key>]] [[--model <model>]]");
+                    AnsiConsole.MarkupLine("[red]Usage:[/] agentmesh add <agent-id> [[--name <name>]] [[--role <role>]] [[--adapter <agy|claude|copilot|openai|openrouter|generic>]] [[--command <cmd>]] [[--endpoint <url>]] [[--api-key <key>]] [[--model <model>]]");
                     return 1;
                 }
 
@@ -266,6 +298,19 @@ public static class Program
                 if (!string.IsNullOrWhiteSpace(customEndpoint)) preset.Endpoint = customEndpoint;
                 if (!string.IsNullOrWhiteSpace(customApiKey)) preset.ApiKey = customApiKey;
                 if (!string.IsNullOrWhiteSpace(customDefaultModel)) preset.DefaultModel = customDefaultModel;
+                if (string.Equals(preset.AdapterType, "openrouter", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrWhiteSpace(preset.Endpoint))
+                        preset.Endpoint = AgentMesh.Core.Models.OpenRouterConfig.DefaultEndpoint;
+                    if (string.IsNullOrWhiteSpace(preset.DefaultModel))
+                        preset.DefaultModel = "openrouter/auto";
+                    if (preset.Capabilities == null || preset.Capabilities.Count == 0 ||
+                        preset.Capabilities.SequenceEqual(new[] { "shell", "inspect_workspace" }))
+                    {
+                        preset.Capabilities = ConfigStore.GetDefaultCapabilities("openrouter");
+                    }
+                    preset.Command = null;
+                }
                 configStore.Save(config);
 
                 try
@@ -378,6 +423,9 @@ public static class Program
         AnsiConsole.MarkupLine("  [cyan]agentmesh[/]                             Launch interactive multi-agent TUI dashboard");
         AnsiConsole.MarkupLine("  [cyan]agentmesh tui [[agent1 agent2...]][/]      Launch TUI and immediately start specified agents");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start <agent1> [[agent2...]][/]  Start and connect one or more agents (e.g. agy, claude, test)");
+        AnsiConsole.MarkupLine("  [cyan]agentmesh pr <sync|open|merge>[/]         Sync base branch, push & open 3-R PR, or merge with SHA guard");
+        AnsiConsole.MarkupLine("  [cyan]agentmesh task <set-checklist|update-status|get-checklist>[/]  Register/track the job checklist from a driver shell");
+        AnsiConsole.MarkupLine("  [cyan]agentmesh message post[/]                Post a job message to a persona or the operator");
         AnsiConsole.MarkupLine("  [cyan]agentmesh run --persona <id> [[options]][/] Start as a dedicated persona runner");
         AnsiConsole.MarkupLine("  [cyan]agentmesh start --all[/]                 Start all configured agent presets concurrently");
         AnsiConsole.MarkupLine("  [cyan]agentmesh list[/]                        Show all local presets and live Mesh connection status");
@@ -385,7 +433,7 @@ public static class Program
         AnsiConsole.MarkupLine("  [cyan]agentmesh config [[--url <url>]][/]        View or update Mesh URL and operator token\n");
         AnsiConsole.MarkupLine("[bold]Options:[/]");
         AnsiConsole.MarkupLine("  [grey]--persona, -p <id>[/]  Dedicated persona ID (auto-binds to persona in Mesh)");
-        AnsiConsole.MarkupLine("  [grey]--driver, -d <drv>[/]  Driver/harness to use for persona (e.g. openai, agy, claude)");
+        AnsiConsole.MarkupLine("  [grey]--driver, -d <drv>[/]  Driver/harness to use for persona (e.g. openrouter, openai, agy, claude)");
         AnsiConsole.MarkupLine("  [grey]--headless[/]          Run headless without interactive TUI");
         AnsiConsole.MarkupLine("  [grey]--url <url>[/]         AgentMesh API URL (default: http://localhost:5000)");
         AnsiConsole.MarkupLine("  [grey]--token <token>[/]     Operator/master token for auto-registration");

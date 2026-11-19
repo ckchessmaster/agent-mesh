@@ -45,8 +45,6 @@ vi.mock('../services/api', () => ({
     updateJobTask: vi.fn(),
     assignJobTask: vi.fn(),
     deleteJobTask: vi.fn(),
-    getJobMessages: vi.fn(),
-    postJobMessage: vi.fn(),
     uploadJobAttachments: vi.fn(),
     completeJob: vi.fn(),
     submitQuestionAnswer: vi.fn(),
@@ -143,6 +141,7 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     window.innerWidth = 375;
     window.dispatchEvent(new Event('resize'));
 
@@ -169,7 +168,6 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     vi.mocked(api.getAgentUsage).mockResolvedValue(mockUsage);
     vi.mocked(api.getProjects).mockResolvedValue([mockProject]);
     vi.mocked(api.getProjectJobs).mockResolvedValue([mockJob]);
-    vi.mocked(api.getJobMessages).mockResolvedValue([]);
     vi.mocked(api.getJobTasks).mockResolvedValue([]);
   });
 
@@ -181,12 +179,14 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
   it('renders mobile bottom nav when at master list and allows drilling into job detail with mobile back button', async () => {
     render(<App />);
 
-    // Wait for project to appear in ProjectList
-    expect(await screen.findByText('Mobile Core')).toBeInTheDocument();
-
-    // Verify Mobile Bottom Navigation Bar is present
+    // Default mobile landing tab is Dashboard with bottom navigation bar visible
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
     const bottomNav = await screen.findByTestId('mobile-bottom-nav');
     expect(bottomNav).toBeInTheDocument();
+
+    // Switch to Projects tab via mobile bottom nav and wait for project to appear in ProjectList
+    fireEvent.click(within(bottomNav).getByRole('button', { name: /projects/i }));
+    expect((await screen.findAllByText('Mobile Core')).length).toBeGreaterThan(0);
 
     // Find the job item in the list and click it to drill into Detail view
     const jobItems = await screen.findAllByText('Mobile Navigation Polish');
@@ -210,10 +210,15 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
   it('switches between primary sections via the Mobile Bottom Navigation Bar', async () => {
     render(<App />);
 
-    expect(await screen.findByText('Mobile Core')).toBeInTheDocument();
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
 
     const bottomNav = await screen.findByTestId('mobile-bottom-nav');
     expect(bottomNav).toBeInTheDocument();
+
+    // Switch to Projects tab
+    const projectsBtn = within(bottomNav).getByRole('button', { name: /projects/i });
+    fireEvent.click(projectsBtn);
+    expect((await screen.findAllByText('Mobile Core')).length).toBeGreaterThan(0);
 
     // Switch to Personas tab
     const personasBtn = within(bottomNav).getByRole('button', { name: /personas/i });
@@ -232,12 +237,14 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     // Danger Zone should be visible in Drivers tab
     const dangerZoneBtn = await screen.findByTestId('danger-zone-clear-mesh-btn');
     expect(dangerZoneBtn).toBeInTheDocument();
+
+    // Switch back to Dashboard tab
+    fireEvent.click(within(bottomNav).getByTestId('mobile-nav-dashboard'));
+    expect(await screen.findByTestId('main-dashboard')).toBeInTheDocument();
   });
 
   it('triggers reset mesh from Danger Zone button in Drivers tab', async () => {
     render(<App />);
-
-    expect(await screen.findByText('Mobile Core')).toBeInTheDocument();
 
     const bottomNav = await screen.findByTestId('mobile-bottom-nav');
     const driversBtn = within(bottomNav).getByRole('button', { name: /drivers/i });
@@ -262,10 +269,8 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
         project={mockProject}
         job={mockJob}
         tasks={[]}
-        messages={[]}
         personas={[mockPersona]}
         sessions={[]}
-        onSendMessage={vi.fn()}
         onAddTask={vi.fn()}
         onToggleTask={vi.fn()}
         onDeleteTask={vi.fn()}
@@ -297,10 +302,8 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
             verificationMethod: 'vitest test'
           }
         ]}
-        messages={[]}
         personas={[mockPersona]}
         sessions={[]}
-        onSendMessage={vi.fn()}
         onAddTask={vi.fn()}
         onToggleTask={vi.fn()}
         onDeleteTask={vi.fn()}
@@ -431,4 +434,128 @@ describe('Mobile Responsiveness & Master-Detail Navigation', () => {
     const mentionPalette = screen.getByTestId('team-mention-palette');
     expect(mentionPalette.className).toContain('max-w-[calc(100vw-2rem)]');
   });
+
+  it('stacks CockpitLayout vertically on mobile and side-by-side on desktop with responsive feed spacing', async () => {
+    window.innerWidth = 375;
+
+    render(
+      <JobCockpit
+        project={mockProject}
+        job={mockJob}
+        tasks={[]}
+        personas={[mockPersona]}
+        sessions={[]}
+        onAddTask={vi.fn()}
+        onToggleTask={vi.fn()}
+        onDeleteTask={vi.fn()}
+        onCompleteJob={vi.fn()}
+      />
+    );
+
+    const layout = screen.getByTestId('cockpit-layout');
+    expect(layout.className).toContain('flex-col');
+    expect(layout.className).toContain('md:flex-row');
+
+    const sidebar = screen.getByTestId('sticky-sidebar');
+    expect(sidebar.className).toContain('w-full');
+    expect(sidebar.className).toContain('md:w-[320px]');
+
+    // Verify JobCockpit action button container wraps on narrow mobile viewports
+    const completeBtn = screen.getByTestId('cockpit-complete-job-btn');
+    const actionGroup = completeBtn.parentElement?.parentElement;
+    expect(actionGroup?.className).toContain('flex-wrap');
+  });
+
+  it('renders TimelineFeed and timeline cards with responsive mobile padding and wrapping controls', async () => {
+    const { TimelineFeed } = await import('../components/cockpit/TimelineFeed');
+    const sampleCards = [
+      {
+        id: 'c-init',
+        jobId: 'job-1',
+        stage: 0,
+        cardType: 'JobInitialized' as const,
+        status: 'Resolved' as const,
+        title: 'Job Initialized',
+        summaryMarkdown: '',
+        structuredPayloadJson: JSON.stringify({
+          jobId: 'job-1',
+          targetBranch: 'mesh/very-long-branch-name-for-mobile-truncation',
+          assignedAgentId: 'astra'
+        }),
+        comments: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      },
+      {
+        id: 'c-plan',
+        jobId: 'job-1',
+        stage: 1,
+        cardType: 'PlanApproval' as const,
+        status: 'PendingInput' as const,
+        title: 'Plan Approval',
+        summaryMarkdown: '',
+        structuredPayloadJson: JSON.stringify({
+          reasoning: 'Verify mobile stacking',
+          tasks: [
+            {
+              taskId: 't-1',
+              title: 'Fix mobile cockpit layout',
+              targetFile: 'src/components/cockpit/CockpitLayout.tsx',
+              verificationMethod: 'vitest run'
+            }
+          ]
+        }),
+        comments: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      },
+      {
+        id: 'c-step',
+        jobId: 'job-1',
+        stage: 2,
+        cardType: 'TaskStep' as const,
+        status: 'Active' as const,
+        title: 'Step 1: Implement responsive layout',
+        summaryMarkdown: '',
+        structuredPayloadJson: JSON.stringify({
+          taskIndex: 0,
+          taskTitle: 'Implement responsive layout'
+        }),
+        comments: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    ];
+
+    render(
+      <TimelineFeed
+        cards={sampleCards}
+        onSubmitPlanDecision={vi.fn()}
+        onSendPlanGuidance={vi.fn()}
+        onAddComment={vi.fn()}
+      />
+    );
+
+    const feed = screen.getByTestId('timeline-feed');
+    expect(feed.className).toContain('p-3');
+    expect(feed.className).toContain('sm:p-6');
+
+    const initCard = screen.getByTestId('job-initialized-card');
+    expect(initCard.className).toContain('p-3');
+    expect(initCard.className).toContain('sm:p-4');
+
+    const planCard = screen.getByTestId('plan-approval-card');
+    expect(planCard.className).toContain('p-3');
+    expect(planCard.className).toContain('sm:p-4');
+
+    const guidanceBtn = screen.getByTestId('plan-send-guidance');
+    const decisionRow = guidanceBtn.parentElement?.parentElement;
+    expect(decisionRow?.className).toContain('flex-col');
+    expect(decisionRow?.className).toContain('sm:flex-row');
+
+    const stepCard = screen.getByTestId('task-step-card');
+    expect(stepCard.className).toContain('p-3');
+    expect(stepCard.className).toContain('sm:p-4');
+  });
 });
+

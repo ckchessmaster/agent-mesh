@@ -47,6 +47,14 @@ builder.Services.AddTemporalClient(clientTargetHost: temporalHost, clientNamespa
 // Pinned by ApiServiceRegistrationTests so it cannot regress quietly.
 builder.Services.AddScoped<IWorkflowSignalRouter, WorkflowSignalRouter>();
 
+// Operator recovery for a job whose turn stopped advancing: settles the phantom sessions and asks the
+// orchestrator for one resumed run, so the repair does not require anyone to reset workflow history by
+// hand. The gateway wraps the three Temporal calls the recovery makes, and is registered unconditionally
+// because the Temporal client above is too; recovery keeps the parameter optional so a test, or a
+// deployment with no orchestrator, gets an honest "settled, cannot resume" instead of a null reference.
+builder.Services.AddScoped<IJobExecutionWorkflowGateway, TemporalJobExecutionWorkflowGateway>();
+builder.Services.AddScoped<IJobTurnRecovery, JobTurnRecovery>();
+
 // Configure Authentication & Authorization
 builder.Services.AddSingleton<IApiKeyService, ApiKeyService>();
 builder.Services.AddSingleton<ICredentialEncryptionService, AesCredentialEncryptionService>();
@@ -55,7 +63,10 @@ builder.Services.AddSingleton<ICredentialEncryptionService, AesCredentialEncrypt
 // the dashboard fans these out over every driver on load, and each probe shells out to a
 // provider CLI that takes seconds to answer.
 builder.Services.AddSingleton<AgyDriverQuotaProbe>();
-builder.Services.AddSingleton<IDriverQuotaProbe>(sp => sp.GetRequiredService<AgyDriverQuotaProbe>());
+builder.Services.AddSingleton<OpenRouterDriverQuotaProbe>();
+builder.Services.AddSingleton<IDriverQuotaProbe>(sp => new CompositeDriverQuotaProbe(
+    sp.GetRequiredService<AgyDriverQuotaProbe>(),
+    sp.GetRequiredService<OpenRouterDriverQuotaProbe>()));
 
 // Driver capability introspection (models, efforts, context windows) resolved per driver from
 // the driver itself. Same singleton rationale as the quota probe, plus a concurrency gate: this
@@ -137,7 +148,9 @@ builder.Services.AddSeaweedS3Storage(builder.Configuration);
 // The durable workspace state is what makes handoff work across machines: a runner's local
 // directory is a cache, so anything not saved here is treated as lost when the next persona starts.
 builder.Services.Configure<JobHandoffOptions>(builder.Configuration.GetSection(JobHandoffOptions.SectionName));
+builder.Services.AddSingleton<IProjectWorkspaceSetup, ProjectWorkspaceSetup>();
 builder.Services.AddScoped<IJobWorkspaceService, JobWorkspaceService>();
+builder.Services.AddScoped<IPersonaMcpResolver, PersonaMcpResolver>();
 builder.Services.AddScoped<JobTurnDispatcher>();
 builder.Services.AddScoped<IJobHandoffService, JobHandoffService>();
 builder.Services.AddHostedService<JobHandoffReaper>();
@@ -156,6 +169,13 @@ builder.Services.AddHttpClient(GitHubPullRequestService.HttpClientName, client =
     client.Timeout = TimeSpan.FromSeconds(30);
 });
 builder.Services.AddScoped<IGitHubPullRequestService, GitHubPullRequestService>();
+
+// The GitHub half of the review gate: a decision made on the PR page itself (approval,
+// changes-requested, or a manual merge) is read back and delivered as the same PrReviewSignal the
+// review endpoints send, so a reviewer who never opens the Cockpit still releases the parked
+// workflow. See PrReviewPollingService for the verdict rules and duplicate suppression.
+builder.Services.Configure<PrReviewPollingOptions>(builder.Configuration.GetSection(PrReviewPollingOptions.SectionName));
+builder.Services.AddHostedService<PrReviewPollingService>();
 
 // The Cockpit's Changes tab: what files a job touched, and the diff for each.
 //
@@ -197,6 +217,8 @@ builder.Services.AddScoped<IAttentionNotifier, AttentionNotifier>();
 // Dedicated Persona Container Environments & Idle Reaper
 builder.Services.AddPersonaContainerManager(builder.Configuration);
 builder.Services.AddHostedService<PersonaIdleReaperService>();
+// Settles turn sessions whose owner stopped advancing them (see the service remarks).
+builder.Services.AddHostedService<OrphanedTurnSweeperService>();
 
 // Configure CORS
 builder.Services.AddCors(options =>

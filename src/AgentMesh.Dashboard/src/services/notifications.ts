@@ -225,7 +225,7 @@ const defaultStorage = (): Storage | null => {
 /**
  * Only an *absolute* `http`/`https` URL is openable from a banner. Two reasons it is this strict:
  *
- * - The value comes from a job ledger payload an agent wrote, so `javascript:` or `data:` would
+ * - The value comes from a timeline card payload an agent wrote, so `javascript:` or `data:` would
  *   otherwise execute in the cockpit's own origin on a single click — a one-click XSS by construction.
  * - Parsing is done without a base on purpose. Resolving `github.com/o/r/pull/1` against the app origin
  *   would turn a malformed value into a same-origin 404, which looks like a working link in a test and a

@@ -40,6 +40,34 @@ public record PlanApprovalSignal(
     string ApproverId
 );
 
+/// <summary>
+/// Free-form operator guidance delivered while a plan gate is open, which is not a decision.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Before this, the gate had exactly two exits: approve, or reject with feedback. Rejecting marks the
+/// card Rejected and says so on the timeline, so an operator who wanted to add a fact the agent could
+/// not have known ("the billing module is frozen this sprint") had to file it as a criticism of a plan
+/// that was not wrong, and an operator whose job skipped Discovery Q&A entirely had no way to reach
+/// the agent at all until the implementation tasks were already running.
+/// </para>
+/// <para>
+/// Guidance therefore must not borrow <see cref="PlanApprovalSignal"/> with <c>Approved = false</c>:
+/// that would write a Rejected card, and the record of what the operator asked for would be indistinguishable
+/// from a record of what the operator refused. The gate stays open and the card stays waiting.
+/// </para>
+/// </remarks>
+/// <param name="CardId">The PlanApproval card the guidance was written against.</param>
+/// <param name="Content">Raw operator text, handed to Stage 1B as planning context.</param>
+/// <param name="SenderId">Who wrote it; "operator" from the cockpit.</param>
+/// <param name="MessageId">The persisted comment row id, so a retried POST cannot wake the gate twice.</param>
+public record PlanGuidanceSignal(
+    Guid CardId,
+    string Content,
+    string SenderId,
+    string? MessageId = null
+);
+
 public record AbortActiveTurnSignal(
     string Reason,
     string RequestedBy
@@ -50,6 +78,22 @@ public record TurnInterventionSignal(
     string? AdditionalContext = null
 );
 
+public record JobAssigneeUpdatedSignal(
+    string? AssignedAgentId
+);
+
+public record JobExecutionContinuationState(
+    int ReviewRound,
+    Guid? InitCardId,
+    Guid? PrCardId,
+    string? ActivePrUrl,
+    int? ActivePrNumber,
+    string? CandidateHeadSha,
+    int CompletedTaskOffset,
+    IReadOnlyList<ProposedChecklistItem> PendingTasks,
+    string? RemediationContext = null
+);
+
 [method: JsonConstructor]
 public record JobExecutionInput(
     string JobId,
@@ -58,7 +102,9 @@ public record JobExecutionInput(
     string InitialPrompt,
     string TargetBranch,
     string AssignedAgentId,
-    string ApprovalPolicy = "LeadOrHuman"
+    string ApprovalPolicy = "LeadOrHuman",
+    JobExecutionContinuationState? Continuation = null,
+    int? ContinueAsNewAfterRounds = null
 )
 {
     public JobExecutionInput(
@@ -86,7 +132,8 @@ public record ChildTaskExecutionInput : TaskExecutionInput
         string AssignedAgentId,
         string WorkspacePath,
         string TargetBranch,
-        string? ProjectId = null)
+        string? ProjectId = null,
+        string? RemediationContext = null)
         : base(
             JobId: JobId,
             TaskId: TaskId,
@@ -96,7 +143,8 @@ public record ChildTaskExecutionInput : TaskExecutionInput
             TargetBranch: TargetBranch,
             PersonaId: AssignedAgentId,
             TaskIndex: TaskIndex,
-            TaskTitle: TaskTitle)
+            TaskTitle: TaskTitle,
+            RemediationContext: RemediationContext)
     {
     }
 }
@@ -142,13 +190,18 @@ public record CodingTurnInput(
 public record MergePullRequestInput(
     string JobId,
     string TargetBranch,
-    string? PrUrl = null
+    string? PrUrl = null,
+    string? ApprovedHeadSha = null
 );
 
 public record JobWorkflowState(
     int CurrentTaskIndex,
     int TotalTasks,
-    string CurrentHeartbeat
+    string CurrentHeartbeat,
+    int ReviewRound = 0,
+    string? ActivePrUrl = null,
+    int IgnoredSelfReviewCount = 0,
+    string? AssignedAgentId = null
 );
 
 [Workflow("JobExecutionWorkflow")]
@@ -164,10 +217,16 @@ public interface IJobExecutionWorkflow
     Task SubmitPlanDecisionAsync(PlanApprovalSignal signal);
 
     [WorkflowSignal]
+    Task SubmitPlanGuidanceAsync(PlanGuidanceSignal signal);
+
+    [WorkflowSignal]
     Task AbortTurnAsync(AbortActiveTurnSignal signal);
 
     [WorkflowSignal]
     Task InterveneTurnAsync(TurnInterventionSignal signal);
+
+    [WorkflowSignal]
+    Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal);
 
     [WorkflowSignal]
     Task ReceiveChatMessageAsync(ChatMessageSignal signal);
@@ -201,6 +260,9 @@ public interface ITaskExecutionWorkflow
 
     [WorkflowSignal]
     Task InterveneTurnAsync(TurnInterventionSignal signal);
+
+    [WorkflowSignal]
+    Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal);
 
     [WorkflowSignal]
     Task ReceiveChatMessageAsync(ChatMessageSignal signal);

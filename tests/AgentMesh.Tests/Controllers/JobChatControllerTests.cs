@@ -37,86 +37,6 @@ public class JobChatControllerTests
     private static AgentMeshDbContext CreateInMemoryDb() => TestDbContextFactory.Create();
 
     [Fact]
-    public async Task JobChat_SignalWithStart_LaunchesWorkflow()
-    {
-        // Arrange
-        using var db = CreateInMemoryDb();
-        var jobId = Guid.NewGuid();
-
-        var job = new ProjectJob
-        {
-            Id = jobId,
-            ProjectId = "proj-1",
-            Title = "Autonomous Job",
-            GitBranchName = "feat/test",
-            AssignedAgentId = "implementer-1",
-            ApprovalPolicy = PlanApprovalPolicy.LeadOrHuman,
-            Status = AgentMesh.Core.Enums.ProjectJobStatus.Active
-        };
-        db.ProjectJobs.Add(job);
-        await db.SaveChangesAsync();
-
-        WorkflowOptions? capturedOptions = null;
-
-        var mockHandle = new Mock<WorkflowHandle<JobExecutionWorkflow, JobExecutionResult>>(
-            _mockTemporalClient.Object,
-            $"job-{jobId}",
-            (string?)null,
-            (string?)null,
-            (string?)null);
-
-        _mockTemporalClient
-            .Setup(c => c.StartWorkflowAsync(
-                It.IsAny<System.Linq.Expressions.Expression<Func<JobExecutionWorkflow, Task<JobExecutionResult>>>>(),
-                It.IsAny<WorkflowOptions>()))
-            .Callback<System.Linq.Expressions.Expression<Func<JobExecutionWorkflow, Task<JobExecutionResult>>>, WorkflowOptions>(
-                (expr, opts) =>
-                {
-                    capturedOptions = opts;
-                })
-            .ReturnsAsync(mockHandle.Object);
-
-        var controller = new JobChatController(
-            db,
-            _mockTemporalClient.Object,
-            _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
-        );
-
-        var user = new ClaimsPrincipal(new ClaimsIdentity(
-        [
-            new Claim(ClaimTypes.Name, "developer"),
-            new Claim("agent_id", "operator")
-        ], "TestAuth"));
-
-        controller.ControllerContext = new ControllerContext
-        {
-            HttpContext = new DefaultHttpContext { User = user }
-        };
-
-        var request = new PostMessageRequest("Please build the new feature.", null);
-
-        // Act
-        var result = await controller.PostChatMessage(jobId.ToString(), request);
-
-        // Assert
-        result.Should().BeOfType<OkObjectResult>();
-
-        // Verify temporal workflow was started with SignalWithStart configuration
-        capturedOptions.Should().NotBeNull();
-        capturedOptions!.Id.Should().Be($"job-{jobId}");
-        capturedOptions.TaskQueue.Should().Be(WorkflowSignalRouter.TaskQueue);
-        capturedOptions.StartSignal.Should().Be("ReceiveChatMessage");
-        capturedOptions.StartSignalArgs.Should().NotBeNull();
-        capturedOptions.StartSignalArgs!.Should().HaveCount(1);
-
-        var firstArg = capturedOptions.StartSignalArgs!.First();
-        firstArg.Should().BeOfType<ChatMessageSignal>();
-        var chatSignal = (ChatMessageSignal)firstArg!;
-        chatSignal.Content.Should().Be("Please build the new feature.");
-    }
-
-    [Fact]
     public async Task PostReview_RejectsSelfReviewByImplementer()
     {
         // Arrange
@@ -134,11 +54,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // Implementer attempts to approve their own PR
@@ -181,40 +101,47 @@ public class JobChatControllerTests
         };
         db.ProjectJobs.Add(job);
 
-        // 1. Implementer opens PR and writes PR linkage to job ledger
-        var prLinkage = new { prNumber = 101, prUrl = "https://github.com/org/repo/pull/101", source = "mcp:open_pull_request" };
-        db.JobMessages.Add(new JobMessage
+        // 1. Implementer opens PR and writes PR linkage to job timeline
+        var prLinkage = new
+        {
+            prNumber = 101,
+            prUrl = "https://github.com/org/repo/pull/101",
+            authorPersonaId = "implementer-bot",
+            senderPersona = "implementer-bot",
+            source = "mcp:open_pull_request"
+        };
+        db.JobTimelineCards.Add(new JobTimelineCard
         {
             Id = Guid.NewGuid(),
-            JobId = jobId,
-            SenderType = "persona",
-            SenderId = "implementer-bot",
-            SenderName = "Implementer",
-            Content = "Opened pull request #101",
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.PrReview,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "PR #101",
             StructuredPayloadJson = JsonSerializer.Serialize(prLinkage),
-            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-10)
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-10)
         });
 
-        // 2. Later, another persona (e.g. tech lead) posts a chat message WITHOUT PR linkage
-        db.JobMessages.Add(new JobMessage
+        // 2. Later, another persona (e.g. tech lead) posts a timeline card WITHOUT PR linkage
+        db.JobTimelineCards.Add(new JobTimelineCard
         {
             Id = Guid.NewGuid(),
-            JobId = jobId,
-            SenderType = "persona",
-            SenderId = "astra",
-            SenderName = "Astra",
-            Content = "Reviewing this PR now.",
-            StructuredPayloadJson = null,
-            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-2)
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.InternalConsultation,
+            Status = TimelineCardStatus.Active,
+            Title = "Review note (@astra)",
+            StructuredPayloadJson = "{\"content\":\"Reviewing this PR now.\",\"authorPersonaId\":\"astra\"}",
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-2)
         });
 
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // Case A: The implementer attempts to review their PR -> must be rejected as self review
@@ -273,11 +200,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // Tech lead attempts to approve a HumanOnly plan
@@ -323,11 +250,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // Authenticated principal without any identity claims
@@ -366,11 +293,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // Caller claims agent_id is "operator" but has no Operator role claim
@@ -415,11 +342,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // Implementer is also a tech lead
@@ -464,11 +391,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // An agent attempts to review PR when author is unrecorded
@@ -512,11 +439,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             null,
             _mockHubContext.Object,
-            NullLogger<JobChatController>.Instance
+            NullLogger<JobReviewsController>.Instance
         );
 
         // Operator reviews PR when author is unrecorded
@@ -593,11 +520,11 @@ public class JobChatControllerTests
             .Setup(d => d.DispatchAsync(It.IsAny<JobTurnRequest>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new DispatchedJobTurn(new AgentSession(), new SessionMessage(), new Agent()));
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             temporalClient: null,
             hubContext: _mockHubContext.Object,
-            logger: NullLogger<JobChatController>.Instance,
+            logger: NullLogger<JobReviewsController>.Instance,
             turnDispatcher: mockDispatcher.Object,
             workflows: null
         );
@@ -674,11 +601,11 @@ public class JobChatControllerTests
         db.ProjectJobs.Add(job);
         await db.SaveChangesAsync();
 
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             temporalClient: null,
             hubContext: _mockHubContext.Object,
-            logger: NullLogger<JobChatController>.Instance,
+            logger: NullLogger<JobReviewsController>.Instance,
             turnDispatcher: null,
             workflows: null
         );
@@ -770,11 +697,11 @@ public class JobChatControllerTests
             .ReturnsAsync(false);
 
         // Note: non-null temporalClient present (like production)
-        var controller = new JobChatController(
+        var controller = new JobReviewsController(
             db,
             temporalClient: _mockTemporalClient.Object,
             hubContext: _mockHubContext.Object,
-            logger: NullLogger<JobChatController>.Instance,
+            logger: NullLogger<JobReviewsController>.Instance,
             turnDispatcher: mockDispatcher.Object,
             workflows: mockRouter.Object
         );

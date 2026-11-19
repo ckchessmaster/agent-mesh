@@ -79,6 +79,13 @@ public static class BaselineRuntimes
         new("direct", "Direct Chat", "Direct conversational responses without executing tools")
     };
 
+    private static List<ModeOptionDto> OpenRouterModes() => new()
+    {
+        new("auto", "Auto (Autonomous)", "Autonomous tool loop via OpenRouter Chat Completions"),
+        new("plan", "Plan Only", "Explores codebase and plans changes without modifying files"),
+        new("direct", "Direct Chat", "Direct conversational responses without executing tools")
+    };
+
     private static List<TierOptionDto> CopilotTiers() => new()
     {
         new("auto", "Auto", "Automatically select the best available model for each task"),
@@ -150,6 +157,12 @@ public static class BaselineRuntimes
             supportsContextSelection: true,
             contextSizes: DefaultContextSizes(),
             effortSource: $"contract:{DriverAdapters.OpenAi}"),
+
+        [DriverAdapters.OpenRouter] = Entry(
+            DriverAdapters.OpenRouter, "OpenRouter", OpenRouterModes(),
+            supportsContextSelection: true,
+            contextSizes: DefaultContextSizes(),
+            effortSource: $"contract:{DriverAdapters.OpenRouter}"),
 
         [DriverAdapters.Generic] = Entry(
             DriverAdapters.Generic, "Custom Command Agent", new List<ModeOptionDto>(),

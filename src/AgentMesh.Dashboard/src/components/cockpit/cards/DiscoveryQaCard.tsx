@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import type { JobTimelineCard, DiscoveryPayload } from '../../../types/timeline';
+import type { JobTimelineCard, DiscoveryPayload, DiscoveryQuestion, DiscoveryAnswerRow } from '../../../types/timeline';
 import { CardComments } from './CardComments';
 import { HelpCircle, CheckCircle, Send, Sparkles } from 'lucide-react';
 
@@ -7,6 +7,42 @@ export interface DiscoveryQaCardProps {
   card: JobTimelineCard;
   onSubmitAnswers?: (cardId: string, answers: Record<string, string>, feedback?: string) => Promise<void> | void;
   onAddComment?: (cardId: string, content: string) => Promise<void> | void;
+}
+
+/**
+ * The questions and answers on this card, whatever shape the writer used.
+ *
+ * The Discovery Q&A activity writes `questions` plus `answers` keyed by question id. A card written when a
+ * session question was answered carries the answer array instead, and before November 2026 it carried
+ * nothing else — which is why jobs whose questions were asked and answered in the session chat showed an
+ * empty Q&A card on the timeline. Both read as the same rows here, so the cockpit does not depend on which
+ * path wrote the card.
+ */
+function readDiscoveryPayload(payload: DiscoveryPayload): {
+  questions: DiscoveryQuestion[];
+  answers: Record<string, string>;
+} {
+  const keyed = !Array.isArray(payload.answers) ? payload.answers : undefined;
+  const rows = (Array.isArray(payload.answers) ? payload.answers : []) as DiscoveryAnswerRow[];
+
+  const questions: DiscoveryQuestion[] =
+    payload.questions && payload.questions.length > 0
+      ? payload.questions
+      : rows.map((row, idx) => ({
+          id: `q_${(row.questionIndex ?? idx) + 1}`,
+          question: row.question ?? '',
+          options: row.selectedOptions && row.selectedOptions.length > 0 ? row.selectedOptions : undefined
+        }));
+
+  const answers: Record<string, string> = { ...(keyed ?? {}) };
+  rows.forEach((row, idx) => {
+    const id = `q_${(row.questionIndex ?? idx) + 1}`;
+    if (answers[id]) return;
+    const chosen = [...(row.selectedOptions ?? []), row.customText?.trim()].filter(Boolean).join('; ');
+    answers[id] = chosen || '(No response provided)';
+  });
+
+  return { questions: questions.filter((q) => q.question.trim().length > 0), answers };
 }
 
 export const DiscoveryQaCard: React.FC<DiscoveryQaCardProps> = ({
@@ -21,7 +57,9 @@ export const DiscoveryQaCard: React.FC<DiscoveryQaCardProps> = ({
     // fallback
   }
 
-  const [answers, setAnswers] = useState<Record<string, string>>(() => payload.answers || {});
+  const { questions, answers: initialAnswers } = readDiscoveryPayload(payload);
+
+  const [answers, setAnswers] = useState<Record<string, string>>(initialAnswers);
   const [generalFeedback, setGeneralFeedback] = useState<string>(() => payload.feedback || '');
   const [submitting, setSubmitting] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(card.status === 'Approved' || card.status === 'Resolved');
@@ -56,24 +94,27 @@ export const DiscoveryQaCard: React.FC<DiscoveryQaCardProps> = ({
   return (
     <div
       data-testid="discovery-qa-card"
-      className="p-4 rounded-lg bg-slate-900/90 border border-indigo-500/30 shadow-md text-slate-200 mb-4 transition"
+      className="p-3 sm:p-4 rounded-lg bg-slate-900/90 border border-indigo-500/30 shadow-md text-slate-200 mb-3 sm:mb-4 transition"
     >
       {/* Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-        <div className="flex items-center space-x-2">
-          <div className="p-1.5 rounded bg-indigo-500/20 text-indigo-400">
+      <div className="flex items-start sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+        <div className="flex items-start sm:items-center space-x-2 min-w-0">
+          <div className="p-1.5 rounded bg-indigo-500/20 text-indigo-400 shrink-0">
             <HelpCircle className="w-4 h-4" />
           </div>
-          <div>
+          <div className="min-w-0">
             <h3 className="text-sm font-semibold text-slate-100 flex items-center space-x-2">
-              <span>{card.title || 'Discovery Q&A'}</span>
-              <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="truncate">{card.title || 'Discovery Q&A'}</span>
+              <Sparkles className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
             </h3>
-            <p className="text-xs text-slate-400">{payload.summary || 'Clarification required before decomposition'}</p>
+            <p className="text-xs text-slate-400 break-words">
+              {payload.summary ||
+                (isSubmitted ? 'Answered in the session transcript' : 'Clarification required before decomposition')}
+            </p>
           </div>
         </div>
         <span
-          className={`px-2 py-0.5 text-xs font-mono rounded ${
+          className={`px-2 py-0.5 text-xs font-mono rounded shrink-0 ${
             isPending
               ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30 animate-pulse'
               : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
@@ -85,7 +126,7 @@ export const DiscoveryQaCard: React.FC<DiscoveryQaCardProps> = ({
 
       {/* Questions Form */}
       <form onSubmit={handleSubmit} className="mt-4 space-y-4">
-        {payload.questions?.map((q, idx) => {
+        {questions.map((q, idx) => {
           const selectedVal = answers[q.id] || '';
           return (
             <div key={q.id || idx} className="space-y-1.5 p-3 rounded bg-slate-950/40 border border-slate-800/80">

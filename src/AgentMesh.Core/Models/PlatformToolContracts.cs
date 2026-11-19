@@ -76,7 +76,10 @@ public record Summary3R(
 public record OpenPullRequestArgs(
     string Title,
     Summary3R Summary3R,
-    string? BranchName = null
+    string? BranchName = null,
+    string? PrUrl = null,
+    int? PrNumber = null,
+    string? HeadSha = null
 );
 
 // NOTE: the job spec also lists an `OpenPullRequestResult(Success, PrNumber, PrUrl, Message)`

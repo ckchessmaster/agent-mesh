@@ -235,6 +235,8 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
     private readonly bool _hasCustomHttpLister;
     private readonly Func<string, CancellationToken, Task<string?>> _copilotModelLister;
     private readonly bool _hasCustomCopilotModelLister;
+    private readonly Func<DriverCapabilityProbeRequest, string?> _copilotTokenResolver;
+    private readonly Func<string, string?, CancellationToken, Task<string?>> _openRouterModelsFetcher;
     private readonly IPersonaContainerManager? _containerManager;
 
     public DriverCapabilityProbe(IPersonaContainerManager? containerManager = null)
@@ -250,7 +252,9 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         Func<string, string, TimeSpan, CancellationToken, Task<string?>> cliRunner,
         Func<string, string?, CancellationToken, Task<IReadOnlyList<string>?>>? httpModelLister = null,
         int maxConcurrentProbes = MaxConcurrentProbes,
-        Func<string, CancellationToken, Task<string?>>? copilotModelLister = null)
+        Func<string, CancellationToken, Task<string?>>? copilotModelLister = null,
+        Func<DriverCapabilityProbeRequest, string?>? copilotTokenResolver = null,
+        Func<string, string?, CancellationToken, Task<string?>>? openRouterModelsFetcher = null)
     {
         _ttlProvider = ttlProvider;
         _negativeTtlProvider = negativeTtlProvider;
@@ -260,6 +264,13 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         _httpModelLister = httpModelLister ?? ListOpenAiModelsAsync;
         _hasCustomCopilotModelLister = copilotModelLister != null;
         _copilotModelLister = copilotModelLister ?? FetchCopilotModelsHttpAsync;
+        // Credential *discovery* gets its own seam, apart from the model lister, because the two fail
+        // differently: injecting a lister only stops the outbound call, while ResolveCopilotToken still
+        // reads this machine's ~/.copilot, ~/.config/github-copilot and GH_TOKEN first. So a test that
+        // means "unauthenticated" cannot say so on a host that is signed in — which is how
+        // Copilot_WhenUnauthenticated came to pass on a clean runner and fail on a developer laptop.
+        _copilotTokenResolver = copilotTokenResolver ?? ResolveCopilotToken;
+        _openRouterModelsFetcher = openRouterModelsFetcher ?? FetchOpenRouterModelsJsonAsync;
         _gate = new SemaphoreSlim(maxConcurrentProbes, maxConcurrentProbes);
     }
 
@@ -356,6 +367,7 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 {
                     DriverAdapters.Agy => await ProbeAgyAsync(request, ct),
                     DriverAdapters.OpenAi => await ProbeOpenAiAsync(request, ct),
+                    DriverAdapters.OpenRouter => await ProbeOpenRouterAsync(request, ct),
                     DriverAdapters.Copilot => await ProbeCopilotAsync(request, ct),
                     _ => PresetOnly(adapter, request)
                 };
@@ -405,7 +417,10 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
             if (!string.IsNullOrWhiteSpace(request.Endpoint))
             {
                 // No adapter recorded (rows written before the field existed): infer from transport.
-                return DriverAdapters.OpenAi;
+                return request.RuntimeType == RuntimeType.OpenRouter ||
+                       request.Endpoint.Contains("openrouter.ai", StringComparison.OrdinalIgnoreCase)
+                    ? DriverAdapters.OpenRouter
+                    : DriverAdapters.OpenAi;
             }
 
             return DriverAdapters.InferFromDriverId(request.DriverId, request.Endpoint, request.RuntimeType);
@@ -416,7 +431,10 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         {
             if (string.IsNullOrWhiteSpace(request.Endpoint)) return null;
 
-            return DriverAdapters.OpenAi;
+            return request.RuntimeType == RuntimeType.OpenRouter ||
+                   request.Endpoint.Contains("openrouter.ai", StringComparison.OrdinalIgnoreCase)
+                ? DriverAdapters.OpenRouter
+                : DriverAdapters.OpenAi;
         }
 
         return adapter;
@@ -438,11 +456,15 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 : DriverAdapters.Copilot;
         }
 
+        var effectiveEndpoint = adapter == DriverAdapters.OpenRouter && string.IsNullOrWhiteSpace(request.Endpoint)
+            ? OpenRouterConfig.DefaultEndpoint
+            : request.Endpoint;
+
         // Normalization is shared with a declaration's endpoint binding
         // (DriverModelDiscovery.NormalizeEndpoint) on purpose: both decide whether two spellings
         // name one server, and if they disagreed the cache would dedupe a pair the guard splits,
         // or vice versa. Behaviour is unchanged from the inline version this replaces.
-        var normalized = DriverModelDiscovery.NormalizeEndpoint(request.Endpoint);
+        var normalized = DriverModelDiscovery.NormalizeEndpoint(effectiveEndpoint);
         if (normalized == null) return $"{adapter}:default";
 
         return $"{adapter}:{normalized}";
@@ -610,11 +632,88 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
             request);
     }
 
+    private async Task<DriverCapabilityReading?> ProbeOpenRouterAsync(
+        DriverCapabilityProbeRequest request,
+        CancellationToken ct)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(request.Endpoint)
+            ? OpenRouterConfig.DefaultEndpoint
+            : request.Endpoint.Trim();
+
+        var apiKey = !string.IsNullOrWhiteSpace(request.ApiKey)
+            ? request.ApiKey.Trim()
+            : Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")?.Trim();
+
+        var json = await _openRouterModelsFetcher(endpoint, apiKey, ct);
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return WithOperatorModels(Unavailable(DriverAdapters.OpenRouter,
+                $"OpenRouter at {endpoint.TrimEnd('/')} did not return a model list."), request);
+        }
+
+        var discovered = DriverModelDiscovery.ParseOpenRouterModels(json);
+        if (discovered.Count == 0)
+        {
+            return WithOperatorModels(Unavailable(DriverAdapters.OpenRouter,
+                $"OpenRouter at {endpoint.TrimEnd('/')} returned no tool-capable text models."), request);
+        }
+
+        var models = discovered
+            .Select(m => new DriverModelCapability(
+                Id: m.Id,
+                Name: m.Name,
+                Efforts: m.Efforts,
+                ContextSizes: ContextSizesForModel(m.Id, m.MaxContextTokens, request.LearnedContextLimits),
+                MaxContextTokens: m.MaxContextTokens,
+                PromptPricePerMillion: m.PromptPricePerMillion,
+                CompletionPricePerMillion: m.CompletionPricePerMillion))
+            .ToList();
+
+        return WithOperatorModels(
+            new DriverCapabilityReading(
+                Adapter: DriverAdapters.OpenRouter,
+                Models: models,
+                ModelSource: CapabilitySourceKind.Probed,
+                ObservedAt: DateTimeOffset.UtcNow,
+                SupportsContextSelection: true,
+                EffortSource: "openrouter:supported_parameters"),
+            request);
+    }
+
+    private static async Task<string?> FetchOpenRouterModelsJsonAsync(
+        string endpoint,
+        string? apiKey,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(ProbeTimeout);
+
+            using var httpReq = new HttpRequestMessage(HttpMethod.Get, DriverModelDiscovery.ToModelsUrl(endpoint));
+            if (!string.IsNullOrWhiteSpace(apiKey))
+            {
+                httpReq.Headers.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+            }
+            httpReq.Headers.TryAddWithoutValidation("X-Title", OpenRouterConfig.DefaultAppTitle);
+
+            using var res = await SharedHttp.SendAsync(httpReq, timeoutCts.Token);
+            if (!res.IsSuccessStatusCode) return null;
+
+            return await res.Content.ReadAsStringAsync(timeoutCts.Token);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     private async Task<DriverCapabilityReading?> ProbeCopilotAsync(
         DriverCapabilityProbeRequest request,
         CancellationToken ct)
     {
-        var token = ResolveCopilotToken(request);
+        var token = _copilotTokenResolver(request);
         if (!string.IsNullOrWhiteSpace(token))
         {
             try
@@ -648,9 +747,9 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
 
     internal static string? ResolveCopilotToken(DriverCapabilityProbeRequest request)
     {
-        if (!string.IsNullOrWhiteSpace(request.OAuthToken))
+        if (CopilotCredentialHelper.IsSupportedCopilotToken(request.OAuthToken))
         {
-            return request.OAuthToken.Trim();
+            return request.OAuthToken!.Trim();
         }
 
         try
@@ -663,41 +762,58 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 if (File.Exists(driverOauth))
                 {
                     var token = File.ReadAllText(driverOauth).Trim();
-                    if (!string.IsNullOrWhiteSpace(token)) return token;
+                    if (CopilotCredentialHelper.IsSupportedCopilotToken(token)) return token;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(request.DriverId))
+            {
+                var driverCopilotConfig = Path.Combine(
+                    userHome, ".agentmesh", "copilot-homes",
+                    request.DriverId.Trim().ToLowerInvariant(), "config.json");
+                if (File.Exists(driverCopilotConfig))
+                {
+                    var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(driverCopilotConfig));
+                    if (tok != null) return tok;
                 }
             }
 
             var copilotConfig = Path.Combine(userHome, ".copilot", "config.json");
             if (File.Exists(copilotConfig))
             {
-                var json = File.ReadAllText(copilotConfig);
-                var match = Regex.Match(json, @"""(?:token|oauth_token|access_token|user_token)""\s*:\s*""([^""]+)""");
-                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
-                {
-                    return match.Groups[1].Value.Trim();
-                }
+                var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(copilotConfig));
+                if (tok != null) return tok;
             }
 
             var copilotHosts = Path.Combine(userHome, ".config", "github-copilot", "hosts.json");
             if (File.Exists(copilotHosts))
             {
-                var json = File.ReadAllText(copilotHosts);
-                var match = Regex.Match(json, @"""(?:oauth_token|token|access_token)""\s*:\s*""([^""]+)""");
-                if (match.Success && !string.IsNullOrWhiteSpace(match.Groups[1].Value))
-                {
-                    return match.Groups[1].Value.Trim();
-                }
+                var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(copilotHosts));
+                if (tok != null) return tok;
+            }
+
+            var copilotApps = Path.Combine(userHome, ".config", "github-copilot", "apps.json");
+            if (File.Exists(copilotApps))
+            {
+                var tok = CopilotCredentialHelper.TryExtractCopilotTokenFromJson(File.ReadAllText(copilotApps));
+                if (tok != null) return tok;
             }
         }
         catch { }
 
-        var envToken = Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN");
-        if (!string.IsNullOrWhiteSpace(envToken)) return envToken.Trim();
+        var oauthEnv = Environment.GetEnvironmentVariable(CopilotCredentialHelper.CopilotOAuthTokenEnvVar);
+        if (CopilotCredentialHelper.IsSupportedCopilotToken(oauthEnv))
+        {
+            return oauthEnv!.Trim();
+        }
 
-        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN") ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
-        if (!string.IsNullOrWhiteSpace(ghToken)) return ghToken.Trim();
+        var personaGitHubToken = Environment.GetEnvironmentVariable(CopilotCredentialHelper.PersonaGitHubTokenEnvVar)
+                                 ?? Environment.GetEnvironmentVariable("GH_TOKEN")
+                                 ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
 
-        return null;
+        return CopilotCredentialHelper.SanitizeCopilotEnvToken(
+            Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN"),
+            personaGitHubToken);
     }
 
     private static async Task<string?> FetchCopilotModelsHttpAsync(string token, CancellationToken ct)
@@ -1005,7 +1121,10 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         var declaredEndpoint = DriverModelDiscovery.NormalizeEndpoint(candidate.Endpoint);
         if (declaredEndpoint != null)
         {
-            var rowEndpoint = DriverModelDiscovery.NormalizeEndpoint(request.Endpoint);
+            var effectiveRowEndpoint = adapter == DriverAdapters.OpenRouter && string.IsNullOrWhiteSpace(request.Endpoint)
+                ? OpenRouterConfig.DefaultEndpoint
+                : request.Endpoint;
+            var rowEndpoint = DriverModelDiscovery.NormalizeEndpoint(effectiveRowEndpoint);
             if (!string.Equals(declaredEndpoint, rowEndpoint, StringComparison.OrdinalIgnoreCase)) return false;
         }
 
@@ -1066,7 +1185,10 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         var declaredEndpoint = DriverModelDiscovery.NormalizeEndpoint(candidate.Endpoint);
         if (declaredEndpoint != null)
         {
-            var rowEndpoint = DriverModelDiscovery.NormalizeEndpoint(request.Endpoint);
+            var effectiveRowEndpoint = adapter == DriverAdapters.OpenRouter && string.IsNullOrWhiteSpace(request.Endpoint)
+                ? OpenRouterConfig.DefaultEndpoint
+                : request.Endpoint;
+            var rowEndpoint = DriverModelDiscovery.NormalizeEndpoint(effectiveRowEndpoint);
             if (!string.Equals(declaredEndpoint, rowEndpoint, StringComparison.OrdinalIgnoreCase)) return false;
         }
 
@@ -1088,7 +1210,10 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                     m.Efforts ?? Array.Empty<string>(),
                     declared.SupportsContextSelection
                         ? ContextSizesForModel(m.Id.Trim(), m.MaxContextTokens, learnedLimits)
-                        : null))
+                        : null,
+                    m.MaxContextTokens,
+                    m.PromptPricePerMillion,
+                    m.CompletionPricePerMillion))
                 .ToList(),
             ModelSource: CapabilitySourceKind.Declared,
             ObservedAt: declared.ObservedAt,

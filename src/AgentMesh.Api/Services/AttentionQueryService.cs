@@ -3,6 +3,7 @@ using System.Text.Json;
 using AgentMesh.Api.Tools;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 
@@ -31,7 +32,7 @@ public static class AttentionTypes
     /// <summary>An open pull request waiting for a reviewer.</summary>
     public const string PrReview = "prReview";
 
-    /// <summary>An agent posted to the job ledger asking a human to reply.</summary>
+    /// <summary>An agent parked its turn asking the operator to reply to it.</summary>
     public const string Escalation = "escalation";
 }
 
@@ -50,7 +51,10 @@ public static class AttentionTypes
 /// carries no prose beyond <paramref name="Title"/>.
 /// </param>
 /// <param name="JobId">Job as a string; timeline cards key on the string form.</param>
-/// <param name="PrUrl">Populated for <see cref="AttentionTypes.PrReview"/> when the ledger carries the linkage.</param>
+/// <param name="PrUrl">
+/// Populated for <see cref="AttentionTypes.PrReview"/> when the review card carries the linkage — that is
+/// how <c>open_pull_request</c> tells the gate card which pull request to click through to.
+/// </param>
 /// <param name="Since">When the wait started, i.e. the age the operator sees as "waiting 3h".</param>
 public sealed record AttentionItemDto(
     string Id,
@@ -130,11 +134,11 @@ internal static class AttentionKindExtensions
 }
 
 /// <summary>
-/// Reads the three places a "waiting on a human" state is recorded and folds them into one list.
+/// Reads the two places a "waiting on a human" state is recorded and folds them into one list.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <strong>Why a fold over three sources.</strong> There is no single column that says
+/// <strong>Why a fold over two sources.</strong> There is no single column that says
 /// "blocked on the operator", and no cross-project job-list endpoint either —
 /// <c>GET /api/project-jobs</c> is scoped to one project. The state is spread across:
 /// </para>
@@ -147,17 +151,28 @@ internal static class AttentionKindExtensions
 /// <c>TimelineActivities</c>).</description>
 /// </item>
 /// <item>
-/// <description><see cref="JobTimelineCard"/> rows in
-/// <see cref="TimelineCardStatus.PendingInput"/> — the structured questions and the proposed
-/// checklist, i.e. where the actual prose lives.</description>
-/// </item>
-/// <item>
-/// <description><see cref="JobMessage"/> ledger rows whose payload carries
-/// <c>requiresReply: true</c> — an agent asking a human something. The
-/// <c>Escalation3R</c>/<c>PrReview</c> card types exist in the enum but nothing writes them, so
-/// the ledger is the only source for these two kinds.</description>
+/// <description><see cref="JobTimelineCard"/> rows — the structured questions and the proposed
+/// checklist, the parked escalation, and the pull-request gate. Every one of the five wait kinds has a
+/// card type now: <see cref="TimelineCardType.PlanApproval"/> and
+/// <see cref="TimelineCardType.DiscoveryQa"/> in
+/// <see cref="TimelineCardStatus.PendingInput"/> carry the gates,
+/// <see cref="TimelineCardType.Escalation3R"/> in <see cref="TimelineCardStatus.PendingInput"/> is what
+/// <c>post_job_message</c> with <c>requires_reply</c> writes, and
+/// <see cref="TimelineCardType.PrReview"/> in <see cref="TimelineCardStatus.PendingInput"/> is the review
+/// gate <c>open_pull_request</c> attaches its linkage to.</description>
 /// </item>
 /// </list>
+/// <para>
+/// <strong>Why not the job ledger.</strong> This service used to read <c>job_messages</c> for the
+/// escalation and pull-request kinds, on the reasoning that the <c>Escalation3R</c> and
+/// <c>PrReview</c> card types existed in the enum but nothing wrote them. The ledger is gone: the same
+/// platform change that removed it made those two card types the record of those two waits, with the
+/// same <c>requiresReply</c>/<c>targetPersona</c>/<c>prUrl</c>/<c>prNumber</c> payload keys. Reading
+/// cards also removes the one thing the fold could not do reliably before — decide whether a human has
+/// answered an escalation — because the reply now flips the card out of
+/// <see cref="TimelineCardStatus.PendingInput"/> (see the comments route on
+/// <c>JobTimelineController</c>) and the wait simply stops being a pending card.
+/// </para>
 /// <para>
 /// <strong>Deliberate drift from <c>ProjectJobsController.DeriveLifecycleStatus</c>.</strong> That
 /// helper maps a heartbeat onto a single display label for the job list ("AwaitingApproval",
@@ -177,7 +192,7 @@ internal static class AttentionKindExtensions
 /// </para>
 /// <para>
 /// <strong>Cost.</strong> Three indexed reads regardless of project count (jobs by status, cards by
-/// job id, ledger by job id), then an in-memory fold. Nothing per project, nothing per job, no N+1.
+/// job id, projects by id), then an in-memory fold. Nothing per project, nothing per job, no N+1.
 /// The status filter keeps the driving set small: completed and archived jobs leave the rollup
 /// entirely, which is also why resolved waits disappear without needing a "resolved" write.
 /// </para>
@@ -207,43 +222,30 @@ public sealed class AttentionQueryService(
         j => j.Status == ProjectJobStatus.Active || j.Status == ProjectJobStatus.Pending;
 
     /// <summary>
-    /// The gate cards for a set of jobs.
+    /// The human-gate cards for a set of jobs.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Explicit <c>||</c> comparisons rather than <c>array.Contains(c.CardType)</c>: this predicate has
-    /// to survive translation to SQL, and the three-way form is unambiguous in both providers.
-    /// TurnInterrupted is included in its <see cref="TimelineCardStatus.Active"/> form (that is how the
-    /// worker writes it), so the card is used for enrichment only — the heartbeat decides whether the
-    /// interrupt is still a live wait.
+    /// to survive translation to SQL, and the five-way form is unambiguous in both providers.
+    /// </para>
+    /// <para>
+    /// Status is deliberately <em>not</em> filtered here, because the five types do not share one
+    /// "this is a live wait" status: the gates and the escalation are <c>PendingInput</c>, a
+    /// <see cref="TimelineCardType.TurnInterrupted"/> card is written <see cref="TimelineCardStatus.Active"/>
+    /// by the worker and is used for enrichment only (the heartbeat decides whether the interrupt is still
+    /// live), and filtering in SQL would mean a status test per type in a query that runs on every poll.
+    /// The callers that care filter in memory — see <see cref="ClassifyPendingCard"/> and
+    /// <see cref="FindCard"/>.
+    /// </para>
     /// </remarks>
     internal static Expression<Func<JobTimelineCard, bool>> CardPredicate(List<string> jobIds)
         => c => jobIds.Contains(c.JobId)
                 && (c.CardType == TimelineCardType.PlanApproval
                     || c.CardType == TimelineCardType.DiscoveryQa
-                    || c.CardType == TimelineCardType.TurnInterrupted);
-
-    /// <summary>
-    /// The ledger rows that can carry a structured signal: an escalation request or a PR linkage. Rows
-    /// with no payload are ordinary chat and cannot open a wait, so they never leave the database.
-    /// </summary>
-    internal static Expression<Func<JobMessage, bool>> LedgerPredicate(List<Guid> jobIds)
-        => m => jobIds.Contains(m.JobId) && m.StructuredPayloadJson != null;
-
-    /// <summary>
-    /// The rows that close a wait: something a human actually said.
-    /// </summary>
-    /// <remarks>
-    /// <c>"user"</c> is the sender type <c>JobChatController</c> stamps on operator posts, and the
-    /// <see cref="JobMessage.SenderType"/> default, so rows written before the distinction existed still
-    /// count; <c>"operator"</c> is the spelling the card-comment surface uses and is accepted for the
-    /// same reason. Persona and system rows never close a wait — otherwise an agent could resolve its
-    /// own escalation by talking over it. Kept as a separate predicate from
-    /// <see cref="LedgerPredicate"/> because a reply carries no payload, so the two sets do not overlap
-    /// and each stays small.
-    /// </remarks>
-    internal static Expression<Func<JobMessage, bool>> HumanReplyPredicate(List<Guid> jobIds)
-        => m => jobIds.Contains(m.JobId)
-                && (m.SenderType == "user" || m.SenderType == "operator");
+                    || c.CardType == TimelineCardType.TurnInterrupted
+                    || c.CardType == TimelineCardType.Escalation3R
+                    || c.CardType == TimelineCardType.PrReview);
 
     public async Task<AttentionRollupDto> QueryAsync(CancellationToken cancellationToken = default)
     {
@@ -259,15 +261,12 @@ public sealed class AttentionQueryService(
             return new AttentionRollupDto([], 0, generatedAt);
         }
 
-        // Cards key on the string form of the job id; ledger rows on the Guid. Both spellings are
-        // produced by different writers, so both indexes are built rather than normalising one of
-        // them and hoping the other matches.
+        // Cards key on the string form of the job id: that is the only spelling any writer uses for
+        // JobTimelineCard.JobId, so no Guid index is needed once the ledger left the fold.
         var jobKeyByGuid = jobs.ToDictionary(j => j.Id, j => j.Id.ToString());
         var jobIds = jobKeyByGuid.Values.ToList();
-        var jobGuids = jobs.Select(j => j.Id).ToList();
 
         var cardLookup = await LoadCardsAsync(jobIds, cancellationToken);
-        var (prByJob, escalationByJob) = await LoadLedgerAsync(jobGuids, cancellationToken);
         var projectNames = await LoadProjectNamesAsync(
             jobs.Select(j => j.ProjectId).Distinct(StringComparer.Ordinal).ToList(), cancellationToken);
 
@@ -276,11 +275,9 @@ public sealed class AttentionQueryService(
         {
             var key = jobKeyByGuid[job.Id];
             cardLookup.TryGetValue(key, out var cards);
-            escalationByJob.TryGetValue(job.Id, out var escalation);
-            prByJob.TryGetValue(job.Id, out var pr);
             projectNames.TryGetValue(job.ProjectId, out var projectName);
 
-            var item = BuildItem(job, key, cards ?? [], escalation, pr, projectName);
+            var item = BuildItem(job, key, cards ?? [], projectName);
             if (item is not null)
             {
                 items.Add(item);
@@ -307,13 +304,12 @@ public sealed class AttentionQueryService(
     /// <remarks>
     /// <para>
     /// It shares everything that decides an answer with the rollup — <see cref="OpenJobsPredicate"/>,
-    /// <see cref="CardPredicate"/>, <see cref="LedgerPredicate"/>, <see cref="HumanReplyPredicate"/>,
-    /// <see cref="ClassifyHeartbeat"/> and <c>BuildItem</c> — and differs only in the driving set: one
-    /// job id instead of all open ones. That is deliberate. The push events carry the same
-    /// <see cref="AttentionItemDto"/> a client later gets from <c>GET /api/attention</c>, including
-    /// <see cref="AttentionItemDto.Id"/>, which is the client's dedupe key: if the two paths classified
-    /// independently, the same wait would arrive under two ids and a notification would fire twice for
-    /// it, or a banner would never clear.
+    /// <see cref="CardPredicate"/>, <see cref="ClassifyHeartbeat"/> and <c>BuildItem</c> — and differs
+    /// only in the driving set: one job id instead of all open ones. That is deliberate. The push events
+    /// carry the same <see cref="AttentionItemDto"/> a client later gets from <c>GET /api/attention</c>,
+    /// including <see cref="AttentionItemDto.Id"/>, which is the client's dedupe key: if the two paths
+    /// classified independently, the same wait would arrive under two ids and a notification would fire
+    /// twice for it, or a banner would never clear.
     /// </para>
     /// <para>
     /// <strong>Why a completed job answers null.</strong> The status filter is applied before anything
@@ -322,8 +318,8 @@ public sealed class AttentionQueryService(
     /// any code path having to write a "resolved" fact.
     /// </para>
     /// <para>
-    /// Cost is four indexed reads (job by primary key, its cards, its structured ledger rows, its last
-    /// human reply) plus the project name, all of them the queries above narrowed to one id.
+    /// Cost is two indexed reads (job by primary key, its cards) plus the project name, both of them the
+    /// queries above narrowed to one id.
     /// </para>
     /// </remarks>
     public async Task<AttentionItemDto?> QueryJobAsync(
@@ -342,20 +338,15 @@ public sealed class AttentionQueryService(
         }
 
         var key = job.Id.ToString();
-        var jobIds = new List<string> { key };
-        var jobGuids = new List<Guid> { job.Id };
 
-        var cards = (await LoadCardsAsync(jobIds, cancellationToken)).TryGetValue(key, out var rows)
+        var cards = (await LoadCardsAsync([key], cancellationToken)).TryGetValue(key, out var rows)
             ? rows
             : [];
-        var (prByJob, escalationByJob) = await LoadLedgerAsync(jobGuids, cancellationToken);
-        prByJob.TryGetValue(job.Id, out var pr);
-        escalationByJob.TryGetValue(job.Id, out var escalation);
 
         var projectNames = await LoadProjectNamesAsync([job.ProjectId], cancellationToken);
         projectNames.TryGetValue(job.ProjectId, out var projectName);
 
-        return BuildItem(job, key, cards, escalation, pr, projectName);
+        return BuildItem(job, key, cards, projectName);
     }
 
     private async Task<Dictionary<string, List<CardRow>>> LoadCardsAsync(
@@ -386,67 +377,6 @@ public sealed class AttentionQueryService(
                 StringComparer.OrdinalIgnoreCase);
     }
 
-    private async Task<(Dictionary<Guid, PrLink> PrLinks, Dictionary<Guid, EscalationRow> Escalations)>
-        LoadLedgerAsync(List<Guid> jobIds, CancellationToken cancellationToken)
-    {
-        var rows = await db.JobMessages.AsNoTracking()
-            .Where(LedgerPredicate(jobIds))
-            .OrderBy(m => m.CreatedAt)
-            .ThenBy(m => m.Id)
-            .Select(m => new
-            {
-                m.Id,
-                m.JobId,
-                m.SenderType,
-                m.SenderName,
-                m.Content,
-                m.StructuredPayloadJson,
-                m.CreatedAt
-            })
-            .ToListAsync(cancellationToken);
-
-        var pr = new Dictionary<Guid, PrLink>();
-        var asks = new Dictionary<Guid, EscalationRow>();
-
-        // Ascending order, so the last match wins for both signals: the newest PR linkage (a job that
-        // reopened a PR after changes-requested must click through to the current one) and the newest
-        // ask. A human row never opens a wait even if it carries a payload — nobody escalates to
-        // themselves and expects the bell to ring.
-        foreach (var row in rows)
-        {
-            if (IsHumanSender(row.SenderType))
-            {
-                continue;
-            }
-
-            if (TryReadPrLinkage(row.StructuredPayloadJson, out var link))
-            {
-                pr[row.JobId] = link;
-            }
-
-            if (RequiresOperatorReply(row.StructuredPayloadJson))
-            {
-                asks[row.JobId] = new EscalationRow(row.Id, row.Content, row.SenderName, row.CreatedAt);
-            }
-        }
-
-        // A human reply is the only thing that closes an ask, and reply rows carry no payload — so the
-        // predicate above deliberately excludes them and they come back here as one aggregate instead.
-        // Grouping on the server keeps this constant per job rather than a per-message list the API
-        // then walks: an active job accumulates a ledger row per chat turn, and this endpoint is polled.
-        var lastReplyAt = await db.JobMessages.AsNoTracking()
-            .Where(HumanReplyPredicate(jobIds))
-            .GroupBy(m => m.JobId)
-            .Select(g => new { JobId = g.Key, RepliedAt = g.Max(m => m.CreatedAt) })
-            .ToDictionaryAsync(g => g.JobId, g => g.RepliedAt, cancellationToken);
-
-        var escalations = asks
-            .Where(a => !lastReplyAt.TryGetValue(a.Key, out var repliedAt) || a.Value.CreatedAt > repliedAt)
-            .ToDictionary(a => a.Key, a => a.Value);
-
-        return (pr, escalations);
-    }
-
     private async Task<Dictionary<string, string>> LoadProjectNamesAsync(
         List<string> projectIds,
         CancellationToken cancellationToken)
@@ -467,27 +397,26 @@ public sealed class AttentionQueryService(
         JobRow job,
         string jobKey,
         IReadOnlyList<CardRow> cards,
-        EscalationRow? escalation,
-        PrLink? pr,
         string? projectName)
     {
         // The heartbeat is the authority on whether a wait is still open: it is rewritten by whichever
         // code opened the gate, and a parked job writes nothing further, so a heartbeat that reads
         // "Executing task #3" means the agent is working — even if a PendingInput card from an earlier
         // phase was never resolved (nothing flips a TurnInterrupted card to a terminal status, and a
-        // rejected plan leaves the old row behind while the revision is generated). Cards are consulted
-        // only when there is no heartbeat at all, which is the safety net for a gate recorded as a card
-        // and nothing else.
+        // rejected plan leaves the old row behind while the revision is generated). Gate cards are
+        // consulted only when there is no heartbeat at all, which is the safety net for a gate recorded
+        // as a card and nothing else.
         //
-        // An unanswered escalation sits between the two rather than last, because post_job_message with
-        // requires_reply parks the session without touching the heartbeat: the job would otherwise look
-        // busy while it waits for exactly the reply being asked for.
+        // An escalation card sits outside that gate rather than inside it, because post_job_message with
+        // requires_reply parks the session without touching the heartbeat unless the job is in discovery:
+        // the job would otherwise look busy while it waits for exactly the reply being asked for.
         AttentionKind? winner = ClassifyHeartbeat(job.ProgressHeartbeat);
         if (winner is null && string.IsNullOrWhiteSpace(job.ProgressHeartbeat))
         {
             winner = ClassifyPendingCard(cards);
         }
 
+        var escalation = FindEscalationCard(cards);
         winner ??= escalation is not null ? AttentionKind.Escalation : null;
 
         if (winner is null)
@@ -503,16 +432,19 @@ public sealed class AttentionQueryService(
             AttentionKind.DiscoveryQuestions => FindCard(cards, TimelineCardType.DiscoveryQa, TimelineCardStatus.PendingInput),
             AttentionKind.InterruptedTurn => FindCard(cards, TimelineCardType.TurnInterrupted, TimelineCardStatus.Active)
                                              ?? FindCard(cards, TimelineCardType.TurnInterrupted, TimelineCardStatus.PendingInput),
+            AttentionKind.Escalation => escalation,
+            AttentionKind.PrReview => FindCard(cards, TimelineCardType.PrReview, TimelineCardStatus.PendingInput),
             _ => null
         };
 
-        var (title, detail) = Describe(winner.Value, job, card, escalation);
+        var (title, detail) = Describe(winner.Value, job, card);
 
-        var since = winner.Value switch
-        {
-            AttentionKind.Escalation => escalation?.CreatedAt ?? job.UpdatedAt,
-            _ => card?.CreatedAt ?? job.UpdatedAt
-        };
+        // The pull-request linkage lives on the gate card, written by open_pull_request through
+        // PrReviewCardPayload.Merge — the same reader the review poller uses, so the bell cannot offer a
+        // click-through target that the poller does not consider the current pull request.
+        var (prNumber, prUrl) = winner.Value == AttentionKind.PrReview && card is not null
+            ? PrReviewCardPayload.ReadReference(card.StructuredPayloadJson)
+            : ((int?)null, (string?)null);
 
         return new AttentionItemDto(
             Id: $"{jobKey}:{winner.Value.ToWireName()}",
@@ -524,20 +456,33 @@ public sealed class AttentionQueryService(
             ProjectId: job.ProjectId,
             ProjectName: projectName,
             CardId: card?.Id,
-            PrUrl: winner.Value == AttentionKind.PrReview ? pr?.Url : null,
-            PrNumber: winner.Value == AttentionKind.PrReview ? pr?.Number : null,
-            Since: since);
+            PrUrl: prUrl,
+            PrNumber: prNumber,
+            // Every kind now has a card on the path that created the wait, so the card's own creation
+            // time is the honest "waiting since"; the job row is the fallback for a heartbeat-only gate.
+            Since: card?.CreatedAt ?? job.UpdatedAt);
     }
 
     /// <summary>
     /// The pending human-gate cards for a job, mapped to a kind. Null when no card is waiting.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// <see cref="TimelineCardType.TurnInterrupted"/> is excluded on purpose: the worker writes it as
     /// <see cref="TimelineCardStatus.Active"/>, and the interrupt is also recorded on the heartbeat.
     /// Treating an Active interrupt card as a gate here would keep a job in the inbox after the
     /// operator resumed it, because nothing ever flips that card to a terminal status. The heartbeat
     /// is the live signal; the card is only decoration once it is.
+    /// </para>
+    /// <para>
+    /// <see cref="TimelineCardType.Escalation3R"/> and <see cref="TimelineCardType.PrReview"/> are
+    /// excluded for a different reason: neither is a heartbeat-empty-only signal. An escalation is raised
+    /// by <c>post_job_message</c> while the job is mid-task, so it is resolved outside this ranking —
+    /// see <see cref="FindEscalationCard"/> — and a pending review card outlives the review it was
+    /// opened for (only the gate card moves when the workflow merges, per
+    /// <c>PrReviewPollingService</c>), so announcing one on card evidence alone would ring the bell for
+    /// a job that is back to implementing. The heartbeat naming the review is the live signal there.
+    /// </para>
     /// </remarks>
     private static AttentionKind? ClassifyPendingCard(IReadOnlyList<CardRow> cards)
     {
@@ -573,6 +518,29 @@ public sealed class AttentionQueryService(
         // Cards are loaded newest-first, so the first match is the current one — a job that went
         // through a rejected plan and a revision shows the revision.
         => cards.FirstOrDefault(c => c.CardType == type && c.Status == status);
+
+    /// <summary>
+    /// The escalation card, if any, that is waiting on the <em>operator</em> right now.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three writers produce these: <c>post_job_message</c> with <c>requires_reply</c> (the parked turn
+    /// that used to be a ledger row), <c>SessionsController</c> forwarding an agent's
+    /// <c>ask_question</c> into a job thread, and the worker's error pause in
+    /// <c>HttpAgentTurnRunner</c>. All three write <see cref="TimelineCardStatus.PendingInput"/>, and all
+    /// three flip or resolve that status when the human answers on the card — which is why there is no
+    /// "has a human replied since" query left in this file.
+    /// </para>
+    /// <para>
+    /// A card addressed to another persona is skipped: that is an internal consult which parks the
+    /// other agent, and pinging a human about it is noise. Cards are newest-first, so the first match is
+    /// the live ask.
+    /// </para>
+    /// </remarks>
+    private static CardRow? FindEscalationCard(IReadOnlyList<CardRow> cards)
+        => cards.FirstOrDefault(c => c.CardType == TimelineCardType.Escalation3R
+                                     && c.Status == TimelineCardStatus.PendingInput
+                                     && EscalationAwaitsOperator(c.StructuredPayloadJson));
 
     /// <summary>
     /// Maps a job's free-text heartbeat onto a wait kind, or null when the job is working.
@@ -660,8 +628,7 @@ public sealed class AttentionQueryService(
     private static (string Title, string? Detail) Describe(
         AttentionKind kind,
         JobRow job,
-        CardRow? card,
-        EscalationRow? escalation)
+        CardRow? card)
     {
         var heartbeat = job.ProgressHeartbeat?.Trim();
 
@@ -684,11 +651,16 @@ public sealed class AttentionQueryService(
 
             AttentionKind.PrReview => (
                 "Pull request awaiting review",
-                Truncate(heartbeat ?? card?.Title)),
+                Truncate(heartbeat
+                         ?? ReadPayloadStrings(card?.StructuredPayloadJson, null, null, "note", "summary")
+                         ?? card?.Title)),
 
+            // The card body is the 3-R prose the agent wrote, so it becomes the banner text; the card's
+            // own title ("Escalation from @rook to @operator") is the fallback when a writer stores no
+            // content, and the heartbeat is the last resort for a card whose payload will not parse.
             AttentionKind.Escalation => (
-                Truncate(FirstLine(escalation?.Content), 80) ?? "Escalation awaiting your reply",
-                Truncate(escalation?.Content)),
+                Truncate(FirstLine(EscalationBody(card)), 80) ?? card?.Title ?? "Escalation awaiting your reply",
+                Truncate(EscalationBody(card)) ?? Truncate(card?.Title) ?? Truncate(heartbeat)),
 
             _ => ("Attention needed", Truncate(heartbeat))
         };
@@ -775,70 +747,29 @@ public sealed class AttentionQueryService(
     }
 
     /// <summary>
-    /// In-memory mirror of <see cref="HumanReplyPredicate"/>, for the rows already loaded.
+    /// True unless a card payload says the ask is addressed to some persona other than the operator.
     /// </summary>
     /// <remarks>
-    /// Used to ignore a human's own payload rows when scanning for asks: a review decision posted by
-    /// the operator carries a <c>structured_payload</c> value, and reading it as an escalation would pin a
-    /// permanent item to a job that is waiting on nobody.
+    /// <para>
+    /// This is the inverse of the rule it replaces. On the ledger the payload <em>was</em> the request —
+    /// a row is just a row unless its payload says <c>requiresReply</c> — so absence had to mean "not a
+    /// wait" and the classifier failed closed. On a card the wait is already recorded structurally, by
+    /// <see cref="TimelineCardStatus.PendingInput"/> on an <see cref="TimelineCardType.Escalation3R"/>
+    /// row, and the payload only says <em>who</em> has to answer: <c>post_job_message</c> writes
+    /// <c>targetPersona</c> beside <c>requiresReply</c>, and the worker's error pause writes
+    /// <c>"operator"</c> explicitly. An unreadable or partial payload must therefore not swallow a real
+    /// park; only a target that names somebody else suppresses the item.
+    /// </para>
+    /// <para>
+    /// A card addressed to another persona is an internal consult: it parks that agent, not the operator,
+    /// and a desktop notification about it is noise.
+    /// </para>
     /// </remarks>
-    private static bool IsHumanSender(string? senderType)
-        => string.Equals(senderType, "user", StringComparison.OrdinalIgnoreCase)
-           || string.Equals(senderType, "operator", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// True when a payload is an agent asking the <em>human</em> to reply.
-    /// </summary>
-    /// <remarks>
-    /// <c>post_job_message</c> records <c>requiresReply</c> and <c>targetPersona</c> together
-    /// (<c>PlatformMcpTools</c>), and <c>HttpAgentTurnRunner</c> writes the same pair with
-    /// <c>targetPersona: "operator"</c> for its parked turns. A row targeted at another persona is an
-    /// internal consult: it parks the agent, not the operator, so it must not raise a desktop
-    /// notification. A row with no <c>requiresReply</c> at all (chat, PR linkage, card notes) is not
-    /// a wait either — absence is read as "not a request", never as one.
-    /// </remarks>
-    internal static bool RequiresOperatorReply(string? payloadJson)
+    internal static bool EscalationAwaitsOperator(string? payloadJson)
     {
         if (string.IsNullOrWhiteSpace(payloadJson))
         {
-            return false;
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(payloadJson);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object
-                || !TryReadBool(doc.RootElement, "requiresReply", out var requiresReply)
-                || !requiresReply)
-            {
-                return false;
-            }
-
-            var target = TryReadString(doc.RootElement, "targetPersona");
-            return string.IsNullOrWhiteSpace(target)
-                   || target.Trim().TrimStart('@')
-                       .Equals(PlatformMcpTools.OperatorPersonaId, StringComparison.OrdinalIgnoreCase);
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Pulls the PR linkage out of a ledger payload (<c>prUrl</c>, <c>prNumber</c>).
-    /// </summary>
-    /// <remarks>
-    /// The job row has no PR column — adding one is a migration — so the linkage written by
-    /// <c>open_pull_request</c> into the ledger is where the click-through target lives. Same reason
-    /// <c>JobChatController</c> reads it.
-    /// </remarks>
-    internal static bool TryReadPrLinkage(string? payloadJson, out PrLink link)
-    {
-        link = default;
-        if (string.IsNullOrWhiteSpace(payloadJson))
-        {
-            return false;
+            return true;
         }
 
         try
@@ -846,24 +777,53 @@ public sealed class AttentionQueryService(
             using var doc = JsonDocument.Parse(payloadJson);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
-                return false;
+                return true;
             }
 
-            var url = TryReadString(doc.RootElement, "prUrl");
-            int? number = TryReadInt(doc.RootElement, "prNumber");
-
-            if (string.IsNullOrWhiteSpace(url) && number is null)
+            var target = TryReadString(doc.RootElement, "targetPersona");
+            if (!string.IsNullOrWhiteSpace(target)
+                && !target.Trim().TrimStart('@')
+                    .Equals(PlatformMcpTools.OperatorPersonaId, StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
 
-            link = new PrLink(url, number);
-            return true;
+            // An explicit "requiresReply": false is a writer saying this card is not a request at all —
+            // an FYI addressed to the operator. Only the explicit false counts; a missing key does not.
+            return !TryReadBool(doc.RootElement, "requiresReply", out var requiresReply) || requiresReply;
         }
         catch (JsonException)
         {
-            return false;
+            return true;
         }
+    }
+
+    /// <summary>
+    /// The prose an escalation card carries for the human: the 3-R body, the forwarded question, or the
+    /// error the agent paused on.
+    /// </summary>
+    /// <remarks>
+    /// <c>post_job_message</c> renders the body as <c>"@operator &lt;content&gt;"</c> so a human scanning
+    /// the timeline sees that a message is addressed to them. In the bell that mention is redundant —
+    /// only operator-facing waits get here at all — so it is dropped to keep the banner prose.
+    /// </remarks>
+    private static string? EscalationBody(CardRow? card)
+    {
+        var content = ReadPayloadStrings(card?.StructuredPayloadJson, null, null, "content");
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return null;
+        }
+
+        var trimmed = content.TrimStart();
+        if (trimmed.StartsWith('@'))
+        {
+            var rest = trimmed[1..];
+            var cut = rest.IndexOfAny([' ', '\t', '\r', '\n']);
+            trimmed = cut < 0 ? string.Empty : rest[cut..].TrimStart();
+        }
+
+        return trimmed.Length > 0 ? trimmed : null;
     }
 
     private static bool TryReadBool(JsonElement obj, string property, out bool value)
@@ -893,23 +853,6 @@ public sealed class AttentionQueryService(
         => obj.TryGetProperty(property, out var element) && element.ValueKind == JsonValueKind.String
             ? element.GetString()
             : null;
-
-    private static int? TryReadInt(JsonElement obj, string property)
-    {
-        if (!obj.TryGetProperty(property, out var element))
-        {
-            return null;
-        }
-
-        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out var number))
-        {
-            return number;
-        }
-
-        return element.ValueKind == JsonValueKind.String && int.TryParse(element.GetString(), out var parsed)
-            ? parsed
-            : null;
-    }
 
     private static string? FirstLine(string? text)
         => text?.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim();
@@ -949,12 +892,4 @@ public sealed class AttentionQueryService(
         string Title,
         string StructuredPayloadJson,
         DateTimeOffset CreatedAt);
-
-    internal sealed record EscalationRow(
-        Guid Id,
-        string Content,
-        string? SenderName,
-        DateTimeOffset CreatedAt);
-
-    internal readonly record struct PrLink(string? Url, int? Number);
 }

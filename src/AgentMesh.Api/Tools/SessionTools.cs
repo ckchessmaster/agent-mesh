@@ -132,11 +132,38 @@ public class SessionTools(
             return UnauthorizedResponse();
         }
 
+        var httpCtx = httpContextAccessor?.HttpContext;
+        var personaHeader = httpCtx?.Request.Headers.TryGetValue(AgentMesh.Api.Services.PlatformCallContextResolver.PersonaIdHeader, out var ph) == true
+            ? ph.ToString()
+            : null;
+        string? metadataPersona = null;
+        if (!string.IsNullOrWhiteSpace(metadataJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(metadataJson);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                    doc.RootElement.TryGetProperty("personaId", out var pProp) &&
+                    pProp.ValueKind == JsonValueKind.String)
+                {
+                    metadataPersona = pProp.GetString();
+                }
+            }
+            catch { }
+        }
+        var resolvedPersonaId = !string.IsNullOrWhiteSpace(personaHeader)
+            ? personaHeader.Trim().TrimStart('@').ToLowerInvariant()
+            : (!string.IsNullOrWhiteSpace(metadataPersona)
+                ? metadataPersona.Trim().TrimStart('@').ToLowerInvariant()
+                : null);
+
         var session = new AgentSession
         {
             Title = title.Trim(),
             Status = "active",
             MetadataJson = metadataJson ?? "{}",
+            PersonaId = resolvedPersonaId,
+            DriverId = callerAgentId,
             CreatorAgentId = callerAgentId,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow

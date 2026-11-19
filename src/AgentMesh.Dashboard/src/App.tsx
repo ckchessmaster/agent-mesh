@@ -37,10 +37,13 @@ import {
   Download,
   ZoomIn,
   FolderGit2,
+  LayoutDashboard,
   Maximize2,
   Box,
   GitBranch,
-  Copy
+  Copy,
+  Plug,
+  Server
 } from 'lucide-react';
 import { api } from './services/api';
 import { AttentionBell, MuteToggle } from './components/AttentionBell';
@@ -56,6 +59,7 @@ import {
   QUOTA_TEXT_CLASS,
   describeReset,
   describeUsageChip,
+  formatUsdCost,
   relativeTime,
   summarizeQuota
 } from './utils/driverUsage';
@@ -72,8 +76,9 @@ import type {
   AgentSession,
   AgentUsageResponse,
   AskQuestionItem,
-  JobMessage,
+  DashboardOverviewResponse,
   JobTask,
+  CreateProjectRequest,
   Persona,
   Project,
   ProjectJob,
@@ -83,10 +88,12 @@ import type {
   SessionMessage,
   SessionArtifact,
   JobArtifact,
+  McpServer,
+  ModelCapability,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from './types';
-import { ProjectJobStatus } from './types';
+import { JobLifecycleStatus, ProjectJobStatus } from './types';
 import type { JobPanelTab } from './types';
 import { SlashCommandPalette, SLASH_COMMANDS, type SlashCommandItem } from './components/SlashCommandPalette';
 import { ArtifactViewer } from './components/ArtifactViewer';
@@ -96,11 +103,15 @@ import { ProjectModal } from './components/ProjectModal';
 import { NewJobModal } from './components/NewJobModal';
 import { JobCockpit } from './components/JobCockpit';
 import { ProjectList } from './components/ProjectList';
+import { MainDashboard } from './components/MainDashboard';
 import { MermaidViewer } from './components/MermaidViewer';
 import { getOptionLabel, getOptionDescription } from './components/QuestionCard';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { DriverConfigModal } from './components/DriverConfigModal';
+import { SearchableModelPicker } from './components/SearchableModelPicker';
 import { PersonaEnvironmentModal } from './components/PersonaEnvironmentModal';
+import { McpCatalogModal } from './components/McpCatalogModal';
+import { PersonaMcpModal } from './components/PersonaMcpModal';
 import { SessionListSection } from './components/SessionListSection';
 import { isJobTurnSession, sortSessionsByRecency } from './utils/sessionDisplay';
 
@@ -263,14 +274,15 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [sessions, setSessions] = useState<AgentSession[]>([]);
-  const [activeTab, setActiveTab] = useState<'projects' | 'personas' | 'drivers'>(() => {
+  const [dashboardOverview, setDashboardOverview] = useState<DashboardOverviewResponse | null>(null);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'projects' | 'personas' | 'drivers'>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('agentmesh_active_tab');
-      if (saved === 'projects' || saved === 'personas' || saved === 'drivers') {
+      if (saved === 'dashboard' || saved === 'projects' || saved === 'personas' || saved === 'drivers') {
         return saved;
       }
     }
-    return 'personas';
+    return 'dashboard';
   });
   const hasUserSwitchedTabRef = useRef(
     typeof window !== 'undefined' && !!localStorage.getItem('agentmesh_active_tab')
@@ -396,7 +408,6 @@ export default function App() {
   const handleMobileBack = useCallback(() => {
     setIsMobileDetailView(false);
   }, []);
-  const [jobMessages, setJobMessages] = useState<JobMessage[]>([]);
   const [jobTasks, setJobTasks] = useState<JobTask[]>([]);
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [editingProject, setEditingProject] = useState<Project | null>(null);
@@ -422,6 +433,10 @@ export default function App() {
   const [personaGitAuthorEmail, setPersonaGitAuthorEmail] = useState('');
   const [clearPersonaGitHubToken, setClearPersonaGitHubToken] = useState(false);
   const [inspectingPersonaEnv, setInspectingPersonaEnv] = useState<Persona | null>(null);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [showMcpCatalogModal, setShowMcpCatalogModal] = useState(false);
+  const [managingPersonaMcp, setManagingPersonaMcp] = useState<Persona | null>(null);
+  const [mcpCatalogRefreshTick, setMcpCatalogRefreshTick] = useState(0);
   const [deletingPersonaId, setDeletingPersonaId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
 
@@ -458,6 +473,7 @@ export default function App() {
 
   // Active session inline control edit popover state
   const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | 'contextSize' | null>(null);
+  const [sessionModelFilter, setSessionModelFilter] = useState('');
 
   // Active prompt queue and Send Now dropdown state
   const [activeQueue, setActiveQueue] = useState<QueuedPromptItem[]>([]);
@@ -465,7 +481,7 @@ export default function App() {
 
   // Quick Register Agent modal/drawer state
   const [showRegisterModal, setShowRegisterModal] = useState(false);
-  const [newAgentType, setNewAgentType] = useState<'agy' | 'claude' | 'copilot' | 'openai' | 'generic'>('openai');
+  const [newAgentType, setNewAgentType] = useState<'agy' | 'claude' | 'copilot' | 'openai' | 'openrouter' | 'generic'>('openai');
   const [newAgentId, setNewAgentId] = useState('');
   const [newAgentName, setNewAgentName] = useState('');
   const [newAgentRole, setNewAgentRole] = useState('Autonomous AI Engineer');
@@ -476,7 +492,7 @@ export default function App() {
   const [openAiTestResult, setOpenAiTestResult] = useState<{
     success: boolean;
     message: string;
-    models: { id: string; name: string }[];
+    models: ModelCapability[];
   } | null>(null);
 
   // Interactive Question & Answer state (keyed by toolCallId)
@@ -760,6 +776,49 @@ export default function App() {
     }
   };
 
+  const fetchDashboardOverview = useCallback(async () => {
+    if (typeof api.getDashboardOverview !== 'function') return;
+    try {
+      const res = await api.getDashboardOverview();
+      if (res) {
+        setDashboardOverview(res);
+      }
+    } catch {
+      // MainDashboard gracefully derives fallback stats when the overview endpoint is unavailable
+    }
+  }, []);
+
+  const dashboardAttentionCount = useMemo(() => {
+    if (dashboardOverview) {
+      return Math.max(
+        dashboardOverview.jobStats?.attentionCount ?? 0,
+        dashboardOverview.attentionItems?.length ?? 0
+      );
+    }
+    const waitingSessions = sessions.filter(
+      (s) => (s.status || '').toLowerCase() === 'waiting_for_input'
+    ).length;
+    const seenJobIds = new Set<string>();
+    let blockedOrAwaitingJobs = 0;
+    for (const list of Object.values(jobsByProject)) {
+      if (!Array.isArray(list)) continue;
+      for (const job of list) {
+        if (!job?.id || seenJobIds.has(job.id)) continue;
+        seenJobIds.add(job.id);
+        if (
+          job.status === ProjectJobStatus.Active &&
+          (job.lifecycleStatus === JobLifecycleStatus.Blocked ||
+            job.lifecycleStatus === JobLifecycleStatus.Failed ||
+            job.lifecycleStatus === JobLifecycleStatus.AwaitingApproval ||
+            job.lifecycleStatus === JobLifecycleStatus.AwaitingReview)
+        ) {
+          blockedOrAwaitingJobs++;
+        }
+      }
+    }
+    return waitingSessions + blockedOrAwaitingJobs;
+  }, [dashboardOverview, sessions, jobsByProject]);
+
   const fetchAllData = useCallback(async () => {
     try {
       if (api.verifyAuth) {
@@ -768,17 +827,22 @@ export default function App() {
         });
       }
 
-      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes] = await Promise.all([
+      const [statusRes, agentsRes, personasRes, sessionsRes, capsRes, projectsRes, mcpServersRes, overviewRes] = await Promise.all([
         api.getStatus(),
         api.getAgents(),
         api.getPersonas ? api.getPersonas().catch(() => []) : Promise.resolve([]),
         api.getSessions('all'),
         api.getCapabilities().catch(() => null),
-        api.getProjects ? api.getProjects().catch(() => []) : Promise.resolve([])
+        api.getProjects ? api.getProjects().catch(() => []) : Promise.resolve([]),
+        api.getMcpServers ? api.getMcpServers().catch(() => []) : Promise.resolve([]),
+        typeof api.getDashboardOverview === 'function'
+          ? Promise.resolve(api.getDashboardOverview()).catch(() => null)
+          : Promise.resolve(null)
       ]);
       setStatusData(statusRes);
       setAgents(agentsRes);
       setPersonas(personasRes);
+      setMcpServers(mcpServersRes);
       setSessions((prev) => {
         if (!sessionsRes || sessionsRes.length === 0) return prev;
         const fetchedMap = new Map(sessionsRes.map((s) => [s.id, s]));
@@ -791,25 +855,17 @@ export default function App() {
         return result;
       });
       setProjects(projectsRes || []);
+      if (overviewRes) {
+        setDashboardOverview(overviewRes);
+      }
       if (capsRes) {
         setCapabilities(capsRes);
       }
       setApiError(null);
 
-      // Reconcile tab: prefer user's selected tab if it has items, otherwise select first populated section
-      const isCurrentTabPopulated =
-        (activeTab === 'projects' && projectsRes && projectsRes.length > 0) ||
-        (activeTab === 'personas' && personasRes && personasRes.length > 0) ||
-        (activeTab === 'drivers' && agentsRes && agentsRes.length > 0);
-
-      if (!hasUserSwitchedTabRef.current || !isCurrentTabPopulated) {
-        if (projectsRes && projectsRes.length > 0) {
-          setActiveTab('projects');
-        } else if (personasRes.length > 0) {
-          setActiveTab('personas');
-        } else if (agentsRes.length > 0) {
-          setActiveTab('drivers');
-        }
+      // Keep Dashboard as the default landing page unless the operator explicitly chose another tab.
+      if (!hasUserSwitchedTabRef.current) {
+        setActiveTab((cur) => (cur === 'dashboard' ? cur : 'dashboard'));
       }
 
       // Auto-select first project if none selected
@@ -1085,28 +1141,22 @@ export default function App() {
 
   useEffect(() => {
     if (selectedJobId) {
-      Promise.all([
-        api.getJobMessages(selectedJobId),
-        api.getJobTasks(selectedJobId)
-      ]).then(([msgs, tasks]) => {
-        setJobMessages(msgs);
-        setJobTasks(tasks);
-      }).catch((err) => {
-        console.error('Failed to load job details:', err);
-      });
-      // Deliberately not in the Promise.all above: a server without the artifact endpoint would reject
-      // the whole group and take the messages and checklist down with it, leaving the cockpit empty
-      // rather than just the panel. fetchJobArtifacts swallows its own failure.
+      api.getJobTasks(selectedJobId)
+        .then((tasks) => {
+          setJobTasks(tasks);
+        })
+        .catch((err) => {
+          console.error('Failed to load job details:', err);
+        });
       fetchJobArtifacts(selectedJobId);
     } else {
-      setJobMessages([]);
       setJobTasks([]);
       setJobArtifacts([]);
       setSelectedJobArtifactId(null);
     }
   }, [selectedJobId, fetchJobArtifacts]);
 
-  // Active job polling effect: keeps job messages, tasks, and sessions live every 3s while job is active
+  // Active job polling effect: keeps job tasks and sessions live every 3s while job is active
   useEffect(() => {
     if (!selectedJobId) return;
 
@@ -1122,16 +1172,7 @@ export default function App() {
 
     const interval = setInterval(async () => {
       try {
-        const [msgs, tasks] = await Promise.all([
-          api.getJobMessages(selectedJobId),
-          api.getJobTasks(selectedJobId)
-        ]);
-        setJobMessages((prev) => {
-          if (prev.length === msgs.length && prev[prev.length - 1]?.id === msgs[msgs.length - 1]?.id) {
-            return prev;
-          }
-          return msgs;
-        });
+        const tasks = await api.getJobTasks(selectedJobId);
         setJobTasks((prev) => {
           if (JSON.stringify(prev) === JSON.stringify(tasks)) {
             return prev;
@@ -1159,7 +1200,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, [selectedJobId, selectedProjectId, projects, jobsByProject]);
 
-  const handleSaveProject = async (req: any) => {
+  const handleSaveProject = async (req: CreateProjectRequest) => {
     if (editingProject) {
       const updated = await api.updateProject(editingProject.id, req);
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
@@ -1169,6 +1210,7 @@ export default function App() {
       setSelectedProjectId(created.id);
       fetchJobsForProject(created.id);
     }
+    void fetchDashboardOverview();
   };
 
   const handleDeleteProject = async (projectId: string) => {
@@ -1178,6 +1220,7 @@ export default function App() {
       setSelectedProjectId(null);
       setSelectedJobId(null);
     }
+    void fetchDashboardOverview();
   };
 
   const handleCreateJob = async (req: any) => {
@@ -1190,7 +1233,10 @@ export default function App() {
         ...(prev[jobModalProject.id] || []).filter((j) => j.id !== created.id)
       ]
     }));
+    hasUserSwitchedTabRef.current = true;
+    setActiveTab('projects');
     handleSelectJob(jobModalProject.id, created.id);
+    void fetchDashboardOverview();
   };
 
   const handleDeleteJob = async (jobId: string) => {
@@ -1204,22 +1250,9 @@ export default function App() {
     });
     if (selectedJobId === jobId) {
       setSelectedJobId(null);
-      setJobMessages([]);
       setJobTasks([]);
     }
-  };
-
-  const handleSendJobMessage = async (content: string, attachments?: SessionAttachment[]) => {
-    if (!selectedJobId) return;
-    const msg = await api.postJobMessage(selectedJobId, {
-      content,
-      senderType: 'user',
-      attachments
-    });
-    setJobMessages((prev) => {
-      if (prev.some((m) => m.id === msg.id)) return prev;
-      return [...prev, msg];
-    });
+    void fetchDashboardOverview();
   };
 
   const handleUpdateJob = async (updates: {
@@ -1237,6 +1270,7 @@ export default function App() {
       ...prev,
       [updated.projectId]: (prev[updated.projectId] || []).map((j) => (j.id === updated.id ? updated : j))
     }));
+    void fetchDashboardOverview();
   };
 
   const handleDeleteAgent = async (agentId: string) => {
@@ -1279,16 +1313,19 @@ export default function App() {
     }
 
     if (!answered && selectedJobId) {
-      await api.postJobMessage(selectedJobId, {
-        content: `User answered question:\n${payload.answerSummary}\nPlease proceed with this answer.`,
-        senderType: 'user'
-      });
+      try {
+        const cards = await api.getTimelineCards(selectedJobId);
+        const pendingCard = cards.find((c) => c.status === 'PendingInput') || cards[cards.length - 1];
+        if (pendingCard) {
+          await api.addTimelineComment(selectedJobId, pendingCard.id, {
+            senderId: 'operator',
+            senderType: 'operator',
+            content: `User answered question:\n${payload.answerSummary}\nPlease proceed with this answer.`
+          });
+        }
+      } catch {}
     }
 
-    if (selectedJobId) {
-      const msgs = await api.getJobMessages(selectedJobId);
-      setJobMessages(msgs);
-    }
     await fetchAllData();
   };
 
@@ -1325,13 +1362,7 @@ export default function App() {
         applyJobFromServer(result.job);
         setJobTasks(result.job.tasks || []);
       } else {
-        // No DTO to trust (older server): fall back to the single row rather than clearing
-        // the whole checklist.
         setJobTasks((prev) => prev.map((t) => (t.id === taskId ? result.task : t)));
-      }
-      if (result.movedQueuedTurnCount > 0) {
-        const msgs = await api.getJobMessages(selectedJobId);
-        setJobMessages(msgs);
       }
     } catch (err) {
       console.error('Failed to assign task:', err);
@@ -1357,9 +1388,8 @@ export default function App() {
       }
       return next;
     });
-    // Immediately pull latest sessions, tasks, and messages
+    // Immediately pull latest sessions and tasks
     fetchAllData();
-    api.getJobMessages(selectedJobId).then(setJobMessages).catch(console.error);
     api.getJobTasks(selectedJobId).then(setJobTasks).catch(console.error);
   };
 
@@ -1373,6 +1403,7 @@ export default function App() {
       }
       return next;
     });
+    void fetchDashboardOverview();
   };
 
   const handleArchiveJob = async (jobId?: string) => {
@@ -1387,6 +1418,7 @@ export default function App() {
         }
         return next;
       });
+      void fetchDashboardOverview();
     } catch (err) {
       console.error('Failed to archive job:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to archive job');
@@ -1405,6 +1437,7 @@ export default function App() {
         }
         return next;
       });
+      void fetchDashboardOverview();
     } catch (err) {
       console.error('Failed to reopen job:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to reopen job');
@@ -1423,6 +1456,7 @@ export default function App() {
         }
         return next;
       });
+      void fetchDashboardOverview();
     } catch (err) {
       console.error('Failed to reset job:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to reset job');
@@ -1436,6 +1470,21 @@ export default function App() {
       [job.projectId]: (prev[job.projectId] || []).map((j) => (j.id === job.id ? job : j))
     }));
   }, []);
+
+  const handleRecoverJob = async (jobId?: string, note?: string) => {
+    const targetId = jobId || selectedJobId;
+    if (!targetId) return;
+    try {
+      const res = await api.recoverJob(targetId, { note });
+      // The card has to leave "Stalled" in the same paint that reports the recovery, or the operator
+      // clicks Recover and sees the same stalled card staring back at them while the new run starts.
+      // The recovery message itself lives in the job timeline and heartbeat, which the server writes.
+      applyJobFromServer(res?.job);
+    } catch (err) {
+      console.error('Failed to recover job:', err);
+      setApiError(err instanceof Error ? err.message : 'Failed to recover job');
+    }
+  };
 
   const handleCancelQueuedJobTurn = async (turnId: string, jobId?: string) => {
     const targetId = jobId || selectedJobId;
@@ -1460,8 +1509,6 @@ export default function App() {
           return next;
         });
       }
-      const msgs = await api.getJobMessages(targetId);
-      setJobMessages(msgs);
     } catch (err) {
       console.error('Failed to cancel queued turn:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turn');
@@ -1474,8 +1521,6 @@ export default function App() {
     try {
       const job = await api.cancelQueuedJobTurns(targetId, personaId);
       if (job) applyJobFromServer(job);
-      const msgs = await api.getJobMessages(targetId);
-      setJobMessages(msgs);
     } catch (err) {
       console.error('Failed to cancel queued turns:', err);
       setApiError(err instanceof Error ? err.message : 'Failed to cancel queued turns');
@@ -1524,6 +1569,44 @@ export default function App() {
     }
   }, [selectedSessionId, fetchSessionEvents, fetchSessionArtifacts, connection, signalRConnected]);
 
+  const joinedDashboardJobsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!connection || !signalRConnected) {
+      joinedDashboardJobsRef.current.clear();
+      return;
+    }
+
+    const desiredJobIds = new Set<string>();
+    for (const job of dashboardOverview?.recentJobs ?? []) {
+      if (job?.id && (job.status === ProjectJobStatus.Active || job.status === ProjectJobStatus.Pending)) {
+        desiredJobIds.add(job.id);
+      }
+    }
+    for (const list of Object.values(jobsByProject)) {
+      if (!Array.isArray(list)) continue;
+      for (const job of list) {
+        if (job?.id && (job.status === ProjectJobStatus.Active || job.status === ProjectJobStatus.Pending)) {
+          desiredJobIds.add(job.id);
+        }
+      }
+    }
+
+    const current = joinedDashboardJobsRef.current;
+    for (const jobId of desiredJobIds) {
+      if (!current.has(jobId)) {
+        current.add(jobId);
+        connection.invoke('JoinJob', jobId).catch(() => {});
+      }
+    }
+    for (const jobId of Array.from(current)) {
+      if (!desiredJobIds.has(jobId)) {
+        current.delete(jobId);
+        connection.invoke('LeaveJob', jobId).catch(() => {});
+      }
+    }
+  }, [connection, signalRConnected, dashboardOverview?.recentJobs, jobsByProject]);
+
   // Handle panel resizing
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -1559,6 +1642,9 @@ export default function App() {
           return [...prev, msg];
         });
       }
+      const asksForHumanInput =
+        msg.eventType === 'tool_call' &&
+        (msg.toolName === 'ask_question' || msg.toolName === 'ask_user');
       setSessions((prev) =>
         prev.map((s) =>
           s.id === msg.sessionId
@@ -1566,7 +1652,7 @@ export default function App() {
                 ...s,
                 messageCount: (s.messageCount || 0) + 1,
                 status:
-                  msg.eventType === 'tool_call' && (msg.toolName === 'ask_question' || msg.toolName === 'ask_user')
+                  asksForHumanInput
                     ? 'waiting_for_input'
                     : (msg.eventType === 'prompt' || msg.eventType === 'thought' || msg.eventType === 'tool_call')
                     ? 'thinking'
@@ -1578,6 +1664,9 @@ export default function App() {
             : s
         )
       );
+      if (asksForHumanInput || msg.eventType === 'prompt') {
+        void fetchDashboardOverview();
+      }
     };
 
     const handleSessionCreated = (session: AgentSession) => {
@@ -1596,6 +1685,7 @@ export default function App() {
           setSelectedAgentId(session.driverId || session.creatorAgentId || null);
         }
       }
+      void fetchDashboardOverview();
     };
 
     const handleSessionDeleted = (data: { id?: string; sessionId?: string; personaId?: string; driverId?: string }) => {
@@ -1616,6 +1706,7 @@ export default function App() {
         }
         return cur;
       });
+      void fetchDashboardOverview();
     };
 
     const handleSessionUpdated = (updatedSession?: AgentSession) => {
@@ -1634,6 +1725,9 @@ export default function App() {
       setAgents([]);
       setPersonas([]);
       setSessions([]);
+      setProjects([]);
+      setJobsByProject({});
+      setDashboardOverview(null);
       setEvents([]);
       setArtifacts([]);
       setSelectedPersonaId(null);
@@ -1708,16 +1802,6 @@ export default function App() {
       });
     };
 
-    const handleJobMessageAdded = (msg: JobMessage) => {
-      setJobMessages((prev) => {
-        if (msg.jobId === selectedJobIdRef.current) {
-          if (prev.some((m) => m.id === msg.id)) return prev;
-          return [...prev, msg];
-        }
-        return prev;
-      });
-    };
-
     const handleJobTaskUpdated = (data: { jobId: string; tasks: JobTask[] }) => {
       if (data.jobId === selectedJobIdRef.current) {
         const unique = (data.tasks || []).filter(
@@ -1736,6 +1820,16 @@ export default function App() {
         }
         return next;
       });
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.map((j) =>
+                j.id === data.jobId ? { ...j, tasks: data.tasks } : j
+              )
+            }
+          : prev
+      );
     };
 
     const handleProgressHeartbeatUpdated = (data: {
@@ -1762,6 +1856,26 @@ export default function App() {
         }
         return next;
       });
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.map((j) =>
+                j.id === data.jobId
+                  ? {
+                      ...j,
+                      progressHeartbeat:
+                        data.progressHeartbeat !== undefined ? data.progressHeartbeat : j.progressHeartbeat,
+                      currentTaskId:
+                        data.currentTaskId !== undefined ? data.currentTaskId : j.currentTaskId,
+                      lifecycleStatus:
+                        data.lifecycleStatus !== undefined ? (data.lifecycleStatus as any) : j.lifecycleStatus
+                    }
+                  : j
+              )
+            }
+          : prev
+      );
     };
 
     const handleJobCreated = (job: ProjectJob) => {
@@ -1769,6 +1883,15 @@ export default function App() {
         ...prev,
         [job.projectId]: [job, ...(prev[job.projectId] || []).filter((j) => j.id !== job.id)]
       }));
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: [job, ...prev.recentJobs.filter((j) => j.id !== job.id)]
+            }
+          : prev
+      );
+      void fetchDashboardOverview();
     };
 
     const handleJobUpdated = (job: ProjectJob) => {
@@ -1776,6 +1899,17 @@ export default function App() {
         ...prev,
         [job.projectId]: (prev[job.projectId] || []).map((j) => (j.id === job.id ? job : j))
       }));
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.some((j) => j.id === job.id)
+                ? prev.recentJobs.map((j) => (j.id === job.id ? { ...j, ...job } : j))
+                : [job, ...prev.recentJobs]
+            }
+          : prev
+      );
+      void fetchDashboardOverview();
     };
 
     const handleJobDeleted = (data: { id: string; projectId: string }) => {
@@ -1784,19 +1918,60 @@ export default function App() {
         [data.projectId]: (prev[data.projectId] || []).filter((j) => j.id !== data.id)
       }));
       setSelectedJobId((cur) => (cur === data.id ? null : cur));
+      setDashboardOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              recentJobs: prev.recentJobs.filter((j) => j.id !== data.id),
+              attentionItems: prev.attentionItems.filter((item) => item.jobId !== data.id)
+            }
+          : prev
+      );
+      void fetchDashboardOverview();
     };
 
     const handleProjectCreated = (proj: Project) => {
       setProjects((prev) => [proj, ...prev.filter((p) => p.id !== proj.id)]);
+      void fetchDashboardOverview();
     };
 
     const handleProjectUpdated = (proj: Project) => {
       setProjects((prev) => prev.map((p) => (p.id === proj.id ? proj : p)));
+      void fetchDashboardOverview();
     };
 
     const handleProjectDeleted = (data: { id: string }) => {
       setProjects((prev) => prev.filter((p) => p.id !== data.id));
       setSelectedProjectId((cur) => (cur === data.id ? null : cur));
+      void fetchDashboardOverview();
+    };
+
+    const handleTimelineCardUpdated = () => {
+      void fetchDashboardOverview();
+    };
+
+    const handlePersonaRunnerStatusChanged = (data: {
+      personaId?: string;
+      driverId?: string;
+      status?: string;
+    }) => {
+      if (data?.personaId && data.status) {
+        const targetId = data.personaId.toLowerCase();
+        setPersonas((prev) =>
+          prev.map((p) =>
+            p.id.toLowerCase() === targetId ? { ...p, driverStatus: data.status } : p
+          )
+        );
+      }
+      if (data?.driverId && data.status) {
+        const targetDriverId = data.driverId.toLowerCase();
+        setAgents((prev) =>
+          prev.map((a) =>
+            a.id.toLowerCase() === targetDriverId ? { ...a, status: data.status } : a
+          )
+        );
+      }
+      void fetchAllData();
     };
 
     const handleCommandOutput = (data: { sessionId?: string; commandId?: string; output?: string }) => {
@@ -1826,6 +2001,16 @@ export default function App() {
       attentionBellRef.current?.pushResolved(payload?.jobId);
     };
 
+    const handleMcpUpdated = () => {
+      setMcpCatalogRefreshTick((t) => t + 1);
+      if (api.getMcpServers) {
+        void api.getMcpServers().then(setMcpServers).catch(() => {});
+      }
+      if (api.getPersonas) {
+        void api.getPersonas().then(setPersonas).catch(() => {});
+      }
+    };
+
     connection.on('ReceiveMessage', handleReceiveMessage);
     connection.on('CommandOutput', handleCommandOutput);
     connection.on('SessionCreated', handleSessionCreated);
@@ -1842,19 +2027,31 @@ export default function App() {
     connection.on('PersonaCreated', handleSessionUpdated);
     connection.on('PersonaUpdated', handleSessionUpdated);
     connection.on('PersonaDeleted', handleSessionUpdated);
+    connection.on('McpServerCreated', handleMcpUpdated);
+    connection.on('McpServerUpdated', handleMcpUpdated);
+    connection.on('McpServerDeleted', handleMcpUpdated);
+    connection.on('PersonaMcpServerAssigned', handleMcpUpdated);
+    connection.on('PersonaMcpServerUpdated', handleMcpUpdated);
+    connection.on('PersonaMcpServerRemoved', handleMcpUpdated);
     connection.on('MeshReset', handleMeshReset);
-    connection.on('JobMessageAdded', handleJobMessageAdded);
-    connection.on('JobMessageCreated', handleJobMessageAdded);
     connection.on('JobTaskUpdated', handleJobTaskUpdated);
+    connection.on('ChecklistUpdated', handleJobTaskUpdated);
     connection.on('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
     connection.on('JobCreated', handleJobCreated);
     connection.on('JobUpdated', handleJobUpdated);
     connection.on('JobDeleted', handleJobDeleted);
+    connection.on('JobStaged', handleTimelineCardUpdated);
     connection.on('ProjectCreated', handleProjectCreated);
     connection.on('ProjectUpdated', handleProjectUpdated);
     connection.on('ProjectDeleted', handleProjectDeleted);
     connection.on(AttentionEvent.Needed, handleAttentionNeeded);
     connection.on(AttentionEvent.Resolved, handleAttentionResolved);
+    connection.on('ProjectPersonaAssigned', handleTimelineCardUpdated);
+    connection.on('ProjectPersonaRemoved', handleTimelineCardUpdated);
+    connection.on('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
+    connection.on('JobApprovalUpdated', handleTimelineCardUpdated);
+    connection.on('JobHandoffUpdated', handleTimelineCardUpdated);
+    connection.on('PersonaRunnerStatusChanged', handlePersonaRunnerStatusChanged);
 
     return () => {
       connection.off('ReceiveMessage', handleReceiveMessage);
@@ -1873,21 +2070,33 @@ export default function App() {
       connection.off('PersonaCreated', handleSessionUpdated);
       connection.off('PersonaUpdated', handleSessionUpdated);
       connection.off('PersonaDeleted', handleSessionUpdated);
+      connection.off('McpServerCreated', handleMcpUpdated);
+      connection.off('McpServerUpdated', handleMcpUpdated);
+      connection.off('McpServerDeleted', handleMcpUpdated);
+      connection.off('PersonaMcpServerAssigned', handleMcpUpdated);
+      connection.off('PersonaMcpServerUpdated', handleMcpUpdated);
+      connection.off('PersonaMcpServerRemoved', handleMcpUpdated);
       connection.off('MeshReset', handleMeshReset);
-      connection.off('JobMessageAdded', handleJobMessageAdded);
-      connection.off('JobMessageCreated', handleJobMessageAdded);
       connection.off('JobTaskUpdated', handleJobTaskUpdated);
+      connection.off('ChecklistUpdated', handleJobTaskUpdated);
       connection.off('ProgressHeartbeatUpdated', handleProgressHeartbeatUpdated);
       connection.off('JobCreated', handleJobCreated);
       connection.off('JobUpdated', handleJobUpdated);
       connection.off('JobDeleted', handleJobDeleted);
+      connection.off('JobStaged', handleTimelineCardUpdated);
       connection.off('ProjectCreated', handleProjectCreated);
       connection.off('ProjectUpdated', handleProjectUpdated);
       connection.off('ProjectDeleted', handleProjectDeleted);
       connection.off(AttentionEvent.Needed, handleAttentionNeeded);
       connection.off(AttentionEvent.Resolved, handleAttentionResolved);
+      connection.off('ProjectPersonaAssigned', handleTimelineCardUpdated);
+      connection.off('ProjectPersonaRemoved', handleTimelineCardUpdated);
+      connection.off('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
+      connection.off('JobApprovalUpdated', handleTimelineCardUpdated);
+      connection.off('JobHandoffUpdated', handleTimelineCardUpdated);
+      connection.off('PersonaRunnerStatusChanged', handlePersonaRunnerStatusChanged);
     };
-  }, [connection, selectedSessionId, fetchAllData, fetchSessionEvents, fetchSessionArtifacts]);
+  }, [connection, selectedSessionId, fetchAllData, fetchDashboardOverview, fetchSessionEvents, fetchSessionArtifacts]);
 
   const handleResetMesh = async () => {
     setIsActionPending(true);
@@ -1896,6 +2105,9 @@ export default function App() {
       setAgents([]);
       setPersonas([]);
       setSessions([]);
+      setProjects([]);
+      setJobsByProject({});
+      setDashboardOverview(null);
       setEvents([]);
       setSelectedPersonaId(null);
       setSelectedAgentId(null);
@@ -2157,7 +2369,13 @@ export default function App() {
 
   // Sync / validate model, mode, tier when agent changes
   useEffect(() => {
-    if (newSessionModel && availableModels.length > 0 && !availableModels.some((m) => m.id === newSessionModel) && currentRuntimeCaps?.adapter !== 'openai') {
+    if (
+      newSessionModel &&
+      availableModels.length > 0 &&
+      !availableModels.some((m) => m.id === newSessionModel) &&
+      currentRuntimeCaps?.adapter !== 'openai' &&
+      currentRuntimeCaps?.adapter !== 'openrouter'
+    ) {
       setNewSessionModel('');
     }
     if (newSessionMode && availableModes.length > 0 && !availableModes.some((m) => m.id === newSessionMode)) {
@@ -2938,6 +3156,47 @@ export default function App() {
   };
 
   const handleTestOpenAi = async () => {
+    if (newAgentType === 'openrouter') {
+      setIsTestingOpenAi(true);
+      setOpenAiTestResult(null);
+      try {
+        const res = await api.testOpenRouterServer({
+          endpoint: newAgentEndpoint.trim() || undefined,
+          apiKey: newAgentApiKey.trim() || undefined
+        });
+        if (res.success) {
+          const extras: string[] = [];
+          if (res.keyLabel) extras.push(res.keyLabel);
+          if (res.isFreeTier) extras.push('free tier');
+          if (typeof res.limitRemaining === 'number') extras.push(`$${res.limitRemaining.toFixed(2)} left`);
+          const extraSuffix = extras.length > 0 ? ` (${extras.join(', ')})` : '';
+          setOpenAiTestResult({
+            success: true,
+            message: `Verified OpenRouter key! Found ${res.models.length} tool-capable model(s)${extraSuffix}.`,
+            models: res.models
+          });
+          if (res.models.length > 0 && !newAgentModel) {
+            setNewAgentModel(res.models[0].id);
+          }
+        } else {
+          setOpenAiTestResult({
+            success: false,
+            message: res.error || 'Failed to verify OpenRouter connection.',
+            models: []
+          });
+        }
+      } catch (err) {
+        setOpenAiTestResult({
+          success: false,
+          message: err instanceof Error ? err.message : 'OpenRouter connection test failed.',
+          models: []
+        });
+      } finally {
+        setIsTestingOpenAi(false);
+      }
+      return;
+    }
+
     if (!newAgentEndpoint.trim()) return;
     setIsTestingOpenAi(true);
     setOpenAiTestResult(null);
@@ -2950,7 +3209,7 @@ export default function App() {
         setOpenAiTestResult({
           success: true,
           message: `Connected successfully! Found ${res.models.length} model(s).`,
-          models: res.models
+          models: res.models.map((m) => ({ id: m.id, name: m.name, efforts: [] }))
         });
         if (res.models.length > 0 && !newAgentModel) {
           setNewAgentModel(res.models[0].id);
@@ -3010,11 +3269,25 @@ export default function App() {
           models: openAiTestResult?.models || (newAgentModel.trim() ? [{ id: newAgentModel.trim(), name: newAgentModel.trim() }] : [])
         };
         capabilitiesJson = JSON.stringify(caps);
+      } else if (newAgentType === 'openrouter') {
+        const defaultModelId = newAgentModel.trim() || 'openrouter/auto';
+        const caps = {
+          adapter: 'openrouter',
+          endpoint: newAgentEndpoint.trim() || 'https://openrouter.ai/api/v1',
+          apiKey: newAgentApiKey.trim() || undefined,
+          defaultModel: defaultModelId,
+          models:
+            openAiTestResult?.models && openAiTestResult.models.length > 0
+              ? openAiTestResult.models.map((m) => ({ id: m.id, name: m.name }))
+              : [{ id: defaultModelId, name: defaultModelId }]
+        };
+        capabilitiesJson = JSON.stringify(caps);
       }
 
       const created = await api.upsertAgent({
         id: newAgentId.trim().toLowerCase(),
         name: newAgentName.trim(),
+        ...(newAgentType === 'openrouter' ? { runtimeType: 4 } : {}),
         role: newAgentRole.trim() || 'Autonomous Agent',
         status: 'offline',
         capabilitiesJson
@@ -3108,6 +3381,9 @@ export default function App() {
   }, [currentRuntimeCaps, selectedSessionMetadata?.model]);
 
   const sessionAvailableEfforts = useMemo(() => {
+    if (currentRuntimeCaps?.adapter === 'openrouter' && sessionModelCap) {
+      return sessionModelCap.efforts;
+    }
     if (sessionModelCap && sessionModelCap.efforts.length > 0) return sessionModelCap.efforts;
     const allEfforts = Array.from(new Set(currentRuntimeCaps?.models.flatMap((m) => m.efforts) || []));
     return allEfforts.length > 0 ? allEfforts : ['low', 'medium', 'high'];
@@ -3131,8 +3407,8 @@ export default function App() {
       {/* Top Bar */}
       <header className="h-14 border-b border-slate-800/80 bg-slate-900/70 backdrop-blur px-3 sm:px-5 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2 sm:gap-3 min-w-0">
-          {/* Mobile Back Button (only shown in mobile detail view) */}
-          {isMobile && isMobileDetailView && (
+          {/* Mobile Back Button (only shown in mobile detail view on split-pane tabs) */}
+          {isMobile && isMobileDetailView && activeTab !== 'dashboard' && (
             <button
               type="button"
               onClick={handleMobileBack}
@@ -3183,6 +3459,33 @@ export default function App() {
             <div className="flex items-center gap-1 ml-4 bg-slate-950/80 border border-slate-800 rounded-xl p-1">
               <button
                 type="button"
+                data-testid="desktop-nav-dashboard"
+                onClick={() => {
+                  hasUserSwitchedTabRef.current = true;
+                  setActiveTab('dashboard');
+                  setIsMobileDetailView(false);
+                }}
+                className={`px-3 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                  activeTab === 'dashboard'
+                    ? 'bg-sky-600/25 text-sky-300 border border-sky-500/40 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                }`}
+              >
+                <LayoutDashboard className="w-3.5 h-3.5" />
+                <span>Dashboard</span>
+                {dashboardAttentionCount > 0 && (
+                  <span
+                    data-testid="header-dashboard-attention-badge"
+                    className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/35"
+                  >
+                    {dashboardAttentionCount}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                data-testid="desktop-nav-projects"
                 onClick={() => {
                   hasUserSwitchedTabRef.current = true;
                   setActiveTab('projects');
@@ -3302,8 +3605,105 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Split View */}
+      {/* Main View */}
       <div className="flex-1 flex overflow-hidden">
+        {activeTab === 'dashboard' ? (
+          <ErrorBoundary fallbackTitle="Dashboard Error">
+            <MainDashboard
+              statusData={statusData}
+              apiError={apiError}
+              signalRConnected={signalRConnected}
+              isLoading={isLoading}
+              overview={dashboardOverview}
+              projects={projects}
+              jobsByProject={jobsByProject}
+              personas={personas}
+              agents={agents}
+              sessions={sessions}
+              agentUsages={agentUsages}
+              onRefresh={fetchAllData}
+              onNavigateTab={(tab) => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab(tab);
+                setIsMobileDetailView(false);
+              }}
+              onSelectJob={(projectId, jobId) => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab('projects');
+                handleSelectJob(projectId, jobId);
+              }}
+              onSelectProject={(projectId) => {
+                hasUserSwitchedTabRef.current = true;
+                setSelectedProjectId(projectId);
+                setActiveTab('projects');
+                setIsMobileDetailView(false);
+              }}
+              onSelectSession={(session) => {
+                hasUserSwitchedTabRef.current = true;
+                if (session.personaId) {
+                  setSelectedPersonaId(session.personaId);
+                  setSelectedAgentId(session.driverId || session.creatorAgentId || null);
+                  setActiveTab('personas');
+                } else {
+                  if (session.driverId || session.creatorAgentId) {
+                    setSelectedAgentId(session.driverId || session.creatorAgentId || null);
+                  }
+                  setActiveTab('drivers');
+                }
+                setSelectedSessionId(session.id);
+                setIsCreatingSession(false);
+                setIsMobileDetailView(true);
+              }}
+              onSelectPersona={(persona) => {
+                hasUserSwitchedTabRef.current = true;
+                setSelectedPersonaId(persona.id);
+                setSelectedAgentId(persona.driverId);
+                const pSessions = personaSessionsMap.get(persona.id) || [];
+                if (pSessions.length > 0 && !pSessions.some((s) => s.id === selectedSessionId)) {
+                  setSelectedSessionId(pSessions[0].id);
+                }
+                setIsCreatingSession(false);
+                setActiveTab('personas');
+                setIsMobileDetailView(false);
+              }}
+              onStartPersonaSession={(persona) => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab('personas');
+                startNewSessionWithPersona(persona);
+              }}
+              onSelectDriver={(agent) => {
+                hasUserSwitchedTabRef.current = true;
+                setSelectedAgentId(agent.id);
+                const aSessions = agentSessionsMap.get(agent.id) || [];
+                if (aSessions.length > 0 && !aSessions.some((s) => s.id === selectedSessionId)) {
+                  setSelectedSessionId(aSessions[0].id);
+                }
+                setIsCreatingSession(false);
+                setActiveTab('drivers');
+                setIsMobileDetailView(false);
+              }}
+              onOpenDriverUsage={(agent) => {
+                void handleOpenUsageModal(agent);
+              }}
+              onOpenNewProjectModal={() => {
+                setEditingProject(null);
+                setShowProjectModal(true);
+              }}
+              onOpenNewJobModal={(proj) => {
+                setJobModalProject(proj);
+                setShowJobModal(true);
+              }}
+              onOpenCreatePersonaModal={() => openCreatePersonaModal()}
+              onOpenRegisterDriverModal={() => {
+                hasUserSwitchedTabRef.current = true;
+                setActiveTab('drivers');
+                setIsMobileDetailView(false);
+                setShowRegisterModal(true);
+              }}
+            />
+          </ErrorBoundary>
+        ) : (
+          <>
         {/* Left Sidebar: Projects, Personas or Drivers & Their Sessions */}
         <aside
           className={`${
@@ -3336,21 +3736,33 @@ export default function App() {
             />
           ) : activeTab === 'personas' ? (
             <>
-              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Users className="w-4 h-4 text-sky-400" />
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Users className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400 truncate">
                     Personas ({personas.length})
                   </span>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => openCreatePersonaModal()}
-                  className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>New Persona</span>
-                </button>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowMcpCatalogModal(true)}
+                    data-testid="open-mcp-catalog-btn"
+                    title="Manage shared MCP server catalog"
+                    className="text-xs flex items-center gap-1 text-slate-300 hover:text-sky-300 font-medium px-2 py-1 rounded bg-slate-800/60 hover:bg-slate-800 border border-slate-700/70 transition cursor-pointer"
+                  >
+                    <Server className="w-3 h-3 text-sky-400" />
+                    <span>MCP ({mcpServers.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openCreatePersonaModal()}
+                    className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>New Persona</span>
+                  </button>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-3 space-y-4 pb-24 sm:pb-4">
@@ -3459,11 +3871,33 @@ export default function App() {
                                     <span>GitHub</span>
                                   </span>
                                 )}
+                                {(persona.mcpServerCount ?? 0) > 0 && (
+                                  <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-950/50 border border-sky-500/30 text-[10px] font-mono text-sky-300"
+                                    title={`${persona.mcpServerCount} MCP server(s) assigned`}
+                                  >
+                                    <Plug className="w-2.5 h-2.5 text-sky-400" />
+                                    <span>{persona.mcpServerCount} MCP</span>
+                                  </span>
+                                )}
                               </div>
                             </div>
                           </div>
 
                           <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setManagingPersonaMcp(persona);
+                              }}
+                              className="p-1 rounded-md text-slate-400 hover:text-sky-300 hover:bg-slate-800 transition cursor-pointer"
+                              title={`Configure MCP servers for ${persona.name}`}
+                              aria-label={`Configure MCP servers for ${persona.name}`}
+                              data-testid={`persona-mcp-btn-${persona.id}`}
+                            >
+                              <Plug className="w-3 h-3 text-sky-400" />
+                            </button>
                             <button
                               type="button"
                               onClick={(e) => {
@@ -3564,20 +3998,31 @@ export default function App() {
             </>
           ) : (
             <>
-              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Bot className="w-4 h-4 text-sky-400" />
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+              <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Bot className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400 truncate">
                     Connected Drivers ({agents.length})
                   </span>
                 </div>
-                <button
-                  onClick={() => setShowRegisterModal((v) => !v)}
-                  className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Add Driver</span>
-                </button>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowMcpCatalogModal(true)}
+                    title="Manage shared MCP server catalog"
+                    className="text-xs flex items-center gap-1 text-slate-300 hover:text-sky-300 font-medium px-2 py-1 rounded bg-slate-800/60 hover:bg-slate-800 border border-slate-700/70 transition cursor-pointer"
+                  >
+                    <Server className="w-3 h-3 text-sky-400" />
+                    <span>MCP ({mcpServers.length})</span>
+                  </button>
+                  <button
+                    onClick={() => setShowRegisterModal((v) => !v)}
+                    className="text-xs flex items-center gap-1 text-sky-400 hover:text-sky-300 font-medium px-2 py-1 rounded hover:bg-slate-800/60 transition cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add Driver</span>
+                  </button>
+                </div>
               </div>
 
               {/* Inline Register Driver Drawer */}
@@ -3596,15 +4041,25 @@ export default function App() {
                       onChange={(e) => {
                         const t = e.target.value as any;
                         setNewAgentType(t);
-                        if (t === 'openai' && !newAgentId) {
-                          setNewAgentId('ollama-local');
-                          setNewAgentName('Local Ollama Server');
+                        setOpenAiTestResult(null);
+                        if (t === 'openai') {
+                          if (!newAgentId || newAgentId === 'openrouter') setNewAgentId('ollama-local');
+                          if (!newAgentName || newAgentName === 'OpenRouter') setNewAgentName('Local Ollama Server');
+                          if (!newAgentEndpoint || newAgentEndpoint === 'https://openrouter.ai/api/v1') setNewAgentEndpoint('http://localhost:11434/v1');
+                          if (newAgentModel === 'openrouter/auto') setNewAgentModel('');
+                          setNewAgentRole('Autonomous AI Engineer');
+                        } else if (t === 'openrouter') {
+                          if (!newAgentId || newAgentId === 'ollama-local') setNewAgentId('openrouter');
+                          if (!newAgentName || newAgentName === 'Local Ollama Server') setNewAgentName('OpenRouter');
+                          if (!newAgentEndpoint || newAgentEndpoint === 'http://localhost:11434/v1') setNewAgentEndpoint('https://openrouter.ai/api/v1');
+                          if (!newAgentModel) setNewAgentModel('openrouter/auto');
                           setNewAgentRole('Autonomous AI Engineer');
                         }
                       }}
                       className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 cursor-pointer"
                     >
                       <option value="openai">OpenAI Compatible Server (Ollama / vLLM / LM Studio / OpenAI)</option>
+                      <option value="openrouter">OpenRouter (300+ Cloud Models)</option>
                       <option value="agy">Antigravity CLI (agy)</option>
                       <option value="claude">Claude Code CLI</option>
                       <option value="copilot">GitHub Copilot CLI</option>
@@ -3635,6 +4090,82 @@ export default function App() {
                     onChange={(e) => setNewAgentRole(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
                   />
+
+                  {newAgentType === 'openrouter' && (
+                    <div className="space-y-2 p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">API Key</label>
+                        <input
+                          type="password"
+                          aria-label="OpenRouter API Key"
+                          placeholder="sk-or-v1-... (or uses host OPENROUTER_API_KEY)"
+                          value={newAgentApiKey}
+                          onChange={(e) => setNewAgentApiKey(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">Base URL Override (Optional)</label>
+                        <input
+                          type="text"
+                          aria-label="OpenRouter Base URL"
+                          placeholder="https://openrouter.ai/api/v1"
+                          value={newAgentEndpoint}
+                          onChange={(e) => setNewAgentEndpoint(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500"
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={handleTestOpenAi}
+                          disabled={isTestingOpenAi}
+                          className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-400 font-medium text-[11px] flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                        >
+                          {isTestingOpenAi && <RefreshCw className="w-3 h-3 animate-spin" />}
+                          <span>Test &amp; Fetch Models</span>
+                        </button>
+                      </div>
+
+                      {openAiTestResult && (
+                        <div
+                          className={`p-2 rounded text-[11px] ${
+                            openAiTestResult.success
+                              ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/40'
+                              : 'bg-rose-950/40 text-rose-300 border border-rose-800/40'
+                          }`}
+                        >
+                          {openAiTestResult.message}
+                        </div>
+                      )}
+
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">Default Model</label>
+                        {openAiTestResult?.models && openAiTestResult.models.length > 0 ? (
+                          <SearchableModelPicker
+                            ariaLabel="Fetched OpenRouter Model Selection"
+                            models={openAiTestResult.models}
+                            value={newAgentModel}
+                            onChange={setNewAgentModel}
+                            defaultOptionLabel="openrouter/auto (default)"
+                            allowCustom
+                            compact
+                          />
+                        ) : (
+                          <input
+                            type="text"
+                            aria-label="Custom Model Input"
+                            placeholder="e.g. openrouter/auto, anthropic/claude-sonnet-4"
+                            value={newAgentModel}
+                            onChange={(e) => setNewAgentModel(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 text-[11px] focus:outline-none focus:border-sky-500 font-mono"
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                   {newAgentType === 'openai' && (
                     <div className="space-y-2 p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
@@ -4048,11 +4579,9 @@ export default function App() {
                       project={activeProj}
                       job={activeJ}
                       tasks={jobTasks}
-                      messages={jobMessages}
                       personas={personas}
                       sessions={sessions}
                       onStartJob={handleStartJob}
-                      onSendMessage={handleSendJobMessage}
                       onAddTask={handleAddTask}
                       onToggleTask={handleToggleTask}
                       onUpdateTask={handleUpdateTask}
@@ -4062,6 +4591,7 @@ export default function App() {
                       onArchiveJob={handleArchiveJob}
                       onReopenJob={handleReopenJob}
                       onResetJob={handleResetJob}
+                      onRecoverJob={(note) => handleRecoverJob(activeJ.id, note)}
                       onOpenLightbox={setLightboxAttachment}
                       onStopTurn={handleStopSession}
                       onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}
@@ -4380,30 +4910,48 @@ export default function App() {
                       <label className="block text-[11px] font-medium text-slate-400">
                         Model
                       </label>
-                      <select
-                        aria-label="New Session Model"
-                        value={newSessionModel}
-                        onChange={(e) => setNewSessionModel(e.target.value)}
-                        disabled={availableModels.length === 0}
-                        title={capabilitySourceLabel(currentRuntimeCaps)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        <option value="">Default Model</option>
-                        {availableModels.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.name || m.id}
-                          </option>
-                        ))}
-                      </select>
-                      {currentRuntimeCaps?.adapter === 'openai' && (
-                        <input
-                          type="text"
-                          aria-label="Custom Session Model Input"
-                          placeholder="Or custom model name..."
+                      {currentRuntimeCaps?.adapter === 'openrouter' || availableModels.length > 25 ? (
+                        <SearchableModelPicker
+                          ariaLabel="New Session Model"
+                          models={availableModels}
                           value={newSessionModel}
-                          onChange={(e) => setNewSessionModel(e.target.value)}
-                          className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                          onChange={setNewSessionModel}
+                          defaultOptionLabel="Default Model"
+                          allowCustom={
+                            currentRuntimeCaps?.adapter === 'openai' ||
+                            currentRuntimeCaps?.adapter === 'openrouter'
+                          }
+                          disabled={availableModels.length === 0}
+                          title={capabilitySourceLabel(currentRuntimeCaps)}
                         />
+                      ) : (
+                        <>
+                          <select
+                            aria-label="New Session Model"
+                            value={newSessionModel}
+                            onChange={(e) => setNewSessionModel(e.target.value)}
+                            disabled={availableModels.length === 0}
+                            title={capabilitySourceLabel(currentRuntimeCaps)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <option value="">Default Model</option>
+                            {availableModels.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                {m.name || m.id}
+                              </option>
+                            ))}
+                          </select>
+                          {currentRuntimeCaps?.adapter === 'openai' && (
+                            <input
+                              type="text"
+                              aria-label="Custom Session Model Input"
+                              placeholder="Or custom model name..."
+                              value={newSessionModel}
+                              onChange={(e) => setNewSessionModel(e.target.value)}
+                              className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                            />
+                          )}
+                        </>
                       )}
                       {/* Provenance, so a bundled preset is never mistaken for a driver answer. */}
                       {availableModels.length > 0 ? (
@@ -4609,7 +5157,10 @@ export default function App() {
                     <div className="relative inline-block">
                       <button
                         type="button"
-                        onClick={() => setEditingSessionControl((prev) => (prev === 'model' ? null : 'model'))}
+                        onClick={() => {
+                          setSessionModelFilter('');
+                          setEditingSessionControl((prev) => (prev === 'model' ? null : 'model'));
+                        }}
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
                         title="Click to change model for this session"
                       >
@@ -4617,32 +5168,97 @@ export default function App() {
                         <span>{selectedSessionMetadata?.model || 'default model'}</span>
                         <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
                       </button>
-                      {editingSessionControl === 'model' && (
-                        <div className="absolute left-0 top-full mt-1.5 z-40 w-64 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
-                          <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
-                            Switch Session Model
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateSessionControl({ model: '' })}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
-                          >
-                            <span>Default Model</span>
-                            {!selectedSessionMetadata?.model && <Check className="w-3 h-3 text-sky-400" />}
-                          </button>
-                          {availableModels.map((m) => (
+                      {editingSessionControl === 'model' && (() => {
+                        const isSearchablePopover =
+                          currentRuntimeCaps?.adapter === 'openrouter' || availableModels.length > 25;
+                        const allowCustomSessionModel =
+                          currentRuntimeCaps?.adapter === 'openai' ||
+                          currentRuntimeCaps?.adapter === 'openrouter';
+                        const q = sessionModelFilter.trim().toLowerCase();
+                        const visibleModels = isSearchablePopover && q
+                          ? availableModels.filter(
+                              (m) =>
+                                m.id.toLowerCase().includes(q) ||
+                                (m.name && m.name.toLowerCase().includes(q))
+                            )
+                          : availableModels;
+                        const hasExactCustom =
+                          allowCustomSessionModel &&
+                          Boolean(sessionModelFilter.trim()) &&
+                          !availableModels.some((m) => m.id.toLowerCase() === q);
+                        return (
+                          <div className={`absolute left-0 top-full mt-1.5 z-40 ${isSearchablePopover ? 'w-80' : 'w-64'} bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-72 overflow-y-auto`}>
+                            <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                              Switch Session Model
+                            </div>
+                            {isSearchablePopover && (
+                              <div className="px-1.5 pb-1.5">
+                                <input
+                                  type="text"
+                                  autoFocus
+                                  aria-label="Filter session models"
+                                  value={sessionModelFilter}
+                                  onChange={(e) => setSessionModelFilter(e.target.value)}
+                                  placeholder="Search models or enter slug..."
+                                  className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                                />
+                              </div>
+                            )}
                             <button
-                              key={m.id}
                               type="button"
-                              onClick={() => handleUpdateSessionControl({ model: m.id })}
+                              onClick={() => handleUpdateSessionControl({ model: '' })}
                               className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
                             >
-                              <span className="truncate">{m.name || m.id}</span>
-                              {selectedSessionMetadata?.model === m.id && <Check className="w-3 h-3 text-sky-400" />}
+                              <span>Default Model</span>
+                              {!selectedSessionMetadata?.model && <Check className="w-3 h-3 text-sky-400" />}
                             </button>
-                          ))}
-                        </div>
-                      )}
+                            {visibleModels.map((m) => {
+                              const ctxBadge =
+                                m.maxContextTokens && m.maxContextTokens > 0
+                                  ? m.maxContextTokens >= 1_000_000
+                                    ? `${Number((m.maxContextTokens / 1_000_000).toFixed(1))}M`
+                                    : `${Math.round(m.maxContextTokens / 1000)}k`
+                                  : null;
+                              const priceBadge =
+                                typeof m.promptPricePerMillion === 'number' &&
+                                typeof m.completionPricePerMillion === 'number'
+                                  ? m.promptPricePerMillion === 0 && m.completionPricePerMillion === 0
+                                    ? 'free'
+                                    : `$${Number(m.promptPricePerMillion.toFixed(2))}/$${Number(m.completionPricePerMillion.toFixed(2))}`
+                                  : null;
+                              return (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  onClick={() => handleUpdateSessionControl({ model: m.id })}
+                                  className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between gap-2 cursor-pointer"
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <div className="truncate">{m.name || m.id}</div>
+                                    {isSearchablePopover && (ctxBadge || priceBadge) && (
+                                      <div className="flex items-center gap-1 mt-0.5 text-[10px] font-mono text-slate-400">
+                                        {ctxBadge && <span>{ctxBadge}</span>}
+                                        {ctxBadge && priceBadge && <span>·</span>}
+                                        {priceBadge && <span>{priceBadge}</span>}
+                                      </div>
+                                    )}
+                                  </div>
+                                  {selectedSessionMetadata?.model === m.id && <Check className="w-3 h-3 text-sky-400 shrink-0" />}
+                                </button>
+                              );
+                            })}
+                            {hasExactCustom && (
+                              <button
+                                type="button"
+                                onClick={() => handleUpdateSessionControl({ model: sessionModelFilter.trim() })}
+                                className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-sky-950/60 text-sky-300 font-mono border border-dashed border-sky-500/40 mt-1 cursor-pointer"
+                              >
+                                Use custom: {sessionModelFilter.trim()}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {/* Effort Selector Badge & Popover */}
@@ -4820,20 +5436,34 @@ export default function App() {
                       </div>
                     )}
 
-                    {selectedSessionMetadata?.cumulativeUsage?.totalTokens ? (
-                      <span
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30"
-                        title={`In: ${selectedSessionMetadata.cumulativeUsage.inputTokens || 0} | Out: ${selectedSessionMetadata.cumulativeUsage.outputTokens || 0} | Think: ${selectedSessionMetadata.cumulativeUsage.thinkingTokens || 0}`}
-                      >
-                        <Zap className="w-3 h-3 text-sky-400 shrink-0" />
-                        <span>
-                          {selectedSessionMetadata.cumulativeUsage.totalTokens.toLocaleString()} tokens
-                          {selectedSessionMetadata.cumulativeUsage.totalDurationSeconds
-                            ? ` (${selectedSessionMetadata.cumulativeUsage.totalDurationSeconds.toFixed(1)}s)`
-                            : ''}
+                    {selectedSessionMetadata?.cumulativeUsage?.totalTokens ? (() => {
+                      const cu = selectedSessionMetadata.cumulativeUsage;
+                      const formattedCost = formatUsdCost(cu.costUsd);
+                      const cached = cu.cachedTokens || 0;
+                      const titleParts = [
+                        `In: ${cu.inputTokens || 0}`,
+                        `Out: ${cu.outputTokens || 0}`,
+                        `Think: ${cu.thinkingTokens || 0}`,
+                        cached > 0 ? `Cached: ${cached.toLocaleString()}` : null,
+                        formattedCost ? `Cost: ${formattedCost}` : null
+                      ].filter(Boolean);
+                      return (
+                        <span
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30"
+                          title={titleParts.join(' | ')}
+                        >
+                          <Zap className="w-3 h-3 text-sky-400 shrink-0" />
+                          <span>
+                            {cu.totalTokens.toLocaleString()} tokens
+                            {cached > 0 ? ` (${cached.toLocaleString()} cached)` : ''}
+                            {formattedCost ? ` · ${formattedCost}` : ''}
+                            {cu.totalDurationSeconds
+                              ? ` (${cu.totalDurationSeconds.toFixed(1)}s)`
+                              : ''}
+                          </span>
                         </span>
-                      </span>
-                    ) : null}
+                      );
+                    })() : null}
                   </div>
                 </div>
 
@@ -6007,6 +6637,8 @@ export default function App() {
             </div>
           )}
         </main>
+          </>
+        )}
       </div>
 
       {/* Agent Quota & Usage Details Modal */}
@@ -6098,6 +6730,26 @@ export default function App() {
                       </span>
                     </div>
                   </div>
+                  {((usage?.lifetimeTokens?.cachedTokens ?? 0) > 0 || (usage?.lifetimeTokens?.costUsd ?? 0) > 0) && (
+                    <div className="grid grid-cols-2 gap-2.5 mt-2.5">
+                      {(usage?.lifetimeTokens?.cachedTokens ?? 0) > 0 && (
+                        <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                          <span className="text-[10px] font-mono text-slate-500 uppercase block">Cached Tokens</span>
+                          <span className="text-base font-bold text-cyan-300 font-mono mt-0.5 block">
+                            {(usage?.lifetimeTokens?.cachedTokens || 0).toLocaleString()}
+                          </span>
+                        </div>
+                      )}
+                      {(usage?.lifetimeTokens?.costUsd ?? 0) > 0 && (
+                        <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                          <span className="text-[10px] font-mono text-slate-500 uppercase block">Total Cost (USD)</span>
+                          <span className="text-base font-bold text-amber-300 font-mono mt-0.5 block">
+                            {formatUsdCost(usage?.lifetimeTokens?.costUsd)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Provider Quota Meters - rendered only from a real provider reading */}
@@ -6413,28 +7065,68 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                     <div className="space-y-1">
                       <label className="block text-[11px] text-slate-400">Default Model</label>
-                      <select
-                        aria-label="Persona Default Model"
-                        value={personaDefaultModel}
-                        disabled={driverModels.length === 0}
-                        title={capabilitySourceLabel(personaModalRuntimeCaps)}
-                        onChange={(e) => {
-                          const newModel = e.target.value;
-                          setPersonaDefaultModel(newModel);
-                          const newModelObj = driverModels.find((m) => m.id === newModel);
-                          if (newModelObj?.contextSizes && personaDefaultContextSize && !newModelObj.contextSizes.some((cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase())) {
-                            setPersonaDefaultContextSize('');
+                      {personaModalRuntimeCaps?.adapter === 'openrouter' || driverModels.length > 25 ? (
+                        <SearchableModelPicker
+                          ariaLabel="Persona Default Model"
+                          models={driverModels}
+                          value={personaDefaultModel}
+                          disabled={driverModels.length === 0}
+                          title={capabilitySourceLabel(personaModalRuntimeCaps)}
+                          defaultOptionLabel="Driver Default"
+                          allowCustom={
+                            personaModalRuntimeCaps?.adapter === 'openai' ||
+                            personaModalRuntimeCaps?.adapter === 'openrouter'
                           }
-                        }}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        <option value="">Driver Default</option>
-                        {driverModels.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.name || m.id}
-                          </option>
-                        ))}
-                      </select>
+                          onChange={(newModel) => {
+                            setPersonaDefaultModel(newModel);
+                            const newModelObj = driverModels.find((m) => m.id === newModel);
+                            if (
+                              newModelObj?.contextSizes &&
+                              personaDefaultContextSize &&
+                              !newModelObj.contextSizes.some(
+                                (cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase()
+                              )
+                            ) {
+                              setPersonaDefaultContextSize('');
+                            }
+                          }}
+                        />
+                      ) : (
+                        <>
+                          <select
+                            aria-label="Persona Default Model"
+                            value={personaDefaultModel}
+                            disabled={driverModels.length === 0}
+                            title={capabilitySourceLabel(personaModalRuntimeCaps)}
+                            onChange={(e) => {
+                              const newModel = e.target.value;
+                              setPersonaDefaultModel(newModel);
+                              const newModelObj = driverModels.find((m) => m.id === newModel);
+                              if (newModelObj?.contextSizes && personaDefaultContextSize && !newModelObj.contextSizes.some((cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase())) {
+                                setPersonaDefaultContextSize('');
+                              }
+                            }}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <option value="">Driver Default</option>
+                            {driverModels.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                {m.name || m.id}
+                              </option>
+                            ))}
+                          </select>
+                          {personaModalRuntimeCaps?.adapter === 'openai' && (
+                            <input
+                              type="text"
+                              aria-label="Custom Persona Model Input"
+                              placeholder="Or custom model name..."
+                              value={personaDefaultModel}
+                              onChange={(e) => setPersonaDefaultModel(e.target.value)}
+                              className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                            />
+                          )}
+                        </>
+                      )}
                       {/* Provenance, so a bundled preset is never mistaken for a driver answer. */}
                       {driverModels.length > 0 ? (
                         <p className="text-[10px] text-slate-500 leading-tight">
@@ -6446,16 +7138,6 @@ export default function App() {
                             {capabilityUnavailableMessage(personaModalRuntimeCaps)}
                           </p>
                         )
-                      )}
-                      {personaModalRuntimeCaps?.adapter === 'openai' && (
-                        <input
-                          type="text"
-                          aria-label="Custom Persona Model Input"
-                          placeholder="Or custom model name..."
-                          value={personaDefaultModel}
-                          onChange={(e) => setPersonaDefaultModel(e.target.value)}
-                          className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
-                        />
                       )}
                     </div>
 
@@ -6612,7 +7294,7 @@ export default function App() {
                       className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white font-mono text-xs focus:outline-none focus:border-sky-500"
                     />
                     <p className="text-[10px] text-slate-500">
-                      Fine-grained or classic token with repository contents/pull requests permissions. Stored encrypted at rest.
+                      Fine-grained or classic token with repository contents/pull requests permissions (kept separate from Copilot CLI driver sign-in). Stored encrypted at rest.
                     </p>
                   </div>
 
@@ -6639,6 +7321,33 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+
+                {editingPersona && (
+                  <div className="pt-2 border-t border-slate-800 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="font-semibold text-slate-300 flex items-center gap-1.5">
+                        <Plug className="w-3.5 h-3.5 text-sky-400" />
+                        <span>MCP Tool Servers ({editingPersona.mcpServerCount ?? 0} assigned)</span>
+                      </div>
+                      <p className="text-[10px] text-slate-500 mt-0.5">
+                        Assign shared MCP servers and configure per-persona tool filters or secret overrides.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const target = editingPersona;
+                        setShowPersonaModal(false);
+                        setManagingPersonaMcp(target);
+                      }}
+                      data-testid="edit-persona-configure-mcp-btn"
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 text-[11px] font-semibold flex items-center gap-1.5 transition cursor-pointer shrink-0"
+                    >
+                      <Plug className="w-3 h-3" />
+                      <span>Configure MCP</span>
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Footer */}
@@ -6765,12 +7474,72 @@ export default function App() {
         />
       )}
 
-      {/* Mobile Bottom Navigation Bar: fixed to bottom on mobile when at list/master level */}
-      {isMobile && !isMobileDetailView && (
+      {managingPersonaMcp && (
+        <PersonaMcpModal
+          persona={managingPersonaMcp}
+          onClose={() => setManagingPersonaMcp(null)}
+          onOpenCatalog={() => setShowMcpCatalogModal(true)}
+          catalogRefreshTick={mcpCatalogRefreshTick}
+          onAssignmentsChanged={async () => {
+            if (api.getPersonas) {
+              const updatedPersonas = await api.getPersonas().catch(() => null);
+              if (updatedPersonas) setPersonas(updatedPersonas);
+            }
+            if (api.getMcpServers) {
+              const updatedServers = await api.getMcpServers().catch(() => null);
+              if (updatedServers) setMcpServers(updatedServers);
+            }
+          }}
+        />
+      )}
+
+      {showMcpCatalogModal && (
+        <McpCatalogModal
+          isOpen={showMcpCatalogModal}
+          onClose={() => setShowMcpCatalogModal(false)}
+          initialServers={mcpServers}
+          onCatalogChanged={(nextServers) => {
+            setMcpServers(nextServers);
+            setMcpCatalogRefreshTick((t) => t + 1);
+            if (api.getPersonas) {
+              void api.getPersonas().then(setPersonas).catch(() => {});
+            }
+          }}
+        />
+      )}
+
+      {/* Mobile Bottom Navigation Bar: fixed to bottom on mobile when at list/master level or Dashboard */}
+      {isMobile && (!isMobileDetailView || activeTab === 'dashboard') && (
         <nav
-          className="fixed bottom-0 inset-x-0 border-t border-slate-800/80 bg-slate-900/95 backdrop-blur-md px-4 py-2 flex items-center justify-around shrink-0 z-40 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-lg"
+          className="fixed bottom-0 inset-x-0 border-t border-slate-800/80 bg-slate-900/95 backdrop-blur-md px-2 py-2 flex items-center justify-around shrink-0 z-40 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-lg"
           data-testid="mobile-bottom-nav"
         >
+          <button
+            type="button"
+            data-testid="mobile-nav-dashboard"
+            onClick={() => {
+              hasUserSwitchedTabRef.current = true;
+              setActiveTab('dashboard');
+              setIsMobileDetailView(false);
+            }}
+            className={`relative flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
+              activeTab === 'dashboard'
+                ? 'text-sky-400 font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <LayoutDashboard className="w-5 h-5" />
+            <span className="text-[10px]">Dashboard</span>
+            {dashboardAttentionCount > 0 && (
+              <span
+                data-testid="mobile-dashboard-attention-badge"
+                className="absolute -top-0.5 right-1 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-slate-950 text-[9px] font-bold font-mono flex items-center justify-center"
+              >
+                {dashboardAttentionCount > 99 ? '99+' : dashboardAttentionCount}
+              </span>
+            )}
+          </button>
+
           <button
             type="button"
             onClick={() => {
@@ -6778,7 +7547,7 @@ export default function App() {
               setActiveTab('projects');
               setIsMobileDetailView(false);
             }}
-            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+            className={`flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
               activeTab === 'projects'
                 ? 'text-sky-400 font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
@@ -6795,7 +7564,7 @@ export default function App() {
               setActiveTab('personas');
               setIsMobileDetailView(false);
             }}
-            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+            className={`flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
               activeTab === 'personas'
                 ? 'text-sky-400 font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
@@ -6812,7 +7581,7 @@ export default function App() {
               setActiveTab('drivers');
               setIsMobileDetailView(false);
             }}
-            className={`flex flex-col items-center gap-1 px-4 py-1 rounded-xl transition cursor-pointer ${
+            className={`flex flex-col items-center gap-1 px-3 py-1 rounded-xl transition cursor-pointer ${
               activeTab === 'drivers'
                 ? 'text-sky-400 font-semibold'
                 : 'text-slate-400 hover:text-slate-200'

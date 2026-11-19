@@ -15,8 +15,6 @@ import {
 } from 'lucide-react';
 import type {
   AgentSession,
-  AskQuestionItem,
-  JobMessage,
   JobTask,
   Persona,
   Project,
@@ -25,103 +23,8 @@ import type {
   SessionAttachment
 } from '../types';
 import { ProjectJobStatus } from '../types';
-import { parseTextQuestions } from './QuestionCard';
 import { JobSettingsModal } from './JobSettingsModal';
 import { CockpitLayout } from './cockpit/CockpitLayout';
-
-export function extractQuestionsFromJobMessage(msg: JobMessage): AskQuestionItem[] {
-  if (msg.senderType === 'user') return [];
-
-  if (msg.structuredPayloadJson) {
-    try {
-      let p = JSON.parse(msg.structuredPayloadJson);
-      if (typeof p === 'string') {
-        try {
-          p = JSON.parse(p);
-        } catch {}
-      }
-      if (p) {
-        if (Array.isArray(p.questions)) return p.questions as AskQuestionItem[];
-        if (Array.isArray(p.Questions)) return p.Questions as AskQuestionItem[];
-        if (typeof p.questions === 'string') {
-          try {
-            const inner = JSON.parse(p.questions);
-            if (Array.isArray(inner)) return inner;
-          } catch {}
-        }
-        if (p.question) {
-          return [
-            {
-              question: p.question,
-              options: Array.isArray(p.options) ? p.options : [],
-              is_multi_select: !!p.is_multi_select
-            }
-          ];
-        }
-        if (Array.isArray(p) && p.length > 0 && (p[0].question || p[0].Question)) {
-          return p as AskQuestionItem[];
-        }
-        if (p.toolArgs && typeof p.toolArgs === 'object') {
-          if (Array.isArray(p.toolArgs.questions)) return p.toolArgs.questions;
-        }
-      }
-    } catch {}
-  }
-
-  return parseTextQuestions(msg.content);
-}
-
-export function extractJobMessageAttachments(msg: JobMessage): SessionAttachment[] {
-  if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
-    return msg.attachments;
-  }
-  if (!msg.structuredPayloadJson) return [];
-  try {
-    const parsed = JSON.parse(msg.structuredPayloadJson);
-    const rawList = Array.isArray(parsed?.attachments)
-      ? parsed.attachments
-      : Array.isArray(parsed?.Attachments)
-      ? parsed.Attachments
-      : null;
-
-    if (Array.isArray(rawList)) {
-      return rawList.map((item: any) => {
-        const id = item.id || item.Id || '';
-        const fileName = item.fileName || item.FileName || item.name || item.Name || '';
-        const contentType = item.contentType || item.ContentType || '';
-        const sizeBytes =
-          typeof item.sizeBytes === 'number'
-            ? item.sizeBytes
-            : typeof item.SizeBytes === 'number'
-            ? item.SizeBytes
-            : typeof item.size === 'number'
-            ? item.size
-            : 0;
-        const s3Key = item.s3Key || item.S3Key || '';
-        const targetId = id || fileName;
-        const downloadUrl =
-          item.downloadUrl ||
-          item.DownloadUrl ||
-          (targetId
-            ? `/api/project-jobs/${encodeURIComponent(msg.jobId)}/attachments/${encodeURIComponent(targetId)}/content`
-            : '');
-        const createdAt = item.createdAt || item.CreatedAt || msg.createdAt;
-
-        return {
-          id,
-          sessionId: msg.jobId,
-          fileName,
-          contentType,
-          sizeBytes,
-          s3Key,
-          downloadUrl,
-          createdAt
-        };
-      });
-    }
-  } catch {}
-  return [];
-}
 
 export interface StagedJobAttachmentItem {
   localId: string;
@@ -170,12 +73,10 @@ export interface JobCockpitProps {
   project: Project;
   job: ProjectJob;
   tasks: JobTask[];
-  messages: JobMessage[];
   personas?: Persona[];
   allowManualTaskCreation?: boolean;
   userRole?: string;
   onStartJob?: () => Promise<void>;
-  onSendMessage: (content: string, attachments?: SessionAttachment[]) => Promise<void>;
   onAddTask?: (title: string, requiresDiscussion?: boolean, attachments?: SessionAttachment[]) => Promise<void>;
   onToggleTask?: (taskId: string, isCompleted: boolean) => Promise<void>;
   onUpdateTask?: (
@@ -193,6 +94,13 @@ export interface JobCockpitProps {
   onArchiveJob?: () => Promise<void>;
   onReopenJob?: () => Promise<void>;
   onResetJob?: () => Promise<void>;
+  /**
+   * Resumes a stalled job from the platform's own record of its progress. Present only when the parent
+   * can reach the API; the button renders alongside (never instead of) Reset, because Reset discards the
+   * checklist and Recover keeps it, and an operator needs to be able to see that difference at the moment
+   * they choose.
+   */
+  onRecoverJob?: (note?: string) => Promise<void>;
   onSelectTurnSession?: (sessionId: string) => void;
   onOpenLightbox?: (item: { url: string; fileName: string; sizeBytes?: number }) => void;
   onUploadAttachments?: (files: File[]) => Promise<SessionAttachment[]>;
@@ -232,6 +140,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   onArchiveJob,
   onReopenJob,
   onResetJob,
+  onRecoverJob,
   onEditProject,
   onUpdateJob,
   onDeleteJob,
@@ -252,11 +161,22 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   const [isCompleting, setIsCompleting] = useState(false);
   const [isArchiving, setIsArchiving] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
+  const [showRecoverConfirm, setShowRecoverConfirm] = useState(false);
+  const [isRecovering, setIsRecovering] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
 
   const isCompleted = job.status === ProjectJobStatus.Completed;
   const isArchived = job.status === ProjectJobStatus.Archived;
   const isPending = job.status === ProjectJobStatus.Pending;
+
+  // The platform writes this when it settles a turn nobody is advancing. It is the only honest signal the
+  // cockpit has that a job showing "Active Job" underneath has no agent working on it any more.
+  const isStalled = job.lifecycleStatus === 'Stalled';
+
+  // Recovery only applies to a job that is running in principle and stuck in practice. The badge above
+  // already hides "Stalled" behind Archived/Completed, and the endpoint rejects an archived job with a
+  // 409, so offering the button there would be a control that can only fail.
+  const canRecover = Boolean(onRecoverJob) && isStalled && !isArchived && !isCompleted;
 
   const teamMembers = useMemo(() => {
     const map = new Map<string, { id: string; name: string; role: string }>();
@@ -315,6 +235,20 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
     }
   };
 
+  const handleConfirmRecover = async () => {
+    if (!onRecoverJob) return;
+    setIsRecovering(true);
+    try {
+      await onRecoverJob();
+      setShowRecoverConfirm(false);
+    } catch {
+      // The parent owns the error surface, and the confirm row deliberately stays open: closing it on a
+      // failure would look exactly like a recovery that worked.
+    } finally {
+      setIsRecovering(false);
+    }
+  };
+
   const handleConfirmReset = async () => {
     if (!onResetJob) return;
     setIsResetting(true);
@@ -362,6 +296,14 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 >
                   <Clock className="w-3 h-3 text-slate-400" /> Pending Start
                 </span>
+              ) : isStalled ? (
+                <span
+                  className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1"
+                  data-testid="job-status-stalled"
+                  title="The agent's turn stopped reporting and was settled by the platform. Nothing is running."
+                >
+                  <Clock className="w-3 h-3" /> Stalled
+                </span>
               ) : (
                 <span
                   className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40"
@@ -394,19 +336,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
         {/* Assigned Personas & Actions */}
         <div className="flex items-center flex-wrap gap-1.5 sm:gap-2.5 shrink-0 w-full md:w-auto">
           {/* Job Assignee Dropdown */}
-          <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl text-xs">
-            <span className="text-[11px] font-semibold text-slate-400">Assignee:</span>
+          <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl text-xs min-w-0 max-w-full">
+            <span className="text-[11px] font-semibold text-slate-400 shrink-0">Assignee:</span>
             <select
               value={job.assignedAgentId || project.defaultLeadPersonaId || ''}
               onChange={async (e) => {
                 if (onUpdateJob) {
-                  await onUpdateJob({ assignedAgentId: e.target.value || null });
+                  await onUpdateJob({ assignedAgentId: e.target.value });
                 }
               }}
               title="Assign this job to a team member"
               aria-label="Assigned Team Member"
               data-testid="cockpit-assigned-agent-select"
-              className="bg-slate-900 border border-slate-700/70 rounded-md px-2 py-0.5 text-xs text-sky-300 font-medium focus:outline-none focus:border-sky-500 cursor-pointer"
+              className="bg-slate-900 border border-slate-700/70 rounded-md px-2 py-0.5 text-xs text-sky-300 font-medium focus:outline-none focus:border-sky-500 cursor-pointer min-w-0 max-w-full truncate"
             >
               <option value="">Default (@{project.defaultLeadPersonaId || 'implementer'})</option>
               {teamMembers.map((m) => (
@@ -526,7 +468,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               </button>
             )
           ) : (
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
               <div>
                 {showCompleteConfirm ? (
                   <div className="flex items-center gap-2 bg-slate-900 border border-emerald-500/40 p-1.5 rounded-xl flex-wrap">
@@ -600,6 +542,45 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     >
                       <Archive className="w-3.5 h-3.5" />
                       <span>Archive</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {canRecover && (
+                <div>
+                  {showRecoverConfirm ? (
+                    <div className="flex items-center gap-2 bg-slate-900 border border-amber-500/40 p-1.5 rounded-xl flex-wrap">
+                      <span className="text-xs text-amber-200">
+                        Settle the abandoned turn{onResetJob ? ' and resume from recorded progress' : ''}?
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setShowRecoverConfirm(false)}
+                        className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConfirmRecover}
+                        disabled={isRecovering}
+                        className="px-3 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold rounded-lg shadow-sm cursor-pointer disabled:opacity-50"
+                        data-testid="cockpit-confirm-recover-btn"
+                      >
+                        {isRecovering ? 'Recovering...' : 'Confirm Recover'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowRecoverConfirm(true)}
+                      title="Settle the turn that stopped reporting and resume the job from the task it was on. Keeps the checklist and the workspace; unlike Reset, nothing is terminated."
+                      className="px-3.5 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
+                      data-testid="cockpit-recover-job-btn"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Recover Job</span>
                     </button>
                   )}
                 </div>

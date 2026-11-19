@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
+using AgentMesh.Cli.Commands;
 using AgentMesh.Cli.Services;
 using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
@@ -30,6 +31,7 @@ public static class AgentAdapterFactory
             "claude" => new ClaudeAdapter(),
             "copilot" => new CopilotAdapter(),
             "agy" => new AgyAdapter(),
+            "openrouter" or "open-router" => new OpenRouterAdapter(),
             "openai" or "openai-compatible" or "ollama" or "vllm" => new OpenAiAdapter(),
             _ => new GenericCommandAdapter()
         };
@@ -78,9 +80,52 @@ public static class AgentAdapterFactory
     public static bool IsExecutableOnPath(string command) =>
         ResolveExecutablePath(command) != null;
 
-    public static string ResolveWorkspaceDirectory()
+    public static string ResolveWorkspaceDirectory(PromptReceivedEvent? promptEvent = null)
     {
+        if (!string.IsNullOrWhiteSpace(promptEvent?.WorkingDirectory))
+        {
+            return WorkspacePathResolver.Normalize(promptEvent.WorkingDirectory.Trim());
+        }
+
+        var repoOrProject = !string.IsNullOrWhiteSpace(promptEvent?.RepositoryName)
+            ? promptEvent!.RepositoryName
+            : promptEvent?.ProjectId;
+        if (!string.IsNullOrWhiteSpace(repoOrProject) &&
+            (Directory.Exists("/workspace") || string.Equals(Environment.CurrentDirectory, "/workspace", StringComparison.Ordinal)))
+        {
+            return WorkspacePathResolver.FromRepositoryName(repoOrProject);
+        }
+
+        var envRepo = Environment.GetEnvironmentVariable("AGENTMESH_REPOSITORY_NAME")
+                      ?? Environment.GetEnvironmentVariable("AGENTMESH_PROJECT_ID");
+        if (!string.IsNullOrWhiteSpace(envRepo) && Directory.Exists("/workspace"))
+        {
+            return WorkspacePathResolver.FromRepositoryName(envRepo);
+        }
+
         var cwd = Environment.CurrentDirectory;
+        if (string.Equals(cwd, "/workspace", StringComparison.Ordinal) ||
+            string.Equals(cwd, "/workspace/repo", StringComparison.Ordinal))
+        {
+            if (Directory.Exists(WorkspacePathResolver.ReposRoot))
+            {
+                try
+                {
+                    var subdirs = Directory.GetDirectories(WorkspacePathResolver.ReposRoot);
+                    if (subdirs.Length == 1)
+                    {
+                        return WorkspacePathResolver.Normalize(subdirs[0]);
+                    }
+                    var defaultRepoDir = Path.Combine(WorkspacePathResolver.ReposRoot, Project.DefaultRepositoryName);
+                    if (Directory.Exists(defaultRepoDir))
+                    {
+                        return WorkspacePathResolver.Normalize(defaultRepoDir);
+                    }
+                }
+                catch { }
+            }
+        }
+
         // If user launched the binary from inside dist/cli/linux-x64, walk up to repo root if applicable
         var normalized = cwd.Replace('\\', '/');
         var distIdx = normalized.IndexOf("/dist/cli", StringComparison.OrdinalIgnoreCase);
@@ -183,6 +228,146 @@ public static class AgentAdapterFactory
     /// </param>
     public static void KillProcessTree(Process proc, int processGroupLeaderPid)
         => SandboxShell.KillProcessTree(proc, processGroupLeaderPid);
+
+    /// <summary>
+    /// Stamps a driver child process's environment with the identity of the turn it is serving.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>manage_task</c> and <c>post_job_message</c> reach a driver as function tools only when its
+    /// adapter declares schemas. Subprocess drivers (<c>agy</c>, <c>claude -p</c>, <c>copilot</c>) instead
+    /// call <c>agentmesh task …</c> / <c>agentmesh message …</c> from their own shell, and those verbs need
+    /// the turn's session and job to place the call at all — which is also why a static MCP registration
+    /// cannot carry the context: one persona container serves many jobs, so the identity changes per turn.
+    /// Everything a driver shells out to inherits this environment, which is what makes the shell route work
+    /// for every driver without mounting anything into it.
+    /// </para>
+    /// <para>
+    /// The turn wins over an inherited value when it has one: a persona pod is provisioned with
+    /// <c>AGENTMESH_PERSONA_ID</c> and <c>AGENTMESH_JOB_ID</c> is never ambient, so a stale value must not
+    /// attribute a checklist to the wrong job. <c>AGENTMESH_AGENT_ID</c> is the pre-2.6 name kept for any
+    /// operator script already reading it.
+    /// </para>
+    /// </remarks>
+    /// <param name="env">The <c>ProcessStartInfo.Environment</c> dictionary for the child.</param>
+    /// <param name="promptEvent">The dispatch being served.</param>
+    /// <param name="agentId">Driver identity to report, when the caller has a better one than the event.</param>
+    internal static void ApplyMeshTurnContext(
+        IDictionary<string, string?> env,
+        PromptReceivedEvent promptEvent,
+        string? agentId = null)
+    {
+        foreach (var (key, value) in MeshTurnContext(promptEvent, agentId))
+        {
+            env[key] = value;
+        }
+    }
+
+    /// <summary>
+    /// What every subprocess driver is told about reaching the control plane from its own shell.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// One string rather than a per-adapter copy, because the agy incident was a prompt-contract failure:
+    /// the driver was told to call <c>manage_task</c>, its harness had a built-in by that name, and it
+    /// called the wrong one while every layer reported success. A route only exists if every driver that
+    /// needs it is told about it in the same words, so both envelope paths quote this.
+    /// </para>
+    /// <para>
+    /// The platform's own <c>PlatformPrompts.PlatformInvariants</c> says the same thing for job turns; this
+    /// copy exists because an interactive chat turn has no such layer, and a persona answering a question
+    /// in chat still has to move the checklist it is working on.
+    /// </para>
+    /// </remarks>
+    public const string ControlPlaneShellRouteInstructions =
+        "[AgentMesh Control Plane From Your Shell: If your harness gives you no platform function tools, " +
+        "the job checklist and job messages are still reachable from your shell — " +
+        "`agentmesh task set-checklist --json '[{\"title\":\"…\",\"target_file\":\"…\",\"verification_method\":\"…\"}]'`, " +
+        "`agentmesh task update-status --task <task-id> --status <status>`, `agentmesh task get-checklist`, " +
+        "`agentmesh message post`. This process's environment already carries this turn's session and job, " +
+        "so pass no ids. Never substitute a built-in tool of your harness named `manage_task`: that is a " +
+        "local shell-task manager and it reports nothing to AgentMesh. Questions always go through " +
+        "`ask_question`, never through a message.]";
+
+    /// <summary>
+    /// The turn-context variables themselves, so every driver gets an identical set regardless of how it
+    /// is launched.
+    /// </summary>
+    /// <remarks>
+    /// Blank values are omitted rather than set empty: <c>PrCommand</c> and <c>PlatformToolCommand</c>
+    /// treat a present-but-empty <c>AGENTMESH_JOB_ID</c> as a context they should have, and report its
+    /// absence as a misconfiguration the operator can act on.
+    /// </remarks>
+    internal static IEnumerable<KeyValuePair<string, string>> MeshTurnContext(
+        PromptReceivedEvent promptEvent,
+        string? agentId = null)
+    {
+        if (promptEvent.SessionId != Guid.Empty)
+        {
+            yield return new(PlatformToolCommand.SessionIdEnvVar, promptEvent.SessionId.ToString());
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.JobId))
+        {
+            yield return new(PlatformToolCommand.JobIdEnvVar, promptEvent.JobId.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.PersonaId))
+        {
+            yield return new(PlatformToolCommand.PersonaIdEnvVar, promptEvent.PersonaId.Trim());
+        }
+
+        var driver = FirstNonBlank(agentId, promptEvent.DriverId, promptEvent.AgentId);
+        if (driver is not null)
+        {
+            yield return new(PlatformToolCommand.AgentIdEnvVar, driver);
+            yield return new("AGENTMESH_AGENT_ID", driver);
+        }
+    }
+
+    /// <summary>
+    /// The same turn context as an <c>env</c> prefix, for drivers launched as a command line rather than a
+    /// <see cref="ProcessStartInfo"/>.
+    /// </summary>
+    /// <remarks>
+    /// Values are single-quoted with any embedded quote closed and re-opened, because a persona id is
+    /// operator-supplied and an unquoted apostrophe in one would otherwise rewrite the command line.
+    /// Returns the empty string when there is no context to pass, so a caller can concatenate unconditionally.
+    /// </remarks>
+    internal static string BuildMeshTurnContextPrefix(PromptReceivedEvent promptEvent, string? agentId = null)
+    {
+        var assignments = MeshTurnContext(promptEvent, agentId)
+            .Select(pair => $"{pair.Key}='{pair.Value.Replace("'", "'\\''")}'");
+        return string.Join(" ", assignments);
+    }
+
+    private static string? FirstNonBlank(params string?[] values) =>
+        values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim();
+
+    internal static async Task EmitSubprocessMcpEventsAsync(
+        string presetId,
+        string driverName,
+        SubprocessMcpProvisionResult provisioning,
+        Func<TrajectoryEventPayload, Task> onEvent)
+    {
+        foreach (var warning in provisioning.Warnings)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[@{presetId}] Warning: {warning}"
+            });
+        }
+
+        if (provisioning.ProvisionedServerCount > 0)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "thought",
+                Content = $"[@{presetId}] Provisioned {provisioning.ProvisionedServerCount} MCP server(s) for {driverName}."
+            });
+        }
+    }
 
     /// <summary>
     /// Runs a shell command and returns the hardened result: clamped timeout, process-group teardown on
@@ -377,6 +562,7 @@ public static class AgentAdapterFactory
         {
             sb.AppendLine($"[Execution Mode: {mode}]");
         }
+        sb.AppendLine(ControlPlaneShellRouteInstructions);
         sb.AppendLine("[Interactive Human-in-the-Loop Instructions: You are running in an interactive session. If the user asks you to ask them questions, or if you need clarifications or decisions before proceeding, ask your questions directly. Format questions as a numbered list (e.g. 1. Question? 2. Question?), or output a ```ask_question JSON block with questions array. Do NOT state that this is a non-interactive session or that you cannot see replies. The user will be presented with interactive UI cards to answer your questions and will send their responses in the next turn.]");
         sb.AppendLine();
         var attachedBlock = FormatAttachedFilesBlock(attachments);
@@ -637,6 +823,12 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 {
     private static readonly ConcurrentDictionary<Guid, string> SessionConversations = new();
     private static readonly object MappingLock = new();
+    private static readonly AsyncLocal<string?> HomeDirectoryOverride = new();
+    internal static string? HomeDirectoryForTest
+    {
+        get => HomeDirectoryOverride.Value;
+        set => HomeDirectoryOverride.Value = value;
+    }
 
     public static string? GetSessionConversationId(Guid sessionId)
     {
@@ -845,9 +1037,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
 
         var agyPath = (string.Equals(preset.AdapterType, "agy", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(preset.Command))
             ? (AgentAdapterFactory.ResolveExecutablePath(preset.Command) ?? AgentAdapterFactory.ResolveExecutablePath("agy"))
@@ -951,7 +1141,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         public string? ToolArgsJson => ToolCallEvent.ToolArgsJson;
     }
 
-    private static string? TryReadStepContentFromFullTranscript(string fullPath, int targetStepIndex)
+    private static string? TryReadStepFieldFromFullTranscript(string fullPath, int targetStepIndex, string fieldName)
     {
         if (!File.Exists(fullPath)) return null;
         try
@@ -967,9 +1157,9 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     using var doc = JsonDocument.Parse(line);
                     if (doc.RootElement.TryGetProperty("step_index", out var sProp) && sProp.GetInt32() == targetStepIndex)
                     {
-                        if (doc.RootElement.TryGetProperty("content", out var cProp) && cProp.ValueKind == JsonValueKind.String)
+                        if (doc.RootElement.TryGetProperty(fieldName, out var fProp) && fProp.ValueKind == JsonValueKind.String)
                         {
-                            return cProp.GetString();
+                            return fProp.GetString();
                         }
                     }
                 }
@@ -978,6 +1168,147 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
         catch { }
         return null;
+    }
+
+    private static string? TryReadStepContentFromFullTranscript(string fullPath, int targetStepIndex)
+        => TryReadStepFieldFromFullTranscript(fullPath, targetStepIndex, "content");
+
+    internal static List<(int StepIndex, string Thinking)> ReadNewThoughtsFromTranscript(string? transcriptPath, ref int lastThoughtStep)
+    {
+        var thoughts = new List<(int StepIndex, string Thinking)>();
+        if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath)) return thoughts;
+
+        try
+        {
+            using var fs = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(fs);
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+                    if (!root.TryGetProperty("step_index", out var sProp)) continue;
+                    var stepIdx = sProp.GetInt32();
+                    if (stepIdx <= lastThoughtStep) continue;
+
+                    string? thinking = null;
+                    if (root.TryGetProperty("thinking", out var thProp) && thProp.ValueKind == JsonValueKind.String)
+                    {
+                        thinking = thProp.GetString();
+                    }
+
+                    if (root.TryGetProperty("truncated_fields", out var tfProp) && tfProp.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var tf in tfProp.EnumerateArray())
+                        {
+                            if (string.Equals(tf.GetString(), "thinking", StringComparison.Ordinal))
+                            {
+                                var dir = Path.GetDirectoryName(transcriptPath);
+                                var fullPath = !string.IsNullOrWhiteSpace(dir)
+                                    ? Path.Combine(dir, "transcript_full.jsonl")
+                                    : transcriptPath.Replace("transcript.jsonl", "transcript_full.jsonl");
+                                var fullThinking = TryReadStepFieldFromFullTranscript(fullPath, stepIdx, "thinking");
+                                if (!string.IsNullOrWhiteSpace(fullThinking))
+                                {
+                                    thinking = fullThinking;
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(thinking))
+                    {
+                        lastThoughtStep = stepIdx;
+                        thoughts.Add((stepIdx, thinking.Trim()));
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        return thoughts;
+    }
+
+    internal static string FormatAgyToolSummary(
+        string toolName,
+        JsonElement paramsElem,
+        HashSet<string>? filesInspected = null,
+        HashSet<string>? filesModified = null,
+        List<string>? commandsRun = null)
+    {
+        var toolSummary = OpenAiAdapter.GetPropertyString(paramsElem, "toolSummary", "toolAction", "description");
+
+        var cmdVal = OpenAiAdapter.GetPropertyString(paramsElem, "command", "CommandLine", "commandLine", "cmd", "script", "shell_command");
+        if (!string.IsNullOrWhiteSpace(cmdVal))
+        {
+            commandsRun?.Add(cmdVal);
+            var cleanCmd = Regex.Replace(cmdVal, @"\s+", " ").Trim();
+            var clippedCmd = cleanCmd.Length > 80 ? cleanCmd[..77] + "..." : cleanCmd;
+            if (!string.IsNullOrWhiteSpace(toolSummary) &&
+                !cmdVal.Contains(toolSummary, StringComparison.OrdinalIgnoreCase))
+            {
+                return $"Running command ({toolSummary}): {clippedCmd}";
+            }
+            return $"Running command: {clippedCmd}";
+        }
+
+        var pVal = OpenAiAdapter.GetPropertyString(paramsElem, "path", "Path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "target_file", "source_file", "uri");
+        if (!string.IsNullOrWhiteSpace(pVal))
+        {
+            var fileName = Path.GetFileName(pVal);
+            if (string.IsNullOrEmpty(fileName)) fileName = pVal;
+            var tnLower = toolName.ToLowerInvariant();
+            if (tnLower.Contains("write") || tnLower.Contains("edit") || tnLower.Contains("replace") || tnLower.Contains("modify") || tnLower.Contains("patch"))
+            {
+                filesModified?.Add(pVal);
+                return $"Modifying file: {fileName}";
+            }
+
+            filesInspected?.Add(pVal);
+            var startLine = OpenAiAdapter.GetPropertyString(paramsElem, "StartLine", "startLine", "start_line");
+            var endLine = OpenAiAdapter.GetPropertyString(paramsElem, "EndLine", "endLine", "end_line");
+            if (!string.IsNullOrWhiteSpace(startLine) || !string.IsNullOrWhiteSpace(endLine))
+            {
+                return $"Inspecting file: {fileName} (lines {startLine ?? "1"}-{endLine ?? "end"})";
+            }
+            return $"Inspecting file: {fileName}";
+        }
+
+        if (string.Equals(toolName, "manage_task", StringComparison.OrdinalIgnoreCase))
+        {
+            var action = OpenAiAdapter.GetPropertyString(paramsElem, "Action", "action") ?? "manage";
+            var taskId = OpenAiAdapter.GetPropertyString(paramsElem, "TaskId", "task_id", "taskId");
+            return $"Managing task: {action}{(string.IsNullOrWhiteSpace(taskId) ? "" : $" ({taskId})")}";
+        }
+
+        if (string.Equals(toolName, "invoke_subagent", StringComparison.OrdinalIgnoreCase))
+        {
+            var role = OpenAiAdapter.GetPropertyString(paramsElem, "Role", "role");
+            var typeName = OpenAiAdapter.GetPropertyString(paramsElem, "TypeName", "typeName", "type_name");
+            return $"Invoking subagent: {role ?? typeName ?? "subagent"}";
+        }
+
+        if (string.Equals(toolName, "search_web", StringComparison.OrdinalIgnoreCase))
+        {
+            var query = OpenAiAdapter.GetPropertyString(paramsElem, "query", "Query");
+            if (!string.IsNullOrWhiteSpace(query))
+            {
+                var clippedQuery = query.Length > 80 ? query[..77] + "..." : query;
+                return $"Searching web: {clippedQuery}";
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(toolSummary))
+        {
+            return $"Executing {toolName}: {toolSummary}";
+        }
+
+        return $"Executing {toolName}";
     }
 
     public static AskQuestionDetection? CheckForAskQuestionToolCall(string transcriptPath, ref int lastProcessedStep)
@@ -1163,6 +1494,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, preset.Id);
 
         string? activeConvId = null;
         if (!string.IsNullOrWhiteSpace(promptEvent.ConversationId))
@@ -1205,6 +1537,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             {
                 sb.AppendLine($"[Persona Instructions: {promptEvent.PersonaPrompt.Trim()}]");
             }
+            sb.AppendLine(AgentAdapterFactory.ControlPlaneShellRouteInstructions);
             sb.AppendLine();
             if (!string.IsNullOrWhiteSpace(attachedBlock))
             {
@@ -1224,6 +1557,13 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "antigravity-cli", "brain", activeConvId, ".system_generated", "logs", "transcript.jsonl")
             : null;
         var lastTranscriptStep = transcriptFile != null ? GetMaxTranscriptStep(transcriptFile) : -1;
+        var lastThoughtStep = lastTranscriptStep;
+
+        using var mcpProvisioning = SubprocessMcpProvisioner.ProvisionForAgy(
+            promptEvent.McpServers,
+            promptEvent.Mode,
+            HomeDirectoryForTest);
+        await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "agy", mcpProvisioning, onEvent);
 
         using var proc = new Process { StartInfo = psi };
         using var agyReg = ActiveAgyProcessRegistry.Register(promptEvent.SessionId, proc);
@@ -1237,6 +1577,9 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
 
         var streamedResponseBuilder = new StringBuilder();
+        var currentStepThinkingBuilder = new StringBuilder();
+        var currentStepTextBuilder = new StringBuilder();
+        string? pendingIntermediateText = null;
         var emittedFinalResult = false;
         long lastInputTokens = 0, lastOutputTokens = 0, lastThinkingTokens = 0, lastTotalTokens = 0;
         double lastDuration = 0;
@@ -1262,6 +1605,12 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string? agyLastActionSummary = null;
         string? agyLatestThought = null;
 
+        // Resolved once per turn: reading the environment inside the loop would re-parse it on every
+        // line, and a mid-turn change to the bound must not silently extend a turn that is already
+        // being wound down.
+        var agyStreamIdleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+            Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
+
         try
         {
             while (true)
@@ -1272,7 +1621,33 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     throw new OperationCanceledException(ct);
                 }
 
-                var line = await proc.StandardOutput.ReadLineAsync(ct);
+                // Bounded on purpose. `agy` executes its own tools inside its own process, so the
+                // platform's command clamp never applies to what it runs: when its shell wedged on a
+                // `dotnet test`, this read waited on a pipe that would never deliver again, and nothing
+                // above it could tell a quiet driver from a dead one. The turn therefore held its
+                // session open for two hours, and the cockpit reported an agent that was "running a
+                // command" long after the only process able to run one had stopped producing.
+                //
+                // A stall is reported as an error event rather than thrown. The event is what settles the
+                // session status; an exception here would leave the transcript ending on an unanswered
+                // tool call, which is the exact state that made this undebuggable.
+                var agyRead = await StreamStallWatchdog.ReadLineAsync(proc.StandardOutput, agyStreamIdleLimit, ct);
+                if (agyRead.Stalled)
+                {
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "error",
+                        Content = $"Driver `agy` produced no output for {(int)agyStreamIdleLimit.TotalMinutes} minutes" +
+                            $" while {(string.IsNullOrWhiteSpace(agyLastActionSummary) ? "no step had been reported yet" : $"on `{agyLastActionSummary}`")}. " +
+                            "Its process was terminated so this turn stops claiming to be running. " +
+                            "Check the workspace for uncommitted work before re-running the task, and raise " +
+                            $"{TurnStallPolicy.DriverStreamIdleLimitEnvVar} if this driver legitimately runs longer than that."
+                    });
+                    AgentAdapterFactory.KillProcessTree(proc);
+                    return;
+                }
+
+                var line = agyRead.Line;
                 if (line == null) break;
 
                 if (ct.IsCancellationRequested)
@@ -1304,6 +1679,10 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                 if (lastTranscriptStep < 0)
                                 {
                                     lastTranscriptStep = GetMaxTranscriptStep(transcriptFile);
+                                }
+                                if (lastThoughtStep < 0)
+                                {
+                                    lastThoughtStep = lastTranscriptStep;
                                 }
                                 try
                                 {
@@ -1349,39 +1728,83 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                         if (stepType == "agent_response")
                         {
-                            if (step.TryGetProperty("text_delta", out var tdProp))
+                            if ((step.TryGetProperty("text_delta", out var tdProp) ||
+                                 step.TryGetProperty("textDelta", out tdProp)) &&
+                                tdProp.ValueKind == JsonValueKind.String)
                             {
                                 var delta = tdProp.GetString();
                                 if (!string.IsNullOrEmpty(delta))
                                 {
-                                    streamedResponseBuilder.Append(delta);
+                                    currentStepTextBuilder.Append(delta);
                                 }
                             }
 
-                            if (step.TryGetProperty("thought", out var thProp) && thProp.ValueKind == JsonValueKind.String)
+                            if ((step.TryGetProperty("thinking_delta", out var thdProp) ||
+                                 step.TryGetProperty("thinkingDelta", out thdProp) ||
+                                 step.TryGetProperty("thought_delta", out thdProp)) &&
+                                thdProp.ValueKind == JsonValueKind.String)
                             {
-                                var th = thProp.GetString()?.Trim();
-                                if (!string.IsNullOrWhiteSpace(th)) agyLatestThought = th;
+                                var thDelta = thdProp.GetString();
+                                if (!string.IsNullOrEmpty(thDelta))
+                                {
+                                    currentStepThinkingBuilder.Append(thDelta);
+                                }
+                            }
+
+                            string? inlineThoughtProp = null;
+                            if (step.TryGetProperty("thinking", out var thkProp) && thkProp.ValueKind == JsonValueKind.String)
+                            {
+                                inlineThoughtProp = thkProp.GetString()?.Trim();
+                            }
+                            else if (step.TryGetProperty("thought", out var thProp) && thProp.ValueKind == JsonValueKind.String)
+                            {
+                                inlineThoughtProp = thProp.GetString()?.Trim();
                             }
                             else if (step.TryGetProperty("reasoning", out var rsProp) && rsProp.ValueKind == JsonValueKind.String)
                             {
-                                var rs = rsProp.GetString()?.Trim();
-                                if (!string.IsNullOrWhiteSpace(rs)) agyLatestThought = rs;
+                                inlineThoughtProp = rsProp.GetString()?.Trim();
                             }
 
-                            if (state == "DONE" && step.TryGetProperty("usage", out var usageProp))
+                            if (!string.IsNullOrWhiteSpace(inlineThoughtProp))
                             {
-                                var thinkingTokens = usageProp.TryGetProperty("thinking_tokens", out var ttProp) ? ttProp.GetInt32() : 0;
-                                var duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
+                                agyLatestThought = inlineThoughtProp;
+                                if (currentStepThinkingBuilder.Length == 0)
+                                {
+                                    currentStepThinkingBuilder.Append(inlineThoughtProp);
+                                }
+                            }
 
-                                if (usageProp.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
-                                if (usageProp.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
-                                if (usageProp.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
-                                if (usageProp.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
+                            if (state == "DONE")
+                            {
+                                var newTranscriptThoughts = ReadNewThoughtsFromTranscript(transcriptFile, ref lastThoughtStep);
+                                var stepThinkingText = newTranscriptThoughts.Count > 0
+                                    ? string.Join("\n\n", newTranscriptThoughts.Select(t => t.Thinking))
+                                    : currentStepThinkingBuilder.ToString().Trim();
+
+                                var thinkingTokens = 0;
+                                double duration = step.TryGetProperty("duration_seconds", out var durProp) ? durProp.GetDouble() : 0;
+                                if (step.TryGetProperty("usage", out var usageProp))
+                                {
+                                    thinkingTokens = usageProp.TryGetProperty("thinking_tokens", out var ttProp) ? ttProp.GetInt32() : 0;
+
+                                    if (usageProp.TryGetProperty("input_tokens", out var ip)) lastInputTokens = ip.GetInt64();
+                                    if (usageProp.TryGetProperty("output_tokens", out var op)) lastOutputTokens = op.GetInt64();
+                                    if (usageProp.TryGetProperty("thinking_tokens", out var tp)) lastThinkingTokens = tp.GetInt64();
+                                    if (usageProp.TryGetProperty("total_tokens", out var totp)) lastTotalTokens = totp.GetInt64();
+                                }
                                 if (duration > 0) lastDuration = duration;
 
-                                // Emit thought indicator when the model completed a reasoning step before calling a tool
-                                if (thinkingTokens > 0 && streamedResponseBuilder.Length == 0)
+                                if (!string.IsNullOrWhiteSpace(stepThinkingText))
+                                {
+                                    agyLatestThought = stepThinkingText;
+                                    ct.ThrowIfCancellationRequested();
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "thought",
+                                        Content = stepThinkingText
+                                    });
+                                }
+                                else if (thinkingTokens > 0 && currentStepTextBuilder.Length == 0)
                                 {
                                     ct.ThrowIfCancellationRequested();
                                     await onEvent(new TrajectoryEventPayload
@@ -1390,10 +1813,55 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                         Content = $"Model reasoned ({thinkingTokens} thinking tokens in {duration:F1}s)"
                                     });
                                 }
+
+                                if (currentStepTextBuilder.Length > 0)
+                                {
+                                    var stepText = currentStepTextBuilder.ToString().Trim();
+                                    if (!string.IsNullOrWhiteSpace(stepText))
+                                    {
+                                        if (streamedResponseBuilder.Length > 0)
+                                        {
+                                            streamedResponseBuilder.Append("\n\n");
+                                        }
+                                        streamedResponseBuilder.Append(stepText);
+                                        pendingIntermediateText = stepText;
+                                    }
+                                }
+
+                                currentStepThinkingBuilder.Clear();
+                                currentStepTextBuilder.Clear();
                             }
                         }
                         else if (stepType == "tool")
                         {
+                            var flushedThoughts = ReadNewThoughtsFromTranscript(transcriptFile, ref lastThoughtStep);
+                            if (flushedThoughts.Count > 0)
+                            {
+                                var combinedThought = string.Join("\n\n", flushedThoughts.Select(t => t.Thinking));
+                                if (!string.IsNullOrWhiteSpace(combinedThought))
+                                {
+                                    agyLatestThought = combinedThought;
+                                    ct.ThrowIfCancellationRequested();
+                                    await onEvent(new TrajectoryEventPayload
+                                    {
+                                        EventType = "thought",
+                                        Content = combinedThought
+                                    });
+                                }
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(pendingIntermediateText))
+                            {
+                                var intermediate = pendingIntermediateText;
+                                pendingIntermediateText = null;
+                                ct.ThrowIfCancellationRequested();
+                                await onEvent(new TrajectoryEventPayload
+                                {
+                                    EventType = "thought",
+                                    Content = intermediate
+                                });
+                            }
+
                             var toolName = step.TryGetProperty("tool_name", out var tnProp) ? tnProp.GetString() ?? "tool" : "tool";
                             string? argsJson = null;
                             string? outputText = null;
@@ -1414,31 +1882,9 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                         ? paramsElem.GetString()
                                         : paramsElem.GetRawText();
 
-                                    var cmdVal = OpenAiAdapter.GetPropertyString(paramsElem, "command", "CommandLine", "commandLine", "cmd", "script", "shell_command");
-                                    if (!string.IsNullOrWhiteSpace(cmdVal))
-                                    {
-                                        summary = $"Running command: {(cmdVal.Length > 60 ? cmdVal[..57] + "..." : cmdVal)}";
-                                        agyCommandsRun.Add(cmdVal);
-                                    }
-                                    else
-                                    {
-                                        var pVal = OpenAiAdapter.GetPropertyString(paramsElem, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "target_file", "source_file", "uri");
-                                        if (!string.IsNullOrWhiteSpace(pVal))
-                                        {
-                                            var fileName = Path.GetFileName(pVal);
-                                            var tnLower = toolName.ToLowerInvariant();
-                                            if (tnLower.Contains("write") || tnLower.Contains("edit") || tnLower.Contains("replace") || tnLower.Contains("modify") || tnLower.Contains("patch"))
-                                            {
-                                                agyFilesModified.Add(pVal);
-                                                summary = $"Modifying file: {fileName}";
-                                            }
-                                            else
-                                            {
-                                                agyFilesInspected.Add(pVal);
-                                                summary = $"Inspecting file: {fileName}";
-                                            }
-                                        }
-                                    }
+                                    summary = state == "DONE"
+                                        ? FormatAgyToolSummary(toolName, paramsElem, agyFilesInspected, agyFilesModified, agyCommandsRun)
+                                        : FormatAgyToolSummary(toolName, paramsElem);
                                 }
                                 if (tiProp.TryGetProperty("output", out var outProp))
                                 {
@@ -1575,6 +2021,36 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                     else if (evName == "result" && root.TryGetProperty("result", out var resElem))
                     {
+                        if (currentStepTextBuilder.Length > 0)
+                        {
+                            var remainingStepText = currentStepTextBuilder.ToString().Trim();
+                            currentStepTextBuilder.Clear();
+                            if (!string.IsNullOrWhiteSpace(remainingStepText))
+                            {
+                                if (streamedResponseBuilder.Length > 0)
+                                {
+                                    streamedResponseBuilder.Append("\n\n");
+                                }
+                                streamedResponseBuilder.Append(remainingStepText);
+                            }
+                        }
+
+                        var trailingThoughts = ReadNewThoughtsFromTranscript(transcriptFile, ref lastThoughtStep);
+                        if (trailingThoughts.Count > 0)
+                        {
+                            var combinedThought = string.Join("\n\n", trailingThoughts.Select(t => t.Thinking));
+                            if (!string.IsNullOrWhiteSpace(combinedThought))
+                            {
+                                agyLatestThought = combinedThought;
+                                ct.ThrowIfCancellationRequested();
+                                await onEvent(new TrajectoryEventPayload
+                                {
+                                    EventType = "thought",
+                                    Content = combinedThought
+                                });
+                            }
+                        }
+
                         var responseText = resElem.TryGetProperty("response", out var respProp)
                             ? respProp.GetString()?.Trim()
                             : null;
@@ -1679,6 +2155,20 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             if (!emittedFinalResult)
             {
+                if (currentStepTextBuilder.Length > 0)
+                {
+                    var remainingStepText = currentStepTextBuilder.ToString().Trim();
+                    currentStepTextBuilder.Clear();
+                    if (!string.IsNullOrWhiteSpace(remainingStepText))
+                    {
+                        if (streamedResponseBuilder.Length > 0)
+                        {
+                            streamedResponseBuilder.Append("\n\n");
+                        }
+                        streamedResponseBuilder.Append(remainingStepText);
+                    }
+                }
+
                 var fallbackText = streamedResponseBuilder.ToString().Trim();
                 if (string.IsNullOrWhiteSpace(fallbackText) && !string.IsNullOrWhiteSpace(stdErr))
                 {
@@ -1779,9 +2269,7 @@ public class ClaudeAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
         var claudePath = AgentAdapterFactory.ResolveExecutablePath(preset.Command ?? "claude");
 
         if (claudePath != null)
@@ -1802,24 +2290,21 @@ public class ClaudeAdapter : IAgentAdapter
                 promptEvent.PersonaPrompt,
                 promptEvent.SessionId,
                 promptEvent.Attachments);
-            var escapedPrompt = promptEnvelope.Replace("\"", "\\\"");
-            var autocompactArg = !string.IsNullOrWhiteSpace(promptEvent.ContextSize)
-                ? $" --autocompact \"{promptEvent.ContextSize.Trim()}\""
-                : "";
-            var isPastDiscovery = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true);
 
-            var isDiscovery = !isPastDiscovery && (
-                (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true)
-                || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
-            var maxSteps = OpenAiAdapter.ResolveMaxSteps(preset, isDiscovery);
-            var maxStepsArg = $" --max-steps {maxSteps}";
-            var (exitCode, stdOut, stdErr) = await AgentAdapterFactory.RunShellCommandAsync($"\"{claudePath}\"{autocompactArg}{maxStepsArg} -p \"{escapedPrompt}\"", cwd, ct);
+            using var mcpProvisioning = SubprocessMcpProvisioner.ProvisionForClaude(
+                promptEvent.McpServers,
+                promptEvent.Mode);
+            await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "claude", mcpProvisioning, onEvent);
+
+            var psi = BuildClaudeProcessStartInfo(
+                claudePath,
+                cwd,
+                preset,
+                promptEvent,
+                promptEnvelope,
+                mcpProvisioning.ExtraArguments);
+
+            var (exitCode, stdOut, stdErr) = await RunClaudeProcessAsync(psi, preset, onEvent, ct);
             ct.ThrowIfCancellationRequested();
             var output = !string.IsNullOrWhiteSpace(stdOut) ? stdOut : stdErr;
 
@@ -1885,6 +2370,107 @@ public class ClaudeAdapter : IAgentAdapter
         var fallback = new AgyAdapter();
         await fallback.ExecutePromptAsync(preset, promptEvent, onEvent, ct);
     }
+
+    internal static ProcessStartInfo BuildClaudeProcessStartInfo(
+        string claudePath,
+        string cwd,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        string promptEnvelope,
+        IReadOnlyList<string>? extraMcpArguments = null)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = claudePath,
+            WorkingDirectory = cwd,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, preset.Id);
+
+        if (!string.IsNullOrWhiteSpace(promptEvent.ContextSize))
+        {
+            psi.ArgumentList.Add("--autocompact");
+            psi.ArgumentList.Add(promptEvent.ContextSize.Trim());
+        }
+
+        var isPastDiscovery = (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Plan approved", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Executing task", StringComparison.OrdinalIgnoreCase) == true);
+
+        var isDiscovery = !isPastDiscovery && (
+            (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("stage-1-discovery", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("[STAGE 1: DISCOVERY", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.PromptStack?.UserTaskEnvelope?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true)
+            || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
+
+        var maxSteps = OpenAiAdapter.ResolveMaxSteps(preset, isDiscovery);
+        psi.ArgumentList.Add("--max-steps");
+        psi.ArgumentList.Add(maxSteps.ToString());
+
+        if (extraMcpArguments != null)
+        {
+            foreach (var arg in extraMcpArguments)
+            {
+                psi.ArgumentList.Add(arg);
+            }
+        }
+
+        psi.ArgumentList.Add("-p");
+        psi.ArgumentList.Add(promptEnvelope);
+
+        return psi;
+    }
+
+    private static async Task<(int ExitCode, string StdOut, string StdErr)> RunClaudeProcessAsync(
+        ProcessStartInfo psi,
+        AgentPresetConfig preset,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        using var proc = new Process { StartInfo = psi };
+        using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
+        proc.Start();
+        proc.StandardInput.Close();
+
+        var stdOutTask = proc.StandardOutput.ReadToEndAsync(ct);
+        var stdErrTask = proc.StandardError.ReadToEndAsync(ct);
+
+        var idleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+            Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
+
+        try
+        {
+            var exitTask = proc.WaitForExitAsync(ct);
+            await Task.WhenAny(exitTask, Task.Delay(idleLimit, ct));
+            if (!exitTask.IsCompleted)
+            {
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "error",
+                    Content = $"[Claude Code @{preset.Id}] No exit after {(int)idleLimit.TotalMinutes} minutes; terminating the driver so this turn stops claiming to be running."
+                });
+                AgentAdapterFactory.KillProcessTree(proc);
+                await Task.WhenAny(Task.WhenAll(stdOutTask, stdErrTask), Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None));
+                return (-1, string.Empty, "Timed out waiting for Claude CLI.");
+            }
+
+            await exitTask;
+            var stdOut = await stdOutTask;
+            var stdErr = await stdErrTask;
+            return (proc.ExitCode, stdOut, stdErr);
+        }
+        catch (OperationCanceledException)
+        {
+            AgentAdapterFactory.KillProcessTree(proc);
+            throw;
+        }
+    }
 }
 
 public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
@@ -1902,9 +2488,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
         string? copilotPath = null;
         if (!string.IsNullOrWhiteSpace(preset.Command) && !string.Equals(preset.Command, "gh", StringComparison.OrdinalIgnoreCase))
         {
@@ -1969,6 +2553,11 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             promptEvent.SessionId,
             promptEvent.Attachments);
 
+        using var mcpProvisioning = SubprocessMcpProvisioner.ProvisionForCopilot(
+            promptEvent.McpServers,
+            promptEvent.Mode);
+        await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "copilot", mcpProvisioning, onEvent);
+
         var (exitCode, stdout, stderr, runSucceeded) = await RunCopilotSubprocessAsync(
             executablePath,
             isViaGh,
@@ -1978,7 +2567,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             promptEnvelope,
             useJsonFormat: true,
             onEvent,
-            ct);
+            ct,
+            mcpProvisioning.ExtraArguments);
 
         if (!runSucceeded && (stderr.Contains("unexpected argument '--output-format'") || stderr.Contains("unknown option '--output-format'")))
         {
@@ -1991,7 +2581,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 promptEnvelope,
                 useJsonFormat: false,
                 onEvent,
-                ct);
+                ct,
+                mcpProvisioning.ExtraArguments);
         }
     }
 
@@ -2001,7 +2592,9 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string cwd,
         PromptReceivedEvent promptEvent,
         string promptEnvelope,
-        bool useJsonFormat)
+        bool useJsonFormat,
+        string? driverId = null,
+        IReadOnlyList<string>? extraMcpArguments = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -2013,6 +2606,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, driverId);
 
         if (isViaGh)
         {
@@ -2070,10 +2664,201 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             psi.ArgumentList.Add("on");
         }
 
+        if (extraMcpArguments != null)
+        {
+            foreach (var arg in extraMcpArguments)
+            {
+                psi.ArgumentList.Add(arg);
+            }
+        }
+
+        IsolateCopilotEnvironment(psi.Environment, driverId: driverId ?? promptEvent.DriverId);
+
         return psi;
     }
 
-    private static async Task<(int ExitCode, string StdOut, string StdErr, bool Succeeded)> RunCopilotSubprocessAsync(
+    internal static void IsolateCopilotEnvironment(
+        IDictionary<string, string?> environment,
+        string? homeDirectory = null,
+        string? driverId = null)
+    {
+        environment.TryGetValue(CopilotCredentialHelper.PersonaGitHubTokenEnvVar, out var personaGhToken);
+        environment.TryGetValue("GH_TOKEN", out var ghToken);
+        environment.TryGetValue("GITHUB_TOKEN", out var githubToken);
+
+        var effectivePersonaGitHubToken = !string.IsNullOrWhiteSpace(personaGhToken)
+            ? personaGhToken
+            : (!string.IsNullOrWhiteSpace(ghToken) ? ghToken : githubToken);
+
+        if (!string.IsNullOrWhiteSpace(effectivePersonaGitHubToken) &&
+            string.IsNullOrWhiteSpace(personaGhToken))
+        {
+            environment[CopilotCredentialHelper.PersonaGitHubTokenEnvVar] = effectivePersonaGitHubToken.Trim();
+        }
+
+        // Copilot CLI checks COPILOT_GITHUB_TOKEN, GH_TOKEN, and GITHUB_TOKEN ahead of
+        // ~/.copilot/config.json and exits immediately if any of them contains a classic PAT (ghp_).
+        // Keep GitHub repository PAT auth isolated from Copilot CLI auth.
+        environment.Remove("GH_TOKEN");
+        environment.Remove("GITHUB_TOKEN");
+
+        var home = homeDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var copilotHome = environment.TryGetValue("COPILOT_HOME", out var explicitCopilotHome) &&
+                          !string.IsNullOrWhiteSpace(explicitCopilotHome)
+            ? explicitCopilotHome.Trim()
+            : (!string.IsNullOrWhiteSpace(home) ? Path.Combine(home, ".copilot") : null);
+
+        var hasFileLogin = false;
+        if (!string.IsNullOrWhiteSpace(copilotHome))
+        {
+            var configPath = Path.Combine(copilotHome, "config.json");
+            if (File.Exists(configPath))
+            {
+                try
+                {
+                    hasFileLogin = CopilotCredentialHelper.HasActiveCopilotConfigLogin(File.ReadAllText(configPath));
+                }
+                catch { }
+            }
+        }
+
+        var normalizedDriverId = string.IsNullOrWhiteSpace(driverId)
+            ? null
+            : driverId.Trim().TrimStart('@').ToLowerInvariant();
+        if (!hasFileLogin && !string.IsNullOrWhiteSpace(normalizedDriverId) && !string.IsNullOrWhiteSpace(home))
+        {
+            var driverCopilotHome = Path.Combine(home, ".agentmesh", "copilot-homes", normalizedDriverId);
+            var driverConfigPath = Path.Combine(driverCopilotHome, "config.json");
+            if (File.Exists(driverConfigPath))
+            {
+                try
+                {
+                    if (CopilotCredentialHelper.HasActiveCopilotConfigLogin(File.ReadAllText(driverConfigPath)))
+                    {
+                        environment["COPILOT_HOME"] = driverCopilotHome;
+                        hasFileLogin = true;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        environment.TryGetValue("COPILOT_GITHUB_TOKEN", out var rawCopilotEnv);
+        var sanitizedCopilotEnv = CopilotCredentialHelper.SanitizeCopilotEnvToken(
+            rawCopilotEnv,
+            effectivePersonaGitHubToken);
+
+        string? resolvedCopilotToken = sanitizedCopilotEnv;
+        if (resolvedCopilotToken == null)
+        {
+            environment.Remove("COPILOT_GITHUB_TOKEN");
+
+            if (environment.TryGetValue(CopilotCredentialHelper.CopilotOAuthTokenEnvVar, out var oauthTok) &&
+                CopilotCredentialHelper.IsSupportedCopilotToken(oauthTok))
+            {
+                resolvedCopilotToken = oauthTok!.Trim();
+            }
+            else if (!string.IsNullOrWhiteSpace(normalizedDriverId) && !string.IsNullOrWhiteSpace(home))
+            {
+                var driverTokenPath = Path.Combine(home, ".agentmesh", "tokens", $"driver-{normalizedDriverId}.oauth");
+                if (File.Exists(driverTokenPath))
+                {
+                    try
+                    {
+                        var fileTok = File.ReadAllText(driverTokenPath).Trim();
+                        if (CopilotCredentialHelper.IsSupportedCopilotToken(fileTok))
+                        {
+                            resolvedCopilotToken = fileTok;
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        // Env-token injection takes precedence over any file state ON PURPOSE (validated against
+        // Copilot CLI 1.0.112: COPILOT_GITHUB_TOKEN wins over config.json, even a poisoned one).
+        // It is injected whenever a supported token is available — even when a config-file login
+        // looks active — so a drifted/corrupted config.json can never deadlock the driver again.
+        if (!string.IsNullOrWhiteSpace(resolvedCopilotToken))
+        {
+            environment["COPILOT_GITHUB_TOKEN"] = resolvedCopilotToken.Trim();
+        }
+    }
+
+    internal static void SelfHealContainerCopilotConfig(IDictionary<string, string?> environment)
+    {
+        try
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrWhiteSpace(home)) return;
+
+            var copilotHome = environment.TryGetValue("COPILOT_HOME", out var explicitHome) &&
+                              !string.IsNullOrWhiteSpace(explicitHome)
+                ? explicitHome.Trim()
+                : Path.Combine(home, ".copilot");
+
+            var inContainer = File.Exists("/.dockerenv") ||
+                              !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("KUBERNETES_SERVICE_HOST")) ||
+                              string.Equals(Environment.GetEnvironmentVariable("REMOTE_CONTAINERS"), "true", StringComparison.OrdinalIgnoreCase) ||
+                              Directory.Exists("/workspace/.agentmesh/state");
+
+            var configPath = Path.Combine(copilotHome, "config.json");
+            if (!File.Exists(configPath)) return;
+
+            var existingJson = File.ReadAllText(configPath);
+            // Only prune orphaned sign-in records outside containers if the file also carries
+            // AgentMesh-managed token maps (any era naming), indicating an AgentMesh-merged file
+            // rather than an OS keychain desktop login.
+            var pruneOrphans = inContainer ||
+                existingJson.Contains("\"authTokens\"", StringComparison.Ordinal) ||
+                existingJson.Contains("\"copilotTokens\"", StringComparison.Ordinal) ||
+                existingJson.Contains("\"copilot_tokens\"", StringComparison.Ordinal);
+
+            environment.TryGetValue(CopilotCredentialHelper.CopilotOAuthTokenEnvVar, out var oauthEnv);
+            string? cleanedJson;
+            var changed = false;
+
+            if (!CopilotCredentialHelper.HasActiveCopilotConfigLogin(existingJson) &&
+                CopilotCredentialHelper.IsSupportedCopilotToken(oauthEnv))
+            {
+                // Re-key with the login the CLI itself recorded in the file (lastLoggedInUser /
+                // loggedInUsers / host:login-qualified keys) so the healed file is in the native
+                // shape the CLI can resolve. No login => Merge refuses to write the poison shape.
+                cleanedJson = CopilotCredentialHelper.MergeCopilotTokenIntoConfigJson(
+                    existingJson,
+                    oauthEnv!,
+                    CopilotCredentialHelper.TryGetKnownLoginFromConfigJson(existingJson),
+                    overwriteExisting: false);
+                changed = !string.Equals(existingJson.Trim(), cleanedJson?.Trim(), StringComparison.Ordinal);
+            }
+            else
+            {
+                cleanedJson = CopilotCredentialHelper.ScrubClassicPatFromConfigJson(
+                    existingJson,
+                    out changed,
+                    pruneOrphanedLoggedInUsers: pruneOrphans);
+            }
+
+            if (changed)
+            {
+                if (string.IsNullOrWhiteSpace(cleanedJson))
+                {
+                    File.Delete(configPath);
+                }
+                else
+                {
+                    File.WriteAllText(configPath, cleanedJson + "\n");
+                }
+            }
+        }
+        catch { }
+    }
+
+    internal const int MaxRawFallbackPreviewChars = 16_384;
+    private const int MaxToolResultPayloadChars = 32_768;
+
+    internal static async Task<(int ExitCode, string StdOut, string StdErr, bool Succeeded)> RunCopilotSubprocessAsync(
         string executablePath,
         bool isViaGh,
         string cwd,
@@ -2082,9 +2867,30 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string promptEnvelope,
         bool useJsonFormat,
         Func<TrajectoryEventPayload, Task> onEvent,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<string>? extraMcpArguments = null)
     {
-        var psi = BuildCopilotProcessStartInfo(executablePath, isViaGh, cwd, promptEvent, promptEnvelope, useJsonFormat);
+        using var localProvisioning = extraMcpArguments == null
+            ? SubprocessMcpProvisioner.ProvisionForCopilot(promptEvent.McpServers, promptEvent.Mode)
+            : null;
+        if (localProvisioning != null)
+        {
+            await AgentAdapterFactory.EmitSubprocessMcpEventsAsync(preset.Id, "copilot", localProvisioning, onEvent);
+        }
+
+        var effectiveMcpArgs = extraMcpArguments ?? localProvisioning?.ExtraArguments;
+        var psi = BuildCopilotProcessStartInfo(
+            executablePath,
+            isViaGh,
+            cwd,
+            promptEvent,
+            promptEnvelope,
+            useJsonFormat,
+            preset.Id,
+            effectiveMcpArgs);
+        SelfHealContainerCopilotConfig(psi.Environment);
+        // Re-evaluate COPILOT_GITHUB_TOKEN / COPILOT_HOME after self-heal so env matches healed config.json
+        IsolateCopilotEnvironment(psi.Environment, driverId: preset.Id ?? promptEvent.DriverId);
 
         using var proc = new Process { StartInfo = psi };
         using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
@@ -2097,8 +2903,89 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var lastActivity = Stopwatch.GetTimestamp();
         var lastHeartbeatTime = Stopwatch.GetTimestamp();
         var sw = Stopwatch.StartNew();
+        var copilotIdleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+            Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
         string? copilotSessionId = null;
         string? terminalUsageJson = null;
+        string? taskCompleteSummary = null;
+        var thoughtDeltaBuilder = new StringBuilder();
+        var pendingArglessTools = new List<string>();
+        string? lastActiveToolName = null;
+        string? lastCopilotActivitySummary = null;
+
+        async Task SafeEmitAsync(TrajectoryEventPayload payload)
+        {
+            if (string.IsNullOrWhiteSpace(payload.Content))
+            {
+                payload.Content = !string.IsNullOrWhiteSpace(payload.ToolName)
+                    ? payload.ToolName
+                    : (!string.IsNullOrWhiteSpace(payload.EventType) ? payload.EventType : "event");
+            }
+
+            try
+            {
+                await onEvent(payload);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                // Keep draining stdout even if posting an individual trajectory event fails
+            }
+        }
+
+        async Task FlushThoughtDeltasAsync()
+        {
+            if (thoughtDeltaBuilder.Length > 0)
+            {
+                var thoughtText = thoughtDeltaBuilder.ToString().Trim();
+                thoughtDeltaBuilder.Clear();
+                if (!string.IsNullOrWhiteSpace(thoughtText))
+                {
+                    Volatile.Write(ref lastCopilotActivitySummary, TruncateLine(thoughtText, 80));
+                    await SafeEmitAsync(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = thoughtText
+                    });
+                }
+            }
+        }
+
+        async Task FlushPendingEventsAsync(string? incomingToolWithArgs = null)
+        {
+            await FlushThoughtDeltasAsync();
+
+            if (pendingArglessTools.Count == 0) return;
+
+            if (incomingToolWithArgs != null)
+            {
+                var matchIdx = pendingArglessTools.FindIndex(
+                    t => string.Equals(t, incomingToolWithArgs, StringComparison.OrdinalIgnoreCase));
+                if (matchIdx >= 0)
+                {
+                    // Coalesce the arg-less streaming prelude with the full tool_call carrying arguments
+                    pendingArglessTools.RemoveAt(matchIdx);
+                    return;
+                }
+            }
+
+            var toEmit = pendingArglessTools.ToList();
+            pendingArglessTools.Clear();
+            foreach (var pending in toEmit)
+            {
+                var fallbackSummary = $"Calling {pending}...";
+                Volatile.Write(ref lastCopilotActivitySummary, fallbackSummary);
+                await SafeEmitAsync(new TrajectoryEventPayload
+                {
+                    EventType = "tool_call",
+                    ToolName = pending,
+                    Content = fallbackSummary
+                });
+            }
+        }
 
         var readStdOutTask = Task.Run(async () =>
         {
@@ -2114,7 +3001,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     rawStdOutBuilder.AppendLine(line);
                 }
 
-                if (TryParseCopilotJsonLine(line, out var evType, out var evContent, out var toolName, out var toolArgs, out var toolRes, out var sid, out var usage))
+                if (TryParseCopilotJsonLine(line, out var evType, out var evContent, out var toolName, out var toolArgs, out var toolRes, out var sid, out var usage, out var parsedTaskSummary))
                 {
                     if (!string.IsNullOrWhiteSpace(sid))
                     {
@@ -2125,37 +3012,67 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     {
                         terminalUsageJson = usage;
                     }
-
-                    if (evType == "thought" && !string.IsNullOrWhiteSpace(evContent))
+                    if (!string.IsNullOrWhiteSpace(parsedTaskSummary))
                     {
-                        await onEvent(new TrajectoryEventPayload
+                        taskCompleteSummary = parsedTaskSummary.Trim();
+                    }
+
+                    if (evType == "thought_delta" && !string.IsNullOrEmpty(evContent))
+                    {
+                        thoughtDeltaBuilder.Append(evContent);
+                    }
+                    else if (evType == "thought" && !string.IsNullOrWhiteSpace(evContent))
+                    {
+                        await FlushThoughtDeltasAsync();
+                        var trimmedThought = evContent.Trim();
+                        Volatile.Write(ref lastCopilotActivitySummary, TruncateLine(trimmedThought, 80));
+                        await SafeEmitAsync(new TrajectoryEventPayload
                         {
                             EventType = "thought",
-                            Content = evContent.Trim()
+                            Content = trimmedThought
                         });
                     }
                     else if (evType == "tool_call" && !string.IsNullOrWhiteSpace(toolName))
                     {
-                        await onEvent(new TrajectoryEventPayload
+                        if (string.IsNullOrWhiteSpace(toolArgs))
                         {
-                            EventType = "tool_call",
-                            ToolName = toolName,
-                            ToolArgsJson = toolArgs,
-                            Content = evContent ?? $"Calling {toolName}..."
-                        });
+                            await FlushThoughtDeltasAsync();
+                            pendingArglessTools.Add(toolName);
+                            lastActiveToolName = toolName;
+                        }
+                        else
+                        {
+                            await FlushPendingEventsAsync(incomingToolWithArgs: toolName);
+                            lastActiveToolName = toolName;
+                            var summary = !string.IsNullOrWhiteSpace(evContent)
+                                ? evContent
+                                : FormatToolCallSummary(toolName, toolArgs);
+                            Volatile.Write(ref lastCopilotActivitySummary, summary);
+                            await SafeEmitAsync(new TrajectoryEventPayload
+                            {
+                                EventType = "tool_call",
+                                ToolName = toolName,
+                                ToolArgsJson = toolArgs,
+                                Content = summary
+                            });
+                        }
                     }
                     else if (evType == "tool_result")
                     {
-                        await onEvent(new TrajectoryEventPayload
+                        await FlushPendingEventsAsync();
+                        var effectiveToolName = !string.IsNullOrWhiteSpace(toolName) ? toolName : lastActiveToolName;
+                        var boundedToolResult = BoundPreviewTail(toolRes, MaxToolResultPayloadChars);
+                        await SafeEmitAsync(new TrajectoryEventPayload
                         {
                             EventType = "tool_result",
-                            ToolName = toolName,
-                            ToolResultJson = toolRes,
-                            Content = TruncateLine(toolRes, 120)
+                            ToolName = effectiveToolName,
+                            ToolResultJson = boundedToolResult,
+                            Content = FormatCopilotToolResultSummary(effectiveToolName, toolRes)
                         });
                     }
                     else if (evType == "message" && !string.IsNullOrWhiteSpace(evContent))
                     {
+                        await FlushPendingEventsAsync();
                         lock (streamedResponseBuilder)
                         {
                             streamedResponseBuilder.Append(evContent);
@@ -2163,6 +3080,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                     else if (evType == "result" && !string.IsNullOrWhiteSpace(evContent))
                     {
+                        await FlushPendingEventsAsync();
                         lock (streamedResponseBuilder)
                         {
                             if (streamedResponseBuilder.Length == 0)
@@ -2171,9 +3089,14 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             }
                         }
                     }
+                    else if (evType == "task_complete")
+                    {
+                        await FlushPendingEventsAsync();
+                    }
                 }
                 else
                 {
+                    await FlushPendingEventsAsync();
                     var trimmed = line.Trim();
                     if (trimmed.StartsWith("Running ", StringComparison.OrdinalIgnoreCase) ||
                         trimmed.StartsWith("Executing ", StringComparison.OrdinalIgnoreCase) ||
@@ -2183,7 +3106,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         trimmed.StartsWith("Inspecting ", StringComparison.OrdinalIgnoreCase) ||
                         trimmed.StartsWith("> ", StringComparison.Ordinal))
                     {
-                        await onEvent(new TrajectoryEventPayload
+                        Volatile.Write(ref lastCopilotActivitySummary, TruncateLine(trimmed, 80));
+                        await SafeEmitAsync(new TrajectoryEventPayload
                         {
                             EventType = "thought",
                             Content = trimmed
@@ -2196,6 +3120,8 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                 }
             }
+
+            await FlushPendingEventsAsync();
         }, ct);
 
         var readStdErrTask = Task.Run(async () =>
@@ -2218,7 +3144,14 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         {
             while (!proc.HasExited)
             {
-                await Task.WhenAny(Task.Delay(1000, ct), proc.WaitForExitAsync(ct));
+                if (readStdOutTask.IsCompleted)
+                {
+                    await Task.WhenAny(Task.Delay(1000, ct), proc.WaitForExitAsync(ct));
+                }
+                else
+                {
+                    await Task.WhenAny(Task.Delay(1000, ct), proc.WaitForExitAsync(ct), readStdOutTask);
+                }
                 if (proc.HasExited) break;
 
                 var now = Stopwatch.GetTimestamp();
@@ -2229,11 +3162,32 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 if (silentDuration >= TimeSpan.FromSeconds(60) && sinceLastHeartbeat >= TimeSpan.FromSeconds(60))
                 {
                     lastHeartbeatTime = now;
-                    await onEvent(new TrajectoryEventPayload
+                    var latestActivity = Volatile.Read(ref lastCopilotActivitySummary);
+                    var activitySuffix = !string.IsNullOrWhiteSpace(latestActivity)
+                        ? $" ({latestActivity})"
+                        : "";
+                    await SafeEmitAsync(new TrajectoryEventPayload
                     {
                         EventType = "thought",
-                        Content = $"[GitHub Copilot CLI @{preset.Id}] Still working... ({sw.Elapsed.TotalSeconds:F0}s elapsed)"
+                        Content = $"[GitHub Copilot CLI @{preset.Id}] Still working{activitySuffix}... ({sw.Elapsed.TotalSeconds:F0}s elapsed)"
                     });
+                }
+
+                // The heartbeats above make a wedged copilot look alive, which is worse than silence: the
+                // transcript keeps growing while nothing is happening, and this loop then waits on a
+                // process that will never exit. Same bound as the other subprocess drivers, so the three
+                // of them agree on how long "still working" is allowed to mean.
+                if (silentDuration >= copilotIdleLimit)
+                {
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "error",
+                        Content = $"[GitHub Copilot CLI @{preset.Id}] No output for " +
+                            $"{(int)copilotIdleLimit.TotalMinutes} minutes ({sw.Elapsed.TotalSeconds:F0}s into the turn); " +
+                            "terminating the driver so this turn stops claiming to be running."
+                    });
+                    AgentAdapterFactory.KillProcessTree(proc);
+                    break;
                 }
             }
 
@@ -2250,12 +3204,9 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return (proc.ExitCode, rawStdOut, stdErr, false);
             }
 
-            string output;
-            lock (streamedResponseBuilder) { output = streamedResponseBuilder.ToString().Trim(); }
-            if (string.IsNullOrWhiteSpace(output))
-            {
-                output = !string.IsNullOrWhiteSpace(rawStdOut) ? rawStdOut : stdErr;
-            }
+            string streamedOutput;
+            lock (streamedResponseBuilder) { streamedOutput = streamedResponseBuilder.ToString().Trim(); }
+            var output = ResolveFinalCopilotOutput(streamedOutput, taskCompleteSummary, rawStdOut, stdErr);
 
             // Check if Copilot asked questions
             var questions = AgentAdapterFactory.ExtractQuestionsFromOutput(output);
@@ -2312,6 +3263,62 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
     }
 
+    internal static string ResolveFinalCopilotOutput(
+        string? streamedResponse,
+        string? taskCompleteSummary,
+        string? rawStdOut,
+        string? stdErr,
+        int maxFallbackChars = MaxRawFallbackPreviewChars)
+    {
+        if (!string.IsNullOrWhiteSpace(streamedResponse))
+        {
+            return streamedResponse.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(taskCompleteSummary))
+        {
+            return taskCompleteSummary.Trim();
+        }
+
+        // Extract non-JSON plain-text lines from rawStdOut first; never emit unbounded multi-MB JSONL streams.
+        if (!string.IsNullOrWhiteSpace(rawStdOut))
+        {
+            var plainLines = new List<string>();
+            foreach (var rawLine in rawStdOut.Split('\n'))
+            {
+                var t = rawLine.Trim();
+                if (string.IsNullOrEmpty(t)) continue;
+                if (t.StartsWith('{') && t.EndsWith('}')) continue;
+                plainLines.Add(rawLine.TrimEnd('\r'));
+            }
+
+            if (plainLines.Count > 0)
+            {
+                return BoundPreviewTail(string.Join("\n", plainLines).Trim(), maxFallbackChars)!;
+            }
+        }
+
+        var fallback = !string.IsNullOrWhiteSpace(stdErr) ? stdErr.Trim() : (rawStdOut?.Trim() ?? string.Empty);
+        return BoundPreviewTail(fallback, maxFallbackChars) ?? string.Empty;
+    }
+
+    internal static string? BoundPreviewTail(string? text, int maxChars = MaxRawFallbackPreviewChars)
+    {
+        if (string.IsNullOrEmpty(text) || text.Length <= maxChars)
+        {
+            return text;
+        }
+
+        const string prefix = "[... Earlier output omitted ...]\n";
+        if (maxChars <= prefix.Length)
+        {
+            return text[^maxChars..];
+        }
+
+        var tailLen = maxChars - prefix.Length;
+        return prefix + text[^tailLen..];
+    }
+
     internal static bool TryParseCopilotJsonLine(
         string line,
         out string? eventType,
@@ -2320,7 +3327,28 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         out string? toolArgsJson,
         out string? toolResultJson,
         out string? sessionId,
-        out string? usageJson)
+        out string? usageJson) =>
+        TryParseCopilotJsonLine(
+            line,
+            out eventType,
+            out content,
+            out toolName,
+            out toolArgsJson,
+            out toolResultJson,
+            out sessionId,
+            out usageJson,
+            out _);
+
+    internal static bool TryParseCopilotJsonLine(
+        string line,
+        out string? eventType,
+        out string? content,
+        out string? toolName,
+        out string? toolArgsJson,
+        out string? toolResultJson,
+        out string? sessionId,
+        out string? usageJson,
+        out string? taskCompleteSummary)
     {
         eventType = null;
         content = null;
@@ -2329,6 +3357,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         toolResultJson = null;
         sessionId = null;
         usageJson = null;
+        taskCompleteSummary = null;
 
         if (string.IsNullOrWhiteSpace(line)) return false;
         var trimmed = line.Trim();
@@ -2375,34 +3404,71 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return true;
             }
 
-            if (lower is "assistant.reasoning" or "thought" or "reasoning")
+            if (lower is "session.task_complete" or "task_complete" or "task.complete")
             {
-                eventType = "thought";
-                content = data.TryGetProperty("content", out var c) ? c.GetString() : (data.TryGetProperty("text", out var t) ? t.GetString() : null);
+                eventType = "task_complete";
+                taskCompleteSummary = ExtractTaskCompleteSummary(data) ?? ExtractTaskCompleteSummary(root);
+                content = taskCompleteSummary;
+                return true;
+            }
+
+            if (lower is "assistant.reasoning" or "thought" or "reasoning" || lower.Contains("reasoning") || lower.Contains("thinking"))
+            {
+                eventType = lower.Contains("delta") ? "thought_delta" : "thought";
+                content = OpenAiAdapter.GetPropertyString(data, "content", "text", "delta", "thinking");
                 return !string.IsNullOrWhiteSpace(content);
+            }
+
+            // Evaluate tool_result BEFORE tool_call so events like "tool.execution_complete"
+            // map to tool_result rather than matching "execution" in tool_call!
+            if (lower.Contains("tool") && (lower.Contains("result") || lower.Contains("output") || lower.Contains("finish") || lower.Contains("done") || lower.Contains("complete")))
+            {
+                eventType = "tool_result";
+                toolName = ExtractToolName(data);
+                if (data.TryGetProperty("result", out var r) || data.TryGetProperty("output", out r) || data.TryGetProperty("content", out r) || data.TryGetProperty("stdout", out r))
+                {
+                    toolResultJson = r.ValueKind == JsonValueKind.String ? r.GetString() : r.GetRawText();
+                }
+
+                if (IsTaskCompleteToolName(toolName))
+                {
+                    taskCompleteSummary = ExtractTaskCompleteSummary(data) ?? ExtractTaskCompleteSummaryFromJson(toolResultJson);
+                }
+
+                content = FormatCopilotToolResultSummary(toolName, toolResultJson);
+                return true;
             }
 
             if (lower.Contains("tool") && (lower.Contains("call") || lower.Contains("execution") || lower.Contains("start") || lower.Contains("use")))
             {
                 eventType = "tool_call";
-                toolName = data.TryGetProperty("tool", out var tn) ? tn.GetString() : (data.TryGetProperty("name", out var n) ? n.GetString() : "tool");
-                if (data.TryGetProperty("args", out var a) || data.TryGetProperty("arguments", out a) || data.TryGetProperty("input", out a))
+                if (data.TryGetProperty("args", out var a) ||
+                    data.TryGetProperty("arguments", out a) ||
+                    data.TryGetProperty("input", out a) ||
+                    data.TryGetProperty("parameters", out a))
                 {
                     toolArgsJson = a.ValueKind == JsonValueKind.String ? a.GetString() : a.GetRawText();
                 }
-                content = FormatToolCallSummary(toolName, toolArgsJson);
-                return true;
-            }
-
-            if (lower.Contains("tool") && (lower.Contains("result") || lower.Contains("output") || lower.Contains("finish") || lower.Contains("done")))
-            {
-                eventType = "tool_result";
-                toolName = data.TryGetProperty("tool", out var tn) ? tn.GetString() : (data.TryGetProperty("name", out var n) ? n.GetString() : null);
-                if (data.TryGetProperty("result", out var r) || data.TryGetProperty("output", out r) || data.TryGetProperty("content", out r) || data.TryGetProperty("stdout", out r))
+                else if (data.TryGetProperty("function", out var fnArgsProp) && fnArgsProp.ValueKind == JsonValueKind.Object &&
+                         (fnArgsProp.TryGetProperty("arguments", out a) || fnArgsProp.TryGetProperty("args", out a)))
                 {
-                    toolResultJson = r.ValueKind == JsonValueKind.String ? r.GetString() : r.GetRawText();
+                    toolArgsJson = a.ValueKind == JsonValueKind.String ? a.GetString() : a.GetRawText();
                 }
-                content = TruncateLine(toolResultJson, 120);
+                else if ((data.TryGetProperty("toolCall", out var tcArgsProp) || data.TryGetProperty("tool_call", out tcArgsProp)) &&
+                         tcArgsProp.ValueKind == JsonValueKind.Object &&
+                         (tcArgsProp.TryGetProperty("arguments", out a) || tcArgsProp.TryGetProperty("args", out a) || tcArgsProp.TryGetProperty("input", out a)))
+                {
+                    toolArgsJson = a.ValueKind == JsonValueKind.String ? a.GetString() : a.GetRawText();
+                }
+
+                toolName = InferCopilotToolName(ExtractToolName(data), toolArgsJson);
+
+                if (IsTaskCompleteToolName(toolName))
+                {
+                    taskCompleteSummary = ExtractTaskCompleteSummary(data) ?? ExtractTaskCompleteSummaryFromJson(toolArgsJson);
+                }
+
+                content = FormatToolCallSummary(toolName, toolArgsJson);
                 return true;
             }
 
@@ -2435,31 +3501,379 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
     }
 
-    private static string FormatToolCallSummary(string? toolName, string? toolArgsJson)
+    private static string? ExtractToolName(JsonElement data)
     {
-        if (string.IsNullOrWhiteSpace(toolName)) return "Calling tool...";
+        if (data.ValueKind != JsonValueKind.Object) return null;
+        if (data.TryGetProperty("toolName", out var tnProp) && tnProp.ValueKind == JsonValueKind.String)
+            return tnProp.GetString();
+        if (data.TryGetProperty("tool_name", out var tsnProp) && tsnProp.ValueKind == JsonValueKind.String)
+            return tsnProp.GetString();
+        if (data.TryGetProperty("tool", out var tProp) && tProp.ValueKind == JsonValueKind.String)
+            return tProp.GetString();
+        if (data.TryGetProperty("name", out var nProp) && nProp.ValueKind == JsonValueKind.String)
+            return nProp.GetString();
+
+        if (data.TryGetProperty("function", out var fnProp) && fnProp.ValueKind == JsonValueKind.Object &&
+            fnProp.TryGetProperty("name", out var fnName) && fnName.ValueKind == JsonValueKind.String)
+            return fnName.GetString();
+
+        if ((data.TryGetProperty("toolCall", out var tcProp) || data.TryGetProperty("tool_call", out tcProp)) &&
+            tcProp.ValueKind == JsonValueKind.Object)
+        {
+            if (tcProp.TryGetProperty("toolName", out var tcTn) && tcTn.ValueKind == JsonValueKind.String)
+                return tcTn.GetString();
+            if (tcProp.TryGetProperty("name", out var tcName) && tcName.ValueKind == JsonValueKind.String)
+                return tcName.GetString();
+            if (tcProp.TryGetProperty("function", out var tcFn) && tcFn.ValueKind == JsonValueKind.Object &&
+                tcFn.TryGetProperty("name", out var tcFnName) && tcFnName.ValueKind == JsonValueKind.String)
+                return tcFnName.GetString();
+        }
+
+        return null;
+    }
+
+    private static bool HasJsonProperty(JsonElement root, params string[] names)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return false;
+        foreach (var name in names)
+        {
+            if (root.TryGetProperty(name, out var prop) &&
+                prop.ValueKind != JsonValueKind.Null &&
+                prop.ValueKind != JsonValueKind.Undefined)
+            {
+                return true;
+            }
+        }
+        foreach (var prop in root.EnumerateObject())
+        {
+            foreach (var name in names)
+            {
+                if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase) &&
+                    prop.Value.ValueKind != JsonValueKind.Null &&
+                    prop.Value.ValueKind != JsonValueKind.Undefined)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    internal static string InferCopilotToolName(string? currentToolName, string? toolArgsJson)
+    {
+        if (!string.IsNullOrWhiteSpace(currentToolName) &&
+            !string.Equals(currentToolName, "tool", StringComparison.OrdinalIgnoreCase))
+        {
+            return currentToolName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(toolArgsJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(toolArgsJson);
+                var root = doc.RootElement;
+                if (root.ValueKind == JsonValueKind.String)
+                {
+                    var inner = root.GetString();
+                    if (!string.IsNullOrWhiteSpace(inner))
+                    {
+                        using var innerDoc = JsonDocument.Parse(inner);
+                        return InferCopilotToolNameFromObject(currentToolName, innerDoc.RootElement);
+                    }
+                }
+                else
+                {
+                    return InferCopilotToolNameFromObject(currentToolName, root);
+                }
+            }
+            catch { }
+        }
+
+        return currentToolName ?? "tool";
+    }
+
+    private static string InferCopilotToolNameFromObject(string? currentToolName, JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return currentToolName ?? "tool";
+
+        if (HasJsonProperty(root, "command", "cmd")) return "bash";
+        if (HasJsonProperty(root, "view_range")) return "view";
+        if (HasJsonProperty(root, "old_str", "new_str", "replacement")) return "edit";
+        if (HasJsonProperty(root, "file_text") ||
+            (HasJsonProperty(root, "content") && HasJsonProperty(root, "path", "file", "filePath", "file_path")))
+            return "write";
+        if (HasJsonProperty(root, "pattern") && HasJsonProperty(root, "paths", "include")) return "glob";
+        if (HasJsonProperty(root, "pattern")) return "grep";
+        if (HasJsonProperty(root, "query")) return "sql";
+        if (HasJsonProperty(root, "path", "file")) return "view";
+
+        return currentToolName ?? "tool";
+    }
+
+    private static bool IsTaskCompleteToolName(string? toolName) =>
+        !string.IsNullOrWhiteSpace(toolName) &&
+        (string.Equals(toolName, "task_complete", StringComparison.OrdinalIgnoreCase) ||
+         toolName.EndsWith(".task_complete", StringComparison.OrdinalIgnoreCase) ||
+         toolName.EndsWith("/task_complete", StringComparison.OrdinalIgnoreCase));
+
+    private static string? ExtractTaskCompleteSummary(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object) return null;
+
+        if (element.TryGetProperty("summary", out var sProp) && sProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(sProp.GetString()))
+        {
+            return sProp.GetString();
+        }
+
+        if (element.TryGetProperty("arguments", out var argsProp))
+        {
+            var fromArgs = argsProp.ValueKind == JsonValueKind.String
+                ? ExtractTaskCompleteSummaryFromJson(argsProp.GetString())
+                : ExtractTaskCompleteSummary(argsProp);
+            if (!string.IsNullOrWhiteSpace(fromArgs)) return fromArgs;
+        }
+
+        if (element.TryGetProperty("args", out var aProp))
+        {
+            var fromArgs = aProp.ValueKind == JsonValueKind.String
+                ? ExtractTaskCompleteSummaryFromJson(aProp.GetString())
+                : ExtractTaskCompleteSummary(aProp);
+            if (!string.IsNullOrWhiteSpace(fromArgs)) return fromArgs;
+        }
+
+        if (element.TryGetProperty("result", out var resProp))
+        {
+            if (resProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(resProp.GetString()))
+                return resProp.GetString();
+            if (resProp.ValueKind == JsonValueKind.Object)
+            {
+                if (resProp.TryGetProperty("summary", out var rsProp) && rsProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(rsProp.GetString()))
+                    return rsProp.GetString();
+                if (resProp.TryGetProperty("content", out var rcProp) && rcProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(rcProp.GetString()))
+                    return rcProp.GetString();
+            }
+        }
+
+        if (element.TryGetProperty("content", out var cProp) && cProp.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(cProp.GetString()))
+        {
+            return cProp.GetString();
+        }
+
+        return null;
+    }
+
+    private static string? ExtractTaskCompleteSummaryFromJson(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        var trimmed = json.Trim();
+        if (!trimmed.StartsWith('{')) return trimmed;
+        try
+        {
+            using var doc = JsonDocument.Parse(trimmed);
+            return ExtractTaskCompleteSummary(doc.RootElement);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal static string FormatCopilotToolResultSummary(string? toolName, string? toolResultJson)
+    {
+        if (!string.IsNullOrWhiteSpace(toolResultJson))
+        {
+            var extracted = toolResultJson.Trim();
+            if (extracted.StartsWith('{'))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(extracted);
+                    var root = doc.RootElement;
+                    if (root.ValueKind == JsonValueKind.Object)
+                    {
+                        string? inner = null;
+                        foreach (var key in new[] { "content", "output", "stdout", "result", "message", "detailedContent" })
+                        {
+                            if (root.TryGetProperty(key, out var prop))
+                            {
+                                inner = prop.ValueKind == JsonValueKind.String ? prop.GetString() : prop.GetRawText();
+                                break;
+                            }
+                        }
+                        if (inner != null)
+                        {
+                            extracted = inner;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            var truncated = TruncateLine(extracted, 120);
+            if (!string.IsNullOrWhiteSpace(truncated))
+            {
+                return truncated;
+            }
+        }
+
+        return $"Completed {(string.IsNullOrWhiteSpace(toolName) ? "tool" : toolName)} (no output)";
+    }
+
+    internal static string FormatToolCallSummary(string? toolName, string? toolArgsJson)
+    {
+        toolName = InferCopilotToolName(toolName, toolArgsJson);
         if (string.IsNullOrWhiteSpace(toolArgsJson)) return $"Calling {toolName}...";
 
         try
         {
             using var doc = JsonDocument.Parse(toolArgsJson);
             var root = doc.RootElement;
-            if (string.Equals(toolName, "shell", StringComparison.OrdinalIgnoreCase) && root.TryGetProperty("command", out var cmd))
+            if (root.ValueKind == JsonValueKind.String)
             {
-                return $"Running shell: {cmd.GetString()}";
+                var innerJson = root.GetString();
+                if (!string.IsNullOrWhiteSpace(innerJson))
+                {
+                    using var innerDoc = JsonDocument.Parse(innerJson);
+                    return FormatToolCallSummaryFromObject(toolName, innerDoc.RootElement);
+                }
             }
-            if (string.Equals(toolName, "read", StringComparison.OrdinalIgnoreCase) && (root.TryGetProperty("path", out var rPath) || root.TryGetProperty("file", out rPath)))
-            {
-                return $"Reading file: {rPath.GetString()}";
-            }
-            if (string.Equals(toolName, "write", StringComparison.OrdinalIgnoreCase) && (root.TryGetProperty("path", out var wPath) || root.TryGetProperty("file", out wPath)))
-            {
-                return $"Writing file: {wPath.GetString()}";
-            }
+            return FormatToolCallSummaryFromObject(toolName, root);
         }
         catch { }
 
         return $"Calling {toolName}...";
+    }
+
+    private static string FormatToolCallSummaryFromObject(string toolName, JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return $"Calling {toolName}...";
+
+        var description = OpenAiAdapter.GetPropertyString(root, "description", "summary", "intent", "toolSummary");
+        var cmd = OpenAiAdapter.GetPropertyString(root, "command", "CommandLine", "cmd", "script", "shell_command");
+        var path = OpenAiAdapter.GetPropertyString(root, "path", "file", "filePath", "file_path");
+        var paths = OpenAiAdapter.GetPropertyString(root, "paths", "directory", "dir");
+        var pattern = OpenAiAdapter.GetPropertyString(root, "pattern", "regex", "search");
+        var query = OpenAiAdapter.GetPropertyString(root, "query", "sql");
+
+        var lowerTool = toolName.ToLowerInvariant();
+
+        if (lowerTool == "shell" && !string.IsNullOrWhiteSpace(cmd) && string.IsNullOrWhiteSpace(description))
+        {
+            return $"Running shell: {TruncateLine(cmd, 120)}";
+        }
+
+        if (lowerTool == "read" && !string.IsNullOrWhiteSpace(path) && !HasJsonProperty(root, "view_range"))
+        {
+            return $"Reading file: {path}";
+        }
+
+        if (lowerTool == "write" && !string.IsNullOrWhiteSpace(path))
+        {
+            return $"Writing file: {path}";
+        }
+
+        if (lowerTool is "bash" or "run_command" or "powershell" or "shell" || !string.IsNullOrWhiteSpace(cmd))
+        {
+            if (!string.IsNullOrWhiteSpace(cmd))
+            {
+                var clippedCmd = TruncateLine(cmd, 80);
+                if (!string.IsNullOrWhiteSpace(description))
+                {
+                    return $"{TruncateLine(description, 60)} — {clippedCmd}";
+                }
+                return $"Running {toolName}: {clippedCmd}";
+            }
+        }
+
+        if (lowerTool is "edit" or "str_replace_editor" or "edit_file" or "patch" or "create")
+        {
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                var fileName = Path.GetFileName(path.TrimEnd('/'));
+                return $"Editing {(string.IsNullOrEmpty(fileName) ? path : fileName)}";
+            }
+            if (!string.IsNullOrWhiteSpace(description))
+            {
+                return TruncateLine(description, 100);
+            }
+            return $"Calling {toolName}...";
+        }
+
+        if (lowerTool is "view" or "read_file" or "view_file" or "read")
+        {
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                return FormatViewSummary(path, root);
+            }
+        }
+
+        if (lowerTool is "glob" or "find")
+        {
+            if (!string.IsNullOrWhiteSpace(pattern))
+            {
+                if (!string.IsNullOrWhiteSpace(paths))
+                {
+                    var dirName = Path.GetFileName(paths.TrimEnd('/'));
+                    return $"Finding files: {pattern} in {(string.IsNullOrEmpty(dirName) ? paths : dirName)}";
+                }
+                return $"Finding files: {pattern}";
+            }
+        }
+
+        if (lowerTool is "grep" or "search" or "rg")
+        {
+            if (!string.IsNullOrWhiteSpace(pattern))
+            {
+                var scope = paths ?? path;
+                if (!string.IsNullOrWhiteSpace(scope))
+                {
+                    var scopeName = Path.GetFileName(scope.TrimEnd('/'));
+                    return $"Searching for '{TruncateLine(pattern, 50)}' in {(string.IsNullOrEmpty(scopeName) ? scope : scopeName)}";
+                }
+                return $"Searching for '{TruncateLine(pattern, 60)}'";
+            }
+        }
+
+        if (lowerTool is "sql" or "query" || !string.IsNullOrWhiteSpace(query))
+        {
+            if (!string.IsNullOrWhiteSpace(query))
+            {
+                return !string.IsNullOrWhiteSpace(description)
+                    ? $"Querying ({TruncateLine(description, 50)}): {TruncateLine(query, 60)}"
+                    : $"Querying: {TruncateLine(query, 80)}";
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            return FormatViewSummary(path, root);
+        }
+
+        if (!string.IsNullOrWhiteSpace(description))
+        {
+            return $"{toolName}: {TruncateLine(description, 100)}";
+        }
+
+        return $"Calling {toolName}...";
+    }
+
+    private static string FormatViewSummary(string path, JsonElement root)
+    {
+        var trimmed = path.TrimEnd('/');
+        var fileName = Path.GetFileName(trimmed);
+        var displayPath = path.StartsWith("/workspace/", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(fileName)
+            ? fileName
+            : path;
+
+        if (root.TryGetProperty("view_range", out var vr) &&
+            vr.ValueKind == JsonValueKind.Array &&
+            vr.GetArrayLength() >= 2)
+        {
+            return $"Viewing {displayPath} (lines {vr[0]}-{vr[1]})";
+        }
+
+        return $"Viewing {displayPath}";
     }
 
     private static string TruncateLine(string? input, int maxLen)
@@ -2516,9 +3930,7 @@ public class GenericCommandAdapter : IAgentAdapter
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
 
         // If user configured a custom command (not empty and not default 'agy'), run it and parse JSONL or plain text output
         if (!string.IsNullOrWhiteSpace(preset.Command) &&
@@ -2558,8 +3970,7 @@ public class GenericCommandAdapter : IAgentAdapter
             }
 
             psi.Environment["AGENTMESH_PROMPT"] = promptEvent.Prompt;
-            psi.Environment["AGENTMESH_SESSION_ID"] = promptEvent.SessionId.ToString();
-            psi.Environment["AGENTMESH_AGENT_ID"] = preset.Id;
+            AgentAdapterFactory.ApplyMeshTurnContext(psi.Environment, promptEvent, preset.Id);
 
             using var proc = new Process { StartInfo = psi };
             using var reg = ct.Register(() => AgentAdapterFactory.KillProcessTree(proc));
@@ -2579,12 +3990,35 @@ public class GenericCommandAdapter : IAgentAdapter
             var plainTextBuffer = new StringBuilder();
             var emittedFinalResponse = false;
 
+            // Resolved once, not per line: the bound must not move mid-turn.
+            var genericIdleLimit = TurnStallPolicy.ResolveDriverStreamIdleLimit(
+                Environment.GetEnvironmentVariable(TurnStallPolicy.DriverStreamIdleLimitEnvVar));
+
             try
             {
                 while (true)
                 {
                     ct.ThrowIfCancellationRequested();
-                    var line = await proc.StandardOutput.ReadLineAsync(ct);
+
+                    // Same bound as the agy path, for the same reason: this adapter pipes an arbitrary
+                    // driver's stdout, and a driver that stops writing is indistinguishable from one
+                    // that is thinking, from here. Without a bound the turn outlives its watcher.
+                    var genericRead = await StreamStallWatchdog.ReadLineAsync(proc.StandardOutput, genericIdleLimit, ct);
+                    if (genericRead.Stalled)
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "error",
+                            Content = $"Driver `{AdapterType}` produced no output for " +
+                                $"{(int)genericIdleLimit.TotalMinutes} minutes; its process was terminated so this " +
+                                "turn stops claiming to be running. Raise " +
+                                $"{TurnStallPolicy.DriverStreamIdleLimitEnvVar} if this driver legitimately runs longer."
+                        });
+                        AgentAdapterFactory.KillProcessTree(proc);
+                        return;
+                    }
+
+                    var line = genericRead.Line;
                     if (line == null) break;
                     ct.ThrowIfCancellationRequested();
 

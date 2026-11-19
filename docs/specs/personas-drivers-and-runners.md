@@ -42,7 +42,7 @@ classDiagram
 | :--- | :--- | :--- |
 | **Concept** | Who the agent is (identity, specialization, role) | How the agent computes (model, API, CLI harness) |
 | **Configuration** | `PersonaPrompt`, role, context budget, GitHub PATs | Endpoint, API keys, model presets, tool limits, timeouts |
-| **Examples** | `system-architect`, `tech-lead`, `senior-engineer` | `openai-compatible`, `anthropic-claude`, `agy`, `copilot` |
+| **Examples** | `system-architect`, `tech-lead`, `senior-engineer` | `openrouter`, `openai-compatible`, `anthropic-claude`, `agy`, `copilot` |
 | **Concurrency** | Governed by `MaxConcurrentJobs` (limits active turns) | Governed by rate limits and LLM provider token quotas |
 
 ---
@@ -91,6 +91,12 @@ flowchart LR
 * **Docker Container Manager**: [`DockerPersonaContainerManager`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Infrastructure/Containers/DockerPersonaContainerManager.cs) orchestrates ephemeral Docker containers for local developer runs in .NET Aspire.
 * **Kubernetes Container Manager**: [`KubernetesPersonaContainerManager`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Infrastructure/Containers/KubernetesPersonaContainerManager.cs) manages StatefulSets or on-demand Pods in production Kubernetes clusters.
 
+### Persona Workspace Storage
+* **One claim per persona.** In Kubernetes each persona gets a `ReadWriteOnce` claim named `agentmesh-persona-<persona>-workspace`, requested from `config.personaRunner.storage.size` (default `10Gi`) and its storage class from `config.personaRunner.storage.storageClassName`, which leaves the cluster default in place when unset. The claim outlives the pod, which is what lets a persona keep its checked-out repositories between jobs.
+* **The size is a ceiling that may only rise.** Kubernetes cannot shrink a bound claim, so a configured value *below* what a persona already holds is ignored and warned about once rather than sent to the API server, where it would fail on every turn. Raising the value is the supported direction and the only one.
+* **Raising it reaches existing workspaces.** The configured size is compared against each claim's actual request whenever that persona's workspace is reconciled, and a smaller claim is patched up to the configured size — so growing an established deployment is a chart change, not an operator task. Comparison is numeric, because `10Gi` and `10240Mi` are the same size written two ways and a text comparison would write to every claim on every turn.
+* **A refused resize is not a failed persona.** Resizing needs a storage class with `allowVolumeExpansion: true`; a class that refuses, or a statically provisioned claim, leaves the workspace at the size it already has and logs a warning. Longhorn's default class does support it, and expands the filesystem online.
+
 ### Companion Supervisor & Auto-Updating
 * **Process Supervisor**: Inside runner containers, a companion supervisor monitors process health, handles SIGTERM graceful drains, and exposes health probes.
 * **Idle Auto-Updater**: When runner binaries or driver configurations are updated, idle runner pods automatically pull the latest binary release and restart cleanly without dropping active job sessions.
@@ -101,6 +107,13 @@ flowchart LR
 
 The [`AgentMesh.Cli`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Cli/) project compiles into a cross-platform, single-file native executable (`dist/cli/linux-x64/agentmesh`):
 
-* **Role**: Acts as the runner agent daemon connecting local LLM harnesses (`agy`, OpenAI-compatible engines, Copilot) to the AgentMesh control plane.
-* **Adapters**: Implements provider-specific translation adapters (e.g. `OpenAiAdapter`) that map OpenAI Chat Completion APIs to streaming MCP tool execution.
+* **Role**: Acts as the runner agent daemon connecting local LLM harnesses (`agy`, OpenAI-compatible engines, OpenRouter, Copilot) to the AgentMesh control plane.
+* **Adapters**: Implements provider-specific translation adapters (e.g. `OpenAiAdapter`, `OpenRouterAdapter`) that map Chat Completion APIs to streaming MCP tool execution.
+* **OpenRouter Adapter (`openrouter` / `RuntimeType.OpenRouter`)**:
+  * **Zero-Config & Authentication**: Built-in `"openrouter"` preset auto-seeded by `ConfigStore`, authenticating via stored `apiKey` or `OPENROUTER_API_KEY` (default endpoint `https://openrouter.ai/api/v1`, overridable via `endpoint` or `OPENROUTER_BASE_URL`), forwarding attribution headers (`X-Title: AgentMesh`, optional `HTTP-Referer`). Container managers forward `OPENROUTER_API_KEY` and `OPENROUTER_BASE_URL` into Docker and Kubernetes persona pods.
+  * **Prompt Caching & Sticky Routing**: Attaches `cache_control: { "type": "ephemeral" }` to the leading `PromptStack` system block (with automatic plain-string 400 fallback for providers that reject multipart system content) and sends sticky `session_id` in both the request body and `x-session-id` header.
+  * **Reasoning & Effort**: Advertises OpenRouter's 7-level reasoning effort contract (`none` through `max`) only for models declaring `"reasoning"` in `supported_parameters`, forwards `reasoning.effort` verbatim (with 400 fallback), streams thought deltas without duplication, and replays `reasoning_details` verbatim across multi-turn tool calls.
+  * **Provider Routing & Fallbacks**: Supports [`OpenRouterConfig`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Core/Models/OpenRouterConfig.cs) (`provider.sort`, `order`, `only`, `ignore`, `allowFallbacks`, `dataCollection`, `zdr`, `requireParameters`, and `fallbackModels` -> `models[]`).
+  * **Discovery, Quota & Telemetry**: Discovers tool-capable text models from `GET /api/v1/models` with context lengths and USD/1M pricing, probes key limits/credits cleanly via [`OpenRouterDriverQuotaProbe`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Api/Services/DriverQuotaProbe.cs) (`/api/v1/key` with fallback to `/api/v1/credits`, returning `null` when unlimited or forbidden), and accumulates `cachedTokens` and `costUsd` alongside token counts.
 * **SignalR Event Streaming**: Streams real-time thoughts, tool calls, and stdout logs to the Web Cockpit.
+* **Bounded Driver Reads**: A driver that stops writing to stdout is indistinguishable from one that is thinking, and the read that waits for it holds the turn open forever. The `agy`, generic-command and `copilot` adapters therefore bound that read at 20 minutes of silence (`AGENTMESH_DRIVER_IDLE_TIMEOUT_MINUTES`, raised for slow-build persona containers; values under a minute are ignored, because "0" means "no limit" and no-limit is the configuration that produced a 13-hour phantom turn). On a stall the adapter emits an `error` event — which is what settles the session status — then kills the process tree. The bound is not a command timeout: an ordinary silent `dotnet test` or `npm ci` must stay comfortably inside it.

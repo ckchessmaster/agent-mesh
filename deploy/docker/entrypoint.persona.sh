@@ -21,7 +21,44 @@ if [ -z "$AGENTMESH_PERSONA_ID" ] && [ -n "$1" ] && [[ "$1" != -* ]]; then
     shift
 fi
 
-# Restore Google AI Pro OAuth token if mounted from Secret volume or passed via environment
+# Ensure workspace directory exists and is marked safe for git operations
+mkdir -p /workspace
+cd /workspace
+git config --global --add safe.directory '*' 2>/dev/null || true
+
+# Ensure persistent workspace state directories exist with restricted permissions
+mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.copilot /workspace/.agentmesh/state/.local/bin
+chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
+chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.copilot /workspace/.agentmesh/state/.local 2>/dev/null || true
+
+# If ~/.config, ~/.aip, ~/.gemini, ~/.claude, or ~/.copilot was previously created as a symlink, remove it so credential managers have real directories
+if [ -L /root/.config ]; then rm -f /root/.config; fi
+if [ -L /root/.aip ]; then rm -f /root/.aip; fi
+if [ -L /root/.gemini ]; then rm -f /root/.gemini; fi
+if [ -L /root/.claude ]; then rm -f /root/.claude; fi
+if [ -L /root/.copilot ]; then rm -f /root/.copilot; fi
+mkdir -p /root/.config /root/.aip /root/.gemini /root/.claude /root/.copilot /root/.agentmesh /root/.local/bin
+chmod 700 /root/.config /root/.aip /root/.gemini /root/.claude /root/.copilot /root/.agentmesh 2>/dev/null || true
+
+# Restore persistent state from workspace volume into local directories BEFORE applying fresh credentials
+if [ -d /workspace/.agentmesh/state ]; then
+    for sdir in /workspace/.agentmesh/state/.*; do
+        bname=$(basename "$sdir")
+        if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ]; then
+            if [ -L "/root/$bname" ]; then rm -f "/root/$bname"; fi
+            mkdir -p "/root/$bname"
+            cp -a "$sdir/." "/root/$bname/" 2>/dev/null || true
+            chmod 700 "/root/$bname" 2>/dev/null || true
+        fi
+    done
+fi
+if [ -d /workspace/.agentmesh/state/.local/bin ]; then
+    mkdir -p /root/.local/bin
+    cp -a /workspace/.agentmesh/state/.local/bin/. /root/.local/bin/ 2>/dev/null || true
+    chmod 755 /root/.local/bin/* 2>/dev/null || true
+fi
+
+# Ensure Google AI Pro OAuth token is in place if mounted from Secret volume or passed via environment
 if [ -f /etc/agentmesh-creds/antigravity-oauth-token ] && [ ! -s /root/.gemini/antigravity-cli/antigravity-oauth-token ]; then
     mkdir -p /root/.gemini/antigravity-cli
     cp /etc/agentmesh-creds/antigravity-oauth-token /root/.gemini/antigravity-cli/antigravity-oauth-token
@@ -32,21 +69,62 @@ elif [ -n "$ANTIGRAVITY_OAUTH_TOKEN" ] && [ ! -s /root/.gemini/antigravity-cli/a
     chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token
 fi
 
-# Ensure workspace directory exists and is marked safe for git operations
-mkdir -p /workspace
-cd /workspace
-git config --global --add safe.directory '*' 2>/dev/null || true
-
-# Configure GitHub CLI, Copilot CLI, and git identity if provided
-if [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_TOKEN" ] || [ -n "$COPILOT_GITHUB_TOKEN" ]; then
-    gh auth setup-git 2>/dev/null || true
-    COPILOT_AUTH_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-$GITHUB_TOKEN}}"
-    if [ -n "$COPILOT_AUTH_TOKEN" ] && [ ! -s /root/.copilot/config.json ]; then
-        mkdir -p /root/.copilot
-        printf '{"token":"%s","authTokens":{"https://github.com":{"token":"%s"}}}\n' "$COPILOT_AUTH_TOKEN" "$COPILOT_AUTH_TOKEN" > /root/.copilot/config.json
-        chmod 600 /root/.copilot/config.json
-    fi
+# 1. Configure Persona GitHub PAT for git & gh CLI (strictly separate from Copilot CLI auth)
+PERSONA_GH_TOKEN="${AGENTMESH_GITHUB_TOKEN:-${GH_TOKEN:-$GITHUB_TOKEN}}"
+if [ -n "$PERSONA_GH_TOKEN" ]; then
+    export AGENTMESH_GITHUB_TOKEN="$PERSONA_GH_TOKEN"
+    mkdir -p /root/.agentmesh /root/.config/gh
+    printf '%s\n' "$PERSONA_GH_TOKEN" > /root/.agentmesh/github-pat
+    chmod 600 /root/.agentmesh/github-pat
+    cat <<EOF > /root/.config/gh/hosts.yml
+github.com:
+    users:
+        git:
+            oauth_token: $PERSONA_GH_TOKEN
+    oauth_token: $PERSONA_GH_TOKEN
+    user: git
+    git_protocol: https
+EOF
+    chmod 600 /root/.config/gh/hosts.yml
+    env -u GITHUB_TOKEN -u GH_TOKEN gh auth setup-git 2>/dev/null || gh auth setup-git 2>/dev/null || true
 fi
+
+# 2. Configure GitHub Copilot CLI auth separately (never use GH_TOKEN/GITHUB_TOKEN or classic ghp_ PATs)
+if [[ "${COPILOT_GITHUB_TOKEN:-}" == ghp_* ]] || [[ "${COPILOT_GITHUB_TOKEN:-}" == GHP_* ]]; then
+    unset COPILOT_GITHUB_TOKEN
+elif [ -z "${COPILOT_OAUTH_TOKEN:-}" ] && [ -n "$PERSONA_GH_TOKEN" ] && [ "${COPILOT_GITHUB_TOKEN:-}" = "$PERSONA_GH_TOKEN" ]; then
+    unset COPILOT_GITHUB_TOKEN
+fi
+
+# Ensure storeTokenPlaintext: true in ~/.copilot/settings.json (headless containers have no OS
+# keyring, so interactive logins and re-runs need plaintext persistence). Comment-tolerant: the Copilot
+# CLI writes these files as JSONC with "//" header lines.
+#
+# NOTE: This entrypoint deliberately does NOT seed or rewrite ~/.copilot/config.json anymore.
+# The real Copilot CLI keys token entries by "https://github.com:<login>" and resolves the active
+# sign-in through lastLoggedInUser/loggedInUsers (camelCase); historical jq/C# seeders wrote bare
+# host keys and only understood legacy snake_case records, producing files the CLI rejects wholesale
+# ("No authentication information found") while AgentMesh checks still passed. Config.json is now
+# owned by the Copilot CLI itself (interactive login) and by AgentMesh's API-side native-format
+# seeding; chat invocations additionally always receive COPILOT_GITHUB_TOKEN in the environment,
+# which the CLI checks first and which wins over any file state.
+for cp_settings in /root/.copilot/settings.json /workspace/.agentmesh/state/.copilot/settings.json; do
+    mkdir -p "$(dirname "$cp_settings")"
+    if [ -s "$cp_settings" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            TMP_SET=$(mktemp)
+            if sed '/^[[:space:]]*\/\//d' "$cp_settings" | jq '.storeTokenPlaintext = true' > "$TMP_SET" 2>/dev/null; then
+                mv "$TMP_SET" "$cp_settings"
+            else
+                rm -f "$TMP_SET"
+                printf '{"storeTokenPlaintext":true}\n' > "$cp_settings"
+            fi
+        fi
+    else
+        printf '{"storeTokenPlaintext":true}\n' > "$cp_settings"
+    fi
+    chmod 600 "$cp_settings" 2>/dev/null || true
+done
 
 if [ -n "$GIT_AUTHOR_NAME" ]; then
     git config --global user.name "$GIT_AUTHOR_NAME" 2>/dev/null || true
@@ -85,111 +163,103 @@ if [ "$SIDECAR_ENABLED" = "true" ]; then
     fi
 fi
 
-# Ensure persistent workspace state directories exist with restricted permissions
-mkdir -p /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.copilot /workspace/.agentmesh/state/.local/bin
-chmod 700 /workspace/.agentmesh/state 2>/dev/null || true
-chmod 700 /workspace/.agentmesh/state/.config /workspace/.agentmesh/state/.aip /workspace/.agentmesh/state/.gemini /workspace/.agentmesh/state/.claude /workspace/.agentmesh/state/.copilot /workspace/.agentmesh/state/.local 2>/dev/null || true
+# Ensure ~/.bashrc exports PATH and clean credential separation for interactive shells
+touch /root/.bashrc
+sed -i '/^export COPILOT_GITHUB_TOKEN=/d;/^export AGENTMESH_GITHUB_TOKEN=/d;/^export GH_TOKEN=/d;/^export GITHUB_TOKEN=/d' /root/.bashrc 2>/dev/null || true
 
-# Ensure ~/.bashrc exports PATH for all interactive shells
 if ! grep -q '/root/.local/bin' /root/.bashrc 2>/dev/null; then
     echo 'export PATH="/root/.local/bin:/usr/local/bin:$PATH"' >> /root/.bashrc
 fi
 
-if [ -n "$COPILOT_GITHUB_TOKEN" ] && ! grep -q 'COPILOT_GITHUB_TOKEN' /root/.bashrc 2>/dev/null; then
+if [ -n "${COPILOT_GITHUB_TOKEN:-}" ]; then
     echo "export COPILOT_GITHUB_TOKEN=\"$COPILOT_GITHUB_TOKEN\"" >> /root/.bashrc
 fi
-if [ -n "$GH_TOKEN" ] && ! grep -q 'GH_TOKEN' /root/.bashrc 2>/dev/null; then
+if [ -n "${AGENTMESH_GITHUB_TOKEN:-}" ]; then
+    echo "export AGENTMESH_GITHUB_TOKEN=\"$AGENTMESH_GITHUB_TOKEN\"" >> /root/.bashrc
+fi
+if [ -n "${GH_TOKEN:-}" ]; then
     echo "export GH_TOKEN=\"$GH_TOKEN\"" >> /root/.bashrc
 fi
-if [ -n "$GITHUB_TOKEN" ] && ! grep -q 'GITHUB_TOKEN' /root/.bashrc 2>/dev/null; then
+if [ -n "${GITHUB_TOKEN:-}" ]; then
     echo "export GITHUB_TOKEN=\"$GITHUB_TOKEN\"" >> /root/.bashrc
 fi
 if ! grep -q 'REMOTE_CONTAINERS' /root/.bashrc 2>/dev/null; then
     echo 'export REMOTE_CONTAINERS="true"' >> /root/.bashrc
 fi
-if ! grep -q 'copilot() {' /root/.bashrc 2>/dev/null; then
+if ! grep -q '# agentmesh-copilot-wrapper-v4' /root/.bashrc 2>/dev/null; then
+    sed -i '/^# agentmesh-copilot-wrapper/,/^}/d;/^copilot() {/,/^}/d' /root/.bashrc 2>/dev/null || true
     cat << 'EOF' >> /root/.bashrc
+# agentmesh-copilot-wrapper-v4
 copilot() {
     if [ "$1" = "login" ]; then
-        env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN command copilot login --device-code "${@:2}"
+        local _iso_gh
+        _iso_gh=$(mktemp -d 2>/dev/null || echo "/tmp/copilot-gh-iso-$$")
+        command env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN -u COPILOT_OAUTH_TOKEN GH_CONFIG_DIR="$_iso_gh" copilot login --device-code "${@:2}"
+        local _rc=$?
+        rm -rf "$_iso_gh" 2>/dev/null || true
+        return $_rc
+    elif [[ "${COPILOT_GITHUB_TOKEN:-}" == ghp_* ]] || [[ "${COPILOT_GITHUB_TOKEN:-}" == GHP_* ]] || { [ -n "${AGENTMESH_GITHUB_TOKEN:-}" ] && [ "${COPILOT_GITHUB_TOKEN:-}" = "${AGENTMESH_GITHUB_TOKEN}" ]; }; then
+        command env -u GITHUB_TOKEN -u GH_TOKEN -u COPILOT_GITHUB_TOKEN copilot "$@"
     else
-        command copilot "$@"
+        command env -u GITHUB_TOKEN -u GH_TOKEN copilot "$@"
     fi
 }
 EOF
-fi
-
-# If ~/.config, ~/.aip, ~/.gemini, ~/.claude, or ~/.copilot was previously created as a symlink, remove it so credential managers have real directories
-if [ -L /root/.config ]; then rm -f /root/.config; fi
-if [ -L /root/.aip ]; then rm -f /root/.aip; fi
-if [ -L /root/.gemini ]; then rm -f /root/.gemini; fi
-if [ -L /root/.claude ]; then rm -f /root/.claude; fi
-if [ -L /root/.copilot ]; then rm -f /root/.copilot; fi
-mkdir -p /root/.config /root/.aip /root/.gemini /root/.claude /root/.copilot /root/.local/bin
-chmod 700 /root/.config /root/.aip /root/.gemini /root/.claude /root/.copilot 2>/dev/null || true
-
-# Restore persistent state from workspace volume into local directories
-if [ -d /workspace/.agentmesh/state ]; then
-    for sdir in /workspace/.agentmesh/state/.*; do
-        bname=$(basename "$sdir")
-        if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ]; then
-            if [ -L "/root/$bname" ]; then rm -f "/root/$bname"; fi
-            mkdir -p "/root/$bname"
-            cp -a "$sdir/." "/root/$bname/" 2>/dev/null || true
-            chmod 700 "/root/$bname" 2>/dev/null || true
-        fi
-    done
-fi
-if [ -d /workspace/.agentmesh/state/.local/bin ]; then
-    mkdir -p /root/.local/bin
-    cp -a /workspace/.agentmesh/state/.local/bin/. /root/.local/bin/ 2>/dev/null || true
-    chmod 755 /root/.local/bin/* 2>/dev/null || true
-fi
-
-# Ensure Google AI Pro OAuth token is in place if mounted from Secret volume or passed via environment
-if [ -f /etc/agentmesh-creds/antigravity-oauth-token ] && [ ! -s /root/.gemini/antigravity-cli/antigravity-oauth-token ]; then
-    mkdir -p /root/.gemini/antigravity-cli
-    cp /etc/agentmesh-creds/antigravity-oauth-token /root/.gemini/antigravity-cli/antigravity-oauth-token
-    chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token
-elif [ -n "$ANTIGRAVITY_OAUTH_TOKEN" ] && [ ! -s /root/.gemini/antigravity-cli/antigravity-oauth-token ]; then
-    mkdir -p /root/.gemini/antigravity-cli
-    echo "$ANTIGRAVITY_OAUTH_TOKEN" > /root/.gemini/antigravity-cli/antigravity-oauth-token
-    chmod 600 /root/.gemini/antigravity-cli/antigravity-oauth-token
 fi
 
 # Helper to synchronize state back to workspace volume
 sync_persona_state() {
     mkdir -p /workspace/.agentmesh/state/.config
     if [ -d /root/.config ]; then
-        cp -a /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
+        cp -au /root/.config/. /workspace/.agentmesh/state/.config/ 2>/dev/null || true
     fi
     if [ -d /root/.aip ]; then
         mkdir -p /workspace/.agentmesh/state/.aip
-        cp -a /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
+        cp -au /root/.aip/. /workspace/.agentmesh/state/.aip/ 2>/dev/null || true
     fi
     if [ -d /root/.gemini ]; then
         mkdir -p /workspace/.agentmesh/state/.gemini
-        cp -a /root/.gemini/. /workspace/.agentmesh/state/.gemini/ 2>/dev/null || true
+        (
+            shopt -s dotglob nullglob
+            for gitem in /root/.gemini/*; do
+                gname=$(basename "$gitem")
+                if [ "$gname" = "antigravity-cli" ] && [ -d "$gitem" ]; then
+                    mkdir -p /workspace/.agentmesh/state/.gemini/antigravity-cli
+                    for aitem in "$gitem"/*; do
+                        aname=$(basename "$aitem")
+                        case "$aname" in
+                            log|crashes|cache) continue ;;
+                        esac
+                        cp -au "$aitem" /workspace/.agentmesh/state/.gemini/antigravity-cli/ 2>/dev/null || true
+                    done
+                else
+                    cp -au "$gitem" /workspace/.agentmesh/state/.gemini/ 2>/dev/null || true
+                fi
+            done
+        )
     fi
     if [ -d /root/.claude ]; then
         mkdir -p /workspace/.agentmesh/state/.claude
-        cp -a /root/.claude/. /workspace/.agentmesh/state/.claude/ 2>/dev/null || true
+        cp -au /root/.claude/. /workspace/.agentmesh/state/.claude/ 2>/dev/null || true
     fi
     if [ -d /root/.copilot ]; then
         mkdir -p /workspace/.agentmesh/state/.copilot
-        cp -a /root/.copilot/. /workspace/.agentmesh/state/.copilot/ 2>/dev/null || true
+        cp -au /root/.copilot/. /workspace/.agentmesh/state/.copilot/ 2>/dev/null || true
     fi
     if [ -d /root/.local/bin ]; then
         mkdir -p /workspace/.agentmesh/state/.local/bin
-        cp -a /root/.local/bin/. /workspace/.agentmesh/state/.local/bin/ 2>/dev/null || true
+        cp -au /root/.local/bin/. /workspace/.agentmesh/state/.local/bin/ 2>/dev/null || true
         chmod 700 /workspace/.agentmesh/state/.local 2>/dev/null || true
     fi
-    # Also synchronize all existing state directories in /workspace/.agentmesh/state
+    # Also synchronize any additional custom state directories in /workspace/.agentmesh/state
     if [ -d /workspace/.agentmesh/state ]; then
         for sdir in /workspace/.agentmesh/state/.*; do
             bname=$(basename "$sdir")
-            if [ "$bname" != "." ] && [ "$bname" != ".." ] && [ -d "$sdir" ] && [ -d "/root/$bname" ]; then
-                cp -a "/root/$bname/." "$sdir/" 2>/dev/null || true
+            case "$bname" in
+                .|..|.config|.aip|.gemini|.claude|.copilot|.local) continue ;;
+            esac
+            if [ -d "$sdir" ] && [ -d "/root/$bname" ]; then
+                cp -au "/root/$bname/." "$sdir/" 2>/dev/null || true
                 chmod 700 "$sdir" 2>/dev/null || true
             fi
         done
@@ -242,7 +312,7 @@ fi
 # Start background periodic state synchronization worker
 (
     while true; do
-        sleep 10
+        sleep 60
         sync_persona_state 2>/dev/null || true
     done
 ) &
@@ -337,7 +407,7 @@ fi
 # Ensure GitHub Copilot CLI is installed if missing and npm is available
 if command -v npm >/dev/null 2>&1 && ! command -v copilot >/dev/null 2>&1; then
     echo "Ensuring GitHub Copilot CLI is available..."
-    npm install -g @github/copilot 2>/dev/null || true
+    npm install -g @github/copilot@1.0.112 2>/dev/null || true   # pinned: credential file format is validated against this CLI version
     hash -r 2>/dev/null || true
 fi
 

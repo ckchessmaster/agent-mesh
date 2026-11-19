@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -8,7 +9,9 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
 using AgentMesh.Cli.Services;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
+using ModelContextProtocol.Client;
 
 namespace AgentMesh.Cli.Adapters;
 
@@ -31,7 +34,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         HttpClientInstance = DefaultHttpClient;
     }
 
-    public static Func<Guid, string, string, Task>? CommandOutputBroadcaster { get; set; }
+    public static Func<Guid, string, string, Task>? CommandOutputBroadcaster
+    {
+        get => AgentToolExecutor.CommandOutputBroadcaster;
+        set => AgentToolExecutor.CommandOutputBroadcaster = value;
+    }
 
     /// <summary>
     /// Optional callback invoked when a context-window overflow error reveals a model's true token limit.
@@ -43,7 +50,20 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     /// Optional callback invoked when the agent calls a platform tool (manage_task, post_job_message, open_pull_request, save_memory).
     /// Args: (toolName, argsJson, sessionId, personaId, agentId, ct).
     /// </summary>
-    public static Func<string, string, Guid?, string?, string?, CancellationToken, Task<string>>? PlatformToolExecutor { get; set; }
+    public static Func<string, string, Guid?, string?, string?, CancellationToken, Task<string>>? PlatformToolExecutor
+    {
+        get => AgentToolExecutor.PlatformToolExecutor;
+        set => AgentToolExecutor.PlatformToolExecutor = value;
+    }
+
+    internal static Func<ResolvedMcpServerConfig, string?, IClientTransport?>? McpTransportFactoryForTest
+    {
+        get => AgentToolExecutor.McpTransportFactoryForTest;
+        set => AgentToolExecutor.McpTransportFactoryForTest = value;
+    }
+
+    internal static void ResetMcpTransportFactoryForTest()
+        => AgentToolExecutor.ResetMcpTransportFactoryForTest();
 
     public static string HistoryDirectoryPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -140,14 +160,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     /// <c>OPENAI_TIMEOUT_SECONDS</c> is documented as the endpoint budget.
     /// </remarks>
     public static int? ResolveCommandTimeoutSeconds(AgentPresetConfig preset)
-    {
-        if (preset?.TimeoutSeconds is int configured && configured > 0)
-        {
-            return configured;
-        }
-
-        return null;
-    }
+        => AgentToolExecutor.ResolveCommandTimeoutSeconds(preset);
 
     public static int ResolveMaxRetries(AgentPresetConfig preset)
     {
@@ -210,16 +223,126 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     }
 
     /// <summary>
-    /// Resolves the token budget for a run.
+    /// Resolves the token budget for a run, respecting explicit options and agent/driver profile
+    /// context sizes (including 512k / 524,288) without clamping to legacy 131,072 tables.
     /// </summary>
-    /// <remarks>
-    /// Delegates to <see cref="ModelContextLimits"/> so the API that renders the context picker and
-    /// the adapter that honours the choice read one table. They used to hold separate tables, which
-    /// is how the picker could advertise 256k while the run was clamped to 128k with nothing in the
-    /// response saying so.
-    /// </remarks>
-    public static int ResolveModelContextLimit(string model, string? contextSizeOption)
-        => ModelContextLimits.ResolveTokens(model, contextSizeOption);
+    public static int ResolveModelContextLimit(string model, string? contextSizeOption, AgentPresetConfig? preset = null)
+    {
+        if (ModelContextLimits.ParseOption(contextSizeOption) is int explicitTokens && explicitTokens > 0)
+        {
+            return explicitTokens;
+        }
+
+        if (preset?.ContextWindowTokens is int presetTokens && presetTokens > 0)
+        {
+            return presetTokens;
+        }
+
+        if (preset?.OpenAi?.ContextWindowTokens is int settingsTokens && settingsTokens > 0)
+        {
+            return settingsTokens;
+        }
+
+        if (ModelContextLimits.ParseOption(preset?.DefaultContextSize) is int presetOptionTokens && presetOptionTokens > 0)
+        {
+            return presetOptionTokens;
+        }
+
+        if (ModelContextLimits.ParseOption(preset?.OpenAi?.DefaultContextSize) is int settingsOptionTokens && settingsOptionTokens > 0)
+        {
+            return settingsOptionTokens;
+        }
+
+        var envWindow = Environment.GetEnvironmentVariable("OPENAI_CONTEXT_WINDOW")
+                        ?? Environment.GetEnvironmentVariable("OPENAI_MAX_CONTEXT_TOKENS");
+        if (ModelContextLimits.ParseOption(envWindow) is int envTokens && envTokens > 0)
+        {
+            return envTokens;
+        }
+
+        return ModelContextLimits.ResolveTokens(model, contextSizeOption);
+    }
+
+    /// <summary>
+    /// Resolves the dynamic compaction threshold percentage (default 75%).
+    /// </summary>
+    public static int ResolveCompactionThresholdPercent(AgentPresetConfig? preset = null)
+    {
+        if (preset?.CompactionThresholdPercent is int configured && configured > 0)
+        {
+            return Math.Clamp(configured, 10, 95);
+        }
+
+        if (preset?.OpenAi?.CompactionThresholdPercent is int fromSettings && fromSettings > 0)
+        {
+            return Math.Clamp(fromSettings, 10, 95);
+        }
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_COMPACTION_THRESHOLD_PERCENT"), out var envPct) && envPct > 0)
+        {
+            return Math.Clamp(envPct, 10, 95);
+        }
+
+        return OpenAISettings.DefaultCompactionThresholdPercent;
+    }
+
+    /// <summary>
+    /// Resolves the post-first-byte SSE chunk idle timeout in seconds (default 120s).
+    /// </summary>
+    public static int ResolveStreamChunkIdleTimeoutSeconds(AgentPresetConfig? preset = null)
+    {
+        if (preset?.StreamChunkIdleTimeoutSeconds is int configured && configured > 0)
+        {
+            return configured;
+        }
+
+        if (preset?.OpenAi?.StreamChunkIdleTimeoutSeconds is int fromSettings && fromSettings > 0)
+        {
+            return fromSettings;
+        }
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("OPENAI_STREAM_CHUNK_IDLE_TIMEOUT_SECONDS"), out var envSec) && envSec > 0)
+        {
+            return envSec;
+        }
+
+        return OpenAISettings.DefaultStreamChunkIdleTimeoutSeconds;
+    }
+
+    /// <summary>
+    /// Per-turn budget for waiting out model-server swaps/reloads. Single-residency swap servers
+    /// (llama-swap class deployments: one model resident, picks evict it) report offline for the
+    /// minutes a multi-shard reload takes — the plain 3-retries-in-7-seconds policy turned every
+    /// swap into a dead job. 0 disables the extended wait and keeps the old behavior.
+    /// </summary>
+    public static int ResolveSwapWaitBudgetSeconds(AgentPresetConfig preset)
+    {
+        if (preset?.SwapWaitSeconds is int configured && configured >= 0) return configured;
+        if (int.TryParse(Environment.GetEnvironmentVariable("AGENTMESH_SWAP_WAIT_SECONDS"), out var env) && env >= 0) return env;
+        return 600;
+    }
+
+    /// <summary>
+    /// A 5xx whose body names a model reload, not just any 5xx: a bare "Service Unavailable"
+    /// must keep the plain transient-retry behavior, or every ordinary blip parks the job for
+    /// the swap budget. Swap/reload servers say so in the body ("(titanium) is offline",
+    /// "loading", "warming up") — that self-description is the signal.
+    /// </summary>
+    internal static bool IsModelServerSwapSignal(int statusCode, string? errorContent) =>
+        statusCode >= 500 && statusCode < 600 && !string.IsNullOrEmpty(errorContent) &&
+            (errorContent.Contains("offline", StringComparison.OrdinalIgnoreCase)
+             || errorContent.Contains("loading", StringComparison.OrdinalIgnoreCase)
+             || errorContent.Contains("swapping", StringComparison.OrdinalIgnoreCase)
+             || errorContent.Contains("warm", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Conservative detector for "response ended the turn while promising to act" — the visible
+    /// half of the dropped-tool-call class (the reasoning/tool parser ate the call and left the
+    /// narration). Past-tense summaries ("I ran the tests and they pass") do not match; a
+    /// question in the closing stretch does not match either — the question heuristics own those.
+    /// </summary>
+    internal static bool LooksLikeUnexecutedIntent(string? content)
+        => AgentToolExecutor.LooksLikeUnexecutedIntent(content);
 
     /// <summary>
     /// The credential this adapter would authenticate a run with.
@@ -244,6 +367,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     public static int EstimateMessageTokens(OpenAiMessage message)
     {
         var charCount = (message.Role?.Length ?? 0) + (message.Content?.Length ?? 0);
+        // Round-tripped reasoning is billed input on every later turn — compaction must see it.
+        charCount += message.ReasoningContent?.Length ?? 0;
         if (message.ContentParts != null && message.ContentParts.Count > 0)
         {
             foreach (var part in message.ContentParts)
@@ -686,13 +811,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
     }
 
     public static string TruncateToolResult(string result, int maxChars = 50_000)
-    {
-        if (string.IsNullOrEmpty(result) || result.Length <= maxChars) return result;
-        var headLength = maxChars / 2;
-        var tailLength = maxChars / 3;
-        var omitted = result.Length - (headLength + tailLength);
-        return $"{result[..headLength]}\n\n[... Output truncated: {omitted} characters omitted to preserve context window ...]\n\n{result[^tailLength..]}";
-    }
+        => AgentToolExecutor.TruncateToolResult(result, maxChars);
 
     public async Task ExecutePromptAsync(
         AgentPresetConfig preset,
@@ -700,9 +819,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         Func<TrajectoryEventPayload, Task> onEvent,
         CancellationToken ct)
     {
-        var cwd = !string.IsNullOrWhiteSpace(promptEvent.WorkingDirectory)
-            ? promptEvent.WorkingDirectory
-            : AgentAdapterFactory.ResolveWorkspaceDirectory();
+        var cwd = AgentAdapterFactory.ResolveWorkspaceDirectory(promptEvent);
 
         var endpoint = !string.IsNullOrWhiteSpace(preset.Endpoint)
             ? preset.Endpoint.Trim()
@@ -725,7 +842,34 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
         var timeoutSeconds = ResolveTimeoutSeconds(preset);
         var maxRetries = ResolveMaxRetries(preset);
-        var modelContextLimit = ResolveModelContextLimit(effectiveModel, promptEvent.ContextSize);
+        var modelContextLimit = ResolveModelContextLimit(effectiveModel, promptEvent.ContextSize, preset);
+        var compactionThresholdPercent = ResolveCompactionThresholdPercent(preset);
+        var streamChunkIdleTimeoutSeconds = ResolveStreamChunkIdleTimeoutSeconds(preset);
+
+        // Request-shaping policy for this model+endpoint (Core ModelBehaviorProfiles): explicit
+        // preset override → learned endpoint facts → family table → empty default. An unknown
+        // model gets exactly the pre-registry request shape, so adding a registry row can never
+        // regress a model that row does not name.
+        var isLoopbackEndpoint = endpoint.Contains("localhost") || endpoint.Contains("127.0.0.1") || endpoint.Contains("[::1]");
+        var behaviorProfile = ModelBehaviorProfiles.Resolve(
+            effectiveModel,
+            isLoopbackEndpoint,
+            ParseDialectOverride(preset.SamplingDialect),
+            preset.Sampling,
+            ParseThinkingOverride(preset.ThinkingRoundTrip));
+
+        // Companion pre-flight: fail (or repair) in 20s instead of burning the retry budget — or a
+        // 600s prefill timeout — against a daemon that was never listening.
+        var (companionReady, companionGuidance) = await EnsureCompanionReadyAsync(preset, endpoint, onEvent, ct);
+        if (!companionReady)
+        {
+            await onEvent(new TrajectoryEventPayload
+            {
+                EventType = "response",
+                Content = $"❌ {companionGuidance}"
+            });
+            return;
+        }
 
         ct.ThrowIfCancellationRequested();
         await onEvent(new TrajectoryEventPayload
@@ -906,7 +1050,21 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             || (promptEvent.Prompt?.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase) == true));
 
         var isDirectMode = string.Equals(promptEvent.Mode, "direct", StringComparison.OrdinalIgnoreCase);
-        var toolsDefinition = isDirectMode ? null : GetToolDefinitions(isDiscoveryPhase);
+
+        await using var mcpManager = (!isDirectMode && promptEvent.McpServers is { Count: > 0 })
+            ? await ConnectMcpServersAsync(promptEvent.McpServers, preset, cwd, onEvent, ct)
+            : null;
+
+        // Tool schema is FROZEN across phases: the definition array sits inside the cached
+        // system prefix, so swapping it at every stage transition busts the very prefix the
+        // layers-1-5 prompt stack exists to keep warm — and mid-session tool-set churn also
+        // confuses models that learned the earlier list. Stage enforcement belongs in the
+        // executor (ExecuteToolLocallyRawAsync blocks write/edit/git-mutation/PR during
+        // discovery with instructive errors), which is both cache-stable and teaches the model
+        // why a call was refused instead of silently hiding the capability.
+        var toolsDefinition = isDirectMode
+            ? null
+            : GetToolDefinitions(mcpManager?.GetOpenAiToolDefinitions());
 
         // Compaction: summarize older turns with the model (lossy fallback to truncation), then persist.
         async Task<(bool Changed, bool Summarized)> CompactAsync(int target, bool aggressive)
@@ -921,6 +1079,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var stepCount = 0;
         var readOnlyStreak = 0;
         var warnedBudget = false;
+        var profilePruneApplied = false;
+        var intentNudgesUsed = 0;
+        var swapWaitSecondsUsed = 0;
+        var swapWaitAttempt = 0;
+        var swapWaitBudgetSeconds = ResolveSwapWaitBudgetSeconds(preset);
+        // The sampling keys THIS request actually carried — the only names a 400 may learn
+        // against; base fields are never prunable.
+        var sentSamplingKeys = new List<string>();
         var streamRetryAttempt = 0;
         var responseEmitted = false;
         var askedQuestion = false;
@@ -937,8 +1103,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         {
             ct.ThrowIfCancellationRequested();
 
-            // Proactive history compaction
-            var targetMaxTokens = (int)(modelContextLimit * 0.80);
+            // Proactive history compaction at configured percentage of resolved context window (default 75%)
+            var targetMaxTokens = (int)Math.Floor(modelContextLimit * (compactionThresholdPercent / 100.0));
             if (EstimateTotalTokens(history) > targetMaxTokens)
             {
                 var beforeEst = EstimateTotalTokens(history);
@@ -949,17 +1115,27 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "thought",
-                        Content = $"[@{preset.Id}] Proactively {(summarized ? "summarized" : "truncated")} conversation history ({beforeEst} -> {afterEst} tokens) to remain within {modelContextLimit} context limit."
+                        Content = $"[@{preset.Id}] Proactively {(summarized ? "summarized" : "truncated")} conversation history ({beforeEst} -> {afterEst} tokens, threshold {compactionThresholdPercent}%) to remain within {modelContextLimit} context limit."
                     });
                 }
             }
 
             HttpResponseMessage? httpRes = null;
+            CancellationTokenSource? outerRequestCts = null;
             var retryAttempt = 0;
+            var contentBuilder = new StringBuilder();
+            var reasoningBuilder = new StringBuilder();
+            var reasoningShape = new ReasoningShapeTracker();
+            var toolCallsByIndex = new SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)>();
+            Exception? streamDropped = null;
 
+            try
+            {
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
+                outerRequestCts?.Dispose();
+                outerRequestCts = null;
 
                 // Strict boundary rule, enforced at the last moment before serialisation.
                 //
@@ -997,6 +1173,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     ["stream"] = true,
                     ["stream_options"] = new Dictionary<string, object> { ["include_usage"] = true }
                 };
+                // Rebuilt every step, so keys learned-rejected on a 400 moments ago are honored by
+                // the next iteration without extra bookkeeping.
+                sentSamplingKeys = ApplyProfileSampling(reqBody, behaviorProfile, effectiveModel);
 
                 if (toolsDefinition != null && toolsDefinition.Count > 0)
                 {
@@ -1022,14 +1201,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 var jsonContent = JsonSerializer.Serialize(reqBody);
                 httpReq.Content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                // Outer HTTP timeout covers both initial TCP/TLS handshake AND prompt prefill (TTFT)
+                // up until the first SSE data chunk arrives.
+                outerRequestCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, outerRequestCts.Token);
 
                 try
                 {
                     httpRes = await HttpClientInstance.SendAsync(httpReq, HttpCompletionOption.ResponseHeadersRead, linkedCts.Token);
                 }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested && outerRequestCts.IsCancellationRequested)
                 {
                     if (retryAttempt < maxRetries)
                     {
@@ -1068,9 +1249,15 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
 
                     var errorMsg = $"Failed to connect to OpenAI-compatible endpoint ({chatUrl}): {ex.Message}";
+                    // Hint is derived from the driver profile's own companion commands rather than a
+                    // named daemon binary; only when the profile declares none do we fall back to
+                    // generic proxy advice.
                     var isLocal = endpoint.Contains("localhost") || endpoint.Contains("127.0.0.1");
+                    var companionHint = BuildCompanionAuthHint(preset);
                     var extraHint = isLocal
-                        ? "\n\n💡 If using a driver companion daemon or local proxy (such as `aip proxy`), ensure the companion daemon is active and signed in (`aip login`). You can test and kickstart it via 'Verify Driver' or the interactive terminal in the Persona Environment modal."
+                        ? (companionHint != null
+                            ? $"\n\n💡 {companionHint} You can also test and kickstart the companion via 'Verify Driver' or the interactive terminal in the Persona Environment modal."
+                            : "\n\n💡 If a driver companion daemon or local proxy fronts this endpoint, ensure it is running and signed in. You can test and kickstart it via 'Verify Driver' or the interactive terminal in the Persona Environment modal.")
                         : "";
                     await onEvent(new TrajectoryEventPayload
                     {
@@ -1121,6 +1308,61 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         }
                     }
 
+                    // Profile self-heal: if the endpoint rejected a sampling key we added (or a
+                    // round-tripped reasoning field), learn that endpoint fact, prune, and retry
+                    // the step once. Only our own additions are prunable — base request fields
+                    // are out of reach — and the learning makes every later turn skip what was
+                    // rejected instead of re-triggering the 400.
+                    if (statusCode == 400 && !profilePruneApplied)
+                    {
+                        var didPrune = false;
+                        foreach (var rejectedKey in ParseRejectedRequestParameters(errContent, sentSamplingKeys))
+                        {
+                            if (ModelBehaviorProfiles.RecordRejectedSamplingKey(effectiveModel, rejectedKey))
+                                didPrune = true;
+                        }
+                        if (!didPrune &&
+                            errContent.Contains("reasoning_content", StringComparison.OrdinalIgnoreCase) &&
+                            history.Any(m => m.ReasoningContent != null) &&
+                            !ModelBehaviorProfiles.IsReasoningFieldRejected(effectiveModel))
+                        {
+                            ModelBehaviorProfiles.RecordReasoningFieldRejected(effectiveModel);
+                            didPrune = true;
+                        }
+                        if (didPrune)
+                        {
+                            profilePruneApplied = true;
+                            httpRes.Dispose();
+                            await onEvent(new TrajectoryEventPayload
+                            {
+                                EventType = "thought",
+                                Content = $"[@{preset.Id}] [Profile guard] The endpoint rejected part of the request shape for '{effectiveModel}' (unknown sampling parameter or reasoning field). Pruned it and retried the step — later turns will not send it."
+                            });
+                            continue;
+                        }
+                    }
+
+                    // Park through model swaps instead of dying on them: on a single-residency
+                    // swap server a 503/offline is a minutes-long weight reload, and the plain
+                    // retry policy spent its whole budget inside the first seconds of it. Backed
+                    // off here, the turn resumes on its own; disk-persisted session state makes
+                    // the pause safe. Budget exhausted -> falls through to the normal retry/❌
+                    // path unchanged.
+                    if (IsModelServerSwapSignal(statusCode, errContent) && swapWaitSecondsUsed < swapWaitBudgetSeconds)
+                    {
+                        var swapDelaySeconds = Math.Min(60, 3 * (int)Math.Pow(2, swapWaitAttempt));
+                        swapWaitAttempt++;
+                        swapWaitSecondsUsed += swapDelaySeconds;
+                        httpRes.Dispose();
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] [Swap guard] The model server returned HTTP {statusCode} and describes itself as unavailable — likely a swap/reload, which takes minutes. Paused {swapWaitSecondsUsed}s of a {swapWaitBudgetSeconds}s budget this turn; retrying in {swapDelaySeconds}s. The job is parked, not failed."
+                        });
+                        await Task.Delay(TimeSpan.FromSeconds(swapDelaySeconds), ct);
+                        continue;
+                    }
+
                     if (IsRetryableStatusCode(statusCode) && retryAttempt < maxRetries)
                     {
                         retryAttempt++;
@@ -1136,10 +1378,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
 
                     var errorMsg = $"OpenAI server error (HTTP {statusCode} {httpRes.ReasonPhrase}): {errContent}";
+                    var companionAuthHint = statusCode == 401 ? BuildCompanionAuthHint(preset) : null;
                     await onEvent(new TrajectoryEventPayload
                     {
                         EventType = "response",
-                        Content = $"❌ {errorMsg}"
+                        Content = companionAuthHint == null ? $"❌ {errorMsg}" : $"❌ {errorMsg}\n\n{companionAuthHint}"
                     });
                     httpRes.Dispose();
                     return;
@@ -1150,33 +1393,45 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             using var activeResponse = httpRes!;
 
-            var contentBuilder = new StringBuilder();
-            var reasoningBuilder = new StringBuilder();
-            var toolCallsByIndex = new SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)>();
-
-            Exception? streamDropped = null;
-            using (var stream = await activeResponse.Content.ReadAsStreamAsync(ct))
+            var firstChunkReceived = false;
+            var chunkIdleTimeout = TimeSpan.FromSeconds(streamChunkIdleTimeoutSeconds);
+            using (var prefillLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, outerRequestCts!.Token))
+            using (var stream = await activeResponse.Content.ReadAsStreamAsync(prefillLinkedCts.Token))
             using (var reader = new StreamReader(stream))
             {
-                var streamReadTimeout = TimeSpan.FromSeconds(Math.Max(120, timeoutSeconds));
                 while (true)
                 {
                     ct.ThrowIfCancellationRequested();
-                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    readCts.CancelAfter(streamReadTimeout);
+                    using var chunkIdleCts = firstChunkReceived
+                        ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+                        : null;
+                    chunkIdleCts?.CancelAfter(chunkIdleTimeout);
+
+                    var readToken = firstChunkReceived ? chunkIdleCts!.Token : prefillLinkedCts.Token;
 
                     string? line;
                     try
                     {
-                        line = await reader.ReadLineAsync(readCts.Token);
+                        line = await reader.ReadLineAsync(readToken);
                     }
-                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && readCts.IsCancellationRequested)
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && firstChunkReceived && chunkIdleCts!.IsCancellationRequested)
                     {
                         await onEvent(new TrajectoryEventPayload
                         {
                             EventType = "thought",
-                            Content = $"[@{preset.Id}] Streaming response timed out after {streamReadTimeout.TotalSeconds:F0}s of inactivity from server."
+                            Content = $"[@{preset.Id}] SSE stream stalled for {streamChunkIdleTimeoutSeconds}s after first chunk; cancelling and retrying..."
                         });
+                        streamDropped = new TimeoutException($"SSE stream stalled after {streamChunkIdleTimeoutSeconds}s of chunk inactivity.");
+                        break;
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && !firstChunkReceived && outerRequestCts.IsCancellationRequested)
+                    {
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "thought",
+                            Content = $"[@{preset.Id}] Initial prompt prefill (TTFT) timed out after {timeoutSeconds}s waiting for first SSE chunk."
+                        });
+                        streamDropped = new TimeoutException($"Prompt prefill timed out after {timeoutSeconds}s before first SSE chunk.");
                         break;
                     }
                     catch (Exception ex) when (ex is IOException || ex is HttpRequestException)
@@ -1193,13 +1448,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var trimmed = line.Trim();
                     if (trimmed.StartsWith('{'))
                     {
+                        firstChunkReceived = true;
                         // The server returned a direct JSON body rather than SSE lines
-                        var rest = await reader.ReadToEndAsync(ct);
+                        using var restCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        restCts.CancelAfter(chunkIdleTimeout);
+                        var rest = await reader.ReadToEndAsync(restCts.Token);
                         var fullJson = trimmed + "\n" + rest;
                         try
                         {
                             using var doc = JsonDocument.Parse(fullJson);
-                            ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens);
+                            ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens, reasoningShape);
                         }
                         catch { }
                         break;
@@ -1208,18 +1466,24 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     if (!trimmed.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) continue;
 
                     var data = trimmed.Length > 5 ? trimmed[5..].Trim() : "";
+                    firstChunkReceived = true;
                     if (data == "[DONE]") break;
 
                     try
                     {
                         using var doc = JsonDocument.Parse(data);
-                        ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens);
+                        ParseOpenAiChunkOrMessage(doc.RootElement, contentBuilder, reasoningBuilder, toolCallsByIndex, ref totalInputTokens, ref totalOutputTokens, ref totalTokens, reasoningShape);
                     }
                     catch
                     {
                         // Ignore malformed chunk
                     }
                 }
+            }
+            }
+            finally
+            {
+                outerRequestCts?.Dispose();
             }
 
             if (streamDropped != null)
@@ -1259,6 +1523,18 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             }
             streamRetryAttempt = 0;
 
+            var rawFinalContent = contentBuilder.ToString();
+            var (inlineThought, cleanedFinalContent) = ExtractInlineThinkBlocks(rawFinalContent);
+            if (!string.IsNullOrWhiteSpace(inlineThought))
+            {
+                if (reasoningBuilder.Length == 0)
+                {
+                    reasoningBuilder.Append(inlineThought);
+                }
+                rawFinalContent = cleanedFinalContent;
+            }
+            var finalContent = rawFinalContent;
+
             // If reasoning occurred, emit thought event
             if (reasoningBuilder.Length > 0)
             {
@@ -1272,8 +1548,20 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     });
                 }
             }
-
-            var finalContent = contentBuilder.ToString();
+            else if (toolCallsByIndex.Count > 0 &&
+                     !string.IsNullOrWhiteSpace(finalContent) &&
+                     !toolCallsByIndex.Values.Any(v => string.Equals(v.Name.ToString().Trim(), "ask_question", StringComparison.OrdinalIgnoreCase)))
+            {
+                var narrationText = StripRawToolCallTags(finalContent);
+                if (!string.IsNullOrWhiteSpace(narrationText))
+                {
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "thought",
+                        Content = narrationText
+                    });
+                }
+            }
 
             // Native tool calls execution
             if (toolCallsByIndex.Count > 0)
@@ -1320,7 +1608,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
 
                     // Normal tool execution
-                    var summary = FormatToolSummary(toolName, toolArgs);
+                    var summary = FormatToolSummary(toolName, toolArgs, mcpManager);
                     lastActionSummary = summary;
                     TrackToolActivity(toolName, toolArgs, filesInspected, filesModified, commandsRun);
                     await onEvent(new TrajectoryEventPayload
@@ -1331,28 +1619,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         ToolArgsJson = toolArgs
                     });
 
-                    // Command budget, not the HTTP handshake budget: ResolveTimeoutSeconds falls back to
-                    // 600s, which would mean a wedged test runner holds a worker for ten minutes and the
-                    // 180s sandbox default never applies.
-                    var toolTimeout = ResolveCommandTimeoutSeconds(preset);
-                    var toolResult = await ExecuteToolLocallyAsync(
+                    var toolResult = await ExecuteBridgedOrLocalToolAsync(
                         toolName,
                         toolArgs,
                         cwd,
-                        ct,
-                        toolTimeout,
-                        promptEvent.SessionId,
+                        mcpManager,
+                        preset,
+                        promptEvent,
                         callId,
-                        onOutputChunk: async (chunk) =>
-                        {
-                            if (CommandOutputBroadcaster != null)
-                            {
-                                try { await CommandOutputBroadcaster(promptEvent.SessionId, callId, chunk); } catch { }
-                            }
-                        },
-                        personaId: promptEvent.PersonaId,
-                        agentId: promptEvent.AgentId,
-                        isDiscoveryPhase: isDiscoveryPhase);
+                        isDiscoveryPhase,
+                        ct);
                     ct.ThrowIfCancellationRequested();
 
                     await onEvent(new TrajectoryEventPayload
@@ -1407,12 +1683,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 }
 
                 // Add assistant response with tool_calls and corresponding tool output messages
-                history.Add(new OpenAiMessage
+                var nativeAssistantMessage = new OpenAiMessage
                 {
                     Role = "assistant",
                     Content = string.IsNullOrWhiteSpace(finalContent) ? null : finalContent,
                     ToolCalls = executedToolCalls
-                });
+                };
+                MaybeAttachReasoningToHistory(nativeAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                history.Add(nativeAssistantMessage);
 
                 foreach (var (cId, output) in toolResults)
                 {
@@ -1427,6 +1705,17 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                 if (prOpened)
                 {
+                    // The turn must end on a terminal response event. Returning silently made the
+                    // runner treat a SUCCESSFUL PR submission as an unterminated turn, and its
+                    // safety net then blamed whatever stale tool error happened to be recorded
+                    // anywhere in the turn — a PR-opening job filed as ❌ with an unrelated edit
+                    // miss in the message.
+                    await onEvent(new TrajectoryEventPayload
+                    {
+                        EventType = "response",
+                        Content = (string.IsNullOrWhiteSpace(finalContent) ? "" : finalContent.Trim() + "\n\n")
+                            + "Pull request registered for this branch — turn yielded to the review gate."
+                    });
                     return;
                 }
 
@@ -1451,7 +1740,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
                 // Differentiated step budget: pure read-only turns increment step budget every 2 turns,
                 // while mutating commands increment every turn.
-                bool isPureReadOnlyTurn = executedToolCalls.All(c => IsReadOnlyTool(c.Function.Name, c.Function.Arguments));
+                bool isPureReadOnlyTurn = executedToolCalls.All(c => IsReadOnlyTool(c.Function.Name, c.Function.Arguments, mcpManager));
                 if (isPureReadOnlyTurn)
                 {
                     readOnlyStreak++;
@@ -1498,7 +1787,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     return;
                 }
 
-                var summary = FormatToolSummary(fbName, fbArgs ?? "{}");
+                var summary = FormatToolSummary(fbName, fbArgs ?? "{}", mcpManager);
                 lastActionSummary = summary;
                 TrackToolActivity(fbName, fbArgs ?? "{}", filesInspected, filesModified, commandsRun);
                 await onEvent(new TrajectoryEventPayload
@@ -1509,25 +1798,16 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     ToolArgsJson = fbArgs
                 });
 
-                // Command budget, not the HTTP handshake budget: ResolveTimeoutSeconds falls back to 600s,
-                // which would mean a wedged test runner holds a worker for ten minutes and the 180s sandbox
-                // default never applies.
-                var toolTimeout = ResolveCommandTimeoutSeconds(preset);
-                var toolResult = await ExecuteToolLocallyAsync(
+                var toolResult = await ExecuteBridgedOrLocalToolAsync(
                     fbName,
                     fbArgs ?? "{}",
                     cwd,
-                    ct,
-                    toolTimeout,
-                    promptEvent.SessionId,
+                    mcpManager,
+                    preset,
+                    promptEvent,
                     "fallback-command",
-                    onOutputChunk: async (chunk) =>
-                    {
-                        if (CommandOutputBroadcaster != null)
-                        {
-                            try { await CommandOutputBroadcaster(promptEvent.SessionId, "fallback-command", chunk); } catch { }
-                        }
-                    });
+                    isDiscoveryPhase,
+                    ct);
 
                 await onEvent(new TrajectoryEventPayload
                 {
@@ -1560,7 +1840,9 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     var isError = IsToolResultError(toolResult);
                     if (!isError)
                     {
-                        history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
+                        var checklistAssistantMessage = new OpenAiMessage { Role = "assistant", Content = finalContent };
+                        MaybeAttachReasoningToHistory(checklistAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                        history.Add(checklistAssistantMessage);
                         history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
                         SaveHistoryToDisk(promptEvent.SessionId, history);
 
@@ -1584,12 +1866,21 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
                         SaveHistoryToDisk(promptEvent.SessionId, history);
 
+                        // Same terminal-event contract as the native tool-call path above.
+                        await onEvent(new TrajectoryEventPayload
+                        {
+                            EventType = "response",
+                            Content = (string.IsNullOrWhiteSpace(finalContent) ? "" : finalContent.Trim() + "\n\n")
+                                + "Pull request registered for this branch — turn yielded to the review gate."
+                        });
                         responseEmitted = true;
                         return;
                     }
                 }
 
-                history.Add(new OpenAiMessage { Role = "assistant", Content = finalContent });
+                var fallbackAssistantMessage = new OpenAiMessage { Role = "assistant", Content = finalContent };
+                MaybeAttachReasoningToHistory(fallbackAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                history.Add(fallbackAssistantMessage);
                 history.Add(new OpenAiMessage { Role = "user", Content = $"Tool Result for {fbName}:\n{toolResult}" });
                 SaveHistoryToDisk(promptEvent.SessionId, history);
                 continue;
@@ -1626,7 +1917,49 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 ? finalContent
                 : (reasoningBuilder.Length > 0 ? reasoningBuilder.ToString().Trim() : "Turn completed.");
 
-            history.Add(new OpenAiMessage { Role = "assistant", Content = effectiveContent });
+            // Continuation nudge for the silent tool-call-drop class: a turn-ending response
+            // that PROMISES action without issuing a tool call is not a conclusion — the call
+            // was likely swallowed server-side (parsers lose these at chunk boundaries, so a
+            // retry frequently succeeds). Re-prompt instead of ending; bounded at 2 per turn so
+            // a genuinely stuck model still concludes. Toolless direct mode is exempt.
+            if (toolsDefinition != null && intentNudgesUsed < 2 && LooksLikeUnexecutedIntent(effectiveContent))
+            {
+                intentNudgesUsed++;
+                var narratedTurn = new OpenAiMessage { Role = "assistant", Content = effectiveContent };
+                MaybeAttachReasoningToHistory(narratedTurn, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+                history.Add(narratedTurn);
+                history.Add(new OpenAiMessage
+                {
+                    Role = "user",
+                    Content = "[Harness guard] Your previous message announced an action but no tool call arrived and no result is pending (" + intentNudgesUsed + "/2 nudges). If the tool call was lost in transport, issue it again now. If the work is genuinely finished, reply with your final summary and no action promises."
+                });
+                SaveHistoryToDisk(promptEvent.SessionId, history);
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[@{preset.Id}] [Harness guard] Turn-ending response narrated an unexecuted action — injected continuation nudge ({intentNudgesUsed}/2)."
+                });
+                stepCount++;
+                continue;
+            }
+
+            // Some companion gateways strip streaming `usage` entirely (live forensics: 54 of 62
+            // usage rows had inputTokens=0), which leaves cost telemetry blind and never feeds the
+            // learned-context-limit path. Fall back to the same chars/3.6 estimator compaction uses,
+            // flagged so estimated is never mistaken for measured — and a floor, since the estimate
+            // covers only the final step's prompt, not the cumulative tool loop.
+            var usageEstimated = false;
+            if (totalInputTokens == 0 && totalOutputTokens == 0)
+            {
+                totalInputTokens = EstimateTotalTokens(history);
+                totalOutputTokens = (long)Math.Ceiling(effectiveContent.Length / 3.6);
+                totalTokens = totalInputTokens + totalOutputTokens;
+                usageEstimated = true;
+            }
+
+            var finalAssistantMessage = new OpenAiMessage { Role = "assistant", Content = effectiveContent };
+            MaybeAttachReasoningToHistory(finalAssistantMessage, reasoningBuilder.ToString(), reasoningShape, behaviorProfile, effectiveModel);
+            history.Add(finalAssistantMessage);
 
             sw.Stop();
             var duration = sw.Elapsed.TotalSeconds;
@@ -1644,7 +1977,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         inputTokens = totalInputTokens,
                         outputTokens = totalOutputTokens,
                         totalTokens = totalTokens > 0 ? totalTokens : totalInputTokens + totalOutputTokens,
-                        durationSeconds = duration
+                        durationSeconds = duration,
+                        estimated = usageEstimated
                     }
                 });
             }
@@ -1780,6 +2114,14 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             sw.Stop();
             var duration = sw.Elapsed.TotalSeconds;
+            var checkpointUsageEstimated = false;
+            if (totalInputTokens == 0 && totalOutputTokens == 0)
+            {
+                totalInputTokens = EstimateTotalTokens(history);
+                totalOutputTokens = (long)Math.Ceiling(finalMsg.Length / 3.6);
+                totalTokens = totalInputTokens + totalOutputTokens;
+                checkpointUsageEstimated = true;
+            }
             string? structuredJson = null;
             if (totalTokens > 0 || duration > 0)
             {
@@ -1794,7 +2136,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         inputTokens = totalInputTokens,
                         outputTokens = totalOutputTokens,
                         totalTokens = totalTokens > 0 ? totalTokens : totalInputTokens + totalOutputTokens,
-                        durationSeconds = duration
+                        durationSeconds = duration,
+                        estimated = checkpointUsageEstimated
                     }
                 });
             }
@@ -1811,348 +2154,39 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         }
     }
 
+    private static Task<McpClientManager> ConnectMcpServersAsync(
+        IReadOnlyList<ResolvedMcpServerConfig> servers,
+        AgentPresetConfig preset,
+        string cwd,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+        => AgentToolExecutor.ConnectMcpServersAsync(servers, preset, cwd, onEvent, ct);
+
+    private static Task<string> ExecuteBridgedOrLocalToolAsync(
+        string toolName,
+        string argsJson,
+        string cwd,
+        McpClientManager? mcpManager,
+        AgentPresetConfig preset,
+        PromptReceivedEvent promptEvent,
+        string commandId,
+        bool isDiscoveryPhase,
+        CancellationToken ct)
+        => AgentToolExecutor.ExecuteBridgedOrLocalToolAsync(
+            toolName, argsJson, cwd, mcpManager, preset, promptEvent, commandId, isDiscoveryPhase, ct);
+
     private static string BuildSystemPrompt(AgentPresetConfig preset, PromptReceivedEvent promptEvent, string cwd)
-    {
-        var sb = new StringBuilder();
-        var displayName = !string.IsNullOrWhiteSpace(promptEvent.PersonaName)
-            ? promptEvent.PersonaName
-            : (!string.IsNullOrWhiteSpace(preset.Name) ? preset.Name : preset.Id);
-        var role = !string.IsNullOrWhiteSpace(promptEvent.PersonaRole)
-            ? promptEvent.PersonaRole
-            : preset.Role;
+        => AgentToolExecutor.BuildDefaultSystemPrompt(preset, promptEvent, cwd);
 
-        sb.AppendLine($"You are \"{displayName}\" ({role}), an autonomous AI engineering agent connected via AgentMesh.");
-        sb.AppendLine($"Workspace directory: {cwd}");
+    public static List<object> GetToolDefinitions() => AgentToolExecutor.GetToolDefinitions();
 
-        if (!string.IsNullOrWhiteSpace(promptEvent.PersonaPrompt))
-        {
-            sb.AppendLine();
-            sb.AppendLine("[Persona Instructions]");
-            sb.AppendLine(promptEvent.PersonaPrompt.Trim());
-        }
+    public static List<object> GetToolDefinitions(IEnumerable<object>? extraTools)
+        => AgentToolExecutor.GetToolDefinitions(extraTools);
 
-        if (!string.IsNullOrWhiteSpace(promptEvent.Mode))
-        {
-            sb.AppendLine();
-            sb.AppendLine($"[Execution Mode: {promptEvent.Mode}]");
-            if (string.Equals(promptEvent.Mode, "plan", StringComparison.OrdinalIgnoreCase))
-            {
-                sb.AppendLine("You are in PLAN mode. Explore the codebase and formulate a comprehensive implementation plan. Do NOT write or edit project files.");
-            }
-        }
+    internal static string ResolveDefaultToolWorkingDirectory(string? cwd)
+        => AgentToolExecutor.ResolveDefaultToolWorkingDirectory(cwd);
 
-        sb.AppendLine();
-        sb.AppendLine("[Autonomous Tool Usage & Environment Guidelines]");
-        sb.AppendLine("You have access to autonomous tools to execute shell commands, read files, write files, and edit files in the workspace.");
-        sb.AppendLine("- Use `run_command` to inspect the project, run tests, execute builds, and check git status.");
-        sb.AppendLine("- Use `read_file` to inspect code and text files.");
-        sb.AppendLine("- Use `write_file` or `edit_file` to implement solutions.");
-        sb.AppendLine("- When you need user clarification or critical architectural decisions, call `post_job_message(requires_reply: true)` or `ask_question`.");
-        sb.AppendLine("- Platform MCP Tools: `manage_task`, `post_job_message`, and `open_pull_request` are control plane tools. In Stage 1 Discovery, file edits and git mutations are blocked: use `manage_task(action: 'set_checklist')` to register tasks and `post_job_message(requires_reply: true)` to post the plan.");
-        sb.AppendLine("- Environment Topology: You run in an isolated Linux container runner. The Control Plane API does not mount /workspace directly; state and diffs are reported through platform tools.");
-        sb.AppendLine("- Vision / Image Handling: Attached image files are provided directly to your multimodal visual input when supported. You can inspect, analyze, and describe them visually. However, binary image files on disk cannot be read as plain text via `read_file`. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands.");
-        sb.AppendLine("- Be concise and lead with working code and clear implementation.");
-
-        return sb.ToString();
-    }
-
-    public static List<object> GetToolDefinitions(bool isDiscoveryPhase = false)
-    {
-        var tools = new List<object>
-        {
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "run_command",
-                    description = "Execute a shell command in the workspace directory. Use this to run builds, tests, git commands, and inspection tools. Long output is preserved in full on disk and returned as a head/tail preview; the result names the log file to grep.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            command = new { type = "string", description = "The exact shell command line string to execute." },
-                            workingDirectory = new { type = "string", description = "Optional subdirectory or working directory. Defaults to workspace root." },
-                            timeout_seconds = new { type = "integer", description = "Optional wall-clock limit in seconds (5-600, default 180). Use a larger value for full builds or test suites; the command's whole process tree is killed if it exceeds the limit." }
-                        },
-                        required = new[] { "command" }
-                    }
-                }
-            },
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "read_file",
-                    description = "Read the contents of a text file from the workspace. Supports reading files in parallel in a single response.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
-                            startLine = new { type = "integer", description = "Optional 1-based start line." },
-                            endLine = new { type = "integer", description = "Optional 1-based end line." }
-                        },
-                        required = new[] { "path" }
-                    }
-                }
-            },
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "ask_question",
-                    description = "Ask the human operator questions when you need clarification, decision input, or alignment before proceeding.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            questions = new
-                            {
-                                type = "array",
-                                items = new
-                                {
-                                    type = "object",
-                                    properties = new
-                                    {
-                                        question = new { type = "string", description = "The question to ask." },
-                                        options = new { type = "array", items = new { type = "string" }, description = "List of options for user to select from." },
-                                        is_multi_select = new { type = "boolean", description = "Whether user can select multiple choices." }
-                                    },
-                                    required = new[] { "question" }
-                                }
-                            }
-                        },
-                        required = new[] { "questions" }
-                    }
-                }
-            },
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "manage_task",
-                    description = "Manage the living task checklist and task statuses for the active job. In Stage 1 Discovery, decompose the job into 3 to 6 atomic tasks and register them via action='set_checklist'. In Stage 3, update task status with action='update_task_status'.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            action = new
-                            {
-                                type = "string",
-                                description = "The action to perform: 'set_checklist' (to register 3-6 tasks), 'update_task_status', 'get_checklist', or 'get_details'.",
-                                @enum = new[] { "set_checklist", "update_task_status", "get_checklist", "get_details", "set_status", "list_all" }
-                            },
-                            tasks = new
-                            {
-                                type = "array",
-                                description = "List of 3 to 6 atomic tasks when action is 'set_checklist'.",
-                                items = new
-                                {
-                                    type = "object",
-                                    properties = new
-                                    {
-                                        title = new { type = "string", description = "Clear, actionable title of the task." },
-                                        target_file = new { type = "string", description = "Target file or component path." },
-                                        verification_method = new { type = "string", description = "Exact verification command (e.g. 'dotnet test', 'npm test')." }
-                                    },
-                                    required = new[] { "title" }
-                                }
-                            },
-                            task_id = new { type = "string", description = "Identifier of the task being updated." },
-                            status = new
-                            {
-                                type = "string",
-                                description = "Target status when updating task: 'todo', 'in_progress', 'awaiting_review', or 'completed'.",
-                                @enum = new[] { "todo", "in_progress", "awaiting_review", "completed" }
-                            },
-                            progress_note = new { type = "string", description = "1-sentence heartbeat summarizing the state change." },
-                            notes = new { type = "string", description = "Optional context notes." }
-                        },
-                        required = new[] { "action" }
-                    }
-                }
-            },
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "post_job_message",
-                    description = "Post an update, clarifying question, or architectural escalation to the job's shared ledger. Set requires_reply=true to pause execution and await user/lead response.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            content = new { type = "string", description = "Markdown message body." },
-                            target_persona = new { type = "string", description = "Recipient: 'operator' or assigned teammate persona ID." },
-                            requires_reply = new { type = "boolean", description = "If true, halts turn and parks session awaiting response." },
-                            job_id = new { type = "string", description = "Optional job GUID." }
-                        },
-                        required = new[] { "content" }
-                    }
-                }
-            },
-            new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "save_memory",
-                    description = "Store persistent architectural notes, codebase quirks, or test workarounds for future sessions.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            category = new
-                            {
-                                type = "string",
-                                description = "Category of memory: 'environment' (paths, SDKs, ports, daemon sockets), 'build_and_test' (flags, mocks, test quirks), or 'codebase_gotcha' (domain rules, architectural constraints).",
-                                @enum = new[] { "environment", "build_and_test", "codebase_gotcha" }
-                            },
-                            key = new { type = "string", description = "Unique identifier (e.g. ef-dbcontext-pooling-rule)." },
-                            value = new { type = "string", description = "Concise documentation of the learned knowledge or guideline." },
-                            is_global = new { type = "boolean", description = "True if this memory applies across all projects; false if specific to this project." }
-                        },
-                        required = new[] { "category", "key", "value" }
-                    }
-                }
-            }
-        };
-
-        if (!isDiscoveryPhase)
-        {
-            tools.Add(new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "write_file",
-                    description = "Create a new file or completely overwrite an existing file with the given content.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
-                            content = new { type = "string", description = "The full content to write to the file." }
-                        },
-                        required = new[] { "path", "content" }
-                    }
-                }
-            });
-
-            tools.Add(new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "edit_file",
-                    description = "Replace a target string within an existing file with replacement text.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            path = new { type = "string", description = "The file path relative to workspace root or absolute path." },
-                            target = new { type = "string", description = "The exact character sequence in the file to be replaced." },
-                            replacement = new { type = "string", description = "The text to replace target with." }
-                        },
-                        required = new[] { "path", "target", "replacement" }
-                    }
-                }
-            });
-
-            tools.Add(new
-            {
-                type = "function",
-                function = new
-                {
-                    name = "open_pull_request",
-                    description = "Submit the active branch for review (Stage 4 Two-Man Review Gate). Concludes implementation turn.",
-                    parameters = new
-                    {
-                        type = "object",
-                        properties = new
-                        {
-                            title = new { type = "string", description = "Pull request title following Conventional Commits (e.g. 'feat(api): add tool X')." },
-                            summary_3r = new
-                            {
-                                type = "object",
-                                description = "The structured 3-R summary that becomes the PR body.",
-                                properties = new
-                                {
-                                    result = new { type = "string", description = "What was built and what verifies it (files modified, test commands, passing test counts)." },
-                                    reasoning = new { type = "string", description = "Why this approach was taken and key architectural trade-offs." },
-                                    risk = new { type = "string", description = "Potential risks, edge cases, regression risks, or operational caveats." }
-                                },
-                                required = new[] { "result", "reasoning", "risk" }
-                            },
-                            branch_name = new { type = "string", description = "The local task branch to push (optional; defaults to the job's git branch)." }
-                        },
-                        required = new[] { "title", "summary_3r" }
-                    }
-                }
-            });
-        }
-
-        return tools;
-    }
-
-    private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff", ".tif", ".svg"
-    };
-
-    private static readonly HashSet<string> BinaryExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff", ".tif",
-        ".pdf", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".bz2", ".xz",
-        ".exe", ".dll", ".so", ".dylib", ".bin", ".iso", ".dmg",
-        ".mp3", ".mp4", ".wav", ".ogg", ".avi", ".mov", ".webm", ".mkv",
-        ".wasm", ".pyc", ".class", ".o", ".obj"
-    };
-
-    private static async Task<bool> IsBinaryFileAsync(string filePath, CancellationToken ct)
-    {
-        var ext = Path.GetExtension(filePath);
-        if (BinaryExtensions.Contains(ext))
-        {
-            return true;
-        }
-
-        try
-        {
-            const int bufferSize = 8192;
-            var buffer = new byte[bufferSize];
-            await using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, useAsync: true);
-            var bytesRead = await stream.ReadAsync(buffer.AsMemory(0, bufferSize), ct);
-            for (var i = 0; i < bytesRead; i++)
-            {
-                if (buffer[i] == 0)
-                {
-                    return true;
-                }
-            }
-        }
-        catch
-        {
-            // If checking fails, proceed to normal read
-        }
-
-        return false;
-    }
-
-    public static async Task<string> ExecuteToolLocallyAsync(
+    public static Task<string> ExecuteToolLocallyAsync(
         string toolName,
         string argsJson,
         string cwd,
@@ -2164,267 +2198,11 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string? personaId = null,
         string? agentId = null,
         bool isDiscoveryPhase = false)
-    {
-        var rawResult = await ExecuteToolLocallyRawAsync(toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId, onOutputChunk, personaId, agentId, isDiscoveryPhase);
-        var truncated = TruncateToolResult(rawResult);
-        return truncated.IndexOf('\0') >= 0 ? truncated.Replace("\0", string.Empty) : truncated;
-    }
+        => AgentToolExecutor.ExecuteToolLocallyAsync(
+            toolName, argsJson, cwd, ct, timeoutSeconds, sessionId, commandId, onOutputChunk, personaId, agentId, isDiscoveryPhase);
 
-    private static async Task<string> ExecuteToolLocallyRawAsync(
-        string toolName,
-        string argsJson,
-        string cwd,
-        CancellationToken ct,
-        int? timeoutSeconds = null,
-        Guid? sessionId = null,
-        string? commandId = null,
-        Func<string, Task>? onOutputChunk = null,
-        string? personaId = null,
-        string? agentId = null,
-        bool isDiscoveryPhase = false)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
-            var root = doc.RootElement;
-            var normalizedTool = toolName.ToLowerInvariant();
-
-            // Stage 1 Discovery / Stage 2 Plan Approval guardrails: strictly read-only
-            if (isDiscoveryPhase)
-            {
-                if (normalizedTool is "write_file" or "write_to_file" or "edit_file" or "replace_file_content")
-                {
-                    return "Error: File modifications are forbidden during Stage 1 Discovery and while awaiting plan approval. Complete discovery and receive plan approval before starting implementation.";
-                }
-
-                if (normalizedTool is "open_pull_request")
-                {
-                    return "Error: Opening pull requests is forbidden during Stage 1 Discovery and while awaiting plan approval. Complete discovery using manage_task(action: 'set_checklist') and receive plan approval before starting implementation.";
-                }
-
-                if (normalizedTool is "run_command" or "bash" or "command")
-                {
-                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd", "commandLine", "script", "shell_command") ?? string.Empty;
-                    if (IsMutatingGitCommand(cmd))
-                    {
-                        return "Error: Committing, pushing, or creating pull requests is forbidden during Stage 1 Discovery and while awaiting plan approval. Your objective is read-only exploration and checklist registration via manage_task(action: 'set_checklist').";
-                    }
-                }
-            }
-
-            switch (normalizedTool)
-            {
-                case "manage_task":
-                case "post_job_message":
-                case "open_pull_request":
-                case "save_memory":
-                {
-                    if (PlatformToolExecutor != null)
-                    {
-                        return await PlatformToolExecutor(toolName, argsJson, sessionId, personaId, agentId, ct);
-                    }
-                    return $"Error: Platform tool '{toolName}' is not available (no executor registered).";
-                }
-
-                case "run_command":
-                case "bash":
-                case "command":
-                {
-                    var cmd = GetPropertyString(root, "command", "CommandLine", "cmd", "commandLine", "script", "shell_command");
-                    if (string.IsNullOrWhiteSpace(cmd)) return "Error: 'command' argument is required.";
-
-                    var workDir = GetPropertyString(root, "workingDirectory", "cwd", "workDir");
-                    var effectiveDir = !string.IsNullOrWhiteSpace(workDir)
-                        ? (Path.IsPathRooted(workDir) ? workDir : Path.Combine(cwd, workDir))
-                        : cwd;
-
-                    if (!Directory.Exists(effectiveDir))
-                    {
-                        Directory.CreateDirectory(effectiveDir);
-                    }
-
-                    // Timeout precedence, most specific first:
-                    //   1. `timeout_seconds` on the tool call (the model knows whether it is running `echo`
-                    //      or a full solution build).
-                    //   2. An operator's explicit preset configuration, threaded through `timeoutSeconds`.
-                    //   3. null -> the policy default (180s) inside SandboxShell.
-                    // Deliberately not ResolveTimeoutSeconds(preset): that is the HTTP handshake budget and
-                    // falls back to 600, which would defeat the sandbox default entirely.
-                    var requestedTimeout = GetPropertyInt(root, "timeout_seconds", "timeoutSeconds", "timeout")
-                        ?? timeoutSeconds;
-
-                    var result = await AgentAdapterFactory.RunCommandAsync(
-                        cmd,
-                        effectiveDir,
-                        ct,
-                        timeout: null,
-                        sessionId: sessionId,
-                        commandId: commandId,
-                        onOutputChunk: onOutputChunk,
-                        timeoutSeconds: requestedTimeout);
-
-                    var sb = new StringBuilder();
-                    if (!string.IsNullOrWhiteSpace(result.Output)) sb.AppendLine(result.Output);
-
-                    // The exit code line is what the adapters and existing tests key on. For a timeout the
-                    // diagnostic already names 124; repeating it keeps one source of truth for the number.
-                    sb.Append($"Exit Code: {result.ExitCode}");
-
-                    if (result.LogFilePath != null && !result.Output.Contains(result.LogFilePath, StringComparison.Ordinal))
-                    {
-                        sb.AppendLine();
-                        sb.Append($"Full output: {result.LogFilePath}");
-                    }
-
-                    return sb.ToString().Trim();
-                }
-
-                case "read_file":
-                case "view_file":
-                {
-                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "uri");
-                    if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' argument is required.";
-
-                    var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(cwd, path);
-                    if (!File.Exists(fullPath)) return $"Error: File '{path}' does not exist.";
-
-                    if (await IsBinaryFileAsync(fullPath, ct))
-                    {
-                        var ext = Path.GetExtension(fullPath);
-                        var fi = new FileInfo(fullPath);
-                        if (ImageExtensions.Contains(ext) && !string.Equals(ext, ".svg", StringComparison.OrdinalIgnoreCase))
-                        {
-                            return $"[Image file: '{path}' ({fi.Length:N0} bytes, format: {ext.TrimStart('.').ToUpperInvariant()}). This is a binary image file and cannot be read as plain text. Attached images are already provided directly to your multimodal visual context in the prompt. Do NOT attempt to install OCR packages (e.g., tesseract), write custom Python decoders, or parse raw image bytes with shell commands. If you need details about an unattached image, ask the user to attach or describe it.]";
-                        }
-                        return $"[Binary file: '{path}' ({fi.Length:N0} bytes). This is a binary file and cannot be read as plain text.]";
-                    }
-
-                    var lines = await File.ReadAllLinesAsync(fullPath, ct);
-                    int startLine = GetPropertyInt(root, "startLine", "StartLine", "start_line") ?? 1;
-                    int endLine = GetPropertyInt(root, "endLine", "EndLine", "end_line") ?? lines.Length;
-
-                    startLine = Math.Max(1, startLine);
-                    endLine = Math.Min(lines.Length, Math.Max(startLine, endLine));
-
-                    var sb = new StringBuilder();
-                    for (int i = startLine - 1; i < endLine; i++)
-                    {
-                        sb.AppendLine($"{i + 1}: {lines[i]}");
-                    }
-                    return sb.ToString().TrimEnd();
-                }
-
-                case "write_file":
-                case "write_to_file":
-                {
-                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
-                    if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' argument is required.";
-
-                    var content = GetPropertyString(root, "content", "Content", "text", "CodeContent", "code_content");
-                    content ??= string.Empty;
-
-                    var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(cwd, path);
-                    var dir = Path.GetDirectoryName(fullPath);
-                    if (!string.IsNullOrWhiteSpace(dir) && !Directory.Exists(dir))
-                    {
-                        Directory.CreateDirectory(dir);
-                    }
-
-                    await File.WriteAllTextAsync(fullPath, content, Encoding.UTF8, ct);
-                    return $"Successfully wrote {content.Length} characters to '{path}'.";
-                }
-
-                case "edit_file":
-                case "replace_file_content":
-                {
-                    var path = GetPropertyString(root, "path", "Path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
-                    if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' argument is required.";
-
-                    var target = GetPropertyString(root, "target", "Target", "old_string", "oldText", "TargetContent", "target_content", "old_content", "search", "find");
-                    var replacement = GetPropertyString(root, "replacement", "Replacement", "new_string", "newText", "ReplacementContent", "replacement_content", "new_content", "replace") ?? string.Empty;
-
-                    if (string.IsNullOrEmpty(target)) return "Error: 'target' argument is required.";
-
-                    var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(cwd, path);
-                    if (!File.Exists(fullPath)) return $"Error: File '{path}' does not exist.";
-
-                    var fileText = await File.ReadAllTextAsync(fullPath, ct);
-                    if (!fileText.Contains(target))
-                    {
-                        return $"Error: Target string not found in '{path}'.";
-                    }
-
-                    var updatedText = fileText.Replace(target, replacement);
-                    await File.WriteAllTextAsync(fullPath, updatedText, Encoding.UTF8, ct);
-                    return $"Successfully replaced target in '{path}'.";
-                }
-
-                case "ask_question":
-                {
-                    return "Question submitted to operator. Waiting for response.";
-                }
-
-                default:
-                    return $"Error: Unknown tool '{toolName}'.";
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            return $"Tool execution error: {ex.Message}";
-        }
-    }
-
-    private static string FormatToolSummary(string toolName, string argsJson)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
-            var root = doc.RootElement;
-            switch (toolName.ToLowerInvariant())
-            {
-                case "run_command":
-                case "bash":
-                case "command":
-                    var cmd = GetPropertyString(root, "command", "CommandLine", "commandLine", "cmd", "script", "shell_command");
-                    return !string.IsNullOrWhiteSpace(cmd) ? $"Running command: {(cmd.Length > 60 ? cmd[..57] + "..." : cmd)}" : "Running command";
-                case "read_file":
-                case "view_file":
-                    var rPath = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "uri");
-                    return !string.IsNullOrWhiteSpace(rPath) ? $"Reading file: {Path.GetFileName(rPath)}" : "Reading file";
-                case "write_file":
-                case "write_to_file":
-                    var wPath = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
-                    return !string.IsNullOrWhiteSpace(wPath) ? $"Writing file: {Path.GetFileName(wPath)}" : "Writing file";
-                case "edit_file":
-                case "replace_file_content":
-                    var ePath = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath");
-                    return !string.IsNullOrWhiteSpace(ePath) ? $"Editing file: {Path.GetFileName(ePath)}" : "Editing file";
-                case "ask_question":
-                    return "Asking question";
-                case "manage_task":
-                    var action = GetPropertyString(root, "action") ?? "task";
-                    return $"manage_task: {action}";
-                case "post_job_message":
-                    return "post_job_message";
-                case "open_pull_request":
-                    var title = GetPropertyString(root, "title") ?? "PR";
-                    return $"open_pull_request: {title}";
-                case "save_memory":
-                    var key = GetPropertyString(root, "key") ?? "memory";
-                    return $"save_memory: {key}";
-                default:
-                    return $"Executing {toolName}";
-            }
-        }
-        catch
-        {
-            return $"Executing {toolName}";
-        }
-    }
+    private static string FormatToolSummary(string toolName, string argsJson, McpClientManager? mcpManager = null)
+        => AgentToolExecutor.FormatToolSummary(toolName, argsJson, mcpManager);
 
     private static void TrackToolActivity(
         string toolName,
@@ -2432,149 +2210,36 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         HashSet<string> filesInspected,
         HashSet<string> filesModified,
         List<string> commandsRun)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
-            var root = doc.RootElement;
-            var tnLower = toolName.ToLowerInvariant();
-            if (tnLower is "run_command" or "bash" or "command")
-            {
-                var cmd = GetPropertyString(root, "command", "CommandLine", "commandLine", "cmd", "script", "shell_command");
-                if (!string.IsNullOrWhiteSpace(cmd)) commandsRun.Add(cmd);
-            }
-            else if (tnLower.Contains("write") || tnLower.Contains("edit") || tnLower.Contains("replace") || tnLower.Contains("modify") || tnLower.Contains("patch"))
-            {
-                var path = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "target_file", "source_file", "uri");
-                if (!string.IsNullOrWhiteSpace(path)) filesModified.Add(path);
-            }
-            else if (tnLower.Contains("read") || tnLower.Contains("view") || tnLower.Contains("inspect"))
-            {
-                var path = GetPropertyString(root, "path", "file_path", "filePath", "file", "filename", "TargetFile", "AbsolutePath", "target_file", "source_file", "uri");
-                if (!string.IsNullOrWhiteSpace(path)) filesInspected.Add(path);
-            }
-        }
-        catch { }
-    }
+        => AgentToolExecutor.TrackToolActivity(toolName, argsJson, filesInspected, filesModified, commandsRun);
 
     internal static bool IsMutatingGitCommand(string command)
-    {
-        if (string.IsNullOrWhiteSpace(command)) return false;
-        var trimmed = command.Trim();
-        return Regex.IsMatch(trimmed, @"\b(?:git\s+(?:commit|push|merge|rebase|cherry-pick)|gh\s+pr\s+create)\b", RegexOptions.IgnoreCase);
-    }
+        => AgentToolExecutor.IsMutatingGitCommand(command);
 
-    internal static bool IsReadOnlyTool(string? toolName, string? argsJson)
-    {
-        if (string.IsNullOrWhiteSpace(toolName)) return true;
-        var name = toolName.Trim().ToLowerInvariant();
-        if (name is "read_file" or "view_file" or "ask_question" or "save_memory") return true;
-        if (name is "manage_task")
-        {
-            if (!string.IsNullOrWhiteSpace(argsJson))
-            {
-                return argsJson.Contains("get_checklist", StringComparison.OrdinalIgnoreCase) ||
-                       argsJson.Contains("get_details", StringComparison.OrdinalIgnoreCase);
-            }
-            return false;
-        }
-        if (name is "run_command" or "bash" or "command")
-        {
-            if (!string.IsNullOrWhiteSpace(argsJson))
-            {
-                var lower = argsJson.ToLowerInvariant();
-                return lower.Contains("git status") || lower.Contains("git log") || lower.Contains("git diff") ||
-                       lower.Contains("git branch") || lower.Contains("grep ") || lower.Contains("find ") ||
-                       lower.Contains("cat ") || lower.Contains("ls ");
-            }
-        }
-        return false;
-    }
+    internal static bool IsReadOnlyTool(string? toolName, string? argsJson, McpClientManager? mcpManager = null)
+        => AgentToolExecutor.IsReadOnlyTool(toolName, argsJson, mcpManager);
 
     internal static bool IsToolResultError(string? result)
-    {
-        if (string.IsNullOrWhiteSpace(result)) return true;
-        var trimmed = result.Trim();
-        if (trimmed.StartsWith("Error:", StringComparison.OrdinalIgnoreCase) ||
-            trimmed.StartsWith("Error ", StringComparison.OrdinalIgnoreCase) ||
-            trimmed.StartsWith("Tool execution error:", StringComparison.OrdinalIgnoreCase) ||
-            trimmed.StartsWith("An error occurred", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        try
-        {
-            using var doc = JsonDocument.Parse(trimmed);
-            var root = doc.RootElement;
-            if (root.ValueKind == JsonValueKind.Object)
-            {
-                if (root.TryGetProperty("success", out var s) && s.ValueKind == JsonValueKind.False)
-                {
-                    return true;
-                }
-                if (root.TryGetProperty("error", out var err) && err.ValueKind != JsonValueKind.Null && !string.IsNullOrWhiteSpace(err.ToString()))
-                {
-                    return true;
-                }
-                if (root.TryGetProperty("isError", out var isErr) && isErr.ValueKind == JsonValueKind.True)
-                {
-                    return true;
-                }
-            }
-        }
-        catch
-        {
-            // Non-JSON string without error prefix is not treated as an error
-        }
-
-        return false;
-    }
+        => AgentToolExecutor.IsToolResultError(result);
 
     internal static bool IsRequiresReply(string? toolArgs)
-    {
-        if (string.IsNullOrWhiteSpace(toolArgs)) return false;
-        try
-        {
-            using var doc = JsonDocument.Parse(toolArgs);
-            if (doc.RootElement.TryGetProperty("requires_reply", out var req) ||
-                doc.RootElement.TryGetProperty("requiresReply", out req))
-            {
-                if (req.ValueKind == JsonValueKind.True) return true;
-                if (req.ValueKind == JsonValueKind.String &&
-                    bool.TryParse(req.GetString(), out var b) && b)
-                {
-                    return true;
-                }
-            }
-        }
-        catch { }
-        return false;
-    }
+        => AgentToolExecutor.IsRequiresReply(toolArgs);
 
     internal static bool IsSetChecklistAction(string? toolArgs)
+        => AgentToolExecutor.IsSetChecklistAction(toolArgs);
+
+    internal static (string? ExtractedThought, string CleanedContent) ExtractInlineThinkBlocks(string? content)
+        => AgentToolExecutor.ExtractInlineThinkBlocks(content);
+
+    private static string StripRawToolCallTags(string content)
     {
-        if (string.IsNullOrWhiteSpace(toolArgs)) return false;
-        try
-        {
-            using var doc = JsonDocument.Parse(toolArgs);
-            var root = doc.RootElement;
-            if (root.ValueKind == JsonValueKind.Object)
-            {
-                if (root.TryGetProperty("action", out var act) ||
-                    root.TryGetProperty("Action", out act) ||
-                    root.TryGetProperty("operation", out act) ||
-                    root.TryGetProperty("command", out act))
-                {
-                    return string.Equals(act.GetString()?.Trim(), "set_checklist", StringComparison.OrdinalIgnoreCase);
-                }
-            }
-        }
-        catch { }
-        return false;
+        if (string.IsNullOrWhiteSpace(content)) return string.Empty;
+        var stripped = Regex.Replace(content, @"<tool_call>\s*[\s\S]*?\s*</tool_call>", string.Empty, RegexOptions.IgnoreCase);
+        stripped = Regex.Replace(stripped, @"```(?:json:)?tool_call\s*[\s\S]*?```", string.Empty, RegexOptions.IgnoreCase);
+        stripped = Regex.Replace(stripped, @"<function=[\w.\-]+>[\s\S]*?</function>", string.Empty, RegexOptions.IgnoreCase);
+        return stripped.Trim();
     }
 
-    private static (bool HasTool, string? Name, string? Args) TryParseFallbackToolCall(string content)
+    internal static (bool HasTool, string? Name, string? Args) TryParseFallbackToolCall(string content)
     {
         if (string.IsNullOrWhiteSpace(content)) return (false, null, null);
 
@@ -2619,79 +2284,384 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             return (true, "ask_question", qMatch.Groups[1].Value);
         }
 
+        // Qwen3-Coder/Next XML tool format — the leak shape reasoning/tool parsers have a long
+        // documented history of dropping into `content` instead of `tool_calls` (and which this
+        // model family demonstrably produced inside this very project session). Served as an
+        // execution path so a leaked call still runs instead of ending the turn as prose.
+        // When several calls leak in one message, only the first executes per step; the loop
+        // re-offers the remaining content to the model, which typically re-emits them.
+        var qwenXmlMatch = Regex.Match(content, @"<function=(?<name>[\w.\-]+)>(?<body>.*?)</function>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (qwenXmlMatch.Success)
+        {
+            var fnName = qwenXmlMatch.Groups["name"].Value.Trim();
+            var argsObj = new Dictionary<string, object?>();
+            foreach (Match p in Regex.Matches(qwenXmlMatch.Groups["body"].Value,
+                         @"<parameter=(?<k>[\w.\-]+)>(?<v>.*?)</parameter>", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+            {
+                argsObj[p.Groups["k"].Value.Trim()] = CoerceXmlParamValue(p.Groups["v"].Value.Trim());
+            }
+            if (!string.IsNullOrWhiteSpace(fnName))
+                return (true, fnName, argsObj.Count == 0 ? "{}" : JsonSerializer.Serialize(argsObj));
+        }
+
         return (false, null, null);
     }
 
-    internal static string? GetPropertyString(JsonElement root, params string[] names)
+    internal static object? CoerceXmlParamValue(string raw)
     {
-        if (root.ValueKind == JsonValueKind.String)
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(root.GetString()!);
-                return GetPropertyString(doc.RootElement, names);
-            }
-            catch { return null; }
-        }
-
-        if (root.ValueKind != JsonValueKind.Object) return null;
-
-        // Try exact match first for performance
-        foreach (var name in names)
-        {
-            if (root.TryGetProperty(name, out var prop))
-            {
-                if (prop.ValueKind == JsonValueKind.String) return prop.GetString();
-                if (prop.ValueKind != JsonValueKind.Null && prop.ValueKind != JsonValueKind.Undefined) return prop.GetRawText();
-            }
-        }
-
-        // Case-insensitive fallback
-        foreach (var name in names)
-        {
-            foreach (var prop in root.EnumerateObject())
-            {
-                if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
-                {
-                    if (prop.Value.ValueKind == JsonValueKind.String) return prop.Value.GetString();
-                    if (prop.Value.ValueKind != JsonValueKind.Null && prop.Value.ValueKind != JsonValueKind.Undefined) return prop.Value.GetRawText();
-                }
-            }
-        }
-        return null;
+        if (raw.Length == 0) return "";
+        if (long.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var l))
+            return l; // integers stay integers so downstream TryGetInt32 keeps working
+        if (double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var d))
+            return d;
+        if (string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)) return true;
+        if (string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.Equals(raw, "null", StringComparison.OrdinalIgnoreCase)) return null;
+        return raw;
     }
+
+    internal static string? GetPropertyString(JsonElement root, params string[] names)
+        => AgentToolExecutor.GetPropertyString(root, names);
 
     internal static string ExtractGoal(PromptReceivedEvent promptEvent)
+        => AgentToolExecutor.ExtractGoal(promptEvent);
+
+    internal static bool GetPropertyBool(JsonElement root, params string[] names)
+        => AgentToolExecutor.GetPropertyBool(root, names);
+
+    internal static int CountSubstringOccurrences(string text, string value)
+        => AgentToolExecutor.CountSubstringOccurrences(text, value);
+
+    internal static List<AgentToolExecutor.NormalizedMatch> FindOccurrencesNormalized(string text, string targetLinesJoined)
+        => AgentToolExecutor.FindOccurrencesNormalized(text, targetLinesJoined);
+
+    internal static string StripDisplayLinePrefixesFromEachLine(string target)
+        => AgentToolExecutor.StripDisplayLinePrefixesFromEachLine(target);
+
+    internal static bool IsBenignExitOneCommand(string command)
+        => AgentToolExecutor.IsBenignExitOneCommand(command);
+
+    internal static string ReplaceFirstOrdinal(string text, string search, string replace)
+        => AgentToolExecutor.ReplaceFirstOrdinal(text, search, replace);
+
+    internal static async Task<bool> IsTcpPortOpenAsync(string host, int port, CancellationToken ct)
     {
-        if (!string.IsNullOrWhiteSpace(promptEvent.Prompt))
+        try
         {
-            var rawPrompt = promptEvent.Prompt.Trim();
-            var match = Regex.Match(rawPrompt, @"\[Job Context:\s*([^\]\n]+)", RegexOptions.IgnoreCase);
-            if (match.Success) return match.Groups[1].Value.Trim();
-
-            match = Regex.Match(rawPrompt, @"(?:Task|Title|Goal):\s*([^\n]+)", RegexOptions.IgnoreCase);
-            if (match.Success) return match.Groups[1].Value.Trim();
-
-            var firstLine = rawPrompt.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .FirstOrDefault(l => !l.StartsWith("[") && !l.StartsWith("#"));
-            if (!string.IsNullOrWhiteSpace(firstLine))
-            {
-                return firstLine.Length > 120 ? firstLine[..117] + "..." : firstLine;
-            }
+            using var client = new TcpClient();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(1000);
+            await client.ConnectAsync(host, port, timeout.Token);
+            return true;
         }
-        return "Autonomous Job Implementation";
+        catch
+        {
+            return false;
+        }
     }
 
-    private static int? GetPropertyInt(JsonElement root, params string[] names)
+    /// <summary>
+    /// Launches a companion daemon (per its configured command line) detached, with its stdio
+    /// discarded so a long-lived proxy cannot keep the runner's own output pipes open.
+    /// </summary>
+    internal static void StartCompanionDetached(string command)
     {
-        foreach (var name in names)
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return;
+        try
         {
-            if (root.TryGetProperty(name, out var prop) && prop.TryGetInt32(out var val))
+            // Detach at the shell level: the daemon's fds are repointed at /dev/null before exec,
+            // so it cannot hold the runner's own stdout/stderr pipes open past our exit, and the
+            // outer sh returns immediately instead of leaving us a zombie to reap.
+            var psi = new ProcessStartInfo
             {
-                return val;
+                FileName = "/bin/sh",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add($"( {command} ) </dev/null >/dev/null 2>&1 &");
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(3000);
+        }
+        catch
+        {
+            // Readiness is re-probed on the port; a failed launch surfaces as not-ready.
+        }
+    }
+
+    /// <summary>
+    /// Runs a shell check (e.g. the driver's auth verification command) and reports whether it
+    /// passed. Returns null when the check could not run or timed out — unknown, not failed.
+    /// </summary>
+    internal static async Task<bool?> RunShellCheckAsync(string command, int timeoutSeconds, CancellationToken ct)
+    {
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return null;
+        Process? proc = null;
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "/bin/sh",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("-lc");
+            psi.ArgumentList.Add(command);
+            proc = Process.Start(psi);
+            if (proc == null) return null;
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+            await proc.WaitForExitAsync(timeout.Token);
+            return proc.ExitCode == 0;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return null; // timed out — unknown, not failed; the finally reaps it
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            if (proc != null)
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                proc.Dispose();
             }
         }
-        return null;
+    }
+
+    /// <summary>
+    /// Pre-flight for the driver-companion port fronting a loopback OpenAI-compatible endpoint.
+    /// </summary>
+    /// <remarks>
+    /// Every fact here comes from the generic <see cref="DriverSidecarConfig"/> fields — command
+    /// line, port, login and auth-check commands — so no driver binary is named and any companion
+    /// that "listens on a local port, is started by a command, and is verified by a command" gets
+    /// the same treatment. Live-trajectory forensics (2026-11-15) showed persona turns burning
+    /// their retry budget against a companion that was simply not listening; a 20s pre-flight with
+    /// an actionable guidance string is cheaper than three backoffs against a dead socket, and
+    /// catches expired companion logins before they masquerade as model failures.
+    /// </remarks>
+    internal static async Task<(bool Ready, string? Guidance)> EnsureCompanionReadyAsync(
+        AgentPresetConfig preset,
+        string endpoint,
+        Func<TrajectoryEventPayload, Task> onEvent,
+        CancellationToken ct)
+    {
+        var sc = preset.Sidecar;
+        if (sc is not { Enabled: true } || sc.CompanionPort is not int companionPort)
+            return (true, null);
+
+        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri) ||
+            !(endpointUri.IsLoopback || endpointUri.Host is "localhost" or "127.0.0.1" or "::1"))
+        {
+            return (true, null); // companion fronts a remote route we cannot health-probe from here
+        }
+
+        if (await IsTcpPortOpenAsync("127.0.0.1", companionPort, ct))
+            return (true, null);
+
+        if (string.IsNullOrWhiteSpace(sc.CompanionCommand))
+        {
+            return (false,
+                $"No driver companion is listening on 127.0.0.1:{companionPort} and the driver profile sets no companion command to start it. " +
+                $"Start the daemon that serves {endpoint} before dispatching again" +
+                (!string.IsNullOrWhiteSpace(sc.LoginCommand) ? $", and verify sign-in with: {sc.LoginCommand}" : "") + ".");
+        }
+
+        await onEvent(new TrajectoryEventPayload
+        {
+            EventType = "thought",
+            Content = $"[@{preset.Id}] Driver companion is not listening on 127.0.0.1:{companionPort}. Starting it: `{sc.CompanionCommand}`..."
+        });
+
+        StartCompanionDetached(sc.CompanionCommand);
+
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        var up = false;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (await IsTcpPortOpenAsync("127.0.0.1", companionPort, ct))
+            {
+                up = true;
+                break;
+            }
+            await Task.Delay(500, ct);
+        }
+
+        if (!up)
+        {
+            return (false,
+                $"Started the driver companion (`{sc.CompanionCommand}`) but nothing came up on 127.0.0.1:{companionPort} within 20s. " +
+                "Check the companion daemon's logs on the host serving " + endpoint +
+                (!string.IsNullOrWhiteSpace(sc.AuthCheckCommand) ? $"; verify with: `{sc.AuthCheckCommand}`" : "") +
+                (!string.IsNullOrWhiteSpace(sc.LoginCommand) ? $", and sign in with: `{sc.LoginCommand}`" : "") + ".");
+        }
+
+        await onEvent(new TrajectoryEventPayload
+        {
+            EventType = "thought",
+            Content = $"[@{preset.Id}] Driver companion ready on 127.0.0.1:{companionPort}."
+        });
+
+        // Only pay the cost of an auth probe when we just (re)started the daemon — a warm companion
+        // that is mid-expiry will still fail fast with a 401, which gets its own hint below.
+        if (!string.IsNullOrWhiteSpace(sc.AuthCheckCommand))
+        {
+            var authOk = await RunShellCheckAsync(sc.AuthCheckCommand, 15, ct);
+            if (authOk == false)
+            {
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[@{preset.Id}] [Companion guard] Auth check `{sc.AuthCheckCommand}` FAILED after a cold companion start. " +
+                              (!string.IsNullOrWhiteSpace(sc.LoginCommand)
+                                  ? $"Sign in with `{sc.LoginCommand}` on the host serving {endpoint} — turns will be rejected until then."
+                                  : "The companion appears to need sign-in on the host serving the endpoint.")
+                });
+            }
+            else if (authOk == true)
+            {
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[@{preset.Id}] Companion auth check passed."
+                });
+            }
+        }
+
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Config-derived guidance for companion auth/connection failures, so hint text describes the
+    /// driver's actual commands instead of naming any particular daemon binary.
+    /// </summary>
+    internal static string? BuildCompanionAuthHint(AgentPresetConfig preset)
+    {
+        var sc = preset.Sidecar;
+        if (sc is not { Enabled: true }) return null;
+        var login = !string.IsNullOrWhiteSpace(sc.LoginCommand) ? sc.LoginCommand : preset.LoginCommand;
+        var authCheck = !string.IsNullOrWhiteSpace(sc.AuthCheckCommand) ? sc.AuthCheckCommand : preset.AuthCheckCommand;
+        if (string.IsNullOrWhiteSpace(login) && string.IsNullOrWhiteSpace(authCheck)) return null;
+        var parts = new List<string> { "The driver companion fronting this endpoint appears not to be signed in." };
+        if (!string.IsNullOrWhiteSpace(authCheck)) parts.Add($"Verify with `{authCheck}`");
+        if (!string.IsNullOrWhiteSpace(login)) parts.Add($"sign in with `{login}`");
+        return string.Join("; ", parts) + " on the host serving the endpoint, then retry.";
+    }
+
+    // ---- model-behavior profile wiring (see Core ModelBehaviorProfiles) ----
+
+    private static SamplingDialect? ParseDialectOverride(string? raw) =>
+        Enum.TryParse<SamplingDialect>(raw, ignoreCase: true, out var d) ? d : null;
+
+    private static ThinkingRoundTrip? ParseThinkingOverride(string? raw) =>
+        Enum.TryParse<ThinkingRoundTrip>(raw, ignoreCase: true, out var t) ? t : null;
+
+    internal static List<string> ApplyProfileSampling(Dictionary<string, object?> reqBody, ModelBehaviorProfile profile, string model)
+    {
+        var sent = new List<string>();
+        if (profile.Sampling == null) return sent;
+        foreach (var kvp in profile.Sampling)
+        {
+            if (!profile.MaySendSamplingKey(model, kvp.Key)) continue;
+            reqBody[kvp.Key] = kvp.Value == Math.Floor(kvp.Value) && Math.Abs(kvp.Value) < 1e15
+                ? (long)kvp.Value
+                : kvp.Value;
+            sent.Add(kvp.Key);
+        }
+        return sent;
+    }
+
+    /// <summary>
+    /// Matches endpoint parameter names against a 400 body, restricted to the keys WE added, so
+    /// learned pruning can never delete a base request field. Requires a parameter-rejection
+    /// phrase in the body to avoid mis-learning on unrelated 400s.
+    /// </summary>
+    internal static List<string> ParseRejectedRequestParameters(string errorContent, IReadOnlyCollection<string> candidateKeys)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrWhiteSpace(errorContent) || candidateKeys.Count == 0) return result;
+        var looksLikeParamRejection =
+            errorContent.Contains("unrecognized", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("unknown parameter", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("extra inputs", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("not permitted", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("additional properties", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("unexpected parameter", StringComparison.OrdinalIgnoreCase) ||
+            errorContent.Contains("unsupported parameter", StringComparison.OrdinalIgnoreCase);
+        if (!looksLikeParamRejection) return result;
+        foreach (var key in candidateKeys)
+        {
+            if (Regex.IsMatch(errorContent, $@"\b{Regex.Escape(key)}\b", RegexOptions.IgnoreCase))
+                result.Add(key);
+        }
+        return result;
+    }
+
+    internal sealed class ReasoningShapeTracker
+    {
+        public bool SawField { get; private set; }
+        public bool SawInlineTags { get; private set; }
+
+        public void NoteField() => SawField = true;
+
+        public void NoteInline(string? textChunk)
+        {
+            if (!string.IsNullOrEmpty(textChunk) &&
+                (textChunk.Contains("<think>") || textChunk.Contains("</think>")))
+            {
+                SawInlineTags = true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Round-trips the model's reasoning into assistant history per the resolved policy.
+    /// Qwen's official guidance is that stripping reasoning from multi-step tool history
+    /// measurably degrades quality, so Echo mode mirrors the inbound shape: reasoning that
+    /// arrived as a dedicated field goes back as that field; reasoning that stayed inline in
+    /// content needs no action (it is already there). Inline re-embedding is tag-balanced or
+    /// skipped — an unclosed think block corrupts every later turn's rendering.
+    /// </summary>
+    internal static void MaybeAttachReasoningToHistory(
+        OpenAiMessage assistantMessage,
+        string reasoningText,
+        ReasoningShapeTracker shape,
+        ModelBehaviorProfile profile,
+        string model)
+    {
+        if (string.IsNullOrWhiteSpace(reasoningText)) return;
+        var mode = profile.ThinkingRoundTripMode;
+        if (mode == ThinkingRoundTrip.Off) return;
+
+        var rejected = ModelBehaviorProfiles.IsReasoningFieldRejected(model);
+        var useField = mode switch
+        {
+            ThinkingRoundTrip.Field => !rejected,
+            ThinkingRoundTrip.Inline => false,
+            _ => shape.SawField && !rejected,
+        };
+
+        if (useField)
+        {
+            assistantMessage.ReasoningContent = reasoningText.Trim();
+            return;
+        }
+
+        // Inline: forced mode, or Echo downgraded after the endpoint rejected the field —
+        // which is the vendor's documented workaround verbatim ("pass the content as it is").
+        var safe = ModelBehaviorProfiles.SanitizeInlineThinking(reasoningText);
+        if (safe == null) return;
+        var content = assistantMessage.Content;
+        if (content != null && (content.Contains("<think>") || content.Contains("</think>"))) return; // already inline
+        assistantMessage.Content = $"<think>\n{safe}\n</think>\n\n" + (content ?? "");
     }
 
     private static void ParseOpenAiChunkOrMessage(
@@ -2701,7 +2671,8 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
         SortedDictionary<int, (string? Id, StringBuilder Name, StringBuilder Args)> toolCallsByIndex,
         ref long totalInputTokens,
         ref long totalOutputTokens,
-        ref long totalTokens)
+        ref long totalTokens,
+        ReasoningShapeTracker? shape = null)
     {
         // Check usage in chunk/message
         if (root.TryGetProperty("usage", out var usageElem) && usageElem.ValueKind == JsonValueKind.Object)
@@ -2727,6 +2698,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!string.IsNullOrEmpty(textChunk))
             {
                 contentBuilder.Append(textChunk);
+                shape?.NoteInline(textChunk);
             }
         }
         else if (choice.TryGetProperty("text", out var tProp) && tProp.ValueKind == JsonValueKind.String)
@@ -2735,6 +2707,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!string.IsNullOrEmpty(textChunk))
             {
                 contentBuilder.Append(textChunk);
+                shape?.NoteInline(textChunk);
             }
         }
 
@@ -2749,6 +2722,7 @@ public class OpenAiAdapter : IAgentAdapter, IDescribesOwnCapabilities
             if (!string.IsNullOrEmpty(reasoningChunk))
             {
                 reasoningBuilder.Append(reasoningChunk);
+                shape?.NoteField();
             }
         }
 
@@ -2800,6 +2774,15 @@ public class OpenAiMessage
     [JsonIgnore]
     public List<object>? ContentParts { get; set; }
 
+    /// <summary>
+    /// The model's own reasoning, round-tripped in assistant history per the resolved
+    /// <see cref="ThinkingRoundTrip"/> policy. Emitted only when set — servers that never
+    /// separated reasoning will never see this field.
+    /// </summary>
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; set; }
+
     [JsonPropertyName("tool_call_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ToolCallId { get; set; }
@@ -2821,6 +2804,7 @@ public class OpenAiMessage
     {
         Role = Role,
         Content = Content,
+        ReasoningContent = ReasoningContent,
         ContentParts = ContentParts,
         ToolCallId = ToolCallId,
         ToolCalls = ToolCalls,
@@ -2838,6 +2822,7 @@ public class OpenAiMessage
             dict["content"] = Content;
         }
         if (!string.IsNullOrEmpty(ToolCallId)) dict["tool_call_id"] = ToolCallId;
+        if (ReasoningContent != null) dict["reasoning_content"] = ReasoningContent;
         if (ToolCalls != null && ToolCalls.Count > 0)
         {
             dict["tool_calls"] = ToolCalls.Select(tc => new

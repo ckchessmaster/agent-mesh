@@ -37,7 +37,9 @@ public class DriverCapabilityProbeTests : IDisposable
         TimeSpan? ttl = null,
         TimeSpan? negativeTtl = null,
         int maxConcurrent = 2,
-        Func<string, CancellationToken, Task<string?>>? copilotLister = null)
+        Func<string, CancellationToken, Task<string?>>? copilotLister = null,
+        Func<DriverCapabilityProbeRequest, string?>? copilotTokenResolver = null,
+        Func<string, string?, CancellationToken, Task<string?>>? openRouterFetcher = null)
         => new(
             () => ttl ?? TimeSpan.FromMinutes(10),
             () => negativeTtl ?? TimeSpan.FromMinutes(2),
@@ -45,7 +47,19 @@ public class DriverCapabilityProbeTests : IDisposable
             cliRunner ?? ((_, _, _, _) => Task.FromResult<string?>(SampleAgyModels)),
             lister,
             maxConcurrent,
-            copilotLister);
+            copilotLister,
+            // Defaults to "this machine has no Copilot credentials on it", because that is the state the
+            // Copilot tests are written against and it is not what a signed-in developer laptop is. The
+            // production resolver reads ~/.copilot, ~/.config/github-copilot and GH_TOKEN before the
+            // probe decides whether it can call out at all, so without this default a test asking for the
+            // static preset silently gets whatever this host happens to be authenticated against, and
+            // passes or fails depending on who ran it. A test that wants a token passes one explicitly via
+            // Copilot(oauthToken: ...); wanting the preset means not passing one.
+            copilotTokenResolver ??
+            (request => CopilotCredentialHelper.IsSupportedCopilotToken(request.OAuthToken)
+                ? request.OAuthToken!.Trim()
+                : null),
+            openRouterFetcher);
 
     private static DriverCapabilityProbeRequest Agy(
         string id = "agy",
@@ -1390,12 +1404,48 @@ public class DriverCapabilityProbeTests : IDisposable
     [Fact]
     public async Task Copilot_WhenUnauthenticated_ReturnsStaticPreset()
     {
-        var reading = await Probe().ProbeAsync(Copilot(oauthToken: null));
+        // "Unauthenticated" has to mean the outbound call was never attempted — not that it was attempted
+        // and happened to fail, which a fallback would paper over. This test used to run against whatever
+        // GitHub credentials the machine had, because credential discovery ran before the probe decided
+        // whether it could call out at all: it passed on a clean runner and failed on a signed-in laptop.
+        var outboundCalls = 0;
+        var probe = Probe(copilotLister: (_, _) =>
+        {
+            outboundCalls++;
+            return Task.FromResult<string?>("""{"data":[{"id":"gpt-5-probe-leak"}]}""");
+        });
+
+        var reading = await probe.ProbeAsync(Copilot(oauthToken: null));
 
         reading.Should().NotBeNull();
         reading!.ModelSource.Should().Be(CapabilitySourceKind.StaticPreset);
         reading.Models.Select(m => m.Id).Should().Contain(new[] { "auto", "claude-3.7-sonnet", "gpt-4o" });
+        reading.Models.Select(m => m.Id).Should().NotContain("gpt-5-probe-leak");
         reading.SupportsContextSelection.Should().BeTrue();
+        outboundCalls.Should().Be(0, "a probe with no token must not reach the network");
+    }
+
+    /// <summary>
+    /// The host's own credentials are a fact about the machine, not about the driver being probed.
+    /// </summary>
+    /// <remarks>
+    /// Production discovery deliberately still consults <c>~/.copilot</c>, <c>~/.config/github-copilot</c>
+    /// and <c>GH_TOKEN</c>: on the API host that is how a shared-credential deployment gets a real model
+    /// list. What it must not be is an input a unit test inherits. This pins both halves — the default
+    /// resolver in <c>Probe()</c> ignores the host, and the production resolver is still the one the
+    /// public constructor wires up.
+    /// </remarks>
+    [Fact]
+    public async Task Copilot_HostCredentialsAreNotConsultedWhenTheTestResolverIsSilent()
+    {
+        var hostToken = DriverCapabilityProbe.ResolveCopilotToken(Copilot(oauthToken: null));
+
+        var reading = await Probe().ProbeAsync(Copilot(oauthToken: null));
+
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.StaticPreset,
+            hostToken is null
+                ? "no token exists here, and the preset is the answer either way"
+                : "this host is signed in to Copilot, which the preset tests must not inherit");
     }
 
     [Fact]
@@ -1483,5 +1533,120 @@ public class DriverCapabilityProbeTests : IDisposable
         models[1].Id.Should().Be("o3-mini");
         models[1].Name.Should().Be("OpenAI o3-mini");
         models[1].ContextSizes.Should().Equal("default", "long_context", "128k", "200k", "1m");
+    }
+
+    [Fact]
+    public async Task OpenRouter_ProbesModelsWithEffortsPricingAndContextSizes()
+    {
+        const string openRouterModelsJson = """
+        {
+          "data": [
+            {
+              "id": "anthropic/claude-sonnet-4",
+              "name": "Claude Sonnet 4",
+              "context_length": 200000,
+              "supported_parameters": ["tools", "reasoning"],
+              "architecture": { "output_modalities": ["text"] },
+              "pricing": { "prompt": "0.000003", "completion": "0.000015" }
+            },
+            {
+              "id": "meta-llama/llama-3.3-70b-instruct:free",
+              "name": "Llama 3.3 70B Free",
+              "context_length": 131072,
+              "supported_parameters": ["tools"],
+              "architecture": { "output_modalities": ["text"] },
+              "pricing": { "prompt": "0", "completion": "0" }
+            }
+          ]
+        }
+        """;
+
+        string? requestedEndpoint = null;
+        string? requestedKey = null;
+        var probe = Probe(openRouterFetcher: (ep, key, _) =>
+        {
+            requestedEndpoint = ep;
+            requestedKey = key;
+            return Task.FromResult<string?>(openRouterModelsJson);
+        });
+
+        var reading = await probe.ProbeAsync(new DriverCapabilityProbeRequest(
+            DriverId: "openrouter",
+            RuntimeType: RuntimeType.OpenRouter,
+            Adapter: "openrouter",
+            Endpoint: null,
+            ApiKey: "sk-or-probe"));
+
+        requestedEndpoint.Should().Be("https://openrouter.ai/api/v1");
+        requestedKey.Should().Be("sk-or-probe");
+        reading.Should().NotBeNull();
+        reading!.Adapter.Should().Be(DriverAdapters.OpenRouter);
+        reading.ModelSource.Should().Be(CapabilitySourceKind.Probed);
+        reading.SupportsContextSelection.Should().BeTrue();
+        reading.Models.Select(m => m.Id).Should().Equal(
+            "openrouter/auto",
+            "anthropic/claude-sonnet-4",
+            "meta-llama/llama-3.3-70b-instruct:free");
+
+        var claude = reading.Models.Single(m => m.Id == "anthropic/claude-sonnet-4");
+        claude.Efforts.Should().Equal("none", "minimal", "low", "medium", "high", "xhigh", "max");
+        claude.MaxContextTokens.Should().Be(200_000);
+        claude.PromptPricePerMillion.Should().BeApproximately(3.0, 0.0001);
+        claude.CompletionPricePerMillion.Should().BeApproximately(15.0, 0.0001);
+        claude.ContextSizes.Should().Contain("128k").And.NotContain("500k");
+
+        reading.Models.Single(m => m.Id == "meta-llama/llama-3.3-70b-instruct:free").Efforts.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task OpenRouter_Unavailable_CacheKeyAndDeclarationBinding_TreatNullAsDefaultEndpoint()
+    {
+        var unavail = await Probe(openRouterFetcher: (_, _, _) => Task.FromResult<string?>(null))
+            .ProbeAsync(new DriverCapabilityProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", null));
+        unavail!.ModelSource.Should().Be(CapabilitySourceKind.Unavailable);
+
+        DriverCapabilityProbe.BuildCacheKey(
+            DriverAdapters.OpenRouter,
+            new DriverCapabilityProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", null))
+            .Should().Be(DriverCapabilityProbe.BuildCacheKey(
+                DriverAdapters.OpenRouter,
+                new DriverCapabilityProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", "https://openrouter.ai/api/v1/")));
+
+        DriverCapabilityProbe.NormalizeAdapter(
+            new DriverCapabilityProbeRequest("custom", RuntimeType.CliAgy, null, "https://openrouter.ai/api/v1"))
+            .Should().Be(DriverAdapters.OpenRouter);
+
+        var declared = new DriverCapabilityDeclaration
+        {
+            Adapter = DriverAdapters.OpenRouter,
+            Endpoint = "https://openrouter.ai/api/v1",
+            SupportsContextSelection = true,
+            ObservedAt = DateTimeOffset.UtcNow,
+            Models = new[]
+            {
+                new DriverCapabilityDeclaration.DeclaredModel
+                {
+                    Id = "anthropic/claude-sonnet-4",
+                    Name = "Claude Sonnet 4",
+                    Efforts = new[] { "low", "high" },
+                    MaxContextTokens = 200_000,
+                    PromptPricePerMillion = 3.0,
+                    CompletionPricePerMillion = 15.0
+                }
+            }
+        };
+
+        var reading = await Probe().ProbeAsync(new DriverCapabilityProbeRequest(
+            DriverId: "openrouter",
+            RuntimeType: RuntimeType.OpenRouter,
+            Adapter: "openrouter",
+            Endpoint: null,
+            Declared: declared));
+
+        reading!.ModelSource.Should().Be(CapabilitySourceKind.Declared);
+        var model = reading.Models.Single();
+        model.MaxContextTokens.Should().Be(200_000);
+        model.PromptPricePerMillion.Should().Be(3.0);
+        model.CompletionPricePerMillion.Should().Be(15.0);
     }
 }

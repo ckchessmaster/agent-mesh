@@ -90,6 +90,14 @@ public class AgentJobConfiguration : IEntityTypeConfiguration<AgentJob>
             .HasColumnName("target_branch")
             .HasMaxLength(128);
 
+        builder.Property(j => j.InitialPrompt)
+            .HasColumnName("initial_prompt")
+            .HasColumnType("text");
+
+        builder.Property(j => j.MessageText)
+            .HasColumnName("message_text")
+            .HasColumnType("text");
+
         builder.Property(j => j.CreatedAt)
             .HasDefaultValueSql("CURRENT_TIMESTAMP")
             .IsRequired();

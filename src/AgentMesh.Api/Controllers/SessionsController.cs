@@ -25,7 +25,8 @@ public class SessionsController(
     IHubContext<AgentMeshHub> hubContext,
     IStorageService? storageService = null,
     IWorkflowSignalRouter? workflows = null,
-    ILogger<SessionsController>? logger = null) : ControllerBase
+    ILogger<SessionsController>? logger = null,
+    ICredentialEncryptionService? encryptionService = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -419,6 +420,60 @@ public class SessionsController(
         return (pid, metaName, metaRole, metaPrompt);
     }
 
+    private async Task BroadcastSessionPromptReceivedAsync(
+        AgentSession session,
+        SessionMessage message,
+        string targetAgentId,
+        string? workingDirectory,
+        string? model,
+        string? effort,
+        string? mode,
+        string? tier,
+        string? contextSize,
+        object? attachments)
+    {
+        var normalizedDriver = targetAgentId.Trim().ToLowerInvariant();
+        var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
+        var mcpServers = !string.IsNullOrWhiteSpace(personaId)
+            ? await PersonaMcpResolver.ResolveForPersonaAsync(db, personaId, encryptionService)
+            : null;
+        var conversationId = ExtractSessionConversationId(session.MetadataJson);
+
+        object BuildPayload(List<ResolvedMcpServerConfig>? servers) => new
+        {
+            sessionId = session.Id,
+            messageId = message.Id,
+            agentId = normalizedDriver,
+            driverId = normalizedDriver,
+            personaId,
+            personaName,
+            personaRole,
+            personaPrompt,
+            prompt = message.Content,
+            sender = message.SenderAgentId,
+            workingDirectory,
+            model,
+            effort,
+            mode,
+            tier,
+            contextSize,
+            attachments,
+            mcpServers = servers,
+            conversationId,
+            createdAt = message.CreatedAt
+        };
+
+        var targetedPayload = BuildPayload(mcpServers);
+        var broadcastPayload = BuildPayload(null);
+
+        await hubContext.Clients.Group($"agent-{normalizedDriver}").SendAsync("PromptReceived", targetedPayload);
+        if (!string.IsNullOrWhiteSpace(personaId))
+        {
+            await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", targetedPayload);
+        }
+        await hubContext.Clients.All.SendAsync("PromptReceived", broadcastPayload);
+    }
+
     public static (string? workingDirectory, string? model, string? effort, string? mode, string? tier) ExtractSessionSettings(string? metadataJson)
     {
         if (string.IsNullOrWhiteSpace(metadataJson)) return (null, null, null, null, null);
@@ -511,22 +566,26 @@ public class SessionsController(
 
             if (hasUsage)
             {
-                var input = usageElem.TryGetProperty("inputTokens", out var ip) ? ip.GetInt64() : 0;
-                var output = usageElem.TryGetProperty("outputTokens", out var op) ? op.GetInt64() : 0;
-                var thinking = usageElem.TryGetProperty("thinkingTokens", out var tp) ? tp.GetInt64() : 0;
-                var total = usageElem.TryGetProperty("totalTokens", out var totp) ? totp.GetInt64() : (input + output);
-                var duration = usageElem.TryGetProperty("durationSeconds", out var dp) ? dp.GetDouble() : 0.0;
+                var input = usageElem.TryGetProperty("inputTokens", out var ip) && ip.TryGetInt64(out var iv) ? iv : 0;
+                var output = usageElem.TryGetProperty("outputTokens", out var op) && op.TryGetInt64(out var ov) ? ov : 0;
+                var thinking = usageElem.TryGetProperty("thinkingTokens", out var tp) && tp.TryGetInt64(out var tv) ? tv : 0;
+                var cached = usageElem.TryGetProperty("cachedTokens", out var cp) && cp.TryGetInt64(out var cv) ? cv : 0;
+                var total = usageElem.TryGetProperty("totalTokens", out var totp) && totp.TryGetInt64(out var totv) ? totv : (input + output);
+                var duration = usageElem.TryGetProperty("durationSeconds", out var dp) && dp.TryGetDouble(out var dv) ? dv : 0.0;
+                var cost = usageElem.TryGetProperty("costUsd", out var costp) && costp.TryGetDouble(out var costv) ? costv : 0.0;
 
-                long existingInput = 0, existingOutput = 0, existingThinking = 0, existingTotal = 0;
-                double existingDuration = 0.0;
+                long existingInput = 0, existingOutput = 0, existingThinking = 0, existingCached = 0, existingTotal = 0;
+                double existingDuration = 0.0, existingCost = 0.0;
 
                 if (dict.TryGetValue("cumulativeUsage", out var existingUsageObj) && existingUsageObj is System.Text.Json.JsonElement existingElem)
                 {
-                    if (existingElem.TryGetProperty("inputTokens", out var ei)) existingInput = ei.GetInt64();
-                    if (existingElem.TryGetProperty("outputTokens", out var eo)) existingOutput = eo.GetInt64();
-                    if (existingElem.TryGetProperty("thinkingTokens", out var et)) existingThinking = et.GetInt64();
-                    if (existingElem.TryGetProperty("totalTokens", out var etot)) existingTotal = etot.GetInt64();
-                    if (existingElem.TryGetProperty("totalDurationSeconds", out var ed)) existingDuration = ed.GetDouble();
+                    if (existingElem.TryGetProperty("inputTokens", out var ei) && ei.TryGetInt64(out var eiv)) existingInput = eiv;
+                    if (existingElem.TryGetProperty("outputTokens", out var eo) && eo.TryGetInt64(out var eov)) existingOutput = eov;
+                    if (existingElem.TryGetProperty("thinkingTokens", out var et) && et.TryGetInt64(out var etv)) existingThinking = etv;
+                    if (existingElem.TryGetProperty("cachedTokens", out var ec) && ec.TryGetInt64(out var ecv)) existingCached = ecv;
+                    if (existingElem.TryGetProperty("totalTokens", out var etot) && etot.TryGetInt64(out var etotv)) existingTotal = etotv;
+                    if (existingElem.TryGetProperty("totalDurationSeconds", out var ed) && ed.TryGetDouble(out var edv)) existingDuration = edv;
+                    if (existingElem.TryGetProperty("costUsd", out var ecost) && ecost.TryGetDouble(out var ecostv)) existingCost = ecostv;
                 }
 
                 dict["cumulativeUsage"] = new
@@ -534,8 +593,10 @@ public class SessionsController(
                     inputTokens = existingInput + input,
                     outputTokens = existingOutput + output,
                     thinkingTokens = existingThinking + thinking,
+                    cachedTokens = existingCached + cached,
                     totalTokens = existingTotal + total,
-                    totalDurationSeconds = existingDuration + duration
+                    totalDurationSeconds = existingDuration + duration,
+                    costUsd = Math.Round(existingCost + cost, 8)
                 };
             }
 
@@ -943,12 +1004,15 @@ public class SessionsController(
 
         var callerAgentId = !string.IsNullOrWhiteSpace(req.DriverId)
             ? req.DriverId.Trim().ToLowerInvariant()
-            : !string.IsNullOrWhiteSpace(req.CreatorAgentId)
-                ? req.CreatorAgentId.Trim().ToLowerInvariant()
-                : persona?.DriverId
-                  ?? User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
-                  ?? User?.FindFirst("AgentId")?.Value
-                  ?? "agy";
+            : (persona != null && (string.IsNullOrWhiteSpace(req.CreatorAgentId) ||
+                                   string.Equals(req.CreatorAgentId.Trim(), persona.Id, StringComparison.OrdinalIgnoreCase))
+                ? persona.DriverId.Trim().ToLowerInvariant()
+                : (!string.IsNullOrWhiteSpace(req.CreatorAgentId)
+                    ? req.CreatorAgentId.Trim().ToLowerInvariant()
+                    : persona?.DriverId
+                      ?? User?.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                      ?? User?.FindFirst("AgentId")?.Value
+                      ?? "agy"));
 
         var effectiveWorkDir = !string.IsNullOrWhiteSpace(req.WorkingDirectory) ? req.WorkingDirectory : null;
         var effectiveModel = !string.IsNullOrWhiteSpace(req.Model) ? req.Model : persona?.DefaultModel;
@@ -1020,36 +1084,8 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{callerAgentId}";
-            var promptPayload = new
-            {
-                sessionId = session.Id,
-                messageId = initialMsg.Id,
-                agentId = callerAgentId,
-                driverId = callerAgentId,
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = initialMsg.Content,
-                sender = initialMsg.SenderAgentId,
-                workingDirectory = workDir,
-                model = model,
-                effort = effort,
-                mode = mode,
-                tier = tier,
-                contextSize = contextSize,
-                attachments = req.Attachments,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = initialMsg.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session, initialMsg, callerAgentId, workDir, model, effort, mode, tier, contextSize, req.Attachments);
         }
 
         return CreatedAtAction(nameof(GetSession), new { id = session.Id }, session);
@@ -1377,36 +1413,9 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{message.TargetAgentId.Trim().ToLowerInvariant()}";
-            var promptPayload = new
-            {
-                sessionId = id,
-                messageId = message.Id,
-                agentId = message.TargetAgentId.Trim().ToLowerInvariant(),
-                driverId = message.TargetAgentId.Trim().ToLowerInvariant(),
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = message.Content,
-                sender = message.SenderAgentId,
-                workingDirectory = workDir,
-                model = model,
-                effort = effort,
-                mode = mode,
-                tier = tier,
-                contextSize = contextSize,
-                attachments = messageAttachments.Count > 0 ? messageAttachments : null,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = message.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session, message, message.TargetAgentId, workDir, model, effort, mode, tier, contextSize,
+                messageAttachments.Count > 0 ? messageAttachments : null);
         }
         else if (eventType == "response")
         {
@@ -1459,38 +1468,19 @@ public class SessionsController(
 
                     var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
                     var contextSize = ExtractSessionContextSize(session.MetadataJson);
-                    var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
                     if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
                     {
-                        var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                        var promptPayload = new
-                        {
-                            sessionId = id,
-                            messageId = nextMsg.Id,
-                            agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                            driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                            personaId = personaId,
-                            personaName = personaName,
-                            personaRole = personaRole,
-                            personaPrompt = personaPrompt,
-                            prompt = nextMsg.Content,
-                            sender = nextMsg.SenderAgentId,
-                            workingDirectory = nextPrompt.WorkingDirectory ?? workDir,
-                            model = nextPrompt.Model ?? model,
-                            effort = nextPrompt.Effort ?? effort,
-                            mode = nextPrompt.Mode ?? mode,
-                            tier = nextPrompt.Tier ?? tier,
-                            contextSize = nextPrompt.ContextSize ?? contextSize,
-                            attachments = nextPrompt.Attachments,
-                            conversationId = ExtractSessionConversationId(session.MetadataJson),
-                            createdAt = nextMsg.CreatedAt
-                        };
-                        await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                        if (!string.IsNullOrWhiteSpace(personaId))
-                        {
-                            await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-                        }
-                        await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                        await BroadcastSessionPromptReceivedAsync(
+                            session,
+                            nextMsg,
+                            session.CreatorAgentId,
+                            nextPrompt.WorkingDirectory ?? workDir,
+                            nextPrompt.Model ?? model,
+                            nextPrompt.Effort ?? effort,
+                            nextPrompt.Mode ?? mode,
+                            nextPrompt.Tier ?? tier,
+                            nextPrompt.ContextSize ?? contextSize,
+                            nextPrompt.Attachments);
                     }
                 }
                 else
@@ -1501,7 +1491,7 @@ public class SessionsController(
 
                     if (!string.IsNullOrWhiteSpace(session.PersonaId))
                     {
-                        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+                        await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId, encryptionService);
                     }
                 }
             }
@@ -1631,7 +1621,7 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(session.PersonaId))
         {
-            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId, encryptionService);
         }
 
         var auditDto = ToMessageDto(auditMsg);
@@ -1693,7 +1683,7 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(session.PersonaId))
         {
-            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId);
+            await ProjectJobsController.CheckAndDispatchQueuedJobTurnsAsync(db, hubContext, session.PersonaId, encryptionService);
         }
 
         var auditDto = ToMessageDto(auditMsg);
@@ -1813,36 +1803,17 @@ public class SessionsController(
 
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
-                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-                var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                var promptPayload = new
-                {
-                    sessionId = id,
-                    messageId = msg.Id,
-                    agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    personaId = personaId,
-                    personaName = personaName,
-                    personaRole = personaRole,
-                    personaPrompt = personaPrompt,
-                    prompt = msg.Content,
-                    sender = msg.SenderAgentId,
-                    workingDirectory = req.WorkingDirectory ?? workDir,
-                    model = req.Model ?? model,
-                    effort = req.Effort ?? effort,
-                    mode = req.Mode ?? mode,
-                    tier = req.Tier ?? tier,
-                    contextSize = req.ContextSize ?? contextSize,
-                    attachments = req.Attachments,
-                    conversationId = ExtractSessionConversationId(session.MetadataJson),
-                    createdAt = msg.CreatedAt
-                };
-                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                if (!string.IsNullOrWhiteSpace(personaId))
-                {
-                    await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-                }
-                await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                await BroadcastSessionPromptReceivedAsync(
+                    session,
+                    msg,
+                    session.CreatorAgentId,
+                    req.WorkingDirectory ?? workDir,
+                    req.Model ?? model,
+                    req.Effort ?? effort,
+                    req.Mode ?? mode,
+                    req.Tier ?? tier,
+                    req.ContextSize ?? contextSize,
+                    req.Attachments);
             }
 
             return Ok(new { session, queue, dispatched = true });
@@ -1877,36 +1848,17 @@ public class SessionsController(
 
             if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
             {
-                var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-                var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-                var promptPayload = new
-                {
-                    sessionId = id,
-                    messageId = msg.Id,
-                    agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                    personaId = personaId,
-                    personaName = personaName,
-                    personaRole = personaRole,
-                    personaPrompt = personaPrompt,
-                    prompt = msg.Content,
-                    sender = msg.SenderAgentId,
-                    workingDirectory = req.WorkingDirectory ?? workDir,
-                    model = req.Model ?? model,
-                    effort = req.Effort ?? effort,
-                    mode = req.Mode ?? mode,
-                    tier = req.Tier ?? tier,
-                    contextSize = req.ContextSize ?? contextSize,
-                    attachments = req.Attachments,
-                    conversationId = ExtractSessionConversationId(session.MetadataJson),
-                    createdAt = msg.CreatedAt
-                };
-                await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-                if (!string.IsNullOrWhiteSpace(personaId))
-                {
-                    await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-                }
-                await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+                await BroadcastSessionPromptReceivedAsync(
+                    session,
+                    msg,
+                    session.CreatorAgentId,
+                    req.WorkingDirectory ?? workDir,
+                    req.Model ?? model,
+                    req.Effort ?? effort,
+                    req.Mode ?? mode,
+                    req.Tier ?? tier,
+                    req.ContextSize ?? contextSize,
+                    req.Attachments);
             }
 
             return Ok(new { session, queue, dispatched = true });
@@ -2016,36 +1968,17 @@ public class SessionsController(
 
         if (!string.IsNullOrWhiteSpace(session.CreatorAgentId))
         {
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            var promptPayload = new
-            {
-                sessionId = id,
-                messageId = msg.Id,
-                agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = msg.Content,
-                sender = msg.SenderAgentId,
-                workingDirectory = item.WorkingDirectory ?? workDir,
-                model = item.Model ?? model,
-                effort = item.Effort ?? effort,
-                mode = item.Mode ?? mode,
-                tier = item.Tier ?? tier,
-                contextSize = item.ContextSize ?? contextSize,
-                attachments = item.Attachments,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = msg.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session,
+                msg,
+                session.CreatorAgentId,
+                item.WorkingDirectory ?? workDir,
+                item.Model ?? model,
+                item.Effort ?? effort,
+                item.Mode ?? mode,
+                item.Tier ?? tier,
+                item.ContextSize ?? contextSize,
+                item.Attachments);
         }
 
         return Ok(new { session, queue, dispatched = true });
@@ -2168,42 +2101,55 @@ public class SessionsController(
                         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
                         if (job != null)
                         {
-                            var answerMsg = new JobMessage
+                            var now = DateTimeOffset.UtcNow;
+                            var answerContent = $"User answered question:\n{answerSummary}";
+
+                            // The cockpit's Discovery Q&A card renders `questions` (each with the options it
+                            // offered) and `answers` keyed by question id — the contract TimelineActivities
+                            // writes. This card is written on a different path, and until now it carried only
+                            // the answer array: the questions the operator had just answered on screen were
+                            // never put on the job's own card, so the timeline showed an empty Q&A card for a
+                            // question that was answered in the session chat. Recover what was asked from the
+                            // tool call that asked it, so both surfaces agree.
+                            var askedPayload = await db.SessionMessages
+                                .AsNoTracking()
+                                .Where(m => m.SessionId == id &&
+                                            m.EventType == "tool_call" &&
+                                            m.ToolName == AskQuestionPayload.ToolName)
+                                .OrderByDescending(m => m.CreatedAt)
+                                .Select(m => m.ToolArgsJson)
+                                .FirstOrDefaultAsync();
+
+                            var (cardQuestions, cardAnswers) = ShapeDiscoveryCard(askedPayload, req.Answers);
+
+                            var answerCard = new JobTimelineCard
                             {
                                 Id = Guid.NewGuid(),
-                                JobId = jobId,
-                                SenderType = "user",
-                                SenderId = senderId,
-                                SenderName = "You",
-                                Content = $"User answered question:\n{answerSummary}",
-                                MentionsJson = "[]",
-                                TurnSessionId = session.Id,
+                                JobId = jobId.ToString(),
+                                TaskId = job.CurrentTaskId,
+                                CardType = TimelineCardType.DiscoveryQa,
+                                Status = TimelineCardStatus.Approved,
+                                Title = "Question Answered",
                                 StructuredPayloadJson = JsonSerializer.Serialize(new
                                 {
+                                    content = answerContent,
+                                    senderId = senderId,
+                                    turnSessionId = session.Id,
                                     toolCallId = req.ToolCallId,
-                                    answers = req.Answers,
+                                    summary = answerSummary,
+                                    questions = cardQuestions,
+                                    answers = cardAnswers,
                                     toolName = "ask_question"
                                 }, JsonOptions),
-                                CreatedAt = DateTimeOffset.UtcNow
+                                CreatedAt = now,
+                                UpdatedAt = now
                             };
-                            db.JobMessages.Add(answerMsg);
-                            job.UpdatedAt = DateTimeOffset.UtcNow;
+                            db.JobTimelineCards.Add(answerCard);
+                            job.UpdatedAt = now;
                             await db.SaveChangesAsync();
 
-                            var answerDto = new JobMessageDto(
-                                answerMsg.Id,
-                                answerMsg.JobId,
-                                answerMsg.SenderType,
-                                answerMsg.SenderId,
-                                answerMsg.SenderName,
-                                answerMsg.Content,
-                                new List<string>(),
-                                answerMsg.TurnSessionId,
-                                answerMsg.StructuredPayloadJson,
-                                answerMsg.CreatedAt
-                            );
-
-                            await hubContext.Clients.All.SendAsync("JobMessageAdded", answerDto);
+                            await hubContext.Clients.Group($"job-{jobId}")
+                                .SendAsync("ReceiveTimelineCardUpdated", answerCard);
 
                             if (isJobDrivenByWorkflow && workflows is not null)
                             {
@@ -2211,9 +2157,9 @@ public class SessionsController(
                                     jobId,
                                     new Core.Workflows.ChatMessageSignal(
                                         SenderId: senderId,
-                                        Content: answerMsg.Content,
-                                        Timestamp: answerMsg.CreatedAt,
-                                        MessageId: answerMsg.Id.ToString()),
+                                        Content: answerContent,
+                                        Timestamp: answerCard.CreatedAt,
+                                        MessageId: answerCard.Id.ToString()),
                                     HttpContext.RequestAborted);
 
                                 logger?.LogInformation(
@@ -2234,35 +2180,17 @@ public class SessionsController(
         {
             var (workDir, model, effort, mode, tier) = ExtractSessionSettings(session.MetadataJson);
             var contextSize = ExtractSessionContextSize(session.MetadataJson);
-            var (personaId, personaName, personaRole, personaPrompt) = await ResolveSessionPersonaAsync(session);
-            var targetGroup = $"agent-{session.CreatorAgentId.Trim().ToLowerInvariant()}";
-            var promptPayload = new
-            {
-                sessionId = id,
-                messageId = promptMsg.Id,
-                agentId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                driverId = session.CreatorAgentId.Trim().ToLowerInvariant(),
-                personaId = personaId,
-                personaName = personaName,
-                personaRole = personaRole,
-                personaPrompt = personaPrompt,
-                prompt = promptMsg.Content,
-                sender = promptMsg.SenderAgentId,
-                workingDirectory = workDir,
-                model = model,
-                effort = effort,
-                mode = mode,
-                tier = tier,
-                contextSize = contextSize,
-                conversationId = ExtractSessionConversationId(session.MetadataJson),
-                createdAt = promptMsg.CreatedAt
-            };
-            await hubContext.Clients.Group(targetGroup).SendAsync("PromptReceived", promptPayload);
-            if (!string.IsNullOrWhiteSpace(personaId))
-            {
-                await hubContext.Clients.Group($"persona-{personaId.Trim().ToLowerInvariant()}").SendAsync("PromptReceived", promptPayload);
-            }
-            await hubContext.Clients.All.SendAsync("PromptReceived", promptPayload);
+            await BroadcastSessionPromptReceivedAsync(
+                session,
+                promptMsg,
+                session.CreatorAgentId,
+                workDir,
+                model,
+                effort,
+                mode,
+                tier,
+                contextSize,
+                attachments: null);
         }
 
         return Ok(new { toolResult = toolResultDto, prompt = promptDto, session });
@@ -2845,58 +2773,82 @@ public class SessionsController(
             var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == jobId);
             if (job == null) return;
 
-            var alreadyPosted = await db.JobMessages.AnyAsync(m => m.JobId == jobId && m.TurnSessionId == session.Id && m.Content == responseMessage.Content);
+            var existingCards = await db.JobTimelineCards
+                .AsNoTracking()
+                .Where(c => c.JobId == jobIdStr)
+                .OrderByDescending(c => c.CreatedAt)
+                .Take(20)
+                .ToListAsync();
+
+            var alreadyPosted = existingCards.Any(c =>
+            {
+                try
+                {
+                    using var payloadDoc = JsonDocument.Parse(c.StructuredPayloadJson);
+                    var r = payloadDoc.RootElement;
+                    if (r.ValueKind != JsonValueKind.Object) return false;
+                    var sid = r.TryGetProperty("turnSessionId", out var sp) ? sp.GetString() : null;
+                    var cnt = r.TryGetProperty("content", out var cp) ? cp.GetString() : null;
+                    return sid == session.Id.ToString() && cnt == responseMessage.Content;
+                }
+                catch { return false; }
+            });
             if (alreadyPosted) return;
 
             var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
+            var authorPersonaId = pId ?? session.PersonaId ?? session.DriverId ?? "agent";
 
             var matches = Regex.Matches(responseMessage.Content, @"@([a-zA-Z0-9_\-]+)");
             var mentions = matches.Select(m => m.Groups[1].Value.ToLowerInvariant()).Distinct().ToList();
 
-            var jobMsg = new JobMessage
+            var now = DateTimeOffset.UtcNow;
+            var responseCard = new JobTimelineCard
             {
                 Id = Guid.NewGuid(),
-                JobId = jobId,
-                SenderType = "persona",
-                SenderId = pId ?? session.PersonaId,
-                SenderName = pName ?? session.PersonaId,
-                Content = responseMessage.Content,
-                MentionsJson = JsonSerializer.Serialize(mentions, JsonOptions),
-                TurnSessionId = session.Id,
-                CreatedAt = DateTimeOffset.UtcNow
+                JobId = jobIdStr,
+                TaskId = job.CurrentTaskId,
+                CardType = mentions.Count > 0 ? TimelineCardType.InternalConsultation : TimelineCardType.TaskStep,
+                Status = TimelineCardStatus.Active,
+                Title = $"Turn update (@{authorPersonaId})",
+                StructuredPayloadJson = JsonSerializer.Serialize(new
+                {
+                    content = responseMessage.Content,
+                    senderPersona = authorPersonaId,
+                    authorPersonaId = authorPersonaId,
+                    senderName = pName ?? authorPersonaId,
+                    driverId = session.DriverId,
+                    turnSessionId = session.Id,
+                    mentions = mentions,
+                    source = "session_response"
+                }, JsonOptions),
+                CreatedAt = now,
+                UpdatedAt = now
             };
 
-            db.JobMessages.Add(jobMsg);
-            job.UpdatedAt = DateTimeOffset.UtcNow;
+            db.JobTimelineCards.Add(responseCard);
+            job.UpdatedAt = now;
             await db.SaveChangesAsync();
 
-            var msgDto = new JobMessageDto(
-                jobMsg.Id,
-                jobMsg.JobId,
-                jobMsg.SenderType,
-                jobMsg.SenderId,
-                jobMsg.SenderName,
-                jobMsg.Content,
-                mentions,
-                jobMsg.TurnSessionId,
-                jobMsg.StructuredPayloadJson,
-                jobMsg.CreatedAt
-            );
-
-            await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
+            await hubContext.Clients.Group($"job-{jobId}")
+                .SendAsync("ReceiveTimelineCardUpdated", responseCard);
 
             // Autonomous Handoff & Progress Checkpoint Continuation Check
             var isCheckpointRollover = responseMessage.Content.Contains("Progress Checkpoint") ||
                                        responseMessage.Content.Contains("Continuing to next turn autonomously");
 
-            var recentMessages = await db.JobMessages
-                .AsNoTracking()
-                .Where(m => m.JobId == jobId)
-                .OrderByDescending(m => m.CreatedAt)
-                .Take(20)
-                .ToListAsync();
-
-            var consecutivePersonaCount = recentMessages.TakeWhile(m => m.SenderType == "persona").Count();
+            var consecutivePersonaCount = 1 + existingCards.TakeWhile(c =>
+            {
+                try
+                {
+                    using var payloadDoc = JsonDocument.Parse(c.StructuredPayloadJson);
+                    var r = payloadDoc.RootElement;
+                    return r.ValueKind == JsonValueKind.Object &&
+                           r.TryGetProperty("authorPersonaId", out var ap) &&
+                           !string.IsNullOrWhiteSpace(ap.GetString()) &&
+                           !string.Equals(ap.GetString(), "operator", StringComparison.OrdinalIgnoreCase);
+                }
+                catch { return false; }
+            }).Count();
             var maxAllowedHops = isCheckpointRollover ? 50 : 5;
             if (consecutivePersonaCount < maxAllowedHops)
             {
@@ -2925,8 +2877,8 @@ public class SessionsController(
                                 new Core.Workflows.ChatMessageSignal(
                                     SenderId: pId ?? "agent",
                                     Content: responseMessage.Content,
-                                    Timestamp: jobMsg.CreatedAt,
-                                    MessageId: jobMsg.Id.ToString(),
+                                    Timestamp: responseCard.CreatedAt,
+                                    MessageId: responseCard.Id.ToString(),
                                     TargetPersonaIds: [nextPersonaId]));
                         }
 
@@ -3129,48 +3081,144 @@ public class SessionsController(
             if (job == null) return;
 
             var payload = questionMessage.ToolArgsJson ?? questionMessage.StructuredPayloadJson;
-            var alreadyPosted = await db.JobMessages.AnyAsync(m => m.JobId == jobId && m.TurnSessionId == session.Id && m.StructuredPayloadJson == payload);
+            var existingQuestionCards = await db.JobTimelineCards
+                .AsNoTracking()
+                .Where(c => c.JobId == jobIdStr && c.CardType == TimelineCardType.Escalation3R)
+                .Select(c => c.StructuredPayloadJson)
+                .ToListAsync();
+
+            var alreadyPosted = existingQuestionCards.Any(p =>
+            {
+                try
+                {
+                    using var pDoc = JsonDocument.Parse(p);
+                    var r = pDoc.RootElement;
+                    if (r.ValueKind != JsonValueKind.Object) return false;
+                    var sid = r.TryGetProperty("turnSessionId", out var sp) ? sp.GetString() : null;
+                    var raw = r.TryGetProperty("rawQuestionPayload", out var rp) ? rp.GetString() : null;
+                    return sid == session.Id.ToString() && raw == payload;
+                }
+                catch { return false; }
+            });
             if (alreadyPosted) return;
 
             var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
+            var authorPersonaId = pId ?? session.PersonaId ?? session.DriverId ?? "agent";
 
             var (content, normalizedPayload) = ProcessJobTurnQuestionPayload(payload, questionMessage.Content);
+            var now = DateTimeOffset.UtcNow;
 
-            var jobMsg = new JobMessage
+            var questionCard = new JobTimelineCard
             {
                 Id = Guid.NewGuid(),
-                JobId = jobId,
-                SenderType = "persona",
-                SenderId = pId ?? session.PersonaId,
-                SenderName = pName ?? session.PersonaId,
-                Content = content,
-                MentionsJson = "[]",
-                TurnSessionId = session.Id,
-                StructuredPayloadJson = normalizedPayload,
-                CreatedAt = DateTimeOffset.UtcNow
+                JobId = jobIdStr,
+                TaskId = job.CurrentTaskId,
+                CardType = TimelineCardType.Escalation3R,
+                Status = TimelineCardStatus.PendingInput,
+                Title = $"Question from @{authorPersonaId}",
+                StructuredPayloadJson = JsonSerializer.Serialize(new
+                {
+                    content = content,
+                    requiresReply = true,
+                    targetPersona = "operator",
+                    senderPersona = authorPersonaId,
+                    authorPersonaId = authorPersonaId,
+                    senderName = pName ?? authorPersonaId,
+                    driverId = session.DriverId,
+                    turnSessionId = session.Id,
+                    rawQuestionPayload = payload,
+                    normalizedQuestionPayload = normalizedPayload,
+                    source = "session_question"
+                }, JsonOptions),
+                CreatedAt = now,
+                UpdatedAt = now
             };
 
-            db.JobMessages.Add(jobMsg);
-            job.UpdatedAt = DateTimeOffset.UtcNow;
+            db.JobTimelineCards.Add(questionCard);
+            job.UpdatedAt = now;
             await db.SaveChangesAsync();
 
-            var msgDto = new JobMessageDto(
-                jobMsg.Id,
-                jobMsg.JobId,
-                jobMsg.SenderType,
-                jobMsg.SenderId,
-                jobMsg.SenderName,
-                jobMsg.Content,
-                new List<string>(),
-                jobMsg.TurnSessionId,
-                jobMsg.StructuredPayloadJson,
-                jobMsg.CreatedAt
-            );
-
-            await hubContext.Clients.All.SendAsync("JobMessageAdded", msgDto);
-            await hubContext.Clients.All.SendAsync("JobMessageCreated", msgDto);
+            await hubContext.Clients.Group($"job-{jobId}")
+                .SendAsync("ReceiveTimelineCardUpdated", questionCard);
         }
         catch { }
+    }
+
+    /// <summary>
+    /// Shapes "what the agent asked" and "what the operator picked" into the contract the cockpit's
+    /// Discovery Q&amp;A card renders.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The answer request carries the question text and the choices taken, but never the choices that were
+    /// on offer, and a card without those cannot show what the operator did not pick. So the question set is
+    /// read back from the <c>ask_question</c> tool call that produced it, through
+    /// <see cref="AskQuestionPayload"/> — the same reader the worker uses, which is what lets an Antigravity
+    /// <c>{"questions":"[...]"}</c> call be understood on both surfaces instead of one.
+    /// </para>
+    /// <para>
+    /// Pairing is by question text first and position second, then nothing: an answer whose question cannot
+    /// be recovered still appears on the card (with no options), because losing an answer the operator gave
+    /// is worse than a card that cannot show the alternatives that were declined.
+    /// </para>
+    /// </remarks>
+    private static (List<Core.Workflows.DiscoveryQuestion> Questions, Dictionary<string, string> Answers) ShapeDiscoveryCard(
+        string? askedPayload,
+        List<QuestionAnswerDto>? answers)
+    {
+        var asked = AskQuestionPayload.Parse(askedPayload);
+        var taken = new bool[asked.Count];
+        var questions = new List<Core.Workflows.DiscoveryQuestion>();
+        var answersById = new Dictionary<string, string>();
+
+        void Add(string text, AskQuestion? source, string answer)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            var id = $"q_{questions.Count + 1}";
+            var options = source?.Options is { Count: > 0 } ? source.Options : null;
+            questions.Add(new Core.Workflows.DiscoveryQuestion(id, text.Trim(), options));
+            answersById[id] = string.IsNullOrWhiteSpace(answer) ? "User skipped" : answer;
+        }
+
+        foreach (var answer in answers ?? [])
+        {
+            if (answer is null) continue;
+            var text = answer.Question?.Trim() ?? string.Empty;
+
+            var index = -1;
+            for (var i = 0; i < asked.Count; i++)
+            {
+                if (!taken[i] && string.Equals(asked[i].Question, text, StringComparison.OrdinalIgnoreCase))
+                {
+                    index = i;
+                    break;
+                }
+            }
+
+            if (index < 0 && answer.QuestionIndex >= 0 && answer.QuestionIndex < asked.Count && !taken[answer.QuestionIndex])
+            {
+                index = answer.QuestionIndex;
+            }
+
+            if (index >= 0) taken[index] = true;
+
+            var parts = new List<string>();
+            if (answer.SelectedOptions is { Count: > 0 }) parts.Add(string.Join(", ", answer.SelectedOptions));
+            if (!string.IsNullOrWhiteSpace(answer.CustomText)) parts.Add(answer.CustomText.Trim());
+
+            Add(text.Length > 0 ? text : (index >= 0 ? asked[index].Question : string.Empty),
+                index >= 0 ? asked[index] : null,
+                parts.Count > 0 ? string.Join("; ", parts) : "User skipped");
+        }
+
+        // A question the operator left unanswered is still a question the agent asked; the card has to say
+        // so rather than quietly shrink.
+        for (var i = 0; i < asked.Count; i++)
+        {
+            if (!taken[i]) Add(asked[i].Question, asked[i], "User skipped");
+        }
+
+        return (questions, answersById);
     }
 
     private static (string formattedContent, string normalizedPayload) ProcessJobTurnQuestionPayload(

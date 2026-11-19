@@ -36,9 +36,15 @@ public sealed record PlatformCallContext(
     string? GitRemoteUrl,
     string? GitBaseBranch,
     string? WorkspaceDirectory,
-    string? TaskId = null)
+    string? TaskId = null,
+    string? DriverId = null,
+    string DriverIdSource = "unresolved")
 {
-    public bool HasIdentity => !string.IsNullOrWhiteSpace(AgentId) || !string.IsNullOrWhiteSpace(PersonaId);
+    public bool HasIdentity =>
+        !string.IsNullOrWhiteSpace(PersonaId) ||
+        !string.IsNullOrWhiteSpace(DriverId) ||
+        !string.IsNullOrWhiteSpace(AgentId);
+
     public bool IsDiscoveryPhase => TaskId == "stage-1-discovery";
 }
 
@@ -82,6 +88,7 @@ public class PlatformCallContextResolver(
     ILogger<PlatformCallContextResolver>? logger = null) : IPlatformCallContextResolver
 {
     public const string PersonaIdHeader = "X-Persona-Id";
+    public const string DriverIdHeader = "X-Driver-Id";
     public const string JobIdHeader = "X-Job-Id";
     public const string AgentIdHeader = "X-Agent-Id";
     public const string SessionIdHeader = "X-Session-Id";
@@ -121,6 +128,7 @@ public class PlatformCallContextResolver(
         }
 
         var (personaId, personaSource) = ResolvePersonaId(context, session);
+        var (driverId, driverSource) = await ResolveDriverIdAsync(context, session, personaId, agentId, agentSource, ct);
 
         // The turn session is the only trustworthy link to a job: it was created by the control
         // plane for one. An explicit header is accepted for out-of-band callers (the Cockpit, a
@@ -172,7 +180,9 @@ public class PlatformCallContextResolver(
             GitRemoteUrl: gitRemote,
             GitBaseBranch: gitBase,
             WorkspaceDirectory: jobId is not null ? ResolveWorkspaceDirectory(jobId.Value) : null,
-            TaskId: taskId);
+            TaskId: taskId,
+            DriverId: driverId,
+            DriverIdSource: driverSource);
     }
 
     private static (string? Value, string Source) ResolveAgentId(HttpContext? context)
@@ -189,20 +199,70 @@ public class PlatformCallContextResolver(
         return (null, "unauthenticated");
     }
 
-    private static (string? Value, string Source) ResolvePersonaId(HttpContext? context, AgentSession? session)
+    private (string? Value, string Source) ResolvePersonaId(HttpContext? context, AgentSession? session)
     {
         if (!string.IsNullOrWhiteSpace(session?.PersonaId))
         {
             return (Normalize(session.PersonaId), "session:personaId");
         }
 
+        var metadataPersona = ReadMetadataString(session?.MetadataJson, "personaId");
+        if (!string.IsNullOrWhiteSpace(metadataPersona))
+        {
+            return (Normalize(metadataPersona), "session:metadata:personaId");
+        }
+
         var header = context?.Request.Headers.TryGetValue(PersonaIdHeader, out var h) == true ? h.ToString() : null;
         if (!string.IsNullOrWhiteSpace(header)) return (Normalize(header), $"header:{PersonaIdHeader}");
+
+        var claimPersona = context?.User?.Identity?.IsAuthenticated == true
+            ? context.User.FindFirst("PersonaId")?.Value ?? context.User.FindFirst("persona_id")?.Value
+            : null;
+        if (!string.IsNullOrWhiteSpace(claimPersona)) return (Normalize(claimPersona), "claim:persona-id");
 
         // A driver running without a persona is still an identity; the caller can address it by
         // agent id, so report the agent id as the persona rather than reporting nothing.
         var (agentId, agentSource) = ResolveAgentId(context);
         return (agentId, agentId is null ? "unresolved" : $"fallback:{agentSource}");
+    }
+
+    private async Task<(string? Value, string Source)> ResolveDriverIdAsync(
+        HttpContext? context,
+        AgentSession? session,
+        string? personaId,
+        string? agentId,
+        string agentSource,
+        CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(session?.DriverId))
+        {
+            return (Normalize(session.DriverId), "session:driverId");
+        }
+
+        var header = context?.Request.Headers.TryGetValue(DriverIdHeader, out var h) == true ? h.ToString() : null;
+        if (!string.IsNullOrWhiteSpace(header))
+        {
+            return (Normalize(header), $"header:{DriverIdHeader}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(agentId))
+        {
+            return (agentId, agentSource);
+        }
+
+        if (!string.IsNullOrWhiteSpace(personaId))
+        {
+            var personaDriver = await db.Personas.AsNoTracking()
+                .Where(p => p.Id == personaId)
+                .Select(p => p.DriverId)
+                .FirstOrDefaultAsync(ct);
+            if (!string.IsNullOrWhiteSpace(personaDriver))
+            {
+                return (Normalize(personaDriver), "persona:driverId");
+            }
+        }
+
+        return (null, "unresolved");
     }
 
     private static (Guid? Value, string Source) ResolveSessionId(HttpContext? context)

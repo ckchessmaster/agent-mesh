@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Text.Json;
 using AgentMesh.Cli.Adapters;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Enums;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 using FluentAssertions;
 
@@ -194,6 +197,149 @@ public class AgyAdapterArgumentTests
         finally
         {
             if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public void ReadNewThoughtsFromTranscript_ReadsIncrementalThoughtsAndResolvesTruncatedFields()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "agy-thoughts-test-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        var transcriptPath = Path.Combine(tempDir, "transcript.jsonl");
+        var fullPath = Path.Combine(tempDir, "transcript_full.jsonl");
+
+        try
+        {
+            File.WriteAllLines(transcriptPath, new[]
+            {
+                """{"step_index":1,"type":"USER_INPUT","content":"hello"}""",
+                """{"step_index":2,"type":"PLANNER_RESPONSE","thinking":"First thought"}""",
+                """{"step_index":3,"type":"PLANNER_RESPONSE","thinking":"Truncated...","truncated_fields":["thinking"]}""",
+                """{"step_index":4,"type":"PLANNER_RESPONSE","thinking":null}"""
+            });
+            File.WriteAllLines(fullPath, new[]
+            {
+                """{"step_index":3,"type":"PLANNER_RESPONSE","thinking":"Full untruncated reasoning from transcript_full"}"""
+            });
+
+            var lastThoughtStep = 1;
+            var batch1 = AgyAdapter.ReadNewThoughtsFromTranscript(transcriptPath, ref lastThoughtStep);
+
+            batch1.Should().HaveCount(2);
+            batch1[0].Should().Be((2, "First thought"));
+            batch1[1].Should().Be((3, "Full untruncated reasoning from transcript_full"));
+            lastThoughtStep.Should().Be(3);
+
+            File.AppendAllLines(transcriptPath, new[]
+            {
+                """{"step_index":5,"type":"PLANNER_RESPONSE","thinking":"Next step thought"}"""
+            });
+
+            var batch2 = AgyAdapter.ReadNewThoughtsFromTranscript(transcriptPath, ref lastThoughtStep);
+            batch2.Should().ContainSingle().Which.Should().Be((5, "Next step thought"));
+            lastThoughtStep.Should().Be(5);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FormatAgyToolSummary_FormatsCommandsFilesTasksAndSubagents()
+    {
+        using var cmdDoc = System.Text.Json.JsonDocument.Parse("""{"CommandLine":"git status -sb","toolSummary":"Check git status"}""");
+        AgyAdapter.FormatAgyToolSummary("run_command", cmdDoc.RootElement)
+            .Should().Be("Running command (Check git status): git status -sb");
+
+        using var readDoc = System.Text.Json.JsonDocument.Parse("""{"AbsolutePath":"/workspace/src/App.tsx","StartLine":10,"EndLine":50}""");
+        AgyAdapter.FormatAgyToolSummary("read_file", readDoc.RootElement)
+            .Should().Be("Inspecting file: App.tsx (lines 10-50)");
+
+        using var editDoc = System.Text.Json.JsonDocument.Parse("""{"TargetFile":"/workspace/src/AgentAdapters.cs"}""");
+        AgyAdapter.FormatAgyToolSummary("edit_file", editDoc.RootElement)
+            .Should().Be("Modifying file: AgentAdapters.cs");
+
+        using var taskDoc = System.Text.Json.JsonDocument.Parse("""{"Action":"update_status","TaskId":"task-1"}""");
+        AgyAdapter.FormatAgyToolSummary("manage_task", taskDoc.RootElement)
+            .Should().Be("Managing task: update_status (task-1)");
+
+        using var subDoc = System.Text.Json.JsonDocument.Parse("""{"Role":"Codebase Researcher","TypeName":"research"}""");
+        AgyAdapter.FormatAgyToolSummary("invoke_subagent", subDoc.RootElement)
+            .Should().Be("Invoking subagent: Codebase Researcher");
+    }
+
+    [Fact]
+    public async Task ExecutePromptAsync_WithMcpServers_StagesAndRestoresAgyMcpConfigWithoutLeakingSecrets()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"agy-mcp-e2e-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var fakeHome = Path.Combine(tempRoot, "home");
+        Directory.CreateDirectory(fakeHome);
+        var capturedConfigPath = Path.Combine(tempRoot, "captured-mcp-config.json");
+        var fakeAgy = Path.Combine(tempRoot, "fake-agy.sh");
+
+        var mcpConfigPath = Path.Combine(fakeHome, ".gemini", "config", "mcp_config.json");
+        var script = $$$"""
+            #!/usr/bin/env bash
+            cp "{{{mcpConfigPath}}}" "{{{capturedConfigPath}}}"
+            echo '{"event":"init","conversation_id":"conv-mcp-1"}'
+            echo '{"event":"result","result":{"response":"Agy saw MCP config."}}'
+            """;
+        await File.WriteAllTextAsync(fakeAgy, script);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(fakeAgy, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        try
+        {
+            AgyAdapter.HomeDirectoryForTest = fakeHome;
+            var adapter = new AgyAdapter();
+            var preset = new AgentPresetConfig { Id = "agy-mcp", AdapterType = "agy", Command = fakeAgy };
+            var promptEvent = new PromptReceivedEvent
+            {
+                SessionId = Guid.NewGuid(),
+                WorkingDirectory = tempRoot,
+                Prompt = "Check docs",
+                McpServers =
+                [
+                    new ResolvedMcpServerConfig
+                    {
+                        Id = "context7",
+                        Name = "Context7",
+                        Transport = McpTransportType.Http,
+                        Url = "https://mcp.context7.com/mcp",
+                        Headers = new Dictionary<string, string> { ["Authorization"] = "Bearer agy_e2e_secret" },
+                        AllowedTools = ["query-docs"]
+                    }
+                ]
+            };
+
+            var events = new List<TrajectoryEventPayload>();
+            await adapter.ExecutePromptAsync(preset, promptEvent, ev =>
+            {
+                events.Add(ev);
+                return Task.CompletedTask;
+            }, CancellationToken.None);
+
+            File.Exists(capturedConfigPath).Should().BeTrue();
+            File.Exists(mcpConfigPath).Should().BeFalse("ephemeral mcp_config.json must be cleaned up after agy exits");
+
+            using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(capturedConfigPath));
+            var ctx = doc.RootElement.GetProperty("mcpServers").GetProperty("context7");
+            ctx.GetProperty("serverUrl").GetString().Should().Be("https://mcp.context7.com/mcp");
+            ctx.GetProperty("headers").GetProperty("Authorization").GetString().Should().Be("Bearer agy_e2e_secret");
+            ctx.GetProperty("enabledTools").EnumerateArray().Select(e => e.GetString()).Should().Equal("query-docs");
+
+            events.Should().Contain(e => e.EventType == "thought" && e.Content.Contains("Provisioned 1 MCP server(s) for agy"));
+            events.Should().Contain(e => e.EventType == "response" && e.Content == "Agy saw MCP config.");
+            string.Join("\n", events.Select(e => e.Content)).Should().NotContain("agy_e2e_secret");
+        }
+        finally
+        {
+            AgyAdapter.HomeDirectoryForTest = null;
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
         }
     }
 }

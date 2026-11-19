@@ -34,4 +34,7 @@ public class Persona
 
     [JsonIgnore]
     public ICollection<ProjectPersona> ProjectPersonas { get; set; } = new List<ProjectPersona>();
+
+    [JsonIgnore]
+    public ICollection<PersonaMcpServer> PersonaMcpServers { get; set; } = new List<PersonaMcpServer>();
 }

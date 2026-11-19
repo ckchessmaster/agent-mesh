@@ -59,6 +59,71 @@ public interface IGitHubPullRequestService
         string? baseRef,
         string? repositoryOverride = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Reads a pull request's state and the review decisions recorded against it on GitHub.
+    /// </summary>
+    /// <remarks>
+    /// The pull half of the review loop. The gate could previously be released only through the
+    /// platform's two review endpoints, so a reviewer who approved (or requested changes) on the
+    /// GitHub PR page was never heard from. This read is what lets a poller observe that decision and
+    /// deliver it as the same <c>PrReviewSignal</c> the endpoints send; the verdict policy itself
+    /// (latest review per reviewer counts, an approval binds to the commit it saw, the PR author
+    /// cannot be the second pair of eyes) lives in the caller so it can be tested without HTTP.
+    /// See <c>GitHubPullRequestService.Reviews.cs</c> for why the repository is resolved
+    /// URL-first here, unlike the merge path.
+    /// <para>
+    /// <paramref name="tokenOverride"/> reads with an explicit credential (the author persona's PAT,
+    /// which the review poller resolves per job) before consulting deployment configuration. The
+    /// PR's own author can always read its reviews — the account that opened it is a natural reader —
+    /// and a deployment whose control plane holds no token otherwise could never poll at all.
+    /// </para>
+    /// </remarks>
+    Task<GitHubPrReviewSnapshot> ReadPullRequestReviewStateAsync(
+        string prUrlOrNumber,
+        string? repositoryOverride = null,
+        string? tokenOverride = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Reads what CI has decided about a pull request's head commit.
+    /// </summary>
+    /// <remarks>
+    /// The other half of the loop the review read opened. A gate parked on a red build used to be a
+    /// persona that had stopped working and a human who had to notice; this lets the poller report the
+    /// failure as the request-changes review it functionally is, so the author is sent back to fix it.
+    /// <para>
+    /// Like the review read, this returns evidence and never a verdict. Deciding that a
+    /// <c>queued</c> run is not a failure, that a re-run that passed supersedes the attempt that failed,
+    /// and that a failure the current park already acted on must not fire again is policy, and it lives
+    /// with the rest of the gate's policy so it can be tested without HTTP.
+    /// </para>
+    /// <para>
+    /// <paramref name="headShaOverride"/> asks about a specific commit for a caller that already read
+    /// the pull request this tick. It exists to save a second GET, not to skip the head binding: passing
+    /// a stale SHA is how a fixed build gets reported broken again.
+    /// </para>
+    /// <para>
+    /// A failed read must never be presented as a green commit. Callers act on this only when
+    /// <c>Success</c> is true, and a <c>Success</c> result with no checks means the repository reported
+    /// no CI for this commit, which is a real answer and not a licence to halt.
+    /// </para>
+    /// <para>
+    /// The default reports "this implementation does not read CI" rather than an empty successful
+    /// snapshot, and that distinction is the whole point: a caller that treats an unread result as
+    /// green would halt nothing, and one that treats it as red would halt a build nobody looked at. The
+    /// poller only acts on <c>Success</c>, so a stub or a future non-GitHub implementation stays inert
+    /// by default instead of having to remember to say so.
+    /// </para>
+    /// </remarks>
+    Task<GitHubCiSnapshot> ReadPullRequestCiStateAsync(
+        string prUrlOrNumber,
+        string? repositoryOverride = null,
+        string? tokenOverride = null,
+        string? headShaOverride = null,
+        CancellationToken ct = default) =>
+        Task.FromResult(GitHubCiSnapshot.Failure("not_supported",
+            "This pull request service does not read CI state."));
 }
 
 /// <summary>Which merge strategy GitHub should apply.</summary>
@@ -92,13 +157,24 @@ public enum GitHubMergeMethod
 /// GitHub reject the merge if the author pushed since the approval — the check that stops an
 /// unreviewed commit from riding an earlier approval into the base branch.
 /// </param>
+/// <param name="Token">
+/// An explicit credential to merge with, winning over <c>GitHub:Token</c> and the App triple.
+/// The worker merges with the job's <em>author persona</em> PAT (the same credential its container
+/// opened the PR with), which is how a deployment where no control-plane token exists — every GitHub
+/// identity is a persona's — still merges through the platform rather than through an agent turn.
+/// GitHub permits an author to merge its own PR; what the two-man rule gates is the approval, and
+/// that stays a human/operator decision recorded out-of-band. A request-supplied token is the
+/// caller's declared identity for exactly this, and it must never be logged: the same redaction the
+/// push URL gets applies to it.
+/// </param>
 public record GitHubMergeRequest(
     string PrUrlOrNumber,
     string? Repository = null,
     GitHubMergeMethod Method = GitHubMergeMethod.Squash,
     string? CommitTitle = null,
     string? CommitMessage = null,
-    string? Sha = null);
+    string? Sha = null,
+    string? Token = null);
 
 /// <summary>The outcome of a merge attempt.</summary>
 /// <param name="AlreadyMerged">
@@ -106,9 +182,21 @@ public record GitHubMergeRequest(
 /// so the caller can tell a fresh merge from an idempotent replay without parsing the message.
 /// </param>
 /// <param name="FailureReason">
-/// Machine-readable cause (<c>no_credentials</c>, <c>not_found</c>, <c>not_mergeable</c>,
-/// <c>sha_mismatch</c>, <c>api_error</c>) so the workflow can distinguish "the reviewer changed the
-/// PR and it now conflicts" from "GitHub was briefly unreachable".
+/// Machine-readable cause (<c>no_credentials</c>, <c>not_found</c>, <c>pr_closed</c>,
+/// <c>merge_conflict</c>, <c>sha_moved</c>, <c>not_mergeable</c>, <c>api_error</c>) so the workflow can
+/// distinguish "the reviewer changed the PR", "the branch now conflicts with main" and "GitHub was
+/// briefly unreachable". The three route differently: a conflict is work an agent can do, a moved head
+/// invalidates an approval, and an API error is a retry.
+/// <para>
+/// <strong>Why <c>merge_conflict</c> and <c>sha_moved</c> are separate codes.</strong> GitHub answers
+/// both with HTTP 409, and the previous single <c>sha_mismatch</c> code conflated them — its own message
+/// admitted it ("the head commit changed since the reviewed state, <em>or the branch now conflicts with
+/// the base</em>"). They need opposite handling under the job-level review loop: a conflict means "merge
+/// main into the branch and resolve it", which is a task; a moved head means the code the reviewer
+/// signed off is gone, which must go back to a human, because auto-generating a task for it would merge
+/// unreviewed work. A conflated code makes the orchestrator guess, and either guess is wrong half the
+/// time.
+/// </para>
 /// </param>
 public record GitHubMergeResult(
     bool Success,
@@ -217,9 +305,6 @@ public partial class GitHubPullRequestService(
     ILogger<GitHubPullRequestService> logger,
     Func<GitCommandRequest, CancellationToken, Task<GitCommandResult>>? gitRunner = null) : IGitHubPullRequestService
 {
-    /// <summary>The number handed back when there are no credentials to open a real PR with.</summary>
-    public const int SimulatedPrNumber = 999;
-
     public const string HttpClientName = "agentmesh-github";
 
     private const int DefaultPushTimeoutSeconds = 120;
@@ -315,25 +400,26 @@ public partial class GitHubPullRequestService(
 
         var (owner, repo) = ResolveRepository(request, options);
 
-        // No credentials and no target repository: this is the local-Aspire path. Say so plainly
-        // and do not touch git — a developer's working copy is not a job workspace, and pushing it
-        // would be a destructive surprise in exchange for a PR nobody asked GitHub for.
+        // Simulated PR #999 path is permanently retired: missing control-plane credentials return a real
+        // refusal directing the persona container to execute `agentmesh pr open` with its own credentials.
         if (string.IsNullOrWhiteSpace(token))
         {
             logger.LogWarning(
-                "open_pull_request running WITHOUT credentials: simulated PR #{PrNumber} for '{Branch}'. " +
-                "Set GitHub:Token (or a persona GitHub token) to open a real pull request.",
-                SimulatedPrNumber, headBranch);
+                "open_pull_request refused WITHOUT credentials for '{Branch}': simulated PRs are disabled. " +
+                "Run 'agentmesh pr open' in the persona container or configure GitHub:Token.",
+                headBranch);
 
             return new GitHubPullRequestResult(
-                Success: true,
-                PrNumber: SimulatedPrNumber,
-                PrUrl: $"https://github.com/{owner ?? "your-org"}/{repo ?? "your-repo"}/pull/{SimulatedPrNumber}",
+                Success: false,
+                PrNumber: null,
+                PrUrl: null,
                 HeadBranch: headBranch,
                 BaseBranch: baseBranch,
-                Message: $"Simulated PR #{SimulatedPrNumber} (no GitHub token configured, so nothing was pushed " +
-                         "and no review was requested). Configure GitHub:Token to open a real pull request.",
-                Simulated: true);
+                Message: "No GitHub token is configured on the control plane (simulated PRs are disabled). " +
+                         "Run `agentmesh pr open` inside your persona container (which holds your persona GitHub credentials) " +
+                         "to sync main, push the branch, create the real PR, and register its URL/number.",
+                Simulated: false,
+                FailureReason: "no_credentials");
         }
 
         if (owner is null || repo is null)
@@ -470,14 +556,31 @@ public partial class GitHubPullRequestService(
                 "GitHub:Repository is not configured, and the pull request reference is a bare number.");
         }
 
-        var token = await ResolveTokenAsync(options, ct);
+        // An explicit request token wins over the deployment's own credentials: the worker merges as
+        // the job's author persona (whose PAT opened the PR), and a deployment whose only GitHub
+        // identities are persona accounts has no control-plane token to find. The refusal below names
+        // both possibilities because "who was supposed to sign this merge" is the first question an
+        // operator faces when a job halts on no_credentials.
+        var token = !string.IsNullOrWhiteSpace(request.Token) ? request.Token.Trim() : null;
+        var tokenSource = token is not null ? "request-supplied credential" : null;
+        if (token is null)
+        {
+            token = await ResolveTokenAsync(options, ct);
+            tokenSource = string.IsNullOrWhiteSpace(token) ? null : "configured credential";
+        }
+
         if (string.IsNullOrWhiteSpace(token))
         {
             return MergeFailure("no_credentials",
-                "No GitHub credentials are configured (GitHub:Token, or the App id/key/installation " +
-                "triple). A merge is never simulated: reporting success here would mark the task " +
-                "complete while the work sits unmerged on its branch.");
+                "No GitHub credentials available for this merge: the request carried no explicit " +
+                "token (no author-persona PAT was resolved for the job), the job's persona may have no " +
+                "GitHub token stored, and no deployment credential is configured (GitHub:Token, or the " +
+                "App id/key/installation triple). A merge is never simulated: reporting success here " +
+                "would mark the task complete while the work sits unmerged on its branch.");
         }
+
+        logger.LogInformation("Merging {Owner}/{Repo}#{Pr} with {TokenSource}.",
+            target.Owner, target.Repo, prNumber, tokenSource);
 
         // ── Pre-read: distinguish "already merged" from "not mergeable" ───────────
         var getState = await SendAsync(
@@ -499,6 +602,12 @@ public partial class GitHubPullRequestService(
         }
 
         var (state, headSha, mergedSha) = TryReadPullRequestState(getBody);
+
+        // Read the mergeability fields in the same pass over the body we already hold. GitHub computes
+        // them asynchronously, so `mergeable` can be null while it works; a null therefore means "the
+        // pre-read settled nothing", and the 409 classifier below falls back to other facts rather than
+        // treating unknown as clean.
+        var (preReadMergeable, preReadMergeableState) = TryReadMergeability(getBody);
 
         if (string.Equals(state, "merged", StringComparison.OrdinalIgnoreCase))
         {
@@ -579,15 +688,104 @@ public partial class GitHubPullRequestService(
                 MergeCommitSha: commitSha);
         }
 
-        // 409 with a sha we sent means the head moved after approval — the guard doing its job, not a
-        // transient error. Naming it separately stops the workflow's retry policy from hammering a
-        // merge that will never succeed without a fresh review.
+        // A 409 is not one condition, and the review loop routes its two halves in opposite
+        // directions, so classify it from facts we can establish rather than returning one code for
+        // both. The previous `sha_mismatch` conflated them and its own message said so ("the head
+        // commit changed since the reviewed state, or the branch now conflicts with the base").
+        //
+        //   head moved after approval  -> `sha_moved`      -> a human must re-review. Auto-generating
+        //                                                  work here would merge code nobody signed off.
+        //   branch behind/conflicting  -> `merge_conflict` -> an agent can fix it: merge main into the
+        //                                                  branch. Fed back as a task, like a comment.
         if (mergeResponse.StatusCode == System.Net.HttpStatusCode.Conflict)
         {
-            return MergeFailure("sha_mismatch",
-                $"GitHub refused to merge pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}: " +
-                "the head commit changed since the reviewed state, or the branch now conflicts with the base. " +
-                "A re-review is required.", mergeBody, token);
+            var approvedSha = request.Sha?.Trim();
+            var pr = prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            // Provable first, GitHub's prose second: an approval-SHA that no longer matches the head we
+            // just read is unambiguous, and it outranks a conflict because the approval is already void.
+            // Written as nested conditions rather than one hoisted boolean so the compiler keeps the
+            // non-null narrowing for both SHAs inside the message.
+            if (!string.IsNullOrWhiteSpace(approvedSha) && !string.IsNullOrWhiteSpace(headSha) &&
+                !string.Equals(approvedSha, headSha, StringComparison.OrdinalIgnoreCase))
+            {
+                return MergeFailure("sha_moved",
+                    $"Pull request #{pr} head is {Truncate(headSha, 12)}, not the approved {Truncate(approvedSha, 12)}: " +
+                    "the author pushed after the review, so the approval no longer covers what is on the " +
+                    "branch. A re-review is required.", mergeBody, token);
+            }
+
+            // `dirty` = conflicting files, `behind` = no conflicts but the base has moved. Both are
+            // agent-fixable by the same action (merge the base in), and `behind` arrives with
+            // `mergeable: true`, so a mergeable-only check would misroute the commonest case — a PR
+            // whose approval is perfectly intact and which merely needs main merged into it — to a
+            // human re-review that has nothing new to review.
+            //
+            // `blocked` is deliberately absent: under branch protection it usually means failing
+            // required checks or a missing approving review, which merging main does not fix, and
+            // `unknown`/null means GitHub is still computing.
+            var needsBaseMerge = preReadMergeableState is "dirty" or "behind";
+            var conflicts = preReadMergeable == false || needsBaseMerge;
+
+            if (conflicts)
+            {
+                var remedy = string.Equals(preReadMergeableState, "behind", StringComparison.OrdinalIgnoreCase)
+                    ? "the base branch has moved ahead of it: merge the current base into the head branch, " +
+                      "then request a re-review of the resulting head"
+                    : "files conflict with the base branch: merge the current base into the head branch, " +
+                      "resolve the conflicts, then request a re-review";
+
+                return MergeFailure("merge_conflict",
+                    $"Pull request #{pr} cannot merge because {remedy} (GitHub reports " +
+                    $"'{preReadMergeableState ?? "not mergeable"}').", mergeBody, token);
+            }
+
+            // The pre-read settled nothing (mergeable is null while GitHub recomputes, or the body was
+            // unreadable), so fall back to what GitHub actually said. Its two 409 shapes are distinct
+            // prose and each names its own remedy, which is a better signal than inferring a cause from
+            // whether the caller happened to supply an approval SHA.
+            var saidOutOfDate = mergeBody.Contains("out of date", StringComparison.OrdinalIgnoreCase) ||
+                                mergeBody.Contains("conflict", StringComparison.OrdinalIgnoreCase);
+            var saidStaleSha = mergeBody.Contains("expected sha", StringComparison.OrdinalIgnoreCase) ||
+                               mergeBody.Contains("head commit", StringComparison.OrdinalIgnoreCase);
+
+            if (saidOutOfDate && !saidStaleSha)
+            {
+                return MergeFailure("merge_conflict",
+                    $"Pull request #{pr} is behind or conflicting with its base branch: merge the current " +
+                    "base into the head branch, resolve whatever it reports, then request a re-review.",
+                    mergeBody, token);
+            }
+
+            if (saidStaleSha && !saidOutOfDate)
+            {
+                return MergeFailure("sha_moved",
+                    $"GitHub refused to merge pull request #{pr}: the head commit no longer matches the " +
+                    "approved state. A re-review is required.", mergeBody, token);
+            }
+
+            // Nothing distinguishes the two, so refuse on the reading that cannot ship unreviewed code:
+            // when an approval SHA was in play, treat the refusal as a stale approval and send it back to
+            // the human. Guessing "conflict" instead would spend an agent turn merging main for a PR whose
+            // real problem is that nobody reviewed the current head.
+            if (!string.IsNullOrWhiteSpace(approvedSha))
+            {
+                return MergeFailure("sha_moved",
+                    $"GitHub refused to merge pull request #{pr} at the approved commit " +
+                    $"{Truncate(approvedSha, 12)} without naming a conflict: the head may have moved while " +
+                    "the merge was in flight. A re-review is required.", mergeBody, token);
+            }
+
+            // No approval SHA was supplied, so the SHA guard cannot have fired; the remaining causes of a
+            // 409 are conflicting files or a branch GitHub considers out of date against the base. Both
+            // are fixed by the same action, so naming it a conflict hands the orchestrator work it can
+            // dispatch, and the merge stays blocked until a reviewer signs off on the new head.
+            return MergeFailure("merge_conflict",
+                $"GitHub refused to merge pull request #{pr} because the head branch is not up to date " +
+                "with its base or conflicts with it: merge the current base into the head branch, " +
+                "resolve whatever it reports, then request a re-review. See the recorded GitHub " +
+                "response body for the offending paths.",
+                mergeBody, token);
         }
 
         if (mergeResponse.StatusCode == System.Net.HttpStatusCode.MethodNotAllowed)
@@ -651,6 +849,59 @@ public partial class GitHubPullRequestService(
         catch (JsonException)
         {
             return (null, null, null);
+        }
+    }
+
+    /// <summary>
+    /// Extracts <c>mergeable</c> and <c>mergeable_state</c> from a pull-request payload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// These two fields are how a 409 merge refusal is classified into "conflicts with base" (agent
+    /// work) versus "the approval went stale" (reviewer work), which the job-level review loop routes
+    /// differently.
+    /// </para>
+    /// <para>
+    /// <strong><c>mergeable: null</c> is genuinely tri-state and is preserved as null, not coerced to
+    /// true or false.</strong> GitHub computes mergeability asynchronously, so a freshly-pushed PR
+    /// answers <c>null</c> with <c>mergeable_state: "unknown"</c> or <c>"blocked"</c> while it works.
+    /// A null means only "the read settled nothing" — a PR reported <c>mergeable_state: "clean"</c> can
+    /// still be refused for branch-protection reasons, and a null with state "dirty" still proves a
+    /// conflict, so the caller must read both fields together. Treating null as false would refuse good
+    /// merges during GitHub's recompute window; treating it as true would misclassify conflicts as
+    /// generic API errors, which is the failure this classification exists to prevent.
+    /// </para>
+    /// </remarks>
+    internal static (bool? Mergeable, string? MergeableState) TryReadMergeability(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return (null, null);
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
+
+            bool? mergeable = null;
+            if (doc.RootElement.TryGetProperty("mergeable", out var m))
+            {
+                mergeable = m.ValueKind switch
+                {
+                    JsonValueKind.True => true,
+                    JsonValueKind.False => false,
+                    _ => null, // null, missing, or an unexpected shape: unsettled, not "clean"
+                };
+            }
+
+            var mergeableState = doc.RootElement.TryGetProperty("mergeable_state", out var ms) &&
+                                 ms.ValueKind == JsonValueKind.String
+                ? ms.GetString()
+                : null;
+
+            return (mergeable, mergeableState);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
         }
     }
 

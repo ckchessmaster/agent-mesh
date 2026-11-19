@@ -6,6 +6,7 @@ using AgentMesh.Api.Services;
 using AgentMesh.Api.Tools;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
+using AgentMesh.Core.Workflows;
 using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Services;
 using AgentMesh.Tests.Helpers;
@@ -129,16 +130,16 @@ public class AttentionBroadcastTests
     {
         using var db = TestDbContextFactory.Create();
         var jobId = SeedWaitingJob(db, heartbeat: null);
-        db.JobMessages.Add(new JobMessage
+        db.JobTimelineCards.Add(new JobTimelineCard
         {
-            JobId = jobId,
-            SenderType = "persona",
-            SenderId = "rook",
-            SenderName = "Rook",
-            Content = "Result: blocked on a decision. Reasoning: two shapes. Risk: none.",
-            MentionsJson = "[]",
-            StructuredPayloadJson = """{"requiresReply":true,"targetPersona":"operator"}""",
-            CreatedAt = Base.AddMinutes(4)
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.Escalation3R,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Escalation from @rook to @operator",
+            StructuredPayloadJson =
+                """{"content":"Result: blocked on a decision. Reasoning: two shapes. Risk: none.","requiresReply":true,"targetPersona":"operator"}""",
+            CreatedAt = Base.AddMinutes(4),
+            UpdatedAt = Base.AddMinutes(4)
         });
         await db.SaveChangesAsync();
 
@@ -431,43 +432,89 @@ public class AttentionBroadcastWriteSiteTests
     }
 
     [Fact]
-    public async Task JobChat_OperatorReply_AnnouncesTheLedgerWrite()
+    public async Task JobTimeline_EscalationCardComment_AnnouncesTheClose()
     {
-        using var db = TestDbContextFactory.Create();
-        var jobId = Guid.NewGuid();
-        SeedProjectAndJob(db, jobId, "Awaiting pull request review (PR #75)");
-        await db.SaveChangesAsync();
-
-        var attention = new RecordingAttentionNotifier();
-        var controller = new JobChatController(db, attention: attention)
-        {
-            ControllerContext = OperatorContext()
-        };
-
-        var result = await controller.PostChatMessage(
-            jobId.ToString(), new PostMessageRequest("Approved, merge it.", null));
-
-        result.Should().BeOfType<OkObjectResult>();
-        attention.Refreshed.Should().Equal(jobId.ToString());
-    }
-
-    [Fact]
-    public async Task ProjectJobs_JobMessageRoute_AnnouncesBecauseTheWorkerPostsEscalationsHere()
-    {
-        // HttpAgentTurnRunner posts an agent's blocked-turn message to this route before it falls back to
-        // writing the row itself, so the worker's escalations open a bell through the API too.
+        // The escalation close is a card status flip now: a comment on a PendingInput Escalation3R row is
+        // the only thing that retires the wait, because the job ledger that used to record the reply is
+        // gone. If this route stops announcing, an answered question keeps ringing until the bell polls.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProjectAndJob(db, jobId, "Executing task #2");
+        var cardId = Guid.NewGuid();
+        db.JobTimelineCards.Add(new JobTimelineCard
+        {
+            Id = cardId,
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.Escalation3R,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Escalation from @rook to @operator",
+            StructuredPayloadJson =
+                """{"content":"Which branch should I target?","requiresReply":true,"targetPersona":"operator"}""",
+            CreatedAt = Base,
+            UpdatedAt = Base
+        });
+        await db.SaveChangesAsync();
+
+        // Prove the wait existed before the comment, so "gone afterwards" means something.
+        (await QueryService(db).QueryJobAsync(jobId)).Should().NotBeNull();
+
+        var attention = new RecordingAttentionNotifier();
+        var controller = new JobTimelineController(
+            db, new Mock<ITemporalClient>().Object, attention: attention);
+
+        var result = await controller.AddComment(
+            jobId.ToString(), cardId, new AddCommentRequest("operator", "operator", "origin/main, obviously"));
+
+        result.Should().BeOfType<OkObjectResult>();
+        attention.Refreshed.Should().Equal(jobId.ToString());
+
+        var reloaded = await db.JobTimelineCards.SingleAsync(c => c.Id == cardId);
+        reloaded.Status.Should().Be(TimelineCardStatus.Resolved,
+            "the flip is the closure signal the rollup reads; if a comment stops resolving the card, the bell never clears");
+        (await QueryService(db).QueryJobAsync(jobId)).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task JobTimeline_PlanDecisionRoute_AnnouncesAfterItsOwnWrites()
+    {
+        // Both sides of the gate change the wait — approval clears it, rejection keeps it with a new
+        // heartbeat — and only the recomputed state knows which, so the announcement has to come after
+        // the card and heartbeat writes, not before the Temporal signal.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        SeedProjectAndJob(db, jobId, "Awaiting plan approval");
+        var cardId = Guid.NewGuid();
+        db.JobTimelineCards.Add(new JobTimelineCard
+        {
+            Id = cardId,
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.PlanApproval,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Plan Approval: Proposed Implementation Checklist",
+            StructuredPayloadJson = """{"tasks":[{"title":"Backend: broadcasts"}]}""",
+            CreatedAt = Base,
+            UpdatedAt = Base
+        });
         await db.SaveChangesAsync();
 
         var attention = new RecordingAttentionNotifier();
-        var controller = new ProjectJobsController(db, attention: attention);
+        // The route signals the workflow before it records the verdict, so a handle that refuses the
+        // signal returns Conflict and announces nothing — the mock has to accept it for this to be a
+        // test of the announcement rather than of Temporal.
+        var temporal = new Mock<ITemporalClient>();
+        var workflowId = $"job-{jobId}";
+        var handle = new Mock<WorkflowHandle<IJobExecutionWorkflow>>(
+            temporal.Object, workflowId, (string?)null, (string?)null, (string?)null);
+        temporal.Setup(c => c.GetWorkflowHandle<IJobExecutionWorkflow>(workflowId, null))
+            .Returns(handle.Object);
 
-        var result = await controller.PostJobMessage(
-            jobId, new PostJobMessageRequest("Result: need a decision.", "system", "rook", "Rook"));
+        var controller = new JobTimelineController(
+            db, temporal.Object, attention: attention);
 
-        result.Should().BeOfType<OkObjectResult>();
+        var result = await controller.SubmitPlanDecision(
+            jobId.ToString(), cardId, new PlanDecisionPayload(Approved: true), CancellationToken.None);
+
+        result.Should().BeOfType<AcceptedResult>();
         attention.Refreshed.Should().Equal(jobId.ToString());
     }
 
@@ -544,6 +591,14 @@ public class AttentionBroadcastWriteSiteTests
         raw.Should().NotContain("\"error\"");
         attention.Refreshed.Should().Equal(jobId.ToString());
     }
+
+    /// <summary>
+    /// The read model behind the push, so a write-site test can assert what <c>GET /api/attention</c>
+    /// would answer before and after the route runs. "The event fired" only means something if the state
+    /// actually changed: the notifier recomputes rather than classifies the write, by design.
+    /// </summary>
+    private static AttentionQueryService QueryService(AgentMeshDbContext db)
+        => new(db, NullLogger<AttentionQueryService>.Instance);
 
     private static void SeedProjectAndJob(
         AgentMeshDbContext db, Guid jobId, string? heartbeat, ProjectJobStatus status = ProjectJobStatus.Active)

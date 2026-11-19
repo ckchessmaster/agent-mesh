@@ -23,7 +23,10 @@ public class AgentSession
         set
         {
             _driverId = value;
-            _creatorAgentId = value;
+            if (_creatorAgentId is null)
+            {
+                _creatorAgentId = value;
+            }
         }
     }
 
@@ -36,7 +39,10 @@ public class AgentSession
         set
         {
             _creatorAgentId = value;
-            _driverId = value;
+            if (_driverId is null)
+            {
+                _driverId = value;
+            }
         }
     }
 

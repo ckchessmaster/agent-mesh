@@ -755,4 +755,113 @@ public class DriverQuotaProbeTests
             await Task.Delay(10);
         }
     }
+
+    [Fact]
+    public void AgyDriverQuotaProbe_IsAntigravity_ReturnsFalse_ForOpenRouter()
+    {
+        AgyDriverQuotaProbe.IsAntigravity(new DriverQuotaProbeRequest(
+            DriverId: "openrouter",
+            RuntimeType: RuntimeType.OpenRouter,
+            Adapter: null,
+            Endpoint: null)).Should().BeFalse();
+
+        AgyDriverQuotaProbe.IsAntigravity(new DriverQuotaProbeRequest(
+            DriverId: "agy-gateway",
+            RuntimeType: RuntimeType.OpenRouter,
+            Adapter: "openrouter",
+            Endpoint: null)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task OpenRouterQuotaProbe_ReadsKeyLimit_WithResetWindow()
+    {
+        var calls = 0;
+        var probe = new OpenRouterDriverQuotaProbe(
+            () => TimeSpan.FromSeconds(60),
+            () => TimeSpan.FromMinutes(5),
+            (url, apiKey, _) =>
+            {
+                Interlocked.Increment(ref calls);
+                apiKey.Should().Be("sk-or-123");
+                if (url.EndsWith("/key", StringComparison.Ordinal))
+                {
+                    return Task.FromResult((200, (string?)"""
+                    {
+                      "data": {
+                        "label": "Mesh CI",
+                        "limit": 25.0,
+                        "limit_remaining": 15.0,
+                        "limit_reset": "monthly",
+                        "usage": 10.0,
+                        "is_free_tier": false
+                      }
+                    }
+                    """));
+                }
+                return Task.FromResult((404, (string?)null));
+            });
+
+        var req = new DriverQuotaProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", null, ApiKey: "sk-or-123");
+        var reading = await probe.ProbeAsync(req);
+        var cachedReading = await probe.ProbeAsync(req);
+
+        calls.Should().Be(1, "subsequent reads within TTL should use cache");
+        reading.Should().NotBeNull();
+        cachedReading.Should().BeSameAs(reading);
+        reading!.Provider.Should().Be("OpenRouter");
+        reading.PlanName.Should().Be("API Key Budget · Mesh CI");
+        reading.Source.Should().Be("openrouter:/key");
+        reading.PrimaryRemainingFraction.Should().BeApproximately(0.6, 0.0001);
+        reading.Groups.Should().ContainSingle();
+        reading.Groups[0].Buckets[0].Window.Should().Be("monthly");
+        reading.Groups[0].Buckets[0].Description.Should().Be("$15.00 of $25.00 remaining");
+    }
+
+    [Fact]
+    public async Task OpenRouterQuotaProbe_FallsBackToCreditsOnUnlimitedKey_AndReturnsNullOn403Or401()
+    {
+        // Unlimited key (`limit: null`) + management key returns /credits -> Account Credits reading
+        var mgmtProbe = new OpenRouterDriverQuotaProbe(
+            () => TimeSpan.Zero,
+            () => TimeSpan.Zero,
+            (url, _, _) => url.EndsWith("/key", StringComparison.Ordinal)
+                ? Task.FromResult((200, (string?)"""{"data":{"limit":null,"usage":2.5,"is_free_tier":false}}"""))
+                : Task.FromResult((200, (string?)"""{"data":{"total_credits":50.0,"total_usage":12.5}}""")));
+
+        var creditsReading = await mgmtProbe.ProbeAsync(
+            new DriverQuotaProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", null, ApiKey: "sk-mgmt"));
+        creditsReading.Should().NotBeNull();
+        creditsReading!.Source.Should().Be("openrouter:/credits");
+        creditsReading.PrimaryRemainingFraction.Should().BeApproximately(0.75, 0.0001);
+
+        // Standard key returns `limit: null` on /key and 403 on /credits -> must return null cleanly
+        var standardProbe = new OpenRouterDriverQuotaProbe(
+            () => TimeSpan.Zero,
+            () => TimeSpan.Zero,
+            (url, _, _) => url.EndsWith("/key", StringComparison.Ordinal)
+                ? Task.FromResult((200, (string?)"""{"data":{"limit":null,"usage":2.5,"is_free_tier":false}}"""))
+                : Task.FromResult((403, (string?)"""{"error":"Management key required"}""")));
+
+        (await standardProbe.ProbeAsync(
+            new DriverQuotaProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", null, ApiKey: "sk-std")))
+            .Should().BeNull();
+
+        // Unauthorized key returns 401 -> must return null cleanly
+        var unauthProbe = new OpenRouterDriverQuotaProbe(
+            () => TimeSpan.Zero,
+            () => TimeSpan.Zero,
+            (_, _, _) => Task.FromResult((401, (string?)"Unauthorized")));
+
+        (await unauthProbe.ProbeAsync(
+            new DriverQuotaProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", null, ApiKey: "sk-bad")))
+            .Should().BeNull();
+
+        // Composite probe routes to the matching provider probe
+        var composite = new CompositeDriverQuotaProbe(
+            new AgyDriverQuotaProbe(() => TimeSpan.Zero, () => "/bin/false", (_, _, _, _) => Task.FromResult<string?>(null)),
+            mgmtProbe);
+        var compositeReading = await composite.ProbeAsync(
+            new DriverQuotaProbeRequest("openrouter", RuntimeType.OpenRouter, "openrouter", null, ApiKey: "sk-mgmt"));
+        compositeReading!.Provider.Should().Be("OpenRouter");
+    }
 }

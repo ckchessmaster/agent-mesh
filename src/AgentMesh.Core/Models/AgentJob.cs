@@ -23,6 +23,8 @@ public class AgentJob
     public string? ProjectId { get; set; }
     public string? WorkingDirectory { get; set; }
     public string? TargetBranch { get; set; }
+    public string? InitialPrompt { get; set; }
+    public string? MessageText { get; set; }
     public string? ResultJson { get; set; }
     public string? ResultS3Uri { get; set; }
     public string ArtifactsManifestJson { get; set; } = "{}";

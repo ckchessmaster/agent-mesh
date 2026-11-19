@@ -21,7 +21,7 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
             .IsRequired();
 
         builder.Property(j => j.Description)
-            .HasMaxLength(1024)
+            .HasColumnType("text")
             .HasDefaultValue(string.Empty)
             .IsRequired();
 
@@ -97,6 +97,5 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
             .HasDatabaseName("ix_project_jobs_status");
 
         builder.Ignore(j => j.Project);
-        builder.Ignore(j => j.Messages);
     }
 }

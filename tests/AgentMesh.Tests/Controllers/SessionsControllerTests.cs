@@ -1120,38 +1120,115 @@ public class SessionsControllerTests
             StructuredPayloadJson: questionsPayload
         ));
 
-        // Assert 1: Session transitions to waiting_for_input and JobMessage is created
+        // Assert 1: Session transitions to waiting_for_input and JobTimelineCard is created
         toolCallRes.Should().BeOfType<CreatedAtActionResult>();
         session.Status.Should().Be("waiting_for_input");
 
-        var jobMsgs = db.JobMessages.Where(m => m.JobId == job.Id).ToList();
-        jobMsgs.Should().ContainSingle();
-        var qMsg = jobMsgs[0];
-        qMsg.SenderType.Should().Be("persona");
-        qMsg.SenderId.Should().Be(persona.Id);
-        qMsg.TurnSessionId.Should().Be(session.Id);
-        qMsg.StructuredPayloadJson.Should().Contain("Which DB?");
+        var jobCards = db.JobTimelineCards.Where(c => c.JobId == job.Id.ToString()).ToList();
+        jobCards.Should().ContainSingle();
+        var qCard = jobCards[0];
+        qCard.CardType.Should().Be(TimelineCardType.Escalation3R);
+        qCard.Status.Should().Be(TimelineCardStatus.PendingInput);
+        qCard.StructuredPayloadJson.Should().Contain(persona.Id);
+        qCard.StructuredPayloadJson.Should().Contain(session.Id.ToString());
+        qCard.StructuredPayloadJson.Should().Contain("Which DB?");
 
         // Act 2: Human submits answer to the question
         var answerRes = await controller.SubmitAnswer(session.Id, new SubmitAnswerRequest(
-            ToolCallId: qMsg.Id,
+            ToolCallId: qCard.Id,
             Answers: new List<QuestionAnswerDto>
             {
                 new(0, "Which DB?", new List<string> { "PG" }, "")
             }
         ));
 
-        // Assert 2: Session transitions back to thinking, answer is forwarded to JobMessages
+        // Assert 2: Session transitions back to thinking, answer is forwarded to JobTimelineCards
         answerRes.Should().BeOfType<OkObjectResult>();
         session.Status.Should().Be("thinking");
 
-        var allJobMsgs = db.JobMessages.Where(m => m.JobId == job.Id).OrderBy(m => m.CreatedAt).ToList();
-        allJobMsgs.Should().HaveCount(2);
-        var aMsg = allJobMsgs[1];
-        aMsg.SenderType.Should().Be("user");
-        aMsg.Content.Should().Contain("User answered question:");
-        aMsg.Content.Should().Contain("Which DB? -> A: PG");
-        aMsg.TurnSessionId.Should().Be(session.Id);
+        var allJobCards = db.JobTimelineCards.Where(c => c.JobId == job.Id.ToString()).OrderBy(c => c.CreatedAt).ToList();
+        allJobCards.Should().HaveCount(2);
+        var aCard = allJobCards[1];
+        using var aDoc = System.Text.Json.JsonDocument.Parse(aCard.StructuredPayloadJson);
+        aDoc.RootElement.GetProperty("content").GetString().Should()
+            .Contain("User answered question:")
+            .And.Contain("Which DB? -> A: PG");
+        aCard.StructuredPayloadJson.Should().Contain(session.Id.ToString());
+    }
+
+    /// <summary>
+    /// The job's own Q&amp;A card must show the questions the operator just answered.
+    /// </summary>
+    /// <remarks>
+    /// The cockpit renders a Discovery Q&amp;A card from <c>questions</c> (with the options it offered) and
+    /// <c>answers</c> keyed by question id. The card written when a session question was answered carried
+    /// only the answer array, so job c28eca57 showed both questions in the session chat and an empty card on
+    /// the timeline. The question here is asked in the encoded-array shape Antigravity records, because the
+    /// card is built by the same reader the Stage 1 activity uses and both must see the same questions.
+    /// </remarks>
+    [Fact]
+    public async Task SubmitAnswer_EncodedAskQuestion_WritesTheQuestionsAndAnswersOntoTheJobCard()
+    {
+        using var db = TestDbContextFactory.Create();
+        var project = new Project { Id = "proj-card", Name = "Card Project" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Title = "Card Job",
+            GitBranchName = "mesh/job-card"
+        };
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Encoded question session",
+            Status = "waiting_for_input",
+            CreatorAgentId = "agy",
+            MetadataJson = System.Text.Json.JsonSerializer.Serialize(new { jobId = job.Id.ToString() })
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var controller = new SessionsController(db, _mockHubContext.Object);
+
+        await controller.PostMessage(session.Id, new PostMessageRequest(
+            Content: "Asking question",
+            SenderAgentId: "agy",
+            EventType: "tool_call",
+            ToolName: "ask_question",
+            ToolArgsJson: """
+                {"questions": "[{\"is_multi_select\":false,\"options\":[\"Clone into repos/budget-app\",\"Re-provision the workspace\"],\"question\":\"How should the repository workspace be resolved?\"}]"}
+                """,
+            StructuredPayloadJson: null));
+
+        var res = await controller.SubmitAnswer(session.Id, new SubmitAnswerRequest(
+            ToolCallId: null,
+            Answers:
+            [
+                new(0, "How should the repository workspace be resolved?",
+                    ["Clone into repos/budget-app"], null)
+            ]));
+
+        res.Should().BeOfType<OkObjectResult>();
+
+        var card = db.JobTimelineCards.Single(c =>
+            c.JobId == job.Id.ToString() && c.CardType == TimelineCardType.DiscoveryQa);
+
+        using var doc = System.Text.Json.JsonDocument.Parse(card.StructuredPayloadJson);
+        var root = doc.RootElement;
+
+        var question = root.GetProperty("questions")[0];
+        question.GetProperty("question").GetString().Should().Be("How should the repository workspace be resolved?");
+        question.GetProperty("id").GetString().Should().Be("q_1");
+        question.GetProperty("options").EnumerateArray().Select(o => o.GetString())
+            // The options are what makes the declined choice visible on the card, which is the whole
+            // reason this card has to carry the question set and not only the answer.
+            .Should().ContainInOrder("Clone into repos/budget-app", "Re-provision the workspace");
+
+        root.GetProperty("answers").GetProperty("q_1").GetString()
+            .Should().Be("Clone into repos/budget-app");
     }
 
     [Fact]
@@ -1312,10 +1389,10 @@ public class SessionsControllerTests
         // Assert
         result.Should().BeOfType<CreatedAtActionResult>();
 
-        // 1. Verify JobMessage was posted
-        var jobMsg = db.JobMessages.FirstOrDefault(m => m.JobId == job.Id && m.Content == checkpointResponse);
-        jobMsg.Should().NotBeNull();
-        jobMsg!.SenderId.Should().Be(persona.Id);
+        // 1. Verify JobTimelineCard was posted
+        var jobCard = db.JobTimelineCards.FirstOrDefault(c => c.JobId == job.Id.ToString() && c.StructuredPayloadJson.Contains("Progress Checkpoint"));
+        jobCard.Should().NotBeNull();
+        jobCard!.StructuredPayloadJson.Should().Contain(persona.Id);
 
         // 2. Verify next turn session was dispatched autonomously for the same persona
         var nextSession = db.AgentSessions.FirstOrDefault(s => s.Id != session.Id && s.PersonaId == persona.Id);
@@ -1436,9 +1513,9 @@ public class SessionsControllerTests
         // Assert
         result.Should().BeOfType<CreatedAtActionResult>();
 
-        // 1. Verify JobMessage was posted
-        var jobMsg = db.JobMessages.FirstOrDefault(m => m.JobId == job.Id && m.Content == checkpointResponse);
-        jobMsg.Should().NotBeNull();
+        // 1. Verify JobTimelineCard was posted
+        var jobCard = db.JobTimelineCards.FirstOrDefault(c => c.JobId == job.Id.ToString() && c.StructuredPayloadJson.Contains("Progress Checkpoint"));
+        jobCard.Should().NotBeNull();
 
         // 2. Verify NO next turn session was dispatched autonomously because plan approval is pending
         var nextSession = db.AgentSessions.FirstOrDefault(s => s.Id != session.Id && s.PersonaId == persona.Id);

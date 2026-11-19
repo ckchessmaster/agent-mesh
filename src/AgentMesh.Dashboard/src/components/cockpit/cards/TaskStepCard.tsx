@@ -28,13 +28,13 @@ export const TaskStepCard: React.FC<TaskStepCardProps> = ({
   return (
     <div
       data-testid="task-step-card"
-      className="p-4 rounded-lg bg-slate-900/90 border border-slate-800 shadow-md text-slate-200 mb-4 transition"
+      className="p-3 sm:p-4 rounded-lg bg-slate-900/90 border border-slate-800 shadow-md text-slate-200 mb-3 sm:mb-4 transition"
     >
       {/* Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-        <div className="flex items-center space-x-2">
+      <div className="flex items-start sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+        <div className="flex items-start sm:items-center space-x-2 min-w-0">
           <div
-            className={`p-1.5 rounded ${
+            className={`p-1.5 rounded shrink-0 ${
               isActive
                 ? 'bg-amber-500/20 text-amber-400'
                 : 'bg-indigo-500/20 text-indigo-400'
@@ -42,17 +42,17 @@ export const TaskStepCard: React.FC<TaskStepCardProps> = ({
           >
             <Activity className="w-4 h-4" />
           </div>
-          <div>
-            <h3 className="text-sm font-semibold text-slate-100 flex items-center space-x-2">
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-slate-100 flex items-center space-x-2 break-words">
               <span>{card.title || `Task ${payload.taskIndex + 1}: ${payload.taskTitle}`}</span>
             </h3>
             {payload.stepDetails && (
-              <p className="text-xs text-slate-400 font-mono mt-0.5">{payload.stepDetails}</p>
+              <p className="text-xs text-slate-400 font-mono mt-0.5 break-words">{payload.stepDetails}</p>
             )}
           </div>
         </div>
 
-        <div className="flex items-center space-x-2">
+        <div className="flex items-center space-x-2 shrink-0">
           {isActive ? (
             <span className="flex items-center space-x-1.5 px-2 py-0.5 text-xs font-mono rounded bg-amber-500/10 text-amber-400 border border-amber-500/30 animate-pulse">
               <PlayCircle className="w-3.5 h-3.5 animate-spin" />

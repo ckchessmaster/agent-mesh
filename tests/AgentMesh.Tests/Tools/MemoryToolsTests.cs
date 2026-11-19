@@ -119,6 +119,28 @@ public class MemoryToolsTests
         result.GetProperty("category").GetString().Should().Be(category);
     }
 
+    [Fact]
+    public async Task ListAndSearchMemories_ReturnsProjectAndGlobalMemoriesOrderedByUpdatedAtDesc()
+    {
+        var tool = Tool();
+        await tool.SaveMemory("environment", "global_sdk", "/usr/share/dotnet", is_global: true);
+        await Task.Delay(5);
+        await tool.SaveMemory("build_and_test", "test_flags", "dotnet test --nologo");
+        await Task.Delay(5);
+        await tool.SaveMemory("environment", "active_branch", "mesh/job-123");
+
+        // Re-read under project scope ("rook", "agent-mesh") so both project + "*" global memories return
+        var listed = Parse(await Tool().ListMemories());
+        listed.GetProperty("success").GetBoolean().Should().BeTrue();
+        listed.GetProperty("count").GetInt32().Should().Be(3);
+
+        var keys = listed.GetProperty("keys").EnumerateArray().Select(e => e.GetString()).ToList();
+        keys.Should().Equal("active_branch", "test_flags", "global_sdk");
+
+        var searched = Parse(await Tool().SearchMemory(query: "dotnet"));
+        searched.GetProperty("count").GetInt32().Should().Be(2);
+    }
+
     [Theory]
     [InlineData("BUILD_AND_TEST")]
     [InlineData(" Codebase_Gotcha ")]

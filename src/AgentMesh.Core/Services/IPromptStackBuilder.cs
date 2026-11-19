@@ -73,9 +73,7 @@ public record PromptStackContext(
             TaskId: input.TaskId,
             WorkspacePath: input.WorkspacePath,
             TargetBranch: input.TargetBranch,
-            // The workflow input names no free-text objective: the task itself is the objective. The
-            // composer renders the focus checklist item's title in this slot when it is blank.
-            UserPrompt: string.Empty,
+            UserPrompt: input.RemediationContext ?? string.Empty,
             PersonaId: input.PersonaId,
             PendingReply: pendingReply,
             TurnSessionId: input.TurnSessionId);

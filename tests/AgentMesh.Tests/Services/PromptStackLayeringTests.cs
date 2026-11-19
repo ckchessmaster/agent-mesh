@@ -147,6 +147,66 @@ public class PromptStackLayeringTests
 
         // Naming a directory only helps if the prompt also says not to go and check it.
         assembled.UserTaskEnvelope.Should().Contain("do not run pwd");
+        assembled.UserTaskEnvelope.Should().Contain("Saved Memory Keys:");
+    }
+
+    [Fact]
+    public async Task BuildPromptStack_PrioritizesPersonaMemoriesAndIncludesGlobalMemories_OrderedByUpdatedAtDesc()
+    {
+        using var db = Db();
+        await SeedAsync(db, roster: false, memories: false, repositoryName: "billing-service");
+
+        var older = DateTimeOffset.UtcNow.AddMinutes(-20);
+        var newer = DateTimeOffset.UtcNow.AddMinutes(-2);
+
+        // Driver memory has stale value for same key; Persona ("rook") memory has fresh value + global "*" memory
+        db.AgentMemories.Add(new AgentMemory
+        {
+            AgentId = "driver-rook",
+            ProjectId = ProjectId,
+            Category = AgentMemoryCategories.Environment,
+            Key = "sdk_path",
+            Value = "/stale/driver/path",
+            CreatedAt = older,
+            UpdatedAt = older
+        });
+        db.AgentMemories.Add(new AgentMemory
+        {
+            AgentId = "rook",
+            ProjectId = AgentMemory.GlobalProjectId,
+            Category = AgentMemoryCategories.Environment,
+            Key = "git_identity",
+            Value = "Rook <rook@agentmesh.local>",
+            CreatedAt = older,
+            UpdatedAt = older.AddMinutes(5)
+        });
+        db.AgentMemories.Add(new AgentMemory
+        {
+            AgentId = "rook",
+            ProjectId = ProjectId,
+            Category = AgentMemoryCategories.Environment,
+            Key = "sdk_path",
+            Value = "/fresh/persona/path",
+            CreatedAt = newer,
+            UpdatedAt = newer
+        });
+        await db.SaveChangesAsync();
+
+        var assembled = await BuildAsync(db, Context(workspacePath: ""));
+
+        assembled.CachedSystemPrompt.Should().Contain("[PERSISTENT MEMORY & ENVIRONMENT NOTES]");
+        assembled.CachedSystemPrompt.Should().Contain("/fresh/persona/path")
+            .And.NotContain("/stale/driver/path", "PersonaId memories override stale DriverId entries")
+            .And.Contain("[environment/git_identity]: Rook <rook@agentmesh.local>", "global '*' memories are injected alongside project memories");
+
+        var freshIdx = assembled.CachedSystemPrompt.IndexOf("sdk_path", StringComparison.Ordinal);
+        var olderIdx = assembled.CachedSystemPrompt.IndexOf("git_identity", StringComparison.Ordinal);
+        freshIdx.Should().BeLessThan(olderIdx, "memories are injected ordered by UpdatedAt DESC");
+
+        assembled.UserTaskEnvelope.Should().Contain("Saved Memory Keys: sdk_path, git_identity");
+        PromptStackBuilder.PlatformPrompt()
+            .Should().Contain("inspect `/workspace/repos/<project-name>`")
+            .And.Contain("git branch --show-current && git status --short");
     }
 
     // ──────────────────────────────────────────────────────────────────────────

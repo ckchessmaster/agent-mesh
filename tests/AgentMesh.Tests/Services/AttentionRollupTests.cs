@@ -214,18 +214,20 @@ public class AttentionRollupTests
     }
 
     [Fact]
-    public async Task PrReview_IsReportedWithTheClickThroughFromTheLedger()
+    public async Task PrReview_IsReportedWithTheClickThroughFromTheReviewCard()
     {
-        // The job row has no PR column, so the click-through target only exists in the linkage row
-        // open_pull_request writes. Without it the bell would say "review me" with nowhere to click.
+        // The job row has no PR column, so the click-through target only exists on the gate card that
+        // open_pull_request merges its linkage into. Without it the bell says "review me" with nowhere
+        // to click.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProject(db, "alpha");
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: "Awaiting pull request review (PR #4217)"));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "PR #4217 opened for review.",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.PrReview, TimelineCardStatus.PendingInput,
+            "Pull request awaiting review",
             """
             {"prNumber":4217,"prUrl":"https://github.com/ckchessmaster/agent-mesh/pull/4217",
-             "headBranch":"mesh/job-1","baseBranch":"main","reviewer":"astra","simulated":false,
+             "headBranch":"mesh/job-1","baseBranch":"main","reviewerId":"astra","round":1,
              "source":"mcp:open_pull_request"}
             """));
         await db.SaveChangesAsync();
@@ -236,24 +238,26 @@ public class AttentionRollupTests
         item.PrUrl.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/4217");
         item.PrNumber.Should().Be(4217);
         item.Detail.Should().Contain("PR #4217");
-        // A PR linkage row is not an escalation: it asks for a review, and the kind must not degrade
-        // into the generic bucket just because both live in the same ledger.
+        // A review gate is not an escalation: it asks for a review, and the kind must not degrade into
+        // the generic bucket just because both are cards now.
         item.Id.Should().Be($"{jobId}:prReview");
     }
 
     [Fact]
-    public async Task NewestPrLinkageWins_AfterAPullRequestWasReopened()
+    public async Task NewestReviewCardWins_AfterAPullRequestWasReopened()
     {
-        // The ledger read is ascending and last-match-wins. A job that went through
-        // changes-requested and pushed a new head has two linkage rows, and the bell has to open the
-        // current PR rather than the one a reviewer already refused.
+        // Cards are loaded newest-first, so the first pending gate is the current one. A job that went
+        // through changes-requested and pushed a new head has two review cards, and the bell has to open
+        // the pull request a reviewer has not refused yet.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProject(db, "alpha");
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: "Awaiting pull request review (PR #142)"));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "PR #100 opened.",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.PrReview, TimelineCardStatus.Resolved,
+            "Pull request awaiting review",
             """{"prNumber":100,"prUrl":"https://example.invalid/pull/100"}""", Base.AddMinutes(-40)));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "PR #142 opened.",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.PrReview, TimelineCardStatus.PendingInput,
+            "Pull request awaiting review",
             """{"prNumber":142,"prUrl":"https://example.invalid/pull/142"}""", Base.AddMinutes(-5)));
         await db.SaveChangesAsync();
 
@@ -264,7 +268,25 @@ public class AttentionRollupTests
     }
 
     [Fact]
-    public async Task UnansweredOperatorEscalation_IsReportedAndDatedFromTheAsk()
+    public async Task AReviewGateWithoutAHeartbeatSayingSo_IsNotAnnounced()
+    {
+        // Deliberate, and the reason prReview is not in the pending-card ranking: only the workflow's own
+        // gate card moves when a pull request merges, so a job that went back to implementing can keep a
+        // stale PendingInput card behind. Ringing the bell for that is how a notification surface loses
+        // its operator. The heartbeat naming the review is the live signal.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        SeedProject(db, "alpha");
+        db.ProjectJobs.Add(NewJob(jobId, heartbeat: "Executing task #5: address review feedback"));
+        db.JobTimelineCards.Add(NewCard(jobId,
+            TimelineCardType.PrReview, TimelineCardStatus.PendingInput, "Pull request awaiting review"));
+        await db.SaveChangesAsync();
+
+        (await QueryAsync(db)).Items.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task UnansweredOperatorEscalation_IsReportedAndDatedFromTheCard()
     {
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
@@ -272,9 +294,9 @@ public class AttentionRollupTests
         SeedProject(db, "alpha");
         // No heartbeat: a parked post_job_message leaves the heartbeat saying whatever the task was doing.
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: null));
-        db.JobMessages.Add(NewMessage(jobId, "persona",
-            "Result: hit the 3-strike limit on the rollup tests.\nReasoning: reverted.\nRisk: need guidance on pooling.",
-            """{"requiresReply":true,"targetPersona":"operator","senderPersona":"rook","source":"mcp:post_job_message"}""",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.PendingInput,
+            "Escalation from @rook to @operator",
+            """{"content":"@operator Result: hit the 3-strike limit on the rollup tests.\nReasoning: reverted.\nRisk: need guidance on pooling.","requiresReply":true,"targetPersona":"operator","senderPersona":"rook","source":"mcp:post_job_message"}""",
             askedAt));
         await db.SaveChangesAsync();
 
@@ -283,79 +305,68 @@ public class AttentionRollupTests
         item.Type.Should().Be(AttentionTypes.Escalation);
         item.Id.Should().Be($"{jobId}:escalation");
         item.Since.Should().Be(askedAt);
+        item.CardId.Should().NotBeEmpty("the click-through target is the card the operator has to answer");
+        // The mention the writers prepend is not the operator's problem to read twice.
         item.Title.Should().Be("Result: hit the 3-strike limit on the rollup tests.");
         item.Detail.Should().Contain("need guidance on pooling").And.NotContain("\n");
     }
 
     [Fact]
-    public async Task Escalation_IsClearedOnceAHumanReplies()
+    public async Task Escalation_IsClearedOnceTheOperatorAnswersOnTheCard()
     {
+        // The card comment route flips an Escalation3R out of PendingInput; that flip is the whole
+        // closure signal now, which is why no "has a human replied since" read survives in the service.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProject(db, "alpha");
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: null));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "Which branch should I target?",
-            """{"requiresReply":true,"targetPersona":"operator","senderPersona":"rook"}""",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.Resolved,
+            "Escalation from @rook to @operator",
+            """{"content":"Which branch should I target?","requiresReply":true,"targetPersona":"operator"}""",
             Base.AddMinutes(1)));
-        // The reply carries no payload, which is exactly why the read that finds asks cannot be the read
-        // that finds answers: a single query filtering on structured_payload_json would never see this
-        // row, and the escalation would outlive its own answer forever.
-        db.JobMessages.Add(NewMessage(jobId, "user", "off origin/main, obviously", payload: null,
-            createdAt: Base.AddMinutes(6)));
         await db.SaveChangesAsync();
 
         (await QueryAsync(db)).Items.Should().BeEmpty();
     }
 
     [Fact]
-    public async Task Escalation_SurvivesAnAgentTalkingOverIt()
+    public async Task TwoOpenAsksOnOneJob_StillProduceOneItem_AndTheNewestOneWins()
     {
-        // Only a human closes a wait. Otherwise a second agent replying in chat would silence the bell
-        // while the asked question is still unanswered.
+        // A bell that lists the same job twice is noise, and the newest ask is the one blocking the turn.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProject(db, "alpha");
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: null));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "Need a decision on the branch.",
-            """{"requiresReply":true,"targetPersona":"operator","senderPersona":"rook"}""",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.PendingInput,
+            "Escalation from @rook to @operator",
+            """{"content":"First question.","requiresReply":true,"targetPersona":"operator"}""",
             Base.AddMinutes(1)));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "I'd go with main.", payload: null,
-            createdAt: Base.AddMinutes(6)));
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.PendingInput,
+            "Escalation from @rook to @operator",
+            """{"content":"Second question.","requiresReply":true,"targetPersona":"operator"}""",
+            Base.AddMinutes(6)));
         await db.SaveChangesAsync();
 
-        (await QueryAsync(db)).Items.Should().ContainSingle().Subject
-            .Type.Should().Be(AttentionTypes.Escalation);
+        var item = (await QueryAsync(db)).Items.Should().ContainSingle().Subject;
+
+        item.Type.Should().Be(AttentionTypes.Escalation);
+        item.Title.Should().Be("Second question.");
+        item.Since.Should().Be(Base.AddMinutes(6));
     }
 
     [Fact]
-    public async Task ARepliedAskThatPredatesTheReply_IsNotRevivedByALaterPayloadlessPersonaRow()
+    public async Task ACardThatSaysItIsNotARequest_IsNotAWait()
     {
+        // post_job_message without requires_reply writes a TaskStep card, not an escalation, but a writer
+        // that addresses the operator and explicitly declines a reply must not pin a permanent item to a
+        // job waiting on nobody.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProject(db, "alpha");
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: null));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "Which branch?",
-            """{"requiresReply":true,"targetPersona":"operator"}""", Base.AddMinutes(1)));
-        db.JobMessages.Add(NewMessage(jobId, "user", "main", payload: """{"decision":"main"}""",
-            createdAt: Base.AddMinutes(2)));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "Pushing now.", payload: null,
-            createdAt: Base.AddMinutes(3)));
-        await db.SaveChangesAsync();
-
-        (await QueryAsync(db)).Items.Should().BeEmpty();
-    }
-
-    [Fact]
-    public async Task AHumanCannotOpenAnEscalationAgainstThemselves()
-    {
-        // Review decisions and chat posts from the operator also carry structured payloads. Reading one
-        // as an ask would pin a permanent item to a job waiting on nobody.
-        using var db = TestDbContextFactory.Create();
-        var jobId = Guid.NewGuid();
-        SeedProject(db, "alpha");
-        db.ProjectJobs.Add(NewJob(jobId, heartbeat: null));
-        db.JobMessages.Add(NewMessage(jobId, "user", "Approving my own plan, apparently.",
-            """{"requiresReply":true,"targetPersona":"operator","decision":"approved"}""",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.PendingInput,
+            "Update from @rook",
+            """{"content":"FYI, the migration is idempotent.","requiresReply":false,"targetPersona":"operator"}""",
             Base.AddMinutes(1)));
         await db.SaveChangesAsync();
 
@@ -365,12 +376,15 @@ public class AttentionRollupTests
     [Fact]
     public async Task AskAddressedToAnotherPersona_IsNotTheOperatorsProblem()
     {
+        // requires_reply parks the addressed agent, not the operator: a desktop banner about an internal
+        // consult is the noise that makes an operator mute the whole surface.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProject(db, "alpha");
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: null));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "Astra, is this the right durability guarantee?",
-            """{"requiresReply":true,"targetPersona":"astra","senderPersona":"rook"}""",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.PendingInput,
+            "Escalation from @rook to @astra",
+            """{"content":"Astra, is this the right durability guarantee?","requiresReply":true,"targetPersona":"astra"}""",
             Base.AddMinutes(1)));
         await db.SaveChangesAsync();
 
@@ -387,6 +401,42 @@ public class AttentionRollupTests
         await db.SaveChangesAsync();
 
         (await QueryAsync(db)).Items.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task CardPredicate_ReadsExactlyTheWaitBearingCardTypes()
+    {
+        // The other card types (TaskStep, JobInitialized, InternalConsultation) are the common case by
+        // volume and carry no wait, so they must never leave the database on a polled endpoint.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        foreach (var type in new[]
+                 {
+                     TimelineCardType.PlanApproval, TimelineCardType.DiscoveryQa,
+                     TimelineCardType.TurnInterrupted, TimelineCardType.Escalation3R,
+                     TimelineCardType.PrReview
+                 })
+        {
+            db.JobTimelineCards.Add(NewCard(jobId, type, TimelineCardStatus.PendingInput, $"{type} gate"));
+        }
+
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.TaskStep, TimelineCardStatus.PendingInput, "noise"));
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.JobInitialized, TimelineCardStatus.Active, "noise"));
+        db.JobTimelineCards.Add(NewCard(Guid.NewGuid(), TimelineCardType.PlanApproval,
+            TimelineCardStatus.PendingInput, "another job"));
+        await db.SaveChangesAsync();
+
+        var loaded = await db.JobTimelineCards.AsNoTracking()
+            .Where(AttentionQueryService.CardPredicate([jobId.ToString()]))
+            .Select(c => c.CardType)
+            .ToListAsync();
+
+        loaded.Should().BeEquivalentTo(new[]
+        {
+            TimelineCardType.PlanApproval, TimelineCardType.DiscoveryQa,
+            TimelineCardType.TurnInterrupted, TimelineCardType.Escalation3R,
+            TimelineCardType.PrReview
+        });
     }
 
     [Fact]
@@ -410,15 +460,16 @@ public class AttentionRollupTests
     [Fact]
     public async Task BusyHeartbeat_StillSurfacesAnUnansweredAsk()
     {
-        // The mirror of the test above, and the reason the ledger is not simply last in line: parking
-        // the session does not rewrite the heartbeat, so "Executing task #3" here is a job that is
+        // The mirror of the test above, and the reason the escalation card is not simply last in line:
+        // parking the session does not rewrite the heartbeat, so "Executing task #3" here is a job that is
         // blocked on a human while looking busy.
         using var db = TestDbContextFactory.Create();
         var jobId = Guid.NewGuid();
         SeedProject(db, "alpha");
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: "Executing task #3: wire the bell"));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "Do you want the chime on by default?",
-            """{"requiresReply":true,"targetPersona":"operator","senderPersona":"rook"}""",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.PendingInput,
+            "Escalation from @rook to @operator",
+            """{"content":"Do you want the chime on by default?","requiresReply":true,"targetPersona":"operator"}""",
             Base.AddMinutes(2)));
         await db.SaveChangesAsync();
 
@@ -435,8 +486,9 @@ public class AttentionRollupTests
         db.ProjectJobs.Add(NewJob(jobId, heartbeat: null));
         db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.PlanApproval, TimelineCardStatus.PendingInput,
             "Plan Approval: Proposed Implementation Checklist"));
-        db.JobMessages.Add(NewMessage(jobId, "persona", "Also: is the target branch right?",
-            """{"requiresReply":true,"targetPersona":"operator","senderPersona":"rook"}""",
+        db.JobTimelineCards.Add(NewCard(jobId, TimelineCardType.Escalation3R, TimelineCardStatus.PendingInput,
+            "Escalation from @rook to @operator",
+            """{"content":"Also: is the target branch right?","requiresReply":true,"targetPersona":"operator"}""",
             Base.AddMinutes(1)));
         await db.SaveChangesAsync();
 
@@ -513,36 +565,25 @@ public class AttentionRollupTests
         => AttentionQueryService.ClassifyHeartbeat(heartbeat).Should().BeNull();
 
     [Theory]
-    [InlineData(null, false)]
-    [InlineData("", false)]
-    [InlineData("{}", false)]
-    [InlineData("not json", false)]
-    [InlineData("[1,2,3]", false)]
-    [InlineData("""{"requiresReply":false,"targetPersona":"operator"}""", false)]
-    [InlineData("""{"prNumber":1,"prUrl":"https://example.invalid/1"}""", false)]
+    // A card's PendingInput status is the wait; the payload only says who has to answer. So only an
+    // explicit other target, or an explicit "this is not a request", suppresses the item — a missing or
+    // unreadable payload must never swallow a real park.
+    [InlineData(null, true)]
+    [InlineData("", true)]
+    [InlineData("{}", true)]
+    [InlineData("not json", true)]
+    [InlineData("[1,2,3]", true)]
+    [InlineData("""{"content":"hi"}""", true)]
+    [InlineData("""{"targetPersona":"operator"}""", true)]
+    [InlineData("""{"targetPersona":"@Operator"}""", true)]
+    [InlineData("""{"targetPersona":null}""", true)]
+    [InlineData("""{"targetPersona":""}""", true)]
     [InlineData("""{"requiresReply":true,"targetPersona":"astra"}""", false)]
-    [InlineData("""{"requiresReply":true,"targetPersona":""}""", true)]
-    [InlineData("""{"requiresReply":true}""", true)]
-    [InlineData("""{"requiresReply":true,"targetPersona":null}""", true)]
-    [InlineData("""{"requiresReply":true,"targetPersona":"operator"}""", true)]
-    [InlineData("""{"requiresReply":true,"targetPersona":"@Operator"}""", true)]
-    [InlineData("""{"requiresReply":"true","targetPersona":"operator"}""", true)]
-    public void OnlyAnAskDirectedAtTheHumanCounts(string? payload, bool expected)
-        => AttentionQueryService.RequiresOperatorReply(payload).Should().Be(expected);
-
-    [Fact]
-    public void PrLinkage_IsReadFromTheLedgerPayload_OrAbsent()
-    {
-        AttentionQueryService.TryReadPrLinkage(
-            """{"prNumber":"7","prUrl":"https://example.invalid/7","source":"mcp:open_pull_request"}""",
-            out var asStrings).Should().BeTrue();
-        asStrings.Url.Should().Be("https://example.invalid/7");
-        asStrings.Number.Should().Be(7);
-
-        AttentionQueryService.TryReadPrLinkage("""{"source":"mcp:post_job_message"}""", out _)
-            .Should().BeFalse("a chat row carries no PR and must not be mistaken for a review gate");
-        AttentionQueryService.TryReadPrLinkage("{", out _).Should().BeFalse();
-    }
+    [InlineData("""{"requiresReply":true,"targetPersona":"@sorren"}""", false)]
+    [InlineData("""{"requiresReply":false,"targetPersona":"operator"}""", false)]
+    [InlineData("""{"requiresReply":"false","targetPersona":"operator"}""", false)]
+    public void OnlyAnAskAddressedElsewhere_IsSuppressed(string? payload, bool expected)
+        => AttentionQueryService.EscalationAwaitsOperator(payload).Should().Be(expected);
 
     [Fact]
     public void PayloadProse_DegradesInsteadOfThrowing()
@@ -620,24 +661,6 @@ public class AttentionRollupTests
             StructuredPayloadJson = payload,
             CreatedAt = createdAt ?? Base,
             UpdatedAt = createdAt ?? Base
-        };
-
-    private static JobMessage NewMessage(
-        Guid jobId,
-        string senderType,
-        string content,
-        string? payload = null,
-        DateTimeOffset? createdAt = null)
-        => new()
-        {
-            JobId = jobId,
-            SenderType = senderType,
-            SenderId = senderType == "user" ? "operator" : "rook",
-            SenderName = senderType == "user" ? "operator" : "rook",
-            Content = content,
-            MentionsJson = "[]",
-            StructuredPayloadJson = payload,
-            CreatedAt = createdAt ?? Base
         };
 }
 
@@ -734,55 +757,8 @@ public class AttentionRollupSqlTranslationTests
         sql.Should().Contain("FROM job_timeline_cards");
         sql.Should().Contain("job_id");
         sql.Should().Contain("card_type");
-    }
-
-    [Fact]
-    public void LedgerPredicate_RendersAgainstJobMessages_AndSkipsUnstructuredChat()
-    {
-        using var db = TestDbContextFactory.Postgres();
-
-        var sql = db.JobMessages.AsNoTracking()
-            .Where(AttentionQueryService.LedgerPredicate([Guid.NewGuid()]))
-            .ToQueryString();
-
-        sql.Should().Contain("FROM job_messages");
-        sql.Should().Contain("job_id");
-        // The column is structured_payload, not the property's ...Json suffix — pinned because a
-        // predicate that silently stopped filtering would pull every chat row of every open job. The
-        // SELECT list always projects the column, so the assertion is on the predicate, not the name.
-        sql.Should().Contain("structured_payload IS NOT NULL");
-    }
-
-    [Fact]
-    public void HumanReplyPredicate_RendersAgainstJobMessages_AndIsNotThePayloadQuery()
-    {
-        using var db = TestDbContextFactory.Postgres();
-
-        var sql = db.JobMessages.AsNoTracking()
-            .Where(AttentionQueryService.HumanReplyPredicate([Guid.NewGuid()]))
-            .ToQueryString();
-
-        sql.Should().Contain("FROM job_messages");
-        sql.Should().Contain("sender_type IN");
-        // Replies carry no payload. If this predicate ever grows the payload filter it stops finding
-        // the rows that close an escalation, and the bell rings forever.
-        sql.Should().NotContain("structured_payload IS NOT NULL");
-    }
-
-    [Fact]
-    public void LatestReplyAggregate_RendersAndNeedsNoClientSideWalk()
-    {
-        using var db = TestDbContextFactory.Postgres();
-
-        var sql = db.JobMessages.AsNoTracking()
-            .Where(AttentionQueryService.HumanReplyPredicate([Guid.NewGuid()]))
-            .GroupBy(m => m.JobId)
-            .Select(g => new { JobId = g.Key, RepliedAt = g.Max(m => m.CreatedAt) })
-            .ToQueryString();
-
-        // Translation, not execution: a GroupBy+Max the provider cannot push down would materialise
-        // every reply row of every open job on every poll of the endpoint.
-        sql.Should().Contain("GROUP BY");
-        sql.Should().Contain("max(");
+        // Status is filtered in memory, not here: the five types do not share one "this is a live wait"
+        // status, and a per-type status test in SQL would run on every poll of the endpoint.
+        sql.Should().NotContain("status = @");
     }
 }
