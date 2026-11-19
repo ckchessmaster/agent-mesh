@@ -715,19 +715,33 @@ describe('AttentionBell', () => {
     expect(screen.queryByTestId('attention-enable-desktop-alerts')).toBeNull();
   });
 
-  it('mutes desktop alerts from the popover footer and shows the muted bell', async () => {
+  it('mutes desktop alerts from the header switch and shows the muted bell', async () => {
     const service = makeService();
-    mountBell([makeItem()], { service });
+    // The header mounts the only master switch; the bell popover reports permission state only.
+    render(
+      <>
+        <MuteToggle service={service} compact />
+        <AttentionBell
+          service={service}
+          fetchRollup={async () => rollup(makeItem())}
+          storage={window.localStorage}
+          pollIntervalMs={0}
+          now={() => NOW}
+        />
+      </>
+    );
     await screen.findByTestId('attention-badge');
 
-    openBell();
-    const toggle = await screen.findByTestId('notification-mute-toggle');
+    const toggle = screen.getByTestId('notification-mute-toggle');
     expect(toggle).toHaveAttribute('aria-pressed', 'false');
 
     fireEvent.click(toggle);
     expect(window.localStorage.getItem(MUTE_STORAGE_KEY)).toBe('true');
     expect(toggle).toHaveAttribute('aria-pressed', 'true');
     expect(bellButton()).toHaveAccessibleName(/desktop alerts muted/);
+
+    openBell();
+    expect(screen.getAllByTestId('notification-mute-toggle')).toHaveLength(1);
   });
 
   it('follows a mute change made elsewhere through the service subscription', async () => {

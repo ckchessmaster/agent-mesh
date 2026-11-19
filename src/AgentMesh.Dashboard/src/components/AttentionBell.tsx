@@ -577,13 +577,13 @@ export const AttentionBell = forwardRef<AttentionBellHandle, AttentionBellProps>
     );
   } else if (permission === 'denied') {
     footerHint = (
-      <span data-testid="attention-desktop-alerts-denied" className="text-[10px] text-slate-500 text-right">
+      <span data-testid="attention-desktop-alerts-denied" className="text-[10px] text-slate-500">
         Desktop alerts blocked — allow them in site settings
       </span>
     );
   } else if (permission === 'unsupported') {
     footerHint = (
-      <span data-testid="attention-desktop-alerts-unsupported" className="text-[10px] text-slate-500 text-right">
+      <span data-testid="attention-desktop-alerts-unsupported" className="text-[10px] text-slate-500">
         {service.unsupportedReason() === 'insecure-context'
           ? 'Desktop alerts need HTTPS or localhost'
           : 'Desktop alerts unsupported here'}
@@ -745,8 +745,14 @@ export const AttentionBell = forwardRef<AttentionBellHandle, AttentionBellProps>
             </div>
           )}
 
-          <div className="sticky bottom-0 bg-slate-900/95 backdrop-blur border-t border-slate-800 px-3 py-2 flex items-center justify-between gap-2">
-            <MuteToggle service={service} />
+          {/*
+            Permission status only. The master mute control deliberately lives in the header
+            (`MuteToggle`, mounted by `App.tsx`) rather than in here: it has to be reachable without
+            opening the inbox, and a second copy of the same switch twenty pixels below the first one
+            is a control that lies about how many switches there are. `permission()` has exactly four
+            states and every one of them renders a hint above, so this row is never empty.
+          */}
+          <div className="sticky bottom-0 bg-slate-900/95 backdrop-blur border-t border-slate-800 px-3 py-2 flex items-center gap-2 min-h-[34px]">
             {footerHint}
           </div>
         </div>
