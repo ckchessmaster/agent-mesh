@@ -84,6 +84,39 @@ public class AgyAdapterArgumentTests
     }
 
     [Fact]
+    public void Effort_IsOmittedWhenIncludeEffortIsFalse()
+    {
+        // The retry path after agy rejects a model+effort pair: a valid effort must disappear
+        // entirely so the model applies its own default.
+        var psi = new ProcessStartInfo { FileName = "agy" };
+        AgyAdapter.AddAgySelectionArguments(psi, new PromptReceivedEvent
+        {
+            Model = "gemini-pro-orchestrator-neon",
+            Effort = "high"
+        }, includeEffort: false);
+
+        var args = Flatten(psi);
+        args.Should().NotContain("--effort");
+        args.Should().Contain("--model");
+    }
+
+    [Theory]
+    [InlineData("error: invalid model selection (--model \"gemini-pro-orchestrator-neon\" --effort \"high\"): --effort is not supported for model \"gemini-pro-orchestrator-neon\"", true)]
+    [InlineData("error: --effort is not supported for model \"gemini-pro-orchestrator-neon\"", true)]
+    [InlineData("error: model X does not support --effort", true)]
+    [InlineData("warning: --mode auto is not available for this account; continuing in the default mode.", false)]
+    [InlineData("error: model \"some-unknown-model\" not found", false)]
+    [InlineData("error: not authenticated; run agy login", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void LooksLikeModelEffortRejection_MatchesTheBinaryRejectionAndNothingElse(string? stdErr, bool expected)
+    {
+        // The retry only fires on this one failure class; an auth or unknown-model failure retried
+        // without --effort would burn a second invocation on a fault the flag cannot fix.
+        AgyAdapter.LooksLikeModelEffortRejection(stdErr).Should().Be(expected);
+    }
+
+    [Fact]
     public void ContextSize_IsNeverForwardedBecauseAgyHasNoFlagForIt()
     {
         // agy --help exposes --model, --effort, --mode, --agent and no context-size flag. The old

@@ -102,6 +102,67 @@ public class CopilotAdapterStreamingTests
         content.Should().Be("Analyzing Helm chart persistence templates...");
     }
 
+    /// <summary>
+    /// The incident of 2026-11-18: the copilot CLI's `session.*` control events
+    /// (mcp_server_status_changed, background_tasks_changed, all `"ephemeral":true`) matched no
+    /// branch, the parser returned false, and the caller's non-JSON text fallback appended every
+    /// one to the response builder - two sessions settled with ~500KB event-dump "replies".
+    /// These events must be claimed by the parser so they never reach the text fallback.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"type":"session.background_tasks_changed","data":{},"ephemeral":true,"id":"1f6d41f5-93fd-4112-a769-0551879bd216","timestamp":"2026-11-18T22:17:01.571Z","parentId":"cc515dff-2475-422d-bc5a-b0c7f2518291"}""")]
+    [InlineData("""{"type":"session.mcp_server_status_changed","data":{"serverName":"github-mcp-server","status":"pending"},"ephemeral":true,"id":"d86f1dc9-8d2d-4300-bc05-412ed8d527d8","timestamp":"2026-11-18T21:49:17.041Z"}""")]
+    [InlineData("""{"type":"session.mcp_server_tools_loaded","data":{"serverName":"github-mcp-server","tools":[]},"ephemeral":true}""")]
+    [InlineData("""{"type":"ping","data":{},"ephemeral":true}""")]
+    [InlineData("""{"type":"session.thinking_toggled","data":{"enabled":true},"ephemeral":true}""")]
+    public void TryParseCopilotJsonLine_ControlPlaneEvents_AreClaimedWithNoContent(string line)
+    {
+        var parsed = CopilotAdapter.TryParseCopilotJsonLine(
+            line,
+            out var eventType,
+            out var content,
+            out _, out _, out _, out _, out _);
+
+        parsed.Should().BeTrue($"a line the parser rejects falls through to the raw-text fallback and pollutes the reply: {line}");
+        content.Should().BeNullOrWhiteSpace();
+        eventType.Should().NotBeNullOrWhiteSpace();
+    }
+
+    [Fact]
+    public void TryParseCopilotJsonLine_SessionNamespacedContentEvents_StillMapToHandlers()
+    {
+        // Prefix-stripping must route real content through the normal handlers, not the
+        // control-event claim: the two are indistinguishable at the namespace level.
+        var parsed = CopilotAdapter.TryParseCopilotJsonLine(
+            """{"type":"session.assistant.message","data":{"content":"PR opened"}}""",
+            out var eventType, out var content, out _, out _, out _, out _, out _);
+
+        parsed.Should().BeTrue();
+        eventType.Should().Be("message");
+        content.Should().Be("PR opened");
+
+        parsed = CopilotAdapter.TryParseCopilotJsonLine(
+            """{"type":"session.assistant.reasoning_delta","data":{"delta":"checking"}}""",
+            out eventType, out content, out _, out _, out _, out _, out _);
+
+        parsed.Should().BeTrue();
+        eventType.Should().Be("thought_delta");
+        content.Should().Be("checking");
+    }
+
+    [Fact]
+    public void TryParseCopilotJsonLine_UnknownNonEphemeralJson_StillFallsBack()
+    {
+        // Deliberately narrow: only namespaced or ephemeral events are claimed. An unknown event
+        // shape the CLI actually emits as prose-ish JSON keeps the old raw-text behavior so we do
+        // not silently swallow output we have not learned to parse.
+        var parsed = CopilotAdapter.TryParseCopilotJsonLine(
+            """{"type":"some_future_notice","data":{"content":"hello"}}""",
+            out _, out _, out _, out _, out _, out _, out _);
+
+        parsed.Should().BeFalse();
+    }
+
     [Fact]
     public void TryParseCopilotJsonLine_ToolCallShell_ExtractsToolAndSummary()
     {
