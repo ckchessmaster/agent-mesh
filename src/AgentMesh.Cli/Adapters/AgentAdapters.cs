@@ -1045,7 +1045,23 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
         if (agyPath != null)
         {
-            await ExecuteRealAgyStreamAsync(agyPath, cwd, preset, promptEvent, onEvent, ct);
+            var outcome = await ExecuteRealAgyStreamAsync(agyPath, cwd, preset, promptEvent, onEvent, ct);
+            if (outcome == AgyRunOutcome.EffortRejectedByModel)
+            {
+                // Not every agy model accepts --effort; `agy` treats the combination as an invalid
+                // model selection and exits without producing any turn output. The mesh's effort
+                // contract is driver-level, so it cannot know which model-effort pairs the binary
+                // accepts; the rejection itself is the authoritative signal. Drop the flag once and
+                // let the model apply its own reasoning default rather than failing the turn.
+                await onEvent(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[@{preset.Id}] agy rejected `--effort {promptEvent.Effort?.Trim()}` for model " +
+                        $"\"{promptEvent.Model?.Trim()}\" - this model has no effort levels. Retrying the turn " +
+                        "without the flag; the model will use its own reasoning default."
+                });
+                await ExecuteRealAgyStreamAsync(agyPath, cwd, preset, promptEvent, onEvent, ct, includeEffort: false);
+            }
             return;
         }
 
@@ -1427,6 +1443,12 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
     /// apply its own default, whereas substituting fabricates a choice the user never made.
     /// </item>
     /// <item>
+    /// <paramref name="includeEffort"/> suppresses <c>--effort</c> entirely. It exists for the retry
+    /// in <see cref="ExecutePromptAsync"/>: some models (e.g. <c>gemini-pro-orchestrator-neon</c>)
+    /// accept no effort value at all and agy exits with "invalid model selection" when the pair is
+    /// passed, so the mesh re-invokes without the flag instead of failing the turn.
+    /// </item>
+    /// <item>
     /// There is deliberately no context-size flag. <c>agy --help</c> exposes none, which is why the
     /// capability surface reports <c>supportsContextSelection: false</c> for this driver and the
     /// dashboard hides the picker.
@@ -1439,7 +1461,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         CancellationToken ct = default)
         => DriverCapabilityDescriber.DescribeAgyAsync(preset, ct);
 
-    internal static string? AddAgySelectionArguments(ProcessStartInfo psi, PromptReceivedEvent promptEvent)
+    internal static string? AddAgySelectionArguments(ProcessStartInfo psi, PromptReceivedEvent promptEvent, bool includeEffort = true)
     {
         string? resolvedModel = null;
         if (!string.IsNullOrWhiteSpace(promptEvent.Model))
@@ -1458,7 +1480,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             psi.ArgumentList.Add(resolvedModel);
         }
 
-        if (!string.IsNullOrWhiteSpace(promptEvent.Effort))
+        if (includeEffort && !string.IsNullOrWhiteSpace(promptEvent.Effort))
         {
             var rawEffort = promptEvent.Effort.Trim().ToLowerInvariant();
             if (DriverEffortContracts.Supports(DriverAdapters.Agy, rawEffort))
@@ -1477,13 +1499,46 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
         return resolvedModel;
     }
 
-    private static async Task ExecuteRealAgyStreamAsync(
+    /// <summary>
+    /// How an <c>agy</c> invocation ended, from the mesh's point of view.
+    /// </summary>
+    internal enum AgyRunOutcome
+    {
+        /// <summary>The stream completed (including "completed with a failure message" - see the fallback path).</summary>
+        Completed,
+        /// <summary>
+        /// The binary exited non-zero before producing any output because the
+        /// model+effort pair was rejected ("--effort is not supported for model").
+        /// The caller may retry once without <c>--effort</c>.
+        /// </summary>
+        EffortRejectedByModel
+    }
+
+    /// <summary>
+    /// Detects agy's model+effort rejection on stderr. The binary prints e.g.
+    /// <c>error: invalid model selection (--model "X" --effort "high"): --effort is not supported for model "X"</c>
+    /// and exits without streaming a turn. Matched on the flag token plus a rejection phrase so a
+    /// different startup failure (bad auth, unknown model) is not mistaken for this one.
+    /// </summary>
+    internal static bool LooksLikeModelEffortRejection(string? stdErr)
+    {
+        if (string.IsNullOrWhiteSpace(stdErr)) return false;
+        var s = stdErr.ReplaceLineEndings(" ");
+        if (!s.Contains("--effort", StringComparison.OrdinalIgnoreCase)) return false;
+        return s.Contains("is not supported", StringComparison.OrdinalIgnoreCase)
+            || s.Contains("does not support", StringComparison.OrdinalIgnoreCase)
+            || s.Contains("unsupported", StringComparison.OrdinalIgnoreCase)
+            || s.Contains("invalid", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<AgyRunOutcome> ExecuteRealAgyStreamAsync(
         string agyExecutable,
         string cwd,
         AgentPresetConfig preset,
         PromptReceivedEvent promptEvent,
         Func<TrajectoryEventPayload, Task> onEvent,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool includeEffort = true)
     {
         var psi = new ProcessStartInfo
         {
@@ -1515,7 +1570,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             psi.ArgumentList.Add(activeConvId);
         }
 
-        string? resolvedModel = AddAgySelectionArguments(psi, promptEvent);
+        string? resolvedModel = AddAgySelectionArguments(psi, promptEvent, includeEffort);
 
         var attachedBlock = AgentAdapterFactory.FormatAttachedFilesBlock(promptEvent.Attachments);
         var agyPromptText = string.IsNullOrWhiteSpace(attachedBlock)
@@ -1644,7 +1699,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             $"{TurnStallPolicy.DriverStreamIdleLimitEnvVar} if this driver legitimately runs longer than that."
                     });
                     AgentAdapterFactory.KillProcessTree(proc);
-                    return;
+                    return AgyRunOutcome.Completed;
                 }
 
                 var line = agyRead.Line;
@@ -1720,7 +1775,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                 }
                                 await onEvent(askQ.ToolCallEvent);
                                 AgentAdapterFactory.KillProcessTree(proc);
-                                return;
+                                return AgyRunOutcome.Completed;
                             }
                         }
                         var stepType = step.TryGetProperty("step_type", out var stProp) ? stProp.GetString() : null;
@@ -2014,7 +2069,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                                         EventType = "response",
                                         Content = detailsSb.ToString()
                                     });
-                                    return;
+                                    return AgyRunOutcome.Completed;
                                 }
                             }
                         }
@@ -2144,7 +2199,7 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                     await onEvent(askQ.ToolCallEvent);
                     AgentAdapterFactory.KillProcessTree(proc);
-                    return;
+                    return AgyRunOutcome.Completed;
                 }
             }
 
@@ -2152,6 +2207,15 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
             var stdErr = await proc.StandardError.ReadToEndAsync(ct);
             await proc.WaitForExitAsync(ct);
             ct.ThrowIfCancellationRequested();
+
+            if (includeEffort && proc.ExitCode != 0 && !emittedFinalResult &&
+                streamedResponseBuilder.Length == 0 && currentStepTextBuilder.Length == 0 &&
+                LooksLikeModelEffortRejection(stdErr))
+            {
+                // The binary never started the turn; the caller retries without --effort. Emitting
+                // nothing here keeps the failed first attempt out of the transcript.
+                return AgyRunOutcome.EffortRejectedByModel;
+            }
 
             if (!emittedFinalResult)
             {
@@ -2170,13 +2234,21 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 }
 
                 var fallbackText = streamedResponseBuilder.ToString().Trim();
+                // A non-zero exit with nothing streamed is a failed driver run, not a reply. Marking
+                // it "response" let the turn settle as success with the error text standing in for
+                // the persona's answer, which the turn runner then fed back into the conversation.
+                var isFailedRun = proc.ExitCode != 0 && streamedResponseBuilder.Length == 0;
                 if (string.IsNullOrWhiteSpace(fallbackText) && !string.IsNullOrWhiteSpace(stdErr))
                 {
-                    fallbackText = stdErr.Trim();
+                    fallbackText = isFailedRun
+                        ? $"Driver `agy` for agent `@{preset.Id}` failed (exit code {proc.ExitCode}) before producing any output.\n\n{stdErr.Trim()}"
+                        : stdErr.Trim();
                 }
                 if (string.IsNullOrWhiteSpace(fallbackText))
                 {
-                    fallbackText = $"Agent `@{preset.Id}` finished execution (exit code {proc.ExitCode}).";
+                    fallbackText = isFailedRun
+                        ? $"Driver `agy` for agent `@{preset.Id}` failed with exit code {proc.ExitCode} and no output."
+                        : $"Agent `@{preset.Id}` finished execution (exit code {proc.ExitCode}).";
                 }
 
                 if (lastTotalTokens == 0 && (lastInputTokens > 0 || lastOutputTokens > 0))
@@ -2209,11 +2281,13 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 ct.ThrowIfCancellationRequested();
                 await onEvent(new TrajectoryEventPayload
                 {
-                    EventType = "response",
+                    EventType = isFailedRun ? "error" : "response",
                     Content = fallbackText,
                     StructuredPayloadJson = structuredJson
                 });
             }
+
+            return AgyRunOutcome.Completed;
         }
         catch (OperationCanceledException)
         {
@@ -3378,6 +3452,18 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             var data = root.TryGetProperty("data", out var dProp) ? dProp : root;
 
+            // The CLI namespaces its internal state-sync events under `session.` and flags them
+            // `"ephemeral":true` (MCP server status, background-task churn, heartbeats). Classify
+            // on the type with the prefix stripped so content events like
+            // `session.assistant.message` still map to their handlers, but the control-plane ones
+            // are identified below and never reach the raw-text fallback. Two 500KB blobs of
+            // `session.background_tasks_changed` lines once became the persona's entire reply.
+            var lower = rawType.ToLowerInvariant();
+            var isNamespaced = lower.StartsWith("session.", StringComparison.Ordinal);
+            var isEphemeral = root.TryGetProperty("ephemeral", out var ephemeralProp) &&
+                              ephemeralProp.ValueKind == JsonValueKind.True;
+            var kind = isNamespaced ? lower["session.".Length..] : lower;
+
             if (root.TryGetProperty("sessionId", out var sidRoot) && sidRoot.ValueKind == JsonValueKind.String)
             {
                 sessionId = sidRoot.GetString();
@@ -3396,15 +3482,13 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 usageJson = uData.GetRawText();
             }
 
-            var lower = rawType.ToLowerInvariant();
-
             if (lower == "session.start")
             {
                 eventType = "session.start";
                 return true;
             }
 
-            if (lower is "session.task_complete" or "task_complete" or "task.complete")
+            if (kind is "task_complete" or "task.complete" or "turn.completed")
             {
                 eventType = "task_complete";
                 taskCompleteSummary = ExtractTaskCompleteSummary(data) ?? ExtractTaskCompleteSummary(root);
@@ -3412,16 +3496,20 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return true;
             }
 
-            if (lower is "assistant.reasoning" or "thought" or "reasoning" || lower.Contains("reasoning") || lower.Contains("thinking"))
+            if (kind is "assistant.reasoning" or "thought" or "reasoning" || kind.Contains("reasoning") || kind.Contains("thinking"))
             {
-                eventType = lower.Contains("delta") ? "thought_delta" : "thought";
+                eventType = kind.Contains("delta") ? "thought_delta" : "thought";
                 content = OpenAiAdapter.GetPropertyString(data, "content", "text", "delta", "thinking");
-                return !string.IsNullOrWhiteSpace(content);
+                if (!string.IsNullOrWhiteSpace(content)) return true;
+                // A thought-shaped control event with no text (e.g. a thinking-mode toggle) is
+                // still control-plane noise, not an unparsed line.
+                if (isNamespaced || isEphemeral) { eventType = lower; return true; }
+                return false;
             }
 
             // Evaluate tool_result BEFORE tool_call so events like "tool.execution_complete"
             // map to tool_result rather than matching "execution" in tool_call!
-            if (lower.Contains("tool") && (lower.Contains("result") || lower.Contains("output") || lower.Contains("finish") || lower.Contains("done") || lower.Contains("complete")))
+            if (kind.Contains("tool") && (kind.Contains("result") || kind.Contains("output") || kind.Contains("finish") || kind.Contains("done") || kind.Contains("complete")))
             {
                 eventType = "tool_result";
                 toolName = ExtractToolName(data);
@@ -3439,7 +3527,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return true;
             }
 
-            if (lower.Contains("tool") && (lower.Contains("call") || lower.Contains("execution") || lower.Contains("start") || lower.Contains("use")))
+            if (kind.Contains("tool") && (kind.Contains("call") || kind.Contains("execution") || kind.Contains("start") || kind.Contains("use")))
             {
                 eventType = "tool_call";
                 if (data.TryGetProperty("args", out var a) ||
@@ -3472,14 +3560,16 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return true;
             }
 
-            if (lower is "assistant.message" or "message" or "content.delta" or "assistant.turn")
+            if (kind is "assistant.message" or "message" or "content.delta" or "assistant.turn")
             {
                 eventType = "message";
                 content = data.TryGetProperty("content", out var c) ? c.GetString() : (data.TryGetProperty("text", out var t) ? t.GetString() : (data.TryGetProperty("delta", out var d) ? d.GetString() : null));
-                return !string.IsNullOrWhiteSpace(content);
+                if (!string.IsNullOrWhiteSpace(content)) return true;
+                if (isNamespaced || isEphemeral) { eventType = lower; return true; }
+                return false;
             }
 
-            if (lower is "result" or "workflow.result")
+            if (kind is "result" or "workflow.result")
             {
                 eventType = "result";
                 if (data.TryGetProperty("result", out var res) && res.ValueKind == JsonValueKind.String)
@@ -3490,6 +3580,17 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 {
                     content = c.GetString();
                 }
+                return true;
+            }
+
+            // Control-plane event we understand the shape of but have no handler for
+            // (mcp_server_status_changed, background_tasks_changed, heartbeats...). Claim it so
+            // the caller's non-JSON text fallback never sees it; an event with no usable content
+            // must not become part of the reply. A future type that carries content should get a
+            // branch above, not a trip through raw passthrough.
+            if (isNamespaced || isEphemeral)
+            {
+                eventType = lower;
                 return true;
             }
 
