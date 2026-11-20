@@ -181,6 +181,13 @@ public class PrReviewPollingService(
     /// </summary>
     private readonly ConcurrentDictionary<Guid, string> _loggedUndeliverableKeys = new();
 
+    /// <summary>
+    /// Job id → the credential-skip reason already reported for it. A gate this poller cannot read
+    /// GitHub for is deaf, and deaf is exactly what an operator debugging a merged-but-unfinished
+    /// job needs to be told — once, at Information, rather than once a minute or never.
+    /// </summary>
+    private readonly ConcurrentDictionary<Guid, string> _loggedPollSkipReasons = new();
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!options.Value.Enabled)
@@ -253,6 +260,13 @@ public class PrReviewPollingService(
             .Select(j => j.Id)
             .ToListAsync(ct));
 
+        // A job the workflow never moved off the gate because it was completed or archived out from
+        // under a parked gate leaves its card saying "Awaiting Review" forever: the terminal skip
+        // below is correct for signal delivery but wrong for card lifecycle, and the stale card is
+        // exactly the kind of badge that outlives the truth it was written from (the merged-PR job
+        // this service finally released still showed its gate pending days later).
+        await ResolveTerminalGateCardsAsync(db, terminalJobs, logger, ct);
+
         var parkedJobs = new HashSet<Guid>();
 
         foreach (var card in cards)
@@ -287,8 +301,20 @@ public class PrReviewPollingService(
             {
                 if (string.Equals(snapshot.FailureReason, "no_credentials", StringComparison.Ordinal))
                 {
-                    logger.LogDebug(
-                        "PR review poll for job {JobId} skipped: {Message}", jobId, snapshot.Message);
+                    // Was a Debug line, which meant the most common way a parked gate goes deaf — the
+                    // author persona carries no GitHub token and the deployment configures none — was
+                    // invisible precisely when an operator was trying to work out why a merged PR had
+                    // not completed the job. Reported once per job now: the every-minute re-fire is
+                    // what dedupe is for, not a downgrade to silence.
+                    if (_loggedPollSkipReasons.TryAdd(jobId, "no_credentials"))
+                    {
+                        logger.LogInformation(
+                            "PR review poll for job {JobId} cannot read GitHub ({Pr}): no credentials " +
+                            "resolve for this gate (author persona '{Author}', no configured token). " +
+                            "GitHub-side decisions will not reach the workflow until a token is " +
+                            "attached to the persona or GitHub:Token is configured.",
+                            jobId, prRef, authorPersona ?? "unknown");
+                    }
                 }
                 else
                 {
@@ -399,6 +425,16 @@ public class PrReviewPollingService(
             }
         }
 
+        foreach (var jobId in _loggedPollSkipReasons.Keys)
+        {
+            // Same lifecycle as _deliveredKeys: a gate that stopped being parked (resolved, terminal,
+            // or credentials appeared and reads now succeed) can report a fresh skip reason later.
+            if (!parkedJobs.Contains(jobId))
+            {
+                _loggedPollSkipReasons.TryRemove(jobId, out _);
+            }
+        }
+
         foreach (var jobId in _ciReportedHeads.Keys)
         {
             // Terminal only, on purpose — see _ciReportedHeads. A job that finished can never park a
@@ -407,6 +443,95 @@ public class PrReviewPollingService(
             {
                 _ciReportedHeads.TryRemove(jobId, out _);
             }
+        }
+    }
+
+    /// <summary>
+    /// Closes PR-review gate cards a terminal job left <see cref="TimelineCardStatus.PendingInput"/>.
+    /// </summary>
+    /// <remarks>
+    /// The workflow moves its gate card when it merges or re-parks; a job completed or archived out
+    /// from under a parked gate — the <c>/complete</c> path, or an archive that never touched the
+    /// ledger — leaves the card pending forever. This service then skips the job as terminal every
+    /// tick without ever resolving the card, and the attention queue keeps advertising a review
+    /// nobody is waiting for. A job whose row says Completed/Archived is definitionally not awaiting
+    /// review, which is the same reading the terminal skip already applies to delivery; this applies
+    /// it to lifecycle. Idempotent by query: resolved cards stop matching, so the write happens once.
+    /// </remarks>
+    /// <returns>The number of cards closed, for logging and tests.</returns>
+    internal static async Task<int> ResolveTerminalGateCardsAsync(
+        AgentMeshDbContext db,
+        HashSet<Guid> terminalJobIds,
+        ILogger logger,
+        CancellationToken ct)
+    {
+        if (terminalJobIds.Count == 0)
+        {
+            return 0;
+        }
+
+        var terminalIdStrings = terminalJobIds.Select(id => id.ToString()).ToList();
+        var stale = await db.JobTimelineCards
+            .Where(c => c.CardType == TimelineCardType.PrReview &&
+                        c.Status == TimelineCardStatus.PendingInput &&
+                        terminalIdStrings.Contains(c.JobId))
+            .ToListAsync(ct);
+
+        foreach (var card in stale)
+        {
+            card.Status = TimelineCardStatus.Resolved;
+            card.UpdatedAt = DateTimeOffset.UtcNow;
+            card.StructuredPayloadJson = WithPayloadNote(card.StructuredPayloadJson,
+                "Job reached a terminal status with this gate still pending; the review poller closed " +
+                "the card because a completed or archived job is not waiting on a review.");
+        }
+
+        if (stale.Count > 0)
+        {
+            await db.SaveChangesAsync(ct);
+            logger.LogInformation(
+                "Closed {Count} PR-review gate card(s) left PendingInput on terminal jobs: {Jobs}",
+                stale.Count, string.Join(", ", stale.Select(c => c.JobId).Distinct()));
+        }
+
+        return stale.Count;
+    }
+
+    /// <summary>
+    /// Sets <c>note</c> on a gate card's structured payload, preserving every other field.
+    /// </summary>
+    /// <remarks>
+    /// Best-effort on purpose: a card whose payload will not parse gets its status moved and its
+    /// payload left exactly as found. A malformed jsonb blob must not throw a tick down and take
+    /// every other parked gate's poll — and therefore every other job's review delivery — with it.
+    /// </remarks>
+    internal static string? WithPayloadNote(string? payloadJson, string note)
+    {
+        if (string.IsNullOrWhiteSpace(payloadJson))
+        {
+            return payloadJson;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return payloadJson;
+            }
+
+            var fields = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                fields[prop.Name] = prop.Value.Clone();
+            }
+
+            fields["note"] = note;
+            return JsonSerializer.Serialize(fields);
+        }
+        catch (JsonException)
+        {
+            return payloadJson;
         }
     }
 

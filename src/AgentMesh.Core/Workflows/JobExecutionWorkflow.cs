@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
+using Microsoft.Extensions.Logging;
 using Temporalio.Api.Enums.V1;
 using Temporalio.Common;
 using Temporalio.Exceptions;
@@ -97,10 +98,59 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             _approvalPolicy = PlanApprovalPolicy.LeadOrHuman;
         }
 
-        return await ExecuteTimelineLoopAsync(input);
+        var result = await ExecuteTimelineLoopAsync(input);
+        if (!result.Success)
+        {
+            await SettleFailedOutcomeAsync(input.JobId, result.Message);
+        }
+
+        return result;
     }
 
     public Task<JobExecutionResult> RunAsync(JobExecutionInput input) => ExecuteJobAsync(input);
+
+    /// <summary>
+    /// Writes the workflow's own failure onto the job row before the run completes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every caller that starts this workflow starts it fire-and-forget — the API's two
+    /// <c>StartWorkflowAsync</c> sites and recovery's start all discard the handle, and no one awaits
+    /// the result. So a returned <c>Success: false</c> went into the void: in one incident a job
+    /// halted after 40 turns, the workflow completed as an honest failure, and the job row went on
+    /// claiming "Executing task" forever because there was nobody left to read the outcome. The
+    /// workflow is the only component that knows why it stopped, so it settles its own failure here,
+    /// through the same activity channel every other ledger write it makes uses.
+    /// </para>
+    /// <para>
+    /// Activity failures are logged and swallowed: an unreachable database must not replace the
+    /// job's real halt reason with a completion-time activity exception. Cancellation is not
+    /// swallowed — an operator-initiated cancel already writes its own truth to the row, and this
+    /// run owes that decision nothing further.
+    /// </para>
+    /// </remarks>
+    private async Task SettleFailedOutcomeAsync(string jobId, string? message)
+    {
+        var reason = string.IsNullOrWhiteSpace(message)
+            ? "the workflow halted without reporting a reason"
+            : message!.Trim();
+        _currentHeartbeat = reason.StartsWith("Halted", StringComparison.OrdinalIgnoreCase)
+            ? reason
+            : $"Halted: {reason}";
+
+        try
+        {
+            await Workflow.ExecuteActivityAsync(
+                (ITimelineActivities act) => act.PersistJobHaltAsync(new PersistJobHaltInput(jobId, reason)),
+                TimelineActivityOptions
+            );
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Workflow.Logger.LogWarning(ex,
+                "Could not persist halt outcome for job {JobId}: {Reason}", jobId, reason);
+        }
+    }
 
     private async Task<JobExecutionResult> ExecuteTimelineLoopAsync(JobExecutionInput input)
     {

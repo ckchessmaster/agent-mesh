@@ -111,4 +111,50 @@ public class JobLifecycleStatusTests
         // which case the line is bare. A trailing space must not defeat the badge.
         ProjectJobsController.DeriveLifecycleStatus(Job("Stalled:")).Should().Be("Stalled");
     }
+
+    [Fact]
+    public void AHaltedMarkerReadsAsBlocked()
+    {
+        // The cockpit's JobLifecycleStatus has always had a Blocked slot ("a gate is waiting on a
+        // human") and DeriveLifecycleStatus never produced it: a workflow whose run completed in
+        // failure — or whose halt text says the job is not progressing — rendered as plain
+        // InProgress. PersistJobHaltAsync now writes the "Halted:" prefix, and this is the half
+        // that turns it back into a badge.
+        ProjectJobsController.DeriveLifecycleStatus(
+            Job("Halted: no review on https://github.com/x/y/pull/9 within 7 days; halting."))
+            .Should().Be("Blocked");
+    }
+
+    [Fact]
+    public void AHaltedMarkerBeatsTheWorkQuotedInItsOwnReason()
+    {
+        // Same ordering reason as Stalled: halt reasons quote what the job was doing when the run
+        // stopped ("Task 0 (Add ... + EF configuration) failed: Halted after 40 turns" is real text
+        // from the incident), and the substring walk below would otherwise call it InProgress.
+        var job = Job("Halted: Task 0 (Add ProjectJob.AttachmentsJson + EF configuration) failed: " +
+                      "Halted after 40 turns without reaching a terminal state.");
+
+        ProjectJobsController.DeriveLifecycleStatus(job).Should().Be("Blocked");
+    }
+
+    [Fact]
+    public void StalledStillBeatsHalted()
+    {
+        // If a sweeper ever settles over a halted row, the stall marker is the fresher fact — and
+        // Stalled offers /recover, while Blocked offers an approval.
+        ProjectJobsController.DeriveLifecycleStatus(Job("Stalled: while Halted: waiting on review"))
+            .Should().Be("Stalled");
+    }
+
+    [Theory]
+    [InlineData("Awaiting Review: PR #98", "AwaitingReview")]
+    [InlineData("Awaiting PR review on https://github.com/x/y/pull/98", "AwaitingReview")]
+    public void ThePhrasingsTheGateCardTitleActuallyUsesReadAsAwaitingReview(string heartbeat, string expected)
+    {
+        // The original check matched "Awaiting pull request review" — a string nothing writes. The
+        // persisted heartbeat is copied from the gate card's title ("Awaiting Review: PR #98"), and
+        // the workflow's in-memory form is "Awaiting PR review on <url>". While the check missed both
+        // spellings, a job parked seven days waiting for a human rendered as plain InProgress.
+        ProjectJobsController.DeriveLifecycleStatus(Job(heartbeat)).Should().Be(expected);
+    }
 }
