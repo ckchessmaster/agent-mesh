@@ -32,7 +32,14 @@ Rules worth knowing before editing this area:
   answering the agent, and the row returns if the job clears and parks again.
 * **The master mute switch lives in the header only** — the popover footer reports permission state.
   A second copy of the same switch inside the popover it opens would be a control that lies about how
-  many switches exist.
+  many switches exist. `App.tsx` is the only caller of `MuteToggle`; `AttentionBell.tsx` renders none.
+* **`/api/attention` and `/api/dashboard/overview` answer different questions.** The bell answers "which
+  waits has this operator not been told about" (one item per job per wait, camelCase `type`, id
+  `{jobId}:{type}`); the Dashboard tab badge answers "how much of this board is stuck" (snake_case `kind`
+  plus `severity`, one row per card / session / job, and it also counts free-floating sessions in
+  `waiting_for_input` that have no card at all). Their counts may legitimately differ, and only the bell
+  banners. Do not rename a `type` string to make the two look consistent — see the frozen-names rule
+  above.
 
 ### Testing desktop alerts locally
 
