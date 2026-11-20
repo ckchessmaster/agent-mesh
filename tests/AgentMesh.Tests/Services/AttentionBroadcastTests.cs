@@ -592,6 +592,72 @@ public class AttentionBroadcastWriteSiteTests
         attention.Refreshed.Should().Equal(jobId.ToString());
     }
 
+    [Fact]
+    public async Task SessionsController_AskQuestionPark_AnnouncesTheEscalation()
+    {
+        // A persona parking mid-turn on ask_question is the loudest "I need you" in the product, and it is
+        // the one wait the API writes on its own account: the worker's card writes reach the notifier
+        // through POST /timeline/cards/{id}/notify-updated, but this route inserts the card inline. So the
+        // route is pinned here, through its real entry point, not by calling the private helper.
+        using var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        SeedProjectAndJob(db, jobId, "Executing task #1");
+
+        var persona = new Persona { Id = "persona-qa", Name = "QA Persona", DriverId = "agy" };
+        var session = new AgentSession
+        {
+            Id = Guid.NewGuid(),
+            Title = "Job Turn Session",
+            Status = "thinking",
+            PersonaId = persona.Id,
+            CreatorAgentId = "agy",
+            MetadataJson = JsonSerializer.Serialize(new { jobId = jobId.ToString() })
+        };
+        db.Personas.Add(persona);
+        db.AgentSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        // Nothing waits before the route runs, so the announcement afterwards is caused by this write.
+        (await QueryService(db).QueryJobAsync(jobId)).Should().BeNull();
+
+        var attention = new RecordingAttentionNotifier();
+        var hub = new Mock<IHubContext<AgentMeshHub>>();
+        var clients = new Mock<IHubClients>();
+        var proxy = new Mock<IClientProxy>();
+        clients.Setup(c => c.All).Returns(proxy.Object);
+        clients.Setup(c => c.Group(It.IsAny<string>())).Returns(proxy.Object);
+        hub.Setup(h => h.Clients).Returns(clients.Object);
+        proxy
+            .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object?[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var controller = new SessionsController(db, hub.Object, attention: attention);
+        var questions = JsonSerializer.Serialize(new
+        {
+            questions = new[]
+            {
+                new { question = "Which DB?", options = new[] { "PG", "SQLite" }, is_multi_select = false }
+            }
+        });
+
+        var result = await controller.PostMessage(session.Id, new PostMessageRequest(
+            Content: "Asking database preference",
+            SenderAgentId: "agy",
+            EventType: "tool_call",
+            ToolName: "ask_question",
+            ToolArgsJson: questions,
+            StructuredPayloadJson: questions));
+
+        result.Should().BeOfType<CreatedAtActionResult>();
+        attention.Refreshed.Should().Equal(jobId.ToString());
+
+        // And what it announces is what the inbox now holds: the recomputed item, not a guessed one.
+        var item = await QueryService(db).QueryJobAsync(jobId);
+        item.Should().NotBeNull("the PendingInput Escalation3R this route writes is a wait the rollup reads");
+        item!.Type.Should().Be(AttentionTypes.Escalation);
+        item.Id.Should().Be($"{jobId}:{AttentionTypes.Escalation}");
+    }
+
     /// <summary>
     /// The read model behind the push, so a write-site test can assert what <c>GET /api/attention</c>
     /// would answer before and after the route runs. "The event fired" only means something if the state
