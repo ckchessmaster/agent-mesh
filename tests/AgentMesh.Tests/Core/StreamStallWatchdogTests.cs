@@ -75,9 +75,16 @@ public class StreamStallWatchdogTests
         // Six silent reads that each finish inside the window, for a total elapsed time well past it. A
         // watchdog built on a fixed total budget would cut this stream off around line three, killing a
         // healthy driver mid-turn — the exact class of bug this whole change must not introduce.
+        //
+        // The window used to be 60ms with 15ms reads, which kept the ratio but left only 45ms of
+        // absolute headroom per read — and a single GC pause or thread-starvation spike on a loaded CI
+        // runner eats 45ms for breakfast, turning this into a flake that reports a stall that never
+        // happened. Same ratio, scaled into ranges a scheduler cannot blink through: each read has
+        // ~390ms before it would trip the watchdog, while the 660ms total still clears the 500ms window
+        // that makes this test mean anything.
         var lines = Enumerable.Repeat((string?)"tick", 6).ToList();
-        using var stream = new FakeDriverStream(lines, delayPerRead: TimeSpan.FromMilliseconds(15));
-        var idle = TimeSpan.FromMilliseconds(60);
+        using var stream = new FakeDriverStream(lines, delayPerRead: TimeSpan.FromMilliseconds(110));
+        var idle = TimeSpan.FromMilliseconds(500);
 
         var seen = new List<string>();
         var completed = await StreamStallWatchdog.PumpAsync(
