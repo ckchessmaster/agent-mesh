@@ -1464,7 +1464,11 @@ public class ProjectJobsController(
     }
 
     [HttpPost("api/project-jobs/{id}/reopen")]
-    public async Task<IActionResult> ReopenJob(Guid id)
+    public async Task<IActionResult> ReopenJob(
+        Guid id,
+        [FromServices] IJobExecutionWorkflowGateway? gateway = null,
+        [FromServices] IJobTurnRecovery? recovery = null,
+        CancellationToken ct = default)
     {
         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
         if (job == null)
@@ -1476,9 +1480,49 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // Reopening without resuming is what produced the Notifications incident: `/complete` had
+        // cancelled the run, reopen flipped the row back to Active, and the persona kept taking
+        // dispatched turns on a job with `NoRunningWorkflow` — every escalation it filed to reach a
+        // human landed in the ledger instead, on loop, overnight. If this job had an orchestrator and
+        // that run has closed, reopen resumes it through the recovery path rather than resurrecting a
+        // UI-only zombie. Two shapes deliberately do not resume: a job that never had a run (that is
+        // the pre-start state `/start` owns), and a job whose run is still open (archive-without-
+        // cancel — the run never left, and starting a second one would double-own the workspace).
+        // A failed resume never fails the reopen: the row is already Active, and `/recover` can be
+        // called by hand; silently NOT resuming, however, is the bug being fixed, so it logs loud.
+        if (gateway is not null && recovery is not null)
+        {
+            try
+            {
+                var run = await gateway.FindRunAsync(id, ct);
+                if (run is { IsOpen: false })
+                {
+                    var resume = await recovery.RecoverAsync(
+                        id,
+                        new JobRecoveryRequest(Note:
+                            "Reopened by operator while its workflow run was closed; reopen resumed the " +
+                            "job from its recorded progress rather than leaving it without an orchestrator."),
+                        caller: "operator",
+                        ct: ct);
+                    logger?.LogInformation("Reopen of job {JobId} resumed its closed workflow: {Message}",
+                        id, resume.Message);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger?.LogWarning(ex,
+                    "Reopen of job {JobId} left it Active but NOT resumed — call /recover to restart its " +
+                    "orchestrator; until then escalations on this job have no workflow to answer them.", id);
+            }
+        }
+
         // Reopening puts the job back inside OpenJobsPredicate. If its last heartbeat still reads
         // "Awaiting plan approval" because the plan was never approved, that wait is real again and the
         // bell should say so; if it does not, this is the no-op the client cannot tell apart.
+        // Deliberately after the resume above: when a resume ran, recovery stamped the row with
+        // "Recovering: resuming at task…" — which supersedes whatever wait the pre-resume heartbeat
+        // carried — and the bell must read the state this request actually left behind, not the one
+        // it replaced mid-request.
         await attention.RefreshAttentionAsync(id);
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
@@ -1931,9 +1975,23 @@ public class ProjectJobsController(
             // made an abandoned turn look like a running one for thirteen hours.
             if (AgentMesh.Infrastructure.Services.TurnStallSettler.IsStalledHeartbeat(j.ProgressHeartbeat))
                 return "Stalled";
+            // The halt marker the workflow's own settle write leaves behind (PersistJobHaltAsync).
+            // Checked before the substring walk for the same reason Stalled is: a halt message quotes
+            // what the job was doing when it stopped, and the marker outranks the quote. This is the
+            // only producer the cockpit's Blocked badge has ever had a slot for.
+            if (j.ProgressHeartbeat.StartsWith("Halted", StringComparison.OrdinalIgnoreCase))
+                return "Blocked";
             if (j.ProgressHeartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase))
                 return "AwaitingApproval";
-            if (j.ProgressHeartbeat.Contains("Awaiting pull request review", StringComparison.OrdinalIgnoreCase))
+            // Broadened deliberately: the string this check was written against ("Awaiting pull
+            // request review") is not the string anything actually writes. The persisted writer is
+            // the gate card's title, "Awaiting Review: PR #98", and the workflow's in-memory form is
+            // "Awaiting PR review on <url>" — so AwaitingReview never derived, and a job parked
+            // seven days waiting for a human rendered as plain InProgress. The original phrase stays
+            // for rows written while it was the only spelling.
+            if (j.ProgressHeartbeat.Contains("Awaiting pull request review", StringComparison.OrdinalIgnoreCase) ||
+                j.ProgressHeartbeat.Contains("Awaiting Review", StringComparison.OrdinalIgnoreCase) ||
+                j.ProgressHeartbeat.Contains("Awaiting PR review", StringComparison.OrdinalIgnoreCase))
                 return "AwaitingReview";
             if (j.ProgressHeartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase))
                 return "Planning";

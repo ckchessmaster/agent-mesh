@@ -32,6 +32,7 @@ public class JobExecutionWorkflowTests
             .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
             .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
             .AddActivity((Func<AppendRemediationTasksInput, Task<IReadOnlyList<ProposedChecklistItem>>>)timeline.AppendRemediationTasksAsync)
+            .AddActivity((Func<PersistJobHaltInput, Task>)timeline.PersistJobHaltAsync)
             .AddActivity((Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>)execution.RunAgentCodingTurnAsync)
             .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>()
@@ -173,6 +174,10 @@ public class JobExecutionWorkflowTests
             git.MergeCalls.Should().BeEmpty();
             timeline.DecompositionInputs.Should().ContainSingle(
                 "halting is a decision, not another round of decomposition to spend the persona's turn on");
+            timeline.JobHaltInputs.Should().ContainSingle(
+                    "the result nobody reads must still be written to the job, or a halted workflow " +
+                    "leaves the row claiming whatever it was executing last")
+                .Which.Reason.Should().Contain(JobExecutionWorkflow.EmptyChecklistHaltMessage);
         }
         finally
         {
@@ -954,6 +959,7 @@ public class JobExecutionWorkflowTests
         public List<DecompositionActivityInput> DecompositionInputs { get; } = [];
         public List<UpdateTimelineCardStatusInput> UpdatedCards { get; } = [];
         public List<AppendRemediationTasksInput> AppendedRemediationBatches { get; } = [];
+        public List<PersistJobHaltInput> JobHaltInputs { get; } = [];
         public List<DiscoveryQuestion>? CustomDiscoveryQuestions { get; set; }
         public List<ProposedChecklistItem> CustomTasks { get; set; } =
         [
@@ -1009,6 +1015,13 @@ public class JobExecutionWorkflowTests
         {
             AppendedRemediationBatches.Add(input);
             return Task.FromResult(input.Tasks);
+        }
+
+        [Activity]
+        public Task PersistJobHaltAsync(PersistJobHaltInput input)
+        {
+            JobHaltInputs.Add(input);
+            return Task.CompletedTask;
         }
     }
 

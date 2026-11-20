@@ -1,5 +1,6 @@
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
+using AgentMesh.Infrastructure.Data;
 using AgentMesh.Infrastructure.Services;
 using AgentMesh.Tests.Helpers;
 using FluentAssertions;
@@ -414,5 +415,100 @@ public class PrReviewPollingServiceTests
             db, null, "bee", NullLogger<PrReviewPollingService>.Instance, default)).Should().BeNull();
         (await PrReviewPollingService.ResolvePersonaGithubTokenAsync(
             db, enc, null, NullLogger<PrReviewPollingService>.Instance, default)).Should().BeNull();
+    }
+
+    // ---- Terminal gate cards -----------------------------------------------
+
+    private static async Task<(AgentMeshDbContext Db, JobTimelineCard StaleGate, JobTimelineCard OtherPending,
+        JobTimelineCard LiveGate, Guid TerminalJob, Guid LiveJob)> SeedGateCardsAsync()
+    {
+        var db = TestDbContextFactory.Create();
+        var terminal = Guid.NewGuid();
+        var live = Guid.NewGuid();
+        var staleGate = new JobTimelineCard
+        {
+            JobId = terminal.ToString(),
+            CardType = TimelineCardType.PrReview,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Awaiting Review: PR #98",
+            StructuredPayloadJson = """{"prUrl":"https://github.com/x/y/pull/98","prNumber":98,"note":null}"""
+        };
+        var otherPending = new JobTimelineCard
+        {
+            JobId = terminal.ToString(),
+            CardType = TimelineCardType.Escalation3R,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Escalation from @rook to @operator"
+        };
+        var liveGate = new JobTimelineCard
+        {
+            JobId = live.ToString(),
+            CardType = TimelineCardType.PrReview,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Awaiting Review: PR #99"
+        };
+        db.JobTimelineCards.AddRange(staleGate, otherPending, liveGate);
+        await db.SaveChangesAsync();
+        return (db, staleGate, otherPending, liveGate, terminal, live);
+    }
+
+    [Fact]
+    public async Task TerminalJobs_HaveTheirPendingPrReviewCardsClosed_AndNothingElseTouched()
+    {
+        // A job whose row says Completed/Archived is definitionally not waiting on a review — the same
+        // reading the delivery skip already applies. Without this, `/complete` over a parked gate
+        // leaves a card advertising "Awaiting Review" forever, because the only writer that moves it
+        // (the workflow) is the thing that was cancelled.
+        var (db, staleGate, otherPending, liveGate, terminal, live) = await SeedGateCardsAsync();
+
+        var closed = await PrReviewPollingService.ResolveTerminalGateCardsAsync(
+            db, new HashSet<Guid> { terminal }, NullLogger<PrReviewPollingService>.Instance, default);
+
+        closed.Should().Be(1);
+        staleGate.Status.Should().Be(TimelineCardStatus.Resolved);
+        staleGate.StructuredPayloadJson.Should()
+            .Contain("prNumber").And.Contain("98", "the workflow's payload fields survive the note merge")
+            .And.Contain("terminal status", "the card says why it was closed");
+
+        otherPending.Status.Should().Be(TimelineCardStatus.PendingInput,
+            "this service closes the gate cards it polls, not every pending card a terminal job left");
+        liveGate.Status.Should().Be(TimelineCardStatus.PendingInput);
+
+        // Idempotent: a resolved card stops matching, so the sweep costs nothing on later ticks.
+        (await PrReviewPollingService.ResolveTerminalGateCardsAsync(
+            db, new HashSet<Guid> { terminal }, NullLogger<PrReviewPollingService>.Instance, default))
+            .Should().Be(0);
+        liveGate.Status.Should().Be(TimelineCardStatus.PendingInput,
+            "the live job never entered the terminal set, so its gate was never a write candidate");
+    }
+
+    [Fact]
+    public async Task ResolveTerminalGateCards_EmptyTerminalSet_WritesNothing()
+    {
+        var (db, staleGate, _, _, _, _) = await SeedGateCardsAsync();
+
+        (await PrReviewPollingService.ResolveTerminalGateCardsAsync(
+            db, new HashSet<Guid>(), NullLogger<PrReviewPollingService>.Instance, default)).Should().Be(0);
+
+        staleGate.Status.Should().Be(TimelineCardStatus.PendingInput);
+    }
+
+    [Fact]
+    public void WithPayloadNote_PreservesFields_ReplacesNote_StaysQuietOnUnreadableJson()
+    {
+        var merged = PrReviewPollingService.WithPayloadNote(
+            """{"prUrl":"https://x/1","prNumber":1,"note":"old"}""", "new note");
+        using (var doc = System.Text.Json.JsonDocument.Parse(merged!))
+        {
+            doc.RootElement.GetProperty("prUrl").GetString().Should().Be("https://x/1");
+            doc.RootElement.GetProperty("prNumber").GetInt32().Should().Be(1);
+            doc.RootElement.GetProperty("note").GetString().Should().Be("new note");
+        }
+
+        // A card whose payload will not parse still gets its status moved by the caller; the payload
+        // must come back untouched rather than throw the tick down for every other parked gate.
+        PrReviewPollingService.WithPayloadNote("not json", "n").Should().Be("not json");
+        PrReviewPollingService.WithPayloadNote("[1,2]", "n").Should().Be("[1,2]");
+        PrReviewPollingService.WithPayloadNote(null, "n").Should().BeNull();
     }
 }

@@ -914,6 +914,37 @@ public class TimelineActivities(
     }
 
     [Activity]
+    public async Task PersistJobHaltAsync(PersistJobHaltInput input)
+    {
+        var job = await TryLoadJobAsync(input.JobId);
+        if (job is null)
+        {
+            logger.LogWarning("PersistJobHalt: job {JobId} not found; halt '{Reason}' not written.",
+                input.JobId, input.Reason);
+            return;
+        }
+
+        // A job the operator already finished or archived is not "halted" — writing over its terminal
+        // state would turn a deliberate close into a red Blocked badge, which is a worse lie than the
+        // race it guards against (the complete/archive path stamps its own truth on the row).
+        if (job.Status is ProjectJobStatus.Completed or ProjectJobStatus.Archived)
+        {
+            logger.LogInformation(
+                "PersistJobHalt: job {JobId} is already {Status}; not overwriting with halt '{Reason}'.",
+                job.Id, job.Status, input.Reason);
+            return;
+        }
+
+        job.ProgressHeartbeat = input.Reason.StartsWith("Halted", StringComparison.OrdinalIgnoreCase)
+            ? input.Reason
+            : $"Halted: {input.Reason}";
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await dbContext.SaveChangesAsync();
+
+        logger.LogInformation("Persisted halt for job {JobId}: {Heartbeat}", job.Id, job.ProgressHeartbeat);
+    }
+
+    [Activity]
     public async Task<Guid> UpdateTaskStepCardAsync(TaskStepCardInput input)
     {
         var existing = await dbContext.JobTimelineCards
