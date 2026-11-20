@@ -1,4 +1,4 @@
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AgentMesh.Api.Controllers;
@@ -68,7 +68,13 @@ public class PlatformMcpTools(
     // The production container registers it (Program.cs), and ApiServiceRegistrationTests pins that —
     // without that pin, an absent registration here would silently leave every MCP-routed escalation
     // undeliverable, which is the exact defect this parameter exists to fix.
-    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null)
+    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null,
+    // Optional for the same reason as the router above: this class is constructed directly by the tests
+    // that exercise the ledger and the checklist, and they must not have to know that a bell exists. The
+    // production container registers it and ApiServiceRegistrationTests pins that — an absent
+    // registration here would silently leave every MCP-raised plan gate, discovery park and PR review
+    // unannounced, which is precisely the defect class that parameter is there to close.
+    AgentMesh.Api.Services.IAttentionNotifier? attention = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -294,6 +300,14 @@ public class PlatformMcpTools(
         logger.LogInformation(
             "post_job_message: job={JobId} from={Persona} (driver={Driver}) to={Target} requiresReply={RequiresReply} card={CardId} type={CardType}",
             job.Id, authorPersonaId, driverId ?? "(none)", target, requires_reply, card.Id, card.CardType);
+
+        // Write site for the attention push: this card may have just opened an operator wait
+        // (a reply request addressed to a human is recorded as a PendingInput Escalation3R card)
+        // or closed the one that was open, and on the discovery path the heartbeat above flipped
+        // to "Awaiting … planning questions" in the same transaction. The notifier recomputes the
+        // job from the committed state rather than reading these arguments, so the bell cannot
+        // announce a wait the inbox does not contain.
+        await attention.RefreshAttentionAsync(job.Id, ct);
 
         await hubContext.Clients.Group($"job-{job.Id}")
             .SendAsync("ReceiveTimelineCardUpdated", card, ct);
@@ -566,6 +580,13 @@ public class PlatformMcpTools(
                 lifecycleStatus = checklistLifecycleStatus
             }, ct);
 
+            // Write site 2 of 3 for the attention push: the heartbeat. "Awaiting plan approval" is the
+            // single most common way a job parks on the operator, and on this card-less MCP path the
+            // heartbeat is the ONLY record of it (the PlanApproval card is raised later, by the
+            // orchestrated activity, if that job has one), so a bell that watched cards alone would stay
+            // silent for exactly the gate an operator has to approve.
+            await attention.RefreshAttentionAsync(job.Id, ct);
+
             return JsonSerializer.Serialize(new
             {
                 success = true,
@@ -697,6 +718,10 @@ public class PlatformMcpTools(
             currentTaskId = job.CurrentTaskId,
             lifecycleStatus = taskLifecycleStatus
         }, ct);
+
+        // A status note can be either direction: "Executing task #3" retires the wait the bell is
+        // showing, and a note that parks the task raises one. Both are decided by re-reading the job.
+        await attention.RefreshAttentionAsync(job.Id, ct);
 
         return JsonSerializer.Serialize(new
         {
@@ -1185,6 +1210,11 @@ public class PlatformMcpTools(
         logger.LogInformation(
             "open_pull_request: job={JobId} branch={Branch} -> {Base} as PR #{PrNumber} (headSha={HeadSha}, source={Source})",
             job.Id, resolvedHeadBranch, resolvedBaseBranch, resolvedPrNumber, args.HeadSha ?? "(none)", linkageSource);
+
+        // The heartbeat ("Awaiting pull request review (PR #n)") and the ledger row carrying the PR
+        // linkage are what the rollup reads, and both committed above. This is the event that turns the
+        // review gate from "poll until I notice" into a desktop ping with a click-through URL.
+        await attention.RefreshAttentionAsync(job.Id, ct);
 
         return JsonSerializer.Serialize(new
         {

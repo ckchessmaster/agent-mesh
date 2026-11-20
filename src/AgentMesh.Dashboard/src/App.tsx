@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
+﻿import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Bot,
   Brain,
@@ -46,6 +46,12 @@ import {
   Server
 } from 'lucide-react';
 import { api } from './services/api';
+import { AttentionBell, MuteToggle } from './components/AttentionBell';
+import type { AttentionBellHandle } from './components/AttentionBell';
+import { ATTENTION_NAVIGATE_EVENT, notifications } from './services/notifications';
+import type { AttentionNavigateDetail } from './services/notifications';
+import { AttentionEvent } from './types/attention';
+import type { AttentionItem, AttentionResolved } from './types/attention';
 import { useSignalR } from './hooks/useSignalR';
 import { useAuth } from './auth/AuthProvider';
 import {
@@ -301,6 +307,12 @@ export default function App() {
   });
   const selectedJobIdRef = useRef<string | null>(null);
   selectedJobIdRef.current = selectedJobId;
+  /**
+   * The header bell owns the pending-attention poll and the seen-set; this ref is how live SignalR
+   * pushes reach it. Held as a ref rather than lifted state on purpose: a badge count re-rendering the
+   * 6.7k-line root on every push would be a regression for no benefit.
+   */
+  const attentionBellRef = useRef<AttentionBellHandle>(null);
   const [isMobile, setIsMobile] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
   );
@@ -974,6 +986,46 @@ export default function App() {
     setSelectedJobId(jobId);
     setIsMobileDetailView(true);
   };
+
+  /**
+   * Click-through from an OS banner or a bell row.
+   *
+   * `NotificationService.openItem` already wrote the selection keys, so a *fresh* load lands on the
+   * right job; this listener is the other half — an already-mounted cockpit has no router to follow,
+   * so the service fires `agentmesh:attention-navigate` on `window` and we apply the same selection
+   * here. Mirrors `handleSelectJob` exactly (including the mobile detail view) so a bell click behaves
+   * like clicking the job in the list, and pins the tab because the rollup is cross-project: the
+   * tab-reconciler in `fetchAllData` would otherwise yank the operator back to a populated tab.
+   */
+  useEffect(() => {
+    const onAttentionNavigate = (event: Event) => {
+      const detail = (event as CustomEvent<AttentionNavigateDetail>).detail;
+      if (!detail?.jobId) return;
+      hasUserSwitchedTabRef.current = true;
+      setActiveTab('projects');
+      setSelectedProjectId(detail.projectId || null);
+      setSelectedJobId(detail.jobId);
+      setIsMobileDetailView(true);
+    };
+    window.addEventListener(ATTENTION_NAVIGATE_EVENT, onAttentionNavigate);
+    return () => window.removeEventListener(ATTENTION_NAVIGATE_EVENT, onAttentionNavigate);
+  }, []);
+
+  /**
+   * Unlock the notification chime. Browsers create `AudioContext` in the `suspended` state until the
+   * page observes a gesture, and a suspended context plays nothing — without this the first chime of a
+   * session is silently dropped by the autoplay policy. Both listeners are `once`: the flag is
+   * monotonic, so there is nothing to keep observing after the first input.
+   */
+  useEffect(() => {
+    const unlockChime = () => notifications.noteUserGesture();
+    window.addEventListener('pointerdown', unlockChime, { once: true });
+    window.addEventListener('keydown', unlockChime, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockChime);
+      window.removeEventListener('keydown', unlockChime);
+    };
+  }, []);
 
   useEffect(() => {
     if (selectedProjectId) {
@@ -1935,6 +1987,20 @@ export default function App() {
       });
     };
 
+    /**
+     * Pending-attention pushes. Both are delegated to the bell rather than handled here, which keeps a
+     * single owner for the seen-set: `pushNeeded` banners/chimes once and re-reads the rollup a moment
+     * later, and `pushResolved` clears the seen keys and any open banner for that job. Handling the
+     * event here as well would double-banner, and handling it only here would leave the inbox stale.
+     */
+    const handleAttentionNeeded = (item: AttentionItem) => {
+      attentionBellRef.current?.pushNeeded(item);
+    };
+
+    const handleAttentionResolved = (payload: AttentionResolved) => {
+      attentionBellRef.current?.pushResolved(payload?.jobId);
+    };
+
     const handleMcpUpdated = () => {
       setMcpCatalogRefreshTick((t) => t + 1);
       if (api.getMcpServers) {
@@ -1978,6 +2044,8 @@ export default function App() {
     connection.on('ProjectCreated', handleProjectCreated);
     connection.on('ProjectUpdated', handleProjectUpdated);
     connection.on('ProjectDeleted', handleProjectDeleted);
+    connection.on(AttentionEvent.Needed, handleAttentionNeeded);
+    connection.on(AttentionEvent.Resolved, handleAttentionResolved);
     connection.on('ProjectPersonaAssigned', handleTimelineCardUpdated);
     connection.on('ProjectPersonaRemoved', handleTimelineCardUpdated);
     connection.on('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
@@ -2019,6 +2087,8 @@ export default function App() {
       connection.off('ProjectCreated', handleProjectCreated);
       connection.off('ProjectUpdated', handleProjectUpdated);
       connection.off('ProjectDeleted', handleProjectDeleted);
+      connection.off(AttentionEvent.Needed, handleAttentionNeeded);
+      connection.off(AttentionEvent.Resolved, handleAttentionResolved);
       connection.off('ProjectPersonaAssigned', handleTimelineCardUpdated);
       connection.off('ProjectPersonaRemoved', handleTimelineCardUpdated);
       connection.off('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
@@ -3479,6 +3549,16 @@ export default function App() {
 
         {/* Developer Controls & Auth */}
         <div className="flex items-center gap-2 shrink-0">
+          {/*
+            Pending attention: the bell is the durable inbox (it polls `GET /api/attention` and owns the
+            read/dismiss state) and receives live `AttentionNeeded`/`AttentionResolved` pushes through
+            `attentionBellRef`. The compact toggle beside it is the master mute for desktop alerts —
+            always reachable without opening the inbox, because an operator who cannot silence a chime
+            quickly will close the tab instead. Both read the same persisted flag through the shared
+            notification service, so they cannot drift apart.
+          */}
+          <AttentionBell ref={attentionBellRef} />
+          <MuteToggle compact />
           <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs">
             <User className="w-3.5 h-3.5 text-sky-400 shrink-0" />
             <span className="font-mono text-slate-300 max-w-[90px] sm:max-w-[140px] truncate">{userEmail}</span>

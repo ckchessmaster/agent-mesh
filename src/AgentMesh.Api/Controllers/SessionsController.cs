@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -26,7 +26,8 @@ public class SessionsController(
     IStorageService? storageService = null,
     IWorkflowSignalRouter? workflows = null,
     ILogger<SessionsController>? logger = null,
-    ICredentialEncryptionService? encryptionService = null) : ControllerBase
+    ICredentialEncryptionService? encryptionService = null,
+    IAttentionNotifier? attention = null) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -3140,6 +3141,16 @@ public class SessionsController(
 
             await hubContext.Clients.Group($"job-{jobId}")
                 .SendAsync("ReceiveTimelineCardUpdated", questionCard);
+
+            // The job group event above tells a tab that is already looking at this job to repaint its
+            // card. It does not tell an operator, anywhere else, that their attention is now required —
+            // and this card is precisely that: a PendingInput Escalation3R is what GET /api/attention
+            // reports as the job's `escalation` wait. The worker gets this for free by POSTing
+            // /timeline/cards/{id}/notify-updated after every card write (NotifyCardUpdated refreshes
+            // attention); this route writes the card itself, so it has to do the same restatement.
+            // Without it the desktop banner only appears on the bell's next poll, up to 30s late, for the
+            // single most interrupt-worthy wait in the product.
+            await attention.RefreshAttentionAsync(jobId);
         }
         catch { }
     }

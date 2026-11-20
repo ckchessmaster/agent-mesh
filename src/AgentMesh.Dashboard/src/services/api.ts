@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   Agent,
   AgentSession,
   AgentUsageResponse,
@@ -66,6 +66,7 @@ import {
   ProjectJobPriority,
   ProjectJobStatus,
 } from '../types';
+import type { AttentionRollup } from '../types/attention';
 
 let tokenProvider: (() => string | null) | null = null;
 let unauthorizedHandler: (() => void | Promise<void>) | null = null;
@@ -624,6 +625,22 @@ export const api = {
   async getCapabilities(): Promise<SystemCapabilitiesResponse> {
     const res = await apiFetch('/api/system/capabilities', { headers: getHeaders() });
     if (!res.ok) throw new Error(`Failed to load system capabilities: ${res.statusText}`);
+    return res.json();
+  },
+
+  /**
+   * `GET /api/attention` — every job across every project waiting on a human, oldest first.
+   *
+   * The wait rules (plan-approval heartbeat, unanswered ask, pending card) live server-side in
+   * `AttentionQueryService`, so the bell and the desktop-notification path can never disagree about
+   * what counts as blocked. Nothing is pending returns `{ items: [], count: 0 }`, never a 404, so a
+   * polling client has exactly one shape to handle.
+   */
+  async getAttention(): Promise<AttentionRollup> {
+    const res = await apiFetch('/api/attention', { headers: getHeaders() });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load pending attention'));
+    }
     return res.json();
   },
 

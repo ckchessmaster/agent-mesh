@@ -1,3 +1,11 @@
+﻿/**
+ * Shared wire contract. `./attention` is re-exported here so callers keep importing domain types from
+ * `'../types'`; it has its own file because the pending-attention surface is consumed by three
+ * modules (api service, notification service, bell) and its field names are frozen by a persisted
+ * localStorage key, not by this barrel.
+ */
+export * from './attention';
+
 export interface DriverPersonaSummary {
   id: string;
   name: string;

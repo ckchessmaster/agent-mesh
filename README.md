@@ -1,4 +1,4 @@
-# AgentMesh
+﻿# AgentMesh
 
 > **Heterogeneous Agent Control Plane & Communication Bus**
 
@@ -70,6 +70,125 @@ AgentMesh is a centralized control plane, identity fabric, and durable execution
 
 ---
 
+## Operator Attention & Desktop Notifications
+
+The cockpit answers one question continuously: **what needs a human right now, across every project?**
+
+### What counts as "waiting on you"
+
+The rules live server-side (`src/AgentMesh.Api/Services/AttentionQueryService.cs`) so the desktop
+banner and the bell inbox can never disagree about what is blocked. A job contributes **at most one**
+item, and only `Active` / `Pending` jobs are considered — a job that finishes or is archived resolves
+itself. Everything else resolves by the record of the wait stopping being a wait: approving the plan card,
+answering the discovery card, or commenting on the escalation card takes it out of `PendingInput`, so
+there is no "resolved" flag to write and nothing to get out of sync.
+
+Every kind is read from the two places a wait is recorded: the job's free-text `ProgressHeartbeat` and its
+timeline cards (`Escalation3R` for a parked ask, `PrReview` for a review gate, `PlanApproval` /
+`DiscoveryQa` for the gates, `TurnInterrupted` for the prose of an interrupt).
+
+| Kind (`type`) | Raised when you are needed |
+| :--- | :--- |
+| `planApproval` | A plan is parked at the approval gate. |
+| `discoveryQuestions` | An agent posted discovery/trade-off questions and is waiting for answers. |
+| `interruptedTurn` | A turn was interrupted mid-flight and needs an operator to recover it. |
+| `prReview` | The job's heartbeat says it is awaiting a pull-request review; the click-through link comes from the open `PrReview` card. |
+| `escalation` | An escalation card sits in `PendingInput` asking the operator — `requiresReply`, with no `targetPersona` naming another persona. A payload we cannot parse counts as awaiting *you*: a missed ping is worse than a duplicate one. |
+
+The heartbeat-driven kinds are recognised from substrings that code in this repository writes
+("Awaiting plan approval", "Awaiting discovery Q&A" / "planning questions", "Turn interrupted", "Awaiting
+PR review"). A heartbeat that matches nothing raises nothing, on the rule that a wrong notification is
+worse than a missing one — the job's own timeline still shows the wait either way. A consult aimed at
+another persona ("Awaiting input from @astra on planning questions") is likewise not your problem and
+stays out of the bell.
+
+### Contract
+
+| Surface | Shape |
+| :--- | :--- |
+| `GET /api/attention` (authorized) | `{ items: [{ id, type, title, detail, jobId, jobTitle, projectId, projectName, cardId, prUrl, prNumber, since }], count, generatedAt }` — oldest first, empty rather than 404 when nothing is blocked. `id` is `"{jobId}:{type}"`. |
+| SignalR `AttentionNeeded` (broadcast to all clients) | One `AttentionItem`, emitted when a job starts waiting. |
+| SignalR `AttentionResolved` (broadcast to all clients) | `{ jobId }`, emitted when that job stops waiting. |
+
+Both events fire from the state-transition write sites that can open or close a wait — the timeline card
+routes (a comment on a pending escalation closes it, and
+`POST /api/jobs/{jobId}/timeline/cards/{cardId}/notify-updated` is how a worker announces a wait it just
+wrote itself), the plan gate, the job lifecycle routes, `manage_task` / `open_pull_request`, and the two
+places an agent stops and asks a human something (`post_job_message` with `requires_reply: true`, and an
+`ask_question` turn parked by `SessionsController`) — so a wait is announced when it opens rather than on
+the next poll.
+
+The push is an optimisation, not a guarantee. The notifier is deliberately stateless — there is no
+SignalR backplane, so a per-process "already announced" cache would swallow events on the next replica —
+and it *recomputes* the rollup instead of classifying the write that triggered it. Re-announcements are
+therefore expected and harmless: the id `{jobId}:{type}` is stable, so the seen-set dedupes the duplicate
+banner. Anything the socket misses self-heals on the bell's next read (every 30 s, or immediately when the
+tab comes forward).
+
+### In the cockpit
+
+The header **bell** badges the number of waits you have not looked at, lists them with the job, the
+project, the reason and how long each has been waiting, and click-throughs: a PR review opens the pull
+request, everything else selects that project and job in the cockpit. Dismissing hides a wait from the
+list without answering the agent — it returns if the job clears and parks again. The switch beside the
+bell is the master mute for desktop alerts.
+
+State is deliberately operator-local (there is no "ack" endpoint; the server's answer to "is this still
+waiting?" is "ask me again"):
+
+| `localStorage` key | Holds | Lifetime |
+| :--- | :--- | :--- |
+| `agentmesh_attention_seen_v1` | Which waits were already announced (banner + chime), shared by the push path and the poll. | 24h — a wait still open tomorrow nudges again. |
+| `agentmesh_attention_read_v1` | Which rows you have opened in the bell (clears the badge). | 24h |
+| `agentmesh_attention_dismissed_v1` | Rows you hid from the list. | 24h, or until the wait resolves |
+| `agentmesh_notifications_muted_v1` | The master mute flag. | until toggled back |
+
+### Two attention indicators, on purpose
+
+The bell is not the Dashboard tab's amber counter, and the two numbers are allowed to differ:
+
+| Indicator | Endpoint | What it counts |
+| :--- | :--- | :--- |
+| Header **bell** (rendered in the header on every viewport, mobile included) | `GET /api/attention` | One item per job per wait, camelCase `type`, id `"{jobId}:{type}"`. **The only surface that raises an OS banner and chimes.** |
+| **Dashboard** tab badge (desktop tab bar and mobile bottom nav) and the landing overview | `GET /api/dashboard/overview` | One row per card (`card:{id}`), per waiting session (`session:{id}`) or per blocked job (`job:{id}`), snake_case `kind` with a `severity`, capped by `attentionLimit` (default 50). |
+
+The overview is a board metric, so it counts things that are not a parked ask: an agent session sitting
+in `waiting_for_input`, or a job whose lifecycle state says blocked with no card behind it. Those never
+ring the bell. Conversely the bell's seen-set is operator-local, so a wait you have already read keeps
+sitting on the tab badge until it actually clears. Both readings are correct. Do not collapse them into
+one vocabulary: the bell's ids are persisted in `localStorage`, so renaming a `type` silently
+re-notifies every operator who already saw that wait.
+
+### Secure context — read this if no banner ever appears
+
+Browsers only expose the `Notification` API and an audible `AudioContext` in a **secure context**:
+`https://…`, or `http://localhost` / `http://127.0.0.1`. Serving the cockpit on a bare LAN address or an
+http tunnel — `http://192.168.0.20:5173`, `http://agents.internal` — means the OS banner is never raised
+and the chime is silent, **with no error thrown**, because the API is simply not exposed to insecure
+origins. The bell states this in its footer instead of failing silently:
+
+> Desktop alerts need HTTPS or localhost
+
+The in-app bell, badge and inbox keep working either way; only the operating-system alert is lost.
+
+* **Deployment:** terminate TLS at the ingress. The Helm chart ships `ingress.className`, `ingress.host`,
+  `ingress.clusterIssuer` (Let's Encrypt) and `ingress.tlsSecretName`, so a normal install is already a
+  secure context.
+* **Remote machine, no certificate:** port-forward and open it as localhost —
+  `kubectl port-forward svc/<release>-dashboard 8080:80` then browse `http://localhost:8080`.
+* **Local development:** `npm run dev` serves `http://localhost:5173`, which *is* a secure context, so
+  notifications work in development. Opening the dev server through a machine name or LAN IP instead
+  turns them off.
+* **Permission is asked, never assumed:** the browser prompt fires only from the bell's
+  *Enable desktop alerts* button, never on page load (browsers auto-deny unprompted requests, and an
+  immediate prompt trains you to dismiss it unread). A prior "block" is a terminal state — the footer
+  then tells you to allow alerts in site settings.
+* **Sound needs a gesture too:** autoplay policy creates `AudioContext` suspended until the page sees
+  input, so the cockpit registers a one-shot `pointerdown`/`keydown` listener. A tab that is never
+  touched will banner silently, by design.
+
+---
+
 ## Local Development Quickstart
 
 ### Prerequisites
@@ -88,6 +207,35 @@ dotnet run --project src/AgentMesh.AppHost
 ```
 
 Open the Aspire dashboard link output in your console to monitor container statuses, distributed traces, and metrics.
+
+### Verifying changes (CI parity)
+
+`.github/workflows/ci.yml` runs three jobs; these are the commands the two gating jobs actually execute,
+so a local green run means the pipeline will be green:
+
+```bash
+# backend job — .NET 10 solution
+dotnet restore AgentMesh.slnx
+dotnet build AgentMesh.slnx --configuration Release --no-restore
+dotnet test AgentMesh.slnx --configuration Release --no-build
+
+# frontend job — working-directory: src/AgentMesh.Dashboard
+npm ci
+npm run lint
+npm test
+npm run build
+```
+
+* **`npm run lint` (oxlint) is not a CI step** — CI installs, tests and builds the cockpit only. Lint debt
+  is caught in review instead, so keep errors at zero and do not add warnings to a file you touch. When a
+  file already carries pre-existing warnings, compare against `git show origin/main:<path>` rather than
+  expecting zero.
+* The Postgres-backed tests (migrations, repository concurrency) skip themselves when no database is
+  reachable, so a handful of `Skipped` results on a laptop is the expected outcome, not a failure.
+* The dashboard build reports chunks over 500 kB. That warning is pre-existing and does not fail
+  `npm run build`.
+* The `helm-and-docker` job (`helm lint`, `helm template`, four image builds) has no local equivalent you
+  need to run unless you change `deploy/`.
 
 ---
 

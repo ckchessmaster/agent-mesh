@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Nodes;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -55,7 +55,10 @@ public class JobTimelineController(
     AgentMeshDbContext db,
     ITemporalClient temporalClient,
     IHubContext<AgentMeshHub>? hubContext = null,
-    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null) : ControllerBase
+    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null,
+    // Optional: this controller is about cards, and the tests that exercise card payloads should
+    // not need a hub or a bell. Program.cs registers it; ApiServiceRegistrationTests pins that.
+    IAttentionNotifier? attention = null) : ControllerBase
 {
     private WorkflowHandle<IJobExecutionWorkflow> GetWorkflowHandle(string jobId)
     {
@@ -100,6 +103,14 @@ public class JobTimelineController(
         }
 
         await BroadcastCardUpdatedAsync(jobId, card);
+
+        // The card family, and the only way the Temporal worker's own writes reach the bell. The worker
+        // has no hub of its own — the runner may not even be online — so its activities call THIS
+        // endpoint after they commit (TimelineActivities.NotifyCardUpdatedAsync). Those activities write
+        // the DiscoveryQa/PlanApproval/TurnInterrupted cards and the matching heartbeat in one save, so
+        // one refresh here covers both sources for every gate the orchestration raises.
+        await attention.RefreshAttentionAsync(jobId);
+
         return Ok(card);
     }
 
@@ -181,6 +192,11 @@ public class JobTimelineController(
             }
         }
 
+        // The escalation close. A comment on a PendingInput Escalation3R card is what retires the wait
+        // now that the job ledger is gone, and the card flip above is the only record of it — so the bell
+        // has to be told here or an answered question keeps ringing until the next poll.
+        await attention.RefreshAttentionAsync(jobId);
+
         return Ok(comment);
     }
 
@@ -212,6 +228,12 @@ public class JobTimelineController(
             card.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync();
             await BroadcastCardUpdatedAsync(jobId, card);
+
+            // Answering the questionnaire is the end of a discoveryQuestions wait. The workflow also
+            // rewrites the heartbeat to "Exploring codebase…" a moment later, but that happens inside
+            // Temporal and may land after this response, so the state is read here as "no longer
+            // waiting on the operator" rather than inferred from what the signal will do.
+            await attention.RefreshAttentionAsync(jobId);
         }
 
         var handle = GetWorkflowHandle(jobId);
@@ -294,6 +316,11 @@ public class JobTimelineController(
         }
 
         await UnparkJobWaitingSessionsAsync(jobId, ct);
+
+        // Last, after every write above: an approval clears the wait and a rejection loops back
+        // to the discovery/plan stage and keeps it, and only the recomputed state knows which —
+        // the heartbeat this route just wrote is the difference between the two.
+        await attention.RefreshAttentionAsync(jobId);
 
         return Accepted();
     }

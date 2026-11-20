@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -123,7 +123,12 @@ public class ProjectJobsController(
     IWorkflowSignalRouter? workflows = null,
     ILogger<ProjectJobsController>? logger = null,
     JobTurnDispatcher? turns = null,
-    ICredentialEncryptionService? encryptionService = null) : ControllerBase
+    ICredentialEncryptionService? encryptionService = null,
+    // Optional like the rest: dozens of tests construct this controller to exercise job and task
+    // CRUD. The production container registers it and ApiServiceRegistrationTests pins that, so
+    // the null default can only ever mean "a unit test", never "notifications are off in
+    // production".
+    IAttentionNotifier? attention = null) : ControllerBase
 {
     private readonly IWorkflowSignalRouter? _workflows = workflows;
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -1413,6 +1418,11 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // Completing or archiving a job removes it from OpenJobsPredicate, which is how a wait that
+        // ended by the job simply finishing raises AttentionResolved: the same call that used to return
+        // an item now returns null. No write site has to know which kind it was clearing.
+        await attention.RefreshAttentionAsync(id);
+
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
         var dto = ToDto(job, project?.Name, cardCount);
@@ -1438,6 +1448,9 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // Same reason as CompleteJob above: archived jobs leave the rollup, so their waits are over.
+        await attention.RefreshAttentionAsync(id);
+
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
         var dto = ToDto(job, project?.Name, cardCount);
@@ -1462,6 +1475,11 @@ public class ProjectJobsController(
         job.Status = ProjectJobStatus.Active;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        // Reopening puts the job back inside OpenJobsPredicate. If its last heartbeat still reads
+        // "Awaiting plan approval" because the plan was never approved, that wait is real again and the
+        // bell should say so; if it does not, this is the no-op the client cannot tell apart.
+        await attention.RefreshAttentionAsync(id);
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
@@ -1519,6 +1537,10 @@ public class ProjectJobsController(
         job.ProgressHeartbeat = null;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        // A reset clears the heartbeat, which is the source that was holding the wait. The job is still
+        // open (Pending is in the rollup), so only the cleared heartbeat makes this a resolution.
+        await attention.RefreshAttentionAsync(id);
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
