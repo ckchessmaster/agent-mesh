@@ -104,7 +104,12 @@ public record JobExecutionInput(
     string AssignedAgentId,
     string ApprovalPolicy = "LeadOrHuman",
     JobExecutionContinuationState? Continuation = null,
-    int? ContinueAsNewAfterRounds = null
+    int? ContinueAsNewAfterRounds = null,
+    /// <summary>
+    /// Per-task turn ceiling handed to every task workflow this run starts, or null for the
+    /// platform default. Read once at run start; see <c>ProjectJob.TurnBudget</c>.
+    /// </summary>
+    int? TurnBudget = null
 )
 {
     public JobExecutionInput(
@@ -133,7 +138,8 @@ public record ChildTaskExecutionInput : TaskExecutionInput
         string WorkspacePath,
         string TargetBranch,
         string? ProjectId = null,
-        string? RemediationContext = null)
+        string? RemediationContext = null,
+        int? TurnBudget = null)
         : base(
             JobId: JobId,
             TaskId: TaskId,
@@ -144,7 +150,8 @@ public record ChildTaskExecutionInput : TaskExecutionInput
             PersonaId: AssignedAgentId,
             TaskIndex: TaskIndex,
             TaskTitle: TaskTitle,
-            RemediationContext: RemediationContext)
+            RemediationContext: RemediationContext,
+            TurnBudget: TurnBudget)
     {
     }
 }

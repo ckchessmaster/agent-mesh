@@ -167,6 +167,58 @@ describe('JobCockpit stalled-job recovery', () => {
   });
 });
 
+/**
+ * The state the honest halt marker (PersistJobHaltAsync) leaves behind: the workflow completed as a
+ * failure, the row stayed Active, and the API derives `Blocked` from the `Halted:` heartbeat. The
+ * cockpit used to fall through that lifecycle to the "Active Job" badge and hide Recover (which was
+ * keyed to `Stalled` alone) — leaving an operator staring at a red Blocked card on the dashboard with
+ * no control on the job itself that could do anything.
+ */
+const haltedJob = (over: Partial<ProjectJob> = {}): ProjectJob =>
+  stalledJob({
+    progressHeartbeat:
+      'Halted: Task 0 (Add ProjectJob.AttachmentsJson) failed - workflow halted after 40 turns without reaching a terminal state',
+    lifecycleStatus: 'Blocked',
+    ...over
+  });
+
+describe('JobCockpit blocked (halted) job', () => {
+  it('badges the halt honestly and never as an active job', () => {
+    renderCockpit(haltedJob());
+
+    expect(screen.getByTestId('job-status-blocked')).toBeInTheDocument();
+    expect(screen.queryByTestId('job-status-active')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('job-status-stalled')).not.toBeInTheDocument();
+  });
+
+  it('puts the halt reason on the badge, where the operator is already looking', () => {
+    renderCockpit(haltedJob());
+
+    expect(screen.getByTestId('job-status-blocked').getAttribute('title')).toContain(
+      'halted after 40 turns'
+    );
+  });
+
+  it('offers Recover for a halted job, and the confirm row says what a halt needs', () => {
+    const onRecoverJob = vi.fn().mockResolvedValue(undefined);
+    renderCockpit(haltedJob(), onRecoverJob);
+
+    fireEvent.click(screen.getByTestId('cockpit-recover-job-btn'));
+    // A halted job has no abandoned turn to settle — its run is closed. The stalled confirmation's
+    // wording would describe something that is not happening, so the blocked branch speaks truth.
+    expect(screen.getByText(/nothing is running/i)).toBeInTheDocument();
+    expect(screen.getByText(/fresh run/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('cockpit-confirm-recover-btn'));
+    return waitFor(() => expect(onRecoverJob).toHaveBeenCalledTimes(1));
+  });
+
+  it('still refuses to offer Recover once the job is archived', () => {
+    renderCockpit(haltedJob({ status: ProjectJobStatus.Archived }), vi.fn());
+    expect(screen.queryByTestId('cockpit-recover-job-btn')).not.toBeInTheDocument();
+  });
+});
+
 describe('api.recoverJob', () => {
   const fetchMock = vi.fn();
 

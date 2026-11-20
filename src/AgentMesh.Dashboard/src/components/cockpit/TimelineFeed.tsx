@@ -7,6 +7,7 @@ import { PlanApprovalCard } from './cards/PlanApprovalCard';
 import { PrReviewCard } from './cards/PrReviewCard';
 import { TaskStepCard } from './cards/TaskStepCard';
 import { TurnInterruptedCard } from './cards/TurnInterruptedCard';
+import { EscalationCard } from './cards/EscalationCard';
 import { CardComments } from './cards/CardComments';
 import { Layers, Loader2, Play } from 'lucide-react';
 
@@ -43,6 +44,12 @@ export interface TimelineFeedProps {
     additionalContext?: string
   ) => Promise<void> | void;
   onAddComment?: (cardId: string, content: string) => Promise<void> | void;
+  /**
+   * Retires an escalation card without replying. Wired to the escalation and interrupted-turn cards
+   * only: gate cards (plan/PR/discovery) are decided through their own routes, and a card resolved
+   * out from under a waiting workflow would leave it parked on a finished card.
+   */
+  onResolveCard?: (cardId: string, note?: string) => Promise<void> | void;
 }
 
 /**
@@ -66,7 +73,8 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
   onSendPlanGuidance,
   onSubmitPrReview,
   onSubmitIntervention,
-  onAddComment
+  onAddComment,
+  onResolveCard
 }) => {
   // --- Feed "stick to bottom" -----------------------------------------------------------
   // The feed is a transcript that grows at the bottom, so it used to open at the top: an
@@ -228,6 +236,16 @@ export const TimelineFeed: React.FC<TimelineFeedProps> = ({
                 key={card.id}
                 card={card}
                 onSubmitIntervention={onSubmitIntervention}
+                onResolve={onResolveCard}
+                onAddComment={onAddComment}
+              />
+            );
+          case 'Escalation3R':
+            return (
+              <EscalationCard
+                key={card.id}
+                card={card}
+                onResolve={onResolveCard}
                 onAddComment={onAddComment}
               />
             );

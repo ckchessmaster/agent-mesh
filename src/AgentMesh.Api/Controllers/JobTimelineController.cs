@@ -44,6 +44,11 @@ public record AbortTurnRequest(
     string RequestedBy = "human"
 );
 
+/// <param name="Note">Optional operator note recorded as the closing comment on the card.</param>
+public record ResolveCardRequest(
+    string? Note = null
+);
+
 public record InterventionRequest(
     string Action, // "resume" | "retry_step" | "realign"
     string? AdditionalContext = null
@@ -198,6 +203,98 @@ public class JobTimelineController(
         await attention.RefreshAttentionAsync(jobId);
 
         return Ok(comment);
+    }
+
+    /// <summary>
+    /// Retires a human-waiting escalation card without deciding a workflow gate or touching the run.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Escalations ("agent paused on error", "turn budget exhausted") and consultations park a card in
+    /// a state the Needs-Attention queue keeps ringing for. A comment retires the wait when the
+    /// operator has something to say; this is the exit for the other case — the problem was fixed
+    /// somewhere else, the job was recovered, or the escalation simply went stale while its workflow
+    /// was closed. Before this endpoint existed, nothing flipped a <c>TurnInterrupted</c> card to a
+    /// terminal status, so a resolved incident rang the bell forever.
+    /// </para>
+    /// <para>
+    /// Gate cards are deliberately refused: <c>PlanApproval</c>, <c>PrReview</c> and <c>DiscoveryQa</c>
+    /// are held by a running workflow that blocks on their decision signal, and silently marking one
+    /// Resolved would leave the workflow waiting on a card the ledger says is finished. Decide those
+    /// with their own controls.
+    /// </para>
+    /// </remarks>
+    [HttpPost("cards/{cardId}/resolve")]
+    public async Task<IActionResult> ResolveCard(
+        string jobId,
+        Guid cardId,
+        [FromBody] ResolveCardRequest? req,
+        CancellationToken ct = default)
+    {
+        var card = await db.JobTimelineCards
+            .Include(c => c.Comments)
+            .FirstOrDefaultAsync(c => c.Id == cardId && c.JobId == jobId, ct);
+
+        if (card is null)
+        {
+            return NotFound(new { error = $"Card '{cardId}' not found on job '{jobId}'." });
+        }
+
+        var isRetirableEscalation = card.CardType is TimelineCardType.Escalation3R
+            or TimelineCardType.InternalConsultation
+            or TimelineCardType.TurnInterrupted;
+        if (!isRetirableEscalation)
+        {
+            return BadRequest(new
+            {
+                error = $"{card.CardType} cards are gates a workflow is holding; decide them with their own " +
+                        "control (approve/reject/submit answers) rather than resolving the card."
+            });
+        }
+
+        // Idempotent by design: an operator double-clicking, or the bell retrying after a refresh,
+        // must not fail loudly against work that is genuinely already done.
+        if (card.Status is TimelineCardStatus.Resolved or TimelineCardStatus.Closed)
+        {
+            return Ok(card);
+        }
+
+        // Same actor resolution as the comments route: a persona calling with its bearer token is an
+        // agent retiring its own escalation; everyone else is the operator.
+        var personaHeader = Request?.Headers.TryGetValue(AgentMesh.Api.Services.PlatformCallContextResolver.PersonaIdHeader, out var ph) == true
+            ? ph.ToString()
+            : null;
+        var actor = !string.IsNullOrWhiteSpace(personaHeader)
+            ? personaHeader.Trim().TrimStart('@').ToLowerInvariant()
+            : "operator";
+        var actorType = !string.IsNullOrWhiteSpace(personaHeader) ? "agent" : "operator";
+
+        var note = string.IsNullOrWhiteSpace(req?.Note) ? null : req.Note.Trim();
+        var comment = new JobCardComment
+        {
+            Id = Guid.NewGuid(),
+            CardId = card.Id,
+            SenderId = actor,
+            SenderType = "system",
+            Content = note is null
+                ? $"⚒️ Escalation marked resolved by {actorType} '{actor}' — no reply expected."
+                : $"⚒️ Escalation marked resolved by {actorType} '{actor}': {note}",
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        db.JobCardComments.Add(comment);
+
+        card.Status = TimelineCardStatus.Resolved;
+        card.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+
+        await BroadcastCardUpdatedAsync(jobId, card);
+
+        // The bell's liveness check reads this same card state, so retiring the wait and refreshing
+        // the attention row are two halves of one promise: the item leaves Needs-Attention when it
+        // is resolved here, not when the next poll happens to agree.
+        await attention.RefreshAttentionAsync(jobId);
+
+        return Ok(card);
     }
 
     [HttpPost("cards/{cardId}/submit-answers")]

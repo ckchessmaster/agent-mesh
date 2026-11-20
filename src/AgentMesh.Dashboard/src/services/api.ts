@@ -1556,6 +1556,7 @@ export const api = {
     priority?: number;
     approvalPolicy?: number;
     assignedAgentId?: string | null;
+    turnBudget?: number | null;
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
       method: 'PUT',
@@ -2055,6 +2056,26 @@ export const api = {
     if (!res.ok) {
       throw new Error(await readApiErrorMessage(res, 'Failed to submit intervention'));
     }
+  },
+
+  /**
+   * Retires an escalation/consultation card without replying to it.
+   *
+   * The exit for "already handled elsewhere / stale wait" — replying is what a comment does, and a
+   * comment on a dead run signals into the void. Gate cards are refused by the endpoint (400);
+   * decide those with their own controls. Returns the updated card so callers can repaint without
+   * waiting on the hub.
+   */
+  async resolveTimelineCard(jobId: string, cardId: string, note?: string): Promise<JobTimelineCard> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/cards/${encodeURIComponent(cardId)}/resolve`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ note: note?.trim() || null })
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to resolve card'));
+    }
+    return (await res.json()) as JobTimelineCard;
   },
 
   async getMcpServers(options?: { enabled?: boolean; transport?: McpTransportType }): Promise<McpServer[]> {

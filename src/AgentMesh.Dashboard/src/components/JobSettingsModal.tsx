@@ -18,6 +18,7 @@ interface JobSettingsModalProps {
     approvalPolicy?: number;
     resultSummary?: string;
     assignedAgentId?: string | null;
+    turnBudget?: number | null;
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
 }
@@ -58,6 +59,10 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
   const [status, setStatus] = useState<ProjectJobStatus>((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
   const [approvalPolicy, setApprovalPolicy] = useState<number>(job.approvalPolicy ?? PlanApprovalPolicy.Autonomous);
   const [resultSummary, setResultSummary] = useState(job.resultSummary || '');
+  // Text, not number: blank must mean "leave unchanged" (the API treats a missing TurnBudget as a
+  // no-op and there is no way to clear one back to the platform default). A number input's NaN on
+  // blur would silently send nothing while looking edited.
+  const [turnBudget, setTurnBudget] = useState<string>(job.turnBudget != null ? String(job.turnBudget) : '');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -73,6 +78,7 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
       setStatus((job.status as ProjectJobStatus) ?? ProjectJobStatus.Active);
       setApprovalPolicy(job.approvalPolicy ?? PlanApprovalPolicy.Autonomous);
       setResultSummary(job.resultSummary || '');
+      setTurnBudget(job.turnBudget != null ? String(job.turnBudget) : '');
       setConfirmDelete(false);
       setError(null);
     }
@@ -86,6 +92,14 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
       if (!title.trim()) setError('Job Title is required.');
       return;
     }
+    const trimmedBudget = turnBudget.trim();
+    if (trimmedBudget) {
+      const parsed = Number(trimmedBudget);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 1000) {
+        setError('Turn budget must be a whole number between 1 and 1000 (blank keeps the current value).');
+        return;
+      }
+    }
     setIsSubmitting(true);
     setError(null);
     try {
@@ -97,7 +111,8 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
         status,
         approvalPolicy,
         resultSummary: resultSummary.trim() || undefined,
-        assignedAgentId: assignedAgentId.trim()
+        assignedAgentId: assignedAgentId.trim(),
+        turnBudget: trimmedBudget ? Number(trimmedBudget) : undefined
       });
       onClose();
     } catch (err: any) {
@@ -273,6 +288,29 @@ export const JobSettingsModal: React.FC<JobSettingsModalProps> = ({
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition font-mono"
               />
             </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+              Task Turn Budget
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={1000}
+              step={1}
+              value={turnBudget}
+              onChange={(e) => setTurnBudget(e.target.value)}
+              placeholder="40 (platform default)"
+              data-testid="job-settings-turn-budget-input"
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500 transition font-mono"
+            />
+            <p className="text-[11px] text-slate-500 mt-1">
+              Turns one task may spend before the workflow halts it. Raise it when a job exhausted its
+              budget on infrastructure failures (rate limits, expired logins) rather than on the work,
+              then press Recover Job to run with the new budget. Blank keeps the current value; it
+              applies to the next run, never one already going.
+            </p>
           </div>
 
           <div>

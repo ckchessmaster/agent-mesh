@@ -102,4 +102,56 @@ describe('TurnInterruptedCard', () => {
 
     expect(screen.getByText(/Intervention action dispatched \(realign\)/)).toBeInTheDocument();
   });
+
+  it('offers a resolve exit for the case where there is no run left to intervene on', async () => {
+    // resume/retry/realign are live-run controls. Once the workflow has halted or completed — the
+    // state this whole incident was about — they can only fail, and an operator with no third door
+    // has no way to acknowledge what they already know.
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<TurnInterruptedCard card={sampleCard} onResolve={onResolve} />);
+
+    const resolveBtn = screen.getByTestId('resolve-turn-card-btn');
+    expect(resolveBtn).toHaveTextContent('Mark Resolved');
+    fireEvent.click(resolveBtn);
+
+    await waitFor(() => expect(onResolve).toHaveBeenCalledWith('card-interrupted-1', undefined));
+    // The resolve path gets its own confirmation: "Intervention action dispatched / turn unblocked"
+    // would claim a signal that was never sent — the point of resolving is that there is no run.
+    expect(screen.getByText(/off the attention queue/)).toBeInTheDocument();
+  });
+
+  it('carries typed guidance into the resolve note, so context written is not lost when retiring', async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<TurnInterruptedCard card={sampleCard} onResolve={onResolve} />);
+
+    fireEvent.change(screen.getByPlaceholderText(/Ensure you rollback/), {
+      target: { value: 'PAT was expired; rotated. Reopen the job instead of resuming.' }
+    });
+    fireEvent.click(screen.getByTestId('resolve-turn-card-btn'));
+
+    await waitFor(() =>
+      expect(onResolve).toHaveBeenCalledWith(
+        'card-interrupted-1',
+        'Operator guidance recorded at resolve: PAT was expired; rotated. Reopen the job instead of resuming.'
+      )
+    );
+  });
+
+  it('without a resolve wiring, renders the original three exits only', () => {
+    // Older parents (and the feed without the route) must not grow a dead button.
+    render(<TurnInterruptedCard card={sampleCard} onSubmitIntervention={vi.fn()} />);
+    expect(screen.queryByTestId('resolve-turn-card-btn')).not.toBeInTheDocument();
+  });
+
+  it('keeps the resolve button live when the resolve fails', async () => {
+    const onResolve = vi.fn().mockRejectedValue(new Error('no resolve route on this build'));
+    render(<TurnInterruptedCard card={sampleCard} onResolve={onResolve} />);
+
+    fireEvent.click(screen.getByTestId('resolve-turn-card-btn'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('resolve-turn-card-error')).toHaveTextContent('no resolve route')
+    );
+    expect(screen.getByTestId('resolve-turn-card-btn')).toBeEnabled();
+  });
 });

@@ -1263,6 +1263,7 @@ export default function App() {
     status?: ProjectJobStatus;
     resultSummary?: string;
     approvalPolicy?: number;
+    turnBudget?: number | null;
   }) => {
     if (!selectedJobId) return;
     const updated = await api.updateProjectJob(selectedJobId, updates);

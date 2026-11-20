@@ -38,7 +38,8 @@ public record ProjectJobDto(
     string? CurrentTaskId = null,
     string? ProgressHeartbeat = null,
     string? LifecycleStatus = null,
-    string? AssignedAgentId = null
+    string? AssignedAgentId = null,
+    int? TurnBudget = null
 );
 
 public record QueuedJobTurnDto(
@@ -74,7 +75,8 @@ public record UpdateProjectJobRequest(
     string? ResultSummary = null,
     ProjectJobPriority? Priority = null,
     PlanApprovalPolicy? ApprovalPolicy = null,
-    string? AssignedAgentId = null
+    string? AssignedAgentId = null,
+    int? TurnBudget = null
 );
 
 public record CreateJobTaskRequest(
@@ -274,6 +276,19 @@ public class ProjectJobsController(
             return NotFound(new { error = $"Job '{id}' not found." });
         }
 
+        // Validated before any field lands, so a request rejected here cannot half-apply: this handler
+        // otherwise writes every named field in one pass, and "the title changed but the budget was
+        // refused" is the kind of split decision an operator should never have to reason about.
+        //
+        // Bounds mirror the fuse's purpose: at 1 turn there is nothing to loop on, and past 1000 the
+        // ceiling has stopped being a fuse at all. Zero and negatives are rejected rather than clamped
+        // — an operator typing 0 means something, and "disable the budget" is not what this field
+        // does (omitted means keep the current value; the platform default is the null state).
+        if (req.TurnBudget.HasValue && req.TurnBudget.Value is < 1 or > 1000)
+        {
+            return BadRequest(new { error = "TurnBudget must be between 1 and 1000, or omitted to keep the current value." });
+        }
+
         if (!string.IsNullOrWhiteSpace(req.Title)) job.Title = req.Title.Trim();
         if (req.Description != null) job.Description = req.Description.Trim();
         if (!string.IsNullOrWhiteSpace(req.GitBranchName)) job.GitBranchName = req.GitBranchName.Trim();
@@ -281,6 +296,7 @@ public class ProjectJobsController(
         if (req.Priority.HasValue) job.Priority = req.Priority.Value;
         if (req.ApprovalPolicy.HasValue) job.ApprovalPolicy = req.ApprovalPolicy.Value;
         if (req.ResultSummary != null) job.ResultSummary = req.ResultSummary.Trim();
+        if (req.TurnBudget.HasValue) job.TurnBudget = req.TurnBudget.Value;
         if (req.AssignedAgentId != null)
         {
             job.AssignedAgentId = string.IsNullOrWhiteSpace(req.AssignedAgentId)
@@ -1234,8 +1250,13 @@ public class ProjectJobsController(
                         WorkspacePath: workspacePath,
                         InitialPrompt: initialPrompt,
                         TargetBranch: targetBranch,
-                        ApprovalPolicy: job.ApprovalPolicy
-                    )),
+                        ApprovalPolicy: job.ApprovalPolicy)
+                    {
+                        // Object initializer, not a named argument: the StartWorkflowAsync lambda is
+                        // an expression tree, and named arguments that skip optional parameters are
+                        // not legal in one. Same value either way.
+                        TurnBudget = job.TurnBudget
+                    }),
                     options
                 );
                 temporalStarted = true;
@@ -1255,8 +1276,10 @@ public class ProjectJobsController(
                             WorkspacePath: workspacePath,
                             InitialPrompt: initialPrompt,
                             TargetBranch: targetBranch,
-                            ApprovalPolicy: job.ApprovalPolicy
-                        )),
+                            ApprovalPolicy: job.ApprovalPolicy)
+                        {
+                            TurnBudget = job.TurnBudget
+                        }),
                         options
                     );
                     temporalStarted = true;
@@ -1960,7 +1983,8 @@ public class ProjectJobsController(
             j.CurrentTaskId,
             j.ProgressHeartbeat,
             DeriveLifecycleStatus(j),
-            j.AssignedAgentId
+            j.AssignedAgentId,
+            j.TurnBudget
         );
     }
 

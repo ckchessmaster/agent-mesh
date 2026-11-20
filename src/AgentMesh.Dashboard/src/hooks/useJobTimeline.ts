@@ -214,6 +214,26 @@ export function useJobTimeline(jobId: string) {
     [jobId]
   );
 
+  /**
+   * Retires an escalation card ("already handled / stale wait") without replying to it.
+   *
+   * The optimistic flip is honest here in a way guidance's is not: resolve has no workflow waiting
+   * on the other side, so `Resolved` is exactly the state the endpoint just committed.
+   */
+  const resolveCard = useCallback(
+    async (cardId: string, note?: string) => {
+      const updated = await api.resolveTimelineCard(jobId, cardId, note);
+      setCards((prev) =>
+        prev.map((c) =>
+          c.id === cardId
+            ? { ...c, status: updated?.status || 'Resolved', comments: updated?.comments ?? c.comments }
+            : c
+        )
+      );
+    },
+    [jobId]
+  );
+
   return {
     cards,
     loading,
@@ -226,6 +246,7 @@ export function useJobTimeline(jobId: string) {
     sendPlanGuidance,
     submitPrReview,
     abortActiveTurn,
-    submitIntervention
+    submitIntervention,
+    resolveCard
   };
 }
