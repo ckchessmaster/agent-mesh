@@ -676,6 +676,12 @@ export const JobLifecycleStatus = {
   InProgress: 'InProgress',
   AwaitingReview: 'AwaitingReview',
   Completed: 'Completed',
+  /**
+   * Nothing is running and the job needs an operator. Produced by the workflow's `Halted:` marker
+   * (see PersistJobHaltAsync): the run closed on a failure — exhausted turn budget, empty checklist,
+   * dead PR stage — while the row stayed Active. The cockpit shows the halt reason and offers
+   * Recover, not an approval.
+   */
   Blocked: 'Blocked',
   Failed: 'Failed',
   /**
@@ -855,6 +861,12 @@ export interface ProjectJob {
   progressHeartbeat?: string | null;
   lifecycleStatus?: JobLifecycleStatus | string | null;
   assignedAgentId?: string | null;
+  /**
+   * Per-task turn budget for the next run of this job; null/undefined means the platform default (40).
+   * Raising it is the repair for a task that exhausted its budget on infrastructure failures rather
+   * than on the work; read at run start, so it never affects a run already going.
+   */
+  turnBudget?: number | null;
   queuedTurns?: QueuedJobTurnDto[];
   messageCount: number;
   createdAt: string;

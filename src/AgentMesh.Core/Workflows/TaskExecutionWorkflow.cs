@@ -1,5 +1,7 @@
+using System.Text.Json;
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
+using Microsoft.Extensions.Logging;
 using Temporalio.Common;
 using Temporalio.Exceptions;
 using Temporalio.Workflows;
@@ -9,6 +11,13 @@ namespace AgentMesh.Core.Workflows;
 [Workflow("TaskExecutionWorkflow")]
 public class TaskExecutionWorkflow : ITaskExecutionWorkflow
 {
+    /// <summary>
+    /// The platform default ceiling on coding turns per task, used when the run's input carries no
+    /// <see cref="TaskExecutionInput.TurnBudget"/>. It is a fuse, not a goal: it exists so a task
+    /// repeating the same failure cannot loop forever. A job whose turns die on infrastructure
+    /// instead of on the work can exhaust it while still making progress, so the operator can raise
+    /// the budget for the next run on the job itself instead of waiting on a code change.
+    /// </summary>
     public const int MaxTurns = 40;
 
     public static readonly TimeSpan MaxWait = TimeSpan.FromDays(7);
@@ -38,6 +47,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
     private string? _rawAgentId;
     private DateTimeOffset? _awaitingSince;
     private int _turnCount;
+    private int _maxTurnsForRun = MaxTurns;
     private TurnOutcomeStatus? _lastOutcome;
     private string? _activePrUrl;
     private int? _activePrNumber;
@@ -54,6 +64,13 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         _currentStatus = "Running";
         _turnSessionId = input.TurnSessionId;
 
+        // Resolved once from the run input and held: re-reading the job row per iteration would let an
+        // operator's mid-run edit silently change the loop bound this workflow replays against.
+        if (input.TurnBudget is > 0)
+        {
+            _maxTurnsForRun = input.TurnBudget.Value;
+        }
+
         _rawPersonaId = input.PersonaId;
         _rawAgentId = input.AgentId;
         _personaId = NormalizeIdentity(input.PersonaId);
@@ -63,7 +80,7 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
 
         while (!_isTerminated)
         {
-            if (_turnCount >= MaxTurns)
+            if (_turnCount >= _maxTurnsForRun)
             {
                 var reason =
                     $"Halted after {_turnCount} turns without reaching a terminal state. The task is " +
@@ -71,6 +88,8 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
                     "stuck-loop detector did not catch.";
                 _currentStatus = $"Halted: {reason}";
                 _lastOutcome = TurnOutcomeStatus.StuckLoopDetected;
+
+                await RecordTurnBudgetExhaustedAsync(input, reason);
 
                 return new TaskExecutionResult(false, input.TaskId, _activePrUrl, reason);
             }
@@ -267,6 +286,72 @@ public class TaskExecutionWorkflow : ITaskExecutionWorkflow
         }
 
         return new TaskExecutionResult(true, input.TaskId, _activePrUrl, "Task completed.");
+    }
+
+    /// <summary>
+    /// Files an operator-facing escalation when a task burns through its turn budget.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The halt is honest, but on its own it is only a red badge on one job row. The escalation card
+    /// puts the same event where the operator is already looking — the Needs-Attention queue — and
+    /// says what will actually help: if the turns died on infrastructure, raise the job's turn budget
+    /// before recovering; if the agent is repeating a failing step, reply on the card with the
+    /// correction, then recover.
+    /// </para>
+    /// <para>
+    /// A failure here is logged and swallowed for the same reason the parent workflow swallows its
+    /// halt persistence: losing a card is better than losing the task result that carries the halt
+    /// reason.
+    /// </para>
+    /// </remarks>
+    private async Task RecordTurnBudgetExhaustedAsync(TaskExecutionInput input, string reason)
+    {
+        var taskLabel = string.IsNullOrWhiteSpace(input.TaskTitle)
+            ? $"task {input.TaskId}"
+            : $"task {(input.TaskIndex ?? 0) + 1}: {input.TaskTitle}";
+        var content =
+            $"⏳ **Turn budget exhausted ({_turnCount}/{_maxTurnsForRun}) on {taskLabel}.**\n\n" +
+            $"> {reason}\n\n" +
+            "Nothing is running on this task any more. To continue:\n" +
+            "- If the turns kept dying on infrastructure (rate limits, expired credentials, cold " +
+            $"starts), raise this job's **Turn budget** (currently {_maxTurnsForRun}) and press " +
+            "**Recover Job** — it resumes from the recorded checklist.\n" +
+            "- If the agent was repeating a failing step, reply on this card with what it should do " +
+            "differently, then press **Recover Job**.\n" +
+            "- If the task is no longer worth doing, mark it complete or archive the job.";
+
+        var payload = JsonSerializer.Serialize(new
+        {
+            content,
+            requiresReply = true,
+            targetPersona = "operator",
+            senderPersona = "workflow",
+            authorPersonaId = "workflow",
+            source = "task_workflow:turn_budget",
+            turnBudget = _maxTurnsForRun,
+            turnsUsed = _turnCount
+        });
+
+        try
+        {
+            await Workflow.ExecuteActivityAsync(
+                (ITimelineActivities act) => act.CreateCardAsync(new CreateTimelineCardInput(
+                    input.JobId,
+                    input.TaskId,
+                    TimelineCardType.Escalation3R,
+                    TimelineCardStatus.PendingInput,
+                    $"Turn budget exhausted: {taskLabel} ({_turnCount}/{_maxTurnsForRun} turns)",
+                    payload
+                )),
+                TimelineActivityOptions);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Workflow.Logger.LogWarning(ex,
+                "Could not file the turn-budget escalation card for job {JobId} task {TaskId}",
+                input.JobId, input.TaskId);
+        }
     }
 
     [WorkflowSignal]

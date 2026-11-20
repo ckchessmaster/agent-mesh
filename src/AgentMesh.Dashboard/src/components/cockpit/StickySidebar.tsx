@@ -215,7 +215,13 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
   const workflowId = temporalHealth?.workflowId || (jobId.startsWith('job-') ? jobId : `job-${jobId}`);
   const runId = temporalHealth?.runId || 'run-live-01';
   const attempt = temporalHealth?.attempt ?? 1;
+  // A halted job's run is closed, but its TaskStep card stays 'Active' in the ledger forever — the
+  // halt settles the job, not the card. So the lifecycle marker outranks the stale card here, and
+  // the cockpit chip says Blocked instead of pulsing "Running" over a workflow that already gave up.
+  const isBlocked = job?.lifecycleStatus === 'Blocked';
+
   const derivedStatus = () => {
+    if (isBlocked) return 'Blocked';
     if (temporalHealth?.status) return temporalHealth.status;
     if (activeTaskStep) return 'Running';
     if (job) {
@@ -255,9 +261,13 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
             {completedCount}/{items.length} steps
           </span>
           <span
+            data-testid="cockpit-status-chip"
+            title={isBlocked ? (job?.progressHeartbeat || 'The workflow halted; nothing is running.') : undefined}
             className={`px-2 py-0.5 text-xs font-mono rounded ${
               status === 'Running'
                 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 animate-pulse'
+                : status === 'Blocked'
+                ? 'bg-rose-500/15 text-rose-300 border border-rose-500/40'
                 : 'bg-slate-800 text-slate-400 border border-slate-700'
             }`}
           >
@@ -501,22 +511,32 @@ export const StickySidebar: React.FC<StickySidebarProps> = ({
         </div>
       </div>
 
-      {/* Stop Active Turn Emergency Action */}
+      {/* Stop Active Turn Emergency Action. Deliberately disabled when the job is Blocked: the abort is a
+          signal to a live run, and a halted job's run is closed — offering it there is a control whose
+          only honest outcome is a silent no-op (or a NoRunningWorkflow error), which is how an operator
+          ends up pressing a red button six times. */}
       <div className="pt-2">
         <button
           type="button"
           data-testid="stop-active-turn-btn"
-          disabled={aborting || isAborting}
+          disabled={aborting || isAborting || isBlocked}
+          title={isBlocked
+            ? 'Nothing is running — the workflow halted. Use Recover Job (or Reset) to move the job again.'
+            : 'Send an abort signal to the currently executing agent turn'}
           onClick={handleAbort}
           className={`w-full py-2.5 px-3 rounded-md font-semibold text-xs flex items-center justify-center space-x-2 transition shadow-sm ${
-            abortSuccess
+            isBlocked
+              ? 'bg-slate-800 text-slate-500 border border-slate-700/60 cursor-not-allowed'
+              : abortSuccess
               ? 'bg-amber-600 text-white'
               : 'bg-red-600/90 hover:bg-red-600 text-white active:bg-red-700 disabled:opacity-50'
           }`}
         >
           <AlertOctagon className="w-4 h-4" />
           <span>
-            {abortSuccess
+            {isBlocked
+              ? '🛑 Stop Active Turn (none running)'
+              : abortSuccess
               ? 'Signal Dispatched!'
               : aborting || isAborting
               ? 'Aborting Process Group...'

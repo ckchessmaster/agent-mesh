@@ -202,7 +202,12 @@ public class McpServerSchemaTests
     {
         using var db = TestDbContextFactory.Postgres();
         var migrations = db.GetService<IMigrationsAssembly>().Migrations.Keys.ToList();
-        migrations.Last().Should().Be(MigrationId);
+        // The tip moved from AddMcpServersAndPersonaMcpServers when AddProjectJobTurnBudget stacked on
+        // top (the same tripwire the AgentMemory/ProjectDocument schema tests pin with a TipMigrationId
+        // constant). What this test actually guarantees — a snapshot with nothing pending — is the
+        // HasPendingModelChanges line below, which now diffs against the tip snapshot including it.
+        migrations.Should().Contain(MigrationId);
+        migrations.IndexOf(MigrationId).Should().BeLessThan(migrations.Count - 1);
 
         db.Database.HasPendingModelChanges().Should().BeFalse(
             "AgentMeshDbContextModelSnapshot must stay in exact sync with McpServerConfiguration and PersonaMcpServerConfiguration");

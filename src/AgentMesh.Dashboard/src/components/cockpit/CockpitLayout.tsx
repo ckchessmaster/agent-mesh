@@ -42,7 +42,8 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
     sendPlanGuidance,
     submitPrReview,
     abortActiveTurn,
-    submitIntervention
+    submitIntervention,
+    resolveCard
   } = useJobTimeline(jobId);
 
   return (
@@ -85,6 +86,9 @@ export const CockpitLayout: React.FC<CockpitLayoutProps> = ({
           onSendPlanGuidance={sendPlanGuidance}
           onSubmitPrReview={submitPrReview}
           onSubmitIntervention={submitIntervention}
+          // Awaited, not fired-and-forgotten: the escalation card renders a rejection inline, and a
+          // failed resolve must not look like a retired escalation to the operator.
+          onResolveCard={resolveCard}
           onAddComment={(cardId, content) => { void addComment(cardId, content); }}
         />
       </div>

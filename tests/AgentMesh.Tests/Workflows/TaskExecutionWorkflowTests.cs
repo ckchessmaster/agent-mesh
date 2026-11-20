@@ -1,5 +1,6 @@
 ﻿using AgentMesh.Core.Activities;
 using AgentMesh.Tests.Sandbox;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Workflows;
 using AgentMesh.Worker.Workflows;
 using FluentAssertions;
@@ -604,6 +605,100 @@ public class TaskExecutionWorkflowTests
     }
 
     /// <summary>
+    /// A per-job turn budget replaces the default ceiling for that run, and only that run.
+    /// </summary>
+    /// <remarks>
+    /// The fuse exists to stop looping agents, but a task whose turns keep dying on infrastructure
+    /// exhausts it while making real progress. The operator's lever is the job's TurnBudget (Settings
+    /// → Recover), not a code change to the constant; this pins that the input actually moves the
+    /// loop bound the workflow enforces.
+    /// </remarks>
+    [Fact]
+    public async Task Workflow_CustomTurnBudget_ReplacesDefaultCeiling()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity());
+
+        for (var i = 0; i < 10; i++)
+        {
+            turns.Enqueue(TurnOutcome.ContinueTurn("still working"));
+        }
+
+        var handle = await StartWorkflowAsync(env, SampleInput with { TurnBudget = 3 });
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+
+        result.Success.Should().BeFalse();
+        result.Summary.Should().Contain("Halted after 3 turns",
+            "the halt an operator reads must name the budget that actually stopped the run");
+        turns.Calls.Should().Be(3,
+            "the input budget is the ceiling for this run — smaller than the default, honored exactly");
+    }
+
+    /// <summary>
+    /// Exhausting the turn budget files an operator-facing escalation, not just a failed result.
+    /// </summary>
+    /// <remarks>
+    /// The parent turns the failure into a "Halted:" heartbeat, which is honest but only visible on
+    /// that one job row. The card is what puts the event in Needs-Attention with the next move
+    /// written down — raise the budget and Recover, or reply with a correction and Recover.
+    /// </remarks>
+    [Fact]
+    public async Task Workflow_TurnBudgetExhausted_FilesOperatorEscalationCard()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        var cards = new FakeCardActivity();
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity(), cards);
+
+        turns.Enqueue(TurnOutcome.ContinueTurn("still working"));
+        turns.Enqueue(TurnOutcome.ContinueTurn("still working"));
+
+        // TaskTitle without TaskIndex: a task index turns every turn into a UpdateTaskStepCard call
+        // (the living-checklist heartbeat), which is a separate timeline activity this test's worker
+        // deliberately does not register.
+        var handle = await StartWorkflowAsync(env, SampleInput with { TurnBudget = 2, TaskTitle = "Wire the widget" });
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+        result.Success.Should().BeFalse();
+
+        var escalation = cards.CreatedCards.Should().ContainSingle().Subject;
+        escalation.CardType.Should().Be(TimelineCardType.Escalation3R);
+        escalation.Status.Should().Be(TimelineCardStatus.PendingInput,
+            "an escalation is a human wait: PendingInput is what the attention rollup counts");
+        escalation.Title.Should().Contain("Turn budget exhausted").And.Contain("2/2");
+        escalation.StructuredPayloadJson.Should()
+            .Contain("task_workflow:turn_budget")
+            .And.Contain("Recover Job", "the card has to name the control that actually resumes the job")
+            .And.Contain("Wire the widget", "and the task it stopped on");
+    }
+
+    /// <summary>
+    /// A failing card activity must not cost the operator the halt reason.
+    /// </summary>
+    /// <remarks>
+    /// Same rule the parent workflow follows for its halt persistence: the task result is what the
+    /// job ledger records, and an unreachable timeline store may swallow a card but never mask the
+    /// failure behind it.
+    /// </remarks>
+    [Fact]
+    public async Task Workflow_EscalationCardFailure_StillHaltsWithResult()
+    {
+        await using var env = await NewEnvironmentAsync();
+        var turns = new FakeTurnActivity();
+        var cards = new FakeCardActivity(new Temporalio.Exceptions.ApplicationFailureException(
+            "timeline store unreachable", nonRetryable: true));
+        await using var worker = TestWorker.Start(env, turns, new FakeGitActivity(), cards);
+
+        turns.Enqueue(TurnOutcome.ContinueTurn("still working"));
+
+        var handle = await StartWorkflowAsync(env, SampleInput with { TurnBudget = 1 });
+        var result = await handle.GetResultAsync<TaskExecutionResult>();
+
+        result.Success.Should().BeFalse();
+        result.Summary.Should().Contain("Halted after 1 turns");
+    }
+
+    /// <summary>
     /// The signal wire names are what the SDK actually registers.
     /// </summary>
     /// <remarks>
@@ -792,12 +887,21 @@ public class TaskExecutionWorkflowTests
         public static TestWorker Start(
             WorkflowEnvironment env,
             FakeTurnActivity turns,
-            FakeGitActivity git)
+            FakeGitActivity git,
+            FakeCardActivity? cards = null)
         {
             var options = new TemporalWorkerOptions(Queue)
                 .AddActivity(turns.RunAgentCodingTurnAsync)
                 .AddActivity(git.MergePullRequestAsync)
                 .AddWorkflow<TaskExecutionWorkflow>();
+
+            // Only the budget-exhausted tests register it; everywhere else the card activity has no
+            // handler, which is itself a fact: the workflow must halt honestly even when filing the
+            // escalation fails.
+            if (cards is not null)
+            {
+                options = options.AddActivity(cards.CreateCardAsync);
+            }
 
             // Sticky execution off. A sticky-held workflow routes its next task to the queue of the
             // worker that cached it, so after the shutdown test stops that worker the server keeps
@@ -1051,6 +1155,44 @@ public class TaskExecutionWorkflowTests
                     "cancellation would have landed somewhere else in the run and this test would " +
                     "prove nothing about the merge path");
             }
+        }
+    }
+
+    /// <summary>
+    /// Captures timeline cards the workflow files, with an optional standing failure.
+    /// </summary>
+    /// <remarks>
+    /// Implements only <see cref="CreateCardAsync"/>: that is the only timeline activity the task
+    /// workflow reaches, and <c>TestWorker</c> registers methods, not whole interfaces, so the rest of
+    /// <c>ITimelineActivities</c> deliberately has no here to be called at.
+    /// </remarks>
+    private sealed class FakeCardActivity
+    {
+        private readonly Exception? failure;
+
+        public FakeCardActivity(Exception? failureToThrow = null) => failure = failureToThrow;
+
+        public List<CreateTimelineCardInput> CreatedCards { get; } = [];
+
+        [Activity]
+        public Task<JobTimelineCard> CreateCardAsync(CreateTimelineCardInput input)
+        {
+            if (failure is not null)
+            {
+                return Task.FromException<JobTimelineCard>(failure);
+            }
+
+            CreatedCards.Add(input);
+            return Task.FromResult(new JobTimelineCard
+            {
+                Id = Guid.NewGuid(),
+                JobId = input.JobId,
+                TaskId = input.TaskId,
+                CardType = input.CardType,
+                Status = input.Status,
+                Title = input.Title,
+                StructuredPayloadJson = input.StructuredPayloadJson
+            });
         }
     }
 

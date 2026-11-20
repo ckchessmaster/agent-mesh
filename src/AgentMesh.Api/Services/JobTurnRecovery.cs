@@ -567,7 +567,11 @@ public sealed class JobTurnRecovery(
             WorkspacePath: workspacePath,
             InitialPrompt: initialPrompt,
             TargetBranch: !string.IsNullOrWhiteSpace(job.GitBranchName) ? job.GitBranchName : "main",
-            ApprovalPolicy: job.ApprovalPolicy)
+            // ToString() is deliberate: with TurnBudget named, overload resolution now lands on the
+            // primary constructor, whose ApprovalPolicy is the string form — the same value the
+            // enum-typed convenience ctor produced before this field existed.
+            ApprovalPolicy: job.ApprovalPolicy.ToString(),
+            TurnBudget: job.TurnBudget)
         {
             Continuation = continuation
         };

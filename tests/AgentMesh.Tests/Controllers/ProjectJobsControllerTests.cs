@@ -136,6 +136,55 @@ public class ProjectJobsControllerTests
     }
 
     [Fact]
+    public async Task UpdateJob_TurnBudget_PersistsOmittedMeansKeep()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project { Id = "app", Name = "App" });
+        var job = new ProjectJob { Id = Guid.NewGuid(), ProjectId = "app", Title = "Job 1", TasksJson = "[]" };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        // A budget that started null (platform default) becomes an explicit value the cockpit and the
+        // recovery input can both see.
+        var firstResult = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(Title: "kept", TurnBudget: 80));
+        var first = (firstResult.Should().BeOfType<OkObjectResult>().Subject.Value as ProjectJobDto)!;
+        first.TurnBudget.Should().Be(80);
+        first.Title.Should().Be("kept");
+        (await db.ProjectJobs.FindAsync(job.Id))!.TurnBudget.Should().Be(80);
+
+        // Every other field of this handler follows "null = unchanged"; TurnBudget must not be the one
+        // field where leaving a control blank silently resets a job to the platform default.
+        var secondResult = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(Description: "touching description"));
+        var second = (secondResult.Should().BeOfType<OkObjectResult>().Subject.Value as ProjectJobDto)!;
+        second.TurnBudget.Should().Be(80);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(1001)]
+    public async Task UpdateJob_TurnBudgetOutOfRange_RefusesWholeRequest(int rejected)
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project { Id = "app", Name = "App" });
+        var job = new ProjectJob { Id = Guid.NewGuid(), ProjectId = "app", Title = "Job 1", TurnBudget = 40, TasksJson = "[]" };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        var result = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(
+            Title: "should NOT land", TurnBudget: rejected));
+
+        result.Should().BeOfType<BadRequestObjectResult>();
+        var inDb = await db.ProjectJobs.FindAsync(job.Id);
+        inDb!.Title.Should().Be("Job 1", "a refused request must not half-apply the fields before it");
+        inDb.TurnBudget.Should().Be(40);
+    }
+
+    [Fact]
     public async Task UpdateJob_ChangingAssignedAgentId_SignalsWorkflowRouter()
     {
         using var db = TestDbContextFactory.Create();

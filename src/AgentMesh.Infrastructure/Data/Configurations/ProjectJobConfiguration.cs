@@ -78,6 +78,10 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
             .HasColumnName("current_task_id")
             .HasMaxLength(64);
 
+        builder.Property(j => j.TurnBudget)
+            .HasColumnName("turn_budget")
+            .IsRequired(false);
+
         builder.Property(j => j.ProgressHeartbeat)
             .HasColumnName("progress_heartbeat")
             .HasColumnType("text");
