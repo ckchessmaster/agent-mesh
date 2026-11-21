@@ -140,6 +140,95 @@ public class DecompositionEmptyChecklistTests
             .And.NotContain("Stateful Cards");
     }
 
+    /// <summary>
+    /// Job 67fc1b8a (2026-11-20): the discovery turn registered a checklist AND posted its plan as
+    /// a requires-reply escalation, so the feed carried an "Escalation from @bee to @operator"
+    /// NEEDS YOU card and this gate at once - the same approval asked twice, the older card
+    /// wearing the louder badge, and the session parked on a reply the workflow never waits for.
+    /// The gate is the approval surface; opening it supersedes an open operator escalation.
+    /// Persona-addressed consultations are left alone - no human is blocked on them.
+    /// </summary>
+    [Fact]
+    public async Task TheGateSupersedesAnOpenOperatorEscalationFromTheSamePlanHandoff()
+    {
+        var tasks = JsonSerializer.Serialize(new[]
+        {
+            new
+            {
+                id = Guid.NewGuid(),
+                title = "Wire job attachments",
+                target_file = "src/Api/Controllers/ProjectJobsController.cs",
+                verification_method = "dotnet test"
+            }
+        });
+        var (db, jobId) = await SeedJob(tasks);
+
+        var operatorEscalation = new JobTimelineCard
+        {
+            Id = Guid.NewGuid(),
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.Escalation3R,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Escalation from @bee to @operator",
+            StructuredPayloadJson = JsonSerializer.Serialize(new
+            {
+                content = "@operator Stage 1 Discovery & Implementation Plan: 4 tasks.",
+                targetPersona = "operator",
+                requiresReply = true,
+                source = "mcp:post_job_message"
+            }),
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        var personaConsultation = new JobTimelineCard
+        {
+            Id = Guid.NewGuid(),
+            JobId = jobId.ToString(),
+            CardType = TimelineCardType.Escalation3R,
+            Status = TimelineCardStatus.PendingInput,
+            Title = "Escalation from @bee to @astra",
+            StructuredPayloadJson = JsonSerializer.Serialize(new
+            {
+                content = "@astra schema review before I commit?",
+                targetPersona = "astra",
+                requiresReply = true,
+                source = "mcp:post_job_message"
+            }),
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        db.JobTimelineCards.AddRange(operatorEscalation, personaConsultation);
+        await db.SaveChangesAsync();
+
+        var activities = new TimelineActivities(
+            db,
+            NullLogger<TimelineActivities>.Instance,
+            new StubPromptStackBuilder(),
+            new ScriptedTurnRunner("never dispatched"));
+        await activities.ExecuteDecompositionActivityAsync(new DecompositionActivityInput(
+            jobId.ToString(),
+            "Reallocate a budget line between categories",
+            "/workspace/repos/budget-app",
+            Feedback: null,
+            Answers: new Dictionary<string, string>()));
+
+        var stored = await db.JobTimelineCards.AsNoTracking().ToDictionaryAsync(c => c.Id);
+        stored.Values.Single(c => c.CardType == TimelineCardType.PlanApproval)
+            .Status.Should().Be(TimelineCardStatus.PendingInput, "the gate itself is the ask that survives");
+
+        stored[operatorEscalation.Id].Status.Should().Be(TimelineCardStatus.Resolved,
+            "one open ask per decision: the gate carries the approval now");
+        var payload = JsonDocument.Parse(stored[operatorEscalation.Id].StructuredPayloadJson).RootElement;
+        payload.GetProperty("resolutionNote").GetString().Should().Contain("Plan Approval gate");
+        payload.GetProperty("content").GetString().Should().Contain("Stage 1 Discovery",
+            "superseding closes the wait, it does not erase what the agent said");
+        payload.GetProperty("targetPersona").GetString().Should().Be("operator",
+            "the original payload fields survive the annotation");
+
+        stored[personaConsultation.Id].Status.Should().Be(TimelineCardStatus.PendingInput,
+            "a persona-addressed consultation is not the operator's blocker to double-count");
+    }
+
     [Fact]
     public async Task AChecklistThatDoesExist_IsStillPresentedNormally()
     {

@@ -151,11 +151,12 @@ public class CopilotAdapterStreamingTests
     }
 
     [Fact]
-    public void TryParseCopilotJsonLine_UnknownNonEphemeralJson_StillFallsBack()
+    public void TryParseCopilotJsonLine_UnknownEventWithContent_StillFallsBackToTheCaller()
     {
-        // Deliberately narrow: only namespaced or ephemeral events are claimed. An unknown event
-        // shape the CLI actually emits as prose-ish JSON keeps the old raw-text behavior so we do
-        // not silently swallow output we have not learned to parse.
+        // Deliberately narrow, and now narrower than #101 made it: control events without text are
+        // claimed outright. Only a typed event that still could carry prose is left for the caller,
+        // and the caller keeps its promise too - a JSON-shaped fallback line is dropped from the
+        // reply and reported once, not appended to it (see the live-incident replay above).
         var parsed = CopilotAdapter.TryParseCopilotJsonLine(
             """{"type":"some_future_notice","data":{"content":"hello"}}""",
             out _, out _, out _, out _, out _, out _, out _);
@@ -365,9 +366,140 @@ public class CopilotAdapterStreamingTests
         }
     }
 
-    [Fact]
-    public void ResolveFinalCopilotOutput_WhenStreamedAndTaskCompleteAreEmpty_BoundsLargeRawJsonlFallbackTo16Kb()
+    /// <summary>
+    /// 2026-11-20, the copilot blob incident (job 67fc1b8a, session 63db5295): a 116KB `response`
+    /// whose raw lines were the CLI's own message bus. None of these types are `session.`-prefixed
+    /// or `ephemeral`, so #101's control-event claim never saw them; they matched no branch, the
+    /// raw-text fallback appended every one, and the persona's "reply" became the dump. These are
+    /// the leaked line shapes from that transcript (payloads truncated, type names verbatim).
+    /// </summary>
+    [Theory]
+    [InlineData("""{"type":"instruction.update","data":{"content":"<mode_changed_notice>\n\n<autopilot_mode>\nThe Autopilot mode is currently active.</autopilot_mode>\n</mode_changed_notice>","authority":"runtime","lifecycle":"persistent","boundary":"nextModelRequest","fallback":"rebuildSystemPrompt","name":"mode-state","postinitial":false},"id":"bb372e26-45df-4e06-9aaa-7d035fa430f0","timestamp":"2026-11-20T19:39:18.554Z","parentId":"5724381b-610d-4d88-a30d-64b117635796"}""")]
+    [InlineData("""{"type":"user.message","data":{"content":"You are running on driver @beeline-gh-copilot as Persona Bee, acting as Senior Software Engineer connected to the interactive AgentMesh Cockpit. [Active Session ID: 141ca1f1-2552-4972-b357-b35091887376] ... LAYER 1: PLATFORM INVARIANTS ..."},"timestamp":"2026-11-20T19:39:18.556Z","parentId":"d6218105-67e6-4792-966e-20f40cc949af"}""")]
+    [InlineData("""{"type":"assistant.turn_start","data":{"turnId":"18","agentMode":"autopilot","id":"c10811fa-2097-4a88-bb86-ba5f66982b9c","timestamp":"2026-11-20T19:49:08.692Z","parentId":"b8bdb3e9-6916-41db-8caa-6ea843b61918"}}""")]
+    [InlineData("""{"type":"assistant.turn_end","data":{"turnId":"21","id":"78ba2d44-9a78-4043-a599-f9f08d177ca0","timestamp":"2026-11-20T19:49:30.925Z","parentId":"850ee6d-94e1-4703-9bd7-482229a405c"}}""")]
+    [InlineData("""{"type":"assistant.message","data":{"content":"","model":"gemini-4-carbon","toolRequests":[{"name":"shell","intent":"Oub8Sc2MhJ5Dz9i8vpBP+0WKnwuuIQaeM5Zcp2QboOMPN6r9fOlQcquRlL1h7O5Atgu","toolTitle":"Running command"}],"reasoningOpaque":"H4sIAAAAA/+Oxdi3jsIwAEXRdS9bv9iW6RgRb0qF+u//8c8555xzzjn//wMAAPwD0cdT8gAaAAIA","turnId":"20"}}""")]
+    public void TryParseCopilotJsonLine_LiveIncidentLeakedLines_AreClaimedWithNoContent(string line)
     {
+        var parsed = CopilotAdapter.TryParseCopilotJsonLine(
+            line, out var eventType, out var content, out _, out _, out _, out _, out _);
+
+        parsed.Should().BeTrue(
+            "an unclaimed line falls through to the raw-text fallback and can become the reply again");
+        eventType.Should().NotBeNullOrWhiteSpace();
+        content.Should().BeNullOrWhiteSpace(
+            "none of these carry the persona's words: notices, envelope echoes, turn bookkeeping and " +
+            "blank tool-request shells are the driver's bus, not a message to the Job Timeline");
+    }
+
+    [Fact]
+    public void TryParseCopilotJsonLine_EmptyReasoningEvent_IsClaimedNotFellThrough()
+    {
+        var parsed = CopilotAdapter.TryParseCopilotJsonLine(
+            """{"type":"assistant.reasoning","data":{"content":""}}""",
+            out var eventType, out var content, out _, out _, out _, out _, out _);
+
+        parsed.Should().BeTrue("a textless thought event is control noise, not an unparsed line");
+        content.Should().BeNullOrWhiteSpace();
+        eventType.Should().NotBeNullOrWhiteSpace();
+    }
+
+    [Fact]
+    public void TryParseCopilotJsonLine_UnknownEventWithoutTextEnvelope_IsClaimedAsControlEvent()
+    {
+        // #101 left unknown non-ephemeral shapes on the raw-text fallback "by design"; the
+        // incident showed the fallback was a blob channel - unknown control types arrive
+        // unannounced and each one then becomes transcript. A typed event with no text to say is
+        // claimed; one that could carry prose (#101's case, below) keeps the fallback.
+        var parsed = CopilotAdapter.TryParseCopilotJsonLine(
+            """{"type":"some_future_notice","data":{"count":3,"level":"warn"}}""",
+            out var eventType, out var content, out _, out _, out _, out _, out _);
+
+        parsed.Should().BeTrue();
+        content.Should().BeNullOrWhiteSpace();
+        eventType.Should().Be("some_future_notice");
+    }
+
+    [Theory]
+    [InlineData("""{"type":"a"}""", true)]
+    [InlineData("""   {"a":1}   """, true)]
+    [InlineData("plain prose stays prose", false)]
+    [InlineData("""{"a":1} trailing prose""", false)]
+    [InlineData("{", false)]
+    [InlineData("", false)]
+    public void IsJsonEventLineShape_RecognizesTheEventWireFormatAndNothingElse(string line, bool expected) =>
+        CopilotAdapter.IsJsonEventLineShape(line).Should().Be(expected);
+
+    [Fact]
+    public async Task RunCopilotSubprocessAsync_LiveIncidentSequence_ReplyContainsOnlyThePersonaText()
+    {
+        // Replay of session 63db5295's stream shape: instruction notices, an echoed envelope,
+        // turn boundaries and blank tool-request envelopes around one real message. The settled
+        // reply must be that message alone - the same stream produced a 116KB "Turn update" card
+        // in production on 2026-11-20.
+        var tempDir = Path.Combine(Path.GetTempPath(), "copilot-incident-replay-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tempDir);
+        var fakeScript = Path.Combine(tempDir, "fake-copilot.sh");
+
+        const string scriptContent = """
+            #!/usr/bin/env bash
+            echo '{"type":"instruction.update","data":{"content":"<mode_changed_notice>Autopilot active</mode_changed_notice>","authority":"runtime","name":"mode-state"}}'
+            echo '{"type":"user.message","data":{"content":"You are running on driver @beeline-gh-copilot as Persona Bee..."}}'
+            echo '{"type":"assistant.turn_start","data":{"turnId":"20","agentMode":"autopilot"}}'
+            echo '{"type":"assistant.message","data":{"content":"","toolRequests":[{"name":"shell","intent":"Oub8Sc2MhJ5Dz9i8vpBP"}],"reasoningOpaque":"H4sIAAAAA"}}'
+            echo '{"type":"assistant.turn_end","data":{"turnId":"20"}}'
+            echo '{"type":"assistant.turn_start","data":{"turnId":"21","agentMode":"autopilot"}}'
+            echo '{"type":"assistant.message","data":{"content":"Stage 1 discovery complete. NO_OPEN_QUESTIONS"}}'
+            echo '{"type":"assistant.turn_end","data":{"turnId":"21"}}'
+            """;
+        await File.WriteAllTextAsync(fakeScript, scriptContent);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(fakeScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        try
+        {
+            var events = new List<TrajectoryEventPayload>();
+            var preset = new AgentPresetConfig { Id = "copilot-cli", AdapterType = "copilot" };
+            var promptEvent = new PromptReceivedEvent { SessionId = Guid.NewGuid(), Prompt = "Plan attachments" };
+
+            var (exitCode, _, _, succeeded) = await CopilotAdapter.RunCopilotSubprocessAsync(
+                fakeScript,
+                isViaGh: false,
+                cwd: tempDir,
+                preset,
+                promptEvent,
+                promptEnvelope: "Plan attachments",
+                useJsonFormat: true,
+                ev => { events.Add(ev); return Task.CompletedTask; },
+                CancellationToken.None);
+
+            exitCode.Should().Be(0);
+            succeeded.Should().BeTrue();
+
+            var responseEvent = events.Single(e => e.EventType == "response");
+            responseEvent.Content.Should().Be("Stage 1 discovery complete. NO_OPEN_QUESTIONS");
+            responseEvent.Content.Should().NotContain("instruction.update");
+            responseEvent.Content.Should().NotContain("H4sIAAAAA");
+            var allText = string.Concat(events.Select(e => e.Content ?? string.Empty));
+            allText.Should().NotContain("mode_changed_notice");
+            allText.Should().NotContain("unrecognized control-event",
+                "everything in this stream is a known type now; the drop-notice path is for future shapes");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ResolveFinalCopilotOutput_WhenStreamedAndTaskCompleteAreEmpty_ReportsEventOnlyStreamInsteadOfDumpingJsonl()
+    {
+        // The bounded 16KB raw-JSONL tail this replaced was the last path by which the CLI's
+        // message bus could reach the chat - 16KB of {"type":...} is still a blob. An event-only
+        // transcript with no stderr is reported as the driver gap it is; rawStdOut stays with the
+        // session artifact for forensics.
         var sb = new System.Text.StringBuilder();
         for (var i = 0; i < 1500; i++)
         {
@@ -382,8 +514,26 @@ public class CopilotAdapterStreamingTests
             rawStdOut: rawJsonl,
             stdErr: string.Empty);
 
+        resolved.Should().NotContain("line-1499-");
+        resolved.Should().NotContain("""{"type":""");
+        resolved.Should().Contain("1500 event line(s)").And.Contain("no assistant message");
         resolved.Length.Should().BeLessThanOrEqualTo(CopilotAdapter.MaxRawFallbackPreviewChars);
-        resolved.Should().Contain("line-1499-", "bounded fallback keeps the tail where exit diagnostics appear");
+    }
+
+    [Fact]
+    public void ResolveFinalCopilotOutput_WhenEventsProducedNoReply_ButStdErrExists_ReturnsStdErrTail()
+    {
+        // Exit diagnostics still win over the report: a driver that crashed says so on stderr,
+        // and that sentence is the whole point of the fallback.
+        var raw = """{"type":"assistant.turn_start","data":{"turnId":"1"}}""";
+
+        var resolved = CopilotAdapter.ResolveFinalCopilotOutput(
+            streamedResponse: string.Empty,
+            taskCompleteSummary: null,
+            rawStdOut: raw,
+            stdErr: "TypeError: cannot read properties of undefined");
+
+        resolved.Should().Contain("TypeError");
     }
 
     [Fact]

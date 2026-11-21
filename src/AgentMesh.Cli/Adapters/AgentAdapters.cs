@@ -2986,6 +2986,12 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         var pendingArglessTools = new List<string>();
         string? lastActiveToolName = null;
         string? lastCopilotActivitySummary = null;
+        // JSON-shaped lines the parser declined (an unknown type carrying content - #101's
+        // deliberate raw-fallback case). They are events, not prose; #101's text fallback let them
+        // accumulate into the persona's reply. They are counted and reported once as a thought so
+        // the drop is visible, while the raw driver transcript keeps them verbatim for forensics.
+        int droppedEventLines = 0;
+        string? firstDroppedEventLine = null;
 
         async Task SafeEmitAsync(TrajectoryEventPayload payload)
         {
@@ -3188,6 +3194,20 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                         });
                     }
 
+                    // The reply is prose or nothing. A JSON-shaped line the parser did not claim
+                    // is still an event on the CLI's bus: appending it is how turn boundaries,
+                    // echoed envelopes and tool-request blobs became the persona's "answer"
+                    // (session 63db5295, 116KB, 2026-11-20). Keep it out of the reply and report
+                    // the count once at the end of the stream instead of reliving it per line.
+                    if (IsJsonEventLineShape(trimmed))
+                    {
+                        if (Interlocked.Increment(ref droppedEventLines) == 1)
+                        {
+                            Interlocked.CompareExchange(ref firstDroppedEventLine, TruncateLine(trimmed, 140), null);
+                        }
+                        continue;
+                    }
+
                     lock (streamedResponseBuilder)
                     {
                         streamedResponseBuilder.AppendLine(line);
@@ -3278,6 +3298,22 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return (proc.ExitCode, rawStdOut, stdErr, false);
             }
 
+            var droppedCount = Volatile.Read(ref droppedEventLines);
+            if (droppedCount > 0)
+            {
+                // One line naming the gap - not a copy of it. An unrecognized event is either a
+                // control type the parser's catalog lacks or a content type predating a branch;
+                // either way the operator's transcript must not become the overflow buffer for
+                // the driver's message bus.
+                await SafeEmitAsync(new TrajectoryEventPayload
+                {
+                    EventType = "thought",
+                    Content = $"[GitHub Copilot CLI @{preset.Id}] Kept {droppedCount} unrecognized " +
+                        $"control-event line(s) out of the reply (first: {Volatile.Read(ref firstDroppedEventLine)}). " +
+                        "The raw driver transcript still has them; the adapter needs a parse branch for the type."
+                });
+            }
+
             string streamedOutput;
             lock (streamedResponseBuilder) { streamedOutput = streamedResponseBuilder.ToString().Trim(); }
             var output = ResolveFinalCopilotOutput(streamedOutput, taskCompleteSummary, rawStdOut, stdErr);
@@ -3358,11 +3394,12 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         if (!string.IsNullOrWhiteSpace(rawStdOut))
         {
             var plainLines = new List<string>();
+            var eventLineCount = 0;
             foreach (var rawLine in rawStdOut.Split('\n'))
             {
                 var t = rawLine.Trim();
                 if (string.IsNullOrEmpty(t)) continue;
-                if (t.StartsWith('{') && t.EndsWith('}')) continue;
+                if (IsJsonEventLineShape(t)) { eventLineCount++; continue; }
                 plainLines.Add(rawLine.TrimEnd('\r'));
             }
 
@@ -3370,10 +3407,33 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             {
                 return BoundPreviewTail(string.Join("\n", plainLines).Trim(), maxFallbackChars)!;
             }
+
+            // An event-only transcript with no reply text and no stderr is a driver gap, not an
+            // answer, and the old bounded 16KB tail of `{"type":...}` lines was still a blob in
+            // the chat - the last path by which the message bus could reach the operator. Name
+            // the absence instead; rawStdOut stays with the session artifact for forensics.
+            if (eventLineCount > 0 && string.IsNullOrWhiteSpace(stdErr))
+            {
+                return $"The copilot driver streamed {eventLineCount} event line(s) but produced no reply " +
+                       "text - no assistant message and no task_complete summary reached the platform. The " +
+                       "raw driver transcript is preserved with the session; if this recurs, the adapter " +
+                       "is missing a parse branch for the event type.";
+            }
         }
 
         var fallback = !string.IsNullOrWhiteSpace(stdErr) ? stdErr.Trim() : (rawStdOut?.Trim() ?? string.Empty);
         return BoundPreviewTail(fallback, maxFallbackChars) ?? string.Empty;
+    }
+
+    /// <summary>
+    /// True for a line shaped like a single JSON object event - the copilot CLI's --stream wire
+    /// format. Used wherever the transcript must tell the driver's message bus apart from prose.
+    /// </summary>
+    internal static bool IsJsonEventLineShape(string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        var t = line.Trim();
+        return t.Length > 1 && t[0] == '{' && t[^1] == '}';
     }
 
     internal static string? BoundPreviewTail(string? text, int maxChars = MaxRawFallbackPreviewChars)
@@ -3501,10 +3561,11 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 eventType = kind.Contains("delta") ? "thought_delta" : "thought";
                 content = OpenAiAdapter.GetPropertyString(data, "content", "text", "delta", "thinking");
                 if (!string.IsNullOrWhiteSpace(content)) return true;
-                // A thought-shaped control event with no text (e.g. a thinking-mode toggle) is
-                // still control-plane noise, not an unparsed line.
-                if (isNamespaced || isEphemeral) { eventType = lower; return true; }
-                return false;
+                // A thought-shaped event with no text (a thinking-mode toggle, a delta flush) says
+                // nothing; claim it. Falling through here re-emerged as a blob channel in the
+                // 2026-11-20 incident: the text fallback appends the *line*, control fields and all.
+                eventType = lower;
+                return true;
             }
 
             // Evaluate tool_result BEFORE tool_call so events like "tool.execution_complete"
@@ -3565,8 +3626,16 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 eventType = "message";
                 content = data.TryGetProperty("content", out var c) ? c.GetString() : (data.TryGetProperty("text", out var t) ? t.GetString() : (data.TryGetProperty("delta", out var d) ? d.GetString() : null));
                 if (!string.IsNullOrWhiteSpace(content)) return true;
-                if (isNamespaced || isEphemeral) { eventType = lower; return true; }
-                return false;
+                // A blank message envelope is claimed, never dumped into the reply. A tool-only
+                // assistant turn arrives as an assistant.message whose text `content` is empty but
+                // which carries a large base64 `toolRequests` / `reasoningOpaque` payload (the
+                // 37KB lines of the 2026-11-20 incident, session 63db5295); its real tool calls
+                // reach the transcript as separate tool.* events, so the envelope has nothing the
+                // persona is saying. The caller appends message content only when non-blank, so
+                // claiming here is a no-op - returning false handed the whole line to the
+                // text fallback instead.
+                eventType = lower;
+                return true;
             }
 
             if (kind is "result" or "workflow.result")
@@ -3583,12 +3652,41 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return true;
             }
 
+            // The Copilot CLI wraps its whole message bus into --stream output, and not all of it
+            // is `session.`-prefixed or `ephemeral`: `instruction.update` pushes mode-state and
+            // sandbox notices to the next model request (data.content is prompt furniture, never a
+            // persona answer), `user.message` echoes the prompt envelope we ourselves sent, and
+            // `assistant.turn_start`/`turn_end` are turn-boundary bookkeeping. The 2026-11-20
+            // incident (session 63db5295: turn boundaries, an instruction notice, a 45KB echoed
+            // envelope and six tool-only assistant turns - 116KB - settled as the persona's
+            // "reply") was these names walking straight through #101's "unknown shapes keep the
+            // raw-text fallback" rule. They are not unknown shapes; they are named control events
+            // whose catalog was incomplete. Give a future type that carries something a persona
+            // should say a branch above - not a trip through raw passthrough.
+            if (kind is "instruction.update" or "user.message"
+                or "assistant.turn_start" or "assistant.turn_end")
+            {
+                eventType = lower;
+                return true;
+            }
+
             // Control-plane event we understand the shape of but have no handler for
             // (mcp_server_status_changed, background_tasks_changed, heartbeats...). Claim it so
             // the caller's non-JSON text fallback never sees it; an event with no usable content
             // must not become part of the reply. A future type that carries content should get a
             // branch above, not a trip through raw passthrough.
             if (isNamespaced || isEphemeral)
+            {
+                eventType = lower;
+                return true;
+            }
+
+            // One last net the blob cannot slip through: a line that parsed as a JSON object with
+            // a string `type`, matched no content handler above, and is not a shape #101 chose to
+            // leave in the text fallback (no `data` envelope to hold text). An event is not prose;
+            // the raw driver transcript keeps it for forensics even when the reply does not.
+            if (!data.TryGetProperty("content", out _) && !data.TryGetProperty("text", out _) &&
+                !data.TryGetProperty("delta", out _) && !data.TryGetProperty("result", out _))
             {
                 eventType = lower;
                 return true;
