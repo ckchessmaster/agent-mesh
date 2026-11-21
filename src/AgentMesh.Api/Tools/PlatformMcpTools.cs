@@ -225,6 +225,28 @@ public class PlatformMcpTools(
 
         var authorPersonaId = sender.PersonaId ?? sender.AgentId ?? "unknown";
         var driverId = context.Context.DriverId ?? sender.AgentId;
+
+        // A Stage 1 plan hand-off is not an escalation. The Plan Approval gate the workflow opens
+        // from the registered checklist is the single surface where the operator decides, so a
+        // reply-required post to the human during the discovery turn asks the same question twice,
+        // parks the session as waiting_for_input, and leaves two PendingInput cards for one
+        // decision (bee job 67fc1b8a, 2026-11-20: the discovery turn posted its plan with
+        // requires_reply because an earlier revision of the protocol told it to; the gate opened
+        // from the same checklist anyway). The prompts now say otherwise - this is the backstop:
+        // the post still lands in the timeline, as the notification it actually is. A genuine
+        // blocker in discovery has no registered checklist yet to open a gate, so it still
+        // escalates; Stage 3 strikes never see this branch (not discovery phase).
+        var planHandoffDowngraded = false;
+        if (requires_reply &&
+            string.Equals(target, OperatorPersonaId, StringComparison.OrdinalIgnoreCase) &&
+            context.Context.IsDiscoveryPhase &&
+            !string.IsNullOrWhiteSpace(job.TasksJson) &&
+            !string.Equals(job.TasksJson.Trim(), "[]", StringComparison.Ordinal))
+        {
+            requires_reply = false;
+            planHandoffDowngraded = true;
+        }
+
         var cardType = requires_reply
             ? TimelineCardType.Escalation3R
             : (target != OperatorPersonaId
@@ -331,10 +353,15 @@ public class PlatformMcpTools(
             targetPersona = target,
             requiresReply = requires_reply,
             sessionStatus = parkedSession?.Status,
-            message = requires_reply
-                ? $"Escalation card posted to the Job Timeline and addressed to @{target}. The session is now waiting for input; " +
-                  "conclude your turn and continue when the reply arrives."
-                : $"Timeline card posted to the Job Timeline and addressed to @{target}.",
+            message = planHandoffDowngraded
+                ? "Plan posted to the Job Timeline as a plain update. The Plan Approval gate opens from your " +
+                  "registered checklist when this turn ends, and that gate is where the operator decides - a " +
+                  "reply request on the plan would ask them to approve it on two cards, so this message did not " +
+                  "park the session. Conclude with NO_OPEN_QUESTIONS and stop."
+                : requires_reply
+                    ? $"Escalation card posted to the Job Timeline and addressed to @{target}. The session is now waiting for input; " +
+                      "conclude your turn and continue when the reply arrives."
+                    : $"Timeline card posted to the Job Timeline and addressed to @{target}.",
             resolvedFrom = ResolveProvenance(context.Context),
         }, JsonOptions);
     }
