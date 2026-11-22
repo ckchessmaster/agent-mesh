@@ -561,6 +561,7 @@ export interface AgentUsageResponse {
 export interface SessionAttachment {
   id: string;
   sessionId: string;
+  jobId?: string;
   fileName: string;
   contentType: string;
   sizeBytes: number;
@@ -824,6 +825,7 @@ export interface ProjectJob {
   lifecycleStatus?: JobLifecycleStatus | string | null;
   assignedAgentId?: string | null;
   queuedTurns?: QueuedJobTurnDto[];
+  attachments?: SessionAttachment[] | null;
   messageCount: number;
   createdAt: string;
   updatedAt: string;

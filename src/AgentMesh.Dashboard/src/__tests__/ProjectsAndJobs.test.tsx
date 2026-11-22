@@ -1338,4 +1338,128 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       });
     });
   });
+
+  describe('NewJobModal job creation with attachments', () => {
+    it('creates the job and uploads pasted screenshots and files via uploadJobAttachments', async () => {
+      const createdJob: ProjectJob = {
+        id: 'job-attach-201',
+        projectId: 'mesh-core',
+        projectName: 'Mesh Core System',
+        title: 'Fix Dashboard Screenshot Layout',
+        description: 'See attached screenshot',
+        status: ProjectJobStatus.Pending,
+        gitBranchName: 'mesh/job-attach-201',
+        tasks: [],
+        messageCount: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      vi.mocked(api.createProjectJob).mockResolvedValue(createdJob);
+      vi.mocked(api.uploadJobAttachments).mockResolvedValue([
+        {
+          id: 'att-shot-1',
+          sessionId: 'job-attach-201',
+          jobId: 'job-attach-201',
+          fileName: 'screenshot-1.png',
+          contentType: 'image/png',
+          sizeBytes: 128,
+          s3Key: 'jobs/job-attach-201/attachments/att-shot-1/screenshot-1.png',
+          downloadUrl: '/api/project-jobs/job-attach-201/attachments/att-shot-1/content',
+          createdAt: new Date().toISOString()
+        }
+      ]);
+
+      render(<App />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Create new Job in this project')).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByTitle('Create new Job in this project'));
+
+      const jobTitleInput = screen.getByPlaceholderText('e.g. Implement OAuth2 flow with Google & GitHub');
+      fireEvent.change(jobTitleInput, { target: { value: 'Fix Dashboard Screenshot Layout' } });
+
+      const descInput = screen.getByTestId('new-job-description-input');
+      fireEvent.change(descInput, { target: { value: 'See attached screenshot' } });
+
+      const pastedPng = new File(['png-bytes'], 'image.png', { type: 'image/png' });
+      fireEvent.paste(descInput, {
+        clipboardData: {
+          files: [pastedPng]
+        }
+      });
+
+      expect(screen.getByText('screenshot-1.png')).toBeInTheDocument();
+
+      fireEvent.submit(jobTitleInput.closest('form')!);
+
+      await waitFor(() => {
+        expect(api.createProjectJob).toHaveBeenCalledWith(
+          'mesh-core',
+          expect.objectContaining({
+            title: 'Fix Dashboard Screenshot Layout',
+            description: 'See attached screenshot'
+          })
+        );
+        expect(api.uploadJobAttachments).toHaveBeenCalledWith(
+          'job-attach-201',
+          expect.arrayContaining([expect.objectContaining({ name: 'screenshot-1.png' })])
+        );
+      });
+      expect('files' in vi.mocked(api.createProjectJob).mock.calls[0][1]).toBe(false);
+    });
+
+    it('rolls back the newly created job when attachment upload fails so retrying does not orphan duplicates', async () => {
+      const createdJob: ProjectJob = {
+        id: 'job-rollback-202',
+        projectId: 'mesh-core',
+        projectName: 'Mesh Core System',
+        title: 'Broken Upload Job',
+        description: '',
+        status: ProjectJobStatus.Pending,
+        gitBranchName: 'mesh/job-rollback-202',
+        tasks: [],
+        messageCount: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      vi.mocked(api.createProjectJob).mockResolvedValue(createdJob);
+      vi.mocked(api.uploadJobAttachments).mockRejectedValue(
+        new Error('Failed to upload attachments: Storage unavailable')
+      );
+      vi.mocked(api.deleteProjectJob).mockResolvedValue({
+        status: 'deleted',
+        id: 'job-rollback-202',
+        projectId: 'mesh-core'
+      });
+
+      render(<App />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Create new Job in this project')).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByTitle('Create new Job in this project'));
+
+      const jobTitleInput = screen.getByPlaceholderText('e.g. Implement OAuth2 flow with Google & GitHub');
+      fireEvent.change(jobTitleInput, { target: { value: 'Broken Upload Job' } });
+
+      const fileInput = screen.getByTestId('new-job-file-input');
+      fireEvent.change(fileInput, {
+        target: { files: [new File(['png'], 'diagram.png', { type: 'image/png' })] }
+      });
+
+      fireEvent.submit(jobTitleInput.closest('form')!);
+
+      await waitFor(() => {
+        expect(api.deleteProjectJob).toHaveBeenCalledWith('job-rollback-202');
+        expect(screen.getByTestId('new-job-error')).toHaveTextContent('Storage unavailable');
+      });
+      // Modal stays open with the staged file intact so the operator can retry cleanly
+      expect(screen.getByText('diagram.png')).toBeInTheDocument();
+    });
+  });
 });

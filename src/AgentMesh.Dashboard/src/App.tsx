@@ -1169,7 +1169,32 @@ export default function App() {
 
   const handleCreateJob = async (req: any) => {
     if (!jobModalProject) return;
-    const created = await api.createProjectJob(jobModalProject.id, req);
+    const { files, ...jobPayload } = req || {};
+    let created = await api.createProjectJob(jobModalProject.id, jobPayload);
+
+    if (Array.isArray(files) && files.length > 0 && typeof api.uploadJobAttachments === 'function') {
+      try {
+        const uploaded = await api.uploadJobAttachments(created.id, files);
+        created = {
+          ...created,
+          attachments: [...(created.attachments || []), ...uploaded]
+        };
+      } catch (err) {
+        if (typeof api.deleteProjectJob === 'function') {
+          try {
+            await api.deleteProjectJob(created.id);
+          } catch {
+            // Best-effort cleanup so retrying Create Job does not leave an orphan job
+          }
+        }
+        setJobsByProject((prev) => ({
+          ...prev,
+          [jobModalProject.id]: (prev[jobModalProject.id] || []).filter((j) => j.id !== created.id)
+        }));
+        throw err;
+      }
+    }
+
     setJobsByProject((prev) => ({
       ...prev,
       [jobModalProject.id]: [
@@ -1823,10 +1848,18 @@ export default function App() {
     };
 
     const handleJobCreated = (job: ProjectJob) => {
-      setJobsByProject((prev) => ({
-        ...prev,
-        [job.projectId]: [job, ...(prev[job.projectId] || []).filter((j) => j.id !== job.id)]
-      }));
+      setJobsByProject((prev) => {
+        const current = prev[job.projectId] || [];
+        const existing = current.find((j) => j.id === job.id);
+        const mergedJob =
+          (!job.attachments || job.attachments.length === 0) && existing?.attachments?.length
+            ? { ...job, attachments: existing.attachments }
+            : job;
+        return {
+          ...prev,
+          [job.projectId]: [mergedJob, ...current.filter((j) => j.id !== job.id)]
+        };
+      });
       setDashboardOverview((prev) =>
         prev
           ? {

@@ -455,6 +455,7 @@ const mapDashboardProjectJob = (raw: any): ProjectJob => {
   const item = raw ?? {};
   const rawTasks = item.tasks ?? item.Tasks;
   const rawQueuedTurns = item.queuedTurns ?? item.QueuedTurns;
+  const rawAttachments = item.attachments ?? item.Attachments;
   const tasks: any[] = Array.isArray(rawTasks) ? rawTasks : [];
   const createdAt = readStr(item, 'createdAt', 'CreatedAt') ?? new Date().toISOString();
 
@@ -486,6 +487,7 @@ const mapDashboardProjectJob = (raw: any): ProjectJob => {
     lifecycleStatus: readStr(item, 'lifecycleStatus', 'LifecycleStatus'),
     assignedAgentId: readStr(item, 'assignedAgentId', 'AssignedAgentId'),
     queuedTurns: Array.isArray(rawQueuedTurns) ? rawQueuedTurns : undefined,
+    attachments: Array.isArray(rawAttachments) ? rawAttachments : undefined,
     messageCount: readInt(item, 'messageCount', 'MessageCount') ?? 0,
     createdAt,
     updatedAt: readStr(item, 'updatedAt', 'UpdatedAt') ?? createdAt,
@@ -1495,6 +1497,7 @@ export const api = {
     priority?: number;
     approvalPolicy?: number;
     assignedAgentId?: string | null;
+    attachments?: SessionAttachment[];
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
       method: 'POST',
@@ -1772,6 +1775,7 @@ export const api = {
       return {
         id,
         sessionId: jobId,
+        jobId,
         fileName,
         contentType,
         sizeBytes,
