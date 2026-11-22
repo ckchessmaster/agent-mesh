@@ -564,6 +564,8 @@ public class PromptStackBuilder(
             sb.Append("* Job: ").Append(job.Title.Trim()).Append(" — ").Append(CollapseWhitespace(job.Description)).Append('\n');
         }
 
+        AppendJobAttachments(sb, job, focus);
+
         if (context.TaskId == "stage-1-discovery")
         {
             sb.Append("\n[STAGE 1: DISCOVERY & DECOMPOSITION]\n");
@@ -792,6 +794,113 @@ public class PromptStackBuilder(
             if (isFocus) sb.Append("  ← this workflow");
             sb.Append('\n');
         }
+    }
+
+    internal const int MaxRenderedJobAttachments = 25;
+    internal const string JobAttachmentsHeader = "[JOB ATTACHMENTS]";
+
+    private static void AppendJobAttachments(StringBuilder sb, ProjectJob? job, JobTaskDto? focus)
+    {
+        var merged = new List<JobAttachmentDto>();
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AppendRange(IEnumerable<JobAttachmentDto>? items)
+        {
+            if (items is null) return;
+            foreach (var att in items)
+            {
+                if (att is null || (string.IsNullOrWhiteSpace(att.Id) && string.IsNullOrWhiteSpace(att.FileName)))
+                {
+                    continue;
+                }
+
+                var key = !string.IsNullOrWhiteSpace(att.Id) ? att.Id.Trim() : $"file:{att.FileName}";
+                if (seenIds.Add(key))
+                {
+                    merged.Add(att);
+                }
+            }
+        }
+
+        AppendRange(ParseAttachments(job?.AttachmentsJson));
+        AppendRange(focus?.Attachments);
+
+        if (merged.Count == 0) return;
+
+        sb.Append('\n').Append(JobAttachmentsHeader).Append('\n');
+        sb.Append("Files and screenshots attached to this job (staged into workspace and available via API):\n");
+
+        var rendered = 0;
+        foreach (var att in merged)
+        {
+            if (rendered >= MaxRenderedJobAttachments) break;
+            rendered++;
+
+            var safeFileName = SanitizeAttachmentFileName(att.FileName);
+            var contentType = !string.IsNullOrWhiteSpace(att.ContentType)
+                ? att.ContentType.Trim()
+                : "application/octet-stream";
+            var stagedRelativePath = !string.IsNullOrWhiteSpace(att.Id)
+                ? $".agentmesh/attachments/{att.Id.Trim()}_{safeFileName}"
+                : $".agentmesh/attachments/{safeFileName}";
+            var downloadUrl = !string.IsNullOrWhiteSpace(att.DownloadUrl)
+                ? att.DownloadUrl.Trim()
+                : job is not null && !string.IsNullOrWhiteSpace(att.Id)
+                    ? $"/api/project-jobs/{job.Id}/attachments/{Uri.EscapeDataString(att.Id.Trim())}/content"
+                    : string.Empty;
+
+            sb.Append("* ").Append(safeFileName)
+              .Append(" (").Append(contentType);
+            if (att.SizeBytes > 0)
+            {
+                sb.Append(", ").Append(FormatAttachmentSize(att.SizeBytes));
+            }
+            sb.Append(") — staged: ").Append(stagedRelativePath);
+            if (!string.IsNullOrEmpty(downloadUrl))
+            {
+                sb.Append(" → ").Append(downloadUrl);
+            }
+            sb.Append('\n');
+        }
+
+        if (merged.Count > rendered)
+        {
+            sb.Append("… ").Append(merged.Count - rendered)
+              .Append(" more attachment(s) not listed");
+            if (job is not null)
+            {
+                sb.Append(" (GET /api/project-jobs/").Append(job.Id).Append("/attachments)");
+            }
+            sb.Append('\n');
+        }
+    }
+
+    private static List<JobAttachmentDto> ParseAttachments(string? attachmentsJson)
+    {
+        if (string.IsNullOrWhiteSpace(attachmentsJson)) return [];
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<JobAttachmentDto>>(attachmentsJson, JsonOpts) ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static string SanitizeAttachmentFileName(string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName)) return "attachment.bin";
+        var leaf = Path.GetFileName(fileName.Trim());
+        return string.IsNullOrWhiteSpace(leaf) ? "attachment.bin" : leaf;
+    }
+
+    private static string FormatAttachmentSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{(bytes / 1024.0).ToString("0.#", CultureInfo.InvariantCulture)} KB";
+        return $"{(bytes / (1024.0 * 1024.0)).ToString("0.#", CultureInfo.InvariantCulture)} MB";
     }
 
     private static List<JobTaskDto> ParseTasks(string? tasksJson)

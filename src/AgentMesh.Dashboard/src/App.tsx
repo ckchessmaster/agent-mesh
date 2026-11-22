@@ -102,6 +102,8 @@ import { PanelTabStrip } from './components/PanelTabStrip';
 import { ProjectModal } from './components/ProjectModal';
 import { NewJobModal } from './components/NewJobModal';
 import { JobCockpit } from './components/JobCockpit';
+import { AttachmentLightboxModal } from './components/AttachmentLightboxModal';
+import { mergeJobAttachments } from './utils/jobAttachments';
 import { ProjectList } from './components/ProjectList';
 import { MainDashboard } from './components/MainDashboard';
 import { MermaidViewer } from './components/MermaidViewer';
@@ -1225,7 +1227,32 @@ export default function App() {
 
   const handleCreateJob = async (req: any) => {
     if (!jobModalProject) return;
-    const created = await api.createProjectJob(jobModalProject.id, req);
+    const { files, ...jobPayload } = req || {};
+    let created = await api.createProjectJob(jobModalProject.id, jobPayload);
+
+    if (Array.isArray(files) && files.length > 0 && typeof api.uploadJobAttachments === 'function') {
+      try {
+        const uploaded = await api.uploadJobAttachments(created.id, files);
+        created = {
+          ...created,
+          attachments: [...(created.attachments || []), ...uploaded]
+        };
+      } catch (err) {
+        if (typeof api.deleteProjectJob === 'function') {
+          try {
+            await api.deleteProjectJob(created.id);
+          } catch {
+            // Best-effort cleanup so retrying Create Job does not leave an orphan job
+          }
+        }
+        setJobsByProject((prev) => ({
+          ...prev,
+          [jobModalProject.id]: (prev[jobModalProject.id] || []).filter((j) => j.id !== created.id)
+        }));
+        throw err;
+      }
+    }
+
     setJobsByProject((prev) => ({
       ...prev,
       [jobModalProject.id]: [
@@ -1263,6 +1290,7 @@ export default function App() {
     status?: ProjectJobStatus;
     resultSummary?: string;
     approvalPolicy?: number;
+    assignedAgentId?: string | null;
     turnBudget?: number | null;
   }) => {
     if (!selectedJobId) return;
@@ -1272,6 +1300,42 @@ export default function App() {
       [updated.projectId]: (prev[updated.projectId] || []).map((j) => (j.id === updated.id ? updated : j))
     }));
     void fetchDashboardOverview();
+  };
+
+  const handleUploadJobAttachments = async (jobId: string, files: File[]): Promise<SessionAttachment[]> => {
+    const uploaded = await api.uploadJobAttachments(jobId, files);
+    if (Array.isArray(uploaded) && uploaded.length > 0) {
+      setJobsByProject((prev) => {
+        const next = { ...prev };
+        for (const pId of Object.keys(next)) {
+          next[pId] = next[pId].map((j) =>
+            j.id === jobId
+              ? { ...j, attachments: mergeJobAttachments(j.attachments ?? [], uploaded) }
+              : j
+          );
+        }
+        return next;
+      });
+    }
+    return uploaded;
+  };
+
+  const handleDeleteJobAttachment = async (jobId: string, attachmentId: string): Promise<void> => {
+    const res = await api.deleteJobAttachment(jobId, attachmentId);
+    setJobsByProject((prev) => {
+      const next = { ...prev };
+      for (const pId of Object.keys(next)) {
+        next[pId] = next[pId].map((j) => {
+          if (j.id !== jobId) return j;
+          if (res?.job) return res.job;
+          return {
+            ...j,
+            attachments: (j.attachments ?? []).filter((att) => att.id !== attachmentId)
+          };
+        });
+      }
+      return next;
+    });
   };
 
   const handleDeleteAgent = async (agentId: string) => {
@@ -1880,10 +1944,18 @@ export default function App() {
     };
 
     const handleJobCreated = (job: ProjectJob) => {
-      setJobsByProject((prev) => ({
-        ...prev,
-        [job.projectId]: [job, ...(prev[job.projectId] || []).filter((j) => j.id !== job.id)]
-      }));
+      setJobsByProject((prev) => {
+        const current = prev[job.projectId] || [];
+        const existing = current.find((j) => j.id === job.id);
+        const mergedJob =
+          (!job.attachments || job.attachments.length === 0) && existing?.attachments?.length
+            ? { ...job, attachments: existing.attachments }
+            : job;
+        return {
+          ...prev,
+          [job.projectId]: [mergedJob, ...current.filter((j) => j.id !== job.id)]
+        };
+      });
       setDashboardOverview((prev) =>
         prev
           ? {
@@ -4594,6 +4666,8 @@ export default function App() {
                       onResetJob={handleResetJob}
                       onRecoverJob={(note) => handleRecoverJob(activeJ.id, note)}
                       onOpenLightbox={setLightboxAttachment}
+                      onUploadAttachments={(files) => handleUploadJobAttachments(activeJ.id, files)}
+                      onDeleteAttachment={(attachmentId) => handleDeleteJobAttachment(activeJ.id, attachmentId)}
                       onStopTurn={handleStopSession}
                       onCancelQueuedTurn={(turnId) => handleCancelQueuedJobTurn(turnId, activeJ.id)}
                       onCancelQueuedTurns={(personaId) => handleCancelQueuedJobTurns(personaId, activeJ.id)}
@@ -7374,61 +7448,10 @@ export default function App() {
       })()}
 
       {/* Fullscreen Image Lightbox Modal */}
-      {lightboxAttachment && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label={`Image preview: ${lightboxAttachment.fileName}`}
-          data-testid="attachment-lightbox"
-          onClick={() => setLightboxAttachment(null)}
-          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center p-2 sm:p-6 pt-[max(0.75rem,env(safe-area-inset-top))] pb-[max(0.75rem,env(safe-area-inset-bottom))]"
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="max-w-5xl w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
-          >
-            <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
-              <div className="flex items-center gap-2 min-w-0">
-                <ImageIcon className="w-4 h-4 text-sky-400 shrink-0" />
-                <span className="font-mono text-xs font-semibold text-white truncate">
-                  {lightboxAttachment.fileName}
-                </span>
-                {lightboxAttachment.sizeBytes ? (
-                  <span className="text-[11px] font-mono text-slate-400">
-                    ({formatAttachmentSize(lightboxAttachment.sizeBytes)})
-                  </span>
-                ) : null}
-              </div>
-              <div className="flex items-center gap-2">
-                <a
-                  href={`${lightboxAttachment.url}${lightboxAttachment.url.includes('?') ? '&' : '?'}download=true`}
-                  download={lightboxAttachment.fileName}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5 transition"
-                >
-                  <Download className="w-3.5 h-3.5 text-sky-400" />
-                  <span>Download</span>
-                </a>
-                <button
-                  type="button"
-                  onClick={() => setLightboxAttachment(null)}
-                  aria-label="Close image preview"
-                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-            <div className="flex-1 p-6 bg-slate-950 flex items-center justify-center overflow-auto">
-              <img
-                src={lightboxAttachment.url}
-                alt={lightboxAttachment.fileName}
-                className="max-h-[75vh] max-w-full object-contain rounded-lg shadow-xl"
-                data-testid="lightbox-image"
-              />
-            </div>
-          </div>
-        </div>
-      )}
+      <AttachmentLightboxModal
+        attachment={lightboxAttachment}
+        onClose={() => setLightboxAttachment(null)}
+      />
       {showProjectModal && (
         <ProjectModal
           isOpen={showProjectModal}

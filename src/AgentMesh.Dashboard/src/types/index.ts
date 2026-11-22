@@ -593,6 +593,7 @@ export interface AgentUsageResponse {
 export interface SessionAttachment {
   id: string;
   sessionId: string;
+  jobId?: string;
   fileName: string;
   contentType: string;
   sizeBytes: number;
@@ -868,6 +869,7 @@ export interface ProjectJob {
    */
   turnBudget?: number | null;
   queuedTurns?: QueuedJobTurnDto[];
+  attachments?: SessionAttachment[] | null;
   messageCount: number;
   createdAt: string;
   updatedAt: string;

@@ -65,6 +65,12 @@ public class ProjectJobConfiguration : IEntityTypeConfiguration<ProjectJob>
             .HasDefaultValue("[]")
             .IsRequired();
 
+        builder.Property(j => j.AttachmentsJson)
+            .HasColumnName("attachments")
+            .HasColumnType("jsonb")
+            .HasDefaultValue("[]")
+            .IsRequired();
+
         builder.Property(j => j.ResultSummary);
 
         builder.Property(j => j.ApprovalPolicy)

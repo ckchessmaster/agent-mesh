@@ -458,6 +458,7 @@ const mapDashboardProjectJob = (raw: any): ProjectJob => {
   const item = raw ?? {};
   const rawTasks = item.tasks ?? item.Tasks;
   const rawQueuedTurns = item.queuedTurns ?? item.QueuedTurns;
+  const rawAttachments = item.attachments ?? item.Attachments;
   const tasks: any[] = Array.isArray(rawTasks) ? rawTasks : [];
   const createdAt = readStr(item, 'createdAt', 'CreatedAt') ?? new Date().toISOString();
 
@@ -489,6 +490,7 @@ const mapDashboardProjectJob = (raw: any): ProjectJob => {
     lifecycleStatus: readStr(item, 'lifecycleStatus', 'LifecycleStatus'),
     assignedAgentId: readStr(item, 'assignedAgentId', 'AssignedAgentId'),
     queuedTurns: Array.isArray(rawQueuedTurns) ? rawQueuedTurns : undefined,
+    attachments: Array.isArray(rawAttachments) ? rawAttachments : undefined,
     messageCount: readInt(item, 'messageCount', 'MessageCount') ?? 0,
     createdAt,
     updatedAt: readStr(item, 'updatedAt', 'UpdatedAt') ?? createdAt,
@@ -580,6 +582,41 @@ const getHeaders = (): Record<string, string> => ({
   'Content-Type': 'application/json',
   ...getAuthHeadersOnly()
 });
+
+const mapJobAttachmentItem = (jobId: string, item: any): SessionAttachment => {
+  const id = item?.id || item?.Id || '';
+  const fileName = item?.fileName || item?.FileName || item?.name || item?.Name || '';
+  const contentType = item?.contentType || item?.ContentType || '';
+  const sizeBytes =
+    typeof item?.sizeBytes === 'number'
+      ? item.sizeBytes
+      : typeof item?.SizeBytes === 'number'
+      ? item.SizeBytes
+      : typeof item?.size === 'number'
+      ? item.size
+      : 0;
+  const s3Key = item?.s3Key || item?.S3Key || '';
+  const targetId = id || fileName;
+  const downloadUrl =
+    item?.downloadUrl ||
+    item?.DownloadUrl ||
+    (targetId
+      ? `/api/project-jobs/${encodeURIComponent(jobId)}/attachments/${encodeURIComponent(targetId)}/content`
+      : '');
+  const createdAt = item?.createdAt || item?.CreatedAt || new Date().toISOString();
+
+  return {
+    id,
+    sessionId: jobId,
+    jobId,
+    fileName,
+    contentType,
+    sizeBytes,
+    s3Key,
+    downloadUrl,
+    createdAt
+  };
+};
 
 export interface SessionControlOptions {
   model?: string;
@@ -1537,6 +1574,7 @@ export const api = {
     priority?: number;
     approvalPolicy?: number;
     assignedAgentId?: string | null;
+    attachments?: SessionAttachment[];
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/jobs`, {
       method: 'POST',
@@ -1779,6 +1817,22 @@ export const api = {
     return { found: true, patch: mapJobChangePatch(await res.json()) };
   },
 
+  getJobAttachmentContentUrl(jobId: string, attachmentId: string, download = false): string {
+    const base = `/api/project-jobs/${encodeURIComponent(jobId)}/attachments/${encodeURIComponent(attachmentId)}/content`;
+    return download ? `${base}?download=true` : base;
+  },
+
+  async getJobAttachments(jobId: string): Promise<SessionAttachment[]> {
+    const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(jobId)}/attachments`, {
+      headers: getHeaders()
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load job attachments'));
+    }
+    const raw = await res.json();
+    return (Array.isArray(raw) ? raw : []).map((item: any) => mapJobAttachmentItem(jobId, item));
+  },
+
   async uploadJobAttachments(jobId: string, files: File[]): Promise<SessionAttachment[]> {
     const formData = new FormData();
     files.forEach((f) => formData.append('files', f, f.name));
@@ -1798,31 +1852,31 @@ export const api = {
       throw new Error(`Failed to upload attachments: ${errMsg}`);
     }
     const raw = await res.json();
-    return (Array.isArray(raw) ? raw : []).map((item: any) => {
-      const id = item.id || item.Id || '';
-      const fileName = item.fileName || item.FileName || item.name || item.Name || '';
-      const contentType = item.contentType || item.ContentType || '';
-      const sizeBytes = typeof item.sizeBytes === 'number'
-        ? item.sizeBytes
-        : typeof item.SizeBytes === 'number'
-        ? item.SizeBytes
-        : (typeof item.size === 'number' ? item.size : 0);
-      const s3Key = item.s3Key || item.S3Key || '';
-      const targetId = id || fileName;
-      const downloadUrl = item.downloadUrl || item.DownloadUrl || (targetId ? `/api/project-jobs/${encodeURIComponent(jobId)}/attachments/${encodeURIComponent(targetId)}/content` : '');
-      const createdAt = item.createdAt || item.CreatedAt || new Date().toISOString();
+    return (Array.isArray(raw) ? raw : []).map((item: any) => mapJobAttachmentItem(jobId, item));
+  },
 
-      return {
-        id,
-        sessionId: jobId,
-        fileName,
-        contentType,
-        sizeBytes,
-        s3Key,
-        downloadUrl,
-        createdAt
-      };
-    });
+  async deleteJobAttachment(
+    jobId: string,
+    attachmentId: string
+  ): Promise<{ status: string; attachmentId: string; job?: ProjectJob }> {
+    const res = await apiFetch(
+      `/api/project-jobs/${encodeURIComponent(jobId)}/attachments/${encodeURIComponent(attachmentId)}`,
+      {
+        method: 'DELETE',
+        headers: getHeaders()
+      }
+    );
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errBody = await res.json();
+        if (errBody?.error) errMsg = errBody.error;
+      } catch {
+        // Ignore JSON parse error
+      }
+      throw new Error(`Failed to delete attachment: ${errMsg}`);
+    }
+    return res.json();
   },
 
   async approvePlan(jobId: string, approverRole?: string, comments?: string): Promise<{ success: boolean; approverId?: string; approverRole?: string }> {
