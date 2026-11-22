@@ -17,6 +17,7 @@ namespace AgentMesh.Tests.Data;
 public class McpServerSchemaTests
 {
     private const string MigrationId = "20261118143000_AddMcpServersAndPersonaMcpServers";
+    private const string TipMigrationId = "20261122020500_AddProjectJobAttachments";
 
     private static IEntityType McpServerEntity()
     {
@@ -202,7 +203,8 @@ public class McpServerSchemaTests
     {
         using var db = TestDbContextFactory.Postgres();
         var migrations = db.GetService<IMigrationsAssembly>().Migrations.Keys.ToList();
-        migrations.Last().Should().Be(MigrationId);
+        migrations.Should().Contain(MigrationId);
+        migrations.Last().Should().Be(TipMigrationId);
 
         db.Database.HasPendingModelChanges().Should().BeFalse(
             "AgentMeshDbContextModelSnapshot must stay in exact sync with McpServerConfiguration and PersonaMcpServerConfiguration");

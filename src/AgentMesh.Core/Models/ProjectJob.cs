@@ -113,6 +113,16 @@ public class ProjectJob
     /// </remarks>
     public string ArtifactsJson { get; set; } = "[]";
 
+    /// <summary>
+    /// The job's user-uploaded attachment manifest: a JSON array of <see cref="JobAttachmentDto"/>.
+    /// </summary>
+    /// <remarks>
+    /// Persisted directly on <c>project_jobs.attachments</c> so files and pasted screenshots uploaded at
+    /// job creation or mid-job survive restarts, render in the Cockpit, and stage into every subsequent
+    /// agent turn.
+    /// </remarks>
+    public string AttachmentsJson { get; set; } = "[]";
+
     public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.Autonomous;
     public string? CurrentTaskId { get; set; }
     public string? ProgressHeartbeat { get; set; }

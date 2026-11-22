@@ -1198,6 +1198,13 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("text")
                         .HasColumnName("assigned_agent_id");
 
+                    b.Property<string>("AttachmentsJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("[]")
+                        .HasColumnName("attachments");
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
