@@ -225,9 +225,9 @@ public class MacroTurnController(
             Sender: string.IsNullOrWhiteSpace(req.Sender) ? ResolveSender() : req.Sender.Trim(),
             PreflightContext: req.PreflightContext,
             PromptStack: req.PromptStack,
-            // The macro turn carries no attachments: the assembler already folded the checklist item's
-            // attachments into the prompt text, and re-staging them here would duplicate them into the
-            // turn session's directory under a second id.
+            // Explicit per-request attachments are null on workflow macro turns: JobTurnDispatcher
+            // resolves and stages persisted job attachments (job.AttachmentsJson) and the focus
+            // checklist item's attachments automatically without duplicating IDs.
             Attachments: null,
             Hydration: null,
             TaskId: req.TaskId), ct);

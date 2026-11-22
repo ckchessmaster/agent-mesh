@@ -129,7 +129,11 @@ public class JobTurnDispatcher
         // preamble needs building at all — see PrepareAsync's composePreamble.
         var hasLayeredStack = req.PromptStack is not null;
 
-        var attachments = req.Attachments ?? new List<JobAttachmentDto>();
+        var attachments = Controllers.ProjectJobsController.ResolveTurnAttachments(
+            job,
+            persona.Id,
+            req.TaskId,
+            req.Attachments);
         if (attachments.Count > 0)
         {
             StageAttachments(job.Id, turnSessionId, attachments);
@@ -186,6 +190,10 @@ public class JobTurnDispatcher
         };
         db.AgentSessions.Add(turnSession);
 
+        var jobAttachmentsPreamble = !hasLayeredStack
+            ? FormatLegacyJobAttachmentsLine(Controllers.ProjectJobsController.ParseAttachments(job.AttachmentsJson))
+            : string.Empty;
+
         // The two prompt shapes and the reason for the split are documented at hasLayeredStack, where the
         // project library was loaded for whichever of the two this turn is composing.
         var promptWithContext = hasLayeredStack
@@ -195,6 +203,7 @@ public class JobTurnDispatcher
             : $"[Project Context: Project \"{project.Name}\" ({project.WorkspaceType}), Branch: \"{job.GitBranchName}\"]\n" +
               library.ProjectPreamble +
               $"[Job Context: {job.Title} - {job.Description}]\n" +
+              jobAttachmentsPreamble +
               (req.PreflightContext ?? string.Empty) +
               "\n" +
               req.Prompt;
@@ -481,11 +490,26 @@ public class JobTurnDispatcher
         };
     }
 
+    internal static string FormatLegacyJobAttachmentsLine(List<JobAttachmentDto> jobAttachments)
+    {
+        if (jobAttachments.Count == 0) return string.Empty;
+
+        var items = jobAttachments
+            .Where(a => !string.IsNullOrWhiteSpace(a.FileName) || !string.IsNullOrWhiteSpace(a.Id))
+            .Select(a => $"{a.FileName} ({a.DownloadUrl})")
+            .ToList();
+
+        return items.Count == 0
+            ? string.Empty
+            : $"[Job Attachments: {string.Join(", ", items)}]\n";
+    }
+
     private static void StageAttachments(Guid jobId, Guid turnSessionId, List<JobAttachmentDto> attachments)
     {
-        var sessionAttachDir = Controllers.SessionsController.GetAttachmentDirectory(turnSessionId);
-        var jobAttachDir = Controllers.ProjectJobsController.GetAttachmentDirectory(jobId);
-        Directory.CreateDirectory(sessionAttachDir);
+        var jobAttachDir = Controllers.ProjectJobsController.GetAttachmentDirectoryWithoutCreating(jobId);
+        if (!Directory.Exists(jobAttachDir)) return;
+
+        string? sessionAttachDir = null;
 
         foreach (var att in attachments)
         {
@@ -496,10 +520,11 @@ public class JobTurnDispatcher
                 src = Directory.GetFiles(jobAttachDir, $"{att.Id}_*").FirstOrDefault()
                       ?? Directory.GetFiles(jobAttachDir, $"*{att.Id}*").FirstOrDefault();
             }
-            if (!File.Exists(src)) continue;
+            if (string.IsNullOrEmpty(src) || !File.Exists(src)) continue;
 
             try
             {
+                sessionAttachDir ??= Controllers.SessionsController.GetAttachmentDirectory(turnSessionId);
                 File.Copy(src, Path.Combine(sessionAttachDir, $"{att.Id}_{safeName}"), overwrite: true);
             }
             catch
