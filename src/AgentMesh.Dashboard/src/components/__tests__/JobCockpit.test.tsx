@@ -1,12 +1,15 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { api } from '../../services/api';
 import { JobCockpit, getActiveMentionQuery, resolveTargetTaskId } from '../JobCockpit';
-import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type Persona } from '../../types';
+import { ProjectJobStatus, type Project, type ProjectJob, type JobTask, type Persona, type SessionAttachment } from '../../types';
 
 vi.mock('../../services/api', () => ({
   api: {
     getTimelineCards: vi.fn().mockResolvedValue([]),
+    getJobAttachments: vi.fn(),
     uploadJobAttachments: vi.fn(),
+    deleteJobAttachment: vi.fn(),
     uploadTaskAttachments: vi.fn(),
     deleteTaskAttachment: vi.fn()
   }
@@ -258,5 +261,169 @@ describe('JobCockpit - Header, Status, and Timeline Workspace', () => {
 
     expect(screen.getAllByText('Archived').length).toBeGreaterThan(0);
     expect(screen.getByTestId('cockpit-reopen-job-btn')).toBeInTheDocument();
+  });
+
+  it('auto-displays existing job attachments, previews images in lightbox, and deletes attachments', async () => {
+    const existingAttachments: SessionAttachment[] = [
+      {
+        id: 'att-img-1',
+        sessionId: 'job-1',
+        jobId: 'job-1',
+        fileName: 'screenshot-1.png',
+        contentType: 'image/png',
+        sizeBytes: 2048,
+        s3Key: 'jobs/job-1/attachments/att-img-1/screenshot-1.png',
+        downloadUrl: '/api/project-jobs/job-1/attachments/att-img-1/content',
+        createdAt: '2026-11-22T01:00:00Z'
+      },
+      {
+        id: 'att-doc-1',
+        sessionId: 'job-1',
+        jobId: 'job-1',
+        fileName: 'architecture.pdf',
+        contentType: 'application/pdf',
+        sizeBytes: 10240,
+        s3Key: 'jobs/job-1/attachments/att-doc-1/architecture.pdf',
+        downloadUrl: '/api/project-jobs/job-1/attachments/att-doc-1/content',
+        createdAt: '2026-11-22T01:01:00Z'
+      }
+    ];
+
+    vi.mocked(api.deleteJobAttachment).mockResolvedValue({
+      status: 'deleted',
+      attachmentId: 'att-doc-1'
+    });
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={{ ...mockJob, attachments: existingAttachments }}
+      />
+    );
+
+    expect(screen.getByTestId('toggle-job-attachments-btn')).toHaveTextContent('Attachments (2)');
+    expect(screen.getByTestId('cockpit-attachments-bar')).toBeInTheDocument();
+    expect(screen.getByText('screenshot-1.png')).toBeInTheDocument();
+    expect(screen.getByText('architecture.pdf')).toBeInTheDocument();
+
+    // Open built-in lightbox preview for image attachment
+    fireEvent.click(screen.getByTestId('cockpit-attachment-preview-att-img-1'));
+    const lightbox = await screen.findByTestId('attachment-lightbox');
+    expect(lightbox).toBeInTheDocument();
+    expect(screen.getByTestId('lightbox-image')).toHaveAttribute(
+      'src',
+      '/api/project-jobs/job-1/attachments/att-img-1/content'
+    );
+    expect(screen.getByTestId('lightbox-download-link')).toHaveAttribute(
+      'href',
+      '/api/project-jobs/job-1/attachments/att-img-1/content?download=true'
+    );
+
+    // Close lightbox via Escape key
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByTestId('attachment-lightbox')).not.toBeInTheDocument();
+    });
+
+    // Delete the PDF attachment
+    fireEvent.click(screen.getByTestId('cockpit-attachment-delete-att-doc-1'));
+    await waitFor(() => {
+      expect(api.deleteJobAttachment).toHaveBeenCalledWith('job-1', 'att-doc-1');
+      expect(screen.queryByText('architecture.pdf')).not.toBeInTheDocument();
+      expect(screen.getByTestId('toggle-job-attachments-btn')).toHaveTextContent('Attachments (1)');
+    });
+  });
+
+  it('supports anytime clipboard screenshot paste (continuing screenshot-N numbering), drag-and-drop, and plain-text paste pass-through', async () => {
+    const initialShot: SessionAttachment = {
+      id: 'att-1',
+      sessionId: 'job-1',
+      jobId: 'job-1',
+      fileName: 'screenshot-1.png',
+      contentType: 'image/png',
+      sizeBytes: 512,
+      s3Key: 'jobs/job-1/attachments/att-1/screenshot-1.png',
+      downloadUrl: '/api/project-jobs/job-1/attachments/att-1/content',
+      createdAt: '2026-11-22T01:00:00Z'
+    };
+
+    vi.mocked(api.uploadJobAttachments)
+      .mockResolvedValueOnce([
+        {
+          id: 'att-2',
+          sessionId: 'job-1',
+          jobId: 'job-1',
+          fileName: 'screenshot-2.png',
+          contentType: 'image/png',
+          sizeBytes: 768,
+          s3Key: 'jobs/job-1/attachments/att-2/screenshot-2.png',
+          downloadUrl: '/api/project-jobs/job-1/attachments/att-2/content',
+          createdAt: '2026-11-22T01:05:00Z'
+        }
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: 'att-3',
+          sessionId: 'job-1',
+          jobId: 'job-1',
+          fileName: 'logs.txt',
+          contentType: 'text/plain',
+          sizeBytes: 256,
+          s3Key: 'jobs/job-1/attachments/att-3/logs.txt',
+          downloadUrl: '/api/project-jobs/job-1/attachments/att-3/content',
+          createdAt: '2026-11-22T01:06:00Z'
+        }
+      ]);
+
+    render(
+      <JobCockpit
+        {...mockProps}
+        job={{ ...mockJob, attachments: [initialShot] }}
+      />
+    );
+
+    const cockpitRoot = screen.getByTestId('job-cockpit-root');
+
+    // Plain-text paste must NOT be intercepted
+    const textPasteNotCancelled = fireEvent.paste(cockpitRoot, {
+      clipboardData: { files: [], items: [] }
+    });
+    expect(textPasteNotCancelled).toBe(true);
+    expect(api.uploadJobAttachments).not.toHaveBeenCalled();
+
+    // Unnamed/generic clipboard screenshot continues numbering at screenshot-2.png
+    const pastedGenericPng = new File(['png-data'], 'image.png', { type: 'image/png' });
+    const imagePasteNotCancelled = fireEvent.paste(cockpitRoot, {
+      clipboardData: { files: [pastedGenericPng] }
+    });
+    expect(imagePasteNotCancelled).toBe(false);
+
+    await waitFor(() => {
+      expect(api.uploadJobAttachments).toHaveBeenCalledWith(
+        'job-1',
+        expect.arrayContaining([expect.objectContaining({ name: 'screenshot-2.png' })])
+      );
+      expect(screen.getByText('screenshot-2.png')).toBeInTheDocument();
+      expect(screen.getByTestId('toggle-job-attachments-btn')).toHaveTextContent('Attachments (2)');
+    });
+
+    // Drag-and-drop shows overlay and uploads dropped file
+    fireEvent.dragEnter(cockpitRoot);
+    expect(screen.getByTestId('cockpit-drop-overlay')).toBeInTheDocument();
+
+    const droppedLog = new File(['stacktrace'], 'logs.txt', { type: 'text/plain' });
+    fireEvent.drop(cockpitRoot, {
+      dataTransfer: { files: [droppedLog] }
+    });
+    expect(screen.queryByTestId('cockpit-drop-overlay')).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(api.uploadJobAttachments).toHaveBeenCalledWith(
+        'job-1',
+        expect.arrayContaining([expect.objectContaining({ name: 'logs.txt' })])
+      );
+      expect(screen.getByText('logs.txt')).toBeInTheDocument();
+      expect(screen.getByTestId('toggle-job-attachments-btn')).toHaveTextContent('Attachments (3)');
+    });
   });
 });

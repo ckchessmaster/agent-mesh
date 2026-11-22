@@ -1,3 +1,5 @@
+import type { SessionAttachment } from '../types';
+
 export const MAX_JOB_ATTACHMENTS = 10;
 export const MAX_JOB_ATTACHMENT_BYTES = 25 * 1024 * 1024; // 25 MB
 
@@ -68,6 +70,60 @@ export function formatAttachmentSize(bytes?: number | null): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export const formatAttachmentBytes = formatAttachmentSize;
+
+export function nextScreenshotSequenceNumber(
+  existingFileNames: Array<string | null | undefined>,
+  currentSeq = 0
+): number {
+  let highest = currentSeq;
+  for (const name of existingFileNames) {
+    if (!name) continue;
+    const match = /^screenshot-(\d+)(?:\.[a-z0-9]+)?$/i.exec(name.trim());
+    if (match) {
+      const num = Number.parseInt(match[1], 10);
+      if (Number.isFinite(num) && num > highest) {
+        highest = num;
+      }
+    }
+  }
+  return highest + 1;
+}
+
+export function resolveJobAttachmentUrl(
+  jobId: string,
+  att: { id?: string; fileName?: string; downloadUrl?: string },
+  download = false
+): string {
+  const targetId = att.id || att.fileName || '';
+  const base =
+    att.downloadUrl ||
+    (jobId && targetId
+      ? `/api/project-jobs/${encodeURIComponent(jobId)}/attachments/${encodeURIComponent(targetId)}/content`
+      : '');
+  if (!base || !download) return base;
+  return `${base}${base.includes('?') ? '&' : '?'}download=true`;
+}
+
+export function mergeJobAttachments(
+  existing: SessionAttachment[],
+  incoming: SessionAttachment[]
+): SessionAttachment[] {
+  const byKey = new Map<string, SessionAttachment>();
+  for (const item of existing) {
+    const key = (item.id || item.fileName || '').toLowerCase();
+    if (key) byKey.set(key, item);
+  }
+  for (const item of incoming) {
+    const key = (item.id || item.fileName || '').toLowerCase();
+    if (key) {
+      const prev = byKey.get(key);
+      byKey.set(key, prev ? { ...prev, ...item } : item);
+    }
+  }
+  return Array.from(byKey.values());
 }
 
 export function isImageAttachment(contentType?: string | null, fileName?: string | null): boolean {

@@ -44,7 +44,9 @@ vi.mock('../services/api', () => ({
     // rather than the state the test is actually asserting.
     getJobChanges: vi.fn(),
     getJobChangePatch: vi.fn(),
+    getJobAttachments: vi.fn(),
     uploadJobAttachments: vi.fn(),
+    deleteJobAttachment: vi.fn(),
     completeJob: vi.fn(),
     submitQuestionAnswer: vi.fn()
   }
@@ -1460,6 +1462,74 @@ describe('Projects & Multi-Persona Jobs Workflow', () => {
       });
       // Modal stays open with the staged file intact so the operator can retry cleanly
       expect(screen.getByText('diagram.png')).toBeInTheDocument();
+    });
+  });
+
+  describe('Anytime job attachments in JobCockpit and JobSettingsModal', () => {
+    it('pastes a screenshot into an active job in JobCockpit, previews it in App lightbox, and deletes it from JobSettingsModal', async () => {
+      vi.mocked(api.uploadJobAttachments).mockResolvedValue([
+        {
+          id: 'att-live-1',
+          sessionId: 'job-101',
+          jobId: 'job-101',
+          fileName: 'screenshot-1.png',
+          contentType: 'image/png',
+          sizeBytes: 2048,
+          s3Key: 'jobs/job-101/attachments/att-live-1/screenshot-1.png',
+          downloadUrl: '/api/project-jobs/job-101/attachments/att-live-1/content',
+          createdAt: new Date().toISOString()
+        }
+      ]);
+      vi.mocked(api.deleteJobAttachment).mockResolvedValue({
+        status: 'deleted',
+        attachmentId: 'att-live-1'
+      });
+
+      render(<App />);
+
+      const cockpitRoot = await screen.findByTestId('job-cockpit-root');
+      expect(screen.getByTestId('toggle-job-attachments-btn')).toHaveTextContent('Attachments (0)');
+
+      // Paste screenshot anytime while viewing the active job in JobCockpit
+      const pastedPng = new File(['png-bytes'], 'image.png', { type: 'image/png' });
+      fireEvent.paste(cockpitRoot, {
+        clipboardData: { files: [pastedPng] }
+      });
+
+      await waitFor(() => {
+        expect(api.uploadJobAttachments).toHaveBeenCalledWith(
+          'job-101',
+          expect.arrayContaining([expect.objectContaining({ name: 'screenshot-1.png' })])
+        );
+        expect(screen.getByTestId('toggle-job-attachments-btn')).toHaveTextContent('Attachments (1)');
+      });
+
+      // Open App-level lightbox preview from JobCockpit thumbnail
+      fireEvent.click(screen.getByTestId('cockpit-attachment-preview-att-live-1'));
+      const lightbox = await screen.findByTestId('attachment-lightbox');
+      expect(lightbox).toBeInTheDocument();
+      expect(screen.getByTestId('lightbox-image')).toHaveAttribute(
+        'src',
+        '/api/project-jobs/job-101/attachments/att-live-1/content'
+      );
+
+      // Close lightbox
+      fireEvent.click(screen.getByTestId('lightbox-close-btn'));
+      await waitFor(() => {
+        expect(screen.queryByTestId('attachment-lightbox')).not.toBeInTheDocument();
+      });
+
+      // Open JobSettingsModal, verify synced attachment, and delete it
+      fireEvent.click(screen.getByTestId('cockpit-edit-job-btn'));
+      expect(await screen.findByTestId('job-settings-modal')).toBeInTheDocument();
+      expect(screen.getByTestId('job-settings-attachment-count')).toHaveTextContent('1');
+
+      fireEvent.click(screen.getByTestId('job-settings-attachment-delete-att-live-1'));
+      await waitFor(() => {
+        expect(api.deleteJobAttachment).toHaveBeenCalledWith('job-101', 'att-live-1');
+        expect(screen.queryByTestId('job-settings-attachment-item-att-live-1')).not.toBeInTheDocument();
+      });
+      expect(screen.getByTestId('toggle-job-attachments-btn')).toHaveTextContent('Attachments (0)');
     });
   });
 });
