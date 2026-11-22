@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using System.Text.Json;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -36,7 +36,11 @@ public class JobReviewsController(
     IHubContext<AgentMeshHub>? hubContext = null,
     ILogger<JobReviewsController>? logger = null,
     JobTurnDispatcher? turnDispatcher = null,
-    IWorkflowSignalRouter? workflows = null) : ControllerBase
+    IWorkflowSignalRouter? workflows = null,
+    // Optional like every other collaborator here: twelve existing tests build this controller to
+    // exercise chat and approval routing, and none of them should have to stub a bell. Program.cs
+    // registers it; ApiServiceRegistrationTests pins that the production container really does.
+    IAttentionNotifier? attention = null) : ControllerBase
 {
     private static readonly HashSet<string> TechLeadRoles = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -230,6 +234,12 @@ public class JobReviewsController(
             projectJob.UpdatedAt = DateTimeOffset.UtcNow;
         }
         await dbContext.SaveChangesAsync();
+
+        // The heartbeat just became "Plan approved. Starting implementation", which is the transition
+        // out of a planApproval wait. JobTimelineController's plan-decision route is the other door to
+        // the same gate; both announce, because the notifier is idempotent and the client dedupes on the
+        // item id.
+        await attention.RefreshAttentionAsync(jobId);
 
         if (hubContext is not null)
         {

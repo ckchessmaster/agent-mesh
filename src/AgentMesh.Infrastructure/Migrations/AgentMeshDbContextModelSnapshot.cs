@@ -1282,6 +1282,10 @@ namespace AgentMesh.Infrastructure.Migrations
                         .HasColumnType("character varying(255)")
                         .HasColumnName("title");
 
+                    b.Property<int?>("TurnBudget")
+                        .HasColumnType("integer")
+                        .HasColumnName("turn_budget");
+
                     b.Property<DateTimeOffset>("UpdatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")

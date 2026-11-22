@@ -1,3 +1,11 @@
+﻿/**
+ * Shared wire contract. `./attention` is re-exported here so callers keep importing domain types from
+ * `'../types'`; it has its own file because the pending-attention surface is consumed by three
+ * modules (api service, notification service, bell) and its field names are frozen by a persisted
+ * localStorage key, not by this barrel.
+ */
+export * from './attention';
+
 export interface DriverPersonaSummary {
   id: string;
   name: string;
@@ -201,6 +209,24 @@ export interface DriverSidecarConfig {
   authCheckCommand?: string | null;
 }
 
+export interface OpenRouterProviderRouting {
+  sort?: string | null;
+  order?: string[] | null;
+  only?: string[] | null;
+  ignore?: string[] | null;
+  allowFallbacks?: boolean | null;
+  dataCollection?: string | null;
+  zdr?: boolean | null;
+  requireParameters?: boolean | null;
+}
+
+export interface OpenRouterConfig {
+  httpReferer?: string | null;
+  appTitle?: string | null;
+  fallbackModels?: string[] | null;
+  provider?: OpenRouterProviderRouting | null;
+}
+
 /**
  * Parsed driver runtime config, as returned by GET /api/agents/{id}/config and mirrored on
  * Agent.config. The API never sends the API key itself — only whether one is stored.
@@ -226,6 +252,7 @@ export interface DriverConfig {
   hasSidecarAuthKey?: boolean;
   loginCommand?: string | null;
   authCheckCommand?: string | null;
+  openRouter?: OpenRouterConfig | null;
 }
 
 export interface Agent {
@@ -440,6 +467,9 @@ export interface ModelCapability {
    * Absent on a baseline entry, which carries no models at all.
    */
   contextSizes?: string[] | null;
+  maxContextTokens?: number | null;
+  promptPricePerMillion?: number | null;
+  completionPricePerMillion?: number | null;
 }
 
 /**
@@ -548,6 +578,8 @@ export interface LifetimeTokens {
   thinkingTokens: number;
   totalTokens: number;
   totalDurationSeconds: number;
+  cachedTokens?: number;
+  costUsd?: number;
 }
 
 export interface AgentUsageResponse {
@@ -645,6 +677,12 @@ export const JobLifecycleStatus = {
   InProgress: 'InProgress',
   AwaitingReview: 'AwaitingReview',
   Completed: 'Completed',
+  /**
+   * Nothing is running and the job needs an operator. Produced by the workflow's `Halted:` marker
+   * (see PersistJobHaltAsync): the run closed on a failure — exhausted turn budget, empty checklist,
+   * dead PR stage — while the row stayed Active. The cockpit shows the halt reason and offers
+   * Recover, not an approval.
+   */
   Blocked: 'Blocked',
   Failed: 'Failed',
   /**
@@ -824,6 +862,12 @@ export interface ProjectJob {
   progressHeartbeat?: string | null;
   lifecycleStatus?: JobLifecycleStatus | string | null;
   assignedAgentId?: string | null;
+  /**
+   * Per-task turn budget for the next run of this job; null/undefined means the platform default (40).
+   * Raising it is the repair for a task that exhausted its budget on infrastructure failures rather
+   * than on the work; read at run start, so it never affects a run already going.
+   */
+  turnBudget?: number | null;
   queuedTurns?: QueuedJobTurnDto[];
   attachments?: SessionAttachment[] | null;
   messageCount: number;

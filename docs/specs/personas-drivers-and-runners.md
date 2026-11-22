@@ -42,7 +42,7 @@ classDiagram
 | :--- | :--- | :--- |
 | **Concept** | Who the agent is (identity, specialization, role) | How the agent computes (model, API, CLI harness) |
 | **Configuration** | `PersonaPrompt`, role, context budget, GitHub PATs | Endpoint, API keys, model presets, tool limits, timeouts |
-| **Examples** | `system-architect`, `tech-lead`, `senior-engineer` | `openai-compatible`, `anthropic-claude`, `agy`, `copilot` |
+| **Examples** | `system-architect`, `tech-lead`, `senior-engineer` | `openrouter`, `openai-compatible`, `anthropic-claude`, `agy`, `copilot` |
 | **Concurrency** | Governed by `MaxConcurrentJobs` (limits active turns) | Governed by rate limits and LLM provider token quotas |
 
 ---
@@ -107,7 +107,13 @@ flowchart LR
 
 The [`AgentMesh.Cli`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Cli/) project compiles into a cross-platform, single-file native executable (`dist/cli/linux-x64/agentmesh`):
 
-* **Role**: Acts as the runner agent daemon connecting local LLM harnesses (`agy`, OpenAI-compatible engines, Copilot) to the AgentMesh control plane.
-* **Adapters**: Implements provider-specific translation adapters (e.g. `OpenAiAdapter`) that map OpenAI Chat Completion APIs to streaming MCP tool execution.
+* **Role**: Acts as the runner agent daemon connecting local LLM harnesses (`agy`, OpenAI-compatible engines, OpenRouter, Copilot) to the AgentMesh control plane.
+* **Adapters**: Implements provider-specific translation adapters (e.g. `OpenAiAdapter`, `OpenRouterAdapter`) that map Chat Completion APIs to streaming MCP tool execution.
+* **OpenRouter Adapter (`openrouter` / `RuntimeType.OpenRouter`)**:
+  * **Zero-Config & Authentication**: Built-in `"openrouter"` preset auto-seeded by `ConfigStore`, authenticating via stored `apiKey` or `OPENROUTER_API_KEY` (default endpoint `https://openrouter.ai/api/v1`, overridable via `endpoint` or `OPENROUTER_BASE_URL`), forwarding attribution headers (`X-Title: AgentMesh`, optional `HTTP-Referer`). Container managers forward `OPENROUTER_API_KEY` and `OPENROUTER_BASE_URL` into Docker and Kubernetes persona pods.
+  * **Prompt Caching & Sticky Routing**: Attaches `cache_control: { "type": "ephemeral" }` to the leading `PromptStack` system block (with automatic plain-string 400 fallback for providers that reject multipart system content) and sends sticky `session_id` in both the request body and `x-session-id` header.
+  * **Reasoning & Effort**: Advertises OpenRouter's 7-level reasoning effort contract (`none` through `max`) only for models declaring `"reasoning"` in `supported_parameters`, forwards `reasoning.effort` verbatim (with 400 fallback), streams thought deltas without duplication, and replays `reasoning_details` verbatim across multi-turn tool calls.
+  * **Provider Routing & Fallbacks**: Supports [`OpenRouterConfig`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Core/Models/OpenRouterConfig.cs) (`provider.sort`, `order`, `only`, `ignore`, `allowFallbacks`, `dataCollection`, `zdr`, `requireParameters`, and `fallbackModels` -> `models[]`).
+  * **Discovery, Quota & Telemetry**: Discovers tool-capable text models from `GET /api/v1/models` with context lengths and USD/1M pricing, probes key limits/credits cleanly via [`OpenRouterDriverQuotaProbe`](file:///home/ckingdon/projects/agent-mesh/src/AgentMesh.Api/Services/DriverQuotaProbe.cs) (`/api/v1/key` with fallback to `/api/v1/credits`, returning `null` when unlimited or forbidden), and accumulates `cachedTokens` and `costUsd` alongside token counts.
 * **SignalR Event Streaming**: Streams real-time thoughts, tool calls, and stdout logs to the Web Cockpit.
 * **Bounded Driver Reads**: A driver that stops writing to stdout is indistinguishable from one that is thinking, and the read that waits for it holds the turn open forever. The `agy`, generic-command and `copilot` adapters therefore bound that read at 20 minutes of silence (`AGENTMESH_DRIVER_IDLE_TIMEOUT_MINUTES`, raised for slow-build persona containers; values under a minute are ignored, because "0" means "no limit" and no-limit is the configuration that produced a 13-hour phantom turn). On a stall the adapter emits an `error` event — which is what settles the session status — then kills the process tree. The bound is not a command timeout: an ordinary silent `dotnet test` or `npm ci` must stay comfortably inside it.

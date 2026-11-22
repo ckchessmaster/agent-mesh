@@ -181,6 +181,14 @@ public sealed record DriverCapabilityDeclaration
         [JsonPropertyName("maxContextTokens")]
         public int? MaxContextTokens { get; init; }
 
+        /// <summary>Prompt price per 1M tokens in USD, when reported (e.g. OpenRouter).</summary>
+        [JsonPropertyName("promptPricePerMillion")]
+        public double? PromptPricePerMillion { get; init; }
+
+        /// <summary>Completion price per 1M tokens in USD, when reported (e.g. OpenRouter).</summary>
+        [JsonPropertyName("completionPricePerMillion")]
+        public double? CompletionPricePerMillion { get; init; }
+
         // No contextSizes field, deliberately. Which windows to *offer* is the API's product
         // policy (bounded to what the runtime will actually honour), not a provider fact, so a
         // runner is not asked to declare it and the API does not read it even if a future CLI

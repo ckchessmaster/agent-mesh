@@ -1,3 +1,4 @@
+using System.Text.Json;
 using AgentMesh.Api.Controllers;
 using AgentMesh.Core.Enums;
 using AgentMesh.Core.Models;
@@ -420,5 +421,163 @@ public class ProjectsControllerTests
         dto.Message.Should().Be("Remote clone failed.");
         dto.Error.Should().Be("Remote clone failed.");
         dto.Warnings.Should().ContainSingle("auth required");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // The write boundary for the repository binding.
+    //
+    // projects.repository_name shipped with a column default of Project.DefaultRepositoryName — this
+    // deployment's own repository — so every project created before the create-time fix inherited it,
+    // and the dashboard re-sends the unchanged field on every save. The row then resolves every agent
+    // command onto another repository's checkout, and the job branches and commits there with no error
+    // anywhere. These tests pin the rejection, the repair, and the two legitimate escapes.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task CreateProject_PlaceholderRepositoryNameOnForeignRemote_IsRejectedWithTheFix()
+    {
+        using var db = TestDbContextFactory.Create();
+        var controller = new ProjectsController(db);
+
+        var result = await controller.CreateProject(new CreateProjectRequest(
+            Name: "Budget App",
+            Id: "budget-app",
+            WorkspaceType: WorkspaceType.Git,
+            GitRepositoryUrl: "https://github.com/ckchessmaster/budget-app",
+            RepositoryName: "agent-mesh"));
+
+        var bad = result.Should().BeOfType<BadRequestObjectResult>().Subject;
+        var error = JsonSerializer.Serialize(bad.Value);
+        error.Should().Contain("/workspace/repos/agent-mesh");
+        error.Should().Contain("/workspace/repos/budget-app");
+
+        (await db.Projects.AnyAsync(p => p.Id == "budget-app")).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task CreateProject_ForeignRemoteWithNoRepositoryName_DerivesItsOwnDirectory()
+    {
+        using var db = TestDbContextFactory.Create();
+        var controller = new ProjectsController(db);
+
+        var result = await controller.CreateProject(new CreateProjectRequest(
+            Name: "Budget App",
+            Id: "budget-app",
+            WorkspaceType: WorkspaceType.Git,
+            GitRepositoryUrl: "https://github.com/ckchessmaster/budget-app"));
+
+        var created = result.Should().BeOfType<CreatedAtActionResult>().Subject;
+        var dto = created.Value.Should().BeOfType<ProjectSummaryDto>().Subject;
+
+        dto.RepositoryName.Should().Be("budget-app");
+        dto.ResolvedWorkingDirectory.Should().Be("/workspace/repos/budget-app");
+    }
+
+    [Fact]
+    public async Task UpdateProject_UnrelatedEditOnLegacyPlaceholderRow_StatesTheBindingFix()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project
+        {
+            Id = "budget-app",
+            Name = "Budget App",
+            WorkspaceType = WorkspaceType.Git,
+            GitRepositoryUrl = "https://github.com/ckchessmaster/budget-app",
+            RepositoryName = Project.DefaultRepositoryName,
+            WorkingDirectory = string.Empty
+        });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectsController(db);
+
+        // The dashboard re-sends every unchanged field, so a name-only edit must not be allowed to
+        // quietly re-commit the placeholder.
+        var result = await controller.UpdateProject("budget-app", new UpdateProjectRequest(Name: "Budget App v2"));
+
+        var bad = result.Should().BeOfType<BadRequestObjectResult>().Subject;
+        // JsonSerializer escapes apostrophes, so assert the phrase without them.
+        JsonSerializer.Serialize(bad.Value)
+            .Should().Contain("Set repository_name to")
+            .And.Contain("budget-app");
+
+        var persisted = await db.Projects.SingleAsync(p => p.Id == "budget-app");
+        persisted.Name.Should().Be("Budget App");
+    }
+
+    [Fact]
+    public async Task UpdateProject_RepointingRepositoryNameAtItsOwnRemote_ResolvesTheRightDirectory()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project
+        {
+            Id = "budget-app",
+            Name = "Budget App",
+            WorkspaceType = WorkspaceType.Git,
+            GitRepositoryUrl = "https://github.com/ckchessmaster/budget-app",
+            RepositoryName = Project.DefaultRepositoryName,
+            WorkingDirectory = string.Empty
+        });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectsController(db);
+
+        var result = await controller.UpdateProject(
+            "budget-app",
+            new UpdateProjectRequest(RepositoryName: "budget-app"));
+
+        var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+        var dto = ok.Value.Should().BeOfType<ProjectSummaryDto>().Subject;
+
+        dto.RepositoryName.Should().Be("budget-app");
+        dto.ResolvedWorkingDirectory.Should().Be("/workspace/repos/budget-app");
+    }
+
+    [Fact]
+    public async Task UpdateProject_PlaceholderNameWithExplicitWorkingDirectory_IsAllowed()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project
+        {
+            Id = "legacy-place",
+            Name = "Legacy Place",
+            WorkspaceType = WorkspaceType.Git,
+            GitRepositoryUrl = "https://github.com/ckchessmaster/elsewhere",
+            RepositoryName = Project.DefaultRepositoryName,
+            WorkingDirectory = "/workspace/repos/legacy-place"
+        });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectsController(db);
+
+        var result = await controller.UpdateProject("legacy-place", new UpdateProjectRequest(Name: "Still fine"));
+
+        var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+        var dto = ok.Value.Should().BeOfType<ProjectSummaryDto>().Subject;
+
+        dto.ResolvedWorkingDirectory.Should().Be("/workspace/repos/legacy-place");
+    }
+
+    [Fact]
+    public async Task UpdateProject_MonorepoProjectNamingItsCheckoutDifferently_IsAllowed()
+    {
+        // One remote, several projects: each deliberately names its own checkout. Only the inherited
+        // placeholder is a conflict, so this save must keep working.
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project
+        {
+            Id = "billing-api",
+            Name = "Billing API",
+            WorkspaceType = WorkspaceType.Git,
+            GitRepositoryUrl = "https://github.com/acme/monorepo.git",
+            RepositoryName = "billing-api",
+            WorkingDirectory = string.Empty
+        });
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectsController(db);
+
+        var result = await controller.UpdateProject("billing-api", new UpdateProjectRequest(Name: "Billing"));
+
+        result.Should().BeOfType<OkObjectResult>();
     }
 }

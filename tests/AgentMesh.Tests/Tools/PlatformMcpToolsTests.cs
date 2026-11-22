@@ -143,6 +143,95 @@ public class PlatformMcpToolsTests
             "the runner's status chip must flip without a page refresh");
     }
 
+    /// <summary>
+    /// 2026-11-20, bee job 67fc1b8a: the discovery turn posted its plan with requires_reply=true
+    /// (an earlier revision of the Stage 1 protocol told it to) while also registering the
+    /// checklist, and the workflow opened the Plan Approval gate from that checklist anyway - two
+    /// PendingInput cards asking the operator to approve one plan, one of them parking the session
+    /// as waiting_for_input on a reply the workflow never waits for. The gate is the approval
+    /// surface; the plan hand-off must land as a notification, and the tool result has to say so
+    /// or the agent believes it is blocked.
+    /// </summary>
+    [Fact]
+    public async Task PostJobMessage_Stage1PlanHandoffWithChecklistDowngraded_IsPlainUpdateWithSessionUnparked()
+    {
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, new List<JobTaskDto> { new() { Title = "Wire job attachments" } });
+        var sessionId = Guid.NewGuid();
+        await SeedSessionAsync(db, sessionId, job.Id, personaId: "rook", status: "thinking");
+
+        var tools = BuildTools(db,
+            Context(jobId: job.Id, personaId: "rook", sessionId: sessionId) with { TaskId = "stage-1-discovery" });
+
+        var result = Parse(await tools.PostJobMessage(
+            "Stage 1 Discovery & Implementation Plan: 4 tasks. Please approve.", "operator", requires_reply: true));
+
+        result.GetProperty("success").GetBoolean().Should().BeTrue(result.ToString());
+        result.GetProperty("requiresReply").GetBoolean().Should().BeFalse(
+            "the plan gate is the one approval ask; a plan hand-off must not open a second wait");
+        result.GetProperty("message").GetString().Should().Contain("Plan Approval gate");
+
+        var card = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        card.CardType.Should().Be(TimelineCardType.TaskStep);
+        card.Status.Should().Be(TimelineCardStatus.Active);
+        card.Title.Should().Be("Update from @rook");
+
+        var session = await ReadBackAsync(dbName, d => d.AgentSessions.SingleAsync(s => s.Id == sessionId));
+        session.Status.Should().NotBe(PlatformMcpTools.WaitingForInputStatus,
+            "a downgraded hand-off parks nothing; the workflow parks the job on the gate instead");
+    }
+
+    [Fact]
+    public async Task PostJobMessage_Stage1BlockerWithNoChecklistRegistered_StillEscalates()
+    {
+        // The downgrade keys off the registered checklist, because that is what the gate opens
+        // from. A discovery blocker with nothing to decompose has no gate coming: its escalation
+        // is the only thing that reaches the operator, and it must stay PendingInput.
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db);
+        var sessionId = Guid.NewGuid();
+        await SeedSessionAsync(db, sessionId, job.Id, personaId: "rook", status: "thinking");
+
+        var tools = BuildTools(db,
+            Context(jobId: job.Id, personaId: "rook", sessionId: sessionId) with { TaskId = "stage-1-discovery" });
+
+        var result = Parse(await tools.PostJobMessage(
+            "Cannot proceed: the repo requires a signed CLA nobody assigned can grant.", "operator", requires_reply: true));
+
+        result.GetProperty("requiresReply").GetBoolean().Should().BeTrue();
+        var card = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        card.CardType.Should().Be(TimelineCardType.Escalation3R);
+        card.Status.Should().Be(TimelineCardStatus.PendingInput);
+        var session = await ReadBackAsync(dbName, d => d.AgentSessions.SingleAsync(s => s.Id == sessionId));
+        session.Status.Should().Be(PlatformMcpTools.WaitingForInputStatus);
+    }
+
+    [Fact]
+    public async Task PostJobMessage_Stage3EscalationOnJobWithTasks_StillEscalates()
+    {
+        // A 3-strike blocker in Stage 3 also has a checklist registered - from the approved plan -
+        // so "has tasks" alone must not downgrade anything. The downgrade is scoped to the
+        // discovery turn's context, which Stage 3 turns do not carry.
+        var dbName = "PlatformTools_" + Guid.NewGuid().ToString("N");
+        using var db = NewDb(dbName);
+        var job = await SeedJobAsync(db, new List<JobTaskDto> { new() { Title = "Wire job attachments" } });
+        var sessionId = Guid.NewGuid();
+        await SeedSessionAsync(db, sessionId, job.Id, personaId: "rook", status: "thinking");
+
+        var tools = BuildTools(db, Context(jobId: job.Id, personaId: "rook", sessionId: sessionId));
+
+        var result = Parse(await tools.PostJobMessage(
+            "Third failed build after three strikes; reverting and halting per the 3-strike rule.", "operator", requires_reply: true));
+
+        result.GetProperty("requiresReply").GetBoolean().Should().BeTrue();
+        var card = await ReadBackAsync(dbName, d => d.JobTimelineCards.SingleAsync(c => c.JobId == job.Id.ToString()));
+        card.CardType.Should().Be(TimelineCardType.Escalation3R);
+        var session = await ReadBackAsync(dbName, d => d.AgentSessions.SingleAsync(s => s.Id == sessionId));
+        session.Status.Should().Be(PlatformMcpTools.WaitingForInputStatus);
+    }
+
     [Fact]
     public async Task PostJobMessage_ToOperatorWithoutReply_CreatesActiveTaskStepCard_AndPreservesPersonaVsDriverSplit()
     {

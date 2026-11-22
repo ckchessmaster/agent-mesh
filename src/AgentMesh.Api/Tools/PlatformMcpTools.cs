@@ -1,4 +1,4 @@
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AgentMesh.Api.Controllers;
@@ -68,7 +68,13 @@ public class PlatformMcpTools(
     // The production container registers it (Program.cs), and ApiServiceRegistrationTests pins that —
     // without that pin, an absent registration here would silently leave every MCP-routed escalation
     // undeliverable, which is the exact defect this parameter exists to fix.
-    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null)
+    AgentMesh.Api.Services.IWorkflowSignalRouter? workflows = null,
+    // Optional for the same reason as the router above: this class is constructed directly by the tests
+    // that exercise the ledger and the checklist, and they must not have to know that a bell exists. The
+    // production container registers it and ApiServiceRegistrationTests pins that — an absent
+    // registration here would silently leave every MCP-raised plan gate, discovery park and PR review
+    // unannounced, which is precisely the defect class that parameter is there to close.
+    AgentMesh.Api.Services.IAttentionNotifier? attention = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -219,6 +225,28 @@ public class PlatformMcpTools(
 
         var authorPersonaId = sender.PersonaId ?? sender.AgentId ?? "unknown";
         var driverId = context.Context.DriverId ?? sender.AgentId;
+
+        // A Stage 1 plan hand-off is not an escalation. The Plan Approval gate the workflow opens
+        // from the registered checklist is the single surface where the operator decides, so a
+        // reply-required post to the human during the discovery turn asks the same question twice,
+        // parks the session as waiting_for_input, and leaves two PendingInput cards for one
+        // decision (bee job 67fc1b8a, 2026-11-20: the discovery turn posted its plan with
+        // requires_reply because an earlier revision of the protocol told it to; the gate opened
+        // from the same checklist anyway). The prompts now say otherwise - this is the backstop:
+        // the post still lands in the timeline, as the notification it actually is. A genuine
+        // blocker in discovery has no registered checklist yet to open a gate, so it still
+        // escalates; Stage 3 strikes never see this branch (not discovery phase).
+        var planHandoffDowngraded = false;
+        if (requires_reply &&
+            string.Equals(target, OperatorPersonaId, StringComparison.OrdinalIgnoreCase) &&
+            context.Context.IsDiscoveryPhase &&
+            !string.IsNullOrWhiteSpace(job.TasksJson) &&
+            !string.Equals(job.TasksJson.Trim(), "[]", StringComparison.Ordinal))
+        {
+            requires_reply = false;
+            planHandoffDowngraded = true;
+        }
+
         var cardType = requires_reply
             ? TimelineCardType.Escalation3R
             : (target != OperatorPersonaId
@@ -295,6 +323,14 @@ public class PlatformMcpTools(
             "post_job_message: job={JobId} from={Persona} (driver={Driver}) to={Target} requiresReply={RequiresReply} card={CardId} type={CardType}",
             job.Id, authorPersonaId, driverId ?? "(none)", target, requires_reply, card.Id, card.CardType);
 
+        // Write site for the attention push: this card may have just opened an operator wait
+        // (a reply request addressed to a human is recorded as a PendingInput Escalation3R card)
+        // or closed the one that was open, and on the discovery path the heartbeat above flipped
+        // to "Awaiting … planning questions" in the same transaction. The notifier recomputes the
+        // job from the committed state rather than reading these arguments, so the bell cannot
+        // announce a wait the inbox does not contain.
+        await attention.RefreshAttentionAsync(job.Id, ct);
+
         await hubContext.Clients.Group($"job-{job.Id}")
             .SendAsync("ReceiveTimelineCardUpdated", card, ct);
 
@@ -317,10 +353,15 @@ public class PlatformMcpTools(
             targetPersona = target,
             requiresReply = requires_reply,
             sessionStatus = parkedSession?.Status,
-            message = requires_reply
-                ? $"Escalation card posted to the Job Timeline and addressed to @{target}. The session is now waiting for input; " +
-                  "conclude your turn and continue when the reply arrives."
-                : $"Timeline card posted to the Job Timeline and addressed to @{target}.",
+            message = planHandoffDowngraded
+                ? "Plan posted to the Job Timeline as a plain update. The Plan Approval gate opens from your " +
+                  "registered checklist when this turn ends, and that gate is where the operator decides - a " +
+                  "reply request on the plan would ask them to approve it on two cards, so this message did not " +
+                  "park the session. Conclude with NO_OPEN_QUESTIONS and stop."
+                : requires_reply
+                    ? $"Escalation card posted to the Job Timeline and addressed to @{target}. The session is now waiting for input; " +
+                      "conclude your turn and continue when the reply arrives."
+                    : $"Timeline card posted to the Job Timeline and addressed to @{target}.",
             resolvedFrom = ResolveProvenance(context.Context),
         }, JsonOptions);
     }
@@ -566,6 +607,13 @@ public class PlatformMcpTools(
                 lifecycleStatus = checklistLifecycleStatus
             }, ct);
 
+            // Write site 2 of 3 for the attention push: the heartbeat. "Awaiting plan approval" is the
+            // single most common way a job parks on the operator, and on this card-less MCP path the
+            // heartbeat is the ONLY record of it (the PlanApproval card is raised later, by the
+            // orchestrated activity, if that job has one), so a bell that watched cards alone would stay
+            // silent for exactly the gate an operator has to approve.
+            await attention.RefreshAttentionAsync(job.Id, ct);
+
             return JsonSerializer.Serialize(new
             {
                 success = true,
@@ -697,6 +745,10 @@ public class PlatformMcpTools(
             currentTaskId = job.CurrentTaskId,
             lifecycleStatus = taskLifecycleStatus
         }, ct);
+
+        // A status note can be either direction: "Executing task #3" retires the wait the bell is
+        // showing, and a note that parks the task raises one. Both are decided by re-reading the job.
+        await attention.RefreshAttentionAsync(job.Id, ct);
 
         return JsonSerializer.Serialize(new
         {
@@ -1185,6 +1237,11 @@ public class PlatformMcpTools(
         logger.LogInformation(
             "open_pull_request: job={JobId} branch={Branch} -> {Base} as PR #{PrNumber} (headSha={HeadSha}, source={Source})",
             job.Id, resolvedHeadBranch, resolvedBaseBranch, resolvedPrNumber, args.HeadSha ?? "(none)", linkageSource);
+
+        // The heartbeat ("Awaiting pull request review (PR #n)") and the ledger row carrying the PR
+        // linkage are what the rollup reads, and both committed above. This is the event that turns the
+        // review gate from "poll until I notice" into a desktop ping with a click-through URL.
+        await attention.RefreshAttentionAsync(job.Id, ct);
 
         return JsonSerializer.Serialize(new
         {

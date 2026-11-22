@@ -32,6 +32,7 @@ public class JobExecutionWorkflowTests
             .AddActivity((Func<TurnInterruptedCardInput, Task<Guid>>)timeline.RecordTurnInterruptedAsync)
             .AddActivity((Func<TaskStepCardInput, Task<Guid>>)timeline.UpdateTaskStepCardAsync)
             .AddActivity((Func<AppendRemediationTasksInput, Task<IReadOnlyList<ProposedChecklistItem>>>)timeline.AppendRemediationTasksAsync)
+            .AddActivity((Func<PersistJobHaltInput, Task>)timeline.PersistJobHaltAsync)
             .AddActivity((Func<TaskExecutionInput, ChatMessageSignal?, Task<TurnOutcome>>)execution.RunAgentCodingTurnAsync)
             .AddActivity((Func<MergePullRequestInput, Task<string>>)git.MergeJobPullRequestAsync)
             .AddWorkflow<JobExecutionWorkflow>()
@@ -173,6 +174,10 @@ public class JobExecutionWorkflowTests
             git.MergeCalls.Should().BeEmpty();
             timeline.DecompositionInputs.Should().ContainSingle(
                 "halting is a decision, not another round of decomposition to spend the persona's turn on");
+            timeline.JobHaltInputs.Should().ContainSingle(
+                    "the result nobody reads must still be written to the job, or a halted workflow " +
+                    "leaves the row claiming whatever it was executing last")
+                .Which.Reason.Should().Contain(JobExecutionWorkflow.EmptyChecklistHaltMessage);
         }
         finally
         {
@@ -717,6 +722,166 @@ public class JobExecutionWorkflowTests
         }
     }
 
+    [Fact]
+    public async Task JobWorkflow_UpdateAssigneeDuringExecution_TriggersNextItemAndPrStageForNewAssignee()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var timeline = new FakeTimelineActivities
+        {
+            CustomDiscoveryQuestions = [],
+            CustomTasks =
+            [
+                new("task-1", "Task 1: Initial piece", "src/One.cs", "dotnet test"),
+                new("task-2", "Task 2: Follow-up piece", "src/Two.cs", "dotnet test")
+            ]
+        };
+        var task1Entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var task1Release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var execution = new FakeExecutionActivities
+        {
+            FirstTaskEntered = task1Entered,
+            FirstTaskGate = task1Release.Task
+        };
+        var git = new FakeGitActivities();
+
+        using var worker = BuildWorker(env, timeline, execution, git);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(new JobExecutionInput(
+                    JobId: jobId,
+                    AssignedAgentId: "rook",
+                    ProjectId: "mesh-core",
+                    WorkspacePath: "/workspace/repos/agent-mesh",
+                    InitialPrompt: "Implement two-step feature",
+                    TargetBranch: "main",
+                    ApprovalPolicy: PlanApprovalPolicy.LeadOrHuman)),
+                new WorkflowOptions($"job-{jobId}", Queue));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
+            await handle.SignalAsync(wf => wf.SubmitPlanDecisionAsync(
+                new PlanApprovalSignal(timeline.PlanCardId, true, "Approved", "astra")));
+
+            await task1Entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+
+            // Reassign the job while task-1 is running
+            await handle.SignalAsync(wf => wf.UpdateAssigneeAsync(new JobAssigneeUpdatedSignal("sorren")));
+            await WaitUntilAsync(handle, s => s.AssignedAgentId == "sorren");
+
+            // Let task-1 finish so Temporal triggers task-2 and Stage 4
+            task1Release.SetResult();
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase));
+
+            execution.RecordedInputs.Should().HaveCount(3, "task-1, task-2, and Stage 4 PR turn");
+            execution.RecordedInputs[0].TaskId.Should().Be("task-1");
+            execution.RecordedInputs[0].AgentId.Should().Be("rook");
+            execution.RecordedInputs[0].PersonaId.Should().Be("rook");
+
+            execution.RecordedInputs[1].TaskId.Should().Be("task-2");
+            execution.RecordedInputs[1].AgentId.Should().Be("sorren", "the next checklist item must run for the new assignee");
+            execution.RecordedInputs[1].PersonaId.Should().Be("sorren");
+
+            execution.RecordedInputs[2].TaskId.Should().StartWith("stage-4-pr-open-");
+            execution.RecordedInputs[2].AgentId.Should().Be("sorren", "Stage 4 must run for the new assignee");
+            execution.RecordedInputs[2].PersonaId.Should().Be("sorren");
+
+            // Two-Man Rule now blocks the new assignee from self-approving
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("sorren", true, "Self-approve attempt", DateTimeOffset.UtcNow, 101)));
+            await WaitUntilAsync(handle, s => s.IgnoredSelfReviewCount == 1);
+
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("astra", true, "Verified by independent reviewer.", DateTimeOffset.UtcNow, 101)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+            git.MergeCalls.Should().ContainSingle();
+        }
+        finally
+        {
+            task1Release.TrySetResult();
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [Fact]
+    public async Task JobWorkflow_UpdateAssignee_PreservedAcrossContinueAsNewAndRemediationRound()
+    {
+        await using var env = await WorkflowEnvironment.StartTimeSkippingAsync();
+        var timeline = new FakeTimelineActivities
+        {
+            CustomDiscoveryQuestions = [],
+            CustomTasks = [new("task-1", "Initial task", "src/Core.cs", "dotnet test")]
+        };
+        var execution = new FakeExecutionActivities();
+        var git = new FakeGitActivities();
+
+        using var worker = BuildWorker(env, timeline, execution, git);
+        using var cts = new CancellationTokenSource();
+        var workerTask = worker.ExecuteAsync(cts.Token);
+
+        try
+        {
+            var jobId = Guid.NewGuid().ToString("N");
+            var wfId = $"job-{jobId}";
+            var input = new JobExecutionInput(
+                JobId: jobId,
+                ProjectId: "mesh-core",
+                WorkspacePath: "/workspace/repos/agent-mesh",
+                InitialPrompt: "ContinueAsNew preserves reassigned persona",
+                TargetBranch: "main",
+                AssignedAgentId: "rook",
+                ApprovalPolicy: "LeadOrHuman",
+                ContinueAsNewAfterRounds: 1);
+            var handle = await env.Client.StartWorkflowAsync(
+                (JobExecutionWorkflow wf) => wf.ExecuteJobAsync(input),
+                new WorkflowOptions(wfId, Queue));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.Contains("Awaiting plan approval"));
+            await handle.SignalAsync(wf => wf.SubmitPlanDecisionAsync(
+                new PlanApprovalSignal(timeline.PlanCardId, true, "Approved", "astra")));
+
+            await WaitUntilAsync(handle, s => s.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase));
+
+            // Reassign the job before requesting changes (which triggers ContinueAsNew)
+            await handle.SignalAsync(wf => wf.UpdateAssigneeAsync(new JobAssigneeUpdatedSignal("sorren")));
+            await WaitUntilAsync(handle, s => s.AssignedAgentId == "sorren");
+
+            await handle.SignalAsync(wf => wf.ReceivePrReviewAsync(new PrReviewSignal(
+                "astra",
+                false,
+                "- Fix edge case in `src/Core.cs`",
+                DateTimeOffset.UtcNow,
+                101)));
+
+            var latestHandle = env.Client.GetWorkflowHandle<JobExecutionWorkflow>(wfId);
+            await WaitUntilLatestAsync(latestHandle, s =>
+                s.ReviewRound == 1 &&
+                s.CurrentHeartbeat.StartsWith("Awaiting PR review", StringComparison.OrdinalIgnoreCase));
+
+            execution.RecordedInputs.Where(i => i.TaskId.StartsWith("remediation-r1-"))
+                .Should().ContainSingle()
+                .Which.PersonaId.Should().Be("sorren", "ContinueAsNew must carry the reassigned assignee into remediation tasks");
+
+            await latestHandle.SignalAsync(wf => wf.ReceivePrReviewAsync(
+                new PrReviewSignal("astra", true, "LGTM", DateTimeOffset.UtcNow, 101)));
+
+            var result = await handle.GetResultAsync<JobExecutionResult>();
+            result.Success.Should().BeTrue();
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await workerTask; } catch (OperationCanceledException) { }
+        }
+    }
+
     private static async Task WaitUntilAsync(
         WorkflowHandle<JobExecutionWorkflow, JobExecutionResult> handle,
         Func<JobWorkflowState, bool> predicate,
@@ -794,6 +959,7 @@ public class JobExecutionWorkflowTests
         public List<DecompositionActivityInput> DecompositionInputs { get; } = [];
         public List<UpdateTimelineCardStatusInput> UpdatedCards { get; } = [];
         public List<AppendRemediationTasksInput> AppendedRemediationBatches { get; } = [];
+        public List<PersistJobHaltInput> JobHaltInputs { get; } = [];
         public List<DiscoveryQuestion>? CustomDiscoveryQuestions { get; set; }
         public List<ProposedChecklistItem> CustomTasks { get; set; } =
         [
@@ -850,6 +1016,13 @@ public class JobExecutionWorkflowTests
             AppendedRemediationBatches.Add(input);
             return Task.FromResult(input.Tasks);
         }
+
+        [Activity]
+        public Task PersistJobHaltAsync(PersistJobHaltInput input)
+        {
+            JobHaltInputs.Add(input);
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class FakeGitActivities : IGitActivities
@@ -884,23 +1057,36 @@ public class JobExecutionWorkflowTests
     {
         public int TaskTurnCount { get; private set; }
         public int PrStageTurnCount { get; private set; }
+        public List<TaskExecutionInput> RecordedInputs { get; } = [];
+        public TaskCompletionSource? FirstTaskEntered { get; set; }
+        public Task? FirstTaskGate { get; set; }
 
         [Activity]
-        public Task<TurnOutcome> RunAgentCodingTurnAsync(TaskExecutionInput input, ChatMessageSignal? pendingReply)
+        public async Task<TurnOutcome> RunAgentCodingTurnAsync(TaskExecutionInput input, ChatMessageSignal? pendingReply)
         {
+            RecordedInputs.Add(input);
             if (input.TaskId.StartsWith("stage-4-pr-open-", StringComparison.OrdinalIgnoreCase))
             {
                 var roundSuffix = input.TaskId["stage-4-pr-open-".Length..];
                 PrStageTurnCount++;
-                return Task.FromResult(TurnOutcome.AwaitingReview(
+                return TurnOutcome.AwaitingReview(
                     "https://github.com/ckchessmaster/agent-mesh/pull/101",
                     101,
                     $"Job PR #101 ready (round {roundSuffix})",
-                    headSha: $"sha-round-{roundSuffix}"));
+                    headSha: $"sha-round-{roundSuffix}");
             }
 
             TaskTurnCount++;
-            return Task.FromResult(TurnOutcome.Completed($"Completed {input.TaskTitle}"));
+            if (TaskTurnCount == 1 && FirstTaskEntered != null)
+            {
+                FirstTaskEntered.TrySetResult();
+                if (FirstTaskGate != null)
+                {
+                    await FirstTaskGate;
+                }
+            }
+
+            return TurnOutcome.Completed($"Completed {input.TaskTitle}");
         }
 
         [Activity]

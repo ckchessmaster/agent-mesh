@@ -1,4 +1,4 @@
-using AgentMesh.Api.Controllers;
+﻿using AgentMesh.Api.Controllers;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Services;
 using AgentMesh.Infrastructure.Data;
@@ -245,6 +245,66 @@ public class ApiServiceRegistrationTests : IClassFixture<WebApplicationFactory<A
         var router = scope.ServiceProvider.GetService<IWorkflowSignalRouter>();
 
         router.Should().BeOfType<WorkflowSignalRouter>();
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // The notification surface: pending-attention rollup and its push notifier
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The attention read model and the notifier that broadcasts it are registered, scoped, and bound to
+    /// their real implementations.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Same shape of failure <see cref="IJobTurnRecovery"/> was pinned for, and it bites harder here:
+    /// every controller and the MCP tool surface take <see cref="IAttentionNotifier"/> as an
+    /// <em>optional</em> constructor parameter so that the ~40 tests constructing those types directly do
+    /// not have to know about SignalR. A missing registration therefore never throws at activation — it
+    /// turns all fifteen write sites into no-ops through <c>AttentionNotifierExtensions</c>.
+    /// <c>GET /api/attention</c> would keep answering, every write-site test would stay green because they
+    /// inject a recorder, and the only symptom in production would be a bell that quietly falls back to
+    /// its 30-second poll. Nothing else in this suite can see that.
+    /// </para>
+    /// <para>
+    /// Scoped, not singleton: both read an <c>AgentMeshDbContext</c>, and every consumer is a per-request
+    /// controller. Pinning the lifetime is what stops a future "optimization" from capturing a scoped
+    /// DbContext into a singleton graph.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData(typeof(IAttentionQueryService), typeof(AttentionQueryService))]
+    [InlineData(typeof(IAttentionNotifier), typeof(AttentionNotifier))]
+    public void AttentionServices_AreRegisteredScopedAgainstTheirImplementations(
+        Type service, Type implementation)
+    {
+        var descriptor = Descriptors.SingleOrDefault(d => d.ServiceType == service);
+
+        descriptor.Should().NotBeNull(
+            $"Program.cs must register {service.Name}. Without it the write sites silently stop " +
+            $"announcing waits, because they declare it as an optional parameter.");
+
+        descriptor!.ImplementationType.Should().Be(implementation);
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Scoped);
+    }
+
+    /// <summary>
+    /// It resolves through a real request scope, so its own graph is complete.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="AttentionNotifier"/> needs <see cref="IAttentionQueryService"/> plus
+    /// <c>IHubContext&lt;AgentMeshHub&gt;</c>, which <c>AddSignalR</c> supplies from further down
+    /// <c>Program.cs</c>. A descriptor alone would not catch the hub services being registered after the
+    /// point a controller is first activated.
+    /// </remarks>
+    [Fact]
+    public void AttentionNotifier_ResolvesFromARequestScope()
+    {
+        using var scope = _factory.Services.CreateScope();
+
+        var notifier = scope.ServiceProvider.GetService<IAttentionNotifier>();
+
+        notifier.Should().BeOfType<AttentionNotifier>();
     }
 
     // ──────────────────────────────────────────────────────────────────────────

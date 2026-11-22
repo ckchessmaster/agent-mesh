@@ -136,6 +136,98 @@ public class ProjectJobsControllerTests
     }
 
     [Fact]
+    public async Task UpdateJob_TurnBudget_PersistsOmittedMeansKeep()
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project { Id = "app", Name = "App" });
+        var job = new ProjectJob { Id = Guid.NewGuid(), ProjectId = "app", Title = "Job 1", TasksJson = "[]" };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        // A budget that started null (platform default) becomes an explicit value the cockpit and the
+        // recovery input can both see.
+        var firstResult = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(Title: "kept", TurnBudget: 80));
+        var first = (firstResult.Should().BeOfType<OkObjectResult>().Subject.Value as ProjectJobDto)!;
+        first.TurnBudget.Should().Be(80);
+        first.Title.Should().Be("kept");
+        (await db.ProjectJobs.FindAsync(job.Id))!.TurnBudget.Should().Be(80);
+
+        // Every other field of this handler follows "null = unchanged"; TurnBudget must not be the one
+        // field where leaving a control blank silently resets a job to the platform default.
+        var secondResult = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(Description: "touching description"));
+        var second = (secondResult.Should().BeOfType<OkObjectResult>().Subject.Value as ProjectJobDto)!;
+        second.TurnBudget.Should().Be(80);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(1001)]
+    public async Task UpdateJob_TurnBudgetOutOfRange_RefusesWholeRequest(int rejected)
+    {
+        using var db = TestDbContextFactory.Create();
+        db.Projects.Add(new Project { Id = "app", Name = "App" });
+        var job = new ProjectJob { Id = Guid.NewGuid(), ProjectId = "app", Title = "Job 1", TurnBudget = 40, TasksJson = "[]" };
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var controller = new ProjectJobsController(db);
+
+        var result = await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(
+            Title: "should NOT land", TurnBudget: rejected));
+
+        result.Should().BeOfType<BadRequestObjectResult>();
+        var inDb = await db.ProjectJobs.FindAsync(job.Id);
+        inDb!.Title.Should().Be("Job 1", "a refused request must not half-apply the fields before it");
+        inDb.TurnBudget.Should().Be(40);
+    }
+
+    [Fact]
+    public async Task UpdateJob_ChangingAssignedAgentId_SignalsWorkflowRouter()
+    {
+        using var db = TestDbContextFactory.Create();
+
+        var project = new Project { Id = "app", Name = "App", DefaultLeadPersonaId = "lead-persona" };
+        var job = new ProjectJob
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = "app",
+            Title = "Job 1",
+            AssignedAgentId = "rook",
+            TasksJson = "[]"
+        };
+        db.Projects.Add(project);
+        db.ProjectJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        var router = new Mock<IWorkflowSignalRouter>();
+        router.Setup(r => r.SendAssigneeUpdateAsync(
+                job.Id,
+                It.IsAny<JobAssigneeUpdatedSignal>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SignalDelivery($"job-{job.Id:D}", SignalDeliveryStatus.Delivered));
+
+        var controller = new ProjectJobsController(db, workflows: router.Object);
+
+        await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(AssignedAgentId: "sorren"));
+
+        router.Verify(r => r.SendAssigneeUpdateAsync(
+            job.Id,
+            It.Is<JobAssigneeUpdatedSignal>(s => s.AssignedAgentId == "sorren"),
+            It.IsAny<CancellationToken>()), Times.Once);
+
+        // Clearing back to Default signals the project's default lead persona
+        await controller.UpdateJob(job.Id, new UpdateProjectJobRequest(AssignedAgentId: ""));
+
+        router.Verify(r => r.SendAssigneeUpdateAsync(
+            job.Id,
+            It.Is<JobAssigneeUpdatedSignal>(s => s.AssignedAgentId == "lead-persona"),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
     public async Task TaskManagement_CanAddToggleAndDeleteTasks()
     {
         using var db = TestDbContextFactory.Create();
@@ -352,6 +444,121 @@ public class ProjectJobsControllerTests
 
         var inDbReopened = await db.ProjectJobs.FindAsync(job.Id);
         inDbReopened!.Status.Should().Be(ProjectJobStatus.Active);
+    }
+
+    // ---- Reopen resumption ---------------------------------------------------
+    //
+    // /complete cancels the job's Temporal run (it is the only API path that does), and reopen used
+    // to flip the row back to Active without restarting anything. The result was the Notifications
+    // incident: a job that looked alive, dispatched persona turns that found NoRunningWorkflow, and
+    // every escalation the persona filed to reach a human looping into the ledger overnight instead.
+    // Reopen now resumes a closed run through the same recovery path /recover uses — and the three
+    // run shapes (closed / open / never-existing) decide whether it does.
+
+    private static async Task<(ProjectJobsController Controller, AgentMeshDbContext Db, Guid JobId)>
+        SeedReopenFixtureAsync()
+    {
+        var db = TestDbContextFactory.Create();
+        var jobId = Guid.NewGuid();
+        db.Projects.Add(new Project { Id = "reopen-resume", Name = "Reopen Resume" });
+        db.ProjectJobs.Add(new ProjectJob
+        {
+            Id = jobId,
+            ProjectId = "reopen-resume",
+            Title = "Notifications",
+            Status = ProjectJobStatus.Archived,
+            CurrentTaskId = "f0471534-4362-4130-918e-851951394e32",
+            ProgressHeartbeat = "Halted: no review on the pull request"
+        });
+        await db.SaveChangesAsync();
+        return (new ProjectJobsController(db), db, jobId);
+    }
+
+    private static Mock<IJobExecutionWorkflowGateway> GatewayWith(JobRunState? run)
+    {
+        var gateway = new Mock<IJobExecutionWorkflowGateway>();
+        gateway.Setup(g => g.FindRunAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(run);
+        return gateway;
+    }
+
+    private static Mock<IJobTurnRecovery> RecoveryReturningResumed(out List<Guid> recovered)
+    {
+        recovered = [];
+        var recovery = new Mock<IJobTurnRecovery>();
+        recovery.Setup(r => r.RecoverAsync(It.IsAny<Guid>(), It.IsAny<JobRecoveryRequest>(),
+                    It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Guid id, JobRecoveryRequest _, string _, CancellationToken _) =>
+                new JobRecoveryResult(id, $"job-{id}", JobRecoveryAction.Resumed, Array.Empty<Guid>(),
+                    "Backend rollup", 1, 7, null, $"Resumed {id} at task 1/7"));
+        return recovery;
+    }
+
+    [Fact]
+    public async Task Reopen_WithClosedRun_ResumesThroughRecovery()
+    {
+        var (controller, db, jobId) = await SeedReopenFixtureAsync();
+        var gateway = GatewayWith(new JobRunState($"job-{jobId}", IsOpen: false));
+        var recovery = RecoveryReturningResumed(out _);
+
+        var result = await controller.ReopenJob(jobId, gateway.Object, recovery.Object);
+
+        result.Should().BeOfType<OkObjectResult>();
+        (await db.ProjectJobs.FindAsync(jobId))!.Status.Should().Be(ProjectJobStatus.Active);
+        recovery.Verify(r => r.RecoverAsync(
+                jobId,
+                It.Is<JobRecoveryRequest>(q => q.Resume),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once, "the reopen must not leave a job with recorded progress Active-but-unorchestrated");
+    }
+
+    [Fact]
+    public async Task Reopen_WithOpenRun_DoesNotResume()
+    {
+        // Archive-without-cancel leaves the run live; it never left the job, and a second run would
+        // double-own the workspace lease.
+        var (controller, _, jobId) = await SeedReopenFixtureAsync();
+        var gateway = GatewayWith(new JobRunState($"job-{jobId}", IsOpen: true));
+        var recovery = RecoveryReturningResumed(out _);
+
+        (await controller.ReopenJob(jobId, gateway.Object, recovery.Object)).Should().BeOfType<OkObjectResult>();
+
+        recovery.Verify(r => r.RecoverAsync(It.IsAny<Guid>(), It.IsAny<JobRecoveryRequest>(),
+            It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Reopen_WithNoRunEverStarted_DoesNotResume()
+    {
+        // A job that never had an orchestrator is the pre-start state /start owns; reopening it must
+        // not silently kick off discovery.
+        var (controller, _, jobId) = await SeedReopenFixtureAsync();
+        var gateway = GatewayWith(run: null);
+        var recovery = RecoveryReturningResumed(out _);
+
+        (await controller.ReopenJob(jobId, gateway.Object, recovery.Object)).Should().BeOfType<OkObjectResult>();
+
+        recovery.Verify(r => r.RecoverAsync(It.IsAny<Guid>(), It.IsAny<JobRecoveryRequest>(),
+            It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Reopen_ResumeFailure_StillReopensTheJob()
+    {
+        // The row is Active before the resume is attempted and the failure is loud in the logs;
+        // turning a recoverable "reopened, needs /recover" into a failed HTTP call would invite the
+        // operator to click reopen again and again against a dead orchestrator.
+        var (controller, db, jobId) = await SeedReopenFixtureAsync();
+        var gateway = GatewayWith(new JobRunState($"job-{jobId}", IsOpen: false));
+        var recovery = new Mock<IJobTurnRecovery>();
+        recovery.Setup(r => r.RecoverAsync(It.IsAny<Guid>(), It.IsAny<JobRecoveryRequest>(),
+                It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new Exception("temporal unreachable"));
+
+        (await controller.ReopenJob(jobId, gateway.Object, recovery.Object)).Should().BeOfType<OkObjectResult>();
+
+        (await db.ProjectJobs.FindAsync(jobId))!.Status.Should().Be(ProjectJobStatus.Active);
     }
 
     [Fact]

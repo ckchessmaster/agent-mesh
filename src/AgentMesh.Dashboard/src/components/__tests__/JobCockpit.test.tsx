@@ -249,6 +249,12 @@ describe('JobCockpit - Header, Status, and Timeline Workspace', () => {
     await waitFor(() => {
       expect(onUpdate).toHaveBeenCalledWith({ assignedAgentId: 'agy-soren' });
     });
+
+    fireEvent.change(assigneeSelect, { target: { value: '' } });
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledWith({ assignedAgentId: '' });
+    });
   });
 
   it('renders archived job state with reopen option', () => {

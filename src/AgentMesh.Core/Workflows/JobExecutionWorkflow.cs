@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Models;
+using Microsoft.Extensions.Logging;
 using Temporalio.Api.Enums.V1;
 using Temporalio.Common;
 using Temporalio.Exceptions;
@@ -63,6 +64,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
     private PrReviewSignal? _prReview;
     private AbortActiveTurnSignal? _pendingAbort;
     private TurnInterventionSignal? _pendingIntervention;
+    private JobAssigneeUpdatedSignal? _pendingAssigneeUpdate;
     private ChildWorkflowHandle<ITaskExecutionWorkflow, TaskExecutionResult>? _activeChildHandle;
     private string? _activeChildWorkflowId;
     private List<ChecklistTaskItem> _tasks = new();
@@ -96,10 +98,59 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             _approvalPolicy = PlanApprovalPolicy.LeadOrHuman;
         }
 
-        return await ExecuteTimelineLoopAsync(input);
+        var result = await ExecuteTimelineLoopAsync(input);
+        if (!result.Success)
+        {
+            await SettleFailedOutcomeAsync(input.JobId, result.Message);
+        }
+
+        return result;
     }
 
     public Task<JobExecutionResult> RunAsync(JobExecutionInput input) => ExecuteJobAsync(input);
+
+    /// <summary>
+    /// Writes the workflow's own failure onto the job row before the run completes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every caller that starts this workflow starts it fire-and-forget — the API's two
+    /// <c>StartWorkflowAsync</c> sites and recovery's start all discard the handle, and no one awaits
+    /// the result. So a returned <c>Success: false</c> went into the void: in one incident a job
+    /// halted after 40 turns, the workflow completed as an honest failure, and the job row went on
+    /// claiming "Executing task" forever because there was nobody left to read the outcome. The
+    /// workflow is the only component that knows why it stopped, so it settles its own failure here,
+    /// through the same activity channel every other ledger write it makes uses.
+    /// </para>
+    /// <para>
+    /// Activity failures are logged and swallowed: an unreachable database must not replace the
+    /// job's real halt reason with a completion-time activity exception. Cancellation is not
+    /// swallowed — an operator-initiated cancel already writes its own truth to the row, and this
+    /// run owes that decision nothing further.
+    /// </para>
+    /// </remarks>
+    private async Task SettleFailedOutcomeAsync(string jobId, string? message)
+    {
+        var reason = string.IsNullOrWhiteSpace(message)
+            ? "the workflow halted without reporting a reason"
+            : message!.Trim();
+        _currentHeartbeat = reason.StartsWith("Halted", StringComparison.OrdinalIgnoreCase)
+            ? reason
+            : $"Halted: {reason}";
+
+        try
+        {
+            await Workflow.ExecuteActivityAsync(
+                (ITimelineActivities act) => act.PersistJobHaltAsync(new PersistJobHaltInput(jobId, reason)),
+                TimelineActivityOptions
+            );
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Workflow.Logger.LogWarning(ex,
+                "Could not persist halt outcome for job {JobId}: {Reason}", jobId, reason);
+        }
+    }
 
     private async Task<JobExecutionResult> ExecuteTimelineLoopAsync(JobExecutionInput input)
     {
@@ -199,6 +250,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
                     _pendingAbort = null;
                     _pendingIntervention = null;
+                    _pendingAssigneeUpdate = null;
 
                     var taskSpecificContext = BuildChildRemediationContext(task, currentRemediationContext);
                     var childInput = new ChildTaskExecutionInput(
@@ -206,11 +258,12 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                         task.TaskId,
                         globalIdx,
                         task.Title,
-                        input.AssignedAgentId,
+                        CurrentAssignedAgentId(input),
                         input.WorkspacePath,
                         input.TargetBranch,
                         input.ProjectId,
-                        taskSpecificContext
+                        taskSpecificContext,
+                        input.TurnBudget
                     );
 
                     var childWorkflowId = _reviewRound == 0
@@ -230,6 +283,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
                     _activeChildHandle = childHandle;
 
+                    if (_pendingAssigneeUpdate != null)
+                    {
+                        await TrySignalChildAssigneeAsync(childHandle, _pendingAssigneeUpdate);
+                        _pendingAssigneeUpdate = null;
+                    }
                     if (_pendingAbort != null)
                     {
                         await childHandle.SignalAsync(wf => wf.AbortTurnAsync(_pendingAbort));
@@ -246,6 +304,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                     _activeChildWorkflowId = null;
                     _pendingAbort = null;
                     _pendingIntervention = null;
+                    _pendingAssigneeUpdate = null;
 
                     if (!result.Success)
                     {
@@ -599,14 +658,15 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
                   $"(`agentmesh pr sync --base {input.TargetBranch}`), push your commits, and update/re-register PR " +
                   $"{_activePrUrl} via `agentmesh pr open` so the latest HEAD SHA is recorded for re-review.";
 
+            var stageAssignee = CurrentAssignedAgentId(input);
             var stageInput = new TaskExecutionInput(
                 JobId: input.JobId,
                 TaskId: $"stage-4-pr-open-{_reviewRound}",
-                AgentId: input.AssignedAgentId,
+                AgentId: stageAssignee,
                 ProjectId: input.ProjectId,
                 WorkspacePath: input.WorkspacePath,
                 TargetBranch: input.TargetBranch,
-                PersonaId: input.AssignedAgentId,
+                PersonaId: stageAssignee,
                 TaskTitle: string.IsNullOrWhiteSpace(_activePrUrl)
                     ? "Stage 4: Open Job Pull Request"
                     : $"Stage 4: Update Job Pull Request (Round {_reviewRound})",
@@ -710,13 +770,14 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             _ => prLabel
         };
 
+        var effectiveAssignee = CurrentAssignedAgentId(input);
         var payloadJson = JsonSerializer.Serialize(new
         {
             prUrl = _activePrUrl,
             prNumber = _activePrNumber,
             headSha = _candidateHeadSha,
-            authorPersonaId = input.AssignedAgentId,
-            senderPersona = input.AssignedAgentId,
+            authorPersonaId = effectiveAssignee,
+            senderPersona = effectiveAssignee,
             targetBranch = input.TargetBranch,
             round = _reviewRound + 1,
             reviewerId,
@@ -792,7 +853,11 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             PendingTasks: nextTasks,
             RemediationContext: remediationContext);
 
-        var nextInput = input with { Continuation = continuation };
+        var nextInput = input with
+        {
+            AssignedAgentId = CurrentAssignedAgentId(input),
+            Continuation = continuation
+        };
         throw Workflow.CreateContinueAsNewException((JobExecutionWorkflow wf) => wf.ExecuteJobAsync(nextInput));
     }
 
@@ -1131,6 +1196,57 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
         return Task.CompletedTask;
     }
 
+    private string CurrentAssignedAgentId(JobExecutionInput input) =>
+        !string.IsNullOrWhiteSpace(_assignedAgentId) ? _assignedAgentId! : input.AssignedAgentId;
+
+    private static async Task TrySignalChildAssigneeAsync(
+        ChildWorkflowHandle<ITaskExecutionWorkflow, TaskExecutionResult> childHandle,
+        JobAssigneeUpdatedSignal signal)
+    {
+        try
+        {
+            await childHandle.SignalAsync(wf => wf.UpdateAssigneeAsync(signal));
+        }
+        catch (Exception)
+        {
+            // Child workflow may have just completed before the parent observed its result;
+            // the parent already updated _assignedAgentId so the next item will use it.
+        }
+    }
+
+    [WorkflowSignal]
+    public async Task UpdateAssigneeAsync(JobAssigneeUpdatedSignal signal)
+    {
+        if (signal is null || string.IsNullOrWhiteSpace(signal.AssignedAgentId))
+        {
+            return;
+        }
+
+        var normalized = signal.AssignedAgentId.Trim().TrimStart('@').ToLowerInvariant();
+        if (normalized.Length == 0)
+        {
+            return;
+        }
+
+        _assignedAgentId = normalized;
+        Workflow.UpsertMemo(MemoUpdate.ValueSet("personaId", normalized));
+
+        var forwarded = new JobAssigneeUpdatedSignal(normalized);
+        if (_activeChildHandle != null)
+        {
+            await TrySignalChildAssigneeAsync(_activeChildHandle, forwarded);
+            _pendingAssigneeUpdate = null;
+        }
+        else if (_activeChildWorkflowId != null)
+        {
+            _pendingAssigneeUpdate = forwarded;
+        }
+        else
+        {
+            _pendingAssigneeUpdate = null;
+        }
+    }
+
     [WorkflowSignal]
     public Task UpdateHeartbeatAsync(string heartbeat)
     {
@@ -1146,5 +1262,6 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
             _currentHeartbeat,
             _reviewRound,
             _activePrUrl,
-            _ignoredSelfReviewCount);
+            _ignoredSelfReviewCount,
+            _assignedAgentId);
 }

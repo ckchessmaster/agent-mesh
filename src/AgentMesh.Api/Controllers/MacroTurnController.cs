@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
 using AgentMesh.Core.Models;
@@ -94,7 +94,10 @@ public class MacroTurnController(
     AgentMeshDbContext db,
     JobTurnDispatcher turns,
     IJobWorkspaceService? workspaces = null,
-    IHubContext<AgentMeshHub>? hubContext = null) : ControllerBase
+    IHubContext<AgentMeshHub>? hubContext = null,
+    // Optional: the two tests that drive this controller assert dispatch behaviour, not notifications.
+    // Program.cs registers it; ApiServiceRegistrationTests pins that.
+    IAttentionNotifier? attention = null) : ControllerBase
 {
     /// <summary>
     /// Dispatches one coding turn, or reports the one already running.
@@ -215,6 +218,12 @@ public class MacroTurnController(
                     lifecycleStatus = ProjectJobsController.DeriveLifecycleStatus(job)
                 }, ct);
             }
+
+            // The heartbeat just became "Executing task: …" or "Exploring codebase…", i.e. an agent
+            // picked the job back up. Whatever the bell was showing for this job is over, and this is
+            // the write site that says so for the dispatch-a-turn path (the chat and card paths have
+            // their own).
+            await attention.RefreshAttentionAsync(job.Id, ct);
         }
 
         var dispatched = await turns.DispatchAsync(new JobTurnRequest(

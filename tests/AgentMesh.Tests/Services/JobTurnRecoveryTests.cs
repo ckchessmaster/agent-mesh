@@ -313,6 +313,22 @@ public class JobTurnRecoveryTests
     }
 
     [Fact]
+    public async Task RecoverAsync_CarriesTheJobsTurnBudget_IntoTheStartedRun()
+    {
+        // The recovery path is how a turn-budget halt actually gets rerun: the operator raises the
+        // budget in Settings, presses Recover, and this is the call that decides what the fresh run
+        // enforces. Dropping the field here would make the Settings control a lie on exactly the
+        // jobs that need it.
+        var job = AddJob();
+        job.TurnBudget = 80;
+        _db.SaveChanges();
+
+        await Create().RecoverAsync(job.Id, new JobRecoveryRequest(), "ckingdon");
+
+        _gateway.Starts.Single().Input.TurnBudget.Should().Be(80);
+    }
+
+    [Fact]
     public async Task RecoverAsync_StartsOnTheIdTemporalAlreadyKnows()
     {
         var job = AddJob();

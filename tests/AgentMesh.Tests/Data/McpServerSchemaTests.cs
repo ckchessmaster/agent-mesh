@@ -204,6 +204,7 @@ public class McpServerSchemaTests
         using var db = TestDbContextFactory.Postgres();
         var migrations = db.GetService<IMigrationsAssembly>().Migrations.Keys.ToList();
         migrations.Should().Contain(MigrationId);
+        migrations.IndexOf(MigrationId).Should().BeLessThan(migrations.Count - 1);
         migrations.Last().Should().Be(TipMigrationId);
 
         db.Database.HasPendingModelChanges().Should().BeFalse(

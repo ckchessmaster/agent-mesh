@@ -82,6 +82,16 @@ public interface IWorkflowSignalRouter
         Task.FromResult(new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow));
 
     /// <summary>
+    /// Updates the assigned persona/agent on the running workflow for this job so subsequent tasks,
+    /// turns, and PR stages run for the new assignee rather than the original one.
+    /// </summary>
+    Task<SignalDelivery> SendAssigneeUpdateAsync(
+        Guid jobId,
+        JobAssigneeUpdatedSignal signal,
+        CancellationToken ct = default) =>
+        Task.FromResult(new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow));
+
+    /// <summary>
     /// Starts a macro task workflow for one checklist task.
     /// </summary>
     /// <remarks>
@@ -550,6 +560,107 @@ public class WorkflowSignalRouter(
 
         return new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow,
             "No running workflow found for this job; checklist saved to database only.");
+    }
+
+    public async Task<SignalDelivery> SendAssigneeUpdateAsync(
+        Guid jobId,
+        JobAssigneeUpdatedSignal signal,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(signal);
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ProbeTimeout);
+
+        var jobWorkflowIds = new[] { $"job-{jobId:D}", $"job-{jobId:N}", $"job-{jobId}" };
+        foreach (var jobWfId in jobWorkflowIds.Distinct())
+        {
+            WorkflowExecutionDescription? jobDesc = null;
+            try
+            {
+                jobDesc = await DescribeAsync(jobWfId, deadline.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow,
+                    "Timed out probing Temporal for a running workflow; assignee saved to database.");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger?.LogDebug("Probe for job workflow {WorkflowId} failed: {Detail}", jobWfId, Describe(ex));
+            }
+
+            if (jobDesc is not null && jobDesc.Status == WorkflowExecutionStatus.Running)
+            {
+                try
+                {
+                    var jobHandle = temporal.GetWorkflowHandle<IJobExecutionWorkflow>(jobWfId);
+                    await jobHandle.SignalAsync(
+                        w => w.UpdateAssigneeAsync(signal),
+                        new WorkflowSignalOptions { Rpc = Rpc(ct) });
+
+                    logger?.LogInformation(
+                        "Signalled job execution workflow {WorkflowId} with updated assignee {AssignedAgentId}",
+                        jobWfId, signal.AssignedAgentId ?? "(null)");
+
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Delivered);
+                }
+                catch (RpcException ex)
+                {
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, Describe(ex));
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+                {
+                    logger?.LogWarning(ex, "Assignee update signal for {WorkflowId} was rejected", jobWfId);
+                    return new SignalDelivery(jobWfId, SignalDeliveryStatus.Rejected, ex.Message);
+                }
+            }
+        }
+
+        var workflowId = WorkflowIdFor(jobId);
+        WorkflowExecutionDescription? description = null;
+        try
+        {
+            description = await DescribeAsync(workflowId, deadline.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return new SignalDelivery(workflowId, SignalDeliveryStatus.NoRunningWorkflow,
+                "Timed out probing Temporal for a running task workflow; assignee saved to database.");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger?.LogDebug("Probe for task workflow {WorkflowId} failed: {Detail}", workflowId, Describe(ex));
+        }
+
+        if (description is null || description.Status != WorkflowExecutionStatus.Running)
+        {
+            return new SignalDelivery($"job-{jobId:D}", SignalDeliveryStatus.NoRunningWorkflow,
+                "No running workflow found for this job; assignee saved to database only.");
+        }
+
+        try
+        {
+            var handle = temporal.GetWorkflowHandle<ITaskExecutionWorkflow>(workflowId);
+            await handle.SignalAsync(
+                w => w.UpdateAssigneeAsync(signal),
+                new WorkflowSignalOptions { Rpc = Rpc(ct) });
+
+            logger?.LogInformation(
+                "Signalled task execution workflow {WorkflowId} with updated assignee {AssignedAgentId}",
+                workflowId, signal.AssignedAgentId ?? "(null)");
+
+            return new SignalDelivery(workflowId, SignalDeliveryStatus.Delivered);
+        }
+        catch (RpcException ex)
+        {
+            return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, Describe(ex));
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        {
+            logger?.LogWarning(ex, "Assignee update signal for {WorkflowId} was rejected", workflowId);
+            return new SignalDelivery(workflowId, SignalDeliveryStatus.Rejected, ex.Message);
+        }
     }
 
     public async Task<WorkflowStartResult> StartTaskWorkflowAsync(

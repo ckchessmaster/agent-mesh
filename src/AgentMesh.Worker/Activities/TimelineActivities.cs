@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using AgentMesh.Core.Activities;
 using AgentMesh.Core.Enums;
@@ -26,6 +27,54 @@ public class TimelineActivities(
         PropertyNameCaseInsensitive = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
+
+    /// <summary>
+    /// Whether an escalation card is addressed to the human operator (as opposed to another
+    /// persona). The payload's <c>targetPersona</c> written by <c>post_job_message</c> decides;
+    /// cards predating that field are matched on the "Escalation from @x to @operator" title,
+    /// which is the fallback <see cref="TimelineCardType.Escalation3R"/> rendering itself uses.
+    /// </summary>
+    private static bool EscalationTargetsOperator(JobTimelineCard card)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(card.StructuredPayloadJson))
+            {
+                using var doc = JsonDocument.Parse(card.StructuredPayloadJson);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                    doc.RootElement.TryGetProperty("targetPersona", out var target) &&
+                    target.ValueKind == JsonValueKind.String)
+                {
+                    return string.Equals(target.GetString(), "operator", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+        }
+        catch
+        {
+            // An unreadable payload is no reason to guess wrong; fall through to the title.
+        }
+
+        return (card.Title ?? string.Empty).Contains("to @operator", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Adds a <c>resolutionNote</c> to a card payload, preserving everything already recorded, so
+    /// a card closed by the platform says why on the card itself.
+    /// </summary>
+    private static string WithResolutionNote(string payloadJson, string note)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(payloadJson)) return payloadJson;
+            if (JsonNode.Parse(payloadJson) is not JsonObject obj) return payloadJson;
+            obj["resolutionNote"] = note;
+            return obj.ToJsonString(JsonOptions);
+        }
+        catch
+        {
+            return payloadJson;
+        }
+    }
 
     private async Task<ProjectJob?> TryLoadJobAsync(string jobId, CancellationToken ct = default)
     {
@@ -842,6 +891,31 @@ public class TimelineActivities(
 
         dbContext.JobTimelineCards.Add(card);
 
+        // One ask per decision: a plan hand-off posted with requires_reply during the discovery
+        // turn (older prompts told drivers to do exactly that; bee job 67fc1b8a, 2026-11-20 left
+        // the operator an "Escalation from @bee" NEEDS YOU card and a Pending Approval gate for
+        // the same four tasks) must not sit open beside this gate. Two PendingInput cards means
+        // the operator answers whichever they notice first and the job carries a wait nobody will
+        // ever reply to - the same supersession rule the workflow applies to stale gate cards
+        // inside RunDecompositionAndPlanApprovalAsync. Persona-addressed consultations are left
+        // alone; no human is blocked on them.
+        var supersededEscalations = new List<JobTimelineCard>();
+        var openEscalations = await dbContext.JobTimelineCards
+            .Where(c => c.JobId == input.JobId
+                        && c.CardType == TimelineCardType.Escalation3R
+                        && c.Status == TimelineCardStatus.PendingInput
+                        && c.Id != card.Id)
+            .ToListAsync(ct);
+        foreach (var escalation in openEscalations.Where(EscalationTargetsOperator))
+        {
+            escalation.Status = TimelineCardStatus.Resolved;
+            escalation.UpdatedAt = DateTimeOffset.UtcNow;
+            escalation.StructuredPayloadJson = WithResolutionNote(
+                escalation.StructuredPayloadJson,
+                "Superseded by the Plan Approval gate: the plan is approved or rejected on that card.");
+            supersededEscalations.Add(escalation);
+        }
+
         if (job != null)
         {
             SyncJobTasksJson(job, tasks);
@@ -853,6 +927,14 @@ public class TimelineActivities(
 
         await dbContext.SaveChangesAsync(ct);
         await NotifyCardUpdatedAsync(card);
+        foreach (var stale in supersededEscalations)
+        {
+            await NotifyCardUpdatedAsync(stale);
+            logger.LogInformation(
+                "PlanApproval gate {GateCardId} superseded open operator escalation {EscalationCardId} " +
+                "on job {JobId}; the gate is the one approval surface",
+                card.Id, stale.Id, input.JobId);
+        }
 
         logger.LogInformation("Created PlanApproval card {CardId} for job {JobId}", card.Id, input.JobId);
         if (noChecklist)
@@ -911,6 +993,37 @@ public class TimelineActivities(
             card.Id, input.JobId, input.TaskId);
 
         return card.Id;
+    }
+
+    [Activity]
+    public async Task PersistJobHaltAsync(PersistJobHaltInput input)
+    {
+        var job = await TryLoadJobAsync(input.JobId);
+        if (job is null)
+        {
+            logger.LogWarning("PersistJobHalt: job {JobId} not found; halt '{Reason}' not written.",
+                input.JobId, input.Reason);
+            return;
+        }
+
+        // A job the operator already finished or archived is not "halted" — writing over its terminal
+        // state would turn a deliberate close into a red Blocked badge, which is a worse lie than the
+        // race it guards against (the complete/archive path stamps its own truth on the row).
+        if (job.Status is ProjectJobStatus.Completed or ProjectJobStatus.Archived)
+        {
+            logger.LogInformation(
+                "PersistJobHalt: job {JobId} is already {Status}; not overwriting with halt '{Reason}'.",
+                job.Id, job.Status, input.Reason);
+            return;
+        }
+
+        job.ProgressHeartbeat = input.Reason.StartsWith("Halted", StringComparison.OrdinalIgnoreCase)
+            ? input.Reason
+            : $"Halted: {input.Reason}";
+        job.UpdatedAt = DateTimeOffset.UtcNow;
+        await dbContext.SaveChangesAsync();
+
+        logger.LogInformation("Persisted halt for job {JobId}: {Heartbeat}", job.Id, job.ProgressHeartbeat);
     }
 
     [Activity]

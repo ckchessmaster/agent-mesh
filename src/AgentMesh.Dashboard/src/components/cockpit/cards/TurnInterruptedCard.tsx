@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import type { JobTimelineCard, TurnInterruptedPayload } from '../../../types/timeline';
 import { CardComments } from './CardComments';
-import { AlertOctagon, Play, RotateCcw, Compass, CheckCircle2, Terminal } from 'lucide-react';
+import { AlertOctagon, Play, RotateCcw, Compass, CheckCircle2, Terminal, ShieldAlert } from 'lucide-react';
 
 export interface TurnInterruptedCardProps {
   card: JobTimelineCard;
@@ -9,12 +9,19 @@ export interface TurnInterruptedCardProps {
     action: 'resume' | 'retry_step' | 'realign',
     additionalContext?: string
   ) => Promise<void> | void;
+  /**
+   * Retires the card without signalling a workflow. The interventions below are live-run controls:
+   * once the workflow has halted or completed there is nothing to resume, and an operator who only
+   * sees those three buttons has no honest way to acknowledge what they already know.
+   */
+  onResolve?: (cardId: string, note?: string) => Promise<void> | void;
   onAddComment?: (cardId: string, content: string) => Promise<void> | void;
 }
 
 export const TurnInterruptedCard: React.FC<TurnInterruptedCardProps> = ({
   card,
   onSubmitIntervention,
+  onResolve,
   onAddComment
 }) => {
   let payload: TurnInterruptedPayload = {
@@ -30,9 +37,29 @@ export const TurnInterruptedCard: React.FC<TurnInterruptedCardProps> = ({
 
   const [guidance, setGuidance] = useState('');
   const [submittingAction, setSubmittingAction] = useState<string | null>(null);
+  const [isResolving, setIsResolving] = useState(false);
+  const [resolveError, setResolveError] = useState<string | null>(null);
   const [resolvedAction, setResolvedAction] = useState<string | null>(
     card.status === 'Resolved' || card.status === 'Closed' ? 'resolved' : null
   );
+
+  const handleResolve = async () => {
+    if (!onResolve || isResolving) return;
+    setIsResolving(true);
+    setResolveError(null);
+    try {
+      await onResolve(
+        card.id,
+        guidance.trim() ? `Operator guidance recorded at resolve: ${guidance.trim()}` : undefined
+      );
+      setResolvedAction('resolved');
+    } catch (err) {
+      // The row stays open on failure — closing it would look like a resolve that worked.
+      setResolveError(err instanceof Error ? err.message : 'Failed to resolve interrupted turn.');
+    } finally {
+      setIsResolving(false);
+    }
+  };
 
   const handleAction = async (action: 'resume' | 'retry_step' | 'realign') => {
     if (submittingAction || resolvedAction || !onSubmitIntervention) return;
@@ -107,51 +134,77 @@ export const TurnInterruptedCard: React.FC<TurnInterruptedCardProps> = ({
 
       {/* Recovery Triggers */}
       {isPending ? (
-        <div className="mt-4 pt-3 border-t border-rose-900/60 flex flex-wrap items-center justify-end gap-2">
-          <button
-            type="button"
-            data-testid="realign-turn-btn"
-            disabled={submittingAction !== null}
-            onClick={() => handleAction('realign')}
-            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition disabled:opacity-50"
-          >
-            <Compass className="w-3.5 h-3.5 text-indigo-400" />
-            <span>
-              {submittingAction === 'realign' ? 'Realigning...' : 'Send Back to Alignment'}
-            </span>
-          </button>
+        <>
+          <div className="mt-4 pt-3 border-t border-rose-900/60 flex flex-wrap items-center justify-end gap-2">
+            {onResolve && (
+              <button
+                type="button"
+                data-testid="resolve-turn-card-btn"
+                disabled={isResolving || submittingAction !== null}
+                onClick={handleResolve}
+                title="Acknowledge this interruption and retire the card without signalling the workflow — for when the run has already halted or completed and there is no turn left to intervene on."
+                className="mr-auto px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition disabled:opacity-50"
+              >
+                <ShieldAlert className="w-3.5 h-3.5" />
+                <span>{isResolving ? 'Resolving...' : 'No run to resume — Mark Resolved'}</span>
+              </button>
+            )}
 
-          <button
-            type="button"
-            data-testid="retry-step-btn"
-            disabled={submittingAction !== null}
-            onClick={() => handleAction('retry_step')}
-            className="px-3.5 py-1.5 bg-amber-600/80 hover:bg-amber-600 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow transition disabled:opacity-50"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span>
-              {submittingAction === 'retry_step' ? 'Retrying Step...' : 'Retry Last Step'}
-            </span>
-          </button>
+            <button
+              type="button"
+              data-testid="realign-turn-btn"
+              disabled={submittingAction !== null || isResolving}
+              onClick={() => handleAction('realign')}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs font-semibold flex items-center space-x-1.5 transition disabled:opacity-50"
+            >
+              <Compass className="w-3.5 h-3.5 text-indigo-400" />
+              <span>
+                {submittingAction === 'realign' ? 'Realigning...' : 'Send Back to Alignment'}
+              </span>
+            </button>
 
-          <button
-            type="button"
-            data-testid="resume-turn-btn"
-            disabled={submittingAction !== null}
-            onClick={() => handleAction('resume')}
-            className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow transition disabled:opacity-50"
-          >
-            <Play className="w-3.5 h-3.5" />
-            <span>
-              {submittingAction === 'resume' ? 'Resuming...' : 'Resume Turn'}
-            </span>
-          </button>
-        </div>
+            <button
+              type="button"
+              data-testid="retry-step-btn"
+              disabled={submittingAction !== null || isResolving}
+              onClick={() => handleAction('retry_step')}
+              className="px-3.5 py-1.5 bg-amber-600/80 hover:bg-amber-600 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow transition disabled:opacity-50"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>
+                {submittingAction === 'retry_step' ? 'Retrying Step...' : 'Retry Last Step'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="resume-turn-btn"
+              disabled={submittingAction !== null || isResolving}
+              onClick={() => handleAction('resume')}
+              className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold flex items-center space-x-1.5 shadow transition disabled:opacity-50"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>
+                {submittingAction === 'resume' ? 'Resuming...' : 'Resume Turn'}
+              </span>
+            </button>
+          </div>
+          {resolveError && (
+            <div
+              data-testid="resolve-turn-card-error"
+              className="mt-2 text-xs text-rose-300 bg-rose-950/60 border border-rose-500/40 rounded px-2 py-1"
+            >
+              {resolveError}
+            </div>
+          )}
+        </>
       ) : (
         <div className="mt-3 p-2.5 rounded bg-emerald-950/20 border border-emerald-500/30 flex items-center space-x-2 text-xs text-emerald-400">
           <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
           <span>
-            Intervention action dispatched ({resolvedAction}). Turn unblocked in Temporal coordinator.
+            {resolvedAction === 'resolved'
+              ? 'Escalation retired — off the attention queue. Resume the job itself with Recover Job.'
+              : `Intervention action dispatched (${resolvedAction}). Turn unblocked in Temporal coordinator.`}
           </span>
         </div>
       )}

@@ -55,6 +55,12 @@ public class AgentsController(
 
         var rawToken = apiKeyService.GenerateToken();
         var hashedToken = apiKeyService.HashToken(rawToken);
+        var effectiveRuntimeType = req.RuntimeType;
+        if (effectiveRuntimeType == RuntimeType.CliAgy &&
+            DriverAdapters.Canonicalize(DriverCapabilities.Parse(req.CapabilitiesJson).Adapter) == DriverAdapters.OpenRouter)
+        {
+            effectiveRuntimeType = RuntimeType.OpenRouter;
+        }
 
         var agent = new Agent
         {
@@ -62,7 +68,7 @@ public class AgentsController(
             Name = req.Name.Trim(),
             Role = string.IsNullOrWhiteSpace(req.Role) ? AgentKind.DriverRole : req.Role.Trim(),
             Status = req.Status ?? (AgentMeshHub.IsAgentConnected(normalizedId) ? "online" : "offline"),
-            RuntimeType = req.RuntimeType,
+            RuntimeType = effectiveRuntimeType,
             TrustTier = req.TrustTier,
             PersonaPrompt = req.PersonaPrompt ?? $"Autonomous AI Agent ({normalizedId})",
             MemorySummary = req.MemorySummary ?? string.Empty,
@@ -114,6 +120,12 @@ public class AgentsController(
             {
                 existing.CapabilitiesJson = DriverCapabilities.Merge(existing.CapabilitiesJson, req.CapabilitiesJson)
                     ?? existing.CapabilitiesJson;
+            }
+            if (req.RuntimeType == RuntimeType.OpenRouter ||
+                (existing.RuntimeType == RuntimeType.CliAgy &&
+                 DriverAdapters.Canonicalize(DriverCapabilities.Parse(req.CapabilitiesJson).Adapter) == DriverAdapters.OpenRouter))
+            {
+                existing.RuntimeType = RuntimeType.OpenRouter;
             }
             existing.LastHeartbeatAt = DateTimeOffset.UtcNow;
             existing.UpdatedAt = DateTimeOffset.UtcNow;
@@ -319,6 +331,14 @@ public class AgentsController(
             };
             patch["sidecar"] = JsonSerializer.SerializeToNode(req.Sidecar, sidecarOptions);
         }
+        if (req.OpenRouter is not null)
+        {
+            var openRouterOptions = new JsonSerializerOptions
+            {
+                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            };
+            patch["openRouter"] = JsonSerializer.SerializeToNode(req.OpenRouter, openRouterOptions);
+        }
 
         if (patch.Count == 0)
         {
@@ -331,7 +351,7 @@ public class AgentsController(
         await db.SaveChangesAsync();
 
         CapabilityProbe.InvalidateCache();
-        if (req.Endpoint is not null || !string.IsNullOrWhiteSpace(req.ApiKey) || req.Adapter is not null)
+        if (req.Endpoint is not null || !string.IsNullOrWhiteSpace(req.ApiKey) || req.Adapter is not null || req.OpenRouter is not null)
         {
             await SyncDriverCapabilitiesFromProbeAsync(agent, HttpContext?.RequestAborted ?? CancellationToken.None);
         }
@@ -535,6 +555,102 @@ public class AgentsController(
             var oaStatus = steps.Any(s => s.Status == "failed") ? "failed" :
                            steps.Any(s => s.Status == "warning") ? "warning" : "passed";
             return Ok(new PersonaDriverVerificationResult(normalizedId, normalizedId, oaStatus, steps));
+        }
+
+        if (adapter == DriverAdapters.OpenRouter)
+        {
+            var effectiveEndpoint = string.IsNullOrWhiteSpace(view.Endpoint)
+                ? OpenRouterConfig.DefaultEndpoint
+                : view.Endpoint.Trim();
+
+            steps.Add(new PersonaDriverVerificationStep(
+                "Driver Adapter Check",
+                "success",
+                $"OpenRouter adapter configured ({effectiveEndpoint})"));
+
+            var effectiveKey = DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, view.Sidecar).ApiKey
+                               ?? Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")?.Trim();
+
+            if (string.IsNullOrWhiteSpace(effectiveKey))
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Authentication Check",
+                    "failed",
+                    "No OpenRouter API key configured on this driver or host environment (OPENROUTER_API_KEY)."));
+            }
+            else
+            {
+                try
+                {
+                    using var keyClient = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+                    var baseUrl = OpenRouterDriverQuotaProbe.NormalizeBaseUrl(effectiveEndpoint);
+                    using var keyReq = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/key");
+                    keyReq.Headers.Authorization =
+                        new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", effectiveKey);
+                    keyReq.Headers.TryAddWithoutValidation("X-Title", OpenRouterConfig.DefaultAppTitle);
+
+                    using var keyRes = await keyClient.SendAsync(keyReq, ct);
+                    if (keyRes.IsSuccessStatusCode)
+                    {
+                        var keyBody = await keyRes.Content.ReadAsStringAsync(ct);
+                        var detail = "OpenRouter API key verified";
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(keyBody);
+                            var payload = doc.RootElement.TryGetProperty("data", out var d) && d.ValueKind == JsonValueKind.Object
+                                ? d
+                                : doc.RootElement;
+                            var parts = new List<string>();
+                            if (payload.TryGetProperty("is_free_tier", out var free) && free.ValueKind == JsonValueKind.True)
+                                parts.Add("free tier");
+                            if (payload.TryGetProperty("limit_remaining", out var rem) && rem.ValueKind == JsonValueKind.Number && rem.TryGetDouble(out var remVal))
+                                parts.Add($"${remVal:0.00} remaining");
+                            if (parts.Count > 0) detail += $" ({string.Join(", ", parts)})";
+                        }
+                        catch { }
+
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Authentication Check",
+                            "success",
+                            detail));
+                    }
+                    else
+                    {
+                        steps.Add(new PersonaDriverVerificationStep(
+                            "Authentication Check",
+                            "failed",
+                            $"OpenRouter /key validation returned HTTP {(int)keyRes.StatusCode} ({keyRes.ReasonPhrase})."));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    steps.Add(new PersonaDriverVerificationStep(
+                        "Authentication Check",
+                        "failed",
+                        $"OpenRouter /key validation failed: {ex.Message}"));
+                }
+            }
+
+            var probeReading = await SyncDriverCapabilitiesFromProbeAsync(agent, ct);
+            if (probeReading != null && probeReading.Models.Count > 0)
+            {
+                var sample = string.Join(", ", probeReading.Models.Take(5).Select(m => m.Id));
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Endpoint & Model Discovery",
+                    "success",
+                    $"Discovered {probeReading.Models.Count} model(s): {sample}"));
+            }
+            else
+            {
+                steps.Add(new PersonaDriverVerificationStep(
+                    "Endpoint & Model Discovery",
+                    "failed",
+                    probeReading?.UnavailableReason ?? "Failed to discover models from OpenRouter."));
+            }
+
+            var orStatus = steps.Any(s => s.Status == "failed") ? "failed" :
+                           steps.Any(s => s.Status == "warning") ? "warning" : "passed";
+            return Ok(new PersonaDriverVerificationResult(normalizedId, normalizedId, orStatus, steps));
         }
 
         var cliBin = adapter switch
@@ -840,6 +956,15 @@ public class AgentsController(
                 return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "already_authenticated", Instructions: "OpenAI API key is already configured on this driver."));
             }
             return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "apikey_required", Instructions: "OpenAI-compatible drivers authenticate via API key. Enter your API key below."));
+        }
+
+        if (adapter == DriverAdapters.OpenRouter && string.IsNullOrWhiteSpace(loginCmd))
+        {
+            if (view.HasApiKey || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")))
+            {
+                return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "already_authenticated", Instructions: "OpenRouter API key is already configured on this driver."));
+            }
+            return Ok(new PersonaAuthStartResult(normalizedId, normalizedId, "apikey_required", Instructions: "OpenRouter authenticates via API key (sk-or-v1-...). Enter your OpenRouter API key below."));
         }
 
         var cliBin = adapter switch
@@ -1444,7 +1569,7 @@ public class AgentsController(
                     var st = await containerManager.GetStatusAsync(pId, ct);
                     if (st.Status == "running")
                     {
-                        await containerManager.ConfigureApiKeyAsync(pId, cleanKey, req.Provider ?? normalizedId, ct);
+                        await containerManager.ConfigureApiKeyAsync(pId, cleanKey, req.Provider ?? adapter, ct);
                     }
                 }
                 catch { }
@@ -1466,16 +1591,27 @@ public class AgentsController(
             var reading = await CapabilityProbe.ProbeAsync(probeReq, ct);
             if (reading != null && reading.Models.Count > 0)
             {
+                var declarationEndpoint = view.Endpoint;
+                if (string.IsNullOrWhiteSpace(declarationEndpoint) && reading.Adapter == DriverAdapters.OpenRouter)
+                {
+                    declarationEndpoint = OpenRouterConfig.DefaultEndpoint;
+                }
+
                 var declaration = new DriverCapabilityDeclaration
                 {
                     Adapter = reading.Adapter,
-                    Endpoint = DriverModelDiscovery.NormalizeEndpoint(view.Endpoint),
+                    Endpoint = DriverModelDiscovery.NormalizeEndpoint(declarationEndpoint),
                     ObservedAt = DateTimeOffset.UtcNow,
+                    SupportsContextSelection = reading.SupportsContextSelection,
+                    Source = reading.Adapter == DriverAdapters.OpenRouter ? "openrouter-models-api" : null,
                     Models = reading.Models.Select(m => new DriverCapabilityDeclaration.DeclaredModel
                     {
                         Id = m.Id,
                         Name = m.Name,
-                        Efforts = m.Efforts.ToList()
+                        Efforts = m.Efforts.ToList(),
+                        MaxContextTokens = m.MaxContextTokens,
+                        PromptPricePerMillion = m.PromptPricePerMillion,
+                        CompletionPricePerMillion = m.CompletionPricePerMillion
                     }).ToList()
                 };
 
@@ -2395,8 +2531,10 @@ public class AgentsController(
         long totalInputTokens = 0;
         long totalOutputTokens = 0;
         long totalThinkingTokens = 0;
+        long totalCachedTokens = 0;
         long totalTokens = 0;
         double totalDurationSeconds = 0;
+        double totalCostUsd = 0;
 
         foreach (var sess in sessions)
         {
@@ -2406,11 +2544,13 @@ public class AgentsController(
                 using var doc = JsonDocument.Parse(sess.MetadataJson);
                 if (doc.RootElement.TryGetProperty("cumulativeUsage", out var usage))
                 {
-                    if (usage.TryGetProperty("inputTokens", out var ip)) totalInputTokens += ip.GetInt64();
-                    if (usage.TryGetProperty("outputTokens", out var op)) totalOutputTokens += op.GetInt64();
-                    if (usage.TryGetProperty("thinkingTokens", out var tp)) totalThinkingTokens += tp.GetInt64();
-                    if (usage.TryGetProperty("totalTokens", out var totp)) totalTokens += totp.GetInt64();
-                    if (usage.TryGetProperty("totalDurationSeconds", out var dp)) totalDurationSeconds += dp.GetDouble();
+                    if (usage.TryGetProperty("inputTokens", out var ip) && ip.TryGetInt64(out var iv)) totalInputTokens += iv;
+                    if (usage.TryGetProperty("outputTokens", out var op) && op.TryGetInt64(out var ov)) totalOutputTokens += ov;
+                    if (usage.TryGetProperty("thinkingTokens", out var tp) && tp.TryGetInt64(out var tv)) totalThinkingTokens += tv;
+                    if (usage.TryGetProperty("cachedTokens", out var cp) && cp.TryGetInt64(out var cv)) totalCachedTokens += cv;
+                    if (usage.TryGetProperty("totalTokens", out var totp) && totp.TryGetInt64(out var totv)) totalTokens += totv;
+                    if (usage.TryGetProperty("totalDurationSeconds", out var dp) && dp.TryGetDouble(out var dv)) totalDurationSeconds += dv;
+                    if (usage.TryGetProperty("costUsd", out var costp) && costp.TryGetDouble(out var costv)) totalCostUsd += costv;
                 }
             }
             catch { }
@@ -2432,7 +2572,9 @@ public class AgentsController(
                 OutputTokens: totalOutputTokens,
                 ThinkingTokens: totalThinkingTokens,
                 TotalTokens: totalTokens,
-                TotalDurationSeconds: totalDurationSeconds
+                TotalDurationSeconds: totalDurationSeconds,
+                CachedTokens: totalCachedTokens,
+                CostUsd: Math.Round(totalCostUsd, 8)
             ),
             ProviderQuota: providerQuota
         ));
@@ -2441,13 +2583,15 @@ public class AgentsController(
     private async Task<ProviderQuotaDto?> GetAgentProviderQuotaAsync(Agent agent, bool refresh)
     {
         var caps = DriverCapabilities.Parse(agent.CapabilitiesJson);
+        var (apiKey, _, _) = DriverCapabilities.ExtractProbeSecrets(agent.CapabilitiesJson, caps.Sidecar);
         var request = new DriverQuotaProbeRequest(
             DriverId: agent.Id,
             RuntimeType: agent.RuntimeType,
             Adapter: caps?.Adapter,
             Endpoint: caps?.Endpoint,
             // `refresh=true` is an explicit user action, so it bypasses the probe's TTL cache.
-            ForceRefresh: refresh);
+            ForceRefresh: refresh,
+            ApiKey: apiKey);
 
         var reading = await QuotaProbe.ProbeAsync(request, HttpContext?.RequestAborted ?? CancellationToken.None);
         return reading == null ? null : ToDto(reading);
@@ -2544,7 +2688,8 @@ public record UpdateDriverConfigRequest(
     List<string>? Capabilities = null,
     DriverSidecarConfig? Sidecar = null,
     string? LoginCommand = null,
-    string? AuthCheckCommand = null
+    string? AuthCheckCommand = null,
+    OpenRouterConfig? OpenRouter = null
 );
 
 public record CreateAgentSessionRequest(
@@ -2609,7 +2754,9 @@ public record LifetimeTokensDto(
     long OutputTokens,
     long ThinkingTokens,
     long TotalTokens,
-    double TotalDurationSeconds
+    double TotalDurationSeconds,
+    long CachedTokens = 0,
+    double CostUsd = 0
 );
 
 public record AgentUsageResponse(

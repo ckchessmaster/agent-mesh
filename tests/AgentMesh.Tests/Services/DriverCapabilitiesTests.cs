@@ -506,4 +506,55 @@ public class DriverCapabilitiesTests
         doc.RootElement.TryGetProperty("authCheckCommand", out _).Should().BeFalse();
         doc.RootElement.GetProperty("apiKey").GetString().Should().Be("stored-secret-key");
     }
+
+    [Fact]
+    public void ParseAndMerge_OpenRouterConfig_PreservesNestedProviderAndClearsEmptyStrings()
+    {
+        var existing = """
+        {
+          "adapter": "openrouter",
+          "apiKey": "sk-or-secret",
+          "openRouter": {
+            "httpReferer": "https://old.example",
+            "appTitle": "OldTitle",
+            "fallbackModels": ["openai/gpt-4o"],
+            "provider": {
+              "sort": "price",
+              "order": ["anthropic", "bedrock"],
+              "zdr": true
+            }
+          }
+        }
+        """;
+
+        var patch = """
+        {
+          "openRouter": {
+            "httpReferer": "",
+            "appTitle": "AgentMesh",
+            "fallbackModels": ["anthropic/claude-sonnet-4", "openai/gpt-4.1"],
+            "provider": {
+              "sort": "throughput",
+              "dataCollection": "deny"
+            }
+          }
+        }
+        """;
+
+        var merged = DriverCapabilities.Merge(existing, patch);
+        var parsed = DriverCapabilities.Parse(merged);
+
+        parsed.OpenRouter.Should().NotBeNull();
+        parsed.OpenRouter!.HttpReferer.Should().BeNull("empty string should clear the override");
+        parsed.OpenRouter.AppTitle.Should().Be("AgentMesh");
+        parsed.OpenRouter.FallbackModels.Should().Equal("anthropic/claude-sonnet-4", "openai/gpt-4.1");
+        parsed.OpenRouter.Provider.Should().NotBeNull();
+        parsed.OpenRouter.Provider!.Sort.Should().Be("throughput");
+        parsed.OpenRouter.Provider.DataCollection.Should().Be("deny");
+        parsed.OpenRouter.Provider.Order.Should().Equal(
+            new[] { "anthropic", "bedrock" },
+            "existing nested provider fields survive partial update");
+        parsed.OpenRouter.Provider.Zdr.Should().BeTrue();
+        parsed.HasApiKey.Should().BeTrue();
+    }
 }

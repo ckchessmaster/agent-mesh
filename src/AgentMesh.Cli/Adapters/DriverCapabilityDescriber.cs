@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
 using AgentMesh.Cli.Models;
+using AgentMesh.Core.Models;
 using AgentMesh.Core.Services;
 
 namespace AgentMesh.Cli.Adapters;
@@ -235,6 +236,83 @@ internal static class DriverCapabilityDescriber
     }
 
     /// <summary>
+    /// Declares the tool-capable text models, context sizes, pricing, and reasoning support served
+    /// by OpenRouter (<c>GET /api/v1/models</c>).
+    /// </summary>
+    internal static async Task<DriverCapabilityDeclaration> DescribeOpenRouterAsync(
+        AgentPresetConfig preset,
+        string? apiKey,
+        CancellationToken ct = default)
+    {
+        var endpoint = OpenRouterAdapter.ResolveEndpoint(preset);
+        var url = DriverModelDiscovery.ToModelsUrl(endpoint);
+
+        try
+        {
+            var (statusCode, body, error) = await ModelsEndpointReader(url, apiKey, ct);
+
+            if (statusCode == 0)
+            {
+                return Unavailable(
+                    DriverAdapters.OpenRouter,
+                    error ?? $"Could not reach {endpoint}.",
+                    endpoint);
+            }
+
+            if (statusCode == (int)HttpStatusCode.Unauthorized || statusCode == (int)HttpStatusCode.Forbidden)
+            {
+                return Unavailable(
+                    DriverAdapters.OpenRouter,
+                    $"{endpoint} rejected the configured API key (HTTP {statusCode}).",
+                    endpoint);
+            }
+
+            if (statusCode < 200 || statusCode >= 300)
+            {
+                return Unavailable(
+                    DriverAdapters.OpenRouter,
+                    $"{endpoint} returned HTTP {statusCode} for /models.",
+                    endpoint);
+            }
+
+            var discovered = DriverModelDiscovery.ParseOpenRouterModels(body);
+            if (discovered.Count == 0)
+            {
+                return Unavailable(
+                    DriverAdapters.OpenRouter,
+                    error ?? $"{endpoint} returned no tool-capable models.",
+                    endpoint);
+            }
+
+            return new DriverCapabilityDeclaration
+            {
+                Adapter = DriverAdapters.OpenRouter,
+                Endpoint = endpoint,
+                Models = discovered.Select(m => new DriverCapabilityDeclaration.DeclaredModel
+                {
+                    Id = m.Id,
+                    Name = m.Name,
+                    Efforts = m.Efforts,
+                    MaxContextTokens = m.MaxContextTokens,
+                    PromptPricePerMillion = m.PromptPricePerMillion,
+                    CompletionPricePerMillion = m.CompletionPricePerMillion
+                }).ToList(),
+                SupportsContextSelection = ModelContextLimits.SupportsContextSelection(DriverAdapters.OpenRouter),
+                Source = "openrouter-models-endpoint",
+                ObservedAt = DateTimeOffset.UtcNow
+            };
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return Unavailable(DriverAdapters.OpenRouter, $"Could not reach {endpoint}: {ex.Message}", endpoint);
+        }
+    }
+
+    /// <summary>
     /// Declares what GitHub Copilot can run on this runner.
     /// </summary>
     internal static async Task<DriverCapabilityDeclaration> DescribeCopilotAsync(
@@ -414,7 +492,10 @@ internal static class DriverCapabilityDescriber
     {
         Id = model.Id,
         Name = model.Name,
-        Efforts = model.Efforts
+        Efforts = model.Efforts,
+        MaxContextTokens = model.MaxContextTokens,
+        PromptPricePerMillion = model.PromptPricePerMillion,
+        CompletionPricePerMillion = model.CompletionPricePerMillion
         // No ContextSizes: see the note on DeclaredModel. The runner reports what exists, the API
         // decides what is selectable.
     };
@@ -584,9 +665,17 @@ internal static class DriverCapabilityDescriber
             {
                 request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             }
-            request.Headers.TryAddWithoutValidation("Editor-Version", "vscode/1.95.0");
-            request.Headers.TryAddWithoutValidation("User-Agent", "GitHubCopilotChat/0.22.0");
-            request.Headers.TryAddWithoutValidation("Copilot-Integration-Id", "vscode-chat");
+
+            if (url.Contains("githubcopilot.com", StringComparison.OrdinalIgnoreCase))
+            {
+                request.Headers.TryAddWithoutValidation("Editor-Version", "vscode/1.95.0");
+                request.Headers.TryAddWithoutValidation("User-Agent", "GitHubCopilotChat/0.22.0");
+                request.Headers.TryAddWithoutValidation("Copilot-Integration-Id", "vscode-chat");
+            }
+            else if (url.Contains("openrouter.ai", StringComparison.OrdinalIgnoreCase))
+            {
+                request.Headers.TryAddWithoutValidation("X-Title", OpenRouterConfig.DefaultAppTitle);
+            }
 
             // No proxy: a model listing is a request to a server the operator named explicitly,
             // and routing it through a corporate proxy is how it comes back as an HTML login page.

@@ -16,12 +16,14 @@ import {
   RefreshCw,
   RotateCw,
   Copy,
-  Check
+  Check,
+  SlidersHorizontal
 } from 'lucide-react';
 import type {
   Agent,
   DriverConfig,
   DriverSidecarConfig,
+  OpenRouterConfig,
   PersonaDriverVerificationResult,
   PersonaAuthStartResult
 } from '../types';
@@ -44,6 +46,7 @@ interface DriverConfigModalProps {
     sidecar?: DriverSidecarConfig;
     loginCommand?: string;
     authCheckCommand?: string;
+    openRouter?: OpenRouterConfig;
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
   onAuthSuccess?: () => void | Promise<void>;
@@ -86,22 +89,32 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [isDeleting, setIsDeleting] = useState(false);
 
   const driverAdapter = useMemo(() => {
-    if (config.adapter) return config.adapter.toLowerCase();
+    const normalize = (raw: string) => {
+      const lower = raw.trim().toLowerCase();
+      return lower === 'open-router' ? 'openrouter' : lower;
+    };
+    if (config.adapter) return normalize(config.adapter);
     try {
       const parsed = agent.capabilitiesJson ? JSON.parse(agent.capabilitiesJson) : null;
-      if (parsed?.adapter) return String(parsed.adapter).toLowerCase();
-      if (parsed?.endpoint) return 'openai';
+      if (parsed?.adapter) return normalize(String(parsed.adapter));
+      if (parsed?.endpoint) {
+        return String(parsed.endpoint).toLowerCase().includes('openrouter.ai') ? 'openrouter' : 'openai';
+      }
     } catch {
       // ignore
     }
+    if (String(agent.runtimeType ?? '').trim().toLowerCase() === 'openrouter') return 'openrouter';
     const idLower = (agent.id || '').toLowerCase();
+    if (idLower.includes('openrouter')) return 'openrouter';
     if (idLower.includes('claude')) return 'claude';
     if (idLower.includes('copilot')) return 'copilot';
     if (idLower.includes('openai') || idLower.includes('ollama') || idLower.includes('vllm')) return 'openai';
     return 'agy';
-  }, [config.adapter, agent.capabilitiesJson, agent.id]);
+  }, [config.adapter, agent.capabilitiesJson, agent.id, agent.runtimeType]);
 
   const isOpenAiDriver = driverAdapter === 'openai';
+  const isOpenRouterDriver = driverAdapter === 'openrouter';
+  const isHttpDriver = isOpenAiDriver || isOpenRouterDriver;
   const initialLoginCmd = config.loginCommand ?? config.sidecar?.loginCommand ?? '';
 
   // Driver Verification & Authentication state
@@ -109,7 +122,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [verifyResult, setVerifyResult] = useState<PersonaDriverVerificationResult | null>(null);
   const [showAuthWizard, setShowAuthWizard] = useState(false);
   const [authMode, setAuthMode] = useState<'oauth' | 'apikey'>(
-    !isOpenAiDriver || Boolean(initialLoginCmd.trim()) ? 'oauth' : 'apikey'
+    !isHttpDriver || Boolean(initialLoginCmd.trim()) ? 'oauth' : 'apikey'
   );
   const [authStarting, setAuthStarting] = useState(false);
   const [authSubmitting, setAuthSubmitting] = useState(false);
@@ -297,7 +310,43 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [companionPort, setCompanionPort] = useState(config.sidecar?.companionPort ? String(config.sidecar.companionPort) : '');
   const [loginCommand, setLoginCommand] = useState(config.loginCommand ?? config.sidecar?.loginCommand ?? '');
   const [authCheckCommand, setAuthCheckCommand] = useState(config.authCheckCommand ?? config.sidecar?.authCheckCommand ?? '');
-  const hasInteractiveLogin = !isOpenAiDriver || Boolean(loginCommand.trim());
+  const hasInteractiveLogin = !isHttpDriver || Boolean(loginCommand.trim());
+
+  // OpenRouter Routing & Headers state
+  const initialOpenRouter = config.openRouter;
+  const [orHttpReferer, setOrHttpReferer] = useState(initialOpenRouter?.httpReferer ?? '');
+  const [orAppTitle, setOrAppTitle] = useState(initialOpenRouter?.appTitle ?? '');
+  const [orFallbackModels, setOrFallbackModels] = useState((initialOpenRouter?.fallbackModels ?? []).join(', '));
+  const [orProviderSort, setOrProviderSort] = useState(initialOpenRouter?.provider?.sort ?? '');
+  const [orProviderOrder, setOrProviderOrder] = useState((initialOpenRouter?.provider?.order ?? []).join(', '));
+  const [orProviderOnly, setOrProviderOnly] = useState((initialOpenRouter?.provider?.only ?? []).join(', '));
+  const [orProviderIgnore, setOrProviderIgnore] = useState((initialOpenRouter?.provider?.ignore ?? []).join(', '));
+  const [orProviderAllowFallbacks, setOrProviderAllowFallbacks] = useState(
+    initialOpenRouter?.provider?.allowFallbacks ?? true
+  );
+  const [orProviderDataCollection, setOrProviderDataCollection] = useState(
+    initialOpenRouter?.provider?.dataCollection ?? ''
+  );
+  const [orProviderZdr, setOrProviderZdr] = useState(initialOpenRouter?.provider?.zdr ?? false);
+  const [orProviderRequireParameters, setOrProviderRequireParameters] = useState(
+    initialOpenRouter?.provider?.requireParameters ?? false
+  );
+  const hasCustomOpenRouterConfig = Boolean(
+    (config.endpoint && config.endpoint.trim() && config.endpoint.trim() !== 'https://openrouter.ai/api/v1') ||
+      initialOpenRouter?.httpReferer ||
+      initialOpenRouter?.appTitle ||
+      (initialOpenRouter?.fallbackModels?.length ?? 0) > 0 ||
+      initialOpenRouter?.provider?.sort ||
+      (initialOpenRouter?.provider?.order?.length ?? 0) > 0 ||
+      (initialOpenRouter?.provider?.only?.length ?? 0) > 0 ||
+      (initialOpenRouter?.provider?.ignore?.length ?? 0) > 0 ||
+      initialOpenRouter?.provider?.allowFallbacks === false ||
+      initialOpenRouter?.provider?.dataCollection ||
+      initialOpenRouter?.provider?.zdr ||
+      initialOpenRouter?.provider?.requireParameters
+  );
+  const [openRouterAdvancedExpanded, setOpenRouterAdvancedExpanded] = useState(hasCustomOpenRouterConfig);
+
   const [companionExpanded, setCompanionExpanded] = useState(Boolean(config.sidecar?.companionCommand || config.sidecar?.companionSetup || config.loginCommand || config.sidecar?.loginCommand));
   const [sidecarExpanded, setSidecarExpanded] = useState(Boolean(config.sidecar?.enabled));
   const [isTestingEndpoint, setIsTestingEndpoint] = useState(false);
@@ -306,13 +355,39 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
   const [error, setError] = useState<string | null>(null);
 
   const handleTestConnection = async () => {
-    if (!endpoint.trim()) {
+    if (!isOpenRouterDriver && !endpoint.trim()) {
       setError('Endpoint URL is required to test connection.');
       return;
     }
     setIsTestingEndpoint(true);
     setEndpointTestResult(null);
     try {
+      if (isOpenRouterDriver) {
+        const res = await api.testOpenRouterServer({
+          endpoint: endpoint.trim() || undefined,
+          apiKey: apiKey.trim() || undefined,
+          agentId: agent.id
+        });
+        if (res.success) {
+          const extras: string[] = [];
+          if (res.keyLabel) extras.push(res.keyLabel);
+          if (res.isFreeTier) extras.push('free tier');
+          if (typeof res.limitRemaining === 'number') extras.push(`$${res.limitRemaining.toFixed(2)} left`);
+          const extraSuffix = extras.length > 0 ? ` (${extras.join(', ')})` : '';
+          setEndpointTestResult({
+            success: true,
+            message: `Verified OpenRouter key! Found ${res.models?.length ?? 0} tool-capable model(s)${extraSuffix}.`
+          });
+          await onAuthSuccess?.();
+        } else {
+          setEndpointTestResult({
+            success: false,
+            message: res.error || 'OpenRouter verification failed.'
+          });
+        }
+        return;
+      }
+
       const activeSidecar: DriverSidecarConfig | null = sidecarEnabled
         ? {
             enabled: true,
@@ -409,7 +484,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
       }
     ];
 
-    if (isOpenAiDriver) {
+    if (isHttpDriver) {
       limitFields.push(
         {
           parsed: parseLimit(maxRetries, 'Max retries', 0),
@@ -471,6 +546,52 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
     }
     if (authCheckCommand.trim() !== (config.authCheckCommand ?? '')) {
       patch.authCheckCommand = authCheckCommand.trim();
+    }
+
+    if (isOpenRouterDriver) {
+      const parseCsv = (raw: string) =>
+        raw
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      const csvEq = (a: string[], b?: string[] | null) =>
+        a.length === (b?.length ?? 0) && a.every((v, idx) => v === (b ?? [])[idx]);
+
+      const nextFallbackModels = parseCsv(orFallbackModels);
+      const nextOrder = parseCsv(orProviderOrder);
+      const nextOnly = parseCsv(orProviderOnly);
+      const nextIgnore = parseCsv(orProviderIgnore);
+
+      const orChanged =
+        orHttpReferer.trim() !== (initialOpenRouter?.httpReferer ?? '') ||
+        orAppTitle.trim() !== (initialOpenRouter?.appTitle ?? '') ||
+        !csvEq(nextFallbackModels, initialOpenRouter?.fallbackModels) ||
+        orProviderSort.trim() !== (initialOpenRouter?.provider?.sort ?? '') ||
+        !csvEq(nextOrder, initialOpenRouter?.provider?.order) ||
+        !csvEq(nextOnly, initialOpenRouter?.provider?.only) ||
+        !csvEq(nextIgnore, initialOpenRouter?.provider?.ignore) ||
+        orProviderAllowFallbacks !== (initialOpenRouter?.provider?.allowFallbacks ?? true) ||
+        orProviderDataCollection.trim() !== (initialOpenRouter?.provider?.dataCollection ?? '') ||
+        orProviderZdr !== (initialOpenRouter?.provider?.zdr ?? false) ||
+        orProviderRequireParameters !== (initialOpenRouter?.provider?.requireParameters ?? false);
+
+      if (orChanged) {
+        patch.openRouter = {
+          httpReferer: orHttpReferer.trim(),
+          appTitle: orAppTitle.trim(),
+          fallbackModels: nextFallbackModels,
+          provider: {
+            sort: orProviderSort.trim(),
+            order: nextOrder,
+            only: nextOnly,
+            ignore: nextIgnore,
+            allowFallbacks: orProviderAllowFallbacks,
+            dataCollection: orProviderDataCollection.trim(),
+            zdr: orProviderZdr,
+            requireParameters: orProviderRequireParameters
+          }
+        };
+      }
     }
 
     if (Object.keys(patch).length === 0) {
@@ -805,6 +926,246 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
             )}
           </div>
 
+          {isOpenRouterDriver && (
+            <>
+              <div>
+                <label className={labelClass} htmlFor="driver-api-key">
+                  API Key
+                </label>
+                <div className="relative">
+                  <KeyRound className="w-3.5 h-3.5 text-slate-500 absolute left-2 top-1/2 -translate-y-1/2" />
+                  <input
+                    id="driver-api-key"
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    autoComplete="new-password"
+                    placeholder={config.hasApiKey ? '•••••••••••• (stored — leave blank to keep)' : 'sk-or-v1-...'}
+                    className={`${fieldClass} pl-7 font-mono`}
+                  />
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Stored server-side (or uses host <code className="font-mono">OPENROUTER_API_KEY</code> when unset).
+                </p>
+                <div className="flex items-center justify-between gap-2 mt-1.5">
+                  <button
+                    type="button"
+                    disabled={isTestingEndpoint}
+                    onClick={handleTestConnection}
+                    className="text-[11px] font-medium text-sky-400 hover:text-sky-300 disabled:opacity-50 flex items-center gap-1 cursor-pointer"
+                  >
+                    {isTestingEndpoint ? <Loader2 className="w-3 h-3 animate-spin" /> : <Network className="w-3 h-3" />}
+                    <span>{isTestingEndpoint ? 'Verifying OpenRouter...' : 'Test Connection'}</span>
+                  </button>
+                  {endpointTestResult && (
+                    <span className={`text-[10px] ${endpointTestResult.success ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {endpointTestResult.message}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <label className={labelClass} htmlFor="driver-model">
+                  Default Model
+                </label>
+                <input
+                  id="driver-model"
+                  type="text"
+                  value={defaultModel}
+                  onChange={(e) => setDefaultModel(e.target.value)}
+                  placeholder="e.g. openrouter/auto or anthropic/claude-sonnet-4"
+                  className={`${fieldClass} font-mono`}
+                />
+              </div>
+
+              <div className="pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setOpenRouterAdvancedExpanded(!openRouterAdvancedExpanded)}
+                  className="flex items-center justify-between w-full text-left py-1 text-slate-300 hover:text-white transition cursor-pointer"
+                >
+                  <div className="flex items-center gap-2">
+                    <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
+                    <span className="text-xs font-semibold">OpenRouter Routing &amp; Headers</span>
+                  </div>
+                  {openRouterAdvancedExpanded ? (
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                </button>
+
+                {openRouterAdvancedExpanded && (
+                  <div className="mt-2.5 space-y-3 p-3 rounded-lg bg-slate-950/60 border border-slate-800">
+                    <div>
+                      <label className={labelClass} htmlFor="driver-endpoint">
+                        Base URL Override (optional)
+                      </label>
+                      <input
+                        id="driver-endpoint"
+                        type="text"
+                        value={endpoint}
+                        onChange={(e) => setEndpoint(e.target.value)}
+                        placeholder="https://openrouter.ai/api/v1"
+                        className={`${fieldClass} font-mono`}
+                      />
+                    </div>
+
+                    <div>
+                      <label className={labelClass} htmlFor="openrouter-fallback-models">
+                        Fallback Models (comma-separated slugs)
+                      </label>
+                      <input
+                        id="openrouter-fallback-models"
+                        type="text"
+                        value={orFallbackModels}
+                        onChange={(e) => setOrFallbackModels(e.target.value)}
+                        placeholder="anthropic/claude-sonnet-4, openai/gpt-4.1"
+                        className={`${fieldClass} font-mono`}
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className={labelClass} htmlFor="openrouter-provider-sort">
+                          Provider Sort
+                        </label>
+                        <select
+                          id="openrouter-provider-sort"
+                          value={orProviderSort}
+                          onChange={(e) => setOrProviderSort(e.target.value)}
+                          className={fieldClass}
+                        >
+                          <option value="">Default</option>
+                          <option value="price">price</option>
+                          <option value="throughput">throughput</option>
+                          <option value="latency">latency</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className={labelClass} htmlFor="openrouter-data-collection">
+                          Data Collection
+                        </label>
+                        <select
+                          id="openrouter-data-collection"
+                          value={orProviderDataCollection}
+                          onChange={(e) => setOrProviderDataCollection(e.target.value)}
+                          className={fieldClass}
+                        >
+                          <option value="">Default</option>
+                          <option value="allow">allow</option>
+                          <option value="deny">deny</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <label className={labelClass} htmlFor="openrouter-provider-order">
+                          Provider Order
+                        </label>
+                        <input
+                          id="openrouter-provider-order"
+                          type="text"
+                          value={orProviderOrder}
+                          onChange={(e) => setOrProviderOrder(e.target.value)}
+                          placeholder="anthropic, bedrock"
+                          className={`${fieldClass} font-mono`}
+                        />
+                      </div>
+                      <div>
+                        <label className={labelClass} htmlFor="openrouter-provider-only">
+                          Allow Only
+                        </label>
+                        <input
+                          id="openrouter-provider-only"
+                          type="text"
+                          value={orProviderOnly}
+                          onChange={(e) => setOrProviderOnly(e.target.value)}
+                          placeholder="together, fireworks"
+                          className={`${fieldClass} font-mono`}
+                        />
+                      </div>
+                      <div>
+                        <label className={labelClass} htmlFor="openrouter-provider-ignore">
+                          Ignore Providers
+                        </label>
+                        <input
+                          id="openrouter-provider-ignore"
+                          type="text"
+                          value={orProviderIgnore}
+                          onChange={(e) => setOrProviderIgnore(e.target.value)}
+                          placeholder="deepinfra"
+                          className={`${fieldClass} font-mono`}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-x-4 gap-y-2 pt-0.5">
+                      <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={orProviderAllowFallbacks}
+                          onChange={(e) => setOrProviderAllowFallbacks(e.target.checked)}
+                          className="rounded border-slate-700 bg-slate-900 text-sky-500"
+                        />
+                        <span>Allow Fallbacks</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={orProviderZdr}
+                          onChange={(e) => setOrProviderZdr(e.target.checked)}
+                          className="rounded border-slate-700 bg-slate-900 text-sky-500"
+                        />
+                        <span>Zero Data Retention (ZDR)</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={orProviderRequireParameters}
+                          onChange={(e) => setOrProviderRequireParameters(e.target.checked)}
+                          className="rounded border-slate-700 bg-slate-900 text-sky-500"
+                        />
+                        <span>Require Parameters</span>
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className={labelClass} htmlFor="openrouter-referer">
+                          HTTP-Referer Header
+                        </label>
+                        <input
+                          id="openrouter-referer"
+                          type="text"
+                          value={orHttpReferer}
+                          onChange={(e) => setOrHttpReferer(e.target.value)}
+                          placeholder="https://your-app.example"
+                          className={`${fieldClass} font-mono`}
+                        />
+                      </div>
+                      <div>
+                        <label className={labelClass} htmlFor="openrouter-title">
+                          X-Title Header
+                        </label>
+                        <input
+                          id="openrouter-title"
+                          type="text"
+                          value={orAppTitle}
+                          onChange={(e) => setOrAppTitle(e.target.value)}
+                          placeholder="AgentMesh"
+                          className={`${fieldClass} font-mono`}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+
           {isOpenAiDriver && (
             <>
               <div>
@@ -914,7 +1275,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
                   Also used as the streaming inactivity ceiling.
                 </p>
               </div>
-              {isOpenAiDriver && (
+              {isHttpDriver && (
                 <>
                   <div>
                     <label className={labelClass} htmlFor="driver-max-retries">
@@ -953,7 +1314,7 @@ export const DriverConfigModal: React.FC<DriverConfigModalProps> = ({
             </div>
           </div>
 
-          {isOpenAiDriver && (
+          {isHttpDriver && (
             <div className="pt-2 border-t border-slate-800">
                 <button
                   type="button"

@@ -1,6 +1,12 @@
 ﻿using System.Collections.Concurrent;
+using System.Globalization;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using AgentMesh.Core.Enums;
+using AgentMesh.Core.Models;
+using AgentMesh.Core.Services;
 
 namespace AgentMesh.Api.Services;
 
@@ -43,7 +49,8 @@ public sealed record DriverQuotaProbeRequest(
     /// <summary>
     /// Bypass the probe's own TTL cache. The dashboard sets this on an explicit user refresh.
     /// </summary>
-    bool ForceRefresh = false);
+    bool ForceRefresh = false,
+    string? ApiKey = null);
 
 /// <summary>
 /// Reads real quota data out of a driver's provider.
@@ -492,7 +499,7 @@ public sealed class AgyDriverQuotaProbe : IDriverQuotaProbe
         // An endpoint means it speaks OpenAI-compatible HTTP, not the agy CLI. Non-CLI runtimes
         // have no local binary to invoke at all.
         if (!string.IsNullOrWhiteSpace(request.Endpoint)) return false;
-        if (request.RuntimeType is RuntimeType.OpenAiCompatible or RuntimeType.LocalOllama or RuntimeType.McpCloud)
+        if (request.RuntimeType is RuntimeType.OpenAiCompatible or RuntimeType.LocalOllama or RuntimeType.McpCloud or RuntimeType.OpenRouter)
         {
             return false;
         }
@@ -629,6 +636,347 @@ public static class AgyExecutableLocator
             }
         }
 
+        return null;
+    }
+}
+
+/// <summary>
+/// Chains multiple <see cref="IDriverQuotaProbe"/> implementations, returning the first real reading.
+/// </summary>
+public sealed class CompositeDriverQuotaProbe(params IDriverQuotaProbe[] probes) : IDriverQuotaProbe
+{
+    private readonly IReadOnlyList<IDriverQuotaProbe> _probes = probes ?? Array.Empty<IDriverQuotaProbe>();
+
+    public async Task<DriverQuotaReading?> ProbeAsync(DriverQuotaProbeRequest request, CancellationToken ct = default)
+    {
+        foreach (var probe in _probes)
+        {
+            var reading = await probe.ProbeAsync(request, ct);
+            if (reading != null) return reading;
+        }
+
+        return null;
+    }
+}
+
+/// <summary>
+/// Probes OpenRouter's key spending limit (<c>GET /api/v1/key</c>) with fallback to account credits
+/// (<c>GET /api/v1/credits</c>, which requires a Management Key and returns 403 for standard keys).
+/// Returns <c>null</c> when unconfigured, unauthorized, or unlimited so no quota bar is ever fabricated.
+/// </summary>
+public sealed class OpenRouterDriverQuotaProbe : IDriverQuotaProbe
+{
+    private static readonly TimeSpan DefaultTtl = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan DefaultNegativeTtl = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(10);
+
+    private static readonly HttpClient SharedHttp = new(new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+        AutomaticDecompression = System.Net.DecompressionMethods.All
+    })
+    {
+        Timeout = ProbeTimeout
+    };
+
+    private readonly ConcurrentDictionary<string, (DateTimeOffset ObservedAt, DriverQuotaReading? Reading)> _cache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<DriverQuotaReading?>> _inFlight =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly Func<TimeSpan> _ttlProvider;
+    private readonly Func<TimeSpan> _negativeTtlProvider;
+    private readonly Func<string, string, CancellationToken, Task<(int StatusCode, string? Body)>> _httpGet;
+
+    public OpenRouterDriverQuotaProbe()
+        : this(() => DefaultTtl, () => DefaultNegativeTtl, SendGetAsync)
+    {
+    }
+
+    internal OpenRouterDriverQuotaProbe(
+        Func<TimeSpan> ttlProvider,
+        Func<TimeSpan> negativeTtlProvider,
+        Func<string, string, CancellationToken, Task<(int StatusCode, string? Body)>> httpGet)
+    {
+        _ttlProvider = ttlProvider;
+        _negativeTtlProvider = negativeTtlProvider;
+        _httpGet = httpGet;
+    }
+
+    public async Task<DriverQuotaReading?> ProbeAsync(DriverQuotaProbeRequest request, CancellationToken ct = default)
+    {
+        if (!IsOpenRouter(request)) return null;
+
+        var apiKey = !string.IsNullOrWhiteSpace(request.ApiKey)
+            ? request.ApiKey.Trim()
+            : Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")?.Trim();
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            return null;
+        }
+
+        var baseUrl = NormalizeBaseUrl(request.Endpoint);
+        var keyFingerprint = ComputeKeyFingerprint(apiKey);
+        var cacheKey = $"openrouter:{DriverModelDiscovery.NormalizeEndpoint(baseUrl)}:{keyFingerprint}";
+
+        if (!request.ForceRefresh && _cache.TryGetValue(cacheKey, out var cached))
+        {
+            var allowedAge = cached.Reading == null ? _negativeTtlProvider() : _ttlProvider();
+            if (DateTimeOffset.UtcNow - cached.ObservedAt < allowedAge)
+            {
+                return cached.Reading;
+            }
+        }
+
+        var leaderSource = new TaskCompletionSource<DriverQuotaReading?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var existing = _inFlight.GetOrAdd(cacheKey, leaderSource);
+
+        if (!ReferenceEquals(existing, leaderSource))
+        {
+            return ct.CanBeCanceled ? await existing.Task.WaitAsync(ct) : await existing.Task;
+        }
+
+        DriverQuotaReading? reading = null;
+        try
+        {
+            reading = await FetchReadingAsync(baseUrl, apiKey, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            reading = null;
+        }
+        finally
+        {
+            _cache[cacheKey] = (DateTimeOffset.UtcNow, reading);
+            leaderSource.SetResult(reading);
+            _inFlight.TryRemove(cacheKey, out _);
+        }
+
+        return reading;
+    }
+
+    private async Task<DriverQuotaReading?> FetchReadingAsync(string baseUrl, string apiKey, CancellationToken ct)
+    {
+        var (keyStatus, keyBody) = await _httpGet($"{baseUrl}/key", apiKey, ct);
+        if (keyStatus is >= 200 and < 300)
+        {
+            var keyResult = ParseKeyResponse(keyBody, out var hasKeyData);
+            if (keyResult != null) return keyResult;
+            if (!hasKeyData) return null;
+
+            // Unlimited key (`limit: null`): try account credits endpoint as fallback.
+            // Standard API keys receive 403 here (Management Key required), which returns null cleanly.
+            var (creditsStatus, creditsBody) = await _httpGet($"{baseUrl}/credits", apiKey, ct);
+            if (creditsStatus is >= 200 and < 300)
+            {
+                return ParseCreditsResponse(creditsBody);
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    internal static DriverQuotaReading? ParseKeyResponse(string? json, out bool hasKeyData)
+    {
+        hasKeyData = false;
+        if (string.IsNullOrWhiteSpace(json)) return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
+
+            var payload = root.TryGetProperty("data", out var dataProp) && dataProp.ValueKind == JsonValueKind.Object
+                ? dataProp
+                : root;
+
+            hasKeyData = true;
+
+            var limit = ReadDouble(payload, "limit");
+            if (limit is null or <= 0) return null;
+
+            var usage = ReadDouble(payload, "usage") ?? 0.0;
+            var limitRemaining = ReadDouble(payload, "limit_remaining") ?? Math.Max(0.0, limit.Value - usage);
+            var fraction = Math.Round(Math.Clamp(limitRemaining / limit.Value, 0.0, 1.0), 4);
+
+            var isFreeTier = payload.TryGetProperty("is_free_tier", out var freeProp) && freeProp.ValueKind == JsonValueKind.True;
+            var label = ReadString(payload, "label");
+            var planBase = isFreeTier ? "Free Tier" : "API Key Budget";
+            var planName = !string.IsNullOrWhiteSpace(label) ? $"{planBase} · {label.Trim()}" : planBase;
+
+            var limitReset = ReadString(payload, "limit_reset")?.Trim();
+            DateTimeOffset? resetsAt = null;
+            if (!string.IsNullOrWhiteSpace(limitReset) &&
+                DateTimeOffset.TryParse(limitReset, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsedReset))
+            {
+                resetsAt = parsedReset.ToUniversalTime();
+            }
+
+            var description = string.Format(
+                CultureInfo.InvariantCulture,
+                "${0:0.00} of ${1:0.00} remaining",
+                Math.Max(0.0, limitRemaining),
+                limit.Value);
+
+            var bucket = new DriverQuotaBucket(
+                Id: "key-limit",
+                Name: "Key Credit Limit",
+                Description: description,
+                Window: string.IsNullOrWhiteSpace(limitReset) ? null : limitReset,
+                RemainingFraction: fraction,
+                ResetsAt: resetsAt);
+
+            return new DriverQuotaReading(
+                Provider: "OpenRouter",
+                PlanName: planName,
+                Source: "openrouter:/key",
+                ObservedAt: DateTimeOffset.UtcNow,
+                PrimaryRemainingFraction: fraction,
+                Groups: new[] { new DriverQuotaGroup("Key Spending Limit", null, new[] { bucket }) });
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    internal static DriverQuotaReading? ParseCreditsResponse(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
+
+            var payload = root.TryGetProperty("data", out var dataProp) && dataProp.ValueKind == JsonValueKind.Object
+                ? dataProp
+                : root;
+
+            var totalCredits = ReadDouble(payload, "total_credits");
+            if (totalCredits is null or <= 0) return null;
+
+            var totalUsage = ReadDouble(payload, "total_usage") ?? 0.0;
+            var remaining = Math.Max(0.0, totalCredits.Value - totalUsage);
+            var fraction = Math.Round(Math.Clamp(remaining / totalCredits.Value, 0.0, 1.0), 4);
+
+            var description = string.Format(
+                CultureInfo.InvariantCulture,
+                "${0:0.00} of ${1:0.00} remaining",
+                remaining,
+                totalCredits.Value);
+
+            var bucket = new DriverQuotaBucket(
+                Id: "account-credits",
+                Name: "Account Credits",
+                Description: description,
+                Window: null,
+                RemainingFraction: fraction,
+                ResetsAt: null);
+
+            return new DriverQuotaReading(
+                Provider: "OpenRouter",
+                PlanName: "Account Credits",
+                Source: "openrouter:/credits",
+                ObservedAt: DateTimeOffset.UtcNow,
+                PrimaryRemainingFraction: fraction,
+                Groups: new[] { new DriverQuotaGroup("Account Balance", null, new[] { bucket }) });
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    internal static bool IsOpenRouter(DriverQuotaProbeRequest request)
+    {
+        var adapter = DriverAdapters.Canonicalize(request.Adapter);
+        if (!string.IsNullOrEmpty(adapter))
+        {
+            return adapter == DriverAdapters.OpenRouter;
+        }
+
+        if (request.RuntimeType == RuntimeType.OpenRouter) return true;
+
+        if (!string.IsNullOrWhiteSpace(request.Endpoint))
+        {
+            return request.Endpoint.Contains("openrouter.ai", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (request.RuntimeType is RuntimeType.OpenAiCompatible or RuntimeType.LocalOllama or RuntimeType.McpCloud)
+        {
+            return false;
+        }
+
+        var id = request.DriverId?.Trim().ToLowerInvariant() ?? string.Empty;
+        return id == "openrouter" || id.StartsWith("openrouter-", StringComparison.Ordinal) ||
+               id.EndsWith("-openrouter", StringComparison.Ordinal) || id.Contains("openrouter");
+    }
+
+    internal static string NormalizeBaseUrl(string? endpoint)
+    {
+        var trimmed = (!string.IsNullOrWhiteSpace(endpoint)
+            ? endpoint
+            : Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL"))?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed)) return OpenRouterConfig.DefaultEndpoint;
+
+        var normalized = trimmed.TrimEnd('/');
+        if (normalized.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[..^"/chat/completions".Length].TrimEnd('/');
+        if (normalized.EndsWith("/models", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[..^"/models".Length].TrimEnd('/');
+        return normalized;
+    }
+
+    private static string ComputeKeyFingerprint(string apiKey)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(apiKey));
+        return Convert.ToHexString(bytes)[..16];
+    }
+
+    private static async Task<(int StatusCode, string? Body)> SendGetAsync(
+        string url,
+        string apiKey,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(ProbeTimeout);
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            req.Headers.TryAddWithoutValidation("X-Title", OpenRouterConfig.DefaultAppTitle);
+
+            using var res = await SharedHttp.SendAsync(req, timeoutCts.Token);
+            var body = await res.Content.ReadAsStringAsync(timeoutCts.Token);
+            return ((int)res.StatusCode, body);
+        }
+        catch
+        {
+            return (0, null);
+        }
+    }
+
+    private static string? ReadString(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.String
+            ? prop.GetString()
+            : null;
+
+    private static double? ReadDouble(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var prop)) return null;
+        if (prop.ValueKind == JsonValueKind.Number && prop.TryGetDouble(out var d)) return d;
+        if (prop.ValueKind == JsonValueKind.String &&
+            double.TryParse(prop.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+        {
+            return parsed;
+        }
         return null;
     }
 }

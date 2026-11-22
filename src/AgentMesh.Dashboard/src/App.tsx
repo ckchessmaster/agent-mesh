@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
+﻿import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Bot,
   Brain,
@@ -46,6 +46,12 @@ import {
   Server
 } from 'lucide-react';
 import { api } from './services/api';
+import { AttentionBell, MuteToggle } from './components/AttentionBell';
+import type { AttentionBellHandle } from './components/AttentionBell';
+import { ATTENTION_NAVIGATE_EVENT, notifications } from './services/notifications';
+import type { AttentionNavigateDetail } from './services/notifications';
+import { AttentionEvent } from './types/attention';
+import type { AttentionItem, AttentionResolved } from './types/attention';
 import { useSignalR } from './hooks/useSignalR';
 import { useAuth } from './auth/AuthProvider';
 import {
@@ -53,6 +59,7 @@ import {
   QUOTA_TEXT_CLASS,
   describeReset,
   describeUsageChip,
+  formatUsdCost,
   relativeTime,
   summarizeQuota
 } from './utils/driverUsage';
@@ -82,6 +89,7 @@ import type {
   SessionArtifact,
   JobArtifact,
   McpServer,
+  ModelCapability,
   SystemCapabilitiesResponse,
   SystemStatusResponse
 } from './types';
@@ -102,6 +110,7 @@ import { MermaidViewer } from './components/MermaidViewer';
 import { getOptionLabel, getOptionDescription } from './components/QuestionCard';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { DriverConfigModal } from './components/DriverConfigModal';
+import { SearchableModelPicker } from './components/SearchableModelPicker';
 import { PersonaEnvironmentModal } from './components/PersonaEnvironmentModal';
 import { McpCatalogModal } from './components/McpCatalogModal';
 import { PersonaMcpModal } from './components/PersonaMcpModal';
@@ -300,6 +309,12 @@ export default function App() {
   });
   const selectedJobIdRef = useRef<string | null>(null);
   selectedJobIdRef.current = selectedJobId;
+  /**
+   * The header bell owns the pending-attention poll and the seen-set; this ref is how live SignalR
+   * pushes reach it. Held as a ref rather than lifted state on purpose: a badge count re-rendering the
+   * 6.7k-line root on every push would be a regression for no benefit.
+   */
+  const attentionBellRef = useRef<AttentionBellHandle>(null);
   const [isMobile, setIsMobile] = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
   );
@@ -460,6 +475,7 @@ export default function App() {
 
   // Active session inline control edit popover state
   const [editingSessionControl, setEditingSessionControl] = useState<'model' | 'effort' | 'tier' | 'mode' | 'contextSize' | null>(null);
+  const [sessionModelFilter, setSessionModelFilter] = useState('');
 
   // Active prompt queue and Send Now dropdown state
   const [activeQueue, setActiveQueue] = useState<QueuedPromptItem[]>([]);
@@ -467,7 +483,7 @@ export default function App() {
 
   // Quick Register Agent modal/drawer state
   const [showRegisterModal, setShowRegisterModal] = useState(false);
-  const [newAgentType, setNewAgentType] = useState<'agy' | 'claude' | 'copilot' | 'openai' | 'generic'>('openai');
+  const [newAgentType, setNewAgentType] = useState<'agy' | 'claude' | 'copilot' | 'openai' | 'openrouter' | 'generic'>('openai');
   const [newAgentId, setNewAgentId] = useState('');
   const [newAgentName, setNewAgentName] = useState('');
   const [newAgentRole, setNewAgentRole] = useState('Autonomous AI Engineer');
@@ -478,7 +494,7 @@ export default function App() {
   const [openAiTestResult, setOpenAiTestResult] = useState<{
     success: boolean;
     message: string;
-    models: { id: string; name: string }[];
+    models: ModelCapability[];
   } | null>(null);
 
   // Interactive Question & Answer state (keyed by toolCallId)
@@ -973,6 +989,46 @@ export default function App() {
     setIsMobileDetailView(true);
   };
 
+  /**
+   * Click-through from an OS banner or a bell row.
+   *
+   * `NotificationService.openItem` already wrote the selection keys, so a *fresh* load lands on the
+   * right job; this listener is the other half — an already-mounted cockpit has no router to follow,
+   * so the service fires `agentmesh:attention-navigate` on `window` and we apply the same selection
+   * here. Mirrors `handleSelectJob` exactly (including the mobile detail view) so a bell click behaves
+   * like clicking the job in the list, and pins the tab because the rollup is cross-project: the
+   * tab-reconciler in `fetchAllData` would otherwise yank the operator back to a populated tab.
+   */
+  useEffect(() => {
+    const onAttentionNavigate = (event: Event) => {
+      const detail = (event as CustomEvent<AttentionNavigateDetail>).detail;
+      if (!detail?.jobId) return;
+      hasUserSwitchedTabRef.current = true;
+      setActiveTab('projects');
+      setSelectedProjectId(detail.projectId || null);
+      setSelectedJobId(detail.jobId);
+      setIsMobileDetailView(true);
+    };
+    window.addEventListener(ATTENTION_NAVIGATE_EVENT, onAttentionNavigate);
+    return () => window.removeEventListener(ATTENTION_NAVIGATE_EVENT, onAttentionNavigate);
+  }, []);
+
+  /**
+   * Unlock the notification chime. Browsers create `AudioContext` in the `suspended` state until the
+   * page observes a gesture, and a suspended context plays nothing — without this the first chime of a
+   * session is silently dropped by the autoplay policy. Both listeners are `once`: the flag is
+   * monotonic, so there is nothing to keep observing after the first input.
+   */
+  useEffect(() => {
+    const unlockChime = () => notifications.noteUserGesture();
+    window.addEventListener('pointerdown', unlockChime, { once: true });
+    window.addEventListener('keydown', unlockChime, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockChime);
+      window.removeEventListener('keydown', unlockChime);
+    };
+  }, []);
+
   useEffect(() => {
     if (selectedProjectId) {
       fetchJobsForProject(selectedProjectId).then((jobs) => {
@@ -1235,6 +1291,7 @@ export default function App() {
     resultSummary?: string;
     approvalPolicy?: number;
     assignedAgentId?: string | null;
+    turnBudget?: number | null;
   }) => {
     if (!selectedJobId) return;
     const updated = await api.updateProjectJob(selectedJobId, updates);
@@ -2003,6 +2060,20 @@ export default function App() {
       });
     };
 
+    /**
+     * Pending-attention pushes. Both are delegated to the bell rather than handled here, which keeps a
+     * single owner for the seen-set: `pushNeeded` banners/chimes once and re-reads the rollup a moment
+     * later, and `pushResolved` clears the seen keys and any open banner for that job. Handling the
+     * event here as well would double-banner, and handling it only here would leave the inbox stale.
+     */
+    const handleAttentionNeeded = (item: AttentionItem) => {
+      attentionBellRef.current?.pushNeeded(item);
+    };
+
+    const handleAttentionResolved = (payload: AttentionResolved) => {
+      attentionBellRef.current?.pushResolved(payload?.jobId);
+    };
+
     const handleMcpUpdated = () => {
       setMcpCatalogRefreshTick((t) => t + 1);
       if (api.getMcpServers) {
@@ -2046,6 +2117,8 @@ export default function App() {
     connection.on('ProjectCreated', handleProjectCreated);
     connection.on('ProjectUpdated', handleProjectUpdated);
     connection.on('ProjectDeleted', handleProjectDeleted);
+    connection.on(AttentionEvent.Needed, handleAttentionNeeded);
+    connection.on(AttentionEvent.Resolved, handleAttentionResolved);
     connection.on('ProjectPersonaAssigned', handleTimelineCardUpdated);
     connection.on('ProjectPersonaRemoved', handleTimelineCardUpdated);
     connection.on('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
@@ -2087,6 +2160,8 @@ export default function App() {
       connection.off('ProjectCreated', handleProjectCreated);
       connection.off('ProjectUpdated', handleProjectUpdated);
       connection.off('ProjectDeleted', handleProjectDeleted);
+      connection.off(AttentionEvent.Needed, handleAttentionNeeded);
+      connection.off(AttentionEvent.Resolved, handleAttentionResolved);
       connection.off('ProjectPersonaAssigned', handleTimelineCardUpdated);
       connection.off('ProjectPersonaRemoved', handleTimelineCardUpdated);
       connection.off('ReceiveTimelineCardUpdated', handleTimelineCardUpdated);
@@ -2367,7 +2442,13 @@ export default function App() {
 
   // Sync / validate model, mode, tier when agent changes
   useEffect(() => {
-    if (newSessionModel && availableModels.length > 0 && !availableModels.some((m) => m.id === newSessionModel) && currentRuntimeCaps?.adapter !== 'openai') {
+    if (
+      newSessionModel &&
+      availableModels.length > 0 &&
+      !availableModels.some((m) => m.id === newSessionModel) &&
+      currentRuntimeCaps?.adapter !== 'openai' &&
+      currentRuntimeCaps?.adapter !== 'openrouter'
+    ) {
       setNewSessionModel('');
     }
     if (newSessionMode && availableModes.length > 0 && !availableModes.some((m) => m.id === newSessionMode)) {
@@ -3148,6 +3229,47 @@ export default function App() {
   };
 
   const handleTestOpenAi = async () => {
+    if (newAgentType === 'openrouter') {
+      setIsTestingOpenAi(true);
+      setOpenAiTestResult(null);
+      try {
+        const res = await api.testOpenRouterServer({
+          endpoint: newAgentEndpoint.trim() || undefined,
+          apiKey: newAgentApiKey.trim() || undefined
+        });
+        if (res.success) {
+          const extras: string[] = [];
+          if (res.keyLabel) extras.push(res.keyLabel);
+          if (res.isFreeTier) extras.push('free tier');
+          if (typeof res.limitRemaining === 'number') extras.push(`$${res.limitRemaining.toFixed(2)} left`);
+          const extraSuffix = extras.length > 0 ? ` (${extras.join(', ')})` : '';
+          setOpenAiTestResult({
+            success: true,
+            message: `Verified OpenRouter key! Found ${res.models.length} tool-capable model(s)${extraSuffix}.`,
+            models: res.models
+          });
+          if (res.models.length > 0 && !newAgentModel) {
+            setNewAgentModel(res.models[0].id);
+          }
+        } else {
+          setOpenAiTestResult({
+            success: false,
+            message: res.error || 'Failed to verify OpenRouter connection.',
+            models: []
+          });
+        }
+      } catch (err) {
+        setOpenAiTestResult({
+          success: false,
+          message: err instanceof Error ? err.message : 'OpenRouter connection test failed.',
+          models: []
+        });
+      } finally {
+        setIsTestingOpenAi(false);
+      }
+      return;
+    }
+
     if (!newAgentEndpoint.trim()) return;
     setIsTestingOpenAi(true);
     setOpenAiTestResult(null);
@@ -3160,7 +3282,7 @@ export default function App() {
         setOpenAiTestResult({
           success: true,
           message: `Connected successfully! Found ${res.models.length} model(s).`,
-          models: res.models
+          models: res.models.map((m) => ({ id: m.id, name: m.name, efforts: [] }))
         });
         if (res.models.length > 0 && !newAgentModel) {
           setNewAgentModel(res.models[0].id);
@@ -3220,11 +3342,25 @@ export default function App() {
           models: openAiTestResult?.models || (newAgentModel.trim() ? [{ id: newAgentModel.trim(), name: newAgentModel.trim() }] : [])
         };
         capabilitiesJson = JSON.stringify(caps);
+      } else if (newAgentType === 'openrouter') {
+        const defaultModelId = newAgentModel.trim() || 'openrouter/auto';
+        const caps = {
+          adapter: 'openrouter',
+          endpoint: newAgentEndpoint.trim() || 'https://openrouter.ai/api/v1',
+          apiKey: newAgentApiKey.trim() || undefined,
+          defaultModel: defaultModelId,
+          models:
+            openAiTestResult?.models && openAiTestResult.models.length > 0
+              ? openAiTestResult.models.map((m) => ({ id: m.id, name: m.name }))
+              : [{ id: defaultModelId, name: defaultModelId }]
+        };
+        capabilitiesJson = JSON.stringify(caps);
       }
 
       const created = await api.upsertAgent({
         id: newAgentId.trim().toLowerCase(),
         name: newAgentName.trim(),
+        ...(newAgentType === 'openrouter' ? { runtimeType: 4 } : {}),
         role: newAgentRole.trim() || 'Autonomous Agent',
         status: 'offline',
         capabilitiesJson
@@ -3318,6 +3454,9 @@ export default function App() {
   }, [currentRuntimeCaps, selectedSessionMetadata?.model]);
 
   const sessionAvailableEfforts = useMemo(() => {
+    if (currentRuntimeCaps?.adapter === 'openrouter' && sessionModelCap) {
+      return sessionModelCap.efforts;
+    }
     if (sessionModelCap && sessionModelCap.efforts.length > 0) return sessionModelCap.efforts;
     const allEfforts = Array.from(new Set(currentRuntimeCaps?.models.flatMap((m) => m.efforts) || []));
     return allEfforts.length > 0 ? allEfforts : ['low', 'medium', 'high'];
@@ -3483,6 +3622,16 @@ export default function App() {
 
         {/* Developer Controls & Auth */}
         <div className="flex items-center gap-2 shrink-0">
+          {/*
+            Pending attention: the bell is the durable inbox (it polls `GET /api/attention` and owns the
+            read/dismiss state) and receives live `AttentionNeeded`/`AttentionResolved` pushes through
+            `attentionBellRef`. The compact toggle beside it is the master mute for desktop alerts —
+            always reachable without opening the inbox, because an operator who cannot silence a chime
+            quickly will close the tab instead. Both read the same persisted flag through the shared
+            notification service, so they cannot drift apart.
+          */}
+          <AttentionBell ref={attentionBellRef} />
+          <MuteToggle compact />
           <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs">
             <User className="w-3.5 h-3.5 text-sky-400 shrink-0" />
             <span className="font-mono text-slate-300 max-w-[90px] sm:max-w-[140px] truncate">{userEmail}</span>
@@ -3965,15 +4114,25 @@ export default function App() {
                       onChange={(e) => {
                         const t = e.target.value as any;
                         setNewAgentType(t);
-                        if (t === 'openai' && !newAgentId) {
-                          setNewAgentId('ollama-local');
-                          setNewAgentName('Local Ollama Server');
+                        setOpenAiTestResult(null);
+                        if (t === 'openai') {
+                          if (!newAgentId || newAgentId === 'openrouter') setNewAgentId('ollama-local');
+                          if (!newAgentName || newAgentName === 'OpenRouter') setNewAgentName('Local Ollama Server');
+                          if (!newAgentEndpoint || newAgentEndpoint === 'https://openrouter.ai/api/v1') setNewAgentEndpoint('http://localhost:11434/v1');
+                          if (newAgentModel === 'openrouter/auto') setNewAgentModel('');
+                          setNewAgentRole('Autonomous AI Engineer');
+                        } else if (t === 'openrouter') {
+                          if (!newAgentId || newAgentId === 'ollama-local') setNewAgentId('openrouter');
+                          if (!newAgentName || newAgentName === 'Local Ollama Server') setNewAgentName('OpenRouter');
+                          if (!newAgentEndpoint || newAgentEndpoint === 'http://localhost:11434/v1') setNewAgentEndpoint('https://openrouter.ai/api/v1');
+                          if (!newAgentModel) setNewAgentModel('openrouter/auto');
                           setNewAgentRole('Autonomous AI Engineer');
                         }
                       }}
                       className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 cursor-pointer"
                     >
                       <option value="openai">OpenAI Compatible Server (Ollama / vLLM / LM Studio / OpenAI)</option>
+                      <option value="openrouter">OpenRouter (300+ Cloud Models)</option>
                       <option value="agy">Antigravity CLI (agy)</option>
                       <option value="claude">Claude Code CLI</option>
                       <option value="copilot">GitHub Copilot CLI</option>
@@ -4004,6 +4163,82 @@ export default function App() {
                     onChange={(e) => setNewAgentRole(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500"
                   />
+
+                  {newAgentType === 'openrouter' && (
+                    <div className="space-y-2 p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">API Key</label>
+                        <input
+                          type="password"
+                          aria-label="OpenRouter API Key"
+                          placeholder="sk-or-v1-... (or uses host OPENROUTER_API_KEY)"
+                          value={newAgentApiKey}
+                          onChange={(e) => setNewAgentApiKey(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">Base URL Override (Optional)</label>
+                        <input
+                          type="text"
+                          aria-label="OpenRouter Base URL"
+                          placeholder="https://openrouter.ai/api/v1"
+                          value={newAgentEndpoint}
+                          onChange={(e) => setNewAgentEndpoint(e.target.value)}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-sky-500"
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={handleTestOpenAi}
+                          disabled={isTestingOpenAi}
+                          className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-400 font-medium text-[11px] flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                        >
+                          {isTestingOpenAi && <RefreshCw className="w-3 h-3 animate-spin" />}
+                          <span>Test &amp; Fetch Models</span>
+                        </button>
+                      </div>
+
+                      {openAiTestResult && (
+                        <div
+                          className={`p-2 rounded text-[11px] ${
+                            openAiTestResult.success
+                              ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/40'
+                              : 'bg-rose-950/40 text-rose-300 border border-rose-800/40'
+                          }`}
+                        >
+                          {openAiTestResult.message}
+                        </div>
+                      )}
+
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-0.5">Default Model</label>
+                        {openAiTestResult?.models && openAiTestResult.models.length > 0 ? (
+                          <SearchableModelPicker
+                            ariaLabel="Fetched OpenRouter Model Selection"
+                            models={openAiTestResult.models}
+                            value={newAgentModel}
+                            onChange={setNewAgentModel}
+                            defaultOptionLabel="openrouter/auto (default)"
+                            allowCustom
+                            compact
+                          />
+                        ) : (
+                          <input
+                            type="text"
+                            aria-label="Custom Model Input"
+                            placeholder="e.g. openrouter/auto, anthropic/claude-sonnet-4"
+                            value={newAgentModel}
+                            onChange={(e) => setNewAgentModel(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-200 text-[11px] focus:outline-none focus:border-sky-500 font-mono"
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                   {newAgentType === 'openai' && (
                     <div className="space-y-2 p-2.5 rounded-lg bg-slate-950/60 border border-slate-800">
@@ -4750,30 +4985,48 @@ export default function App() {
                       <label className="block text-[11px] font-medium text-slate-400">
                         Model
                       </label>
-                      <select
-                        aria-label="New Session Model"
-                        value={newSessionModel}
-                        onChange={(e) => setNewSessionModel(e.target.value)}
-                        disabled={availableModels.length === 0}
-                        title={capabilitySourceLabel(currentRuntimeCaps)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        <option value="">Default Model</option>
-                        {availableModels.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.name || m.id}
-                          </option>
-                        ))}
-                      </select>
-                      {currentRuntimeCaps?.adapter === 'openai' && (
-                        <input
-                          type="text"
-                          aria-label="Custom Session Model Input"
-                          placeholder="Or custom model name..."
+                      {currentRuntimeCaps?.adapter === 'openrouter' || availableModels.length > 25 ? (
+                        <SearchableModelPicker
+                          ariaLabel="New Session Model"
+                          models={availableModels}
                           value={newSessionModel}
-                          onChange={(e) => setNewSessionModel(e.target.value)}
-                          className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                          onChange={setNewSessionModel}
+                          defaultOptionLabel="Default Model"
+                          allowCustom={
+                            currentRuntimeCaps?.adapter === 'openai' ||
+                            currentRuntimeCaps?.adapter === 'openrouter'
+                          }
+                          disabled={availableModels.length === 0}
+                          title={capabilitySourceLabel(currentRuntimeCaps)}
                         />
+                      ) : (
+                        <>
+                          <select
+                            aria-label="New Session Model"
+                            value={newSessionModel}
+                            onChange={(e) => setNewSessionModel(e.target.value)}
+                            disabled={availableModels.length === 0}
+                            title={capabilitySourceLabel(currentRuntimeCaps)}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <option value="">Default Model</option>
+                            {availableModels.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                {m.name || m.id}
+                              </option>
+                            ))}
+                          </select>
+                          {currentRuntimeCaps?.adapter === 'openai' && (
+                            <input
+                              type="text"
+                              aria-label="Custom Session Model Input"
+                              placeholder="Or custom model name..."
+                              value={newSessionModel}
+                              onChange={(e) => setNewSessionModel(e.target.value)}
+                              className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                            />
+                          )}
+                        </>
                       )}
                       {/* Provenance, so a bundled preset is never mistaken for a driver answer. */}
                       {availableModels.length > 0 ? (
@@ -4979,7 +5232,10 @@ export default function App() {
                     <div className="relative inline-block">
                       <button
                         type="button"
-                        onClick={() => setEditingSessionControl((prev) => (prev === 'model' ? null : 'model'))}
+                        onClick={() => {
+                          setSessionModelFilter('');
+                          setEditingSessionControl((prev) => (prev === 'model' ? null : 'model'));
+                        }}
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700/90 text-slate-300 border border-slate-700/80 hover:border-slate-600 transition cursor-pointer"
                         title="Click to change model for this session"
                       >
@@ -4987,32 +5243,97 @@ export default function App() {
                         <span>{selectedSessionMetadata?.model || 'default model'}</span>
                         <ChevronDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
                       </button>
-                      {editingSessionControl === 'model' && (
-                        <div className="absolute left-0 top-full mt-1.5 z-40 w-64 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-60 overflow-y-auto">
-                          <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
-                            Switch Session Model
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateSessionControl({ model: '' })}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
-                          >
-                            <span>Default Model</span>
-                            {!selectedSessionMetadata?.model && <Check className="w-3 h-3 text-sky-400" />}
-                          </button>
-                          {availableModels.map((m) => (
+                      {editingSessionControl === 'model' && (() => {
+                        const isSearchablePopover =
+                          currentRuntimeCaps?.adapter === 'openrouter' || availableModels.length > 25;
+                        const allowCustomSessionModel =
+                          currentRuntimeCaps?.adapter === 'openai' ||
+                          currentRuntimeCaps?.adapter === 'openrouter';
+                        const q = sessionModelFilter.trim().toLowerCase();
+                        const visibleModels = isSearchablePopover && q
+                          ? availableModels.filter(
+                              (m) =>
+                                m.id.toLowerCase().includes(q) ||
+                                (m.name && m.name.toLowerCase().includes(q))
+                            )
+                          : availableModels;
+                        const hasExactCustom =
+                          allowCustomSessionModel &&
+                          Boolean(sessionModelFilter.trim()) &&
+                          !availableModels.some((m) => m.id.toLowerCase() === q);
+                        return (
+                          <div className={`absolute left-0 top-full mt-1.5 z-40 ${isSearchablePopover ? 'w-80' : 'w-64'} bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 max-h-72 overflow-y-auto`}>
+                            <div className="px-2 py-1 text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                              Switch Session Model
+                            </div>
+                            {isSearchablePopover && (
+                              <div className="px-1.5 pb-1.5">
+                                <input
+                                  type="text"
+                                  autoFocus
+                                  aria-label="Filter session models"
+                                  value={sessionModelFilter}
+                                  onChange={(e) => setSessionModelFilter(e.target.value)}
+                                  placeholder="Search models or enter slug..."
+                                  className="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-100 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                                />
+                              </div>
+                            )}
                             <button
-                              key={m.id}
                               type="button"
-                              onClick={() => handleUpdateSessionControl({ model: m.id })}
+                              onClick={() => handleUpdateSessionControl({ model: '' })}
                               className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between cursor-pointer"
                             >
-                              <span className="truncate">{m.name || m.id}</span>
-                              {selectedSessionMetadata?.model === m.id && <Check className="w-3 h-3 text-sky-400" />}
+                              <span>Default Model</span>
+                              {!selectedSessionMetadata?.model && <Check className="w-3 h-3 text-sky-400" />}
                             </button>
-                          ))}
-                        </div>
-                      )}
+                            {visibleModels.map((m) => {
+                              const ctxBadge =
+                                m.maxContextTokens && m.maxContextTokens > 0
+                                  ? m.maxContextTokens >= 1_000_000
+                                    ? `${Number((m.maxContextTokens / 1_000_000).toFixed(1))}M`
+                                    : `${Math.round(m.maxContextTokens / 1000)}k`
+                                  : null;
+                              const priceBadge =
+                                typeof m.promptPricePerMillion === 'number' &&
+                                typeof m.completionPricePerMillion === 'number'
+                                  ? m.promptPricePerMillion === 0 && m.completionPricePerMillion === 0
+                                    ? 'free'
+                                    : `$${Number(m.promptPricePerMillion.toFixed(2))}/$${Number(m.completionPricePerMillion.toFixed(2))}`
+                                  : null;
+                              return (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  onClick={() => handleUpdateSessionControl({ model: m.id })}
+                                  className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-between gap-2 cursor-pointer"
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <div className="truncate">{m.name || m.id}</div>
+                                    {isSearchablePopover && (ctxBadge || priceBadge) && (
+                                      <div className="flex items-center gap-1 mt-0.5 text-[10px] font-mono text-slate-400">
+                                        {ctxBadge && <span>{ctxBadge}</span>}
+                                        {ctxBadge && priceBadge && <span>·</span>}
+                                        {priceBadge && <span>{priceBadge}</span>}
+                                      </div>
+                                    )}
+                                  </div>
+                                  {selectedSessionMetadata?.model === m.id && <Check className="w-3 h-3 text-sky-400 shrink-0" />}
+                                </button>
+                              );
+                            })}
+                            {hasExactCustom && (
+                              <button
+                                type="button"
+                                onClick={() => handleUpdateSessionControl({ model: sessionModelFilter.trim() })}
+                                className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-sky-950/60 text-sky-300 font-mono border border-dashed border-sky-500/40 mt-1 cursor-pointer"
+                              >
+                                Use custom: {sessionModelFilter.trim()}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {/* Effort Selector Badge & Popover */}
@@ -5190,20 +5511,34 @@ export default function App() {
                       </div>
                     )}
 
-                    {selectedSessionMetadata?.cumulativeUsage?.totalTokens ? (
-                      <span
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30"
-                        title={`In: ${selectedSessionMetadata.cumulativeUsage.inputTokens || 0} | Out: ${selectedSessionMetadata.cumulativeUsage.outputTokens || 0} | Think: ${selectedSessionMetadata.cumulativeUsage.thinkingTokens || 0}`}
-                      >
-                        <Zap className="w-3 h-3 text-sky-400 shrink-0" />
-                        <span>
-                          {selectedSessionMetadata.cumulativeUsage.totalTokens.toLocaleString()} tokens
-                          {selectedSessionMetadata.cumulativeUsage.totalDurationSeconds
-                            ? ` (${selectedSessionMetadata.cumulativeUsage.totalDurationSeconds.toFixed(1)}s)`
-                            : ''}
+                    {selectedSessionMetadata?.cumulativeUsage?.totalTokens ? (() => {
+                      const cu = selectedSessionMetadata.cumulativeUsage;
+                      const formattedCost = formatUsdCost(cu.costUsd);
+                      const cached = cu.cachedTokens || 0;
+                      const titleParts = [
+                        `In: ${cu.inputTokens || 0}`,
+                        `Out: ${cu.outputTokens || 0}`,
+                        `Think: ${cu.thinkingTokens || 0}`,
+                        cached > 0 ? `Cached: ${cached.toLocaleString()}` : null,
+                        formattedCost ? `Cost: ${formattedCost}` : null
+                      ].filter(Boolean);
+                      return (
+                        <span
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30"
+                          title={titleParts.join(' | ')}
+                        >
+                          <Zap className="w-3 h-3 text-sky-400 shrink-0" />
+                          <span>
+                            {cu.totalTokens.toLocaleString()} tokens
+                            {cached > 0 ? ` (${cached.toLocaleString()} cached)` : ''}
+                            {formattedCost ? ` · ${formattedCost}` : ''}
+                            {cu.totalDurationSeconds
+                              ? ` (${cu.totalDurationSeconds.toFixed(1)}s)`
+                              : ''}
+                          </span>
                         </span>
-                      </span>
-                    ) : null}
+                      );
+                    })() : null}
                   </div>
                 </div>
 
@@ -6470,6 +6805,26 @@ export default function App() {
                       </span>
                     </div>
                   </div>
+                  {((usage?.lifetimeTokens?.cachedTokens ?? 0) > 0 || (usage?.lifetimeTokens?.costUsd ?? 0) > 0) && (
+                    <div className="grid grid-cols-2 gap-2.5 mt-2.5">
+                      {(usage?.lifetimeTokens?.cachedTokens ?? 0) > 0 && (
+                        <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                          <span className="text-[10px] font-mono text-slate-500 uppercase block">Cached Tokens</span>
+                          <span className="text-base font-bold text-cyan-300 font-mono mt-0.5 block">
+                            {(usage?.lifetimeTokens?.cachedTokens || 0).toLocaleString()}
+                          </span>
+                        </div>
+                      )}
+                      {(usage?.lifetimeTokens?.costUsd ?? 0) > 0 && (
+                        <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3">
+                          <span className="text-[10px] font-mono text-slate-500 uppercase block">Total Cost (USD)</span>
+                          <span className="text-base font-bold text-amber-300 font-mono mt-0.5 block">
+                            {formatUsdCost(usage?.lifetimeTokens?.costUsd)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Provider Quota Meters - rendered only from a real provider reading */}
@@ -6785,28 +7140,68 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                     <div className="space-y-1">
                       <label className="block text-[11px] text-slate-400">Default Model</label>
-                      <select
-                        aria-label="Persona Default Model"
-                        value={personaDefaultModel}
-                        disabled={driverModels.length === 0}
-                        title={capabilitySourceLabel(personaModalRuntimeCaps)}
-                        onChange={(e) => {
-                          const newModel = e.target.value;
-                          setPersonaDefaultModel(newModel);
-                          const newModelObj = driverModels.find((m) => m.id === newModel);
-                          if (newModelObj?.contextSizes && personaDefaultContextSize && !newModelObj.contextSizes.some((cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase())) {
-                            setPersonaDefaultContextSize('');
+                      {personaModalRuntimeCaps?.adapter === 'openrouter' || driverModels.length > 25 ? (
+                        <SearchableModelPicker
+                          ariaLabel="Persona Default Model"
+                          models={driverModels}
+                          value={personaDefaultModel}
+                          disabled={driverModels.length === 0}
+                          title={capabilitySourceLabel(personaModalRuntimeCaps)}
+                          defaultOptionLabel="Driver Default"
+                          allowCustom={
+                            personaModalRuntimeCaps?.adapter === 'openai' ||
+                            personaModalRuntimeCaps?.adapter === 'openrouter'
                           }
-                        }}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        <option value="">Driver Default</option>
-                        {driverModels.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.name || m.id}
-                          </option>
-                        ))}
-                      </select>
+                          onChange={(newModel) => {
+                            setPersonaDefaultModel(newModel);
+                            const newModelObj = driverModels.find((m) => m.id === newModel);
+                            if (
+                              newModelObj?.contextSizes &&
+                              personaDefaultContextSize &&
+                              !newModelObj.contextSizes.some(
+                                (cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase()
+                              )
+                            ) {
+                              setPersonaDefaultContextSize('');
+                            }
+                          }}
+                        />
+                      ) : (
+                        <>
+                          <select
+                            aria-label="Persona Default Model"
+                            value={personaDefaultModel}
+                            disabled={driverModels.length === 0}
+                            title={capabilitySourceLabel(personaModalRuntimeCaps)}
+                            onChange={(e) => {
+                              const newModel = e.target.value;
+                              setPersonaDefaultModel(newModel);
+                              const newModelObj = driverModels.find((m) => m.id === newModel);
+                              if (newModelObj?.contextSizes && personaDefaultContextSize && !newModelObj.contextSizes.some((cs) => cs.toLowerCase() === personaDefaultContextSize.toLowerCase())) {
+                                setPersonaDefaultContextSize('');
+                              }
+                            }}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-sky-500 cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <option value="">Driver Default</option>
+                            {driverModels.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                {m.name || m.id}
+                              </option>
+                            ))}
+                          </select>
+                          {personaModalRuntimeCaps?.adapter === 'openai' && (
+                            <input
+                              type="text"
+                              aria-label="Custom Persona Model Input"
+                              placeholder="Or custom model name..."
+                              value={personaDefaultModel}
+                              onChange={(e) => setPersonaDefaultModel(e.target.value)}
+                              className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
+                            />
+                          )}
+                        </>
+                      )}
                       {/* Provenance, so a bundled preset is never mistaken for a driver answer. */}
                       {driverModels.length > 0 ? (
                         <p className="text-[10px] text-slate-500 leading-tight">
@@ -6818,16 +7213,6 @@ export default function App() {
                             {capabilityUnavailableMessage(personaModalRuntimeCaps)}
                           </p>
                         )
-                      )}
-                      {personaModalRuntimeCaps?.adapter === 'openai' && (
-                        <input
-                          type="text"
-                          aria-label="Custom Persona Model Input"
-                          placeholder="Or custom model name..."
-                          value={personaDefaultModel}
-                          onChange={(e) => setPersonaDefaultModel(e.target.value)}
-                          className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-slate-200 text-[11px] font-mono focus:outline-none focus:border-sky-500"
-                        />
                       )}
                     </div>
 

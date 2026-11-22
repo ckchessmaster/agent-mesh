@@ -14,6 +14,13 @@ import { WorkspaceType, ProjectJobStatus } from '../types';
 vi.mock('../services/api', () => ({
   api: {
     verifyAuth: vi.fn().mockResolvedValue({ authenticated: true }),
+    // The header bell polls the pending-attention rollup. Default to an empty inbox so the bell
+    // never renders its error state in an unrelated App test; override per test to seed waits.
+    getAttention: vi.fn().mockResolvedValue({
+      items: [],
+      count: 0,
+      generatedAt: new Date('2026-01-01T00:00:00.000Z').toISOString()
+    }),
     getStatus: vi.fn(),
     getAgents: vi.fn(),
     getPersonas: vi.fn(),

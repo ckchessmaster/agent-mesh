@@ -47,6 +47,7 @@ public class AgentPresetConfig
     public int? CompactionThresholdPercent { get; set; }
     public int? StreamChunkIdleTimeoutSeconds { get; set; }
     public OpenAISettings? OpenAi { get; set; }
+    public OpenRouterConfig? OpenRouter { get; set; }
     public string? LoginCommand { get; set; }
     public string? AuthCheckCommand { get; set; }
     public DriverSidecarConfig? Sidecar { get; set; }

@@ -19,7 +19,8 @@ import {
   AlertCircle,
   Download,
   Eye,
-  X
+  X,
+  AlertOctagon
 } from 'lucide-react';
 import { api } from '../services/api';
 import type {
@@ -120,10 +121,10 @@ export interface JobCockpitProps {
   onReopenJob?: () => Promise<void>;
   onResetJob?: () => Promise<void>;
   /**
-   * Resumes a stalled job from the platform's own record of its progress. Present only when the parent
-   * can reach the API; the button renders alongside (never instead of) Reset, because Reset discards the
-   * checklist and Recover keeps it, and an operator needs to be able to see that difference at the moment
-   * they choose.
+   * Resumes a stalled or halted job from the platform's own record of its progress. Present only when
+   * the parent can reach the API; the button renders alongside (never instead of) Reset, because Reset
+   * discards the checklist and Recover keeps it, and an operator needs to be able to see that
+   * difference at the moment they choose.
    */
   onRecoverJob?: (note?: string) => Promise<void>;
   onSelectTurnSession?: (sessionId: string) => void;
@@ -139,6 +140,7 @@ export interface JobCockpitProps {
     status?: ProjectJobStatus;
     resultSummary?: string;
     assignedAgentId?: string | null;
+    turnBudget?: number | null;
   }) => Promise<void>;
   onDeleteJob?: () => Promise<void>;
   onStopTurn?: (sessionId: string) => Promise<void>;
@@ -421,10 +423,19 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
   // cockpit has that a job showing "Active Job" underneath has no agent working on it any more.
   const isStalled = job.lifecycleStatus === 'Stalled';
 
+  /**
+   * The workflow's own `Halted:` marker (see PersistJobHaltAsync): the run completed as an honest
+   * failure and nothing is advancing the job. A halted job needs recovery as much as a stalled one
+   * does — in fact more reliably, because its run is certainly closed — so the badge must say Blocked
+   * (never the stale "Active Job" the fall-through used to render) and the Recover button must offer
+   * the repair the /recover endpoint already performs.
+   */
+  const isBlocked = job.lifecycleStatus === 'Blocked';
+
   // Recovery only applies to a job that is running in principle and stuck in practice. The badge above
   // already hides "Stalled" behind Archived/Completed, and the endpoint rejects an archived job with a
   // 409, so offering the button there would be a control that can only fail.
-  const canRecover = Boolean(onRecoverJob) && isStalled && !isArchived && !isCompleted;
+  const canRecover = Boolean(onRecoverJob) && (isStalled || isBlocked) && !isArchived && !isCompleted;
 
   const teamMembers = useMemo(() => {
     const map = new Map<string, { id: string; name: string; role: string }>();
@@ -581,6 +592,14 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                 >
                   <Clock className="w-3 h-3" /> Stalled
                 </span>
+              ) : isBlocked ? (
+                <span
+                  className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-rose-500/20 text-rose-300 border border-rose-500/40 flex items-center gap-1"
+                  data-testid="job-status-blocked"
+                  title={job.progressHeartbeat || 'The workflow halted on its own. Nothing is running.'}
+                >
+                  <AlertOctagon className="w-3 h-3" /> Blocked
+                </span>
               ) : (
                 <span
                   className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40"
@@ -610,8 +629,10 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
           </div>
         </div>
 
-        {/* Assigned Personas & Actions */}
-        <div className="flex items-center flex-wrap gap-1.5 sm:gap-2.5 shrink-0 w-full md:w-auto">
+        {/* Assigned Personas & Actions. No shrink-0 here: the row carries Complete/Recover/Reset, and a
+            non-shrinking block next to an overflow-hidden page root clipped those controls off-screen at
+            laptop width — the one place an operator was supposed to triage a stuck job from. */}
+        <div className="flex items-center flex-wrap gap-1.5 sm:gap-2.5 min-w-0 w-full md:w-auto">
           {/* Job Assignee Dropdown */}
           <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800 px-2.5 py-1.5 rounded-xl text-xs min-w-0 max-w-full">
             <span className="text-[11px] font-semibold text-slate-400 shrink-0">Assignee:</span>
@@ -619,7 +640,7 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
               value={job.assignedAgentId || project.defaultLeadPersonaId || ''}
               onChange={async (e) => {
                 if (onUpdateJob) {
-                  await onUpdateJob({ assignedAgentId: e.target.value || null });
+                  await onUpdateJob({ assignedAgentId: e.target.value });
                 }
               }}
               title="Assign this job to a team member"
@@ -849,7 +870,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                   {showRecoverConfirm ? (
                     <div className="flex items-center gap-2 bg-slate-900 border border-amber-500/40 p-1.5 rounded-xl flex-wrap">
                       <span className="text-xs text-amber-200">
-                        Settle the abandoned turn{onResetJob ? ' and resume from recorded progress' : ''}?
+                        {isBlocked
+                          ? 'Nothing is running. Start a fresh run resumed from the recorded checklist?'
+                          : `Settle the abandoned turn${onResetJob ? ' and resume from recorded progress' : ''}?`}
                       </span>
                       <button
                         type="button"
@@ -872,7 +895,9 @@ export const JobCockpit: React.FC<JobCockpitProps> = ({
                     <button
                       type="button"
                       onClick={() => setShowRecoverConfirm(true)}
-                      title="Settle the turn that stopped reporting and resume the job from the task it was on. Keeps the checklist and the workspace; unlike Reset, nothing is terminated."
+                      title={isBlocked
+                        ? 'The workflow halted and its run is closed. Start a fresh run resumed from the recorded checklist and raise the turn budget in Settings first if the turns were dying on infrastructure. Keeps the checklist and the workspace.'
+                        : 'Settle the turn that stopped reporting and resume the job from the task it was on. Keeps the checklist and the workspace; unlike Reset, nothing is terminated.'}
                       className="px-3.5 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 text-xs font-semibold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-sm"
                       data-testid="cockpit-recover-job-btn"
                     >

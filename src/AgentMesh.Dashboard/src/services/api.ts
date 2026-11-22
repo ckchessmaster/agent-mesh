@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   Agent,
   AgentSession,
   AgentUsageResponse,
@@ -8,6 +8,8 @@ import type {
   DashboardOverviewResponse,
   DriverConfig,
   DriverSidecarConfig,
+  ModelCapability,
+  OpenRouterConfig,
   JobTask,
   AssignJobTaskResult,
   Persona,
@@ -64,6 +66,7 @@ import {
   ProjectJobPriority,
   ProjectJobStatus,
 } from '../types';
+import type { AttentionRollup } from '../types/attention';
 
 let tokenProvider: (() => string | null) | null = null;
 let unauthorizedHandler: (() => void | Promise<void>) | null = null;
@@ -662,6 +665,22 @@ export const api = {
     return res.json();
   },
 
+  /**
+   * `GET /api/attention` — every job across every project waiting on a human, oldest first.
+   *
+   * The wait rules (plan-approval heartbeat, unanswered ask, pending card) live server-side in
+   * `AttentionQueryService`, so the bell and the desktop-notification path can never disagree about
+   * what counts as blocked. Nothing is pending returns `{ items: [], count: 0 }`, never a 404, so a
+   * polling client has exactly one shape to handle.
+   */
+  async getAttention(): Promise<AttentionRollup> {
+    const res = await apiFetch('/api/attention', { headers: getHeaders() });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to load pending attention'));
+    }
+    return res.json();
+  },
+
   async testOpenAiServer(req: { endpoint: string; apiKey?: string; sidecar?: DriverSidecarConfig | null; agentId?: string }): Promise<{ success: boolean; error?: string; models: { id: string; name: string }[] }> {
     const res = await apiFetch('/api/system/drivers/test-openai', {
       method: 'POST',
@@ -669,6 +688,27 @@ export const api = {
       body: JSON.stringify(req)
     });
     if (!res.ok) throw new Error(`Failed to test OpenAI server: ${res.statusText}`);
+    return res.json();
+  },
+
+  async testOpenRouterServer(req: {
+    endpoint?: string;
+    apiKey?: string;
+    agentId?: string;
+  }): Promise<{
+    success: boolean;
+    error?: string;
+    models: ModelCapability[];
+    keyLabel?: string | null;
+    isFreeTier?: boolean | null;
+    limitRemaining?: number | null;
+  }> {
+    const res = await apiFetch('/api/system/drivers/test-openrouter', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!res.ok) throw new Error(`Failed to test OpenRouter connection: ${res.statusText}`);
     return res.json();
   },
 
@@ -948,6 +988,7 @@ export const api = {
   async upsertAgent(req: {
     id: string;
     name: string;
+    runtimeType?: number | string;
     role?: string;
     status?: string;
     capabilitiesJson?: string;
@@ -1001,6 +1042,7 @@ export const api = {
       sidecar?: DriverSidecarConfig;
       loginCommand?: string;
       authCheckCommand?: string;
+      openRouter?: OpenRouterConfig;
     }
   ): Promise<DriverConfig> {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/config`, {
@@ -1552,6 +1594,7 @@ export const api = {
     priority?: number;
     approvalPolicy?: number;
     assignedAgentId?: string | null;
+    turnBudget?: number | null;
   }): Promise<ProjectJob> {
     const res = await apiFetch(`/api/project-jobs/${encodeURIComponent(id)}`, {
       method: 'PUT',
@@ -2067,6 +2110,26 @@ export const api = {
     if (!res.ok) {
       throw new Error(await readApiErrorMessage(res, 'Failed to submit intervention'));
     }
+  },
+
+  /**
+   * Retires an escalation/consultation card without replying to it.
+   *
+   * The exit for "already handled elsewhere / stale wait" — replying is what a comment does, and a
+   * comment on a dead run signals into the void. Gate cards are refused by the endpoint (400);
+   * decide those with their own controls. Returns the updated card so callers can repaint without
+   * waiting on the hub.
+   */
+  async resolveTimelineCard(jobId: string, cardId: string, note?: string): Promise<JobTimelineCard> {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/timeline/cards/${encodeURIComponent(cardId)}/resolve`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ note: note?.trim() || null })
+    });
+    if (!res.ok) {
+      throw new Error(await readApiErrorMessage(res, 'Failed to resolve card'));
+    }
+    return (await res.json()) as JobTimelineCard;
   },
 
   async getMcpServers(options?: { enabled?: boolean; transport?: McpTransportType }): Promise<McpServer[]> {

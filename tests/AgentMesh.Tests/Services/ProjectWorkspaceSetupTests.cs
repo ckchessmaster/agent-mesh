@@ -361,6 +361,149 @@ public class ProjectWorkspaceSetupTests : IDisposable
         ]);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Remote identity: an existing checkout must be the project's own repository.
+    //
+    // A project whose repository_name still carries the pre-multi-repo placeholder resolves onto
+    // whichever checkout is mounted at /workspace/repos/agent-mesh — in this deployment, the platform's
+    // own repository. Before this check the fast path accepted any directory containing .git, so the job
+    // branched and committed against the wrong remote while every command reported success.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task EnsureWorkspaceAsync_ExistingCheckoutOfADifferentRemote_FailsAndLeavesItAlone()
+    {
+        var remoteA = await CreateSeededBareRepoAsync("remote-a.git");
+        var remoteB = await CreateSeededBareRepoAsync("remote-b.git");
+        var parent = Path.Combine(_tempRoot, "repos");
+        var targetDir = Path.Combine(parent, "budget-app");
+        Directory.CreateDirectory(parent);
+        await RunGitAsync(parent, "clone", "--", remoteA, targetDir);
+
+        var setup = new ProjectWorkspaceSetup();
+        var result = await setup.EnsureWorkspaceAsync(new ProjectWorkspaceSetupRequest(
+            ProjectId: "budget-app",
+            ProjectName: "Budget App",
+            RepositoryName: "budget-app",
+            WorkingDirectory: targetDir,
+            WorkspaceType: WorkspaceType.Git,
+            GitRepositoryUrl: remoteB,
+            GitBaseBranch: "main"));
+
+        result.Success.Should().BeFalse(result.Message);
+        result.Outcome.Should().Be(ProjectWorkspaceSetupOutcome.Failed);
+        result.UsedFallback.Should().BeFalse();
+        result.Message.Should().Contain("is a checkout of").And.Contain(remoteB);
+
+        // Refusing must be a no-op on the tree it refused: no branch, no commit, no dirty files.
+        var (headExit, headSha, _) = await RunGitAsync(targetDir, "rev-parse", "HEAD");
+        headExit.Should().Be(0);
+        headSha.Should().NotBeEmpty();
+        var (_, porcelain, _) = await RunGitAsync(targetDir, "status", "--porcelain");
+        porcelain.Should().BeEmpty();
+        var (_, branches, _) = await RunGitAsync(targetDir, "branch", "--format=%(refname:short)");
+        branches.Should().Be("main");
+    }
+
+    [Fact]
+    public async Task EnsureWorkspaceAsync_ExistingCheckoutMatchesRemoteSpelledDifferently_IsReused()
+    {
+        var remote = await CreateSeededBareRepoAsync("remote-match.git");
+        var targetDir = Path.Combine(_tempRoot, "cloned-match");
+        await RunGitAsync(_tempRoot, "clone", "--", remote, targetDir);
+
+        var setup = new ProjectWorkspaceSetup();
+        var result = await setup.EnsureWorkspaceAsync(new ProjectWorkspaceSetupRequest(
+            ProjectId: "budget-app",
+            WorkingDirectory: targetDir + "/",
+            WorkspaceType: WorkspaceType.Git,
+            GitRepositoryUrl: remote + "/",
+            GitBaseBranch: "main"));
+
+        result.Success.Should().BeTrue(result.Message);
+        result.Outcome.Should().Be(ProjectWorkspaceSetupOutcome.AlreadyInitialized);
+        result.Warnings.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task EnsureWorkspaceAsync_ExistingCheckoutWithNoConfiguredRemote_IsReused()
+    {
+        var remote = await CreateSeededBareRepoAsync("remote-nourl.git");
+        var targetDir = Path.Combine(_tempRoot, "cloned-nourl");
+        await RunGitAsync(_tempRoot, "clone", "--", remote, targetDir);
+
+        var setup = new ProjectWorkspaceSetup();
+        var result = await setup.EnsureWorkspaceAsync(new ProjectWorkspaceSetupRequest(
+            ProjectId: "local-only",
+            WorkingDirectory: targetDir,
+            WorkspaceType: WorkspaceType.Git));
+
+        result.Success.Should().BeTrue(result.Message);
+        result.Outcome.Should().Be(ProjectWorkspaceSetupOutcome.AlreadyInitialized);
+    }
+
+    [Fact]
+    public async Task EnsureWorkspaceAsync_ExistingCheckoutWithNoOriginRemote_WarnsInsteadOfFailing()
+    {
+        // A locally initialized repository cannot be a checkout of some other project's remote, and
+        // projects whose remote was configured after the fact must keep working. So: warn, do not fail.
+        var targetDir = Path.Combine(_tempRoot, "local-only-noorigin");
+        Directory.CreateDirectory(targetDir);
+        await RunGitAsync(targetDir, "-c", "init.defaultBranch=main", "init");
+
+        var setup = new ProjectWorkspaceSetup();
+        var result = await setup.EnsureWorkspaceAsync(new ProjectWorkspaceSetupRequest(
+            ProjectId: "local-only",
+            WorkingDirectory: targetDir,
+            WorkspaceType: WorkspaceType.Git,
+            GitRepositoryUrl: Path.Combine(_tempRoot, "not-configured-yet.git")));
+
+        result.Success.Should().BeTrue(result.Message);
+        result.Outcome.Should().Be(ProjectWorkspaceSetupOutcome.AlreadyInitialized);
+        result.Warnings.Should().ContainSingle(w => w.Contains("origin"));
+    }
+
+    [Fact]
+    public async Task EnsureWorkspaceAsync_MismatchFoundInMonorepoSubdirectoryCheckout_Fails()
+    {
+        var remoteA = await CreateSeededBareRepoAsync("monorepo-a.git");
+        var monorepoDir = Path.Combine(_tempRoot, "monorepo");
+        var serviceDir = Path.Combine(monorepoDir, "services", "api");
+        await RunGitAsync(_tempRoot, "clone", "--", remoteA, monorepoDir);
+        Directory.CreateDirectory(serviceDir);
+        await File.WriteAllTextAsync(Path.Combine(serviceDir, "Program.cs"), "// api\n");
+        await RunGitAsync(monorepoDir, "add", "-A");
+        await RunGitAsync(monorepoDir, "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "add api service");
+
+        var setup = new ProjectWorkspaceSetup();
+        var result = await setup.EnsureWorkspaceAsync(new ProjectWorkspaceSetupRequest(
+            ProjectId: "other-project",
+            WorkingDirectory: serviceDir,
+            WorkspaceType: WorkspaceType.Git,
+            GitRepositoryUrl: await CreateSeededBareRepoAsync("monorepo-b.git")));
+
+        result.Success.Should().BeFalse(result.Message);
+        result.Message.Should().Contain("is a checkout of");
+    }
+
+    private async Task<string> CreateSeededBareRepoAsync(string name)
+    {
+        var bareRepo = Path.Combine(_tempRoot, name);
+        var seedDir = Path.Combine(_tempRoot, $"{name}-seed");
+        Directory.CreateDirectory(bareRepo);
+        Directory.CreateDirectory(seedDir);
+
+        await RunGitAsync(bareRepo, "-c", "init.defaultBranch=main", "init", "--bare");
+        await RunGitAsync(seedDir, "-c", "init.defaultBranch=main", "init");
+        await File.WriteAllTextAsync(Path.Combine(seedDir, "seed.txt"), $"seed for {name}\n");
+        await RunGitAsync(seedDir, "add", "-A");
+        await RunGitAsync(seedDir, "-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "initial");
+        await RunGitAsync(seedDir, "remote", "add", "origin", bareRepo);
+        await RunGitAsync(seedDir, "push", "origin", "main");
+
+        return bareRepo;
+    }
+
     private static async Task<(int ExitCode, string StdOut, string StdErr)> RunGitAsync(
         string workingDirectory,
         params string[] args)

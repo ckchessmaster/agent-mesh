@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using AgentMesh.Api.Hubs;
 using AgentMesh.Api.Services;
@@ -39,6 +39,7 @@ public record ProjectJobDto(
     string? ProgressHeartbeat = null,
     string? LifecycleStatus = null,
     string? AssignedAgentId = null,
+    int? TurnBudget = null,
     List<JobAttachmentDto>? Attachments = null
 );
 
@@ -77,6 +78,7 @@ public record UpdateProjectJobRequest(
     ProjectJobPriority? Priority = null,
     PlanApprovalPolicy? ApprovalPolicy = null,
     string? AssignedAgentId = null,
+    int? TurnBudget = null,
     List<JobAttachmentDto>? Attachments = null
 );
 
@@ -126,7 +128,12 @@ public class ProjectJobsController(
     IWorkflowSignalRouter? workflows = null,
     ILogger<ProjectJobsController>? logger = null,
     JobTurnDispatcher? turns = null,
-    ICredentialEncryptionService? encryptionService = null) : ControllerBase
+    ICredentialEncryptionService? encryptionService = null,
+    // Optional like the rest: dozens of tests construct this controller to exercise job and task
+    // CRUD. The production container registers it and ApiServiceRegistrationTests pins that, so
+    // the null default can only ever mean "a unit test", never "notifications are off in
+    // production".
+    IAttentionNotifier? attention = null) : ControllerBase
 {
     private readonly IWorkflowSignalRouter? _workflows = workflows;
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -282,6 +289,19 @@ public class ProjectJobsController(
             return NotFound(new { error = $"Job '{id}' not found." });
         }
 
+        // Validated before any field lands, so a request rejected here cannot half-apply: this handler
+        // otherwise writes every named field in one pass, and "the title changed but the budget was
+        // refused" is the kind of split decision an operator should never have to reason about.
+        //
+        // Bounds mirror the fuse's purpose: at 1 turn there is nothing to loop on, and past 1000 the
+        // ceiling has stopped being a fuse at all. Zero and negatives are rejected rather than clamped
+        // — an operator typing 0 means something, and "disable the budget" is not what this field
+        // does (omitted means keep the current value; the platform default is the null state).
+        if (req.TurnBudget.HasValue && req.TurnBudget.Value is < 1 or > 1000)
+        {
+            return BadRequest(new { error = "TurnBudget must be between 1 and 1000, or omitted to keep the current value." });
+        }
+
         if (!string.IsNullOrWhiteSpace(req.Title)) job.Title = req.Title.Trim();
         if (req.Description != null) job.Description = req.Description.Trim();
         if (!string.IsNullOrWhiteSpace(req.GitBranchName)) job.GitBranchName = req.GitBranchName.Trim();
@@ -289,6 +309,7 @@ public class ProjectJobsController(
         if (req.Priority.HasValue) job.Priority = req.Priority.Value;
         if (req.ApprovalPolicy.HasValue) job.ApprovalPolicy = req.ApprovalPolicy.Value;
         if (req.ResultSummary != null) job.ResultSummary = req.ResultSummary.Trim();
+        if (req.TurnBudget.HasValue) job.TurnBudget = req.TurnBudget.Value;
         if (req.AssignedAgentId != null)
         {
             job.AssignedAgentId = string.IsNullOrWhiteSpace(req.AssignedAgentId)
@@ -308,6 +329,46 @@ public class ProjectJobsController(
         await db.SaveChangesAsync();
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
+
+        if (req.AssignedAgentId != null && _workflows != null)
+        {
+            var effectiveAssignee = job.AssignedAgentId;
+            if (string.IsNullOrWhiteSpace(effectiveAssignee))
+            {
+                effectiveAssignee = project?.DefaultLeadPersonaId;
+                if (string.IsNullOrWhiteSpace(effectiveAssignee))
+                {
+                    effectiveAssignee = await db.ProjectPersonas
+                        .AsNoTracking()
+                        .Where(pp => pp.ProjectId == job.ProjectId)
+                        .Select(pp => pp.PersonaId)
+                        .FirstOrDefaultAsync();
+                }
+                if (string.IsNullOrWhiteSpace(effectiveAssignee))
+                {
+                    effectiveAssignee = await db.Personas
+                        .AsNoTracking()
+                        .Select(p => p.Id)
+                        .FirstOrDefaultAsync();
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(effectiveAssignee))
+            {
+                try
+                {
+                    await _workflows.SendAssigneeUpdateAsync(
+                        id,
+                        new JobAssigneeUpdatedSignal(effectiveAssignee.Trim().ToLowerInvariant()),
+                        HttpContext?.RequestAborted ?? CancellationToken.None);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    logger?.LogWarning(ex, "Failed to signal workflow assignee update for job {JobId}", id);
+                }
+            }
+        }
+
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
         var dto = ToDto(job, project?.Name, cardCount);
 
@@ -1297,8 +1358,13 @@ public class ProjectJobsController(
                         WorkspacePath: workspacePath,
                         InitialPrompt: initialPrompt,
                         TargetBranch: targetBranch,
-                        ApprovalPolicy: job.ApprovalPolicy
-                    )),
+                        ApprovalPolicy: job.ApprovalPolicy)
+                    {
+                        // Object initializer, not a named argument: the StartWorkflowAsync lambda is
+                        // an expression tree, and named arguments that skip optional parameters are
+                        // not legal in one. Same value either way.
+                        TurnBudget = job.TurnBudget
+                    }),
                     options
                 );
                 temporalStarted = true;
@@ -1318,8 +1384,10 @@ public class ProjectJobsController(
                             WorkspacePath: workspacePath,
                             InitialPrompt: initialPrompt,
                             TargetBranch: targetBranch,
-                            ApprovalPolicy: job.ApprovalPolicy
-                        )),
+                            ApprovalPolicy: job.ApprovalPolicy)
+                        {
+                            TurnBudget = job.TurnBudget
+                        }),
                         options
                     );
                     temporalStarted = true;
@@ -1481,6 +1549,11 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // Completing or archiving a job removes it from OpenJobsPredicate, which is how a wait that
+        // ended by the job simply finishing raises AttentionResolved: the same call that used to return
+        // an item now returns null. No write site has to know which kind it was clearing.
+        await attention.RefreshAttentionAsync(id);
+
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
         var dto = ToDto(job, project?.Name, cardCount);
@@ -1506,6 +1579,9 @@ public class ProjectJobsController(
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
 
+        // Same reason as CompleteJob above: archived jobs leave the rollup, so their waits are over.
+        await attention.RefreshAttentionAsync(id);
+
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
         var dto = ToDto(job, project?.Name, cardCount);
@@ -1519,7 +1595,11 @@ public class ProjectJobsController(
     }
 
     [HttpPost("api/project-jobs/{id}/reopen")]
-    public async Task<IActionResult> ReopenJob(Guid id)
+    public async Task<IActionResult> ReopenJob(
+        Guid id,
+        [FromServices] IJobExecutionWorkflowGateway? gateway = null,
+        [FromServices] IJobTurnRecovery? recovery = null,
+        CancellationToken ct = default)
     {
         var job = await db.ProjectJobs.FirstOrDefaultAsync(j => j.Id == id);
         if (job == null)
@@ -1530,6 +1610,51 @@ public class ProjectJobsController(
         job.Status = ProjectJobStatus.Active;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        // Reopening without resuming is what produced the Notifications incident: `/complete` had
+        // cancelled the run, reopen flipped the row back to Active, and the persona kept taking
+        // dispatched turns on a job with `NoRunningWorkflow` — every escalation it filed to reach a
+        // human landed in the ledger instead, on loop, overnight. If this job had an orchestrator and
+        // that run has closed, reopen resumes it through the recovery path rather than resurrecting a
+        // UI-only zombie. Two shapes deliberately do not resume: a job that never had a run (that is
+        // the pre-start state `/start` owns), and a job whose run is still open (archive-without-
+        // cancel — the run never left, and starting a second one would double-own the workspace).
+        // A failed resume never fails the reopen: the row is already Active, and `/recover` can be
+        // called by hand; silently NOT resuming, however, is the bug being fixed, so it logs loud.
+        if (gateway is not null && recovery is not null)
+        {
+            try
+            {
+                var run = await gateway.FindRunAsync(id, ct);
+                if (run is { IsOpen: false })
+                {
+                    var resume = await recovery.RecoverAsync(
+                        id,
+                        new JobRecoveryRequest(Note:
+                            "Reopened by operator while its workflow run was closed; reopen resumed the " +
+                            "job from its recorded progress rather than leaving it without an orchestrator."),
+                        caller: "operator",
+                        ct: ct);
+                    logger?.LogInformation("Reopen of job {JobId} resumed its closed workflow: {Message}",
+                        id, resume.Message);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger?.LogWarning(ex,
+                    "Reopen of job {JobId} left it Active but NOT resumed — call /recover to restart its " +
+                    "orchestrator; until then escalations on this job have no workflow to answer them.", id);
+            }
+        }
+
+        // Reopening puts the job back inside OpenJobsPredicate. If its last heartbeat still reads
+        // "Awaiting plan approval" because the plan was never approved, that wait is real again and the
+        // bell should say so; if it does not, this is the no-op the client cannot tell apart.
+        // Deliberately after the resume above: when a resume ran, recovery stamped the row with
+        // "Recovering: resuming at task…" — which supersedes whatever wait the pre-resume heartbeat
+        // carried — and the bell must read the state this request actually left behind, not the one
+        // it replaced mid-request.
+        await attention.RefreshAttentionAsync(id);
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
@@ -1587,6 +1712,10 @@ public class ProjectJobsController(
         job.ProgressHeartbeat = null;
         job.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+
+        // A reset clears the heartbeat, which is the source that was holding the wait. The job is still
+        // open (Pending is in the rollup), so only the cleared heartbeat makes this a resolution.
+        await attention.RefreshAttentionAsync(id);
 
         var project = await db.Projects.AsNoTracking().FirstOrDefaultAsync(p => p.Id == job.ProjectId);
         var cardCount = await db.JobTimelineCards.CountAsync(c => c.JobId == id.ToString());
@@ -2032,6 +2161,7 @@ public class ProjectJobsController(
             j.ProgressHeartbeat,
             DeriveLifecycleStatus(j),
             j.AssignedAgentId,
+            j.TurnBudget,
             ParseAttachments(j.AttachmentsJson)
         );
     }
@@ -2047,9 +2177,23 @@ public class ProjectJobsController(
             // made an abandoned turn look like a running one for thirteen hours.
             if (AgentMesh.Infrastructure.Services.TurnStallSettler.IsStalledHeartbeat(j.ProgressHeartbeat))
                 return "Stalled";
+            // The halt marker the workflow's own settle write leaves behind (PersistJobHaltAsync).
+            // Checked before the substring walk for the same reason Stalled is: a halt message quotes
+            // what the job was doing when it stopped, and the marker outranks the quote. This is the
+            // only producer the cockpit's Blocked badge has ever had a slot for.
+            if (j.ProgressHeartbeat.StartsWith("Halted", StringComparison.OrdinalIgnoreCase))
+                return "Blocked";
             if (j.ProgressHeartbeat.Contains("Awaiting plan approval", StringComparison.OrdinalIgnoreCase))
                 return "AwaitingApproval";
-            if (j.ProgressHeartbeat.Contains("Awaiting pull request review", StringComparison.OrdinalIgnoreCase))
+            // Broadened deliberately: the string this check was written against ("Awaiting pull
+            // request review") is not the string anything actually writes. The persisted writer is
+            // the gate card's title, "Awaiting Review: PR #98", and the workflow's in-memory form is
+            // "Awaiting PR review on <url>" — so AwaitingReview never derived, and a job parked
+            // seven days waiting for a human rendered as plain InProgress. The original phrase stays
+            // for rows written while it was the only spelling.
+            if (j.ProgressHeartbeat.Contains("Awaiting pull request review", StringComparison.OrdinalIgnoreCase) ||
+                j.ProgressHeartbeat.Contains("Awaiting Review", StringComparison.OrdinalIgnoreCase) ||
+                j.ProgressHeartbeat.Contains("Awaiting PR review", StringComparison.OrdinalIgnoreCase))
                 return "AwaitingReview";
             if (j.ProgressHeartbeat.Contains("Exploring codebase", StringComparison.OrdinalIgnoreCase))
                 return "Planning";

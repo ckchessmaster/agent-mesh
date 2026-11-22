@@ -210,6 +210,12 @@ public sealed class ProjectWorkspaceSetup : IProjectWorkspaceSetup
         // Fast path: directory is already a git repository root.
         if (Directory.Exists(targetDirectory) && HasGitMetadata(targetDirectory))
         {
+            var mismatch = await RemoteMismatchReasonAsync(targetDirectory, request, warnings, log, ct);
+            if (mismatch is not null)
+            {
+                return ProjectWorkspaceSetupResult.Failure(targetDirectory, mismatch, warnings);
+            }
+
             log?.Invoke($"Project workspace already initialized at '{targetDirectory}'.");
             return ProjectWorkspaceSetupResult.Succeeded(
                 targetDirectory,
@@ -225,6 +231,12 @@ public sealed class ProjectWorkspaceSetup : IProjectWorkspaceSetup
             IsDirectoryNonEmpty(targetDirectory) &&
             IsInsideMonorepoCheckout(targetDirectory))
         {
+            var mismatch = await RemoteMismatchReasonAsync(targetDirectory, request, warnings, log, ct);
+            if (mismatch is not null)
+            {
+                return ProjectWorkspaceSetupResult.Failure(targetDirectory, mismatch, warnings);
+            }
+
             log?.Invoke($"Project workspace '{targetDirectory}' is part of an existing repository checkout.");
             return ProjectWorkspaceSetupResult.Succeeded(
                 targetDirectory,
@@ -277,6 +289,75 @@ public sealed class ProjectWorkspaceSetup : IProjectWorkspaceSetup
             createdFiles,
             msg,
             warnings: warnings);
+    }
+
+    /// <summary>
+    /// Why an existing checkout must not be reused, or null when it is the repository the project names.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Reusing a directory that already has <c>.git</c> is the fast path, and it used to be
+    /// unconditional — "is a repository" was treated as "is this project's repository". When a project
+    /// row still carries the pre-multi-repo <c>repository_name</c> default
+    /// (<see cref="Project.DefaultRepositoryName"/>, which is also this deployment's own repository),
+    /// the conventional path resolves onto whichever other checkout happens to be mounted in the same
+    /// container, and every command the agent runs — <c>git status</c>, <c>git checkout -b</c>, the
+    /// commit at the end — succeeds against the wrong tree. The job then carries commits, a branch and
+    /// eventually a pull request against a repository the project was never about, and nothing in the
+    /// platform reports an error. That is exactly the failure
+    /// <see cref="WorkspacePathResolver"/> was written to prevent, reintroduced through the door the
+    /// fast path left open.
+    /// </para>
+    /// <para>
+    /// A mismatch is returned as a hard failure rather than routed through
+    /// <see cref="TryFallback"/>: a fallback to a scratch directory at least produces an honest
+    /// "there is no code here", whereas continuing inside a real checkout of a different repository
+    /// produces work that cannot be merged and looks like work while it happens.
+    /// </para>
+    /// <para>
+    /// An unreadable or absent <c>origin</c> warns instead of failing. A workspace initialized locally
+    /// cannot be a checkout of some other repository, and refusing to run there would break projects
+    /// whose remote was configured after the fact or has never been pushed.
+    /// </para>
+    /// </remarks>
+    private async Task<string?> RemoteMismatchReasonAsync(
+        string targetDirectory,
+        ProjectWorkspaceSetupRequest request,
+        List<string> warnings,
+        Action<string>? log,
+        CancellationToken ct)
+    {
+        var expected = request.GitRepositoryUrl?.Trim();
+        if (string.IsNullOrWhiteSpace(expected))
+        {
+            return null;
+        }
+
+        var origin = await _gitRunner(
+            new GitSetupCommand(targetDirectory, ["remote", "get-url", "origin"], LocalGitTimeoutSeconds),
+            ct);
+
+        var originUrl = origin.StdOut.Trim();
+        if (origin.ExitCode != 0 || originUrl.Length == 0)
+        {
+            var unreadable = $"Could not read the 'origin' remote of '{targetDirectory}' to confirm it is " +
+                             $"'{expected}': {FirstNonEmpty(origin.StdErr, origin.StdOut, "git remote get-url returned nothing")}";
+            warnings.Add(unreadable);
+            log?.Invoke(unreadable);
+            return null;
+        }
+
+        if (WorkspacePathResolver.AreRemotesEquivalent(originUrl, expected))
+        {
+            return null;
+        }
+
+        var mismatch = $"'{targetDirectory}' is a checkout of '{originUrl}', not the repository project " +
+                       $"'{FirstNonEmpty(request.ProjectId, request.ProjectName)}' is bound to ('{expected}'). " +
+                       "Refusing to run there: set this project's repository name or working directory to " +
+                       "the intended checkout, or point its git remote at the remote it actually uses.";
+        log?.Invoke(mismatch);
+        return mismatch;
     }
 
     private async Task<ProjectWorkspaceSetupResult> SetupFromRemoteAsync(

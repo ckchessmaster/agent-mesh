@@ -81,6 +81,11 @@ public record PrReviewSignal(
 /// <c>GetTaskStatus</c> query so an operator can open the transcript of a parked task directly
 /// from the workflow, instead of only from the activity's log line.
 /// </param>
+/// <param name="TurnBudget">
+/// Per-task turn ceiling for this run, or null for <see cref="TaskExecutionWorkflow.MaxTurns"/>.
+/// Appended as an optional field so histories written before it existed replay with the default;
+/// the value is read once at run start and never re-resolved mid-run.
+/// </param>
 public record TaskExecutionInput(
     string JobId,
     string TaskId,
@@ -92,7 +97,8 @@ public record TaskExecutionInput(
     string? TurnSessionId = null,
     int? TaskIndex = null,
     string? TaskTitle = null,
-    string? RemediationContext = null);
+    string? RemediationContext = null,
+    int? TurnBudget = null);
 
 /// <summary>
 /// The workflow's terminal result.

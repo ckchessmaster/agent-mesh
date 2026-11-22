@@ -15,6 +15,7 @@ public static class DriverAdapters
     public const string Claude = "claude";
     public const string Copilot = "copilot";
     public const string OpenAi = "openai";
+    public const string OpenRouter = "openrouter";
     public const string Generic = "generic";
 
     /// <summary>
@@ -30,6 +31,7 @@ public static class DriverAdapters
             Agy or Antigravity => Agy,
             Claude or "claude-code" => Claude,
             Copilot or "github-copilot" => Copilot,
+            OpenRouter or "open-router" => OpenRouter,
             OpenAi or "ollama" or "vllm" or "lmstudio" or "lm-studio" => OpenAi,
             Generic or "custom" or "command" => Generic,
             _ => normalized
@@ -45,6 +47,20 @@ public static class DriverAdapters
         string? endpoint = null,
         AgentMesh.Core.Enums.RuntimeType? runtimeType = null)
     {
+        if (runtimeType is AgentMesh.Core.Enums.RuntimeType.OpenRouter ||
+            (!string.IsNullOrWhiteSpace(endpoint) &&
+             endpoint.Contains("openrouter.ai", StringComparison.OrdinalIgnoreCase)))
+        {
+            return OpenRouter;
+        }
+
+        var id = driverId?.Trim().TrimStart('@').ToLowerInvariant() ?? string.Empty;
+        if (id.StartsWith("openrouter", StringComparison.OrdinalIgnoreCase) ||
+            id.Contains("openrouter", StringComparison.OrdinalIgnoreCase))
+        {
+            return OpenRouter;
+        }
+
         if (runtimeType is AgentMesh.Core.Enums.RuntimeType.OpenAiCompatible or AgentMesh.Core.Enums.RuntimeType.LocalOllama ||
             (!string.IsNullOrWhiteSpace(endpoint) &&
              endpoint.StartsWith("http", StringComparison.OrdinalIgnoreCase)))
@@ -52,7 +68,6 @@ public static class DriverAdapters
             return OpenAi;
         }
 
-        var id = driverId?.Trim().TrimStart('@').ToLowerInvariant() ?? string.Empty;
         if (id.StartsWith("copilot", StringComparison.OrdinalIgnoreCase) || id.Contains("copilot", StringComparison.OrdinalIgnoreCase))
             return Copilot;
 

@@ -705,6 +705,28 @@ public class SystemControllerTests
             .Capabilities.Should().Equal("chat", "tools");
     }
 
+    [Fact]
+    public async Task TestOpenRouterServer_WithoutApiKey_ReturnsDescriptiveFailure()
+    {
+        var prevKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY");
+        try
+        {
+            Environment.SetEnvironmentVariable("OPENROUTER_API_KEY", null);
+            var actionResult = await Controller(NullDriverCapabilityProbe.Instance)
+                .TestOpenRouterServer(new TestOpenRouterServerRequest());
+
+            var ok = actionResult.Should().BeOfType<OkObjectResult>().Subject;
+            var res = ok.Value.Should().BeOfType<TestOpenRouterServerResponse>().Subject;
+            res.Success.Should().BeFalse();
+            res.Error.Should().Contain("OpenRouter API key is required");
+            res.Models.Should().BeEmpty();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENROUTER_API_KEY", prevKey);
+        }
+    }
+
     private sealed class ThrowingProbe : IDriverCapabilityProbe
     {
         public Task<DriverCapabilityReading?> ProbeAsync(

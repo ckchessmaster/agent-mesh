@@ -124,6 +124,20 @@ public class ProjectJob
     public string AttachmentsJson { get; set; } = "[]";
 
     public PlanApprovalPolicy ApprovalPolicy { get; set; } = PlanApprovalPolicy.Autonomous;
+
+    /// <summary>
+    /// Per-task turn budget for this job, or null for the platform default
+    /// (<see cref="Workflows.TaskExecutionWorkflow.MaxTurns"/>).
+    /// </summary>
+    /// <remarks>
+    /// The 40-turn ceiling exists to stop a loop that repeats the same failure forever, but a task
+    /// whose turns keep dying on infrastructure (a rate-limited route, an expired login) can exhaust
+    /// it while making real progress. An operator sets this when the ceiling, not the agent, is what
+    /// stopped the job; it is read when a run is <em>started</em>, so changing it only affects the
+    /// next run — never the one already replaying a history.
+    /// </remarks>
+    public int? TurnBudget { get; set; }
+
     public string? CurrentTaskId { get; set; }
     public string? ProgressHeartbeat { get; set; }
     public string? AssignedAgentId { get; set; }
