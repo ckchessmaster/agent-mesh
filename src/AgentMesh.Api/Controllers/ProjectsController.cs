@@ -237,6 +237,12 @@ public class ProjectsController(
             return BadRequest(new { error = workDirError });
         }
 
+        var (bindingConflict, bindingError) = RepositoryBindingConflict(repositoryName, workingDirectory, req.GitRepositoryUrl);
+        if (bindingConflict)
+        {
+            return BadRequest(new { error = bindingError });
+        }
+
         var existing = await db.Projects.FirstOrDefaultAsync(p => p.Id == normalizedId);
         if (existing != null)
         {
@@ -313,6 +319,19 @@ public class ProjectsController(
         if (project == null)
         {
             return NotFound(new { error = $"Project '{id}' not found." });
+        }
+
+        // Checked against the merged row before anything is applied, so a rejected save leaves the row
+        // exactly as it was. A PUT that changes only the git remote can strand the placeholder name as
+        // surely as one that sets both at once, and the dashboard re-sends every unchanged field on
+        // every save — which is how a row that is wrong stays wrong.
+        var (bindingConflict, bindingError) = RepositoryBindingConflict(
+            (req.RepositoryName ?? project.RepositoryName).Trim(),
+            (req.WorkingDirectory ?? project.WorkingDirectory).Trim(),
+            (req.GitRepositoryUrl ?? project.GitRepositoryUrl)?.Trim());
+        if (bindingConflict)
+        {
+            return BadRequest(new { error = bindingError });
         }
 
         if (!string.IsNullOrWhiteSpace(req.Name)) project.Name = req.Name.Trim();
@@ -629,6 +648,56 @@ public class ProjectsController(
         }
 
         return (true, trimmed, null);
+    }
+
+    /// <summary>
+    /// True when saving this project would send every agent command to a different repository than its
+    /// git remote names.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>projects.repository_name</c> predates multi-repo support and was added with a column default
+    /// of <see cref="Project.DefaultRepositoryName"/> — in this deployment, the platform's own
+    /// repository. Every project created between that migration and the fix that derives the name from
+    /// the project identity therefore inherited <c>'agent-mesh'</c>, and because the dashboard re-sends
+    /// the unchanged field on every save, the value is self-perpetuating: a row that is wrong stays
+    /// wrong until someone edits that one field. The resolved working root then points at another
+    /// repository's checkout, which <c>ProjectWorkspaceSetup</c> happily accepts (it is a git
+    /// repository) and <c>PromptStackBuilder</c> stamps into the manifest as authoritative — so a job on
+    /// project B branches and commits on repository A.
+    /// </para>
+    /// <para>
+    /// Only the placeholder is rejected. Two projects legitimately sharing one remote (a monorepo with
+    /// a project per service) choose their own names, and a project with an explicit
+    /// <c>working_directory</c> has already stated where it lives, so neither is a conflict.
+    /// </para>
+    /// </remarks>
+    private static (bool Conflict, string? Error) RepositoryBindingConflict(
+        string repositoryName,
+        string workingDirectory,
+        string? gitRepositoryUrl)
+    {
+        if (!string.IsNullOrWhiteSpace(workingDirectory)) return (false, null);
+        if (string.IsNullOrWhiteSpace(gitRepositoryUrl)) return (false, null);
+        if (!string.Equals(repositoryName, Project.DefaultRepositoryName, StringComparison.Ordinal))
+        {
+            return (false, null);
+        }
+
+        var remoteName = WorkspacePathResolver.TryDeriveRepositoryNameFromRemote(gitRepositoryUrl);
+        if (remoteName is null || string.Equals(remoteName, Project.DefaultRepositoryName, StringComparison.Ordinal))
+        {
+            return (false, null);
+        }
+
+        var expectedRoot = WorkspacePathResolver.FromRepositoryName(remoteName);
+        var actualRoot = WorkspacePathResolver.FromRepositoryName(repositoryName);
+        return (
+            true,
+            $"Repository name '{repositoryName}' is the pre-multi-repo placeholder and resolves every " +
+            $"command to '{actualRoot}', but this project's git remote is '{gitRepositoryUrl.Trim()}', " +
+            $"which belongs at '{expectedRoot}'. Set repository_name to '{remoteName}', or give an " +
+            $"explicit working_directory of '{expectedRoot}'.");
     }
 
     private static (bool Valid, string Value, string? Error) ResolveWorkingDirectory(string? rawWorkingDirectory)
