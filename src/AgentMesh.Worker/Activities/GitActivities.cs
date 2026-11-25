@@ -171,6 +171,9 @@ public class GitActivities(
         }
     }
 
+    internal static TimeSpan ChecksInProgressPollInterval { get; set; } = TimeSpan.FromSeconds(15);
+    internal static TimeSpan ChecksInProgressMaxWait { get; set; } = TimeSpan.FromMinutes(12);
+
     private async Task<string> MergePullRequestInternalAsync(
         string prUrl,
         string? approvedHeadSha,
@@ -190,18 +193,39 @@ public class GitActivities(
             "Merging approved pull request {PrUrl} (repository {Repository}, approvedSha {Sha})",
             prUrl, repository ?? "(resolved from config/url)", effectiveSha ?? "(not recorded)");
 
-        var result = await pullRequests.MergePullRequestAsync(
-            new GitHubMergeRequest(
-                PrUrlOrNumber: prUrl.Trim(),
-                Repository: repository,
-                Method: ReadMergeMethod(),
-                Sha: effectiveSha,
-                Token: authorToken),
-            cancellationToken);
+        var mergeRequest = new GitHubMergeRequest(
+            PrUrlOrNumber: prUrl.Trim(),
+            Repository: repository,
+            Method: ReadMergeMethod(),
+            Sha: effectiveSha,
+            Token: authorToken);
+
+        var startedAt = DateTimeOffset.UtcNow;
+        var result = await pullRequests.MergePullRequestAsync(mergeRequest, cancellationToken);
+
+        // When an operator approves a PR right after it opens, GitHub's required CI checks are often
+        // still in progress and return HTTP 405. Poll while checks remain in progress so the approved
+        // merge completes automatically once CI turns green, rather than halting the job.
+        while (!result.Success &&
+               string.Equals(result.FailureReason, "checks_in_progress", StringComparison.OrdinalIgnoreCase) &&
+               DateTimeOffset.UtcNow - startedAt < ChecksInProgressMaxWait)
+        {
+            logger.LogInformation(
+                "Merge of {PrUrl} waiting on in-progress required status checks; retrying in {DelaySeconds}s ({Message})",
+                prUrl, (int)ChecksInProgressPollInterval.TotalSeconds, result.Message);
+
+            if (ActivityExecutionContext.HasCurrent)
+            {
+                ActivityExecutionContext.Current.Heartbeat($"Waiting for required status checks on {prUrl}");
+            }
+
+            await Task.Delay(ChecksInProgressPollInterval, cancellationToken);
+            result = await pullRequests.MergePullRequestAsync(mergeRequest, cancellationToken);
+        }
 
         if (!result.Success)
         {
-            var retryable = result.FailureReason is "api_error";
+            var retryable = result.FailureReason is "api_error" or "checks_in_progress";
 
             logger.LogWarning(
                 "Merge of {PrUrl} failed ({Reason}, retryable={Retryable}): {Message}",

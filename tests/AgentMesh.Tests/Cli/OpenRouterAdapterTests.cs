@@ -99,6 +99,14 @@ public class OpenRouterAdapterTests : IDisposable
               "pricing": { "prompt": "0", "completion": "0" }
             },
             {
+              "id": "deepseek/deepseek-v4.1-flash-1017:batch",
+              "name": "DeepSeek Batch Only",
+              "context_length": 131072,
+              "supported_parameters": ["tools"],
+              "architecture": { "output_modalities": ["text"] },
+              "pricing": { "prompt": "0.000001", "completion": "0.000002" }
+            },
+            {
               "id": "openai/gpt-image-1",
               "name": "Image Only",
               "context_length": 32000,

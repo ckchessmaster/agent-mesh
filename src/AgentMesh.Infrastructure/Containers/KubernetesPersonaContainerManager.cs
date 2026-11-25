@@ -73,6 +73,28 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kube", "config"));
     }
 
+    internal V1ResourceRequirements BuildPersonaRunnerResourceRequirements()
+    {
+        var cpuRequest = _config["PersonaContainer:CpuRequest"] ?? "100m";
+        var memoryRequest = _config["PersonaContainer:MemoryRequest"] ?? "256Mi";
+        var cpuLimit = _config["PersonaContainer:CpuLimit"] ?? "2000m";
+        var memoryLimit = _config["PersonaContainer:MemoryLimit"] ?? "4Gi";
+
+        return new V1ResourceRequirements
+        {
+            Requests = new Dictionary<string, ResourceQuantity>
+            {
+                ["cpu"] = new ResourceQuantity(cpuRequest),
+                ["memory"] = new ResourceQuantity(memoryRequest)
+            },
+            Limits = new Dictionary<string, ResourceQuantity>
+            {
+                ["cpu"] = new ResourceQuantity(cpuLimit),
+                ["memory"] = new ResourceQuantity(memoryLimit)
+            }
+        };
+    }
+
     private async Task<(string Image, string? PullPolicy, string? PullSecret)> ResolvePersonaRunnerConfigAsync(CancellationToken ct = default)
     {
         var targetImage = _config["PersonaContainer:Image"] ?? _defaultImage;
@@ -248,13 +270,21 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                                   !string.IsNullOrWhiteSpace(configuredImage) &&
                                   !string.Equals(currentImage, configuredImage, StringComparison.OrdinalIgnoreCase);
 
+            var availableSince = deployment.Status?.Conditions?
+                .FirstOrDefault(c => string.Equals(c.Type, "Available", StringComparison.OrdinalIgnoreCase) &&
+                                     string.Equals(c.Status, "True", StringComparison.OrdinalIgnoreCase))
+                ?.LastTransitionTime;
+            var startedAt = availableSince ?? deployment.Metadata.CreationTimestamp;
+
             return new PersonaEnvironmentStatus(
                 PersonaId: personaId,
                 Status: status,
                 Runtime: RuntimeName,
                 ContainerId: deploymentName,
-                StartedAt: deployment.Metadata.CreationTimestamp,
-                LastActivityAt: DateTimeOffset.UtcNow,
+                StartedAt: startedAt,
+                // Leave LastActivityAt null so PersonaIdleReaperService uses StartedAt + DB session
+                // activity instead of always seeing DateTimeOffset.UtcNow and never reaping idle pods.
+                LastActivityAt: null,
                 ErrorMessage: errorMessage,
                 Image: currentImage,
                 ConfiguredImage: configuredImage,
@@ -399,6 +429,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 _logger.LogInformation("Updating deployment {Name} for @{PersonaId}: Replicas=1, Image={Image} (was {OldImage}), EnvUpdated={EnvUpdated}, IsFailed={IsFailed}, NeedsSidecar={NeedsSidecar}",
                     deploymentName, personaId, currentConfigImage, currentImage, needsEnvUpdate, isFailed, needsSidecarUpdate);
 
+                var runnerResources = BuildPersonaRunnerResourceRequirements();
                 var containerPatch = new Dictionary<string, object>
                 {
                     ["name"] = "persona-runner",
@@ -408,6 +439,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                     {
                         secretRef = new { name = ef.SecretRef?.Name, optional = ef.SecretRef?.Optional }
                     }).ToList(),
+                    ["resources"] = new
+                    {
+                        requests = runnerResources.Requests.ToDictionary(kv => kv.Key, kv => kv.Value.ToString()),
+                        limits = runnerResources.Limits.ToDictionary(kv => kv.Key, kv => kv.Value.ToString())
+                    },
                     ["volumeMounts"] = new object[]
                     {
                         new { name = "workspace-storage", mountPath = "/workspace" },
@@ -503,6 +539,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
                 ImagePullPolicy = !string.IsNullOrWhiteSpace(currentPullPolicy) ? currentPullPolicy : null,
                 Env = env,
                 EnvFrom = envFrom,
+                Resources = BuildPersonaRunnerResourceRequirements(),
                 VolumeMounts = new List<V1VolumeMount>
                 {
                     new() { MountPath = "/workspace", Name = "workspace-storage" },
@@ -658,6 +695,7 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
         }
         var sidecarContainer = sidecarConfig != null ? BuildSidecarContainer(sidecarConfig, normPersonaId) : null;
 
+        var restartRunnerResources = BuildPersonaRunnerResourceRequirements();
         var containerPatch = new Dictionary<string, object>
         {
             ["name"] = "persona-runner",
@@ -667,6 +705,11 @@ public class KubernetesPersonaContainerManager : IPersonaContainerManager
             {
                 secretRef = new { name = ef.SecretRef?.Name, optional = ef.SecretRef?.Optional }
             }).ToList(),
+            ["resources"] = new
+            {
+                requests = restartRunnerResources.Requests.ToDictionary(kv => kv.Key, kv => kv.Value.ToString()),
+                limits = restartRunnerResources.Limits.ToDictionary(kv => kv.Key, kv => kv.Value.ToString())
+            },
             ["volumeMounts"] = new object[]
             {
                 new { name = "workspace-storage", mountPath = "/workspace" },

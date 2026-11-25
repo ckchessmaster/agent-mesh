@@ -91,7 +91,9 @@ public class TurnOutcomeDerivationTests
     [Fact]
     public void Classify_OutOfBandPrInSessionTranscript_PausesForReview()
     {
-        var state = State() with
+        var state = State(toolCalls: [
+            Call("bash", """{"command":"gh pr create --title \"Feature\""}""")
+        ]) with
         {
             DiscoveredPrUrl = "Created PR https://github.com/ckchessmaster/agent-mesh/pull/41 on branch mesh/job-2a84d05c"
         };
@@ -107,7 +109,9 @@ public class TurnOutcomeDerivationTests
     [Fact]
     public void Classify_OutOfBandPrInLastSessionMessage_PausesForReview()
     {
-        var state = State() with
+        var state = State(toolCalls: [
+            Call("run_command", """{"command":"agentmesh pr open --title \"Feature\""}""")
+        ]) with
         {
             LastSessionMessageContent = "PR #41 opened. URL: https://github.com/ckchessmaster/agent-mesh/pull/41"
         };
@@ -445,5 +449,51 @@ public class TurnOutcomeDerivationTests
         var signal = HttpAgentTurnRunner.ClassifySignals(state);
         signal.Should().NotBeNull();
         signal!.Status.Should().Be(TurnOutcomeStatus.TaskCompleted);
+    }
+
+    [Fact]
+    public void DetectOutOfBandPr_IgnoresMockPrUrlsInFileEditsAndNonPrShellCommands()
+    {
+        // Regression for job ab9425b5: writing unit test files containing mock GitHub PR URLs
+        // (`pull/142`, `pull/42`) previously fired PrOpenedAwaitingReview mid-task.
+        var state = new HttpAgentTurnRunner.TurnState(
+            SessionStatus: "thinking",
+            ToolCalls:
+            [
+                Call("create", """{"path":"tests/JobPrCiServiceTests.cs","file_text":"https://github.com/ckchessmaster/agent-mesh/pull/142"}"""),
+                Call("edit", """{"path":"tests/PrReviewCard.test.tsx","new_str":"https://github.com/ckchessmaster/agent-mesh/pull/42"}"""),
+                Call("bash", """{"command":"dotnet test"}""")
+            ],
+            JobMessages: [],
+            LastActivityAt: DateTimeOffset.UtcNow,
+            LastSessionMessageContent: "Tested mock PR https://github.com/ckchessmaster/agent-mesh/pull/42 successfully.",
+            DiscoveredPrUrl: "https://github.com/ckchessmaster/agent-mesh/pull/42");
+
+        HttpAgentTurnRunner.DetectOutOfBandPr(state).Should().BeNull();
+        HttpAgentTurnRunner.ClassifySignals(state).Should().BeNull();
+    }
+
+    [Fact]
+    public void DetectOutOfBandPr_DetectsRealPrUrlAfterShellPrCreationCommand()
+    {
+        var state = new HttpAgentTurnRunner.TurnState(
+            SessionStatus: "thinking",
+            ToolCalls:
+            [
+                Call("bash", """{"command":"gh pr create --title \"Add CI status\" --body \"...\""}""")
+            ],
+            JobMessages: [],
+            LastActivityAt: DateTimeOffset.UtcNow,
+            DiscoveredPrUrl: "https://github.com/ckchessmaster/agent-mesh/pull/145");
+
+        var detected = HttpAgentTurnRunner.DetectOutOfBandPr(state);
+        detected.Should().NotBeNull();
+        detected!.Value.Url.Should().Be("https://github.com/ckchessmaster/agent-mesh/pull/145");
+        detected.Value.Number.Should().Be(145);
+
+        var outcome = HttpAgentTurnRunner.ClassifySignals(state);
+        outcome.Should().NotBeNull();
+        outcome!.Status.Should().Be(TurnOutcomeStatus.PrOpenedAwaitingReview);
+        outcome.PrNumber.Should().Be(145);
     }
 }

@@ -32,7 +32,7 @@ public class JobExecutionWorkflow : IJobExecutionWorkflow
 
     private static readonly ActivityOptions MergeActivityOptions = new()
     {
-        StartToCloseTimeout = TimeSpan.FromMinutes(5),
+        StartToCloseTimeout = TimeSpan.FromMinutes(15),
         RetryPolicy = new RetryPolicy
         {
             InitialInterval = TimeSpan.FromSeconds(5),

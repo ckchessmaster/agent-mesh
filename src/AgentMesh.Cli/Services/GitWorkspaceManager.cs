@@ -19,29 +19,97 @@ public static class GitWorkspaceManager
         if (string.IsNullOrWhiteSpace(branchName) || !await IsGitRepositoryAsync(directory))
             return;
 
+        var targetBranch = branchName.Trim();
+
         try
         {
             var (_, currentBranch, _) = await RunGitAsync(directory, "branch --show-current");
-            if (string.Equals(currentBranch.Trim(), branchName.Trim(), StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(currentBranch.Trim(), targetBranch, StringComparison.OrdinalIgnoreCase))
             {
-                log?.Invoke($"Already on job branch '{branchName}'");
+                log?.Invoke($"Already on job branch '{targetBranch}'");
                 return;
             }
 
-            var (code, _, errStr) = await RunGitAsync(directory, $"checkout -B {branchName.Trim()}");
+            // If the job branch already exists locally, switch to it without `-B` so existing
+            // commits on that job branch are never overwritten by whatever HEAD is checked out.
+            var (localRefCode, _, _) = await RunGitAsync(directory, $"show-ref --verify --quiet refs/heads/{targetBranch}");
+            if (localRefCode == 0)
+            {
+                var (switchCode, _, switchErr) = await RunGitAsync(directory, $"checkout {targetBranch}");
+                if (switchCode == 0)
+                {
+                    log?.Invoke($"Switched to existing job branch '{targetBranch}'");
+                }
+                else
+                {
+                    log?.Invoke($"Warning: git checkout {targetBranch} failed: {switchErr.Trim()}");
+                }
+                return;
+            }
+
+            // For a brand-new job branch, refresh origin (best-effort) and anchor to the remote's
+            // default branch (or origin/main / origin/master) rather than inheriting a stale prior
+            // job branch's HEAD (which causes duplicate-commit merge conflicts after squash merges).
+            string? baseRef = null;
+            var (remoteCode, remotesOut, _) = await RunGitAsync(directory, "remote");
+            if (remoteCode == 0 && remotesOut.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Any(r => string.Equals(r.Trim(), "origin", StringComparison.OrdinalIgnoreCase)))
+            {
+                await RunGitAsync(directory, "fetch origin --prune");
+
+                // If the job branch already exists on origin, track it directly.
+                var (remoteBranchCode, _, _) = await RunGitAsync(directory, $"show-ref --verify --quiet refs/remotes/origin/{targetBranch}");
+                if (remoteBranchCode == 0)
+                {
+                    var (trackCode, _, trackErr) = await RunGitAsync(directory, $"checkout -b {targetBranch} origin/{targetBranch}");
+                    if (trackCode == 0)
+                    {
+                        log?.Invoke($"Checked out remote job branch '{targetBranch}' from origin/{targetBranch}");
+                        return;
+                    }
+                    log?.Invoke($"Warning: git checkout -b {targetBranch} origin/{targetBranch} failed: {trackErr.Trim()}");
+                }
+
+                baseRef = await ResolveOriginDefaultRefAsync(directory);
+            }
+
+            var createArgs = !string.IsNullOrWhiteSpace(baseRef)
+                ? $"checkout -b {targetBranch} {baseRef}"
+                : $"checkout -b {targetBranch}";
+
+            var (code, _, errStr) = await RunGitAsync(directory, createArgs);
             if (code == 0)
             {
-                log?.Invoke($"Checked out job branch '{branchName}'");
+                log?.Invoke(!string.IsNullOrWhiteSpace(baseRef)
+                    ? $"Created job branch '{targetBranch}' from '{baseRef}'"
+                    : $"Checked out job branch '{targetBranch}'");
             }
             else
             {
-                log?.Invoke($"Warning: git checkout -B {branchName} failed: {errStr.Trim()}");
+                log?.Invoke($"Warning: git {createArgs} failed: {errStr.Trim()}");
             }
         }
         catch (Exception ex)
         {
-            log?.Invoke($"Warning: Failed to prepare branch '{branchName}': {ex.Message}");
+            log?.Invoke($"Warning: Failed to prepare branch '{targetBranch}': {ex.Message}");
         }
+    }
+
+    private static async Task<string?> ResolveOriginDefaultRefAsync(string directory)
+    {
+        var (symCode, symOut, _) = await RunGitAsync(directory, "symbolic-ref --quiet --short refs/remotes/origin/HEAD");
+        if (symCode == 0 && !string.IsNullOrWhiteSpace(symOut))
+        {
+            return symOut.Trim();
+        }
+
+        foreach (var candidate in new[] { "origin/main", "origin/master" })
+        {
+            var (refCode, _, _) = await RunGitAsync(directory, $"show-ref --verify --quiet refs/remotes/{candidate}");
+            if (refCode == 0) return candidate;
+        }
+
+        return null;
     }
 
     public static async Task CommitTurnChangesAsync(

@@ -621,6 +621,39 @@ public class DriverCapabilityProbeTests : IDisposable
     }
 
     [Fact]
+    public async Task SidecarLoopbackOrCompanionEndpoint_DoesNotSpawnProbePod()
+    {
+        var containerManager = new Moq.Mock<AgentMesh.Core.Services.IPersonaContainerManager>(Moq.MockBehavior.Strict);
+        var probe = new DriverCapabilityProbe(containerManager.Object);
+
+        var sidecar = new AgentMesh.Core.Models.DriverSidecarConfig
+        {
+            Enabled = true,
+            Type = "tailscale",
+            CompanionCommand = "aip proxy 11434",
+            CompanionPort = 11434
+        };
+
+        var reading = await probe.ProbeAsync(new DriverCapabilityProbeRequest(
+            DriverId: "spence-ai",
+            RuntimeType: RuntimeType.OpenAiCompatible,
+            Adapter: "openai",
+            Endpoint: "http://localhost:11434/v1",
+            OperatorModels: new[] { "qwen3.8-flash-next" },
+            Sidecar: sidecar));
+
+        reading.Should().NotBeNull();
+        reading!.Models.Select(m => m.Id).Should().Contain("qwen3.8-flash-next");
+        containerManager.Verify(
+            m => m.TestDriverEndpointAsync(
+                Moq.It.IsAny<string>(),
+                Moq.It.IsAny<string?>(),
+                Moq.It.IsAny<AgentMesh.Core.Models.DriverSidecarConfig>(),
+                Moq.It.IsAny<CancellationToken>()),
+            Moq.Times.Never);
+    }
+
+    [Fact]
     public void NormalizeAdapter_InfersAdapterFromDriverIdWhenAdapterIsNull()
     {
         DriverCapabilityProbe.NormalizeAdapter(new DriverCapabilityProbeRequest(

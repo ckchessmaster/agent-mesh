@@ -1086,6 +1086,23 @@ public class GitHubPullRequestServiceTests
         result.FailureReason.Should().Be("not_mergeable");
     }
 
+    [Theory]
+    [InlineData("""{"message":"Required status check \"Backend (Go)\" is in progress.","status":"405"}""")]
+    [InlineData("""{"message":"2 of 3 required status checks are in progress.","status":"405"}""")]
+    [InlineData("""{"message":"Required status check \"ci/build\" is expected.","status":"405"}""")]
+    public async Task Merge_WhenRequiredStatusChecksInProgress_ReportsRetryableChecksInProgress(string body)
+    {
+        var handler = new StubHttpHandler()
+            .Respond(HttpMethod.Get, ReadPath, 200, """{"state":"open","head":{"sha":"aaa"}}""")
+            .Respond(HttpMethod.Put, MergePath, 405, body);
+
+        var result = await BuildService(TokenConfig(), handler: handler)
+            .MergePullRequestAsync(new GitHubMergeRequest(PrUrl));
+
+        result.Success.Should().BeFalse();
+        result.FailureReason.Should().Be("checks_in_progress");
+    }
+
     [Fact]
     public async Task Merge_OnA5xx_ReportsAGenericApiErrorTheWorkflowCanRetry()
     {

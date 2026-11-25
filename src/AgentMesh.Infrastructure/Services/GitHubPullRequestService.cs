@@ -790,6 +790,14 @@ public partial class GitHubPullRequestService(
 
         if (mergeResponse.StatusCode == System.Net.HttpStatusCode.MethodNotAllowed)
         {
+            if (IsChecksInProgressResponse(mergeBody))
+            {
+                return MergeFailure("checks_in_progress",
+                    $"Pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} is waiting " +
+                    "for required status checks to complete before merging.",
+                    mergeBody, token);
+            }
+
             return MergeFailure("not_mergeable",
                 $"Pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)} is not " +
                 "mergeable (dirty state, blocked by branch protection, or required checks failing).",
@@ -810,6 +818,40 @@ public partial class GitHubPullRequestService(
         return MergeFailure("api_error",
             $"GitHub rejected the merge of pull request #{prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}: " +
             $"HTTP {(int)mergeResponse.StatusCode}.", mergeBody, token);
+    }
+
+    /// <summary>
+    /// Detects GitHub HTTP 405 responses caused by required status checks still running or queued
+    /// (e.g., "Required status check \"Backend (Go)\" is in progress.", "2 of 3 required status
+    /// checks are in progress.", "Required status check ... is expected.").
+    /// </summary>
+    internal static bool IsChecksInProgressResponse(string? body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return false;
+
+        string? message = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("message", out var msg) &&
+                msg.ValueKind == JsonValueKind.String)
+            {
+                message = msg.GetString();
+            }
+        }
+        catch (JsonException)
+        {
+            // Fall through to raw body inspection.
+        }
+
+        var text = message ?? body;
+        return text.Contains("in progress", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("status check", StringComparison.OrdinalIgnoreCase)
+               && (text.Contains("expected", StringComparison.OrdinalIgnoreCase)
+                   || text.Contains("pending", StringComparison.OrdinalIgnoreCase)
+                   || text.Contains("queued", StringComparison.OrdinalIgnoreCase)
+                   || text.Contains("waiting", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
