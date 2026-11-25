@@ -574,7 +574,7 @@ public static class AgentAdapterFactory
         return sb.ToString();
     }
 
-    public static List<ExtractedQuestion> ExtractQuestionsFromOutput(string text)
+    public static List<ExtractedQuestion> ExtractQuestionsFromOutput(string text, bool explicitBlocksOnly = false)
     {
         var questions = new List<ExtractedQuestion>();
         if (string.IsNullOrWhiteSpace(text)) return questions;
@@ -612,13 +612,32 @@ public static class AgentAdapterFactory
             catch { }
         }
 
-        // Check for numbered question lines: e.g. "1. What is ...?" or "1) How ...?" or "- Question?"
-        var numberedMatches = Regex.Matches(text, @"^\s*(?:\d+[\.\)]|[-*])\s+(.+?\?)", RegexOptions.Multiline);
+        if (explicitBlocksOnly) return questions;
+
+        // Strip fenced code blocks so code comments/snippets never match as questions.
+        var textWithoutCodeBlocks = Regex.Replace(text, @"```[\s\S]*?```", string.Empty);
+
+        // Require the question mark at the END of the bullet/numbered line (with optional trailing
+        // punctuation/whitespace) so mid-line code syntax like `?refresh=true`, `ci?: Type`, or
+        // ternary operators inside completion summaries never trigger bogus escalations.
+        var numberedMatches = Regex.Matches(
+            textWithoutCodeBlocks,
+            @"^\s*(?:\d+[\.\)]|[-*])\s+([^\r\n]+?\?)\s*$",
+            RegexOptions.Multiline);
         if (numberedMatches.Count > 0)
         {
             foreach (Match m in numberedMatches)
             {
                 var qText = m.Groups[1].Value.Trim();
+                // Ignore status/summary headings (e.g., "**Result**: ...", "**Reasoning**: ...")
+                // and lines whose trailing `?` lives inside inline backticked code.
+                var outsideCode = Regex.Replace(qText, @"`[^`]*`", string.Empty).Trim();
+                if (!outsideCode.EndsWith('?')) continue;
+                if (Regex.IsMatch(qText, @"^\*{0,2}(?:Result|Reasoning|Changes|Verification|Files|Summary|Next Steps?)\*{0,2}\s*[:\-—]", RegexOptions.IgnoreCase))
+                {
+                    continue;
+                }
+
                 if (!string.IsNullOrWhiteSpace(qText) && qText.Length > 5)
                 {
                     var extractedOpts = new List<string>();
@@ -1031,6 +1050,10 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
     public string AdapterType => "agy";
 
+    // Models for which `agy` has already rejected `--effort` in this runner process. Caching
+    // avoids wasting a full CLI spawn + failure + retry on every subsequent turn for that model.
+    internal static readonly ConcurrentDictionary<string, byte> EffortRejectedModels = new(StringComparer.OrdinalIgnoreCase);
+
     public async Task ExecutePromptAsync(
         AgentPresetConfig preset,
         PromptReceivedEvent promptEvent,
@@ -1045,9 +1068,19 @@ public class AgyAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
         if (agyPath != null)
         {
-            var outcome = await ExecuteRealAgyStreamAsync(agyPath, cwd, preset, promptEvent, onEvent, ct);
+            var normalizedModel = promptEvent.Model?.Trim();
+            var skipEffort = !string.IsNullOrWhiteSpace(normalizedModel) &&
+                             EffortRejectedModels.ContainsKey(normalizedModel);
+
+            var outcome = await ExecuteRealAgyStreamAsync(
+                agyPath, cwd, preset, promptEvent, onEvent, ct, includeEffort: !skipEffort);
             if (outcome == AgyRunOutcome.EffortRejectedByModel)
             {
+                if (!string.IsNullOrWhiteSpace(normalizedModel))
+                {
+                    EffortRejectedModels.TryAdd(normalizedModel, 0);
+                }
+
                 // Not every agy model accepts --effort; `agy` treats the combination as an invalid
                 // model selection and exits without producing any turn output. The mesh's effort
                 // contract is driver-level, so it cannot know which model-effort pairs the binary
@@ -2984,6 +3017,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string? taskCompleteSummary = null;
         var thoughtDeltaBuilder = new StringBuilder();
         var pendingArglessTools = new List<string>();
+        var activeToolNamesByCallId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         string? lastActiveToolName = null;
         string? lastCopilotActivitySummary = null;
         // JSON-shaped lines the parser declined (an unknown type carrying content - #101's
@@ -3081,7 +3115,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     rawStdOutBuilder.AppendLine(line);
                 }
 
-                if (TryParseCopilotJsonLine(line, out var evType, out var evContent, out var toolName, out var toolArgs, out var toolRes, out var sid, out var usage, out var parsedTaskSummary))
+                if (TryParseCopilotJsonLine(line, out var evType, out var evContent, out var toolName, out var toolArgs, out var toolRes, out var sid, out var usage, out var parsedTaskSummary, out var toolCallId))
                 {
                     if (!string.IsNullOrWhiteSpace(sid))
                     {
@@ -3114,6 +3148,11 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     }
                     else if (evType == "tool_call" && !string.IsNullOrWhiteSpace(toolName))
                     {
+                        if (!string.IsNullOrWhiteSpace(toolCallId))
+                        {
+                            activeToolNamesByCallId[toolCallId] = toolName;
+                        }
+
                         if (string.IsNullOrWhiteSpace(toolArgs))
                         {
                             await FlushThoughtDeltasAsync();
@@ -3140,7 +3179,11 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                     else if (evType == "tool_result")
                     {
                         await FlushPendingEventsAsync();
-                        var effectiveToolName = !string.IsNullOrWhiteSpace(toolName) ? toolName : lastActiveToolName;
+                        var effectiveToolName = !string.IsNullOrWhiteSpace(toolName)
+                            ? toolName
+                            : (!string.IsNullOrWhiteSpace(toolCallId) && activeToolNamesByCallId.Remove(toolCallId, out var mappedTool)
+                                ? mappedTool
+                                : lastActiveToolName);
                         var boundedToolResult = BoundPreviewTail(toolRes, MaxToolResultPayloadChars);
                         await SafeEmitAsync(new TrajectoryEventPayload
                         {
@@ -3150,12 +3193,24 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                             Content = FormatCopilotToolResultSummary(effectiveToolName, toolRes)
                         });
                     }
-                    else if (evType == "message" && !string.IsNullOrWhiteSpace(evContent))
+                    else if (evType == "message_delta" && !string.IsNullOrEmpty(evContent))
                     {
                         await FlushPendingEventsAsync();
                         lock (streamedResponseBuilder)
                         {
                             streamedResponseBuilder.Append(evContent);
+                        }
+                    }
+                    else if (evType == "message" && !string.IsNullOrWhiteSpace(evContent))
+                    {
+                        await FlushPendingEventsAsync();
+                        lock (streamedResponseBuilder)
+                        {
+                            if (streamedResponseBuilder.Length > 0)
+                            {
+                                streamedResponseBuilder.Append("\n\n");
+                            }
+                            streamedResponseBuilder.Append(evContent.Trim());
                         }
                     }
                     else if (evType == "result" && !string.IsNullOrWhiteSpace(evContent))
@@ -3318,8 +3373,12 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
             lock (streamedResponseBuilder) { streamedOutput = streamedResponseBuilder.ToString().Trim(); }
             var output = ResolveFinalCopilotOutput(streamedOutput, taskCompleteSummary, rawStdOut, stdErr);
 
-            // Check if Copilot asked questions
-            var questions = AgentAdapterFactory.ExtractQuestionsFromOutput(output);
+            // Check if Copilot asked questions. When Copilot explicitly called `task_complete`,
+            // the turn is finished rather than asking the user a question — only honor explicit
+            // ```ask_question blocks in that case.
+            var questions = AgentAdapterFactory.ExtractQuestionsFromOutput(
+                output,
+                explicitBlocksOnly: !string.IsNullOrWhiteSpace(taskCompleteSummary));
             if (questions.Count > 0)
             {
                 var questionsJson = JsonSerializer.Serialize(new
@@ -3380,14 +3439,17 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         string? stdErr,
         int maxFallbackChars = MaxRawFallbackPreviewChars)
     {
-        if (!string.IsNullOrWhiteSpace(streamedResponse))
-        {
-            return streamedResponse.Trim();
-        }
-
+        // When Copilot explicitly called `task_complete`, its summary is the authoritative final
+        // answer; streamed interim progress blurbs ("Starting Task 4...", "Inspecting files...")
+        // must not overwrite it.
         if (!string.IsNullOrWhiteSpace(taskCompleteSummary))
         {
             return taskCompleteSummary.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(streamedResponse))
+        {
+            return streamedResponse.Trim();
         }
 
         // Extract non-JSON plain-text lines from rawStdOut first; never emit unbounded multi-MB JSONL streams.
@@ -3482,7 +3544,30 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         out string? toolResultJson,
         out string? sessionId,
         out string? usageJson,
-        out string? taskCompleteSummary)
+        out string? taskCompleteSummary) =>
+        TryParseCopilotJsonLine(
+            line,
+            out eventType,
+            out content,
+            out toolName,
+            out toolArgsJson,
+            out toolResultJson,
+            out sessionId,
+            out usageJson,
+            out taskCompleteSummary,
+            out _);
+
+    internal static bool TryParseCopilotJsonLine(
+        string line,
+        out string? eventType,
+        out string? content,
+        out string? toolName,
+        out string? toolArgsJson,
+        out string? toolResultJson,
+        out string? sessionId,
+        out string? usageJson,
+        out string? taskCompleteSummary,
+        out string? toolCallId)
     {
         eventType = null;
         content = null;
@@ -3492,6 +3577,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
         sessionId = null;
         usageJson = null;
         taskCompleteSummary = null;
+        toolCallId = null;
 
         if (string.IsNullOrWhiteSpace(line)) return false;
         var trimmed = line.Trim();
@@ -3568,6 +3654,19 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
                 return true;
             }
 
+            // Streaming partial tool output/progress chunks (e.g. tool.execution_partial_result,
+            // tool.execution_progress) are intermediate stdout updates, not finished tool results.
+            // Claim them quietly so they do not bloat the transcript with repeated "Completed bash
+            // (no output)" rows before tool.execution_complete arrives.
+            if (kind.Contains("tool") && (kind.Contains("partial") || kind.Contains("progress")))
+            {
+                eventType = lower;
+                return true;
+            }
+
+            toolCallId = OpenAiAdapter.GetPropertyString(data, "toolCallId", "tool_call_id", "callId", "call_id")
+                ?? OpenAiAdapter.GetPropertyString(root, "toolCallId", "tool_call_id", "callId", "call_id");
+
             // Evaluate tool_result BEFORE tool_call so events like "tool.execution_complete"
             // map to tool_result rather than matching "execution" in tool_call!
             if (kind.Contains("tool") && (kind.Contains("result") || kind.Contains("output") || kind.Contains("finish") || kind.Contains("done") || kind.Contains("complete")))
@@ -3623,7 +3722,7 @@ public class CopilotAdapter : IAgentAdapter, IDescribesOwnCapabilities
 
             if (kind is "assistant.message" or "message" or "content.delta" or "assistant.turn")
             {
-                eventType = "message";
+                eventType = kind == "content.delta" ? "message_delta" : "message";
                 content = data.TryGetProperty("content", out var c) ? c.GetString() : (data.TryGetProperty("text", out var t) ? t.GetString() : (data.TryGetProperty("delta", out var d) ? d.GetString() : null));
                 if (!string.IsNullOrWhiteSpace(content)) return true;
                 // A blank message envelope is claimed, never dumped into the reply. A tool-only

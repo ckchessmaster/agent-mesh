@@ -582,6 +582,14 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
                 Unavailable(DriverAdapters.OpenAi, "No endpoint is configured for this driver."), request);
         }
 
+        if (ShouldSkipSidecarProbe(endpoint, request.Sidecar))
+        {
+            return WithOperatorModels(
+                Unavailable(DriverAdapters.OpenAi,
+                    $"The server at {endpoint.TrimEnd('/')} runs behind an in-pod companion proxy and is discovered by its live persona runner."),
+                request);
+        }
+
         IReadOnlyList<DiscoveredOpenAiModel>? discovered;
         if (_hasCustomHttpLister)
         {
@@ -956,12 +964,35 @@ public sealed class DriverCapabilityProbe : IDriverCapabilityProbe
         return string.IsNullOrWhiteSpace(configured) ? null : configured.Trim();
     }
 
+    internal static bool IsLoopbackEndpoint(string? endpoint)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint)) return false;
+        if (!Uri.TryCreate(endpoint.Trim(), UriKind.Absolute, out var uri)) return false;
+        if (uri.IsLoopback) return true;
+        return string.Equals(uri.Host, "0.0.0.0", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool ShouldSkipSidecarProbe(string? endpoint, DriverSidecarConfig? sidecar)
+    {
+        if (sidecar is not { Enabled: true }) return false;
+
+        // A bare curl + sidecar probe pod does not run companion daemons (e.g. `aip proxy 11434`),
+        // and cannot reach a loopback endpoint on another pod. Spawning probe pods for these would
+        // always fail and churn Tailscale peers every negative-TTL window.
+        return !string.IsNullOrWhiteSpace(sidecar.CompanionCommand) || IsLoopbackEndpoint(endpoint);
+    }
+
     private async Task<IReadOnlyList<DiscoveredOpenAiModel>?> ListOpenAiModelsDetailedAsync(
         DriverCapabilityProbeRequest request,
         string endpoint,
         string? apiKey,
         CancellationToken ct)
     {
+        if (ShouldSkipSidecarProbe(endpoint, request.Sidecar))
+        {
+            return null;
+        }
+
         if (request.Sidecar is { Enabled: true } && _containerManager != null)
         {
             try

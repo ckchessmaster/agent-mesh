@@ -2799,8 +2799,21 @@ public class SessionsController(
             var (pId, pName, _, _) = await ResolveSessionPersonaAsync(session);
             var authorPersonaId = pId ?? session.PersonaId ?? session.DriverId ?? "agent";
 
-            var matches = Regex.Matches(responseMessage.Content, @"@([a-zA-Z0-9_\-]+)");
-            var mentions = matches.Select(m => m.Groups[1].Value.ToLowerInvariant()).Distinct().ToList();
+            var knownPersonaIds = await db.Personas
+                .AsNoTracking()
+                .Select(p => p.Id)
+                .ToListAsync();
+            var knownPersonaSet = new HashSet<string>(knownPersonaIds, StringComparer.OrdinalIgnoreCase);
+
+            // Match standalone @mentions (not email addresses) and filter to real registered
+            // persona IDs so scoped package names like @sveltejs or @testing-library do not
+            // misclassify completed turn updates as InternalConsultation cards.
+            var matches = Regex.Matches(responseMessage.Content, @"(?<![a-zA-Z0-9._%+-])@([a-zA-Z0-9_\-]+)");
+            var mentions = matches
+                .Select(m => m.Groups[1].Value.ToLowerInvariant())
+                .Where(id => knownPersonaSet.Contains(id) && !string.Equals(id, authorPersonaId, StringComparison.OrdinalIgnoreCase))
+                .Distinct()
+                .ToList();
 
             var now = DateTimeOffset.UtcNow;
             var responseCard = new JobTimelineCard
@@ -2809,7 +2822,7 @@ public class SessionsController(
                 JobId = jobIdStr,
                 TaskId = job.CurrentTaskId,
                 CardType = mentions.Count > 0 ? TimelineCardType.InternalConsultation : TimelineCardType.TaskStep,
-                Status = TimelineCardStatus.Active,
+                Status = TimelineCardStatus.Resolved,
                 Title = $"Turn update (@{authorPersonaId})",
                 StructuredPayloadJson = JsonSerializer.Serialize(new
                 {

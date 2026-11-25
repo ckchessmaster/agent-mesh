@@ -417,9 +417,7 @@ if [ -n "$AGENTMESH_DRIVER_ID" ]; then
     ARGS+=(--driver "$AGENTMESH_DRIVER_ID")
 fi
 
-if [ -n "$AGENTMESH_TOKEN" ]; then
-    ARGS+=(--token "$AGENTMESH_TOKEN")
-fi
+# AGENTMESH_TOKEN is read directly from the environment by `agentmesh`, avoiding exposure in `ps aux`.
 
 if [ -n "$AGENTMESH_MODEL" ]; then
     ARGS+=(--model "$AGENTMESH_MODEL")

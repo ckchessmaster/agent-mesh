@@ -107,6 +107,49 @@ public class GitActivitiesPersonaTokenTests
     }
 
     [Fact]
+    public async Task MergeJobPullRequest_WhenChecksInProgress_PollsUntilMergeSucceeds()
+    {
+        var origInterval = GitActivities.ChecksInProgressPollInterval;
+        var origMaxWait = GitActivities.ChecksInProgressMaxWait;
+        GitActivities.ChecksInProgressPollInterval = TimeSpan.FromMilliseconds(10);
+        GitActivities.ChecksInProgressMaxWait = TimeSpan.FromSeconds(5);
+
+        try
+        {
+            var attempts = 0;
+            var pulls = new Mock<IGitHubPullRequestService>();
+            pulls.Setup(s => s.MergePullRequestAsync(
+                    It.IsAny<GitHubMergeRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() =>
+                {
+                    attempts++;
+                    return attempts < 3
+                        ? new GitHubMergeResult(false, "Required status check is in progress.", FailureReason: "checks_in_progress")
+                        : Merged;
+                });
+
+            var activity = new GitActivities(
+                NullLogger<GitActivities>.Instance,
+                pulls.Object,
+                new ConfigurationBuilder().Build());
+
+            var summary = await activity.MergeJobPullRequestAsync(new MergePullRequestInput(
+                JobId: Guid.NewGuid().ToString(),
+                TargetBranch: "mesh/job-ci",
+                PrUrl: PrUrl,
+                ApprovedHeadSha: "abc123"));
+
+            summary.Should().Be(Merged.Message);
+            attempts.Should().Be(3);
+        }
+        finally
+        {
+            GitActivities.ChecksInProgressPollInterval = origInterval;
+            GitActivities.ChecksInProgressMaxWait = origMaxWait;
+        }
+    }
+
+    [Fact]
     public async Task MergeJobPullRequest_WithoutDbWiring_BehavesLikeTheThreeArgConstructor()
     {
         // Older hosts and the existing construction patterns pass no persona store; merge must not

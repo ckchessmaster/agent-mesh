@@ -405,6 +405,10 @@ public static class DriverModelDiscovery
                 var modelId = idProp.GetString()?.Trim();
                 if (string.IsNullOrWhiteSpace(modelId)) continue;
 
+                // Batch-only endpoints (e.g. deepseek/...:batch) cannot serve /chat/completions
+                // and fail with HTTP 404. Exclude them from interactive model discovery.
+                if (modelId.EndsWith(":batch", StringComparison.OrdinalIgnoreCase)) continue;
+
                 var isAuto = string.Equals(modelId, "openrouter/auto", StringComparison.OrdinalIgnoreCase);
                 if (!isAuto && !IsTextOutputOpenRouterModel(item)) continue;
 

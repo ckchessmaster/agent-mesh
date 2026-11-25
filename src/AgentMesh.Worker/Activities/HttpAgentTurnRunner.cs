@@ -873,10 +873,20 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             .FirstOrDefaultAsync(ct);
 
         var discoveredPrMessage = await db.SessionMessages.AsNoTracking()
-            .Where(m => m.SessionId == sessionId && m.Content != null && m.Content.Contains("/pull/"))
+            .Where(m => m.SessionId == sessionId
+                        && (m.EventType == "tool_result" || m.EventType == "response")
+                        && ((m.Content != null && m.Content.Contains("/pull/"))
+                            || (m.ToolResultJson != null && m.ToolResultJson.Contains("/pull/"))))
             .OrderByDescending(m => m.CreatedAt)
-            .Select(m => m.Content)
+            .Select(m => new { m.EventType, m.ToolName, m.Content, m.ToolResultJson })
             .FirstOrDefaultAsync(ct);
+
+        var discoveredPrText = discoveredPrMessage is not null &&
+            (discoveredPrMessage.EventType == "response" || IsShellTool(discoveredPrMessage.ToolName))
+                ? (discoveredPrMessage.Content?.Contains("/pull/", StringComparison.OrdinalIgnoreCase) == true
+                    ? discoveredPrMessage.Content
+                    : discoveredPrMessage.ToolResultJson)
+                : null;
 
         var targetTaskCompleted = false;
         if (!string.IsNullOrWhiteSpace(taskId) &&
@@ -904,7 +914,7 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             LedgerScopedToSession: ledgerScopedToSession,
             LastSessionMessageContent: lastSessionMessage?.Content,
             LastSessionMessageType: lastSessionMessage?.EventType,
-            DiscoveredPrUrl: discoveredPrMessage,
+            DiscoveredPrUrl: discoveredPrText,
             TargetTaskCompleted: targetTaskCompleted);
     }
 
@@ -1216,9 +1226,44 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
         @"https?://github\.com/[^/\s""']+/[^/\s""']+/pull/(?<pr>\d+)",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+    private static readonly Regex ShellPrCreationCommandRegex = new(
+        @"(?:\bgh\s+pr\s+create\b|\bagentmesh\s+pr\s+open\b)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    internal static bool IsShellTool(string? toolName)
+    {
+        var normalized = NormalizeToolName(toolName);
+        if (string.IsNullOrEmpty(normalized)) return false;
+
+        return normalized is "bash" or "sh" or "shell" or "run_command" or "execute_command" or "exec" or "terminal"
+            || normalized.EndsWith("/bash", StringComparison.Ordinal)
+            || normalized.EndsWith(".bash", StringComparison.Ordinal)
+            || normalized.EndsWith("/run_command", StringComparison.Ordinal)
+            || normalized.EndsWith(".run_command", StringComparison.Ordinal);
+    }
+
+    internal static bool HasPrCreationShellCommand(IReadOnlyList<ToolCallRecord> toolCalls)
+    {
+        foreach (var call in toolCalls)
+        {
+            if (!IsShellTool(call.ToolName) || string.IsNullOrWhiteSpace(call.ArgsJson)) continue;
+            if (ShellPrCreationCommandRegex.IsMatch(call.ArgsJson)) return true;
+        }
+        return false;
+    }
+
     internal static (string Url, int? Number)? DetectOutOfBandPr(TurnState state)
     {
-        // 1. Check discovered PR URL message from session transcript (e.g. tool_result from gh pr create)
+        // Only treat a PR URL in shell output / prose as a newly opened PR when this turn actually
+        // executed a PR-creation CLI command (e.g. `gh pr create` or `agentmesh pr open`). Without
+        // this guard, mock GitHub PR URLs inside unit tests written via `create`/`edit` or printed
+        // during test runs falsely trigger PrOpenedAwaitingReview mid-task.
+        if (!HasPrCreationShellCommand(state.ToolCalls))
+        {
+            return null;
+        }
+
+        // 1. Check discovered PR URL message from shell tool_result or final assistant response
         if (!string.IsNullOrWhiteSpace(state.DiscoveredPrUrl))
         {
             var match = GitHubPrRegex.Match(state.DiscoveredPrUrl);
@@ -1242,10 +1287,12 @@ public class HttpAgentTurnRunner : IAgentTurnRunner
             }
         }
 
-        // 3. Check tool call arguments (e.g. run_command args containing gh pr create or PR URL)
+        // 3. Check PR-creation shell tool call payloads only (never file-editing or read tools).
         foreach (var call in state.ToolCalls.OrderByDescending(t => t.At))
         {
-            if (!string.IsNullOrWhiteSpace(call.ArgsJson))
+            if (IsShellTool(call.ToolName) &&
+                !string.IsNullOrWhiteSpace(call.ArgsJson) &&
+                ShellPrCreationCommandRegex.IsMatch(call.ArgsJson))
             {
                 var match = GitHubPrRegex.Match(call.ArgsJson);
                 if (match.Success)

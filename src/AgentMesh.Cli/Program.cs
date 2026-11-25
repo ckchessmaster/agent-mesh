@@ -65,6 +65,14 @@ public static class Program
         string? targetPersonaId = Environment.GetEnvironmentVariable("AGENTMESH_PERSONA_ID");
         string? targetDriverId = Environment.GetEnvironmentVariable("AGENTMESH_DRIVER_ID");
 
+        // Allow AGENTMESH_TOKEN from environment so containerized runners don't have to expose
+        // bearer tokens in argv / `ps aux`; explicit `--token` still takes precedence below.
+        var envToken = Environment.GetEnvironmentVariable("AGENTMESH_TOKEN");
+        if (!string.IsNullOrWhiteSpace(envToken))
+        {
+            config.MasterToken = envToken.Trim();
+        }
+
         for (var i = 0; i < args.Length; i++)
         {
             var arg = args[i];

@@ -458,6 +458,71 @@ public class AgentMeshCliTests
     }
 
     [Fact]
+    public async Task GitWorkspaceManager_PrepareJobBranchAsync_AnchorsNewBranchToOriginMainAndPreservesExistingBranches()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "agentmesh_git_base_" + Guid.NewGuid().ToString("N")[..8]);
+        var bareOrigin = Path.Combine(root, "origin.git");
+        var workRepo = Path.Combine(root, "work");
+        Directory.CreateDirectory(bareOrigin);
+        Directory.CreateDirectory(workRepo);
+
+        static async Task<string> GitAsync(string dir, string args)
+        {
+            using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = args,
+                WorkingDirectory = dir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            })!;
+            var stdout = await p.StandardOutput.ReadToEndAsync();
+            var stderr = await p.StandardError.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            p.ExitCode.Should().Be(0, $"git {args} failed: {stderr}");
+            return stdout.Trim();
+        }
+
+        try
+        {
+            await GitAsync(bareOrigin, "init --bare --initial-branch=main");
+            await GitAsync(workRepo, $"clone \"{bareOrigin}\" .");
+            await GitAsync(workRepo, "config user.name \"Test\"");
+            await GitAsync(workRepo, "config user.email \"test@example.com\"");
+            File.WriteAllText(Path.Combine(workRepo, "base.txt"), "main-v1");
+            await GitAsync(workRepo, "add -A");
+            await GitAsync(workRepo, "commit -m \"base commit\"");
+            await GitAsync(workRepo, "push -u origin main");
+            var mainSha = await GitAsync(workRepo, "rev-parse HEAD");
+
+            // Simulate prior job branch with an unmerged commit
+            await GitWorkspaceManager.PrepareJobBranchAsync(workRepo, "mesh/job-old");
+            File.WriteAllText(Path.Combine(workRepo, "old-job.txt"), "old-only");
+            await GitAsync(workRepo, "add -A");
+            await GitAsync(workRepo, "commit -m \"old job commit\"");
+            var oldJobSha = await GitAsync(workRepo, "rev-parse HEAD");
+            oldJobSha.Should().NotBe(mainSha);
+
+            // Creating a NEW job branch while sitting on mesh/job-old must anchor to origin/main
+            await GitWorkspaceManager.PrepareJobBranchAsync(workRepo, "mesh/job-new");
+            (await GitAsync(workRepo, "branch --show-current")).Should().Be("mesh/job-new");
+            (await GitAsync(workRepo, "rev-parse HEAD")).Should().Be(mainSha);
+            File.Exists(Path.Combine(workRepo, "old-job.txt")).Should().BeFalse();
+
+            // Switching BACK to existing mesh/job-old must preserve its commits (not reset via -B)
+            await GitWorkspaceManager.PrepareJobBranchAsync(workRepo, "mesh/job-old");
+            (await GitAsync(workRepo, "branch --show-current")).Should().Be("mesh/job-old");
+            (await GitAsync(workRepo, "rev-parse HEAD")).Should().Be(oldJobSha);
+            File.Exists(Path.Combine(workRepo, "old-job.txt")).Should().BeTrue();
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    [Fact]
     public void AgyAdapter_PersistsAndRestores_SessionConversationMapping()
     {
         var sessionId = Guid.NewGuid();

@@ -44,6 +44,14 @@ public class CompositeAuthenticationHandler(
                 {
                     return jwtResult;
                 }
+
+                // A 3-segment JWT that failed JwtBearerScheme (e.g. expired OIDC access token from
+                // an idle browser tab) is never a valid agent API key. Return directly instead of
+                // falling through to ApiKeyScheme and spamming invalid-token warnings + DB lookups.
+                if (LooksLikeJwt(bearerToken))
+                {
+                    return AuthenticateResult.Fail("Invalid or expired JWT Bearer token.");
+                }
             }
 
             // Fallback to ApiKeyScheme in case the Bearer token was a master dev key or agent key
@@ -73,6 +81,11 @@ public class CompositeAuthenticationHandler(
                 {
                     return jwtResult;
                 }
+
+                if (LooksLikeJwt(queryToken))
+                {
+                    return AuthenticateResult.Fail("Invalid or expired JWT access token.");
+                }
             }
 
             return await Context.AuthenticateAsync(AuthConstants.ApiKeyScheme);
@@ -87,6 +100,16 @@ public class CompositeAuthenticationHandler(
 
         // 3. No credentials presented
         return AuthenticateResult.NoResult();
+    }
+
+    internal static bool LooksLikeJwt(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token)) return false;
+        var firstDot = token.IndexOf('.');
+        if (firstDot <= 0) return false;
+        var secondDot = token.IndexOf('.', firstDot + 1);
+        if (secondDot <= firstDot + 1 || secondDot >= token.Length - 1) return false;
+        return token.IndexOf('.', secondDot + 1) < 0;
     }
 
     protected override async Task HandleChallengeAsync(AuthenticationProperties properties)

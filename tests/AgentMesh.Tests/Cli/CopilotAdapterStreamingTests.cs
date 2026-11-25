@@ -537,6 +537,59 @@ public class CopilotAdapterStreamingTests
     }
 
     [Fact]
+    public void ResolveFinalCopilotOutput_PrefersTaskCompleteSummaryOverStreamedProgressBlurbs()
+    {
+        var resolved = CopilotAdapter.ResolveFinalCopilotOutput(
+            streamedResponse: "Starting Task 4...\n\nInspecting files...",
+            taskCompleteSummary: "### Result\nCompleted Task 4 cleanly (commit abc1234).",
+            rawStdOut: string.Empty,
+            stdErr: string.Empty);
+
+        resolved.Should().Be("### Result\nCompleted Task 4 cleanly (commit abc1234).");
+    }
+
+    [Fact]
+    public void TryParseCopilotJsonLine_SuppressesPartialToolResultsAndExtractsToolCallId()
+    {
+        const string partialLine = """{"type":"tool.execution_partial_result","data":{"toolCallId":"call-1","partialOutput":"running..."}}""";
+        var partialParsed = CopilotAdapter.TryParseCopilotJsonLine(
+            partialLine, out var partialType, out _, out _, out _, out _, out _, out _, out _, out _);
+
+        partialParsed.Should().BeTrue();
+        partialType.Should().Be("tool.execution_partial_result");
+
+        const string startLine = """{"type":"tool.execution_start","data":{"toolCallId":"call-1","toolName":"view","arguments":{"path":"Program.cs"}}}""";
+        var startParsed = CopilotAdapter.TryParseCopilotJsonLine(
+            startLine, out var startType, out _, out var startTool, out _, out _, out _, out _, out _, out var startCallId);
+
+        startParsed.Should().BeTrue();
+        startType.Should().Be("tool_call");
+        startTool.Should().Be("view");
+        startCallId.Should().Be("call-1");
+    }
+
+    [Fact]
+    public void ExtractQuestionsFromOutput_IgnoresMidLineQuestionMarksInCompletionSummaries()
+    {
+        const string summary = """
+            ### Result
+            - **Result**: Added `GET /api/project-jobs/{id}/pr-ci` (`?refresh=true`) and `PrReviewPayload.ci?: JobPrCiSummaryDto`.
+            - **Reasoning**: Uses `x ? a : b` ternary for fallback formatting.
+            """;
+
+        AgentAdapterFactory.ExtractQuestionsFromOutput(summary).Should().BeEmpty();
+
+        const string realQuestions = """
+            Before implementing, please clarify:
+            1. Should we target PostgreSQL or SQLite?
+            2. Do you want auto-merge enabled (yes/no)?
+            """;
+
+        var extracted = AgentAdapterFactory.ExtractQuestionsFromOutput(realQuestions);
+        extracted.Should().HaveCount(2);
+    }
+
+    [Fact]
     public async Task MeshClient_EnsureSuccessWithBodySnippetAsync_IncludesTruncatedResponseBodyOn400()
     {
         var errorBody = "{\"error\":\"validation_failed\",\"detail\":\"" + new string('E', 800) + "\"}";
